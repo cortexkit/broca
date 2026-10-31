@@ -414,6 +414,14 @@ call of that batch that never left the process), commits the batch, then seals t
 
 #### Queue and submission
 
+Readers understand optional `queued.request.service_tier_level`, an open string carrying the
+abstract `standard`, `fast` or `ultrafast` level separately from the legacy provider-tier enum.
+Its presence requires `service-tier-queue/v1`; older readers refuse the log by that name rather
+than draining the send at another tier. Queue replay and admission checkpoints retain unfamiliar
+levels verbatim, and draining refuses a level the provider cannot apply. Absence leaves historical
+queued bytes and feature requirements unchanged. Public send admission does not populate this
+member yet: the reader must ship in a release before the writer is enabled.
+
 | Record | Fields |
 |---|---|
 | `queued` | `submission_id`, `request` (the caller's full `SubmissionRequest`), `request_identity_digest` (absent), `principal` (absent), `send_id` (absent), `title` (absent; the send's title, carried onto the `run_started` that drains it, informational like `run_started.title`), `delivery` (absent; `"interrupt"` for the message an interrupting send queued before cancelling the run it interrupted). A prompt queued while a run was active. |
@@ -740,6 +748,14 @@ holding `at_seq`, the last episode (run id, effective config, input, disposition
 `running`/`paused`/`finished`, usage, retries, budget state) and the pending submission
 queue. A version the running build does not recognise is treated as missing, and the
 checkpoint is rebuilt from the WAL.
+
+The optional `has_model_attempt` checkpoint member summarizes the entire folded
+prefix, not just its last episode. A complete fold with no attempts records false;
+any `model_attempt_finished` makes it true, and subsequent episodes cannot clear
+it. Missing on older checkpoints means unknown. Cache diagnostics use this fact
+to avoid an unnecessary prefix read when no predecessor exists; unknown history
+is rebuilt lazily for that session, never by a startup scan. The version-one
+envelope is unchanged, and older checkpoint decoders ignore this optional member.
 
 ### 4.3 `message`
 

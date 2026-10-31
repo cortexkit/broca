@@ -11,8 +11,9 @@ filename, payload or byte offset.
 ## Completeness and admission
 
 Session binds also use this inventory to retain an existing pair's original root.
-An existing `(harness, session)` pair is resolved in a read transaction without
-acquiring SQLite's write lock. Only an absent pair takes an immediate transaction,
+An existing `(harness, session)` pair is positive evidence and resolves in a read
+transaction without acquiring SQLite's write lock or waiting for discovery repair.
+Two recorded roots still refuse as ambiguous, including during repair. Only an absent pair takes an immediate transaction,
 rechecks completeness and the pair's roots, and reserves a candidate if still absent.
 Competing first binds share that writer transaction, so they cannot select different
 roots. A refused bind or an
@@ -47,7 +48,7 @@ unknown, using the existing retryable response. Known candidates can still be
 verified independently. SQLite failures likewise never prove absence. Empty ref
 sets bypass discovery.
 
-## One-time migration, not a boot inventory
+## Migration and on-demand repair
 
 Startup creates the additive schema, then schedules migration off the serve path
 on a separate SQLite connection. It does not hold the serving connection's mutex
@@ -57,14 +58,26 @@ completion marker is recorded only after the source scan finishes. Invalid legac
 identities leave missing session refs
 unknown rather than certifying that no local copy exists.
 
-Migration is scheduled once by `AgentDataService::reconcile_boot`, not by refused
-binds or a periodic repair loop. An in-flight startup migration can restore completeness
-without another restart. Once that attempt has ended, a new gap marker, an older
-writer's session identity not yet added to the inventory, or an uncovered WAL address
-is not automatically repaired in the running process;
-restart schedules the next automatic attempt. Fix unreadable or malformed source data
-before expecting repair to complete. A temporary store error can clear on a later bind
-without migration when the store recovers and its completeness evidence remains valid.
+Boot schedules migration without blocking serve startup. A bind for an unrecorded
+pair that finds incomplete inventory joins that migration, or starts one if none is
+running. Concurrent binds share one repair and its readiness signal, rather than
+polling SQLite. Known-session binds, reads and resumes keep serving. Each new bind
+waits at most 60 seconds, then rechecks resolution; a timeout does not cancel the
+shared repair. A later bind may start another attempt after a failed repair.
+
+The refusal remains `session_address_unavailable`, with `detail.class: "transient"`
+and `detail.reason` identifying `wait_expired`, `migration_failed`, or a remaining
+`gap_marker`. The code is not in subc-protocol 0.33.4's retryable route-open set;
+callers must not assume the transient class alone enables transport retries.
+`health.check.session_address_refusals.repairs` counts started, completed and failed
+attempts, and `diagnostics.findings` retains timestamped `session_inventory_repairs`
+evidence. These counts describe repair attempts, not sessions or census rows.
+
+Mid-run gap markers and legacy pending rows can therefore recover on the next
+new-session bind without a restart. There is no periodic repair loop. Fix unreadable
+or malformed source data before expecting repair to complete. A temporary store
+error can clear on a later bind without migration when the store recovers and its
+completeness evidence remains valid.
 Do not remove a gap marker merely to silence refusals: repair verifies coverage and
 briefly takes a per-root filesystem lease to detect concurrent WAL appends or
 installations whose identities could not be recorded in SQLite before durably clearing
@@ -111,7 +124,7 @@ that counter before scanning, reacquires the lease at completion, and clears the
 marker only if the counter increased by exactly one for its own reacquisition.
 Any intervening writer or repair leaves the marker in place. No lock is held for
 the census duration and no session identities are cached in memory.
-A failed or overlapped repair leaves the marker for the next boot, not a false
+A failed or overlapped repair leaves the marker for the next repair attempt, not a false
 absence or a failed run.
 Downgrade-then-reupgrade is outside the projection-completeness guarantee: an older
 binary can add WAL-only sessions that the already-completed migration will not discover.
@@ -140,3 +153,77 @@ Busy probes inspect the requested WAL for active runs, queued sends and unsettle
 approvals, with the existing actor, lease and move-fence observations. INFO events
 report op, cut id, ref count and elapsed milliseconds, including cancelled calls.
 `health.check.metrics.agent_data_ops` reports each operation's cumulative count.
+
+## Offline split-root repair
+
+If a historical WAL re-key left a session's run-index rows and refs under two
+project roots, inspect the stopped store with:
+
+```sh
+store-maintenance repair-session-root STATE_ROOT --harness HARNESS --session SESSION
+```
+
+This is **preview-only by default**. The JSON lists each terminal run row to
+re-point (run ID, old and new identities, the matched episode's embedded identity
+and terminal state), each v1 ref and v2 alias to remove
+(including root and session), orphaned projection table row counts, the stale
+meta row's lineage, watermark and last run ID, the projection evidence used, and
+any obsolete address discovery rows. Keep a
+backup, review that plan, then repeat with `--write` to apply it. The write prints
+and flushes its plan before applying, rechecks under a SQLite writer transaction,
+and refuses a changed preview. A repaired one-root pair is a no-op on repeat.
+
+**Stop broca and its supervisor for the entire write operation.** Live or unknown
+writer liveness refuses before SQLite opens. The repair additionally acquires
+both canonical session leases to exclude standalone writers; these leases do not
+replace the stopped-supervisor requirement. Preview uses a read-only connection,
+without schema initialization or leases.
+
+Repair requires a complete inventory, exactly two roots, and exactly one address
+with a WAL across all live trees and sealed archive trees. It refuses deletion
+ledgers/tombstones, expired lineage records, move/cut fences, unreadable sources,
+and competing logs.
+Each stale run must be terminal and match an episode by run ID in the surviving
+verified WAL. That episode must end in a durable `run_finished` whose terminal
+state matches the row. The embedded `run_started` triple is reported as historical
+provenance, not used to match the run: folder and harness re-keys change the
+address or run index without rewriting log records. Missing run IDs, unfinished
+episodes and mismatched terminal states refuse repair rather than
+deleting unproven run metadata. Successful repair changes only the proven run
+identities, stale inventory/discovery mappings, and the stale key's orphaned
+projection rows, in one transaction. It never merges projections, changes live
+key rows, changes log bytes or extracts an archive. All other run metadata is
+retained. A present stale meta lineage must match the verified surviving log's
+lineage; a known different lineage refuses even if transcript bytes happen to
+match. Legacy NULL meta lineage means unknown, not different: cleanup requires
+every stale `message` row to have a live-key row at the same `ord` with
+byte-identical stored `json`, and stale `meta.last_run_id` must occur in a verified
+live-log `run_started`. Missing or differing rows refuse with
+`null_lineage_prefix_mismatch`; a missing or unrepresented last run ID refuses
+with `null_lineage_last_run_missing`.
+
+Preview reports `stale_projection_evidence.kind` as `lineage_match` or
+`null_lineage_prefix_match`, with `compared_message_rows`. The known-lineage proof
+compares no message rows (count 0); the NULL-lineage proof reports the number of
+stale rows compared, without JSON normalization. A run row's recorded lineage,
+when present, must also match. The live key must have its own meta row,
+or the verified log must support rebuilding the projection. Cleanup never
+rebuilds or rewrites the live key itself.
+
+The flat-session-key projection tables checked for cleanup are `meta`, `message`,
+`message_tag`, `episode_span`, `retention_lineage`, `retained_head`,
+`compaction_facts`, `bus_event_projection` and `bus_event_open`. Preview lists
+every existing table with a `session` column and its exact stale-key row count;
+`remove` identifies the known projections. An unrecognized table with stale-key
+rows refuses rather than risking authoritative data. Tables using JSON identities
+or bare session names do not match that flat key and are not deleted. Billing
+facts, `export_imported_runs` records preventing double billing of imported runs,
+`retention_withdrawal` provider-withdrawal work, deletion ledgers and move fences
+remain intact. The existing `retention_lineage` delete trigger also removes its
+derived `retention_discovery` hint; preview reports that count separately.
+
+The bind-time ambiguity rule is unchanged: a missing log alone is not proof that
+an inventory identity can be discarded. Interrupted admissions, expiry and moves
+can legitimately leave identity candidates without local content. The legacy
+`rekey-harness.py` refuses inventoried stores before changing anything; it does
+not implement a general inventory-aware harness or project-root migration.

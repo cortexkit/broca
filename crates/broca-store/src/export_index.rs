@@ -560,6 +560,23 @@ fn classify_collision(stored: &str, current: &str) -> CollisionKind {
 }
 
 impl ExportIndex for SqliteStore {
+    fn is_imported_run(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        run_id: &RunId,
+    ) -> Result<bool, ExportError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM export_imported_runs WHERE session=?1 AND run_id=?2)",
+            rusqlite::params![
+                serde_json::to_string(session).map_err(|e| ExportError::Storage(e.to_string()))?,
+                run_id.0
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|e| ExportError::Storage(e.to_string()))
+    }
+
     fn record_imported_runs(
         &self,
         session: &broca_protocol::BindIdentity,

@@ -12,11 +12,26 @@ use subc_protocol::ErrorBody;
 pub use broca_wire::diagnostics::OP;
 pub const REPLY_LIMIT: usize = 65_536;
 static ROOT: OnceLock<(PathBuf, broca_wal::WalConfig)> = OnceLock::new();
+static READER: OnceLock<std::sync::Arc<dyn broca_store::db::DiagnosticEvidenceReader>> =
+    OnceLock::new();
 
 pub fn install(root: PathBuf, config: broca_wal::WalConfig) {
     crate::session_address_health::initialize();
     live::initialize();
     let _ = ROOT.set((root, config));
+}
+
+/// Boot can inject its selected reader without changing the diagnostic service.
+/// The legacy installer retains its existing read-only connection behavior.
+/// Configure a concrete SqliteStore with the boot WalConfig before erasing its
+/// type; the config here also gates recovery-manifest diagnostics.
+pub fn install_with_reader(
+    root: PathBuf,
+    reader: std::sync::Arc<dyn broca_store::db::DiagnosticEvidenceReader>,
+    config: broca_wal::WalConfig,
+) {
+    install(root, config);
+    let _ = READER.set(reader);
 }
 
 pub fn admit(principal: Option<&BindPrincipal>, scope: &SendScope) -> Result<(), ErrorBody> {
@@ -59,14 +74,26 @@ pub fn gather(
     now: i64,
     config: broca_wal::WalConfig,
 ) -> Result<Evidence, ErrorBody> {
-    let store = broca_store::SqliteStore::open_read_only(root.join("run-index.db"))
-        .map_err(|_| {
-            ErrorBody::new(
-                "store_error",
-                "diagnostics.findings cannot read run-index.db",
-            )
-        })?
-        .with_wal_config(config);
+    let store = broca_store::db::open_diagnostic_reader(root, config).map_err(|_| {
+        ErrorBody::new(
+            "store_error",
+            format!(
+                "diagnostics.findings cannot read {}",
+                broca_store::db::operational_database_name(root).unwrap_or("state-format")
+            ),
+        )
+    })?;
+    gather_with_reader(root, store.as_ref(), catalog_age_ms, since, now, config)
+}
+
+pub fn gather_with_reader(
+    root: &Path,
+    store: &dyn broca_store::db::DiagnosticEvidenceReader,
+    catalog_age_ms: Result<i64, String>,
+    since: i64,
+    now: i64,
+    config: broca_wal::WalConfig,
+) -> Result<Evidence, ErrorBody> {
     let runs = store.diagnostic_evidence(since, now).map_err(|_| {
         ErrorBody::new(
             "store_error",
@@ -105,6 +132,10 @@ pub fn gather(
         retention: live::retention_fences(),
         unmapped_credentials: crate::account_routing::published_unmapped_credentials(),
         rings: [
+            (
+                "session_inventory_repairs".into(),
+                crate::session_address_health::repair_snapshot(since, now),
+            ),
             (
                 "session_address_unavailable".into(),
                 crate::session_address_health::snapshot(since, now),
@@ -156,7 +187,21 @@ pub fn serving_reply(
                 "diagnostics.findings run-index source is not configured",
             )
         })?;
-        gather(root, catalog_age, since, now, *config)
+        if let Some(reader) = READER.get() {
+            gather_with_reader(root, reader.as_ref(), catalog_age, since, now, *config)
+        } else {
+            // The legacy installer keeps its selected database until boot
+            // explicitly supplies a different diagnostic reader.
+            let store = broca_store::SqliteStore::open_read_only(root.join("run-index.db"))
+                .map_err(|_| {
+                    ErrorBody::new(
+                        "store_error",
+                        "diagnostics.findings cannot read run-index.db",
+                    )
+                })?
+                .with_wal_config(*config);
+            gather_with_reader(root, &store, catalog_age, since, now, *config)
+        }
     })
 }
 
@@ -676,6 +721,11 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
                             f.summary = format!("Session binds were refused because address discovery was unavailable: {}.", f.key.replace('_', " "));
                             f.hint = "Inspect health.check session_address_refusals and the session_address WARN log; verify inventory completeness and repair before resuming binds.".into();
                         }
+                        if check == "session_inventory_repairs" {
+                            f.severity = if code == "failed" { Severity::Error } else { Severity::Info };
+                            f.summary = format!("Session inventory repairs {} in the observed window.", code);
+                            f.hint = "Inspect health.check session_address_refusals.repairs and the session-ref migration log; known sessions remain available during repair.".into();
+                        }
                         f.count=0;f
                     });
                     f.count += 1;
@@ -733,3 +783,151 @@ pub fn trim(mut reply: Reply) -> Reply {
 #[cfg(test)]
 #[path = "diagnostics_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod operational_port_tests {
+    use super::*;
+    use broca_core::{RunIndex, RunIndexAttribution, RunIndexRow, RunIndexState};
+    use broca_store::db::{DiagnosticEvidenceReader, LogLocation, OverhaulDb, PublishedSession};
+    use broca_wal::WalRecord;
+
+    #[test]
+    fn diagnostics_findings_match_legacy_from_the_same_lifecycle_records() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("diagnostic-ports-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+        let db = OverhaulDb::open(&root).unwrap();
+        let legacy = broca_store::SqliteStore::open_in_memory().unwrap();
+        let source = broca_wal::replay_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/fixtures/resume-close-out-sealed.wal"),
+            broca_wal::DEFAULT_MAX_READ_BYTES,
+        )
+        .unwrap();
+        let start = source
+            .iter()
+            .find(|f| matches!(f.record, WalRecord::RunStarted { .. }))
+            .unwrap()
+            .record
+            .clone();
+        let terminal = source
+            .iter()
+            .find(|f| matches!(f.record, WalRecord::RunFinished { .. }))
+            .unwrap()
+            .record
+            .clone();
+        let bind = broca_protocol::BindIdentity::new("/project", "runner", "diagnostic");
+        let mut records = Vec::new();
+        for (id, paused, timed) in [
+            ("paused", true, true),
+            ("error", false, true),
+            ("untimed", false, false),
+        ] {
+            let mut start = start.clone();
+            if let WalRecord::RunStarted {
+                session,
+                run_id,
+                ts_ms,
+                ..
+            } = &mut start
+            {
+                *session = bind.clone();
+                run_id.0 = id.into();
+                *ts_ms = Some(100);
+            }
+            let last = if paused {
+                WalRecord::RunPaused {
+                    run_id: broca_protocol::RunId(id.into()),
+                    reason: broca_protocol::PauseReason::AuthRequired,
+                    error: None,
+                    ts_ms: Some(200),
+                }
+            } else {
+                let mut value = serde_json::to_value(&terminal).unwrap();
+                value["reason"] = json!("error");
+                value["ts_ms"] = if timed { json!(200) } else { Value::Null };
+                value["error"] = json!({"class":"auth_required","message":"PRIVATE_DIAGNOSTIC_MESSAGE","provider_code":"invalid_api_key","credential_id":"credential"});
+                serde_json::from_value(value).unwrap()
+            };
+            let mut attribution = RunIndexAttribution::default();
+            attribution.observe(&start);
+            attribution.observe(&last);
+            let state = if paused {
+                RunIndexState::Paused
+            } else {
+                RunIndexState::Error
+            };
+            legacy
+                .index_run_active(&RunIndexRow {
+                    run_id: id.into(),
+                    session: bind.clone(),
+                    state: RunIndexState::Active,
+                    submission_id: None,
+                    request_identity_digest: None,
+                    usage: None,
+                    final_step_finish_reason: None,
+                    retries_used: 0,
+                    title: None,
+                    withdrawals_owed: false,
+                })
+                .unwrap();
+            legacy
+                .index_run_attributed(id, state, None, None, 0, &attribution)
+                .unwrap();
+            records.extend([start, last]);
+        }
+        let bytes: Vec<_> = records
+            .iter()
+            .enumerate()
+            .flat_map(|(n, record)| broca_wal::framing::encode(n as u64 + 1, 1, record).unwrap())
+            .collect();
+        db.index(&PublishedSession {
+            bind: &bind,
+            session_ref: "diagnostic",
+            location: LogLocation::Live,
+            bytes: &bytes,
+        })
+        .unwrap();
+        let evidence = |runs| Evidence {
+            recovery_cuts: Vec::new(),
+            runs,
+            late_fence_ms: None,
+            late_delivery_stuck: vec![],
+            retention: Ok(vec![]),
+            catalog_age_ms: Ok(100),
+            unmapped_credentials: BTreeMap::new(),
+            rings: BTreeMap::new(),
+        };
+        let legacy = report(
+            evidence(legacy.diagnostic_evidence(150, 1000).unwrap()),
+            1000,
+            850,
+        );
+        let overhaul = report(
+            evidence(db.diagnostic_evidence(150, 1000).unwrap()),
+            1000,
+            850,
+        );
+        assert!(!legacy.findings.is_empty());
+        assert_eq!(
+            serde_json::to_value(overhaul).unwrap(),
+            serde_json::to_value(legacy).unwrap()
+        );
+        for name in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
+            assert!(!root.join(name).exists());
+        }
+        assert!(gather(&root, Ok(100), 150, 1000, broca_wal::WalConfig::OVERHAUL).is_ok());
+        drop(db);
+        std::fs::remove_file(root.join("broca.db")).unwrap();
+        assert_eq!(
+            gather(&root, Ok(100), 150, 1000, broca_wal::WalConfig::OVERHAUL)
+                .err()
+                .unwrap()
+                .code
+                .as_str(),
+            "store_error"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

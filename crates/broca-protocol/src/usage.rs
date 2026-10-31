@@ -68,7 +68,54 @@ pub struct Usage {
     pub reasoning_tokens: Option<u64>,
 }
 
-pub use cortexkit_role_llm_runner::usage::{ModelUsage, RunUsage};
+pub use cortexkit_role_llm_runner::usage::ModelUsage;
+
+/// Run token totals with optional measurements of completed model calls.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunUsage {
+    #[serde(flatten)]
+    totals: cortexkit_role_llm_runner::usage::RunUsage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generation: Vec<GenerationUsage>,
+}
+
+impl RunUsage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl std::ops::Deref for RunUsage {
+    type Target = cortexkit_role_llm_runner::usage::RunUsage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.totals
+    }
+}
+
+impl std::ops::DerefMut for RunUsage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.totals
+    }
+}
+
+/// Both intervals and output tokens cover exactly the same final attempts with reported
+/// output tokens and ordered send, first-content and last-content timestamps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationUsage {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+    pub model_calls: u64,
+    pub output_tokens: u64,
+    /// Present only when every counted call reported the reasoning subset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    pub sent_to_last_content_ms: u64,
+    pub first_to_last_content_ms: u64,
+}
 
 impl Usage {
     /// Context-fill metric: fresh request input + cache reads + cache writes.
@@ -372,5 +419,39 @@ mod tests {
             .fill_tokens(),
             Some(7)
         );
+    }
+}
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    #[test]
+    fn unmeasured_run_usage_preserves_shared_role_bytes() {
+        let mut legacy = cortexkit_role_llm_runner::usage::RunUsage::new();
+        let mut usage = RunUsage::new();
+        for step in [
+            cortexkit_role_llm_runner::usage::StepUsage::unreported(),
+            cortexkit_role_llm_runner::usage::StepUsage::unreported()
+                .with_output_tokens(30)
+                .with_reasoning_tokens(10),
+        ] {
+            legacy.record_step("provider", "model", None, step);
+            usage.record_step("provider", "model", None, step);
+            let bytes = serde_json::to_vec(&legacy).unwrap();
+            assert_eq!(serde_json::to_vec(&usage).unwrap(), bytes);
+            assert_eq!(serde_json::from_slice::<RunUsage>(&bytes).unwrap(), usage);
+        }
+    }
+
+    #[test]
+    fn generation_round_trips_alongside_shared_role_totals() {
+        let bytes = br#"{"steps":1,"unreported_steps":0,"output_tokens":30,"by_model":[],"generation":[{"model":"model","model_calls":1,"output_tokens":30,"sent_to_last_content_ms":100,"first_to_last_content_ms":60}]}"#;
+        let usage: RunUsage = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(usage.generation.len(), 1);
+        assert_eq!(usage.generation[0].reasoning_tokens, None);
+        assert_eq!(serde_json::to_vec(&usage).unwrap(), bytes);
+        let shared: cortexkit_role_llm_runner::usage::RunUsage =
+            serde_json::from_slice(bytes).unwrap();
+        assert_eq!(shared.output_tokens, usage.output_tokens);
     }
 }

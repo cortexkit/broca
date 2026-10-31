@@ -40,6 +40,7 @@ fn queued(id: &str) -> WalRecord {
         delivery: None,
         submission_id: SubmissionId(id.into()),
         request: Box::new(SubmissionRequest {
+            service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
             directives: None,
@@ -216,4 +217,42 @@ fn crash_before_consume_pending_crash_after_consumed() {
         pending_ids(&after).is_empty(),
         "consumed → never double-started"
     );
+}
+
+#[test]
+fn queued_ultrafast_tier_is_retained_at_every_queue_to_consume_cut() {
+    let mut pending = queued("tier");
+    let WalRecord::Queued { request, .. } = &mut pending else {
+        unreachable!()
+    };
+    request.service_tier_level = Some("ultrafast".into());
+    let records = [pending, consume("run-tier", "tier")];
+    for cut in 0..=records.len() {
+        let replayed: Vec<_> = records[..cut]
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let bytes = broca_wal::framing::encode(index as u64 + 1, 1, record).unwrap();
+                let broca_wal::framing::DecodeStep::Record { framed, .. } =
+                    broca_wal::framing::decode_next(&bytes)
+                else {
+                    panic!("durable frame")
+                };
+                framed.record
+            })
+            .collect();
+        let queue = pending_submissions(&replayed);
+        if cut == 1 {
+            assert_eq!(queue.len(), 1);
+            assert_eq!(
+                queue[0].request.service_tier_level.as_deref(),
+                Some("ultrafast")
+            );
+        } else {
+            assert!(
+                queue.is_empty(),
+                "only the durable queue-to-consume interval may drain"
+            );
+        }
+    }
 }

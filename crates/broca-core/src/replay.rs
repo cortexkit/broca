@@ -4371,6 +4371,7 @@ pub struct RunUsageProjection {
     run_id: RunId,
     active: bool,
     model: Option<(broca_protocol::request::ModelHandle, Option<String>)>,
+    final_attempt: Option<generation::AttemptTiming>,
     pub usage: broca_protocol::usage::RunUsage,
 }
 
@@ -4380,6 +4381,7 @@ impl RunUsageProjection {
             run_id,
             active: false,
             model: None,
+            final_attempt: None,
             usage: Default::default(),
         }
     }
@@ -4395,6 +4397,23 @@ impl RunUsageProjection {
                 if self.active {
                     self.model = Some((config.model.clone(), config.variant.clone()));
                 }
+                self.final_attempt = None;
+            }
+            WalRecord::StepStarted { .. } if self.active => self.final_attempt = None,
+            WalRecord::ModelAttemptFinished {
+                step_id,
+                sent_at_ms,
+                content_progress,
+                ..
+            } if self.active => {
+                // Replace even an unmeasured attempt: a retry's timing never belongs to
+                // the output produced by the step's final attempt.
+                self.final_attempt = Some(generation::AttemptTiming {
+                    step_id: *step_id,
+                    sent: *sent_at_ms,
+                    first: content_progress.first_content_at_ms,
+                    last: content_progress.last_content_at_ms,
+                });
             }
             WalRecord::ModelStepFinished { .. } | WalRecord::ModelStepRefused { .. }
                 if self.active =>
@@ -4402,9 +4421,14 @@ impl RunUsageProjection {
                 // A refused call was billed, so it counts as a call of the model that refused.
                 if let Some((model, variant)) = &self.model {
                     let variant = variant.as_deref().filter(|value| !value.is_empty());
-                    for (provider, model, variant, usage) in
-                        crate::refusal_fallback::usage_by_model(model, variant, record)
-                    {
+                    let by_model = crate::refusal_fallback::usage_by_model(model, variant, record);
+                    generation::record(
+                        &mut self.usage.generation,
+                        self.final_attempt.take(),
+                        record,
+                        &by_model,
+                    );
+                    for (provider, model, variant, usage) in by_model {
                         self.usage.record_step(
                             provider,
                             model,
@@ -4418,6 +4442,8 @@ impl RunUsageProjection {
         }
     }
 }
+
+mod generation;
 
 pub(crate) fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::usage::StepUsage {
     let mut step = cortexkit_role_llm_runner::usage::StepUsage::unreported();
@@ -5423,6 +5449,7 @@ pub(crate) mod projection_boundary_tests {
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
                 recovery_cuts: Vec::new(),
+                has_model_attempt: None,
                 media: None,
                 head: None,
                 has_deferred_calls: None,

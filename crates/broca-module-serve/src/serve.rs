@@ -2393,8 +2393,11 @@ async fn finish_bind(
             "cannot resolve session {:?} in harness {:?}: {error}",
             completed.identity.session, completed.identity.harness
         );
-        let body =
-            ErrorBody::new(error.code(), message).with_detail(serde_json::json!({"class":class}));
+        let mut detail = serde_json::json!({"class":class});
+        if let broca_store::session_address::SessionAddressError::Unavailable(reason) = &error {
+            detail["reason"] = serde_json::json!(reason.reason());
+        }
+        let body = ErrorBody::new(error.code(), message).with_detail(detail);
         return send_error_body(
             writer,
             completed.header.ver,
@@ -2648,8 +2651,7 @@ where
         );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
         let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
-            || (broca_protocol::attachments_enabled()
-                && method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ);
+            || method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ;
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -2765,9 +2767,7 @@ where
         }
     }
     match req.method.as_str() {
-        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ
-            if broca_protocol::attachments_enabled() =>
-        {
+        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ => {
             match handler.media_read(session, req.params).await {
                 Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
                 Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
@@ -3607,8 +3607,7 @@ where
                 handler.compaction_supported(),
                 crate::RETENTION_WRITER_ENABLED,
                 handler.hook_plane_available(),
-            )
-            .with_media(broca_protocol::attachments_enabled());
+            );
             describe.session_class.backup_classes = handler.backup_classes();
             trace_describe("response_ready", channel, epoch, corr);
             let sent = send_json_response(writer, ver, channel, epoch, corr, &describe).await;
@@ -4243,7 +4242,7 @@ fn limit_live_arguments(
         if let cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(event) = &frame.2 {
             let arguments: serde_json::Value =
                 serde_json::from_str(&event.arguments).expect("projected arguments are JSON");
-            let limited = cortexkit_role_llm_runner::live::ToolStarted::new(
+            let mut limited = cortexkit_role_llm_runner::live::ToolStarted::new(
                 &event.mid,
                 &event.tool_call_id,
                 &event.name,
@@ -4251,6 +4250,11 @@ fn limit_live_arguments(
                 Some(limits),
                 event.started_at,
             );
+            // `new` only re-cuts the arguments; the call identity the projector already
+            // attached must survive the cut, or a limited stream loses what lets a client
+            // join this event to its display row.
+            limited.call_key.clone_from(&event.call_key);
+            limited.schema_pin.clone_from(&event.schema_pin);
             return Delivery::Control(Arc::new((
                 frame.0,
                 frame.1.clone(),
@@ -6224,7 +6228,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| panic!("reader did not reach {phase:?} gate"));
-            let snapshot = witness.snapshot().await;
+            let snapshot = witness.reader_phase_snapshot(phase).await;
             task.abort();
             let _ = task.await;
             assert_eq!(snapshot["kind"], "reader_phase", "{phase:?}");

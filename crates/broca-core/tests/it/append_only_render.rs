@@ -298,6 +298,7 @@ impl Provider for TransformingProvider {
                 sent_at_ms: None,
                 transport: None,
                 websocket_request: None,
+                cache_evidence: None,
                 websocket_close_code: None,
                 input_transformations: Some(vec![broca_protocol::InputTransformation {
                     kind: Some("thinking_dropped".into()),

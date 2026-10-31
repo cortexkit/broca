@@ -180,6 +180,38 @@ impl<F: Future> Future for MeasuredFuture<F> {
     }
 }
 
+/// Forward the spawning operation through a task's first poll, which can enqueue
+/// independently inherited blocking reads. The context is dropped after that poll,
+/// so a long-lived subscriber never retains the operation's counter.
+/// With no active operation, return the original future: callers spawn it directly,
+/// without a wrapper allocation or any extra work on its poll path.
+pub fn inherit_future<F: Future>(future: F) -> Result<impl Future<Output = F::Output> + use<F>, F> {
+    match current() {
+        Some(context) => Ok(InheritedFuture {
+            context: Some(context),
+            future: Box::pin(future),
+        }),
+        None => Err(future),
+    }
+}
+
+struct InheritedFuture<F> {
+    context: Option<Context>,
+    future: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for InheritedFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.context.take() {
+            Some(context) => with_context(Some(context), || this.future.as_mut().poll(cx)),
+            None => this.future.as_mut().poll(cx),
+        }
+    }
+}
+
 /// Attribute both a validation read and its decode to a named purpose.
 pub fn validation<T>(kind: ValidationRead, work: impl FnOnce() -> T) -> T {
     let context = current().map(|mut context| {
@@ -352,6 +384,48 @@ impl<R: std::io::Read> std::io::Read for AccessReader<R> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inherited_future_without_an_operation_is_the_original_future() {
+        let future = std::future::ready(17);
+        let original_size = std::mem::size_of_val(&future);
+        let mut bare = super::inherit_future(future)
+            .err()
+            .expect("no operation returns the unwrapped future");
+        assert_eq!(std::mem::size_of_val(&bare), original_size);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert_eq!(
+            std::future::Future::poll(std::pin::Pin::new(&mut bare), &mut cx),
+            std::task::Poll::Ready(17)
+        );
+    }
+
+    #[test]
+    fn inherited_future_releases_its_operation_after_the_first_poll() {
+        let counter = super::WalAccessCounter::default();
+        let operation = counter.operation("spawned read");
+        let baseline = std::sync::Arc::strong_count(&counter.0);
+        let mut first = true;
+        let future = std::future::poll_fn(move |_| {
+            super::record_read(7, 3);
+            if std::mem::take(&mut first) {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        });
+        let mut inherited = Box::pin(
+            operation
+                .run(|| super::inherit_future(future))
+                .ok()
+                .unwrap(),
+        );
+        assert_eq!(std::sync::Arc::strong_count(&counter.0), baseline + 1);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(inherited.as_mut(), &mut cx).is_pending());
+        assert_eq!(std::sync::Arc::strong_count(&counter.0), baseline);
+        assert!(std::future::Future::poll(inherited.as_mut(), &mut cx).is_ready());
+        assert_eq!(counter.snapshot()[0].reads.len(), 1);
+    }
     use super::*;
     use crate::framing::{encode, encode_lineage, WalLineageId};
     use crate::{FileWal, Wal, WalRecord};

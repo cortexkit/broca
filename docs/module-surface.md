@@ -159,9 +159,13 @@ A consumer can be both. The surface is **session-centric**: consumers address
   stamped `workdir`. On subc-protocol 0.33, a new pair without stamped workdir still
   uses the route root, including for outgoing transport. A stamp's `project_id` never
   keys a session. Two inventory roots refuse `session_address_ambiguous` (permanent);
-  incomplete discovery refuses `session_address_unavailable` (transient), never a guess.
-  Existing-pair lookups use a read transaction; only absent pairs take the write lock,
-  recheck discovery, and reserve a root before any actor or WAL opens.
+   Known pairs resolve immediately from positive inventory evidence even during repair.
+   An absent pair waits on shared discovery readiness for at most 60 seconds; incomplete
+   discovery then refuses `session_address_unavailable` (transient), never a guess.
+   Its `detail.reason` distinguishes `wait_expired`, `migration_failed` and a remaining
+   `gap_marker`. Boot and on-demand repairs are single-flight and do not block serve
+   startup. Existing-pair lookups use a read transaction; only absent pairs take the
+   write lock, recheck discovery, and reserve a root before any actor or WAL opens.
 - **Run = one turn's loop execution** — a user message in → the agent loops until its
   response → a terminal. Each run begins with a `RunStarted` **episode marker** (input +
   frozen config + `origin` + `submission_id`). Runs **accumulate** in the lineage WAL:
@@ -417,6 +421,19 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   omitted, never an empty string; each entry contributes to the run totals, including
   unreported steps. These counters and the model breakdown do not change subscriber
   `step_finished` / `run_finished` usage units or the WAL record format.
+  An optional `generation` list groups measured model calls by `{model, service_tier?, speed?}`
+  in first-measured order. Each entry has `model_calls`, `output_tokens`,
+  `sent_to_last_content_ms` and `first_to_last_content_ms`: both durations and the token total
+  cover the same final attempts with reported output tokens and timestamps ordered
+  `sent_at_ms <= first_content_at_ms <= last_content_at_ms`. Durations are sums of `last - sent`
+  and `last - first`; they exclude tool time, failed retries and post-content bookkeeping.
+  `reasoning_tokens` is included only when every counted call reports it, and is already part of
+  output. Tier and speed are provider-reported facts, omitted when absent. Served models use the
+  billing attribution; mixed-model calls are excluded because the log has no per-model timing
+  split. Missing or reversed timestamps and unreported output tokens produce no sample, not zero.
+  Empty groups and an entirely unmeasured `generation` member are omitted; older logs remain
+  unmeasured. These client-side decoded-content intervals measure observed delivery, not the
+  provider's internal token-generation clock.
 - `run.result`'s `final_message.text` joins the final assistant message's text parts with
   nothing inserted, leaving reasoning out; a completed run with no text answers `""`.
   It is not paged and is not subject to `session.read.max_bytes`; when its complete encoded frame
@@ -472,6 +489,10 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   omission for every send. Any other send must name `model`. When an inheriting send is
   queued behind a running turn, its recorded request carries the frozen model itself, so a
   build that does not know the inherited set still runs it on the session's model.
+
+Broca does not send `service_tier` to account routing; a tier chosen by a router reaches broca
+only through the caller's send. Broca does not report `service_tier_applied` or
+`service_tier_served` to account routing.
 
 #### Hard session input-token cap
 
@@ -656,6 +677,14 @@ change. Both surfaces support `immediately` (the next run) and `on_prefix_rebuil
 run after an applied compaction view, model switch, or prefix flush). A new run alone is not a
 rebuild. A flush is a durable rebuild boundary; with nothing pending it does not change request
 bytes or promise a provider cache miss.
+
+In `session.baseline`, top-level composition and absence facts describe the frozen prefix.
+After a refresh applies, `effective.composition_digest` copies the applied manifest's composition
+digest (omitted when unavailable), and `effective.absent_items` reports its absent optional items
+(omitted when empty). These may differ from the prefix after an `append` application; a `fold`
+application rebuilds the prefix from the applied manifest. `effective.manifest_digest` remains the
+identity of the whole applied manifest, not its composition digest. No `effective` object is
+reported before any refresh applies.
 
 Refresh admission uses the ordinary plan admitter and durably records the fetched manifest and
 original reply before answering. Identical retries fetch and write nothing, even after restart
@@ -1512,29 +1541,29 @@ refusal is counted in `health.check` as `reverse_requests_refused`.
 
 **Tool result formats and provider-held calls.** The daemon's dispatch routes declare
 `consumer_capabilities: ["tool-result/v1", "held-reply/v1"]` in every build. Typed result
-decoding still requires the result-format opt-in in the provider's frozen catalog. Text and errors use the same
-stored bytes as legacy replies. With media disabled, builds append the existing
-"not shown to the model" notice for each omitted image. With media enabled, dispatch captures
-images and PDFs through the session's media-capture handle. Role discovery and management routes do not
+decoding still requires the result-format opt-in in the provider's frozen catalog. Negotiating
+`tool-result/v1` does not change the stored text or error payload bytes. Dispatch captures images
+and PDFs through the session's
+media-capture handle. The frozen model's media profile decides which captures reach a model
+request; unsupported kinds remain text markers. Role discovery and management routes do not
 negotiate tool results.
 
-### Runtime media opt-in
+### Model-based media input
 
-In `broca.jsonc`, `"media": {"enabled": true}` enables media for the process.
-The section is optional and `enabled` defaults to `false`. Only a boolean is accepted;
-unknown keys inside `media` refuse boot by name. The decision is read once before stores
-are opened: enabling or disabling media requires restarting broca. `test-attachments`
-remains a non-shipping feature for test seams, not a deployment prerequisite.
+Media input follows the frozen model's catalog input modalities for every session class,
+including heads, workers and sidekicks. No process configuration is required.
+`test-attachments` provides attachment test helpers that cannot be built into release binaries;
+it is not a deployment prerequisite.
 
-Every fresh enabled episode whose model explicitly supports a non-text input modality
+Every fresh episode whose model explicitly supports a non-text input modality
 freezes its adapter media profile, even for text-only input: a tool may return an image
 after the first model request. Requests without media retain their ordinary rendered bytes.
 Resume never adds a profile to an older recorded configuration; those runs keep their media
 markers until a fresh episode is admitted. Existing per-family carrier gates remain in force.
 
-When enabled, `role.describe` declares the llm-runner `attachments` group and its upload
-and `session.media_read` operations. When disabled, it declares neither the group nor
-`session.media_read`; existing upload staging remains available but cannot be sent.
+`role.describe` always declares the llm-runner `attachments` group and its upload
+and `session.media_read` operations. Upload staging is available independently of the model;
+sending an upload requires the frozen profile to accept its kind and exact MIME type.
 The operations follow the pinned llm-runner contract §9.12. In particular,
 `session.media_read {sha256, offset, length}` serves at most 2,097,152 decoded bytes as
 `{data, size, mime}`. Zero length omits `data`; EOF returns empty data, and an offset
@@ -1545,13 +1574,13 @@ Capture authorization uses the stored admission checkpoint and a strictly anchor
 WAL tail, not a replay of the transcript for every chunk. A missing or unusable checkpoint
 requires a named, counted full-replay repair through the shared media-seed fallback counter.
 
-Enabled upload appends are strictly contiguous; replaying a chunk refuses
-`upload_offset_mismatch` with the current `received` count. Disabled legacy staging keeps
-its existing identical-chunk retry behavior. Sends preserve the upload refusal codes
-(`unknown_upload`, `upload_gone`, `upload_not_committed`) instead of reporting a failed
-session open. A disabled send carrying an upload is still refused before admission.
+Upload appends are strictly contiguous; replaying a chunk refuses
+`upload_offset_mismatch` with the current `received` count. Sends preserve the upload refusal
+codes (`unknown_upload`, `upload_gone`, `upload_not_committed`) instead of reporting a failed
+session open. A send carrying a kind the model cannot accept is refused before admission.
 
-Enabled `session.head.input` quotes a finished episode's next model from the in-memory catalog
+`session.head.input` reports a finished episode's next model's accepted input kinds and exact
+MIME types from the in-memory catalog
 and adapter MIME filter without changing the recorded config or fetching catalog data.
 Active resident heads use frozen facts published by the writer's durable metadata tap.
 Nonresident resumable heads cache the frozen facts by session, lineage and WAL sequence;
@@ -1559,13 +1588,13 @@ only a cold position requires a historical read. No stored head-projection shape
 
 Default reads keep media as text markers. `session.read` with `media: "blocks"` returns
 stored references; descriptors and history display rows expose refs rather than payload
-bytes. Enabled blocks reads include stored-content message/part identities for media-bearing
-entries. Default enabled model-view reads also use not-requested text markers; explicit
+bytes. Blocks reads include a digest of each media-bearing message and digests identifying
+each of its content parts. Default model-view reads also use not-requested text markers; explicit
 blocks mode keeps native media references. Provider rendering uses the frozen family's media profile; unsupported person input
 is refused before publication, including ChatGPT audio. Sessions holding media refuse
 agent-data moves before any cut or freeze because move transport currently carries WALs
 only. The existing Engram catalog already includes `media-durable` as a portable filetree
-and excludes temporary, retained and ephemeral media stores; enabling media needs no
+and excludes temporary, retained and ephemeral media stores; model-based admission needs no
 descriptor change.
 
 ### Provider-held calls
@@ -1899,3 +1928,58 @@ never-written sessions carry no error summary.
 Compaction Setup continues to omit `ride_wait_max_ms`, `view_apply` and child-run
 `session_retention`: broca does not promise provider-chosen ride waits, marked
 next-step view application, or the per-session retention policy group.
+
+## Compaction pricing signals and rollback
+
+`broca.jsonc` accepts the boot-only boolean `compaction_signals` (default `true`).
+A config change takes effect after restarting broca; it is not frozen into a session.
+With it on, advance notices describe the next call's current route with
+`history_edit_cost`: `suffix` for prefix-byte prompt caches (Anthropic, Bedrock,
+Gemini/Code Assist, Chat Completions and ordinary Responses), or `full_resend`
+for ChatGPT's WebSocket response-chain route. A switch to HTTPS changes the hint
+on the next notice, even within the same session. Unknown routes omit the hint.
+The header is a pricing hint, never permission to rewrite history.
+
+Before rendering a ChatGPT step, a known missing chain can also request a bounded
+`compaction.ride` RPC with cause `chain_reset`. Age retirement uses the transport's 40-minute decision, and
+run-start acquisition supplies its existing idle/absent-socket decision. The
+transport records why the socket has no usable completion receipt in the attempt's
+`full_input_reason` (for example, `new_connection_age`). The pre-render request and
+the attempt use that same retirement decision, not an elapsed-gap guess.
+A retry or refusal discovered during sending does
+not re-enter this boundary and never announces a new chain-reset request. Cache
+warms, including warms of the original model after a fallback, neither produce
+these step signals nor replace the previous model request's
+[segment-hash fingerprint](cache-dump.md#offline-cache-diagnosis).
+
+Set `"compaction_signals": false` to omit both new signals from newly created
+notices and chain-reset requests. Disabled notices keep the old header encoding/digest. This does
+**not** strip, suppress or rewrite any notice already durable in the WAL, queued
+in the outbox, or accepted by the broker: notice sequence/headers/digest are immutable.
+Notice readers must support the `history_edit_cost` header and digest rules in
+`cortexkit-role-compaction-provider` 0.7.9 before signals are enabled.
+The reader-only pin ships in broca 0.3.290; the signal writer ships in 0.3.291.
+The writer's broca rollback floor is therefore 0.3.290. An older broca can read
+the WAL header map but cannot correctly re-encode this header's notice digest.
+
+**One-step Magic Context rollback:** the kept rollback build `34a40ebc`
+already accepts both signals. Rolling back to that build needs neither switch-off
+nor a compatibility drain.
+
+**Rollback to `4eac8781` or older:** these builds reject the new notice
+header and requires this order:
+
+1. Set `compaction_signals` to `false` and restart broca, leaving bus events enabled.
+2. Let bus recovery finish, then inspect
+   `health.check.metrics.bus_events.compaction_notice_outbox_pending` until zero
+   (and check that the bus loop is progressing without publication failures).
+   This count covers only unpublished notices in broca's outbox. Zero means only
+   that broca has published the queued notices, **never that Magic Context consumed
+   or acknowledged them**; it is not a substitute for completed WAL recovery.
+3. Separately pass Magic Context's own consumer-ACK drain check for advance notices.
+   This is an MC-owned operational check, not a broca API. Obtain its command or
+   dashboard procedure from the MC operator before attempting this rollback.
+   Broca's inbound `compaction_bus.acked` and JetStream publish receipts are not that
+   check. Do not proceed while the MC-owned check is unavailable or nonzero.
+4. Only then roll the Magic Context reader back. A rollback reader that itself
+   tolerates the new header does not need this compatibility drain.

@@ -14,7 +14,57 @@ fn diagnostics_address_unavailability_is_an_error_from_the_first_refusal_per_rea
         Ok(Snapshot {
             since_ms: NOW - 1000,
             truncated: false,
-            events: ["incomplete_inventory", "gap_marker", "store_error"]
+            events: [
+                "incomplete_inventory",
+                "gap_marker",
+                "store_error",
+                "wait_expired",
+                "migration_failed",
+            ]
+            .into_iter()
+            .map(|code| Event {
+                at_ms: NOW - 1,
+                module: String::new(),
+                code: code.into(),
+            })
+            .collect(),
+        }),
+    );
+    let reply = report(evidence, NOW, 1000);
+    let findings: Vec<_> = reply
+        .findings
+        .iter()
+        .filter(|finding| finding.check == "session_address_unavailable")
+        .collect();
+    assert_eq!(findings.len(), 5);
+    for (reason, words) in [
+        ("incomplete_inventory", "incomplete inventory"),
+        ("gap_marker", "gap marker"),
+        ("store_error", "store error"),
+        ("wait_expired", "wait expired"),
+        ("migration_failed", "migration failed"),
+    ] {
+        let finding = findings
+            .iter()
+            .find(|finding| finding.key == reason)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Error);
+        assert_eq!(finding.count, 1);
+        assert_eq!(finding.first_seen_ms, NOW - 1);
+        assert!(finding.summary.contains(words));
+    }
+}
+
+#[test]
+fn diagnostics_inventory_repairs_distinguish_progress_from_failure() {
+    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    let mut evidence = healthy(&store, NOW - 1000);
+    evidence.rings.insert(
+        "session_inventory_repairs".into(),
+        Ok(Snapshot {
+            since_ms: NOW - 1000,
+            truncated: false,
+            events: ["started", "completed", "failed"]
                 .into_iter()
                 .map(|code| Event {
                     at_ms: NOW - 1,
@@ -28,22 +78,20 @@ fn diagnostics_address_unavailability_is_an_error_from_the_first_refusal_per_rea
     let findings: Vec<_> = reply
         .findings
         .iter()
-        .filter(|finding| finding.check == "session_address_unavailable")
+        .filter(|finding| finding.check == "session_inventory_repairs")
         .collect();
     assert_eq!(findings.len(), 3);
-    for (reason, words) in [
-        ("incomplete_inventory", "incomplete inventory"),
-        ("gap_marker", "gap marker"),
-        ("store_error", "store error"),
-    ] {
-        let finding = findings
-            .iter()
-            .find(|finding| finding.key == reason)
-            .unwrap();
-        assert_eq!(finding.severity, Severity::Error);
+    for finding in findings {
         assert_eq!(finding.count, 1);
-        assert_eq!(finding.first_seen_ms, NOW - 1);
-        assert!(finding.summary.contains(words));
+        assert_eq!(
+            finding.severity,
+            if finding.key == "failed" {
+                Severity::Error
+            } else {
+                Severity::Info
+            }
+        );
+        assert!(finding.summary.contains("Session inventory repairs"));
     }
 }
 fn principal() -> BindPrincipal {

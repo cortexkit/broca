@@ -88,7 +88,7 @@ impl OverhaulDb {
                     final_step_finish_reason: None,
                     retries_used: 0,
                     title: None,
-                    withdrawals_owed: false,
+                    withdrawals_owed: super::recovery::owed(tx, run_id)?,
                 })
             })
             .transpose()

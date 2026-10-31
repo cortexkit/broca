@@ -78,6 +78,8 @@ fn retention_request_dumps_are_suppressed_before_any_write() {
         let rendered = runtime.block_on(async {
             tokio::task::spawn_blocking(move || {
                 RenderJob {
+                    cache_session: None,
+                    cache_provider: None,
                     subscription_auth: false,
                     media_renderer: None,
                     media_render_tags: false,
@@ -168,6 +170,8 @@ async fn retention_https_calls_private_diagnostics_on_every_retry() {
     let mut frozen = openai_responses_frozen_config("test-model");
     frozen.base_url = Some(url);
     let rendered = RenderJob {
+        cache_session: None,
+        cache_provider: None,
         subscription_auth: false,
         media_renderer: None,
         media_render_tags: false,

@@ -1268,6 +1268,7 @@ fn submission_from_config(
 ) -> SubmissionRequest {
     let policy_allowed = config.tools.iter().map(|tool| tool.name.clone()).collect();
     SubmissionRequest {
+        service_tier_level: None,
         staged_uploads: None,
         content: Vec::new(),
         directives: config.turn_directives_v1,
@@ -5049,6 +5050,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             input_hooks = prepared.hooks;
         }
         let auth = resolved_request.auth.take();
+        let queued_service_tier = resolved_request.service_tier_level.take();
         let mut req = RunRequest::from_submission(
             resolved_request,
             run_id.clone(),
@@ -5221,6 +5223,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             media,
             media_profile,
             conversation_key,
+            queued_service_tier,
             req,
             auth,
             writer: self
@@ -12454,6 +12457,7 @@ mod tests {
                 media: _,
                 media_profile: _,
                 conversation_key: _,
+                queued_service_tier: _,
                 req,
                 auth: _,
                 writer,

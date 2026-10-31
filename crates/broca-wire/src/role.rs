@@ -214,8 +214,8 @@ pub struct FinalMessage {
     pub text: String,
 }
 
-/// Accept older status fixtures that predate the usage counters while keeping the published
-/// role type as the only representation of run usage.
+/// Accept older status fixtures that predate the usage counters. The shared role totals
+/// retain their representation, with broca's optional generation measurements alongside them.
 pub(crate) fn deserialize_optional_run_usage<'de, D>(
     deserializer: D,
 ) -> Result<Option<broca_protocol::usage::RunUsage>, D::Error>
@@ -477,31 +477,24 @@ pub fn broca_role_describe_with_writers(
             2_592_000, 3_600_000,
         ));
     }
-    RoleDescribeResponse {
+    let mut response = RoleDescribeResponse {
         role: describe,
         session_class: SessionClassCapability {
             backup_classes: vec!["head".into()],
         },
-    }
-}
-
-impl RoleDescribeResponse {
-    /// Advertise the whole attachments group only after boot enables its serving paths.
-    pub fn with_media(mut self, enabled: bool) -> Self {
-        if enabled {
-            self.role
-                .capabilities
-                .push(cortexkit_role_llm_runner::capabilities::ATTACHMENTS.into());
-            self.role.majors[0].ops.extend([
-                "session.upload_begin".into(),
-                "session.upload_append".into(),
-                "session.upload_status".into(),
-                "session.upload_commit".into(),
-                cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
-            ]);
-        }
-        self
-    }
+    };
+    response
+        .role
+        .capabilities
+        .push(cortexkit_role_llm_runner::capabilities::ATTACHMENTS.into());
+    response.role.majors[0].ops.extend([
+        "session.upload_begin".into(),
+        "session.upload_append".into(),
+        "session.upload_status".into(),
+        "session.upload_commit".into(),
+        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
+    ]);
+    response
 }
 
 pub use cortexkit_role_llm_runner::tags::{
@@ -556,7 +549,7 @@ pub struct BaselineWire {
     pub pending: Option<cortexkit_role_llm_runner::baseline::PendingChange>,
     /// The latest applied change, absent while none applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective: Option<cortexkit_role_llm_runner::baseline::EffectiveBaseline>,
+    pub effective: Option<EffectiveBaselineWire>,
     /// The change-policy rungs this session supports, per surface. Present in every ready
     /// baseline on a runner declaring `session_change`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -564,6 +557,21 @@ pub struct BaselineWire {
     /// What the session's frozen config declares about its prompt cache. Absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::CacheDeclarationWire>,
+}
+
+/// The latest applied refresh, whose manifest can differ from the frozen prefix's manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveBaselineWire {
+    pub generation: u64,
+    pub applied_by: String,
+    pub manifest_digest: String,
+    /// The applied manifest's composition, not its whole-manifest identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition_digest: Option<String>,
+    /// Optional items absent from the applied manifest, in the same form as the prefix's
+    /// `absent_items`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absent_items: Vec<serde_json::Value>,
 }
 
 impl BaselineWire {
@@ -841,6 +849,51 @@ mod pinned_reply_bytes {
             "session_baseline.ready.json",
             SESSION_BASELINE_SHA256,
         );
+    }
+
+    #[test]
+    fn session_baseline_applied_refresh_bytes_are_pinned() {
+        let mut baseline = BaselineWire::planned(
+            vec![],
+            vec![],
+            "prefix-composition".into(),
+            vec!["read".into()],
+        );
+        baseline.accepted_generation = 2;
+        baseline.applied_generation = 2;
+        baseline.effective = Some(EffectiveBaselineWire {
+            generation: 2,
+            applied_by: "append".into(),
+            manifest_digest: "whole-manifest".into(),
+            composition_digest: Some("applied-composition".into()),
+            absent_items: vec![
+                serde_json::json!({"provider":"optional","kind":"tool","reason":"timeout"}),
+            ],
+        });
+        let reply = BaselineReply::ready(baseline);
+        if std::env::var_os("BROCA_CAPTURE_SAMPLES").is_some() {
+            println!(
+                "BROCA_SAMPLE session_baseline.applied.json {}",
+                serde_json::to_string(&reply).unwrap()
+            );
+        }
+        assert_golden(
+            reply,
+            "session_baseline.applied.json",
+            "f91fb9045d07ee70cb53ce9ad80d48d60b482ad9d5ee60fec0c411b82904c7cb",
+        );
+    }
+
+    #[test]
+    fn effective_baseline_without_optional_facts_keeps_legacy_bytes() {
+        let legacy = r#"{"generation":1,"applied_by":"fold","manifest_digest":"manifest"}"#;
+        let effective: EffectiveBaselineWire = serde_json::from_str(legacy).unwrap();
+        assert!(effective.composition_digest.is_none());
+        assert!(effective.absent_items.is_empty());
+        assert_eq!(serde_json::to_string(&effective).unwrap(), legacy);
+        let role: cortexkit_role_llm_runner::baseline::EffectiveBaseline =
+            serde_json::from_str(legacy).unwrap();
+        assert_eq!(serde_json::to_string(&role).unwrap(), legacy);
     }
 
     /// The reply to the send that admitted a session carries its baseline. The reply type is
@@ -1163,7 +1216,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "75c61c0d62c66eeb7e38fec6b4be7b1853a7e473d80014cbf945cefd20c674bf",
+            "307b50e8217d3a2d21ed6a03455f35c13dcc2ca64aefb23c873df5f2b114222d",
         );
     }
 
@@ -1341,7 +1394,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "3efc5e7700af5c23bf1ad38fcefdd7649d914269448944045a10390c07c1ce32";
+        "48e03e316d1d829bb6686fd45734713150e5c41171d3834c8e146978dea11b0b";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

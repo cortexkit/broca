@@ -285,18 +285,23 @@ pub(super) fn prepare_cursor(
     })).optional()?;
     let mut seed = None;
     let mut rebuilt = force;
+    let outdated = cp.is_some() && !super::recovery::projection_current(tx, key)?;
     if let Some(cp) = &cp {
-        if !force && valid_cursor(cp, lineage, end, read)? {
+        if !force && !outdated && valid_cursor(cp, lineage, end, read)? {
             seed = load_locator(tx, key, &cp.locator, read)?;
         }
         rebuilt = seed.is_none();
     }
     if cp.is_none() || rebuilt {
-        SeedFallback::new(rebuild_reason.unwrap_or(if cp.is_none() {
-            "publication index missing"
+        SeedFallback::new(if outdated && !force {
+            "withdrawal projection version outdated"
         } else {
-            "publication row cursor invalid"
-        }));
+            rebuild_reason.unwrap_or(if cp.is_none() {
+                "publication index missing"
+            } else {
+                "publication row cursor invalid"
+            })
+        });
         index::clear_session(tx, key)?;
     }
     let cp = if rebuilt { None } else { cp };
@@ -337,6 +342,15 @@ pub(super) fn publish_checked_in_tx(
             }
         }
         index::apply_frame(tx, &key, Some(lineage), &mut seed, frame)?;
+        if matches!(
+            frame.framed.record,
+            broca_wal::WalRecord::TurnFinished { .. }
+                | broca_wal::WalRecord::RunFinished { .. }
+                | broca_wal::WalRecord::RunStarted { .. }
+                | broca_wal::WalRecord::ModelStepFinished { .. }
+        ) {
+            publish_seeds(tx, &key, read)?;
+        }
     }
     let off = range
         .frames
@@ -354,6 +368,7 @@ pub(super) fn publish_checked_in_tx(
     tx.execute("UPDATE session SET lineage_id=?2,indexed_seq=?3,indexed_off=?4,indexed_end=?5,indexed_identity=?6,head_ord=?7,locator_seed=?8,frozen_policy=?9,last_activity_ms=?10,last_write_ms=?11,title_off=?12,lineage_off=?13 WHERE sid=?1",
         params![key,lineage,range.seq.map(u64_to_i64).transpose()?,u64_to_i64(off)?,u64_to_i64(range.end)?,identity,u64_to_i64(seed.head_ord())?,seed.encode()?,seed.frozen_policy.map(u64_to_i64).transpose()?,seed.last_activity_ms.map(u64_to_i64).transpose()?,seed.last_write_ms.map(u64_to_i64).transpose()?,seed.title_off.map(u64_to_i64).transpose()?,u64_to_i64(lineage_off)?])?;
     publish_seeds(tx, &key, read)?;
+    super::recovery::mark_projection_current(tx, &key)?;
     Ok(IndexOutcome {
         rebuilt,
         indexed_seq: range.seq,
@@ -367,7 +382,11 @@ fn positioned(read: &ReadAt<'_>, start: u64, end: u64) -> Result<Vec<PositionedF
         .map_err(DbError::Invalid)
 }
 
-fn publish_seeds(tx: &Transaction<'_>, key: &str, read: &ReadAt<'_>) -> Result<(), DbError> {
+pub(super) fn publish_seeds(
+    tx: &Transaction<'_>,
+    key: &str,
+    read: &ReadAt<'_>,
+) -> Result<(), DbError> {
     let boundary = tx.query_row(
         "SELECT lineage_id,seq,frame_off,frame_end,frame_identity,qualified FROM projection_boundary WHERE sid=?1 AND qualified=1 ORDER BY seq DESC LIMIT 1",
         [key], |r| Ok(SeedBoundary { lineage_id: r.get(0)?, seq: r.get(1)?, frame_off: r.get(2)?, frame_end: r.get(3)?, frame_identity: r.get(4)?, qualified: r.get(5)? }),
@@ -402,6 +421,16 @@ fn publish_seeds(tx: &Transaction<'_>, key: &str, read: &ReadAt<'_>) -> Result<(
     let next = if let Some(stored) = stored {
         let prior = stored.boundary();
         if prior == boundary {
+            tx.execute(
+                "INSERT OR IGNORE INTO episode_seed (sid,seq,continuation) VALUES (?1,?2,?3)",
+                params![
+                    key,
+                    boundary.seq,
+                    stored
+                        .encode()
+                        .map_err(|e| DbError::Invalid(e.to_string()))?
+                ],
+            )?;
             return Ok(());
         }
         if prior.seq < boundary.seq && prior.frame_end <= boundary.frame_off {
@@ -425,6 +454,7 @@ fn publish_seeds(tx: &Transaction<'_>, key: &str, read: &ReadAt<'_>) -> Result<(
                 Ok(next) => next,
                 Err(reason) => {
                     let unavailable = serde_json::json!({"version":1,"continuation":null,"fallback":reason.reason}).to_string();
+                    tx.execute("INSERT OR REPLACE INTO episode_seed (sid,seq,continuation) VALUES (?1,?2,?3)",params![key,boundary.seq,unavailable])?;
                     tx.execute(
                         "UPDATE session SET tail_seed=?2,admission_seed=?2 WHERE sid=?1",
                         params![key, unavailable],
@@ -434,6 +464,16 @@ fn publish_seeds(tx: &Transaction<'_>, key: &str, read: &ReadAt<'_>) -> Result<(
             }
         }
     };
+    // Historical episode reads need the continuation at their own boundary, not
+    // the latest session continuation. Both become visible in this transaction.
+    tx.execute(
+        "INSERT OR REPLACE INTO episode_seed (sid,seq,continuation) VALUES (?1,?2,?3)",
+        params![
+            key,
+            boundary.seq,
+            next.encode().map_err(|e| DbError::Invalid(e.to_string()))?
+        ],
+    )?;
     tx.execute(
         "UPDATE session SET tail_seed=?2,admission_seed=?3 WHERE sid=?1",
         params![

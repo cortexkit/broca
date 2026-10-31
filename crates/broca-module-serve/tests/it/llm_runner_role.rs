@@ -2113,7 +2113,18 @@ async fn one_stream_sequence_counts_both_lanes_and_restarts_for_each_subscribe()
 
 #[tokio::test]
 async fn live_tool_observations_and_control_bytes_survive_a_real_serve_restart() {
-    let (mut rig, _) = one_tool_turn("live-tool-restart").await;
+    assert_tool_replay_survives_restart("live-tool-restart", None).await;
+}
+
+#[tokio::test]
+async fn delayed_tool_replay_survives_a_real_serve_restart() {
+    // The transport withholds replay for longer than the quiet window, even when
+    // the server has already produced it. Silence must not stand in for attachment.
+    assert_tool_replay_survives_restart("delayed-tool-restart", Some(Duration::from_secs(1))).await;
+}
+
+async fn assert_tool_replay_survives_restart(tag: &str, replay_delay: Option<Duration>) {
+    let (mut rig, _) = one_tool_turn(tag).await;
     let records = rig.records();
     let started = records
         .iter()
@@ -2131,11 +2142,17 @@ async fn live_tool_observations_and_control_bytes_survive_a_real_serve_restart()
             _ => None,
         })
         .expect("the real tool call recorded its finish observation");
+    if let Some(delay) = replay_delay {
+        rig.delay_next_subscription_reads(delay);
+    }
+    // The display reset follows the durable control replay. Wait for that barrier
+    // before starting the quiet window, so a slow attachment cannot look empty.
     let before = rig
-        .subscribe_collect(
+        .subscribe_collect_after_display_reset(
             9,
             serde_json::json!({"from":"start"}),
             Duration::from_millis(500),
+            || {},
         )
         .await;
     let values = assert_stream_sequences(&before);
@@ -2156,11 +2173,15 @@ async fn live_tool_observations_and_control_bytes_survive_a_real_serve_restart()
         "stopping an already-finished run writes nothing"
     );
     rig = rig.restart().await;
+    if let Some(delay) = replay_delay {
+        rig.delay_next_subscription_reads(delay);
+    }
     let after = rig
-        .subscribe_collect(
+        .subscribe_collect_after_display_reset(
             9,
             serde_json::json!({"from":"start"}),
             Duration::from_millis(500),
+            || {},
         )
         .await;
     assert_stream_sequences(&after);
@@ -2547,6 +2568,22 @@ async fn live_finalize_filter_restreams_the_stored_block_indices() {
 #[tokio::test]
 async fn live_subscribe_limits_cut_only_typed_arguments_not_existing_units() {
     let (mut rig, _) = one_tool_turn("live-limits").await;
+    let unlimited = rig
+        .subscribe_collect(
+            20,
+            serde_json::json!({"from":"start"}),
+            Duration::from_millis(100),
+        )
+        .await;
+    let unlimited = assert_stream_sequences(&unlimited);
+    let unlimited_started = unlimited
+        .iter()
+        .find(|v| v["event"]["type"] == "tool_started")
+        .expect("tool lifecycle replays without limits");
+    assert!(
+        unlimited_started["event"]["call_key"].is_string(),
+        "the projector attaches the call key: {unlimited_started}"
+    );
     let frames = rig.subscribe_collect(20, serde_json::json!({"from":"start","limits":{"arguments_bytes":1,"result_bytes":1,"error_result_bytes":1}}), Duration::from_millis(100)).await;
     let values = assert_stream_sequences(&frames);
     let started = values
@@ -2555,6 +2592,15 @@ async fn live_subscribe_limits_cut_only_typed_arguments_not_existing_units() {
         .expect("tool lifecycle replays");
     assert_eq!(started["event"]["arguments"], "{");
     assert_eq!(started["event"]["arguments_truncated"], true);
+    // Cutting the arguments must not drop the call identity a client joins on.
+    assert_eq!(
+        started["event"]["call_key"],
+        unlimited_started["event"]["call_key"]
+    );
+    assert_eq!(
+        started["event"]["schema_pin"],
+        unlimited_started["event"]["schema_pin"]
+    );
     let call = values
         .iter()
         .find(|v| v["unit"]["type"] == "tool_call")
@@ -2685,9 +2731,8 @@ fn upload_staging_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, V
     entries
 }
 
-#[cfg(not(feature = "test-attachments"))]
 #[tokio::test]
-async fn upload_roundtrip_is_staged_but_not_advertised_or_admitted() {
+async fn upload_staging_is_declared_but_invalid_pdf_is_not_admitted() {
     let mut rig = Rig::start("upload-roundtrip").await;
     broca_core::media_store::create_media_directories(&rig.dir).unwrap();
     let begin = serde_json::json!({"mime":"application/pdf","bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"});
@@ -2705,7 +2750,8 @@ async fn upload_roundtrip_is_staged_but_not_advertised_or_admitted() {
     assert_eq!(result(&first)["received"], 3);
     let before = upload_staging_snapshot(&rig.dir);
     let retry = call(&mut rig, "session.upload_append", append).await;
-    assert_eq!(result(&retry), result(&first));
+    assert_eq!(refusal(&retry)["code"], "upload_offset_mismatch");
+    assert_eq!(refusal(&retry)["detail"]["received"], 3);
     assert_eq!(upload_staging_snapshot(&rig.dir), before);
     let conflict = call(
         &mut rig,
@@ -2735,13 +2781,16 @@ async fn upload_roundtrip_is_staged_but_not_advertised_or_admitted() {
             serde_json::json!({"content":[{"type":"upload","upload_id":id}]}),
         )
         .await;
-    assert_eq!(refusal(&refused)["code"], "invalid_params");
-    assert!(refusal(&refused)["message"].as_str().unwrap().contains(&id));
+    assert_eq!(refusal(&refused)["code"], "media_unsupported");
+    assert!(refusal(&refused)["message"]
+        .as_str()
+        .unwrap()
+        .contains("pdf"));
     assert_eq!(upload_staging_snapshot(&rig.dir), before);
     assert_eq!(rig.wal_bytes(), wal_before);
     let describe = call(&mut rig, "role.describe", serde_json::json!({})).await;
     let checked = cortexkit_role_llm_runner::describe::check_describe(&result(&describe)).unwrap();
-    assert!(!checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
+    assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
     rig.finish().await;
 }
 

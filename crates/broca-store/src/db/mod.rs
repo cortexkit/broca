@@ -8,12 +8,21 @@
 //! of authoritative state use FULL, which also makes earlier WAL commits durable.
 //! Reconciliation must still handle an index ahead of a restored or torn log.
 
+mod episode_reader;
 mod index;
+mod inventory;
+pub use inventory::open_session_resolver;
+mod operational;
+pub use operational::{
+    open_diagnostic_reader, operational_database_name, DiagnosticEvidenceReader,
+};
 mod publication;
 mod readers;
 mod rebuild;
 mod reconcile;
+mod recovery;
 mod resume_reader;
+mod retention;
 mod schema;
 mod seeds;
 
@@ -22,6 +31,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
+pub use episode_reader::{DatabaseEpisodeReader, EpisodeSnapshot};
 pub use index::{IndexOutcome, LogLocation, PublishedSession};
 pub use readers::{RawPageRequest, RawPageSnapshot};
 pub use rebuild::{AddressFloor, CondemnedLineage, LedgerRows};
@@ -69,6 +79,7 @@ impl From<broca_core::projection_plan::ProjectionPlanError> for DbError {
 
 pub struct OverhaulDb {
     conn: Mutex<Connection>,
+    root: std::path::PathBuf,
     raw_fallback_notices: Mutex<std::collections::HashSet<String>>,
 }
 
@@ -110,13 +121,39 @@ impl OverhaulDb {
         conn.pragma_update(None, "synchronous", "FULL")?;
         let db = Self {
             conn: Mutex::new(conn),
+            root: root.to_path_buf(),
             raw_fallback_notices: Mutex::new(Default::default()),
         };
         db.authoritative_transaction(|tx| {
             schema::initialize(tx)?;
+            inventory::initialize(tx)?;
+            retention::initialize(tx)?;
+            operational::initialize(tx)?;
+            recovery::initialize(tx)?;
             Ok(())
         })?;
         Ok(db)
+    }
+
+    /// Operational readers never initialize a missing database or migrate a root.
+    pub fn open_read_only(root: impl AsRef<Path>) -> Result<Self, DbError> {
+        let root = root.as_ref();
+        let marker = std::fs::read(root.join("state-format"))?;
+        if marker != b"broca-state/2" && marker != b"broca-state/2\n" {
+            return Err(DbError::Invalid(
+                "broca.db requires a broca-state/2 root".into(),
+            ));
+        }
+        let conn = Connection::open_with_flags(
+            root.join("broca.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            root: root.to_path_buf(),
+            raw_fallback_notices: Mutex::new(Default::default()),
+        })
     }
 
     /// All external writers use FULL, including mixed authoritative/index updates.

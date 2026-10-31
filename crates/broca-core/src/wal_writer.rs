@@ -695,11 +695,23 @@ impl FileWalStore {
             &session.project_root.to_string_lossy(),
             &session.session,
         );
-        broca_wal::migration::guard_refs(
-            &self.wal_path(session),
-            &[&legacy, &agent_session_ref(session)],
-            write,
-        )
+        let current = agent_session_ref(session);
+        let wal = self.wal_path(session);
+        if self.config.is_overhaul() && !write {
+            // A reader must not expose a partly installed activation. Recovery
+            // reads WAL descriptors directly and does not pass this serving gate.
+            for reference in [&legacy, &current] {
+                if let Some(cut_id) = broca_wal::migration::cut_fence(
+                    wal.parent().unwrap_or(Path::new(".")),
+                    reference,
+                )
+                .map_err(WalError::Io)?
+                {
+                    return Err(WalError::SessionMoving { cut_id });
+                }
+            }
+        }
+        broca_wal::migration::guard_refs(&wal, &[&legacy, &current], write)
     }
 
     fn check_authorization_move(&self, session: &BindIdentity) -> Result<(), WalError> {
@@ -3728,14 +3740,9 @@ impl WalHandle {
     }
 
     pub(crate) fn bind_media_capture(&mut self, store: &impl WalStore, session: &BindIdentity) {
-        // Tool and person media share the immutable boot decision.
-        self.media_capture = if broca_protocol::attachments_enabled() {
-            store
-                .uploads()
-                .map(|uploads| crate::tool_media::ToolMediaCapture::new(uploads, session.clone()))
-        } else {
-            None
-        };
+        self.media_capture = store
+            .uploads()
+            .map(|uploads| crate::tool_media::ToolMediaCapture::new(uploads, session.clone()));
     }
 
     pub fn check_move(&self) -> Result<(), WalError> {
@@ -6128,6 +6135,25 @@ fn current_write_error(poisoned: &Mutex<Option<WalWriteError>>) -> Option<WalWri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_read_move_check_never_consults_pending_cut_files() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("legacy-read-cut-lookup-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("wal")).unwrap();
+        let wal = super::FileWalStore::new(root.join("wal"));
+        let session = broca_protocol::BindIdentity::new("/project", "runner", "legacy-read");
+        std::fs::create_dir_all(root.join("agent-data/cuts")).unwrap();
+        std::fs::write(root.join("agent-data/cuts/unreadable.json"), b"not JSON").unwrap();
+        assert!(
+            wal.check_move(&session, false).is_ok(),
+            "legacy reads gained a cut-state lookup"
+        );
+        assert!(
+            wal.check_move(&session, true).is_err(),
+            "the unreadable-cut control must reject a lookup"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// THE ADDRESS IS PINNED TO A LITERAL COMPUTED OUTSIDE THIS CODE.
     ///

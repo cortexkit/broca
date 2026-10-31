@@ -40,6 +40,16 @@ impl LiveAnthropicProvider {
 
 #[async_trait]
 impl Provider for LiveAnthropicProvider {
+    fn history_edit_cost(
+        &self,
+    ) -> Option<broca_core::compaction_provider::notice::HistoryEditCost> {
+        self.inner.history_edit_cost()
+    }
+
+    fn prepare_chain_reset(&self) -> bool {
+        self.inner.prepare_chain_reset()
+    }
+
     fn supports_media_renderer(&self) -> bool {
         self.inner.supports_media_renderer()
     }

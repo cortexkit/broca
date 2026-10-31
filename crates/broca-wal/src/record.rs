@@ -942,6 +942,9 @@ pub enum WalRecord {
         transport: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         websocket_request: Option<Box<broca_protocol::provider::WebSocketRequestDigest>>,
+        /// Informational request-prefix evidence. Unknown members remain safe to ignore.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_evidence: Option<Box<serde_json::Value>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         websocket_close_code: Option<u16>,
         /// The provider's own report of what it changed in the request, verbatim (Anthropic's
@@ -1969,6 +1972,7 @@ impl WalRecord {
             sent_at_ms,
             transport,
             websocket_request,
+            cache_evidence,
             websocket_close_code,
             input_transformations,
             input_transformations_unmeasured,
@@ -1996,6 +2000,7 @@ impl WalRecord {
             sent_at_ms,
             transport,
             websocket_request,
+            cache_evidence,
             websocket_close_code,
             input_transformations,
             input_transformations_unmeasured,
@@ -2179,6 +2184,12 @@ impl WalRecord {
             })
         }) {
             with_feature(base, crate::framing::TOOL_SCHEMA_PINS_FEATURE)
+        } else {
+            base
+        };
+        let base = if matches!(self, Self::Queued { request, .. } if request.service_tier_level.is_some())
+        {
+            with_feature(base, crate::framing::SERVICE_TIER_QUEUE_FEATURE)
         } else {
             base
         };
@@ -5179,6 +5190,7 @@ mod schema_tests {
                 delivery: None,
                 submission_id: SubmissionId("sub2".into()),
                 request: Box::new(SubmissionRequest {
+                    service_tier_level: None,
                     staged_uploads: None,
                     content: Vec::new(),
                     directives: None,

@@ -62,17 +62,41 @@ impl WireFamily for OpenAiResponses {
         finish_platform_body(frozen, build_request_body(frozen, opts))
     }
 
+    fn shape_with_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
+        finish_platform_body(
+            frozen,
+            build_prepared_request_body_with_media_and_provenance(frozen, opts, None, provenance)
+                .body,
+        )
+    }
+
     fn shape_with_media(
         &self,
         frozen: &FrozenRenderConfig,
         opts: &CallOptions,
         payloads: &[crate::media_render::InlineMedia<'_>],
     ) -> Value {
+        self.shape_with_media_and_provenance(frozen, opts, payloads, None)
+    }
+
+    fn shape_with_media_and_provenance(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[crate::media_render::InlineMedia<'_>],
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    ) -> Value {
         let media = crate::media_render::MediaRender { frozen, payloads };
-        let body = build_prepared_request_body_with_media(
+        let body = build_prepared_request_body_with_media_and_provenance(
             frozen,
             opts,
             frozen.media.as_ref().map(|_| &media),
+            provenance,
         )
         .body;
         finish_platform_body(frozen, body)
@@ -165,6 +189,15 @@ pub(crate) fn build_prepared_request_body_with_media<'a>(
     opts: &'a CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> PreparedRequestBody<'a> {
+    build_prepared_request_body_with_media_and_provenance(frozen, opts, media, None)
+}
+
+pub(crate) fn build_prepared_request_body_with_media_and_provenance<'a>(
+    frozen: &FrozenRenderConfig,
+    opts: &'a CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+) -> PreparedRequestBody<'a> {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -175,7 +208,13 @@ pub(crate) fn build_prepared_request_body_with_media<'a>(
             Some((anchor, updates)) => (Some(anchor), updates),
             None => (None, Vec::new()),
         };
-    let body = render_prepared_body(frozen, prepared.as_ref(), &updates, media);
+    let body = render_prepared_body_with_provenance(
+        frozen,
+        prepared.as_ref(),
+        &updates,
+        media,
+        provenance,
+    );
     PreparedRequestBody {
         body,
         prepared,
@@ -183,16 +222,17 @@ pub(crate) fn build_prepared_request_body_with_media<'a>(
     }
 }
 
-fn render_prepared_body(
+fn render_prepared_body_with_provenance(
     frozen: &FrozenRenderConfig,
     prepared: &CallOptions,
     updates: &[super::openai_responses_chatgpt::EffortUpdate],
     media: Option<&crate::media_render::MediaRender<'_>>,
+    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
 ) -> Value {
     let view = crate::families::compaction_view(frozen.family_id, prepared);
     let opts = view.as_ref();
     let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
-    let input = convert_input_items(
+    let input = convert_input_items_with_provenance(
         &opts.prompt,
         frozen.system_prompt.clone(),
         &name_map,
@@ -204,6 +244,7 @@ fn render_prepared_body(
             stateless: frozen.static_options.get("store") == Some(&Value::Bool(false)),
         },
         media,
+        provenance,
     );
 
     let mut body = json!({
@@ -358,13 +399,14 @@ pub(crate) fn completed_output_as_input(
     items
 }
 
-fn convert_input_items(
+fn convert_input_items_with_provenance(
     prompt: &[Message],
     system_policy: SystemPromptPolicy,
     name_map: &crate::tool_name_alias::ToolNameMap,
     updates: &[super::openai_responses_chatgpt::EffortUpdate],
     replay: &ReplayPolicy<'_>,
     media: Option<&crate::media_render::MediaRender<'_>>,
+    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
 ) -> Vec<Value> {
     let skip_system = matches!(system_policy, SystemPromptPolicy::InstructionsField);
     let mut out = Vec::new();
@@ -381,24 +423,36 @@ fn convert_input_items(
                 .is_some_and(|update| update.before <= ordinal as usize)
             {
                 let update = updates.next().expect("peeked update");
+                let start = provenance.as_ref().map(|_| out.len());
                 append_effort_update(
                     &mut out,
                     update,
                     message.role == Role::User && ordinal as usize == update.before,
                 );
+                if let Some((sink, start)) = provenance.as_deref_mut().zip(start) {
+                    sink.record_messages(start, out.len(), None);
+                }
             }
         }
         if skip_system && message.role == Role::System {
             continue;
         }
+        let start = provenance.as_ref().map(|_| out.len());
         match message.role {
             Role::System | Role::User => out.push(convert_easy_message(message, media)),
             Role::Assistant => out.extend(convert_assistant_items(message, name_map, replay)),
             Role::Tool => out.extend(convert_tool_output_items(message, media)),
         }
+        if let Some((sink, start)) = provenance.as_deref_mut().zip(start) {
+            sink.record_messages(start, out.len(), message.ordinal);
+        }
     }
     for update in updates {
+        let start = provenance.as_ref().map(|_| out.len());
         append_effort_update(&mut out, update, false);
+        if let Some((sink, start)) = provenance.as_deref_mut().zip(start) {
+            sink.record_messages(start, out.len(), None);
+        }
     }
     out
 }

@@ -80,16 +80,39 @@ impl Witness {
             .collect()
     }
     pub(crate) async fn snapshot(&self) -> serde_json::Value {
+        self.snapshot_matching(|_| true).await
+    }
+
+    async fn snapshot_matching(
+        &self,
+        matches: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if let Some(record) = self.records().first() {
-                    return record.clone();
+                if let Some(record) = self.records().into_iter().find(&matches) {
+                    return record;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("watchdog snapshot deadline")
+    }
+
+    /// Select a stale gated reader with a healthy heartbeat, not an earlier
+    /// starvation episode or a sample where heartbeat legitimately has priority.
+    /// Do not filter by kind: the caller must still detect a classification bug.
+    pub(crate) async fn reader_phase_snapshot(&self, phase: Phase) -> serde_json::Value {
+        self.snapshot_matching(|record| {
+            record["reader"]["phase_code"].as_u64() == Some(phase as u64)
+                && record["reader"]["age_ms"]
+                    .as_u64()
+                    .is_some_and(|age| age > STALE_MS)
+                && record["heartbeat"]["age_ms"]
+                    .as_u64()
+                    .is_some_and(|age| age <= STALE_MS)
+        })
+        .await
     }
 }
 impl Drop for Witness {
@@ -102,6 +125,53 @@ impl Drop for Witness {
         }
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+fn append_snapshots(witness: &Witness, records: &[serde_json::Value]) {
+    let mut file = OpenOptions::new().append(true).open(&witness.path).unwrap();
+    for record in records {
+        writeln!(file, "{record}").unwrap();
+    }
+}
+
+fn phase_snapshot(phase: Phase, heartbeat_age: u64, kind: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "heartbeat": {"age_ms": heartbeat_age},
+        "reader": {"phase_code": phase as u8, "age_ms": STALE_MS + 1},
+    })
+}
+
+#[tokio::test]
+async fn reader_phase_snapshot_waits_for_phase_with_fresh_heartbeat() {
+    let witness = Witness::new(State::new());
+    let expected = phase_snapshot(Phase::Control, 0, "reader_phase");
+    append_snapshots(
+        &witness,
+        &[
+            phase_snapshot(Phase::AwaitFrame, STALE_MS + 1, "heartbeat"),
+            phase_snapshot(Phase::Control, STALE_MS + 1, "heartbeat"),
+            phase_snapshot(Phase::EgressSend, 0, "reader_phase"),
+            expected.clone(),
+        ],
+    );
+    assert_eq!(
+        witness.reader_phase_snapshot(Phase::Control).await,
+        expected
+    );
+}
+
+#[tokio::test]
+async fn reader_phase_snapshot_does_not_filter_the_reported_kind() {
+    let witness = Witness::new(State::new());
+    // A classifier bug must reach the caller's kind assertion, not disappear
+    // because the snapshot selector searched for the expected classification.
+    let incorrect = phase_snapshot(Phase::Control, 0, "heartbeat");
+    append_snapshots(&witness, std::slice::from_ref(&incorrect));
+    assert_eq!(
+        witness.reader_phase_snapshot(Phase::Control).await,
+        incorrect
+    );
 }
 
 #[tokio::test]

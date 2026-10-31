@@ -171,6 +171,9 @@ pub const TURN_DIRECTIVES_FEATURE: &str = "turn-directives/v1";
 /// send's `client_message_id` (llm-runner 0.5.1 §9.11). Part of the send's identity: a build
 /// without it would answer a re-send under the same `send_id` with another id as a retry.
 pub const CLIENT_MESSAGE_ID_FEATURE: &str = "client-message-id/v1";
+/// An abstract tier on a durable queued request must survive draining and restart. A reader
+/// that ignores the member could silently run the queued work at a different provider tier.
+pub const SERVICE_TIER_QUEUE_FEATURE: &str = "service-tier-queue/v1";
 /// A rewrite ride's provider-set wait (compaction-provider 0.5.1 §4, §8): a Setup
 /// `CompactionMessage` record carrying the provider's `ride_wait_ms`, frozen with the session (a
 /// build without it would give the session's rides its own short deadline), and the
@@ -246,6 +249,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     RUNNER_TAGS_V2_FEATURE,
     RUN_CANCEL_AT_FEATURE,
     SCOPE_FEATURE,
+    SERVICE_TIER_QUEUE_FEATURE,
     SESSION_CHANGE_FEATURE,
     SESSION_CLASS_FEATURE,
     STEER_QUEUE_FEATURE,
@@ -1080,6 +1084,10 @@ mod fallback_tests;
 mod reader_release_tests;
 
 #[cfg(test)]
+#[path = "framing/service_tier_queue_tests.rs"]
+mod service_tier_queue_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn recovery_completion_requires_the_recovery_reader_feature() {
@@ -1619,6 +1627,7 @@ mod tests {
                 RUNNER_TAGS_V2_FEATURE,
                 RUN_CANCEL_AT_FEATURE,
                 SCOPE_FEATURE,
+                SERVICE_TIER_QUEUE_FEATURE,
                 SESSION_CHANGE_FEATURE,
                 SESSION_CLASS_FEATURE,
                 STEER_QUEUE_FEATURE,

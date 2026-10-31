@@ -317,6 +317,35 @@ enum UpgradeFailure {
 
 type HttpsPolicy = Arc<dyn Fn() -> bool + Send + Sync>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissingReceipt {
+    Age,
+    Idle,
+    RunStart,
+    Capacity,
+    ReceiptBytes,
+    ReceiptTooLarge,
+    PreviousFailed,
+    ConnectionLimit,
+    AuthChanged,
+}
+
+impl MissingReceipt {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Age => "new_connection_age",
+            Self::Idle => "new_connection_idle",
+            Self::RunStart => "new_connection_run_start",
+            Self::Capacity => "new_connection_run_start_capacity",
+            Self::ReceiptBytes => "new_connection_run_start_receipt_bytes",
+            Self::ReceiptTooLarge => "new_connection_run_start_receipt_too_large",
+            Self::PreviousFailed => "previous_attempt_failed",
+            Self::ConnectionLimit => "connection_limit",
+            Self::AuthChanged => "account_or_credential_change",
+        }
+    }
+}
+
 pub(super) struct Session {
     state: Mutex<State>,
     policy: RwLock<HttpsPolicy>,
@@ -325,6 +354,7 @@ pub(super) struct Session {
 #[derive(Default)]
 struct State {
     socket: Option<Arc<Socket>>,
+    missing_receipt: Option<MissingReceipt>,
     failures: usize,
     turn_state: Option<String>,
     force_https: bool,
@@ -374,16 +404,24 @@ impl Session {
         }
         *state = State {
             generation: state.generation,
+            missing_receipt: state.missing_receipt,
             ..State::default()
         };
     }
 
     fn fail(&self) {
         let mut state = self.state.lock().unwrap();
-        if let Some(socket) = state.socket.take() {
+        let socket = state.socket.take();
+        let lost_socket = socket.is_some();
+        if let Some(socket) = socket {
             socket.shutdown.cancel();
         }
         state.failures += 1;
+        // An upgrade failure can fall back to a successful HTTPS attempt. Without a socket
+        // it did not discard a receipt and cannot prove that the model attempt failed.
+        if lost_socket && state.missing_receipt != Some(MissingReceipt::ConnectionLimit) {
+            state.missing_receipt = Some(MissingReceipt::PreviousFailed);
+        }
     }
 
     pub(super) fn switch_to_https(&self) {
@@ -449,13 +487,31 @@ impl Session {
         .expect("socket pump observes the peer close");
     }
 
-    fn forced_https(&self) -> bool {
+    pub(super) fn forced_https(&self) -> bool {
         let policy = Arc::clone(&self.policy.read().unwrap());
         // Evaluate on every attempt so config edits still take effect immediately. The
         // callback may read disk; it must not hold up socket teardown or failure accounting.
         let configured_https = policy();
         let state = self.state.lock().unwrap();
         configured_https || state.force_https || state.failures >= FAILURE_LIMIT
+    }
+
+    /// Retire an already-expired chain at the boundary, not after a view has rendered.
+    /// The missing-receipt cause is consumed by the ordinary send path exactly once.
+    pub(super) fn prepare_chain_reset(&self) -> bool {
+        let now = self.now();
+        let mut state = self.state.lock().unwrap();
+        if state
+            .socket
+            .as_ref()
+            .and_then(|socket| age_retirement(socket, now))
+            .is_some()
+        {
+            let socket = state.socket.take().expect("expired socket");
+            socket.shutdown.cancel();
+            state.missing_receipt = Some(MissingReceipt::Age);
+        }
+        state.socket.is_none() && state.missing_receipt.is_some()
     }
 
     async fn connection(
@@ -476,9 +532,17 @@ impl Session {
                 if age >= MAX_SOCKET_AGE {
                     tracing::info!(target: "provider", transport = "websocket", socket_generation = socket.generation, socket_age_ms = age.as_millis() as u64, "Retiring Responses websocket before its connection lifetime limit");
                 }
-                socket.shutdown.cancel();
+                let open =
+                    !socket.closed.load(Ordering::Acquire) && !socket.shutdown.is_cancelled();
                 let auth_changed = !connection_identity_matches(socket, request);
+                let receipt_reason = if open && credential_identity_changed(socket, request) {
+                    Some(MissingReceipt::AuthChanged)
+                } else {
+                    age_retirement(socket, now)
+                };
+                socket.shutdown.cancel();
                 state.socket = None;
+                state.missing_receipt = receipt_reason.or(state.missing_receipt);
                 if auth_changed {
                     state.turn_state = None;
                 }
@@ -560,6 +624,13 @@ impl Session {
     }
 }
 
+fn age_retirement(socket: &Socket, now: Instant) -> Option<MissingReceipt> {
+    (!socket.closed.load(Ordering::Acquire)
+        && !socket.shutdown.is_cancelled()
+        && now.saturating_duration_since(socket.established_at) >= MAX_SOCKET_AGE)
+        .then_some(MissingReceipt::Age)
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         self.close();
@@ -621,6 +692,24 @@ fn connection_identity_matches(socket: &Socket, request: &PreparedHttpRequest) -
         )
 }
 
+fn credential_identity_changed(socket: &Socket, request: &PreparedHttpRequest) -> bool {
+    fn auth<'a>(
+        headers: &'a [(String, String)],
+        name: &'static str,
+    ) -> impl Iterator<Item = &'a str> {
+        headers
+            .iter()
+            .filter(move |(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+    socket.auth_revision != request.auth_revision
+        || socket.credential_id != request.credential_id
+        || socket.account_ref != request.account_ref
+        || ["authorization", "chatgpt-account-id"]
+            .into_iter()
+            .any(|name| !auth(&socket.headers, name).eq(auth(&request.headers, name)))
+}
+
 fn stable_turn_metadata_matches(saved: &str, current: &str) -> bool {
     let stable = |text: &str| {
         let mut value: Value = serde_json::from_str(text).ok()?;
@@ -651,6 +740,7 @@ impl Drop for AttemptActivity {
 }
 
 struct ContinuationAttempt<'a> {
+    session: &'a Session,
     socket: &'a Socket,
     enabled: bool,
     keep_socket: bool,
@@ -658,6 +748,10 @@ struct ContinuationAttempt<'a> {
 impl Drop for ContinuationAttempt<'_> {
     fn drop(&mut self) {
         if self.enabled && !self.keep_socket {
+            let mut state = self.session.state.lock().unwrap();
+            if state.missing_receipt != Some(MissingReceipt::ConnectionLimit) {
+                state.missing_receipt = Some(MissingReceipt::PreviousFailed);
+            }
             // A dropped consumer or failed stream can leave unread response records.
             // Retire the socket so any remaining records cannot enter the next attempt.
             *self.socket.continuation.lock().unwrap() = None;
@@ -1002,6 +1096,7 @@ async fn drive_socket(
         }
     };
     let mut retirement = ContinuationAttempt {
+        session,
         socket: &socket,
         enabled: request.codex_wire,
         keep_socket: false,
@@ -1043,7 +1138,13 @@ async fn drive_socket(
         logical.clone()
     };
     let mut continuation = false;
-    let mut full_input_reason = "no_completed_response";
+    let mut full_input_reason = session
+        .state
+        .lock()
+        .unwrap()
+        .missing_receipt
+        .take()
+        .map_or("no_completed_response", MissingReceipt::as_str);
     if request.codex_wire {
         // A completion receipt is one-shot, including when compatibility fails. Never
         // fall back to an older successful response after starting another stream.
@@ -1153,6 +1254,7 @@ async fn drive_socket(
             AttemptOutcome::ChunkError,
         ));
     }
+    trace.cache_work.start(request);
     let completed_id = Mutex::new(None);
     let mut recv = socket.recv.lock().await;
     let stream = futures::stream::unfold(&mut *recv, |recv| async {
@@ -1168,11 +1270,17 @@ async fn drive_socket(
                     && value.pointer("/error/code").and_then(Value::as_str)
                         == Some("websocket_connection_limit_reached")
                 {
+                    session.state.lock().unwrap().missing_receipt =
+                        Some(MissingReceipt::ConnectionLimit);
                     client.chatgpt_connections.retire_idle_credential(request);
                 }
                 if value["type"] == "response.completed" {
                     *completed_id.lock().unwrap() =
                         value["response"]["id"].as_str().map(str::to_owned);
+                }
+                if value["type"] == "response.incomplete" {
+                    session.state.lock().unwrap().missing_receipt =
+                        Some(MissingReceipt::PreviousFailed);
                 }
             }
         }
@@ -2345,5 +2453,54 @@ async fn codex_completed_write_is_counted_when_cancelled_before_acknowledgement(
             .unwrap()
             .physical_send_count,
         1
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn credential_identity_ignores_header_name_case_and_order() {
+    let headers: Vec<(String, String)> = vec![
+        ("authorization".into(), "Bearer test-token".into()),
+        ("chatgpt-account-id".into(), "test-account".into()),
+    ];
+    let socket = Socket {
+        auth_revision: 0,
+        credential_id: None,
+        account_ref: None,
+        url: "ws://synthetic.invalid".into(),
+        headers: headers.clone(),
+        continuation: Mutex::new(None),
+        send: mpsc::channel(1).0,
+        recv: tokio::sync::Mutex::new(mpsc::channel(1).1),
+        shutdown: CancellationToken::new(),
+        closed: Arc::new(AtomicBool::new(false)),
+        close_code: Arc::new(AtomicU16::new(0)),
+        frames: Arc::default(),
+        generation: 1,
+        established_at: Instant::now(),
+        last_completed_at: Mutex::new(None),
+        attempt_active: tokio::sync::watch::channel(false).0,
+    };
+    let mut request = PreparedHttpRequest::from(crate::wire::HttpRequest {
+        method: crate::wire::HttpMethod::Post,
+        url: socket.url.clone(),
+        headers,
+        body: Vec::new(),
+    });
+    request.codex_wire = true;
+    request.headers.reverse();
+    request.headers[1].0 = "Authorization".into();
+    assert!(
+        !connection_identity_matches(&socket, &request),
+        "header formatting still fences socket reuse"
+    );
+    assert!(
+        !credential_identity_changed(&socket, &request),
+        "header formatting cannot prove an account or credential change"
+    );
+    request.headers[1].1 = "Bearer changed-token".into();
+    assert!(
+        credential_identity_changed(&socket, &request),
+        "a changed authentication value is attributable"
     );
 }

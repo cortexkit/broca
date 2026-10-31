@@ -28,13 +28,36 @@ impl broca_fetch_plan::PlanAdmitter for Admitter {
         let text = raw["system_text_items"][0]["params"]["text"]
             .as_str()
             .unwrap_or("");
+        let mut composition = raw["composition"].clone();
+        composition["providers"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|provider| {
+                !raw["tool_items"].as_array().unwrap().iter().any(|item| {
+                    item["provider"] == provider["provider"] && item["optional"] == true
+                })
+            });
         Ok(broca_fetch_plan::Admitted {
             manifest: broca_wal::PlanManifest {
                 rich_ui: None,
                 plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
                 plan_identity: plan.identity.clone(),
-                composition_digest: plan.composition_digest.clone(),
-                fetches: vec![],
+                composition_digest: cortexkit_role_tool_provider::catalog::composition_digest(
+                    &composition,
+                )
+                .unwrap(),
+                fetches: raw["tool_items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| item["optional"] == true)
+                    .map(|item| broca_wal::ProviderFetch {
+                        provider: item["provider"].as_str().unwrap().into(),
+                        outcome: broca_wal::FetchOutcome::Absent {
+                            reason: "timeout".into(),
+                        },
+                    })
+                    .collect(),
                 tools: Arc::new(tools),
                 system_text: text.into(),
                 system_digest: text.into(),
@@ -54,6 +77,49 @@ fn plan(names: &[&str], text: &str) -> Value {
     json!({"tool_items":if names.is_empty() {vec![]} else {vec![json!({"provider":"fixture","params":{}})]},
         "system_text_items":[{"provider":"fixture","params":{"text":text}}], "step_transform_items":[],
         "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),"composition":composition})
+}
+
+fn plan_with_absent_optional(text: &str) -> Value {
+    let mut next = plan(&[], text);
+    next["tool_items"] = json!([{"provider":"optional","params":{},"optional":true}]);
+    next["composition"]["providers"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"provider":"optional","tools":[]}));
+    next["composition_digest"] =
+        cortexkit_role_tool_provider::catalog::composition_digest(&next["composition"])
+            .unwrap()
+            .into();
+    next
+}
+
+fn assert_effective_manifest(rig: &Rig, baseline: &Value) {
+    let manifest = rig
+        .records()
+        .into_iter()
+        .rev()
+        .find_map(|record| {
+            if let broca_wal::WalRecord::RunStarted { manifest, .. } = record {
+                manifest
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(
+        baseline["effective"]["composition_digest"],
+        manifest.composition_digest
+    );
+    assert_eq!(
+        baseline["effective"]["absent_items"],
+        json!([
+            {"provider":"optional","kind":"tool","reason":"timeout"}
+        ])
+    );
+    assert_eq!(
+        baseline["effective"]["absent_items"],
+        serde_json::to_value(broca_fetch_plan::baseline_facts(&manifest).absent_items).unwrap()
+    );
 }
 
 async fn call(rig: &mut Rig, method: &str, params: Value) -> Frame {
@@ -123,7 +189,8 @@ async fn refresh_applies_once_and_keeps_later_episodes_on_the_effective_manifest
     capture("role.describe.session_change.json", &describe);
     let initial = call(&mut rig, "session.baseline", json!({})).await;
     capture("session.baseline.initial.json", &initial);
-    let next = plan(&[], "refreshed system");
+    assert!(result(&initial)["baseline"].get("effective").is_none());
+    let next = plan_with_absent_optional("refreshed system");
     let accepted = refresh(&mut rig, &next, "immediately", 1).await;
     assert_eq!(
         result(&accepted),
@@ -153,6 +220,18 @@ async fn refresh_applies_once_and_keeps_later_episodes_on_the_effective_manifest
     assert_eq!(result(&applied)["baseline"]["applied_generation"], 1);
     assert!(result(&applied)["baseline"].get("pending").is_none());
     assert_eq!(result(&applied)["baseline"]["tool_names"], json!(["work"]));
+    let applied_baseline = &result(&applied)["baseline"];
+    assert_eq!(applied_baseline["effective"]["applied_by"], "append");
+    assert_effective_manifest(&rig, applied_baseline);
+    assert_eq!(
+        applied_baseline["composition_digest"],
+        result(&initial)["baseline"]["composition_digest"]
+    );
+    assert_ne!(
+        applied_baseline["composition_digest"],
+        applied_baseline["effective"]["composition_digest"]
+    );
+    assert!(applied_baseline.get("absent_items").is_none());
     let before = rig.wal_bytes();
     assert_eq!(
         refresh(&mut rig, &next, "immediately", 1).await.body,
@@ -166,7 +245,7 @@ async fn refresh_applies_once_and_keeps_later_episodes_on_the_effective_manifest
 #[tokio::test]
 async fn refresh_waits_for_real_rebuild_and_flush_survives_restart() {
     let (mut rig, _, initial) = ready("change-flush-recovery").await;
-    let next = plan(&[], "after flush");
+    let next = plan_with_absent_optional("after flush");
     let accepted = refresh(&mut rig, &next, "on_prefix_rebuild", 3).await;
     assert_eq!(result(&accepted)["applies_from_next_run"], false);
     rig.script.push(&[Step::Text("still old")]);
@@ -222,6 +301,15 @@ async fn refresh_waits_for_real_rebuild_and_flush_survives_restart() {
     let applied = baseline(&mut rig).await;
     assert_eq!(applied["effective"]["generation"], 3);
     assert_eq!(applied["effective"]["applied_by"], "fold");
+    assert_effective_manifest(&rig, &applied);
+    assert_eq!(
+        applied["composition_digest"],
+        applied["effective"]["composition_digest"]
+    );
+    assert_eq!(
+        applied["absent_items"],
+        applied["effective"]["absent_items"]
+    );
     assert_eq!(applied["tool_names"], json!([]));
     rig.finish().await;
 }

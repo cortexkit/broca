@@ -93,6 +93,8 @@ pub struct EffectiveState {
     /// `append` when the next run applied it with the prefix intact.
     pub applied_by: String,
     pub manifest_digest: String,
+    pub composition_digest: Option<String>,
+    pub absent_items: Vec<cortexkit_role_llm_runner::baseline::AbsentItem>,
 }
 
 /// The session-change facts a WAL folds, for the baseline and for repeat classification.
@@ -241,6 +243,7 @@ impl SessionChangeState {
                             };
                             state.applied_generation = pending.generation;
                             state.applied.insert(pending.generation, applied_by.into());
+                            let facts = crate::baseline_facts(&pending.manifest);
                             state.effective = Some(EffectiveState {
                                 generation: pending.generation,
                                 applied_by: applied_by.into(),
@@ -249,6 +252,9 @@ impl SessionChangeState {
                                         .expect("manifest JSON"),
                                 )
                                 .expect("canonical manifest"),
+                                composition_digest: (!facts.composition_digest.is_empty())
+                                    .then_some(facts.composition_digest),
+                                absent_items: facts.absent_items,
                             });
                             if applied_by == "fold" {
                                 state.prefix_manifest = Some(pending.manifest.clone());
@@ -409,6 +415,96 @@ mod tests {
         let effective = state.effective.unwrap();
         assert_eq!(effective.generation, 1);
         assert_eq!(effective.applied_by, "append");
+    }
+
+    #[test]
+    fn applied_baseline_facts_follow_the_manifest_for_append_and_fold() {
+        let mut manifest = test_manifest("plan-b", "applied-composition");
+        manifest.plan = broca_wal::OpaqueJson::from_json_text(
+            r#"{"tool_items":[{"provider":"optional","optional":true}],"system_text_items":[{"provider":"optional","optional":true}]}"#,
+        ).unwrap();
+        manifest.fetches.push(broca_wal::ProviderFetch {
+            provider: "optional".into(),
+            outcome: broca_wal::FetchOutcome::Absent {
+                reason: "refused:unavailable".into(),
+            },
+        });
+        for rebuild in [false, true] {
+            let mut accept = accepted(1, "immediately", "plan-b");
+            if let WalRecord::SessionRefreshAccepted {
+                manifest: frozen, ..
+            } = &mut accept
+            {
+                **frozen = manifest.clone();
+            }
+            let mut applying_run = run_started(Some("plan-b"));
+            if let WalRecord::RunStarted {
+                manifest: frozen, ..
+            } = &mut applying_run
+            {
+                *frozen = Some(Box::new(manifest.clone()));
+            }
+            let mut records = vec![framed(run_started(Some("plan-a"))), framed(accept)];
+            if rebuild {
+                records.push(framed(WalRecord::SessionPrefixFlushed {
+                    send_id: "flush".into(),
+                    pending_generation: Some(1),
+                }));
+            }
+            records.push(framed(applying_run));
+            let state = SessionChangeState::fold(&records);
+            let effective = state.effective.as_ref().unwrap();
+            assert_eq!(
+                effective.applied_by,
+                if rebuild { "fold" } else { "append" }
+            );
+            assert_eq!(
+                effective.composition_digest.as_deref(),
+                Some("applied-composition")
+            );
+            assert_eq!(
+                serde_json::to_value(&effective.absent_items).unwrap(),
+                serde_json::json!([
+                    {"provider":"optional","kind":"tool","reason":"refused","provider_code":"unavailable"},
+                    {"provider":"optional","kind":"system_text","reason":"refused","provider_code":"unavailable"}
+                ])
+            );
+            assert_eq!(
+                effective.absent_items,
+                crate::baseline_facts(&manifest).absent_items
+            );
+            assert_eq!(
+                effective.manifest_digest,
+                crate::plan_identity(&serde_json::to_value(&manifest).unwrap()).unwrap()
+            );
+            assert_eq!(
+                state.prefix_manifest.as_ref().unwrap().composition_digest,
+                if rebuild { "applied-composition" } else { "c" }
+            );
+
+            // Later runs must not replace the facts of the last applied refresh.
+            records.push(framed(run_started(None)));
+            assert_eq!(
+                SessionChangeState::fold(&records).effective,
+                state.effective
+            );
+        }
+    }
+
+    #[test]
+    fn applied_manifest_without_composition_has_no_effective_digest() {
+        let mut accept = accepted(1, "immediately", "plan-b");
+        if let WalRecord::SessionRefreshAccepted { manifest, .. } = &mut accept {
+            manifest.composition_digest.clear();
+        }
+        let mut run = run_started(Some("plan-b"));
+        if let WalRecord::RunStarted { manifest, .. } = &mut run {
+            manifest.as_mut().unwrap().composition_digest.clear();
+        }
+        let state = SessionChangeState::fold(&[framed(accept), framed(run)]);
+        let effective = state.effective.unwrap();
+        assert!(effective.composition_digest.is_none());
+        assert!(effective.absent_items.is_empty());
     }
 
     #[test]

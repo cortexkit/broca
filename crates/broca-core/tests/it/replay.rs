@@ -1300,6 +1300,7 @@ fn attempt_record(step_id: StepId, attempt: u32, outcome: AttemptOutcome) -> Wal
         sent_at_ms: None,
         transport: None,
         websocket_request: None,
+        cache_evidence: None,
         websocket_close_code: None,
         input_transformations: None,
         input_transformations_unmeasured: false,
@@ -1320,7 +1321,7 @@ fn frame_and_read(path: &std::path::Path, records: &[WalRecord]) -> Vec<broca_wa
 
 /// Provider attempt records are known to this build but carry no session semantics: a real
 /// run's WAL with them replays to EXACTLY the session the same WAL has without them -- the
-/// same replay state, admission checkpoint and control units, and a byte-identical rendered
+/// same replay state, admission checkpoint session facts and control units, and a byte-identical rendered
 /// prompt. Checked where the live loop writes them (before each `ModelStepFinished`, failed
 /// attempts included) and with one inserted at every interior position, including as the last
 /// record of a crash-cut WAL.
@@ -1410,14 +1411,25 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
         );
         checkpoint.at_seq = plain_checkpoint.at_seq;
         // The checkpoint carries the reservation fold replay builds from the same log, so a
-        // resume from it clamps as a full replay would. That fold is the one part allowed to
-        // differ from the plain log's checkpoint.
+        // resume from it clamps as a full replay would. Its attempt-presence summary also
+        // records the informational attempts; neither fact changes the replayed prompt.
         assert_eq!(
             format!("{:?}", checkpoint.output_reservation),
             format!("{:?}", Some(&reservation)),
             "{label}: the checkpoint's reservation fold is replay's"
         );
         checkpoint.output_reservation = plain_checkpoint.output_reservation.clone();
+        assert_eq!(
+            checkpoint.has_model_attempt,
+            Some(true),
+            "{label}: inserted attempts are present"
+        );
+        assert_eq!(
+            plain_checkpoint.has_model_attempt,
+            Some(false),
+            "{label}: plain log has no attempts"
+        );
+        checkpoint.has_model_attempt = plain_checkpoint.has_model_attempt;
         assert_eq!(
             format!("{checkpoint:?}"),
             format!("{plain_checkpoint:?}"),

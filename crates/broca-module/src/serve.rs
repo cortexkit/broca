@@ -2490,9 +2490,7 @@ impl ServeHandler for crate::LineageRegistry {
                 Some(broca_protocol::ErrorClass::Permanent),
             )
         })?;
-        if broca_protocol::attachments_enabled()
-            && req.media == cortexkit_role_llm_runner::read::MediaMode::Inline
-        {
+        if req.media == cortexkit_role_llm_runner::read::MediaMode::Inline {
             page.render_inline_media();
         }
         let subject = model_group_reply_too_large_subject(&page);
@@ -3245,11 +3243,7 @@ impl ServeHandler for crate::LineageRegistry {
             .await?;
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Blocks {
             for entry in &mut response.messages {
-                if broca_protocol::attachments_enabled() {
-                    entry.show_media_blocks_with_identity();
-                } else {
-                    entry.show_media_blocks();
-                }
+                entry.show_media_blocks_with_identity();
             }
         }
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
@@ -3330,23 +3324,19 @@ impl ServeHandler for crate::LineageRegistry {
                 .find_map(|framed| broca_core::record_time_ms(&framed.record))
                 .unwrap_or(0),
         };
-        let media_facts = if broca_protocol::attachments_enabled() {
-            Some(
-                self.media_facts_for_head(
-                    session,
-                    crate::registry::media_head::Request {
-                        lineage: lineage_id,
-                        at_seq,
-                        run_id: page.lineage_state.last_run_id.as_ref(),
-                        state: page.lineage_state.state.as_str(),
-                        model: head_facts.model.as_ref(),
-                    },
-                )
-                .await?,
+        let media_facts = Some(
+            self.media_facts_for_head(
+                session,
+                crate::registry::media_head::Request {
+                    lineage: lineage_id,
+                    at_seq,
+                    run_id: page.lineage_state.last_run_id.as_ref(),
+                    state: page.lineage_state.state.as_str(),
+                    model: head_facts.model.as_ref(),
+                },
             )
-        } else {
-            None
-        };
+            .await?,
+        );
         let interrupted_reason = if page.lineage_state.state.as_str() == "interrupted" {
             if let Some(facts) = &media_facts {
                 facts.interrupt_reason.clone()
@@ -3877,13 +3867,21 @@ impl ServeHandler for crate::LineageRegistry {
                 policy: pending.policy.clone(),
             }
         });
-        baseline.effective = change.effective.as_ref().map(|effective| {
-            cortexkit_role_llm_runner::baseline::EffectiveBaseline {
-                generation: effective.generation,
-                applied_by: effective.applied_by.clone(),
-                manifest_digest: effective.manifest_digest.clone(),
-            }
-        });
+        baseline.effective =
+            change
+                .effective
+                .as_ref()
+                .map(|effective| broca_wire::EffectiveBaselineWire {
+                    generation: effective.generation,
+                    applied_by: effective.applied_by.clone(),
+                    manifest_digest: effective.manifest_digest.clone(),
+                    composition_digest: effective.composition_digest.clone(),
+                    absent_items: effective
+                        .absent_items
+                        .iter()
+                        .map(|item| serde_json::to_value(item).expect("a baseline item is JSON"))
+                        .collect(),
+                });
         baseline.rungs = Some(cortexkit_role_llm_runner::baseline::Rungs {
             tools: broca_fetch_plan::session_change::TOOLS_RUNGS
                 .iter()
@@ -4963,7 +4961,22 @@ mod raw_database_composition_tests {
         );
         let raw =
             crate::registry::LineageRegistry::new_with_reader(Arc::new(NoActor), wal_store, None)
-                .with_raw_pages_for_test(bundle.clone());
+                .with_raw_pages_for_test(bundle.clone())
+                .with_episode_source(Arc::new(crate::registry::EpisodeReadSource::new(
+                    bundle.db.clone(),
+                    Arc::new({
+                        let bundle = bundle.clone();
+                        move |key, _| {
+                            bundle
+                                .publications
+                                .lock()
+                                .unwrap()
+                                .get(key)
+                                .cloned()
+                                .ok_or_else(|| "episode publication missing".into())
+                        }
+                    }),
+                )));
         let counter = broca_wal::access_counter::WalAccessCounter::default();
         let raw_head = counter
             .operation("composed raw head")
@@ -5057,6 +5070,23 @@ mod raw_database_composition_tests {
                 serde_json::to_vec(&legacy.read(request).await.unwrap()).unwrap()
             );
         }
+        for from in [None, Some(0), Some(2), Some(4)] {
+            let request = SessionReadRequest::new(key.clone(), from, Some(2));
+            let actual = counter
+                .operation(format!("composed model page {from:?}"))
+                .run_future(raw.read_model(request.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&legacy.read_model(request).await.unwrap()).unwrap()
+            );
+        }
+        let mut invalid = SessionReadRequest::new(key.clone(), None, Some(2));
+        invalid.after_mid = Some("m0".into());
+        assert!(
+            matches!(raw.read_model(invalid).await,Err(ServeError::InvalidParams{field,..}) if field=="view")
+        );
         assert!(!root.join("run-index.db").exists());
         for op in counter.snapshot() {
             assert!(

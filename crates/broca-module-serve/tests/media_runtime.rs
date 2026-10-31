@@ -1,4 +1,4 @@
-//! Shipping-feature serve coverage. Each boot decision lives in its own process.
+//! Shipping-feature serve coverage for model-based media admission.
 mod delivery_rig;
 #[path = "media_runtime/head_cost.rs"]
 mod head_cost;
@@ -202,80 +202,124 @@ fn refusal(frame: &Frame) -> Value {
     serde_json::from_slice(&frame.body).unwrap()
 }
 
-fn child(enabled: bool) {
-    child_case(enabled, "full");
-}
-
-fn child_case(enabled: bool, case: &str) {
+fn child_case(case: &str) {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "media_runtime_child", "--nocapture"])
-        .env("BROCA_MEDIA_TEST_ENABLED", enabled.to_string())
         .env("BROCA_MEDIA_TEST_CASE", case)
         .status()
         .unwrap();
-    assert!(status.success(), "media.enabled={enabled} child failed");
+    assert!(status.success(), "media case {case} child failed");
+}
+
+#[tokio::test]
+async fn media_capable_model_without_config_sends_tool_png_on_next_request() {
+    tool_png_on_next_request(true).await;
+}
+
+#[tokio::test]
+async fn text_only_model_without_config_keeps_tool_png_as_marker() {
+    tool_png_on_next_request(false).await;
+}
+
+async fn tool_png_on_next_request(accepts_images: bool) {
+    let mut rig = Rig::start(if accepts_images {
+        "tool-image"
+    } else {
+        "tool-marker"
+    })
+    .await;
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    let mut config = frozen(WireFamilyId::AnthropicMessages);
+    if !accepts_images {
+        config.media = None;
+    }
+    *rig.script.media_frozen.lock().unwrap() = Some(config);
+    *rig.script.tool_plane.lock().unwrap() = Some(Arc::new(ImageTool));
+    rig.script.push(&[Step::Call("photo"), Step::Text("seen")]);
+    result(&rig.send("tool-only", "look", None).await);
+    rig.wait_idle().await;
+    let requests = rig.script.rendered.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "first request and tool followup");
+    let first: Value = serde_json::from_slice(&requests[0]).unwrap();
+    let next: Value = serde_json::from_slice(&requests[1]).unwrap();
+    assert!(!first.to_string().contains(&STANDARD.encode(PNG)));
+    let blocks = next["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().unwrap())
+        .filter(|block| block["type"] == "tool_result")
+        .flat_map(|block| block["content"].as_array().into_iter().flatten())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        blocks.iter().any(
+            |block| block["type"] == "image" && block["source"]["data"] == STANDARD.encode(PNG)
+        ),
+        accepts_images,
+        "{next}"
+    );
+    if !accepts_images {
+        assert!(next.to_string().contains("reason=modality"), "{next}");
+        assert!(!next.to_string().contains(&STANDARD.encode(PNG)));
+    }
+    let configs = rig
+        .records()
+        .into_iter()
+        .filter_map(|record| match record {
+            broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(configs.len(), 1);
+    assert_eq!(
+        configs[0].frozen_render_config.get("media").is_some(),
+        accepts_images
+    );
+    rig.finish().await;
 }
 
 #[test]
 fn shipping_runtime_media_on() {
-    child(true);
-}
-#[test]
-fn shipping_runtime_media_off() {
-    child(false);
+    child_case("full");
 }
 
 #[test]
 fn media_on_upload_refusals_keep_contract_codes() {
-    child_case(true, "upload-refusals");
+    child_case("upload-refusals");
 }
 #[test]
 fn media_on_append_replay_is_offset_mismatch() {
-    child_case(true, "strict-append");
+    child_case("strict-append");
 }
 #[test]
 fn media_on_model_view_defaults_to_safe_markers() {
-    child_case(true, "model-media");
+    child_case("model-media");
 }
 #[test]
 fn media_on_head_mime_facts_match_admission() {
-    child_case(true, "head-mime");
+    child_case("head-mime");
 }
 #[test]
 fn media_on_blocks_identity_matches_content() {
-    child_case(true, "blocks-identity");
+    child_case("blocks-identity");
 }
 #[test]
 #[ignore = "explicit 1k/150k active-head cost measurement"]
 fn measure_active_media_head_cost() {
-    child_case(true, "head-cost");
+    child_case("head-cost");
 }
 #[test]
 fn media_on_active_head_avoids_replay() {
-    child_case(true, "head-bounded");
-}
-#[test]
-fn media_off_upload_send_and_staging_bytes_match_master() {
-    child_case(false, "off");
+    child_case("head-bounded");
 }
 #[test]
 fn media_free_model_view_bytes_match_master() {
-    child_case(true, "model-free");
+    child_case("model-free");
 }
 
 #[tokio::test]
-#[ignore = "launched with an isolated boot setting by shipping_runtime_media_on/off"]
+#[ignore = "launched in isolation by the media runtime cases"]
 async fn media_runtime_child() {
-    let enabled: bool = std::env::var("BROCA_MEDIA_TEST_ENABLED")
-        .unwrap()
-        .parse()
-        .unwrap();
-    let config = broca_module_serve::config::MediaConfig::parse(&format!(
-        r#"{{"media":{{"enabled":{enabled}}}}}"#
-    ))
-    .unwrap();
-    broca_protocol::configure_media(config.enabled).unwrap();
-    assert!(broca_protocol::configure_media(!enabled).is_err());
     let case = std::env::var("BROCA_MEDIA_TEST_CASE").unwrap_or_else(|_| "full".into());
     if case == "head-cost" || case == "head-bounded" {
         let sizes: &[usize] = if case == "head-cost" {
@@ -290,7 +334,7 @@ async fn media_runtime_child() {
         .await;
         return;
     }
-    let mode = if enabled { "on" } else { "off" };
+    let mode = "on";
     if let Some(dir) = std::env::var_os("BROCA_MEDIA_SAMPLE_DIR") {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -306,26 +350,19 @@ async fn media_runtime_child() {
     rig.script.push(&[Step::Text("ready")]);
     rig.send("init", "ready", None).await;
     rig.wait_idle().await;
-    if refusals::run(&mut rig, enabled, &case).await {
+    if refusals::run(&mut rig, &case).await {
         rig.finish().await;
         return;
     }
     let describe = call(&mut rig, "role.describe", json!({})).await;
     let checked = cortexkit_role_llm_runner::describe::check_describe(&result(&describe)).unwrap();
-    assert_eq!(
-        checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS),
-        enabled
-    );
-    assert_eq!(
-        result(&describe)["majors"][0]["ops"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("session.media_read")),
-        enabled
-    );
+    assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
+    assert!(result(&describe)["majors"][0]["ops"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("session.media_read")));
     sample(mode, "describe", &[describe]);
     let id = upload(&mut rig, "image/png", PERSON_PNG).await;
-    let before = rig.wal_bytes();
     rig.script.push(&[Step::Call("photo"), Step::Text("seen")]);
     rig.script.hold_model(true);
     let sent = rig
@@ -336,13 +373,7 @@ async fn media_runtime_child() {
             json!({"content":[{"type":"upload","upload_id":id}]}),
         )
         .await;
-    if !enabled {
-        assert_eq!(refusal(&sent)["code"], "invalid_params");
-        assert_eq!(rig.wal_bytes(), before);
-        rig.send("tool-only", "look", None).await;
-    } else {
-        result(&sent);
-    }
+    result(&sent);
     let script = rig.script.clone();
     let live = rig
         .subscribe_collect_after_attach(11, json!({}), Duration::from_millis(100), move || {
@@ -353,36 +384,19 @@ async fn media_runtime_child() {
     sample(mode, "subscribe-live", &live);
     let read = call(&mut rig, "session.read", json!({"media":"blocks"})).await;
     let read_json = result(&read).to_string();
-    assert_eq!(read_json.contains(&digest(PNG)), enabled, "{read_json}");
-    assert_eq!(
-        read_json.contains(&digest(TOOL_PDF)),
-        enabled,
-        "{read_json}"
-    );
-    assert_eq!(
-        read_json.contains(&digest(PERSON_PNG)),
-        enabled,
-        "{read_json}"
-    );
-    if !enabled {
-        assert!(read_json.contains("not shown to the model"));
-    }
+    assert!(read_json.contains(&digest(PNG)), "{read_json}");
+    assert!(read_json.contains(&digest(TOOL_PDF)), "{read_json}");
+    assert!(read_json.contains(&digest(PERSON_PNG)), "{read_json}");
     sample(mode, "session-read", &[read]);
     let descriptors = call(&mut rig, "session.read", json!({"media":"descriptors"})).await;
     let descriptors_json = result(&descriptors).to_string();
-    assert_eq!(
-        descriptors_json.contains("media_ref"),
-        enabled,
-        "{descriptors_json}"
-    );
-    assert_eq!(
+    assert!(descriptors_json.contains("media_ref"), "{descriptors_json}");
+    assert!(
         descriptors_json.contains(&digest(PERSON_PNG)),
-        enabled,
         "{descriptors_json}"
     );
-    assert_eq!(
+    assert!(
         descriptors_json.contains(&digest(PNG)),
-        enabled,
         "{descriptors_json}"
     );
     assert!(!descriptors_json.contains(&STANDARD.encode(PNG)));
@@ -390,9 +404,7 @@ async fn media_runtime_child() {
     let history = call(&mut rig, "session.history", json!({"form":"display"})).await;
     result(&history);
     sample(mode, "session-history", &[history]);
-    if enabled {
-        default_reader_samples(&mut rig, &result(&sent)["run_id"]).await;
-    }
+    default_reader_samples(&mut rig, &result(&sent)["run_id"]).await;
     let replay = rig
         .subscribe_collect(13, json!({"from":"start"}), Duration::from_millis(100))
         .await;
@@ -403,21 +415,17 @@ async fn media_runtime_child() {
         json!({"sha256":digest(PNG),"offset":0,"length":2097152}),
     )
     .await;
-    if enabled {
-        assert_eq!(
-            result(&media),
-            json!({"data":STANDARD.encode(PNG),"size":PNG.len(),"mime":"image/png"})
-        );
-        assert!(rig
-            .script
-            .rendered
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|bytes| String::from_utf8_lossy(bytes).contains(&STANDARD.encode(PNG))));
-    } else {
-        assert!(!refusal(&media).is_null());
-    }
+    assert_eq!(
+        result(&media),
+        json!({"data":STANDARD.encode(PNG),"size":PNG.len(),"mime":"image/png"})
+    );
+    assert!(rig
+        .script
+        .rendered
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|bytes| String::from_utf8_lossy(bytes).contains(&STANDARD.encode(PNG))));
     sample(mode, "media-read-success", &[media]);
     let missing = call(
         &mut rig,
@@ -425,45 +433,39 @@ async fn media_runtime_child() {
         json!({"sha256":"0".repeat(64),"offset":0,"length":0}),
     )
     .await;
-    if enabled {
-        assert_eq!(refusal(&missing)["code"], "unknown_media");
-    }
+    assert_eq!(refusal(&missing)["code"], "unknown_media");
     sample(mode, "media-read-refusal", &[missing]);
-    if enabled {
-        media_read_boundaries(&mut rig).await;
-        assert!(rig.registry().stop_and_seal().await);
-        let mut rig = rig.restart().await;
-        *rig.script.media_frozen.lock().unwrap() = Some(frozen(WireFamilyId::AnthropicMessages));
-        let media = call(
-            &mut rig,
-            "session.media_read",
-            json!({"sha256":digest(PERSON_PNG),"offset":0,"length":2097152}),
-        )
-        .await;
-        assert_eq!(result(&media)["data"], STANDARD.encode(PERSON_PNG));
-        result(&rig.send("restarted", "look again", None).await);
-        rig.wait_idle().await;
-        assert!(
-            rig.script
-                .rendered
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|bytes| String::from_utf8_lossy(bytes).contains(&STANDARD.encode(PNG))),
-            "rendered={:?}; failures={:?}",
-            rig.script
-                .rendered
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|body| String::from_utf8_lossy(body).into_owned())
-                .collect::<Vec<_>>(),
-            rig.script.failures.lock().unwrap()
-        );
-        rig.finish().await;
-    } else {
-        rig.finish().await;
-    }
+    media_read_boundaries(&mut rig).await;
+    assert!(rig.registry().stop_and_seal().await);
+    let mut rig = rig.restart().await;
+    *rig.script.media_frozen.lock().unwrap() = Some(frozen(WireFamilyId::AnthropicMessages));
+    let media = call(
+        &mut rig,
+        "session.media_read",
+        json!({"sha256":digest(PERSON_PNG),"offset":0,"length":2097152}),
+    )
+    .await;
+    assert_eq!(result(&media)["data"], STANDARD.encode(PERSON_PNG));
+    result(&rig.send("restarted", "look again", None).await);
+    rig.wait_idle().await;
+    assert!(
+        rig.script
+            .rendered
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|bytes| String::from_utf8_lossy(bytes).contains(&STANDARD.encode(PNG))),
+        "rendered={:?}; failures={:?}",
+        rig.script
+            .rendered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| String::from_utf8_lossy(body).into_owned())
+            .collect::<Vec<_>>(),
+        rig.script.failures.lock().unwrap()
+    );
+    rig.finish().await;
     for family in [
         WireFamilyId::AnthropicMessages,
         WireFamilyId::BedrockConverse,
@@ -473,7 +475,7 @@ async fn media_runtime_child() {
         WireFamilyId::Gemini,
         WireFamilyId::GoogleCodeAssist,
     ] {
-        family_roundtrip(family, enabled).await;
+        family_roundtrip(family).await;
     }
 }
 
@@ -516,10 +518,10 @@ async fn default_reader_samples(rig: &mut Rig, run_id: &Value) {
     sample("on", "run-result", &[result_frame]);
 }
 
-async fn family_roundtrip(family: WireFamilyId, enabled: bool) {
+async fn family_roundtrip(family: WireFamilyId) {
     use broca_provider::media_profile::MediaCarrier;
     let config = frozen(family);
-    let mut rig = Rig::start(&format!("media-family-{family:?}-{enabled}")).await;
+    let mut rig = Rig::start(&format!("media-family-{family:?}")).await;
     broca_core::media_store::create_media_directories(&rig.dir).unwrap();
     *rig.script.media_frozen.lock().unwrap() = Some(config.clone());
     *rig.script.tool_plane.lock().unwrap() = Some(Arc::new(ImageTool));
@@ -548,7 +550,7 @@ async fn family_roundtrip(family: WireFamilyId, enabled: bool) {
                 json!({"content":[{"type":"upload","upload_id":id}]}),
             )
             .await;
-        if enabled && supported {
+        if supported {
             result(&sent);
             rig.wait_idle().await;
             assert!(
@@ -561,23 +563,14 @@ async fn family_roundtrip(family: WireFamilyId, enabled: bool) {
                 "{family:?}: missing {mime}"
             );
         } else {
-            assert_eq!(
-                refusal(&sent)["code"],
-                if enabled {
-                    "media_unsupported"
-                } else {
-                    "invalid_params"
-                }
-            );
+            assert_eq!(refusal(&sent)["code"], "media_unsupported");
             assert_eq!(rig.wal_bytes(), before);
-            if enabled {
-                assert!(refusal(&sent)["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("model"));
-            }
+            assert!(refusal(&sent)["message"]
+                .as_str()
+                .unwrap()
+                .contains("model"));
         }
-        family_sample(enabled, family, mime, &sent, &rig);
+        family_sample(true, family, mime, &sent, &rig);
     }
     if family == WireFamilyId::OpenAiResponsesChatgpt {
         let bytes = include_bytes!("../../broca-provider/examples/media-live/fixtures/user.wav");
@@ -591,22 +584,13 @@ async fn family_roundtrip(family: WireFamilyId, enabled: bool) {
                 json!({"content":[{"type":"upload","upload_id":id}]}),
             )
             .await;
-        assert_eq!(
-            refusal(&sent)["code"],
-            if enabled {
-                "media_unsupported"
-            } else {
-                "invalid_params"
-            }
-        );
+        assert_eq!(refusal(&sent)["code"], "media_unsupported");
         assert_eq!(rig.wal_bytes(), before);
-        if enabled {
-            assert!(refusal(&sent)["message"]
-                .as_str()
-                .unwrap()
-                .contains("audio"));
-        }
-        family_sample(enabled, family, "audio/wav", &sent, &rig);
+        assert!(refusal(&sent)["message"]
+            .as_str()
+            .unwrap()
+            .contains("audio"));
+        family_sample(true, family, "audio/wav", &sent, &rig);
     }
     rig.finish().await;
 }
@@ -659,7 +643,7 @@ async fn media_read_boundaries(rig: &mut Rig) {
 }
 
 #[test]
-fn malformed_media_refuses_boot_before_connecting_or_opening_state() {
+fn obsolete_media_does_not_refuse_boot_before_connecting() {
     let root =
         broca_test_support::scratch_root().join(format!("media-boot-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
@@ -670,11 +654,14 @@ fn malformed_media_refuses_boot_before_connecting_or_opening_state() {
         r#"{"media":null}"#,
     ] {
         std::fs::write(&config, text).unwrap();
+        let data_home = root.join(format!("data-{}", digest(text.as_bytes())));
+        let logs = data_home.join("cortexkit/broca/logs");
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_ck-broca"))
             .args(["--subc", "missing-connection.json"])
             .env("BROCA_CONFIG_PATH", &config)
             .env("BROCA_STATE_ROOT", root.join("state"))
-            .env("CK_LOG_DIR", root.join("logs"))
+            .env("XDG_DATA_HOME", &data_home)
+            .env("HOME", root.join("home"))
             .env_remove("SUBC_LAUNCH_NONCE_FD")
             .env_remove("SUBC_LAUNCH_NONCE")
             .env_remove("SUBC_MODULE_ID")
@@ -682,11 +669,19 @@ fn malformed_media_refuses_boot_before_connecting_or_opening_state() {
             .unwrap();
         assert!(!output.status.success());
         let error = String::from_utf8_lossy(&output.stderr);
-        assert!(error.contains("media"), "{error}");
-        if text.contains("enabeld") {
-            assert!(error.contains("enabeld"), "{error}");
-        }
-        assert!(!root.join("state").exists());
+        assert!(!error.contains("parse media"), "{error}");
+        assert!(error.contains("missing-connection.json"), "{error}");
+        let log_text = std::fs::read_dir(&logs)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert_eq!(
+            log_text
+                .matches("key 'media' is obsolete and ignored")
+                .count(),
+            1,
+            "{log_text}"
+        );
     }
     std::fs::remove_dir_all(root).unwrap();
 }

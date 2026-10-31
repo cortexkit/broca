@@ -10,27 +10,33 @@ use broca_module::diagnostics::{Event, Ring, Snapshot};
 use broca_store::session_address::{InventoryUnavailable, SessionAddressError};
 use serde_json::{json, Value};
 
-const REASONS: [&str; 5] = [
+const REASONS: [&str; 7] = [
     "incomplete_inventory",
     "gap_marker",
     "store_error",
+    "wait_expired",
+    "migration_failed",
     "ambiguous",
     "invalid_identity",
 ];
 const WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 struct State {
-    counters: [AtomicU64; 5],
-    last_warn: Mutex<[Option<Instant>; 3]>,
+    counters: [AtomicU64; 7],
+    last_warn: Mutex<[Option<Instant>; 5]>,
     unavailable: Ring,
+    repair_counts: [AtomicU64; 3],
+    repairs: Ring,
 }
 
 impl State {
     fn new(since_ms: i64) -> Self {
         Self {
             counters: std::array::from_fn(|_| AtomicU64::new(0)),
-            last_warn: Mutex::new([None; 3]),
+            last_warn: Mutex::new([None; 5]),
             unavailable: Ring::new(since_ms),
+            repair_counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            repairs: Ring::new(since_ms),
         }
     }
 
@@ -40,12 +46,14 @@ impl State {
                 InventoryUnavailable::IncompleteInventory => 0,
                 InventoryUnavailable::GapMarker => 1,
                 InventoryUnavailable::StoreError(_) => 2,
+                InventoryUnavailable::WaitExpired => 3,
+                InventoryUnavailable::MigrationFailed(_) => 4,
             },
-            SessionAddressError::Ambiguous => 3,
-            SessionAddressError::Invalid(_) => 4,
+            SessionAddressError::Ambiguous => 5,
+            SessionAddressError::Invalid(_) => 6,
         };
         self.counters[index].fetch_add(1, Ordering::Relaxed);
-        if index >= 3 {
+        if index >= 5 {
             return false;
         }
         self.unavailable.record(Event {
@@ -74,6 +82,21 @@ impl State {
                 .map(|(name, counter)| ((*name).to_owned(), json!(counter.load(Ordering::Relaxed))))
                 .collect(),
         )
+    }
+
+    fn record_repair(&self, outcome: &str, at_ms: i64) {
+        let index = match outcome {
+            "started" => 0,
+            "completed" => 1,
+            "failed" => 2,
+            _ => unreachable!("unknown inventory repair outcome"),
+        };
+        self.repair_counts[index].fetch_add(1, Ordering::Relaxed);
+        self.repairs.record(Event {
+            at_ms,
+            module: String::new(),
+            code: outcome.into(),
+        });
     }
 }
 
@@ -110,7 +133,21 @@ fn record_into(state: &State, error: &SessionAddressError, at_ms: i64, now: Inst
 }
 
 pub(crate) fn health() -> Value {
-    STATE.health()
+    let mut health = STATE.health();
+    health["repairs"] = json!({
+        "started": STATE.repair_counts[0].load(Ordering::Relaxed),
+        "completed": STATE.repair_counts[1].load(Ordering::Relaxed),
+        "failed": STATE.repair_counts[2].load(Ordering::Relaxed),
+    });
+    health
+}
+
+pub(crate) fn record_repair(outcome: &str) {
+    STATE.record_repair(outcome, broca_module::diagnostics::now_ms());
+}
+
+pub(crate) fn repair_snapshot(since: i64, now: i64) -> Result<Snapshot, String> {
+    STATE.repairs.snapshot(since, now)
 }
 
 pub(crate) fn snapshot(since: i64, now: i64) -> Result<Snapshot, String> {
@@ -190,11 +227,45 @@ mod tests {
         ));
         assert_eq!(
             state.health(),
-            json!({"incomplete_inventory":3,"gap_marker":1,"store_error":1,"ambiguous":1,"invalid_identity":1})
+            json!({"incomplete_inventory":3,"gap_marker":1,"store_error":1,"wait_expired":0,"migration_failed":0,"ambiguous":1,"invalid_identity":1})
         );
         assert_eq!(
             state.unavailable.snapshot(100, 170).unwrap().events.len(),
             5
+        );
+    }
+
+    #[test]
+    fn repairs_are_counted_and_retained_as_timestamped_evidence() {
+        let state = State::new(100);
+        for (outcome, at_ms) in [
+            ("started", 110),
+            ("completed", 120),
+            ("started", 130),
+            ("failed", 140),
+        ] {
+            state.record_repair(outcome, at_ms);
+        }
+        assert_eq!(
+            state
+                .repair_counts
+                .each_ref()
+                .map(|count| count.load(Ordering::Relaxed)),
+            [2, 1, 1]
+        );
+        let snapshot = state.repairs.snapshot(100, 140).unwrap();
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .map(|event| (event.code.as_str(), event.at_ms))
+                .collect::<Vec<_>>(),
+            [
+                ("started", 110),
+                ("completed", 120),
+                ("started", 130),
+                ("failed", 140)
+            ]
         );
     }
 }

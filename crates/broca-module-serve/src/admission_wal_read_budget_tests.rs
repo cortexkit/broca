@@ -187,6 +187,7 @@ async fn assert_media_free_sparse_resume_legacy_render_and_decode(with_tools: bo
         Duration::from_secs(15),
         executor.execute(
             RunJob {
+                queued_service_tier: None,
                 media: Vec::new(),
                 media_profile: None,
                 conversation_key: None,
@@ -219,7 +220,7 @@ async fn assert_media_free_sparse_resume_legacy_render_and_decode(with_tools: bo
         1,
         "only the ordinary final materialization tail read is allowed"
     );
-    let eager_media_setup = usize::from(cfg!(feature = "test-attachments") && with_tools);
+    let eager_media_setup = usize::from(with_tools);
     assert_eq!(
         after_resume.identities - after_setup.identities,
         eager_media_setup
@@ -230,7 +231,7 @@ async fn assert_media_free_sparse_resume_legacy_render_and_decode(with_tools: bo
     );
     assert_eq!(
         after_resume.uploads - after_setup.uploads,
-        usize::from(cfg!(feature = "test-attachments"))
+        1
     );
     {
         let requests = http.requests.lock().unwrap();
@@ -306,6 +307,7 @@ async fn fresh_episode_admission_does_not_add_a_full_wal_read() {
     store.ranged.store(0, Ordering::SeqCst);
     let (ack, admitted) = tokio::sync::oneshot::channel();
     let job = RunJob {
+        queued_service_tier: None,
         media: vec![],
         media_profile: None,
         conversation_key: None,

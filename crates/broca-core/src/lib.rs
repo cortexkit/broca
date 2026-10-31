@@ -92,9 +92,10 @@ pub use context::{
     read_session_page_owned_with_dispatches, record_time_ms, replay_transcript,
     resume_state_from_store, select_held_episodes, tool_call_dispatches, tool_call_key,
     AdmissionStoreSnapshot, ExportCursor, ExportError, ExportFact, ExportIndex, ExportPage,
-    HeldEpisode, HeldPrefix, HeldRowsRequest, MaterializedStore, MissingExportRun, Persister,
-    RunIndex, RunIndexAttribution, RunIndexRow, RunIndexState, SessionReadLineageState,
-    SessionReadMessage, SessionReadPage, SessionReadReason, SessionReadStateKind, SessionStore,
+    HeldEpisode, HeldPrefix, HeldRowsRequest, ImportedRunExclusions, MaterializedStore,
+    MissingExportRun, Persister, RecoveryDiscovery, RunIndex, RunIndexAttribution, RunIndexRow,
+    RunIndexState, SessionInventory, SessionReadLineageState, SessionReadMessage, SessionReadPage,
+    SessionReadReason, SessionReadStateKind, SessionRefResolver, SessionRefs, SessionStore,
     StorePageRow, StorePageSnapshot, StorePrefix, TagLocation, ToolCallDispatch, WithdrawalRun,
     SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
