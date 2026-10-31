@@ -220,7 +220,10 @@ fn extended_path(path: &Path) -> io::Result<Vec<u16>> {
             "path contains NUL",
         ));
     }
-    if !name.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]) {
+    // Normalize drive and UNC paths; leave verbatim (\\?\) and device (\\.\) prefixes alone.
+    if !name.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+        && !name.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
+    {
         // The extended namespace bypasses Win32's slash and dot-component processing.
         // Resolve those lexically before adding the prefix, without following links or
         // requiring the object to exist as filesystem canonicalization would.
@@ -711,9 +714,16 @@ mod path_tests {
         for path in [
             r"\\?\C:\one\.\two\..\file",
             r"\\?\UNC\server\share\one\file",
+            r"\\.\C:\one\.\two\..\file",
         ] {
             assert_path(path, path);
         }
+    }
+
+    #[test]
+    fn device_namespace_is_not_rewritten_as_unc() {
+        assert_path(r"\\.\C:\dir\file", r"\\.\C:\dir\file");
+        assert_path(r"\\server\share\dir\file", r"\\?\UNC\server\share\dir\file");
     }
 
     #[test]
