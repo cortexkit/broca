@@ -1310,22 +1310,11 @@ enum StringSender {
     Interrupt(broca_protocol::BindPrincipal),
 }
 
-/// The `senders` of the session's frozen plan, or none for a session admitted without one.
-fn frozen_plan_senders(
+/// Sender admission uses the latest durable refresh, not the execution manifest's timing.
+fn effective_plan_senders(
     ownership: &broca_core::SessionOwnershipV1,
 ) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
-    ownership
-        .first_episode
-        .as_ref()
-        .and_then(|first| first.manifest.as_ref())
-        .and_then(|manifest| {
-            serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text()).ok()
-        })
-        .and_then(|plan| {
-            plan.as_object()
-                .and_then(|plan| broca_fetch_plan::plan_senders(plan).ok())
-        })
-        .unwrap_or_default()
+    ownership.effective_senders()
 }
 
 /// The actor's run state.
@@ -3336,7 +3325,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // turns out to be a retry of a run started under the old epoch, which it cannot resume.
         let mut reopen_refusal = None;
         // A send using the `delivery_order` group from a module other than the session's owner is
-        // admitted only if the session's frozen plan names that module as a sender, matched on
+        // admitted only if the session's effective sender policy names that module, matched on
         // the daemon-attested principal. Such a sender never becomes the session's principal: the
         // send continues as an internal send under the session's frozen principal, so it takes
         // the frozen scope (its tool routes carry the owner's) and never freezes, adopts or
@@ -5749,9 +5738,23 @@ impl<W: WalStore + 'static> LineageActor<W> {
         {
             return Ok(StringSender::Owner);
         }
-        let senders = frozen_plan_senders(&ownership);
-        // A caller the plan does not name meets the owner check further down, as it always has.
+        let senders = effective_plan_senders(&ownership);
+        // Unrefreshed sessions retain legacy string admission. Once a refresh establishes
+        // sender policy, a removed sender cannot bypass it through legacy string delivery.
         if !senders.iter().any(|sender| &sender.module == module_id) {
+            if ownership
+                .sender_admission
+                .as_ref()
+                .is_some_and(|fold| fold.accepted_senders.is_some())
+            {
+                return Err(SendOutcome::DeliveryRefused {
+                    code: cortexkit_role_llm_runner::errors::SCOPE_OWNER_MISMATCH,
+                    field: "delivery",
+                    message: format!(
+                        "the session's plan does not name module {module_id} as a sender"
+                    ),
+                });
+            }
             return Ok(StringSender::Owner);
         }
         let frozen = ownership
@@ -5832,18 +5835,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 "only the session's owner or a module its plan names may send with an ordered delivery list".into(),
             ));
         };
-        let senders = ownership
-            .first_episode
-            .as_ref()
-            .and_then(|first| first.manifest.as_ref())
-            .and_then(|manifest| {
-                serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text()).ok()
-            })
-            .and_then(|plan| {
-                plan.as_object()
-                    .and_then(|plan| broca_fetch_plan::plan_senders(plan).ok())
-            })
-            .unwrap_or_default();
+        let senders = effective_plan_senders(&ownership);
         let Some(sender) = senders.iter().find(|sender| &sender.module == module_id) else {
             return Err(refused(
                 cortexkit_role_llm_runner::errors::SCOPE_OWNER_MISMATCH,
@@ -5866,7 +5858,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         })
     }
 
-    /// Render once at admission from the attested sender's frozen template. The queued
+    /// Render once at admission from the attested sender's effective template. The queued
     /// request contains the resulting text, so recovery replays bytes rather than slots.
     async fn render_ordered_template(
         &mut self,
@@ -5882,18 +5874,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .load_ownership()
             .await
             .map_err(SendOutcome::Transient)?;
-        let senders = ownership
-            .first_episode
-            .as_ref()
-            .and_then(|first| first.manifest.as_ref())
-            .and_then(|manifest| {
-                serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text()).ok()
-            })
-            .and_then(|plan| {
-                plan.as_object()
-                    .and_then(|plan| broca_fetch_plan::plan_senders(plan).ok())
-            })
-            .unwrap_or_default();
+        let senders = effective_plan_senders(&ownership);
         let Some(broca_protocol::BindPrincipal::Reserved { module_id }) = &request.principal else {
             return Err(refused("no template is declared for this caller".into()));
         };
@@ -9143,6 +9124,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         .prior_snapshot(&key, safe_head)
                         .map(|snapshot| snapshot.checkpoint_at_head);
                 }
+                broca_core::run::repair_sender_admission_checkpoint(
+                    wal_store.as_ref(),
+                    &key,
+                    safe_head,
+                    materialized_store.as_deref(),
+                )?;
                 match broca_core::load_prior_wal_snapshot(
                     wal_store.as_ref(),
                     &key,
@@ -9221,6 +9208,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 if let Some(reader) = admission_reader {
                     return reader.prior_snapshot(&key, safe_head);
                 }
+                broca_core::run::repair_sender_admission_checkpoint(
+                    wal_store.as_ref(),
+                    &key,
+                    safe_head,
+                    materialized_store.as_deref(),
+                )?;
                 broca_core::load_prior_wal_snapshot(
                     wal_store.as_ref(),
                     &key,

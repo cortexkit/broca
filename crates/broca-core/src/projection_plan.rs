@@ -198,6 +198,10 @@ pub fn plan_projection(
         .and_then(|range| range.lineage_id)
         .map(|lineage_id| lineage_id.to_string());
     let reset = !snapshot.attribution_complete
+        // A cached refreshed policy cannot be repaired from only a suffix. Rebuild even
+        // at the same projection boundary so an idle session does not keep stale grants.
+        || snapshot.seed.as_ref().and_then(|seed| seed.admission_checkpoint.ownership.as_ref())
+            .is_some_and(|ownership| !ownership.sender_admission_complete())
         || snapshot
             .seed
             .as_ref()

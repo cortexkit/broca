@@ -2430,7 +2430,7 @@ impl MaterializedStore for SqliteStore {
             .optional()
             .map_err(|e| e.to_string())?
             .flatten();
-        let head = head_json
+        let head: Option<broca_core::head::HeadProjection> = head_json
             .as_deref()
             .map(serde_json::from_str)
             .transpose()
@@ -2438,6 +2438,13 @@ impl MaterializedStore for SqliteStore {
             .flatten();
         if watermark_seq > 0 && head.is_none() {
             return Err(broca_core::StorePageReadError::AttributionStale);
+        }
+        if let Some(head) = &head {
+            if !retained_head::sender_admission_current(&tx, &key, head)
+                .map_err(|e| e.to_string())?
+            {
+                return Err(broca_core::StorePageReadError::AttributionStale);
+            }
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(StorePageSnapshot {
@@ -5437,6 +5444,7 @@ mod tests {
             }),
             latest_manifest: None,
             session_change_recorded: false,
+            sender_admission: None,
             plan_manifest_folded: true,
         };
         let snapshot =
@@ -5541,6 +5549,136 @@ mod tests {
         );
         crate::conformance::projection_range_co_commits_anchor(sqlite_store());
         crate::conformance::failed_projection_keeps_checkpoint_and_messages_atomic(sqlite_store());
+    }
+
+    #[test]
+    fn old_sender_checkpoint_rebuilds_once_and_repairs_head() {
+        let root = broca_test_support::scratch_root().join(format!(
+            "sender-checkpoint-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let wal_store = CountingWalStore::new(root.clone());
+        let session = crate::conformance::session("sender-checkpoint");
+        let mut records = crate::conformance::base_records(&session);
+        let manifest: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
+            "plan":"{\"senders\":[{\"module\":\"occipital\",\"idle_start\":true}]}",
+            "plan_identity":"refresh", "composition_digest":"composition", "fetches":[],
+            "tools":[], "system_text":"", "system_digest":"system", "join_version":1, "role_versions":{}
+        })).unwrap();
+        if let broca_wal::WalRecord::RunStarted { principal, .. } = &mut records[0].record {
+            *principal = Some(broca_protocol::BindPrincipal::Reserved {
+                module_id: "owner".into(),
+            });
+        }
+        let mut wal = wal_store.open(&session).unwrap();
+        wal.append(1, &records[0].record, true).unwrap();
+        wal.append(
+            1,
+            &broca_wal::WalRecord::SessionRefreshAccepted {
+                generation: 1,
+                policy: "on_prefix_rebuild".into(),
+                manifest: Box::new(manifest),
+                run_in_progress: true,
+                applies_from_next_run: false,
+            },
+            true,
+        )
+        .unwrap();
+        for frame in crate::conformance::text_turn(3, 1, "projected") {
+            wal.append(1, &frame.record, true).unwrap();
+        }
+        let safe_head = wal.replay().unwrap().last().unwrap().seq;
+        drop(wal);
+        let store = SqliteStore::open_in_memory().unwrap();
+        let range = wal_store
+            .inner
+            .read_records_range(&session, 0, Some(safe_head), None)
+            .unwrap();
+        Persister::project_range(&store, &session, &range).unwrap();
+        let mut legacy = MaterializedStore::read_admission_snapshot(&store, &session)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        legacy.ownership.as_mut().unwrap().sender_admission = None;
+        let mut old_head = broca_core::head::HeadProjection::default();
+        old_head.observe(&records[0].record);
+        legacy.head = Some(old_head.clone());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET admission_checkpoint_json=?2, head_json=?3 WHERE session=?1",
+                rusqlite::params![
+                    SqliteStore::key(&session),
+                    broca_core::encode_admission_checkpoint(&legacy).unwrap(),
+                    serde_json::to_string(&old_head).unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            MaterializedStore::read_page_with_attribution(
+                &store,
+                &session,
+                Some(0),
+                100,
+                broca_core::context::ReadView::Raw
+            ),
+            Err(broca_core::StorePageReadError::AttributionStale)
+        ));
+        broca_core::run::repair_sender_admission_checkpoint(
+            &wal_store,
+            &session,
+            safe_head,
+            Some(&store),
+        )
+        .unwrap();
+        let repaired_reads = wal_store.range_reads.load(Ordering::SeqCst);
+        assert_eq!(repaired_reads, 1);
+        broca_core::run::repair_sender_admission_checkpoint(
+            &wal_store,
+            &session,
+            safe_head,
+            Some(&store),
+        )
+        .unwrap();
+        assert_eq!(wal_store.range_reads.load(Ordering::SeqCst), repaired_reads);
+        let snapshot =
+            broca_core::load_prior_wal_snapshot(&wal_store, &session, safe_head, Some(&store))
+                .unwrap();
+        assert!(snapshot.base_watermark > 0);
+        assert_eq!(
+            snapshot
+                .checkpoint_at_head
+                .ownership
+                .unwrap()
+                .effective_senders()[0]
+                .module,
+            "occipital"
+        );
+        assert_eq!(wal_store.full_reads.load(Ordering::SeqCst), 0);
+        let page = MaterializedStore::read_page_with_attribution(
+            &store,
+            &session,
+            Some(0),
+            100,
+            broca_core::context::ReadView::Raw,
+        )
+        .unwrap();
+        assert!(page
+            .head
+            .unwrap()
+            .sender(
+                Some(&broca_protocol::BindPrincipal::Reserved {
+                    module_id: "occipital".into()
+                }),
+                &broca_protocol::SendScope::Internal,
+                &[broca_protocol::DeliveryMode::IdleStart]
+            )
+            .is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

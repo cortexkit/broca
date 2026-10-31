@@ -861,6 +861,66 @@ mod tests {
     }
 
     #[test]
+    fn raw_head_uses_latest_accepted_senders_without_origin_reads() {
+        use broca_wal::Wal;
+        let (_, base, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let base = modern_raw_records(base);
+        let bind = bind(&encode_records(&base));
+        let scratch = database();
+        let path = scratch._scratch.0.join("sender-head.wal");
+        let mut wal = broca_wal::FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+        for record in &base {
+            wal.append(1, record, true).unwrap();
+        }
+        publish_writer(&scratch.db, &bind, &wal);
+        for (generation, sender) in [(1, "occipital"), (2, "replacement")] {
+            let manifest = serde_json::from_value(serde_json::json!({
+                "plan":serde_json::json!({"senders":[{"module":sender,"idle_start":true}]}).to_string(),
+                "plan_identity":sender,"composition_digest":"composition","fetches":[],"tools":[],
+                "system_text":"PRIVATE-REFRESH-TEXT","system_digest":"system","join_version":1,"role_versions":{}
+            })).unwrap();
+            wal.append(
+                1,
+                &WalRecord::SessionRefreshAccepted {
+                    generation,
+                    policy: "on_prefix_rebuild".into(),
+                    manifest: Box::new(manifest),
+                    run_in_progress: false,
+                    applies_from_next_run: false,
+                },
+                true,
+            )
+            .unwrap();
+            publish_writer(&scratch.db, &bind, &wal);
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let actual = counter
+                .operation("raw sender head")
+                .run(|| raw_read(&scratch.db, &bind, &wal, Some(0), 100));
+            let frames = wal.replay().unwrap();
+            let expected = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+                .unwrap()
+                .head
+                .unwrap();
+            assert_eq!(actual.head, expected);
+            let operations = counter.snapshot();
+            assert!(
+                operations[0].seed_fallbacks.is_empty(),
+                "{:?}",
+                operations[0]
+            );
+            assert!(operations[0]
+                .reads
+                .iter()
+                .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        }
+    }
+
+    #[test]
     fn raw_database_tool_pages_match_legacy_including_split_turns_and_tags() {
         use broca_wal::Wal;
         for fixture_name in [
