@@ -929,6 +929,12 @@ impl Runtime<'_> {
             )));
         }
         let ride_wait_ms = answer.ride_wait_ms();
+        let view_features =
+            (!asked.view_features().is_empty()).then(|| asked.view_features().to_vec());
+        let view_due = answer.view_due().map(|due| broca_wal::SetupViewDue {
+            version: due.version,
+            digest: due.digest.clone(),
+        });
         let (initial, ceiling, checkpoint) = match answer {
             SetupAnswer::Refuse {
                 code,
@@ -989,8 +995,8 @@ impl Runtime<'_> {
             // Frozen with the session like `ceiling`, so every later ride, a resumed run's
             // included, waits as long as this answer said.
             ride_wait_ms,
-            view_features: None,
-            view_due: None,
+            view_features,
+            view_due,
         };
         let mut state = CompactionState::default();
         self.commit(&mut state, record)
