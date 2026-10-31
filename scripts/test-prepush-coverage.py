@@ -42,7 +42,43 @@ SKIP user_commands_unsafe_host_menu (requires user_commands, queue, run_ops; mis
 SKIP user_commands_owner_only (requires user_commands, queue, run_ops; missing user_commands)
 SKIP user_commands_outcome_unknown (requires user_commands, queue, run_ops, kill_at:UserCommandForwarded; missing user_commands, kill_at:UserCommandForwarded)
 SKIP user_commands_cutoff_after_forward (requires user_commands, queue, run_ops; missing user_commands)
-SKIP user_commands_cutoff_before_forward (requires user_commands, queue, run_ops; missing user_commands)'''
+SKIP user_commands_cutoff_before_forward (requires user_commands, queue, run_ops; missing user_commands)
+SKIP max_output_tokens_caps_response (requires max_output_tokens, run_usage, queue, transcript_reads, run_ops; missing max_output_tokens)
+SKIP read_stable_across_host_metadata_change (requires queue, transcript_reads, host_metadata_change; missing host_metadata_change)
+SKIP attachments_lifecycle (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_restart_gone (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_chunk_cap (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_commit_size (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_model_unsupported (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_model_mime (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_frozen_model (requires attachments, transcript_reads, queue, run_ops, steer, hold_tool_calls; missing attachments)
+SKIP attachments_send_uncommitted (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_send_unknown (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_send_other_session (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_upload_other_session_status (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_upload_other_session_commit (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_send_gone (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_default_read (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_tool_result (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_media_unreferenced (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_media_other_session (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_media_read_admission (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_admission (requires attachments, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_plan_sender (requires attachments, delivery_order, transcript_reads, queue, run_ops; missing attachments)
+SKIP attachments_retention (requires attachments, advance_retention_clock, transcript_reads, queue, run_ops; missing attachments)
+SKIP run_context_ceiling_wait_is_not_a_stall (requires queue, transcript_reads, hold_context_ceiling; missing hold_context_ceiling)
+SKIP adopt_binds_owner_without_a_run (requires adopt, transcript_reads; missing adopt)
+SKIP adopt_exact_repeat_replays_reply (requires adopt, transcript_reads; missing adopt)
+SKIP adopt_send_id_reuse_names_plan (requires adopt, transcript_reads; missing adopt)
+SKIP adopt_plan_drift_refused (requires adopt, transcript_reads; missing adopt)
+SKIP adopt_during_active_run (requires adopt, transcript_reads, hold_tool_calls; missing adopt)
+SKIP adopt_other_owner_refused (requires adopt, transcript_reads; missing adopt)
+SKIP adopt_same_owner_readopts (requires adopt, transcript_reads; missing adopt)
+SKIP adopt_host_turn_is_a_run (requires adopt, transcript_reads, run_ops; missing adopt)
+SKIP adopt_then_owner_sends (requires adopt, queue, transcript_reads; missing adopt)
+SKIP run_cause_queued_start_names_its_send (requires run_cause, live_events, streaming, queue, transcript_reads; missing run_cause)
+SKIP run_cause_send_started_runs_never_omit_send_id (requires run_cause, live_events, streaming, queue, transcript_reads; missing run_cause)
+SKIP run_cause_interrupt_names_the_new_send (requires run_cause, live_events, streaming, queue, transcript_reads; missing run_cause)'''
 
 
 class CoverageGuards(unittest.TestCase):
@@ -180,16 +216,23 @@ class CoverageGuards(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'missing from the CI partition'):
             self.helper.integration_map(full, portable, '1/4')
 
-    def audit_kit_skip(self, line, enclosing=KIT_CASE):
+    def audit_kit_skip(self, line, enclosing=KIT_CASE, slow_output=False, result='PASS', selected=True):
         binary, test = enclosing
         suite = {binary: [(test, False, 'matches')]}
+        if slow_output:
+            suite['other::it'] = [('another_portable_case', False, 'matches')]
         full = self.inventory('kit-full.json', suite)
-        portable = self.inventory('kit-portable.json', suite)
+        portable = self.inventory('kit-portable.json', suite if selected else {})
         clock_binary, sentinel = self.helper.CLOCK
         log = self.root / 'kit.log'
-        log.write_text(f'PASS [0.01s] {clock_binary} {sentinel}\nSummary [0.01s] 1 test run\n'
-                       f'PASS [0.10s] (1/1) {binary} {test}\n  stdout ───\n    {line}\n'
-                       'Summary [0.10s] 1 test run\n')
+        count = 2 if slow_output else 1
+        output = (f'PASS [0.01s] {clock_binary} {sentinel}\nSummary [0.01s] 1 test run\n'
+                  f'{result} [0.10s] (1/{count}) {binary} {test}\n')
+        if slow_output:
+            output += ('PASS [0.11s] (2/2) other::it another_portable_case\n'
+                       f'SLOW [147.383s] (1/2) {binary} {test}\n')
+        output += f'  stdout ───\n    {line}\nSummary [0.10s] {count} tests run\n'
+        log.write_text(output)
         return self.helper.audit_integration(log, full, portable)
 
     def test_real_session_retention_skip_is_expected_without_exempting_the_suite(self):
@@ -200,7 +243,7 @@ class CoverageGuards(unittest.TestCase):
 
     def test_reviewed_optional_kit_cases_match_the_independent_transcript(self):
         lines = KIT_SKIPS.splitlines()
-        self.assertEqual(len(lines), 30)
+        self.assertEqual(len(lines), 66)
         self.assertEqual({line.split()[1] for line in lines}, set(self.helper.KIT_SKIP_EXPECTATIONS))
         for line in lines:
             with self.subTest(case=line.split()[1]):
@@ -210,10 +253,28 @@ class CoverageGuards(unittest.TestCase):
         line = KIT_SKIPS.splitlines()[0]
         for enclosing in [('other::llm_runner_conformance', KIT_CASE[1]),
                           (KIT_CASE[0], 'another_conformance_test'),
+                          (KIT_CASE[0], 'kit_compaction_cases_without_process_kills'),
                           (KIT_CASE[0], KIT_CASE[1] + '_extra')]:
             with self.subTest(enclosing=enclosing):
                 with self.assertRaisesRegex(ValueError, 'passing fixture skip'):
                     self.audit_kit_skip(line, enclosing)
+
+    def test_slow_output_header_attributes_real_kit_skip_to_its_owner(self):
+        result = self.audit_kit_skip(KIT_SKIPS.splitlines()[0], slow_output=True)
+        self.assertEqual(result, {'executed': 2, 'portable_executed': 2, 'clock': 'PASS'})
+
+    def test_slow_header_is_not_a_passing_execution(self):
+        with self.assertRaisesRegex(ValueError, 'execution identities'):
+            self.audit_kit_skip(KIT_SKIPS.splitlines()[0], result='SLOW')
+
+    def test_named_kit_case_guard_stays_strict_outside_portable_selection(self):
+        result = self.audit_kit_skip(KIT_SKIPS.splitlines()[0], selected=False)
+        self.assertEqual(result, {'executed': 1, 'portable_executed': 0, 'clock': 'PASS'})
+        for line in ['SKIP fixture: absent',
+                     'SKIP retention_honoured (requires retention, queue, transcript_reads, run_ops; missing retention)']:
+            with self.subTest(line=line):
+                with self.assertRaisesRegex(ValueError, 'passing fixture skip'):
+                    self.audit_kit_skip(line, selected=False)
 
     def test_arbitrary_session_and_legacy_retention_skips_stay_strict(self):
         lines = [
@@ -223,6 +284,9 @@ class CoverageGuards(unittest.TestCase):
             'SKIP step_events_new_case (requires step_events, queue, transcript_reads; missing step_events)',
             'SKIP user_commands_new_case (requires user_commands, queue; missing user_commands)',
             'SKIP retention_honoured (requires retention, queue, transcript_reads, run_ops; missing retention)',
+            'SKIP tags_resolve_answers_the_current_lineage (requires tags, queue, transcript_reads, dispatch_attribution, kill_at:StepRecorded; missing kill_at:StepRecorded)',
+            'SKIP structured_output_frozen_across_restart (requires structured_output, queue, transcript_reads, run_ops, kill_at:ToolResultRecorded; missing kill_at:ToolResultRecorded)',
+            'SKIP run_result_interrupted_not_cancelled (requires run_ops, queue, transcript_reads, kill_at:DispatchIntent; missing kill_at:DispatchIntent)',
         ]
         for line in lines:
             with self.subTest(line=line):

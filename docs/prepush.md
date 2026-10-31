@@ -130,7 +130,8 @@ The pinned llm-runner kit's optional-case skips have explicit expectations only
 inside `broca-module-serve::llm_runner_conformance /
 ck_broca_passes_the_llm_runner_conformance_suite`. Each reviewed case must report
 its exact required and missing capability sets. The undeclared per-session
-retention, step-events and user-command groups do not exempt the enclosing test:
+retention, step-events, user-command and other optional adapter capabilities do
+not exempt the enclosing test:
 unknown cases, fixture skips, missing declared capabilities and legacy
 `retention_honoured` skips still fail the guard.
 
