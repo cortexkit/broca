@@ -176,6 +176,8 @@ pub const CLIENT_MESSAGE_ID_FEATURE: &str = "client-message-id/v1";
 /// build without it would give the session's rides its own short deadline), and the
 /// `CompactionRideWait` / `CompactionRideWaitEnded` records of a ride whose wait was reported.
 pub const COMPACTION_RIDE_WAIT_FEATURE: &str = "compaction-ride-wait/v1";
+/// Setup's negotiated part rendering and pending first view affect resumed model bytes.
+pub const COMPACTION_VIEW_NEGOTIATION_FEATURE: &str = "compaction-view-negotiation/v1";
 /// Media references and ordered tool parts extend closed content enums.
 pub const MEDIA_CONTENT_FEATURE: &str = "media-content/v1";
 
@@ -213,6 +215,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     CHATGPT_CODEX_WIRE_FEATURE,
     CLIENT_MESSAGE_ID_FEATURE,
     COMPACTION_RIDE_WAIT_FEATURE,
+    COMPACTION_VIEW_NEGOTIATION_FEATURE,
     COMPACTION_VIEW_FEATURE,
     COMPACTION_WAIT_FEATURE,
     COMPACTION_FEATURE,
@@ -1521,6 +1524,7 @@ mod tests {
                 CHATGPT_CODEX_WIRE_FEATURE,
                 CLIENT_MESSAGE_ID_FEATURE,
                 COMPACTION_RIDE_WAIT_FEATURE,
+                COMPACTION_VIEW_NEGOTIATION_FEATURE,
                 COMPACTION_VIEW_FEATURE,
                 COMPACTION_WAIT_FEATURE,
                 COMPACTION_FEATURE,
@@ -3125,6 +3129,35 @@ mod v4_header_len_tests {
                 })
                 .unwrap();
             assert_eq!(frame.len(), prepared.frame_len(), "{record:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod view_negotiation_tests {
+    use super::*;
+
+    #[test]
+    fn an_older_reader_refuses_setup_view_negotiation_before_decoding() {
+        let mut value = serde_json::json!({"type":"compaction_message","provider":"mc","kind":"setup",
+            "compaction_id":"c","version":1,"range":{"from":0,"to":0},"replacement":[],"sha256":"a".repeat(64)});
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|feature| *feature != COMPACTION_VIEW_NEGOTIATION_FEATURE)
+            .collect();
+        for member in ["view_due", "view_features"] {
+            value[member] = if member == "view_due" {
+                serde_json::json!({"version":7,"digest":"b".repeat(64)})
+            } else {
+                serde_json::json!(["truncate", "tag_bytes_edits"])
+            };
+            let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
+            let bytes = encode(1, 1, &record).unwrap();
+            assert!(
+                matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [COMPACTION_VIEW_NEGOTIATION_FEATURE])
+            );
+            value.as_object_mut().unwrap().remove(member);
         }
     }
 }

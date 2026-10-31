@@ -1156,6 +1156,8 @@ mod tests {
                 cut: "m0".into(),
             }),
             ride_wait_ms: None,
+            view_features: None,
+            view_due: None,
         };
         wal.append(1, &setup, true).unwrap();
         let counter = broca_wal::access_counter::WalAccessCounter::default();
