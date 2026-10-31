@@ -1,0 +1,1 @@
+{"result":{"usage":{"steps":1,"unreported_steps":0,"output_tokens":30,"reasoning_tokens":10,"by_model":[{"provider":"fake","model":"fake","steps":1,"unreported_steps":0,"output_tokens":30,"reasoning_tokens":10}]},"run_id":"sample","state":"completed","final_message":{"ordinal":1,"mid":"m1","text":"answer"}}}

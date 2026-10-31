@@ -421,6 +421,19 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   omitted, never an empty string; each entry contributes to the run totals, including
   unreported steps. These counters and the model breakdown do not change subscriber
   `step_finished` / `run_finished` usage units or the WAL record format.
+  An optional `generation` list groups measured model calls by `{model, service_tier?, speed?}`
+  in first-measured order. Each entry has `model_calls`, `output_tokens`,
+  `sent_to_last_content_ms` and `first_to_last_content_ms`: both durations and the token total
+  cover the same final attempts with reported output tokens and timestamps ordered
+  `sent_at_ms <= first_content_at_ms <= last_content_at_ms`. Durations are sums of `last - sent`
+  and `last - first`; they exclude tool time, failed retries and post-content bookkeeping.
+  `reasoning_tokens` is included only when every counted call reports it, and is already part of
+  output. Tier and speed are provider-reported facts, omitted when absent. Served models use the
+  billing attribution; mixed-model calls are excluded because the log has no per-model timing
+  split. Missing or reversed timestamps and unreported output tokens produce no sample, not zero.
+  Empty groups and an entirely unmeasured `generation` member are omitted; older logs remain
+  unmeasured. These client-side decoded-content intervals measure observed delivery, not the
+  provider's internal token-generation clock.
 - `run.result`'s `final_message.text` joins the final assistant message's text parts with
   nothing inserted, leaving reasoning out; a completed run with no text answers `""`.
   It is not paged and is not subject to `session.read.max_bytes`; when its complete encoded frame
