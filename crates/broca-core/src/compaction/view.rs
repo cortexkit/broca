@@ -56,6 +56,8 @@ pub struct Announced {
     pub through_ordinal: Option<u64>,
     pub applied_view_version: Option<u64>,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_edit_cost: Option<String>,
 }
 
 impl Announced {
@@ -68,6 +70,7 @@ impl Announced {
             through_ordinal: number(headers::THROUGH_ORDINAL),
             applied_view_version: number(headers::APPLIED_VIEW_VERSION),
             model: map.get(headers::MODEL).cloned(),
+            history_edit_cost: map.get(headers::HISTORY_EDIT_COST).cloned(),
         }
     }
 }
@@ -813,6 +816,7 @@ pub(crate) fn render(
 
 /// What a step boundary knows that a notice reports besides the folded state.
 pub struct NoticeFacts<'a> {
+    pub history_edit_cost: Option<crate::compaction_provider::notice::HistoryEditCost>,
     /// `llm-runner/v1`'s session reference.
     pub session_ref: String,
     /// The WAL lineage the transcript's ordinals count in.
@@ -910,6 +914,10 @@ pub(crate) fn notice_at(
         a.lineage_id.as_deref() == Some(facts.lineage_id)
             && a.through_ordinal == Some(through_ordinal)
             && a.applied_view_version == applied
+            && facts
+                .history_edit_cost
+                .as_ref()
+                .is_none_or(|cost| a.history_edit_cost.as_deref() == Some(cost.as_str()))
     });
     if unchanged && events.is_empty() {
         return None;
@@ -924,6 +932,9 @@ pub(crate) fn notice_at(
         facts.model,
     )
     .with_events(events);
+    if let Some(cost) = facts.history_edit_cost {
+        notice = notice.with_history_edit_cost(cost);
+    }
     if let Some(window) = facts.window {
         notice = notice.with_window(window);
     }

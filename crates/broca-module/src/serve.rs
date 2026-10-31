@@ -3877,13 +3877,21 @@ impl ServeHandler for crate::LineageRegistry {
                 policy: pending.policy.clone(),
             }
         });
-        baseline.effective = change.effective.as_ref().map(|effective| {
-            cortexkit_role_llm_runner::baseline::EffectiveBaseline {
-                generation: effective.generation,
-                applied_by: effective.applied_by.clone(),
-                manifest_digest: effective.manifest_digest.clone(),
-            }
-        });
+        baseline.effective =
+            change
+                .effective
+                .as_ref()
+                .map(|effective| broca_wire::EffectiveBaselineWire {
+                    generation: effective.generation,
+                    applied_by: effective.applied_by.clone(),
+                    manifest_digest: effective.manifest_digest.clone(),
+                    composition_digest: effective.composition_digest.clone(),
+                    absent_items: effective
+                        .absent_items
+                        .iter()
+                        .map(|item| serde_json::to_value(item).expect("a baseline item is JSON"))
+                        .collect(),
+                });
         baseline.rungs = Some(cortexkit_role_llm_runner::baseline::Rungs {
             tools: broca_fetch_plan::session_change::TOOLS_RUNGS
                 .iter()

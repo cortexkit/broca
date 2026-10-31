@@ -191,6 +191,41 @@ Codex-profile frames additionally record continuation, suffix item count (zero o
 connection generation, previous-ID presence, confirmed physical send count and full-input
 reason. These nested fields, and run starts/refreezes carrying the profile, require
 `chatgpt-codex-wire/v1`; the feature floor is published before the gated frame.
+
+`full_input_reason` is absent on continuations. Broca emits the following closed
+vocabulary on full-input Codex frames; readers decode it as an **open string** so
+later reasons do not prevent an older broca from reading the WAL after rollback:
+
+| Value | Evidence at the transport decision |
+| --- | --- |
+| `new_connection_age` | A usable socket reached its 40-minute absolute age ceiling, including the pool's age expiry. |
+| `new_connection_idle` | A kept socket reached its 10-minute idle expiry before its age ceiling. |
+| `new_connection_run_start` | The run acquired no kept socket and no remembered retirement cause. This does not distinguish first use from a process restart, explicit teardown, or forgotten retirement history. |
+| `new_connection_run_start_capacity` | The pool evicted this session's socket at its 64-idle-socket limit. |
+| `new_connection_run_start_receipt_bytes` | The pool evicted this session's socket to respect its shared receipt-byte budget. |
+| `new_connection_run_start_receipt_too_large` | This session's completed receipt alone exceeded that budget and was not retained. |
+| `previous_attempt_failed` | The preceding attempt errored, was cancelled/cut, or returned `response.incomplete`, leaving no usable receipt. This does not assert a provider cache eviction. |
+| `connection_limit` | The backend reported `websocket_connection_limit_reached`; applies to its failed socket and the same credential's idle sockets retired by that refusal, not local pool capacity. |
+| `account_or_credential_change` | Credential revision, credential/account reference, authorization value, or account header value changed on a socket that otherwise could have been considered for reuse. Header-name casing and ordering alone do not prove a credential change. |
+| `no_completed_response` | No usable saved `response.completed` state for continuing this socket, and no more specific cause known. Endpoint/routing-only changes, header-format-only drift and unexplained peer closures are not guessed to be authentication failures. |
+| `model_changed`, `tools_changed`, `tool_choice_changed`, `parallel_tool_calls_changed`, `reasoning_changed`, `store_changed`, `stream_changed`, `include_changed`, `service_tier_changed`, `prompt_cache_key_changed`, `text_changed` | A receipt exists but the named continuation property differs. |
+| `input_shape`, `input_shortened`, `input_mismatch`, `empty_response_id` | A receipt exists but cannot prove a compatible input prefix or usable response ID. |
+
+The retirement ledger is process-local and bounded to 64 session keys, like the
+idle pool. It stores only a cause and retirement timestamp, consumes a cause at
+checkout, and forgets the oldest entry at capacity. Forgetting a cause falls back
+to `new_connection_run_start`, never a guessed idle/age/failure attribution. When
+both age and idle deadlines have elapsed, the earlier deadline determines expiry;
+equal deadlines select age. A simultaneously observed credential change takes
+precedence over age retirement. A known receipt-compatibility failure always takes
+precedence over a missing-receipt cause.
+
+Optional `cache_evidence` on the attempt contains the canonical full-request
+comparison described in [cache-dump.md](cache-dump.md#offline-cache-diagnosis).
+It is independent of the socket frame: a full-input resend can still extend the
+previous logical request exactly. No new log feature requiring reader support is
+needed for this informational field; older record readers ignore it.
+
 `websocket_close_code` records a received server close code. Response digests cover
 HTTP body bytes or socket text payloads before adaptation, not WebSocket framing or
 ping/pong payloads. The mid-stream WARN identifies transport and numeric close code;

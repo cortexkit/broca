@@ -607,6 +607,7 @@ mod gated {
                 sent_at_ms,
                 transport,
                 websocket_request,
+                cache_evidence: _,
                 websocket_close_code,
                 input_transformations: _,
                 input_transformations_unmeasured: _,
@@ -719,6 +720,12 @@ mod gated {
             format!("{:?}", Some(&reservation))
         );
         checkpoint.output_reservation = stripped_checkpoint.output_reservation.clone();
+        // The checkpoint also records whether the prefix holds any model attempt, so a resume
+        // knows whether an earlier request exists to compare the next one against. That is
+        // the second fold attempt records may change, and nothing else may.
+        assert_eq!(checkpoint.has_model_attempt, Some(true));
+        assert_eq!(stripped_checkpoint.has_model_attempt, Some(false));
+        checkpoint.has_model_attempt = stripped_checkpoint.has_model_attempt;
         assert_eq!(
             format!("{checkpoint:?}"),
             format!("{stripped_checkpoint:?}")

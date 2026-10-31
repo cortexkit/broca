@@ -161,6 +161,9 @@ pub struct ModelAttempt {
     /// tag and send-only metadata. The canonical full-body digest above is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket_request: Option<Box<WebSocketRequestDigest>>,
+    /// Optional request-prefix evidence; absent on attempts without a verified predecessor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_evidence: Option<Box<serde_json::Value>>,
     /// Server close code, when a socket ended this attempt with a close frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket_close_code: Option<u16>,

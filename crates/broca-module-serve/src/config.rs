@@ -81,6 +81,80 @@ impl LlmToolsConfig {
     }
 }
 
+/// Boot-only reader-first rollout switch for compaction notice pricing and chain resets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactionSignalsConfig {
+    pub enabled: bool,
+}
+
+impl Default for CompactionSignalsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl CompactionSignalsConfig {
+    pub fn load_default() -> Result<Self, String> {
+        use crate::config_home::ConfigHome;
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
+                Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                Err(e) => Err(format!(
+                    "read compaction_signals from {}: {e}",
+                    path.display()
+                )),
+            },
+            ConfigHome::Unresolvable => Ok(Self::default()),
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(default = "enabled")]
+            compaction_signals: bool,
+        }
+        fn enabled() -> bool {
+            true
+        }
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        serde_json::from_str::<File>(&text)
+            .map(|file| Self {
+                enabled: file.compaction_signals,
+            })
+            .map_err(|e| format!("parse compaction_signals: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod compaction_signals_config_tests {
+    use super::CompactionSignalsConfig as Config;
+    #[test]
+    fn default_on_and_explicit_off_are_strict_booleans() {
+        for text in ["{}", r#"{"compaction_signals":true}"#] {
+            assert!(Config::parse(text).unwrap().enabled);
+        }
+        assert!(
+            !Config::parse("{/* rollback */ \"compaction_signals\":false,}")
+                .unwrap()
+                .enabled
+        );
+        for text in [
+            r#"{"compaction_signals":null}"#,
+            r#"{"compaction_signals":"false"}"#,
+            r#"{"compaction_signals":0}"#,
+        ] {
+            assert!(Config::parse(text)
+                .unwrap_err()
+                .contains("compaction_signals"));
+        }
+    }
+}
+
 /// Boot-only media opt-in. Unknown settings refuse rather than silently disabling capture.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]

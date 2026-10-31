@@ -237,7 +237,11 @@ impl SessionInventory for OverhaulDb {
             .map_err(|e| format!("reconcile overhaul session inventory: {e}"))
     }
     fn rebuild_inventory(&self, _root: &Path) -> Result<(), String> {
-        self.reconcile_inventory().map_err(|e| e.to_string())
+        // Repair must not hold the serving connection's mutex while rebuilding
+        // the session inventory. WAL-mode readers can resolve known identities.
+        Self::open(&self.root)
+            .and_then(|repair| repair.reconcile_inventory())
+            .map_err(|e| e.to_string())
     }
     fn retained_sessions(&self) -> Result<Vec<BindIdentity>, String> {
         OverhaulDb::retained_sessions(self).map_err(|e| e.to_string())

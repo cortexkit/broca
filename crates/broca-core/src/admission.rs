@@ -92,6 +92,7 @@ pub fn submission_difference(
         work_class: _,
         variant: existing_variant,
         service_tier: existing_service_tier,
+        service_tier_level: existing_service_tier_level,
         stop_when: existing_stop_when,
         context_management: existing_context_management,
         inherit_frozen: existing_inherit_frozen,
@@ -122,6 +123,7 @@ pub fn submission_difference(
         work_class: _,
         variant: requested_variant,
         service_tier: requested_service_tier,
+        service_tier_level: requested_service_tier_level,
         stop_when: requested_stop_when,
         context_management: requested_context_management,
         inherit_frozen: requested_inherit_frozen,
@@ -160,6 +162,10 @@ pub fn submission_difference(
         (
             existing_service_tier != requested_service_tier,
             "service_tier",
+        ),
+        (
+            existing_service_tier_level != requested_service_tier_level,
+            "service_tier_level",
         ),
         (existing_stop_when != requested_stop_when, "stop_when"),
         (
@@ -218,6 +224,8 @@ struct SubmissionIdentityDigestV1 {
     /// Omitted when the send carried no service tier, for the same reason as `variant`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    service_tier_level: Option<String>,
     stop_when: String,
     /// Absent when the caller omitted the field, so every digest stored before the field existed
     /// still compares equal to the same request sent today.
@@ -318,6 +326,7 @@ fn identity_digest_v1(
         work_class: _,
         variant,
         service_tier,
+        service_tier_level,
         stop_when,
         context_management,
         inherit_frozen,
@@ -352,6 +361,7 @@ fn identity_digest_v1(
             .as_ref()
             .map(|variant| digest_json(serde_json::json!(variant))),
         service_tier: service_tier.map(|tier| digest_json(serde_json::json!(tier))),
+        service_tier_level: service_tier_level.clone(),
         stop_when: digest_json(serde_json::json!(stop_when)),
         context_management: context_management
             .as_ref()
@@ -434,6 +444,10 @@ pub fn send_identity_difference_with_conversation_key(
         (
             stored.service_tier != requested.service_tier,
             "service_tier",
+        ),
+        (
+            stored.service_tier_level != requested.service_tier_level,
+            "service_tier_level",
         ),
         (stored.stop_when != requested.stop_when, "stop_when"),
         (
@@ -745,6 +759,10 @@ pub struct AdmissionCheckpointV1 {
     /// Missing on older checkpoints; a tail alone cannot recover an earlier measured request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_reservation: Option<crate::output_reservation::OutputReservationHistory>,
+    /// Whether this complete prefix contains any model attempt, across all episodes.
+    /// Missing on older checkpoints means unknown, never proof that no request was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_model_attempt: Option<bool>,
 }
 
 /// A `DeliveryOrdered` record set aside for the `Queued` record that follows it.
@@ -788,6 +806,7 @@ impl AdmissionCheckpointV1 {
             output_reservation: Some(
                 crate::output_reservation::OutputReservationHistory::default(),
             ),
+            has_model_attempt: Some(false),
         }
     }
 
@@ -800,6 +819,7 @@ impl AdmissionCheckpointV1 {
             checkpoint.lineage_retention = None;
             checkpoint.tags = None;
             checkpoint.output_reservation = None;
+            checkpoint.has_model_attempt = None;
         }
         checkpoint.fold_frames(records)?;
         if checkpoint
@@ -1154,8 +1174,9 @@ impl AdmissionCheckpointV1 {
             | WalRecord::CompactionRideWait { .. }
             | WalRecord::CompactionRideWaitEnded { .. }
             | WalRecord::CompactionNotice { .. } => {}
-            // Provider attempt evidence is informational only, skipped exactly like `Unknown`.
-            WalRecord::ModelAttemptFinished { .. } => {}
+            // Attempts do not alter session or prompt state. Their presence tells cache
+            // diagnostics whether a previous model request may need rebuilding after restart.
+            WalRecord::ModelAttemptFinished { .. } => self.has_model_attempt = Some(true),
             WalRecord::AttemptReserved { .. }
             | WalRecord::AttemptFinished { .. }
             | WalRecord::AttemptReleased { .. }
@@ -1332,7 +1353,10 @@ impl AdmissionCheckpointV1 {
 
 impl Default for AdmissionCheckpointV1 {
     fn default() -> Self {
-        Self::empty()
+        let mut checkpoint = Self::empty();
+        // A default value is not proof that a historical prefix contained no attempts.
+        checkpoint.has_model_attempt = None;
+        checkpoint
     }
 }
 
@@ -2412,7 +2436,9 @@ impl AdmissionContinuation {
         let mut head = crate::head::HeadProjection::default();
         let mut input = crate::input_budget::InputTokenBudget::default();
         let mut output = crate::output_reservation::OutputReservationHistory::default();
+        let mut has_model_attempt = false;
         for frame in self.accounting_frames(read_at)? {
+            has_model_attempt |= matches!(frame.record, WalRecord::ModelAttemptFinished { .. });
             head.observe(&frame.record);
             input.fold(&frame.record).map_err(|_| {
                 crate::replay::SeedFallback::new("continuation input accounting invalid")
@@ -2427,6 +2453,9 @@ impl AdmissionContinuation {
         seed.scalars.head = Some(head);
         seed.scalars.input_budget = Some(input);
         seed.scalars.output_reservation = Some(output);
+        // Attempts are already authenticated accounting sources, so restore the summary
+        // without adding diagnostic state to the content-free continuation's wire schema.
+        seed.scalars.has_model_attempt = Some(has_model_attempt);
         Ok(seed)
     }
 
@@ -2620,8 +2649,9 @@ impl AdmissionContinuation {
         seed.paused_episode(read_at, tail, safe_head)
     }
 
-    /// Consume the suffix after the stored boundary, with the position from the same
-    /// projection fold. Row cursors cannot substitute for either continuation position.
+    /// Consume the suffix after the stored WAL boundary. The supplied projection position
+    /// and tag seed must come from the same fold; database row cursors identify neither
+    /// the WAL boundary nor the projection position.
     pub(crate) fn advance(
         &self,
         read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
@@ -2803,6 +2833,10 @@ impl AdmissionContinuation {
         self.seed.tag_rules = tags.rules.map(|r| (r.render, r.clean));
     }
 }
+
+#[cfg(test)]
+#[path = "admission_checkpoint_legacy.rs"]
+mod checkpoint_legacy;
 
 #[cfg(test)]
 mod tests {
@@ -3019,6 +3053,7 @@ mod tests {
 
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
+            service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
             directives: None,
@@ -3440,6 +3475,7 @@ mod tests {
         // A new checkpoint field must be added to this exhaustive literal and exercised
         // by the populated roundtrip fixture.
         AdmissionCheckpointV1 {
+            has_model_attempt: full.has_model_attempt,
             media: full.media,
             head: full.head,
             has_deferred_calls: full.has_deferred_calls,
@@ -3512,6 +3548,16 @@ mod tests {
             submission_id.0 = "staged-submission".into();
         }
         records.extend([staged, WalRecord::TurnFinished { step_id: StepId(1) }]);
+        records.insert(
+            1,
+            serde_json::from_value(serde_json::json!({
+                "type":"model_attempt_finished","step_id":1,"attempt":0,
+                "request_body_len":12,"request_body_sha256":"request",
+                "response_body_len":0,"response_body_sha256":"response",
+                "outcome":"complete","ts_ms":1
+            }))
+            .unwrap(),
+        );
         let frames: Vec<_> = records
             .into_iter()
             .enumerate()
@@ -5787,6 +5833,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            has_model_attempt: None,
             media: None,
             output_reservation: None,
             head: None,
@@ -5887,6 +5934,106 @@ mod tests {
                 session_change_recorded: false,
                 plan_manifest_folded: true,
             }
+        );
+    }
+
+    #[test]
+    fn checkpoint_attempt_presence_is_ignored_by_the_old_decoder() {
+        let mut checkpoint =
+            AdmissionCheckpointV1::from_frames(&[started(1, "first", None)]).unwrap();
+        for fact in [None, Some(false), Some(true)] {
+            checkpoint.has_model_attempt = fact;
+            let encoded = encode_admission_checkpoint(&checkpoint).unwrap();
+            let old = super::checkpoint_legacy::round_trip(&encoded)
+                .expect("old checkpoint decoder accepts the new optional field");
+            let mut expected = checkpoint.clone();
+            expected.has_model_attempt = None;
+            assert_eq!(old, encode_admission_checkpoint(&expected).unwrap());
+        }
+    }
+
+    #[test]
+    fn attempt_presence_checkpoint_and_tail_match_full_replay_at_every_cut() {
+        let attempt = serde_json::from_value(serde_json::json!({
+            "type":"model_attempt_finished","step_id":1,"attempt":0,
+            "request_body_len":12,"request_body_sha256":"request",
+            "response_body_len":0,"response_body_sha256":"response",
+            "outcome":"complete","ts_ms":1
+        }))
+        .unwrap();
+        let finished = || {
+            serde_json::from_value(serde_json::json!({
+                "type":"run_finished","reason":"completed","usage":{}
+            }))
+            .unwrap()
+        };
+        let records = [
+            started(1, "first", None),
+            frame(2, WalRecord::StepStarted { step_id: StepId(1) }),
+            frame(3, attempt),
+            frame(4, finished()),
+            started(5, "second", None),
+            frame(6, finished()),
+        ];
+        for end in 0..=records.len() {
+            let full = AdmissionCheckpointV1::from_frames(&records[..end]).unwrap();
+            assert_eq!(full.has_model_attempt, Some(end >= 3), "cut {end}");
+            for cut in 0..=end {
+                let prefix = AdmissionCheckpointV1::from_frames(&records[..cut]).unwrap();
+                let mut seeded =
+                    decode_admission_checkpoint(&encode_admission_checkpoint(&prefix).unwrap())
+                        .unwrap();
+                seeded.fold_frames(&records[cut..end]).unwrap();
+                assert_eq!(
+                    seeded.has_model_attempt, full.has_model_attempt,
+                    "prefix {cut}, end {end}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn absent_attempt_presence_stays_unknown_until_a_proven_attempt() {
+        assert_eq!(AdmissionCheckpointV1::default().has_model_attempt, None);
+        assert_eq!(
+            AdmissionCheckpointV1::from_frames(&[started(5, "suffix", None)])
+                .unwrap()
+                .has_model_attempt,
+            None
+        );
+        let prefix = AdmissionCheckpointV1::from_frames(&[started(1, "first", None)]).unwrap();
+        let mut old = serde_json::to_value(prefix).unwrap();
+        old.as_object_mut().unwrap().remove("has_model_attempt");
+        let mut unknown: AdmissionCheckpointV1 = serde_json::from_value(old).unwrap();
+        assert_eq!(unknown.has_model_attempt, None);
+        unknown
+            .fold_record(2, &WalRecord::StepStarted { step_id: StepId(1) })
+            .unwrap();
+        assert_eq!(
+            unknown.has_model_attempt, None,
+            "a tail cannot prove absence in an older prefix"
+        );
+        let attempt = serde_json::from_value(serde_json::json!({
+            "type":"model_attempt_finished","step_id":1,"attempt":0,
+            "request_body_len":12,"request_body_sha256":"request",
+            "response_body_len":0,"response_body_sha256":"response",
+            "outcome":"complete","ts_ms":1
+        }))
+        .unwrap();
+        unknown.fold_record(3, &attempt).unwrap();
+        assert_eq!(unknown.has_model_attempt, Some(true));
+        let finished = serde_json::from_value(serde_json::json!({
+            "type":"run_finished","reason":"completed","usage":{}
+        }))
+        .unwrap();
+        unknown.fold_record(4, &finished).unwrap();
+        unknown
+            .fold_record(5, &started(5, "next", None).record)
+            .unwrap();
+        assert_eq!(
+            unknown.has_model_attempt,
+            Some(true),
+            "a new episode cannot clear a proven attempt"
         );
     }
 

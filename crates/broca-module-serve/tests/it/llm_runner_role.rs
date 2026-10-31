@@ -2113,7 +2113,18 @@ async fn one_stream_sequence_counts_both_lanes_and_restarts_for_each_subscribe()
 
 #[tokio::test]
 async fn live_tool_observations_and_control_bytes_survive_a_real_serve_restart() {
-    let (mut rig, _) = one_tool_turn("live-tool-restart").await;
+    assert_tool_replay_survives_restart("live-tool-restart", None).await;
+}
+
+#[tokio::test]
+async fn delayed_tool_replay_survives_a_real_serve_restart() {
+    // The transport withholds replay for longer than the quiet window, even when
+    // the server has already produced it. Silence must not stand in for attachment.
+    assert_tool_replay_survives_restart("delayed-tool-restart", Some(Duration::from_secs(1))).await;
+}
+
+async fn assert_tool_replay_survives_restart(tag: &str, replay_delay: Option<Duration>) {
+    let (mut rig, _) = one_tool_turn(tag).await;
     let records = rig.records();
     let started = records
         .iter()
@@ -2131,11 +2142,17 @@ async fn live_tool_observations_and_control_bytes_survive_a_real_serve_restart()
             _ => None,
         })
         .expect("the real tool call recorded its finish observation");
+    if let Some(delay) = replay_delay {
+        rig.delay_next_subscription_reads(delay);
+    }
+    // The display reset follows the durable control replay. Wait for that barrier
+    // before starting the quiet window, so a slow attachment cannot look empty.
     let before = rig
-        .subscribe_collect(
+        .subscribe_collect_after_display_reset(
             9,
             serde_json::json!({"from":"start"}),
             Duration::from_millis(500),
+            || {},
         )
         .await;
     let values = assert_stream_sequences(&before);
@@ -2156,11 +2173,15 @@ async fn live_tool_observations_and_control_bytes_survive_a_real_serve_restart()
         "stopping an already-finished run writes nothing"
     );
     rig = rig.restart().await;
+    if let Some(delay) = replay_delay {
+        rig.delay_next_subscription_reads(delay);
+    }
     let after = rig
-        .subscribe_collect(
+        .subscribe_collect_after_display_reset(
             9,
             serde_json::json!({"from":"start"}),
             Duration::from_millis(500),
+            || {},
         )
         .await;
     assert_stream_sequences(&after);

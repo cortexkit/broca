@@ -147,6 +147,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(ServeIoError)?;
     let bus_event_config =
         broca_module_serve::bus_events::Config::load_default_path().map_err(ServeIoError)?;
+    let compaction_signals = broca_module_serve::config::CompactionSignalsConfig::load_default()
+        .map_err(ServeIoError)?;
     let backup_classes = broca_module_serve::session_class::BackupClasses::load_default_path()
         .map_err(ServeIoError)?;
     let provider_overrides =
@@ -671,6 +673,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     executor_impl = executor_impl.with_context_management(context_management);
+    executor_impl = executor_impl.with_compaction_signals(compaction_signals.enabled);
     let vault_auditor = executor_impl.vault_auditor();
     let wal_reader: Arc<dyn broca_core::WalStore> = wal_store.clone();
     let store_reader: Arc<dyn broca_core::MaterializedStore> = run_index.clone();
@@ -2909,6 +2912,7 @@ mod executor {
         hooks: Option<Arc<broca_subc::SubcHookPlane>>,
         compaction_plane: Option<Arc<broca_subc::SubcCompactionPlane>>,
         compaction_views: Arc<broca_core::ViewReadyInbox>,
+        compaction_signals: bool,
         elicitation_plane: Option<Arc<broca_subc::consent::ScopedConsentPlane>>,
         /// Where provider-held calls wait for their late results; see `held_runtime`.
         provider_held_lifecycle: Option<Arc<broca_module::held_slots::HeldSlots>>,
@@ -3011,6 +3015,7 @@ mod executor {
                 hooks: None,
                 compaction_plane: None,
                 compaction_views: Arc::default(),
+                compaction_signals: true,
                 elicitation_plane: None,
                 provider_held_lifecycle: None,
                 provider_client: build_provider_http_client(),
@@ -3185,6 +3190,11 @@ mod executor {
 
         pub fn compaction_inbox(&self) -> Arc<broca_core::ViewReadyInbox> {
             self.compaction_views.clone()
+        }
+
+        pub fn with_compaction_signals(mut self, enabled: bool) -> Self {
+            self.compaction_signals = enabled;
+            self
         }
 
         pub fn with_elicitation_plane(
@@ -4261,6 +4271,7 @@ mod executor {
                 // Only fresh admissions resolve caller render choices; resume uses the bundle.
                 variant: job.req.variant.as_deref().filter(|_| fresh_episode),
                 service_tier: job.req.service_tier.filter(|_| fresh_episode),
+                queued_service_tier: job.queued_service_tier.as_deref().filter(|_| fresh_episode),
                 clock: Some(&self.clock),
                 frozen_account_ref: if fresh_episode {
                     resolution
@@ -4544,7 +4555,9 @@ mod executor {
                     }
                 };
                 resolved.provider.set_media_request_renderer(Arc::new(
-                    move |frozen, opts, tags, commit| media.render(frozen, opts, tags, commit),
+                    move |frozen, opts, tags, commit, provenance| {
+                        media.render_with_provenance(frozen, opts, tags, commit, provenance)
+                    },
                 ));
             }
 
@@ -4606,6 +4619,7 @@ mod executor {
             // the value is already durable). Mock stays None; a real run carries the
             // method-qualified vault credential id.
             let mut control = job.control;
+            control.compaction_signals = self.compaction_signals;
             control.hook_plane = self.hook_plane();
             // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
             // the durable WAL projector. The actor's live-output task discards those same units,
@@ -4806,6 +4820,7 @@ mod executor {
         use super::*;
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
+        include!("queued_service_tier_tests.rs");
         include!("vault_request_tests.rs");
         include!("role_plane_tests.rs");
         include!("admission_wal_read_budget_tests.rs");
@@ -4932,6 +4947,7 @@ mod executor {
             let summary = executor
                 .execute(
                     RunJob {
+                        queued_service_tier: None,
                         media: Vec::new(),
                         media_profile: None,
                         conversation_key: None,
@@ -5464,6 +5480,7 @@ mod executor {
                     prompt_cache_key: None,
                     variant: None,
                     service_tier: None,
+                    queued_service_tier: None,
                     secret_refresher: None,
                     structured_output: None,
                     frozen_account_ref: None,
@@ -5494,6 +5511,7 @@ mod executor {
                 prompt_cache_key: None,
                 variant: None,
                 service_tier: None,
+                queued_service_tier: None,
                 secret_refresher: None,
                 structured_output: None,
                 frozen_account_ref: None,

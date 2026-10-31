@@ -139,6 +139,7 @@ fn attempt(bytes: &[u8]) -> ModelAttempt {
         sent_at_ms: None,
         transport: None,
         websocket_request: None,
+        cache_evidence: None,
         websocket_close_code: None,
         input_transformations: None,
         input_transformations_unmeasured: false,

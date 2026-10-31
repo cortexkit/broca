@@ -277,7 +277,13 @@ impl Provider for ScriptedProvider {
     ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>> {
         if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
             if let Some(renderer) = self.2.read().unwrap().as_ref() {
-                return renderer(&serde_json::to_value(frozen).unwrap(), opts, false, false);
+                return renderer(
+                    &serde_json::to_value(frozen).unwrap(),
+                    opts,
+                    false,
+                    false,
+                    None,
+                );
             }
             return Ok(broca_provider::registry::wire_family(frozen.family_id)
                 .unwrap()
@@ -318,7 +324,7 @@ impl Provider for ScriptedProvider {
             *self.0.hold_model.lock().unwrap()
         ));
         let rendered = if let Some(renderer) = self.2.read().unwrap().as_ref() {
-            renderer(&self.render_config_blob(), opts, false, true).unwrap()
+            renderer(&self.render_config_blob(), opts, false, true, None).unwrap()
         } else if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
             broca_provider::registry::wire_family(frozen.family_id)
                 .unwrap()
@@ -612,9 +618,11 @@ impl RunExecutor for CoreExec {
                 }),
             )
             .unwrap();
-            provider.set_media_request_renderer(Arc::new(move |frozen, opts, tags, commit| {
-                media.render(frozen, opts, tags, commit)
-            }));
+            provider.set_media_request_renderer(Arc::new(
+                move |frozen, opts, tags, commit, provenance| {
+                    media.render_with_provenance(frozen, opts, tags, commit, provenance)
+                },
+            ));
         }
         let mut control = job.control;
         control.hook_plane = self.hook_plane();
@@ -712,6 +720,7 @@ pub struct Rig {
     registry: Arc<LineageRegistry>,
     daemon_scopes: bool,
     corr: u64,
+    next_subscription_read_delay: Option<Duration>,
 }
 
 pub struct FailureDiagnostics {
@@ -889,6 +898,7 @@ impl Rig {
             registry,
             daemon_scopes,
             corr: 1,
+            next_subscription_read_delay: None,
         };
         rig.bind(7).await;
         rig
@@ -1034,6 +1044,12 @@ impl Rig {
         .await
     }
 
+    /// Delay receipt, not production, of the next subscription's replay. This lets a
+    /// regression exercise a slow transport without relying on runner contention.
+    pub fn delay_next_subscription_reads(&mut self, delay: Duration) {
+        self.next_subscription_read_delay = Some(delay);
+    }
+
     async fn subscribe_collect_inner(
         &mut self,
         channel: u16,
@@ -1058,6 +1074,20 @@ impl Rig {
         )
         .unwrap();
         write_frame(&mut self.writer, &frame).await.unwrap();
+        if let Some(delay) = self.next_subscription_read_delay.take() {
+            let mut reader = DelayedSubscriptionReader {
+                reader: &mut self.reader,
+                delay: Box::pin(tokio::time::sleep(delay)),
+            };
+            return collect_subscription_frames_at(
+                &mut reader,
+                corr,
+                quiet,
+                on_attach,
+                attach_condition,
+            )
+            .await;
+        }
         collect_subscription_frames_at(&mut self.reader, corr, quiet, on_attach, attach_condition)
             .await
     }
@@ -1528,6 +1558,23 @@ pub fn result(frame: &Frame) -> serde_json::Value {
         String::from_utf8_lossy(&frame.body)
     );
     serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone()
+}
+
+struct DelayedSubscriptionReader<'a, R> {
+    reader: &'a mut R,
+    delay: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for DelayedSubscriptionReader<'_, R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::task::ready!(std::future::Future::poll(this.delay.as_mut(), cx));
+        std::pin::Pin::new(&mut *this.reader).poll_read(cx, buf)
+    }
 }
 
 async fn collect_subscription_frames(

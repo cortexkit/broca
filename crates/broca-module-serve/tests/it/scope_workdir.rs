@@ -335,13 +335,18 @@ async fn ambiguous_and_incomplete_addresses_refuse_before_wal_or_lease_creation(
                 .execute("DELETE FROM agent_data_census_done", [])
                 .unwrap();
         }
+        let name = if class == "transient" {
+            "unrecorded-pair"
+        } else {
+            "ambiguous-pair"
+        };
         let bind = ModuleControlRequest::RouteBind {
             route_channel: 13,
             epoch: 1,
             target: RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(&first.project_root, &first.harness, &first.session),
+            identity: SubcBindIdentity::new(&first.project_root, &first.harness, name),
             principal: Some(scope_owner()),
             consumer_capabilities: None,
             admission_facts: None,
@@ -364,10 +369,7 @@ async fn ambiguous_and_incomplete_addresses_refuse_before_wal_or_lease_creation(
             after["session_address_refusals"][reason].as_u64().unwrap(),
             counters_before[reason].as_u64().unwrap() + 1
         );
-        assert!(error["message"]
-            .as_str()
-            .unwrap()
-            .contains("ambiguous-pair"));
+        assert!(error["message"].as_str().unwrap().contains(name));
         assert_eq!(count(), before);
         let wal = broca_core::FileWalStore::new(rig.dir.join("wal"));
         let leases = broca_core::FileLeaseStore::new(rig.dir.join("leases"));
@@ -377,4 +379,81 @@ async fn ambiguous_and_incomplete_addresses_refuse_before_wal_or_lease_creation(
         }
     }
     rig.finish().await;
+}
+
+#[tokio::test]
+async fn inventory_wait_refusals_keep_the_precise_transient_code_and_reason() {
+    use broca_module::registry::SessionInventoryReadiness;
+    use broca_store::session_address::{InventoryUnavailable, SessionAddressError};
+
+    struct RefusedReadiness(&'static str);
+    #[async_trait::async_trait]
+    impl SessionInventoryReadiness for RefusedReadiness {
+        fn start(&self) {}
+        async fn wait(&self) -> Result<(), SessionAddressError> {
+            Err(SessionAddressError::Unavailable(match self.0 {
+                "wait_expired" => InventoryUnavailable::WaitExpired,
+                "migration_failed" => {
+                    InventoryUnavailable::MigrationFailed("unreadable WAL".into())
+                }
+                "gap_marker" => InventoryUnavailable::GapMarker,
+                _ => unreachable!(),
+            }))
+        }
+    }
+
+    for reason in ["wait_expired", "migration_failed", "gap_marker"] {
+        let mut rig = Rig::start_with_scopes(reason).await;
+        rig.registry()
+            .set_session_inventory_readiness(std::sync::Arc::new(RefusedReadiness(reason)));
+        let conn = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        conn.execute("DELETE FROM agent_data_census_done", [])
+            .unwrap();
+        let before: u64 = conn
+            .query_row("SELECT count(*) FROM agent_data_session_ref", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: 13,
+            epoch: 1,
+            target: RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new(
+                &rig.session.project_root,
+                &rig.session.harness,
+                "new-after-repair",
+            ),
+            principal: Some(scope_owner()),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
+        let reply = rig.request(0, serde_json::to_value(bind).unwrap()).await;
+        assert_eq!(reply.header.ty, FrameType::Error);
+        let error: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(error["code"], "session_address_unavailable");
+        assert_eq!(
+            error["detail"],
+            json!({"class":"transient", "reason":reason})
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM agent_data_session_ref", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            before
+        );
+        let identity = BindIdentity::new(
+            &rig.session.project_root,
+            &rig.session.harness,
+            "new-after-repair",
+        );
+        assert!(!broca_core::FileWalStore::new(rig.dir.join("wal"))
+            .wal_path(&identity)
+            .exists());
+        rig.finish().await;
+    }
 }

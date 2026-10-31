@@ -957,8 +957,9 @@ pub trait SessionRefResolver: Send + Sync {
 /// Identity discovery and projection maintenance do not authorize moving a WAL
 /// or record whether an ownership transfer completed.
 pub trait SessionInventory: SessionRefResolver + crate::SessionRefIndex {
-    /// Prepare discovery before cut recovery. Overhaul implementations must finish
-    /// their census here, rather than report an empty index as complete.
+    /// Synchronous preparation for offline maintenance. Serving starts repair
+    /// through shared readiness instead of blocking on this operation. An empty
+    /// or unfinished census must remain incomplete until repair has finished.
     fn prepare_inventory(&self, root: &std::path::Path) -> Result<(), String>;
     fn rebuild_inventory(&self, root: &std::path::Path) -> Result<(), String>;
     fn retained_sessions(&self) -> Result<Vec<BindIdentity>, String>;

@@ -346,6 +346,7 @@ pub async fn drive<W: WalStore>(
     #[cfg(test)]
     let control = {
         let mut control = control;
+        crate::compaction::seed_legacy_setup(wal_store, &request);
         crate::compaction::schedule_views(&mut control, &request, state_root);
         control
     };

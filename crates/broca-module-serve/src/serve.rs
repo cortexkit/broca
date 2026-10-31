@@ -2393,8 +2393,11 @@ async fn finish_bind(
             "cannot resolve session {:?} in harness {:?}: {error}",
             completed.identity.session, completed.identity.harness
         );
-        let body =
-            ErrorBody::new(error.code(), message).with_detail(serde_json::json!({"class":class}));
+        let mut detail = serde_json::json!({"class":class});
+        if let broca_store::session_address::SessionAddressError::Unavailable(reason) = &error {
+            detail["reason"] = serde_json::json!(reason.reason());
+        }
+        let body = ErrorBody::new(error.code(), message).with_detail(detail);
         return send_error_body(
             writer,
             completed.header.ver,
@@ -6229,7 +6232,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| panic!("reader did not reach {phase:?} gate"));
-            let snapshot = witness.snapshot().await;
+            let snapshot = witness.reader_phase_snapshot(phase).await;
             task.abort();
             let _ = task.await;
             assert_eq!(snapshot["kind"], "reader_phase", "{phase:?}");
