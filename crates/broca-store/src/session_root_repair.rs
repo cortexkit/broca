@@ -1,6 +1,6 @@
 //! Explicit, offline repair of run-index identities left behind by a WAL re-key.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use broca_core::{agent_session_ref, session_addr, ReadOnlyWalReader, RunIndexState, WalStore};
@@ -18,6 +18,9 @@ pub struct RunRootChange {
     pub from: BindIdentity,
     pub to: BindIdentity,
     pub state: String,
+    pub episode_session: BindIdentity,
+    pub episode_state: String,
+    pub row_lineage_id: Option<String>,
     #[serde(skip)]
     before_json: String,
 }
@@ -298,7 +301,7 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
     }
     let (records, _) = reader.records(live_address)?;
     let mut current = None;
-    let mut finished = BTreeSet::new();
+    let mut episodes = BTreeMap::new();
     for frame in &records {
         match &frame.record {
             broca_wal::WalRecord::RunStarted {
@@ -306,14 +309,27 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
                 session: identity,
                 ..
             } => {
-                current = (identity.harness == harness
-                    && identity.session == session
-                    && (identity == stale || identity == live))
-                    .then_some(run_id.0.clone());
+                // Re-keys preserve the embedded triple as historical provenance.
+                // A later start of the same run must earn its own durable terminal.
+                episodes.insert(run_id.0.clone(), (identity.clone(), None));
+                current = Some(run_id.0.clone());
             }
-            broca_wal::WalRecord::RunFinished { .. } => {
+            broca_wal::WalRecord::RunFinished { reason, .. } => {
                 if let Some(run_id) = current.take() {
-                    finished.insert(run_id);
+                    use broca_protocol::caller::RunFinishReason;
+                    let state = match reason {
+                        RunFinishReason::Completed => RunIndexState::Completed,
+                        RunFinishReason::MaxSteps => RunIndexState::MaxSteps,
+                        RunFinishReason::BudgetExhausted => RunIndexState::BudgetExhausted,
+                        RunFinishReason::ContextCeiling => RunIndexState::ContextCeiling,
+                        RunFinishReason::Cancelled => RunIndexState::Cancelled,
+                        RunFinishReason::Interrupted => RunIndexState::Interrupted,
+                        RunFinishReason::Error => RunIndexState::Error,
+                        RunFinishReason::TransformUnavailable => {
+                            RunIndexState::TransformUnavailable
+                        }
+                    };
+                    episodes.get_mut(&run_id).unwrap().1 = Some(state);
                 }
             }
             _ => {}
@@ -321,7 +337,7 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
     }
     let rows = conn
         .prepare(
-            "SELECT run_id,session,state FROM run_index
+            "SELECT run_id,session,state,lineage_id FROM run_index
          WHERE json_extract(CASE WHEN json_valid(session) THEN session ELSE '{}' END,'$.harness')=?1
            AND json_extract(CASE WHEN json_valid(session) THEN session ELSE '{}' END,'$.session')=?2
          ORDER BY run_id",
@@ -331,10 +347,11 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    for (run_id, raw, state) in rows {
+    for (run_id, raw, state, row_lineage_id) in rows {
         let identity: BindIdentity = serde_json::from_str(&raw)?;
         if identity == *live {
             continue;
@@ -342,20 +359,33 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
         if identity != *stale {
             return Err(format!("run {run_id} names a third, uninventoried root").into());
         }
-        if !RunIndexState::parse(&state).is_some_and(|state| state.is_terminal()) {
+        let Some(expected_state) = RunIndexState::parse(&state).filter(|state| state.is_terminal())
+        else {
             return Err(format!(
                 "run {run_id} is not terminal; session-root repair leaves it alone"
             )
             .into());
-        }
-        if !finished.contains(&run_id) {
-            return Err(format!("run {run_id} has no matching completed episode in the surviving log; cannot re-point exactly").into());
+        };
+        let Some((episode_session, episode_state)) = episodes.get(&run_id) else {
+            return Err(format!(
+                "run {run_id} is missing from the surviving log; cannot re-point exactly"
+            )
+            .into());
+        };
+        let Some(episode_state) = episode_state else {
+            return Err(format!("run {run_id} has no durable run_finished in the surviving log; cannot re-point exactly").into());
+        };
+        if *episode_state != expected_state {
+            return Err(format!("run {run_id} row state {state} does not match durable run_finished state {}; cannot re-point exactly", episode_state.as_str()).into());
         }
         result.repoint_runs.push(RunRootChange {
             run_id,
             from: stale.clone(),
             to: live.clone(),
             state,
+            episode_session: episode_session.clone(),
+            episode_state: episode_state.as_str().to_owned(),
+            row_lineage_id,
             before_json: raw,
         });
     }
@@ -394,6 +424,16 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
         }
     }
     plan_projection_cleanup(conn, root, stale, live, &mut result)?;
+    for run in &result.repoint_runs {
+        if run
+            .row_lineage_id
+            .as_ref()
+            .is_some_and(|lineage| Some(lineage) != result.live_log_lineage.as_ref())
+        {
+            return Err(format!("run {} row lineage_id {:?} differs from surviving log lineage {:?}; cannot re-point exactly",
+                run.run_id, run.row_lineage_id, result.live_log_lineage).into());
+        }
+    }
     Ok(result)
 }
 

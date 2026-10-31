@@ -164,7 +164,8 @@ store-maintenance repair-session-root STATE_ROOT --harness HARNESS --session SES
 ```
 
 This is **preview-only by default**. The JSON lists each terminal run row to
-re-point (run ID, old and new identities), each v1 ref and v2 alias to remove
+re-point (run ID, old and new identities, the matched episode's embedded identity
+and terminal state), each v1 ref and v2 alias to remove
 (including root and session), orphaned projection table row counts, the stale
 meta row's lineage and watermark, and any obsolete address discovery rows. Keep a
 backup, review that plan, then repeat with `--write` to apply it. The write prints
@@ -181,14 +182,19 @@ Repair requires a complete inventory, exactly two roots, and exactly one address
 with a WAL across all live trees and sealed archive trees. It refuses deletion
 ledgers/tombstones, expired lineage records, move/cut fences, unreadable sources,
 and competing logs.
-Each stale run must be terminal and its ID must occur in a matching completed
-episode in the surviving verified WAL. Otherwise repair refuses rather than
+Each stale run must be terminal and match an episode by run ID in the surviving
+verified WAL. That episode must end in a durable `run_finished` whose terminal
+state matches the row. The embedded `run_started` triple is reported as historical
+provenance, not used to match the run: folder and harness re-keys change the
+address or run index without rewriting log records. Missing run IDs, unfinished
+episodes and mismatched terminal states refuse repair rather than
 deleting unproven run metadata. Successful repair changes only the proven run
 identities, stale inventory/discovery mappings, and the stale key's orphaned
 projection rows, in one transaction. It never merges projections, changes live
 key rows, changes log bytes or extracts an archive. All other run metadata is
 retained. A stale meta row must identify the surviving log's lineage; different
-or unverified lineages refuse cleanup. The live key must have its own meta row,
+or unverified lineages refuse cleanup. A run row's recorded lineage, when present,
+must also match. The live key must have its own meta row,
 or the verified log must support rebuilding the projection. Cleanup never
 rebuilds or rewrites the live key itself.
 

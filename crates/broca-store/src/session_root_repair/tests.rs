@@ -15,6 +15,14 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_recorded_harness("broca")
+    }
+
+    fn with_recorded_harness(harness: &str) -> Self {
+        Self::with_first_terminal(harness, Some(RunFinishReason::Completed))
+    }
+
+    fn with_first_terminal(harness: &str, first_terminal: Option<RunFinishReason>) -> Self {
         let root = broca_test_support::scratch_root().join(format!(
             "session-root-repair-{}-{}",
             std::process::id(),
@@ -38,11 +46,15 @@ impl Fixture {
         let mut wal = wal_store.open(&live).unwrap();
         for n in 0..24 {
             let identity = if n < 6 { &stale } else { &live };
+            let mut recorded_identity = identity.clone();
+            if n < 6 {
+                recorded_identity.harness = harness.to_owned();
+            }
             let run_id = format!("run-{n:02}");
             let start = crate::conformance::run_started(
                 0,
                 &run_id,
-                identity,
+                &recorded_identity,
                 "user history",
                 ModelHandle::new("stub", "model"),
             );
@@ -50,19 +62,25 @@ impl Fixture {
             for frame in crate::conformance::text_turn(0, 1, &format!("reply-{n:02}")) {
                 wal.append(1, &frame.record, true).unwrap();
             }
-            wal.append(
-                1,
-                &WalRecord::RunFinished {
-                    interrupt_reason: None,
-                    reason: RunFinishReason::Completed,
-                    ts_ms: Some(2),
-                    usage: Default::default(),
-                    error: None,
-                    retries_used: 0,
-                },
-                true,
-            )
-            .unwrap();
+            if n != 0 || first_terminal.is_some() {
+                wal.append(
+                    1,
+                    &WalRecord::RunFinished {
+                        interrupt_reason: None,
+                        reason: if n == 0 {
+                            first_terminal.unwrap()
+                        } else {
+                            RunFinishReason::Completed
+                        },
+                        ts_ms: Some(2),
+                        usage: Default::default(),
+                        error: None,
+                        retries_used: 0,
+                    },
+                    true,
+                )
+                .unwrap();
+            }
             store
                 .index_run_active(&RunIndexRow {
                     run_id,
@@ -208,6 +226,182 @@ impl Fixture {
         assert!(error.contains(reason), "{error}");
         assert_eq!(self.snapshot(), before);
         assert_eq!(std::fs::read(self.wal_path()).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn historical_harness_rekey_repairs_by_run_id_and_preserves_all_24_runs() {
+    let f = Fixture::with_recorded_harness("runner");
+    f.seed_orphaned_projection(true);
+    let before = f.store.read_prefix_with_watermark(&f.live).unwrap();
+    assert_eq!(before.prefix.len(), 48);
+    let bytes = std::fs::read(f.wal_path()).unwrap();
+    assert_eq!(
+        f.store
+            .resolve_session_address(&f.live, None)
+            .unwrap_err()
+            .code(),
+        "session_address_ambiguous"
+    );
+    let plan = f.preview().unwrap();
+    assert_eq!(plan.repoint_runs.len(), 6);
+    for change in &plan.repoint_runs {
+        assert_eq!(change.from.harness, "broca");
+        assert_eq!(change.episode_session.harness, "runner");
+        assert_eq!(change.episode_session.project_root, f.stale.project_root);
+        assert_eq!(change.episode_session.session, "cktui-dogfood-1");
+        assert_eq!(change.episode_state, "completed");
+    }
+    let report = serde_json::to_value(&plan).unwrap();
+    assert_eq!(report["repoint_runs"][0]["from"]["harness"], "broca");
+    assert_eq!(
+        report["repoint_runs"][0]["episode_session"]["harness"],
+        "runner"
+    );
+    f.store.apply_session_root_repair(&plan).unwrap();
+    let resolved = f.store.resolve_session_address(&f.stale, None).unwrap();
+    assert_eq!(resolved, f.live);
+    for n in 0..24 {
+        let row = f.store.lookup_run(&format!("run-{n:02}")).unwrap().unwrap();
+        assert_eq!(row.session, resolved);
+        assert_eq!(row.state, RunIndexState::Completed);
+        assert_eq!(row.title, Some(format!("title-{n}")));
+        assert!(before.prefix.iter().any(|message| message.content.iter().any(|part| {
+            matches!(part, broca_protocol::ContentBlock::Text { text } if text == &format!("reply-{n:02}"))
+        })), "missing history from run {n}");
+    }
+    assert_eq!(
+        f.store.read_prefix_with_watermark(&resolved).unwrap(),
+        before
+    );
+    assert!(f.projection_rows(&f.stale).values().all(Vec::is_empty));
+    assert_eq!(std::fs::read(f.wal_path()).unwrap(), bytes);
+    let second = f.preview().unwrap();
+    assert!(second.stale_identity.is_none());
+}
+
+#[test]
+fn missing_run_id_after_harness_rekey_refuses_without_cleanup() {
+    let f = Fixture::with_recorded_harness("runner");
+    f.seed_orphaned_projection(true);
+    f.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE run_index SET run_id='not-in-log' WHERE run_id='run-00'",
+            [],
+        )
+        .unwrap();
+    let stale_before = f.projection_rows(&f.stale);
+    let live_before = f.projection_rows(&f.live);
+    f.refuses_unchanged("run not-in-log is missing from the surviving log");
+    assert_eq!(f.projection_rows(&f.stale), stale_before);
+    assert_eq!(f.projection_rows(&f.live), live_before);
+}
+
+#[test]
+fn unfinished_episode_after_harness_rekey_refuses() {
+    let f = Fixture::with_first_terminal("runner", None);
+    f.refuses_unchanged("run run-00 has no durable run_finished");
+}
+
+#[test]
+fn terminal_row_states_must_match_the_recorded_run_finished() {
+    for (reason, state) in [
+        (RunFinishReason::Completed, "completed"),
+        (RunFinishReason::MaxSteps, "max_steps"),
+        (RunFinishReason::BudgetExhausted, "budget_exhausted"),
+        (RunFinishReason::ContextCeiling, "context_ceiling"),
+        (RunFinishReason::Cancelled, "cancelled"),
+        (RunFinishReason::Interrupted, "interrupted"),
+        (RunFinishReason::Error, "error"),
+        (
+            RunFinishReason::TransformUnavailable,
+            "transform_unavailable",
+        ),
+    ] {
+        let f = Fixture::with_first_terminal("runner", Some(reason));
+        f.store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE run_index SET state=?1 WHERE run_id='run-00'",
+                [state],
+            )
+            .unwrap();
+        let plan = f.preview().unwrap();
+        assert_eq!(plan.repoint_runs[0].state, state);
+        assert_eq!(plan.repoint_runs[0].episode_state, state);
+        let wrong = if state == "completed" {
+            "error"
+        } else {
+            "completed"
+        };
+        f.store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE run_index SET state=?1 WHERE run_id='run-00'",
+                [wrong],
+            )
+            .unwrap();
+        f.refuses_unchanged("does not match durable run_finished state");
+    }
+}
+
+#[test]
+fn later_unfinished_start_cannot_reuse_an_earlier_terminal() {
+    let f = Fixture::with_recorded_harness("runner");
+    let start = crate::conformance::run_started(
+        0,
+        "run-00",
+        &f.stale,
+        "resumed",
+        ModelHandle::new("stub", "model"),
+    );
+    let mut writer = broca_core::FileWalStore::new(f.root.join("wal"))
+        .open(&f.live)
+        .unwrap();
+    writer.append(1, &start.record, true).unwrap();
+    drop(writer);
+    f.refuses_unchanged("run run-00 has no durable run_finished");
+}
+
+#[test]
+fn run_row_lineage_must_match_the_verified_surviving_log() {
+    for matching in [true, false] {
+        let f = Fixture::with_recorded_harness("runner");
+        let (_, lineage) = broca_core::FileWalStore::new(f.root.join("wal"))
+            .read_records_with_lineage(&f.live)
+            .unwrap();
+        let lineage = if matching {
+            lineage.unwrap().to_string()
+        } else {
+            "11111111-2222-4333-8444-555555555555".to_owned()
+        };
+        f.store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE run_index SET lineage_id=?1 WHERE run_id='run-00'",
+                [&lineage],
+            )
+            .unwrap();
+        if matching {
+            let plan = f.preview().unwrap();
+            assert_eq!(plan.repoint_runs[0].row_lineage_id.as_ref(), Some(&lineage));
+            f.store.apply_session_root_repair(&plan).unwrap();
+            assert_eq!(
+                f.store.resolve_session_address(&f.stale, None).unwrap(),
+                f.live
+            );
+        } else {
+            f.refuses_unchanged("row lineage_id");
+        }
     }
 }
 
