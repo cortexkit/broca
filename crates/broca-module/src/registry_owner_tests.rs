@@ -1514,56 +1514,6 @@ fn assert_transient(result: Result<(), crate::serve::ServeError>) {
 }
 
 #[tokio::test]
-async fn retract_own_send_unreadable_attribution_never_grants_access_or_opens_an_actor() {
-    let fixture = Fixture::new();
-    fixture.append(&[
-        started(&fixture.session, Some(reserved("owner")), None),
-        finished(),
-    ]);
-    let path = fixture.wal.wal_path(&fixture.session);
-    let before = std::fs::read(&path).unwrap();
-    for fault in [1, 3, 4, 10] {
-        let (registry, wal, _) = registry(&fixture, Ok(None));
-        registry
-            .authorize_session_owner(
-                &fixture.session,
-                Some(&reserved("owner")),
-                &SendScope::Unstamped,
-            )
-            .await
-            .unwrap();
-        // A cached durability proof would legitimately avoid the failing barrier. Evict it
-        // so the sender lookup must prove the whole history under the injected failure.
-        registry
-            .inner
-            .read_proofs
-            .lock()
-            .unwrap()
-            .remove(&fixture.session);
-        wal.fault.store(fault, Ordering::Relaxed);
-        assert_transient(
-            registry
-                .recorded_submission_sender(&fixture.session, "unknown")
-                .await
-                .map(|_| ())
-                .map_err(Into::into),
-        );
-        assert_transient(
-            registry
-                .authorize_session_retract(
-                    &fixture.session,
-                    Some(&reserved("sender")),
-                    &SendScope::Unstamped,
-                    Some("unknown"),
-                )
-                .await,
-        );
-        assert_eq!(registry.slot_state(&fixture.session), None);
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-    }
-}
-
-#[tokio::test]
 async fn owner_barrier_failure_refuses_cancel_and_retract_without_writes() {
     let fixture = Fixture::new();
     fixture.append(&[

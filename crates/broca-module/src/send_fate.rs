@@ -1,132 +1,27 @@
 //! Payload-independent send receipts rebuilt from the durable WAL for retries and polling.
 
 use broca_core::delivery_order::{queued_send_fate, QueuedSendFate};
-use broca_protocol::{BindPrincipal, RunId, SubmissionId};
+use broca_protocol::{RunId, SubmissionId};
 use broca_wal::WalRecord;
 use cortexkit_role_llm_runner::send::{delivered_as, Delivered};
 
 use crate::actor::{indexed_finish_reason, recorded_steers, steer_delivery, SendOutcome};
 
-/// Submission attribution is immutable: never infer it from the current plan or caller.
-pub(crate) fn recorded_submission_sender(
-    records: &[WalRecord],
-    submission_id: &SubmissionId,
-) -> Option<BindPrincipal> {
-    let mut queued = false;
-    let mut ordered = false;
-    let mut principal = None;
-    let mut sent_by = None;
-    for record in records {
-        match record {
-            WalRecord::DeliveryOrdered {
-                submission_id: id,
-                sent_by: sender,
-                ..
-            } if id == submission_id => {
-                if ordered || queued {
-                    return None;
-                }
-                ordered = true;
-                sent_by = sender.clone();
-            }
-            WalRecord::Queued {
-                submission_id: id,
-                principal: sender,
-                ..
-            } if id == submission_id => {
-                if queued {
-                    return None;
-                }
-                queued = true;
-                principal = sender.clone();
-            }
-            _ => {}
-        }
-    }
-    // Delegated sends run under the owner: only DeliveryOrdered.sent_by preserves
-    // their actual sender. Ordinary sends record their sender on Queued instead.
-    queued.then(|| sent_by.or(principal)).flatten()
-}
-
-fn run_sender(records: &[WalRecord], run: &RunId) -> Option<Option<BindPrincipal>> {
-    let submission = SubmissionId(format!("sub-{}", run.0));
-    if records.iter().any(|record| {
-        matches!(record,
-        WalRecord::Queued { submission_id, .. } if submission_id == &submission)
-    }) {
-        return Some(recorded_submission_sender(records, &submission));
-    }
-    records.iter().find_map(|record| match record {
-        WalRecord::RunStarted {
-            run_id, principal, ..
-        } if run_id == run => Some(principal.clone()),
-        _ => None,
-    })
-}
-
-fn qualified_sender_run_id(base: &RunId, sender: &BindPrincipal) -> Result<RunId, String> {
-    use sha2::Digest;
-    let module_id = match sender {
-        BindPrincipal::Reserved { module_id } => module_id,
-        BindPrincipal::Direct | BindPrincipal::Unverified | BindPrincipal::Unknown(_) => {
-            return Err("a sender-qualified ID requires a reserved module principal".into());
-        }
-    };
-    // Retries recompute this ID across upgrades. Hash only the fixed version/kind tags
-    // and the module_id's UTF-8 bytes, never serde's evolving principal representation.
-    let mut digest = sha2::Sha256::new();
-    digest.update(b"v1\0reserved\0");
-    digest.update(module_id.as_bytes());
-    Ok(RunId(format!("{}-sender-{:x}", base.0, digest.finalize())))
-}
-
-/// Preserve legacy IDs, qualifying a delegated sender only when another sender already
-/// owns that ID. Both admission and send.status use the same durable attribution.
-pub(crate) fn resolve_sender_run_id(
-    records: &[WalRecord],
-    base: &RunId,
-    send_id: &str,
-    sender: &BindPrincipal,
-) -> Result<RunId, String> {
-    let qualified = qualified_sender_run_id(base, sender)?;
-    if let Some(recorded) = run_sender(records, &qualified) {
-        return if recorded.as_ref() == Some(sender) {
-            Ok(qualified)
-        } else {
-            Err("the qualified send ID has no matching durable sender".into())
-        };
-    }
-    match run_sender(records, base) {
-        Some(Some(recorded)) if &recorded == sender => Ok(base.clone()),
-        Some(_) => Ok(qualified),
-        // A legacy steer has no run of its own, but its owner's send key still occupies
-        // the unqualified namespace. Delegated string steers already use ordered records.
-        None if recorded_steers(records).contains_key(send_id) => Ok(qualified),
-        None => Ok(base.clone()),
-    }
-}
-
 /// The same fate lookup serves a validated re-send and a read-only `send.status`.
 /// No writer, executor or actor handle is available here: a lookup cannot deliver work.
-/// Ordered sends disable legacy steer lookup because those keys belong to the owner,
-/// not to another sender sharing the same send_id.
 pub(crate) fn recorded_send_outcome(
     records: &[WalRecord],
     own_run: &RunId,
     send_id: &str,
-    legacy_steers: bool,
 ) -> Option<SendOutcome> {
-    if legacy_steers {
-        let steers = recorded_steers(records);
-        if let Some(steer) = steers.get(send_id) {
-            let target = steer.run_id.as_ref()?;
-            return Some(run_outcome(
-                records,
-                target,
-                steer_delivery(records, send_id),
-                false,
-            ));
-        }
+    if let Some(steer) = recorded_steers(records).get(send_id) {
+        let target = steer.run_id.as_ref()?;
+        return Some(run_outcome(
+            records,
+            target,
+            steer_delivery(records, send_id),
+            false,
+        ));
     }
     let submission_id = SubmissionId(format!("sub-{}", own_run.0));
     match queued_send_fate(records, &own_run.0)? {
@@ -181,33 +76,6 @@ fn run_outcome(
         SendOutcome::Active {
             run_id: run_id.clone(),
             delivered,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn qualified_sender_run_id_encoding_is_pinned() {
-        assert_eq!(
-            qualified_sender_run_id(
-                &RunId("run-sid-shared".into()),
-                &BindPrincipal::Reserved { module_id: "ck-mc".into() },
-            ).unwrap(),
-            RunId("run-sid-shared-sender-efbcae06a66482a915f9cd18ad50e0e8d67996b2710ef552318a00b1d9906dff".into()),
-        );
-    }
-
-    #[test]
-    fn qualified_sender_run_id_refuses_unattested_principals() {
-        for principal in [
-            BindPrincipal::Direct,
-            BindPrincipal::Unverified,
-            BindPrincipal::Unknown(serde_json::json!({"kind":"future","module_id":"ck-mc"})),
-        ] {
-            assert!(qualified_sender_run_id(&RunId("run-sid-shared".into()), &principal).is_err());
         }
     }
 }

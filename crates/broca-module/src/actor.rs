@@ -3331,22 +3331,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 request.scope = broca_protocol::SendScope::Internal;
             }
         }
-        let run_id = if let (Some(sender), Some(send_id), true) = (
-            self.admitting_sent_by.clone(),
-            key.send_id(),
-            self.admitting_order.is_some(),
-        ) {
-            let records = match self.read_wal_records().await {
-                Ok(records) => records,
-                Err(error) => return SendOutcome::Error(error),
-            };
-            match crate::send_fate::resolve_sender_run_id(&records, &run_id, send_id, &sender) {
-                Ok(run_id) => run_id,
-                Err(error) => return SendOutcome::Error(error),
-            }
-        } else {
-            run_id
-        };
         if !self.agent_run_writer_enabled() {
             if let Some(scope) = &self.agent_run_scope {
                 return SendOutcome::ScopeRefused(
@@ -3567,11 +3551,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // A key already used by a steer is answered from that steer's record: a steer opens no
         // episode of its own, so the run-id lookup below cannot find it. This also refuses a
         // later send of another mode under the same key, naming `delivery`.
-        if let (true, Some(send_id), Some(request_digest)) = (
-            self.admitting_sent_by.is_none(),
-            key.send_id(),
-            request_identity_digest.as_deref(),
-        ) {
+        if let (Some(send_id), Some(request_digest)) =
+            (key.send_id(), request_identity_digest.as_deref())
+        {
             match self.recorded_steer(send_id).await {
                 Ok(Some(steer)) => {
                     return self
@@ -3651,7 +3633,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         &records,
                         &run_id,
                         key.send_id().unwrap_or(""),
-                        self.admitting_sent_by.is_none(),
                     ) {
                         // An auth-paused re-send is still the explicit re-drive operation;
                         // polling never takes that branch or starts its executor.
@@ -4673,9 +4654,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Ok(records) => records,
             Err(error) => return SendOutcome::Error(error),
         };
-        crate::send_fate::recorded_send_outcome(&records, &target, send_id, true).unwrap_or_else(
-            || SendOutcome::Error("the recorded steer disappeared from the WAL".into()),
-        )
+        crate::send_fate::recorded_send_outcome(&records, &target, send_id).unwrap_or_else(|| {
+            SendOutcome::Error("the recorded steer disappeared from the WAL".into())
+        })
     }
 
     /// Resolve admission fields and start a run as a child task; track it Active. The run
@@ -5941,7 +5922,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 &records,
                 &run_id,
                 identity.send_id.as_deref().unwrap_or(""),
-                false,
             ) {
                 return outcome;
             }

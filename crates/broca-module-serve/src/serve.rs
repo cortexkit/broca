@@ -2500,7 +2500,7 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
             .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?;
         let authorization = tokio::select! {
             _ = conn_cancel.cancelled() => return Ok(()),
-            result = authorize_route_request(handler.as_ref(), &session, &bind, &req.method, None) => result,
+            result = authorize_route_request(handler.as_ref(), &session, &bind, &req.method) => result,
         };
         if let Err(error) = authorization {
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -2594,11 +2594,7 @@ where
             PreparedRouteRequest::Request(req) => req.method.as_str(),
             PreparedRouteRequest::Subscribe { .. } => OP_SUBSCRIBE,
         };
-        let submission_id = match &prepared {
-            PreparedRouteRequest::Request(req) => req.params.get("submission_id").and_then(serde_json::Value::as_str),
-            PreparedRouteRequest::Subscribe { .. } => None,
-        };
-        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method, submission_id).await {
+        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method).await {
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
         let write = matches!(
@@ -2674,13 +2670,8 @@ async fn authorize_route_request<H: ServeHandler>(
     session: &BrocaBindIdentity,
     bind: &BindObservation,
     method: &str,
-    submission_id: Option<&str>,
 ) -> Result<(), ServeError> {
-    if method == OP_RETRACT {
-        handler
-            .authorize_session_retract(session, bind.principal.as_ref(), &bind.scope, submission_id)
-            .await
-    } else if method == OP_CANCEL {
+    if matches!(method, OP_CANCEL | OP_RETRACT) {
         handler
             .authorize_session_owner(session, bind.principal.as_ref(), &bind.scope)
             .await
@@ -8734,173 +8725,6 @@ mod tests {
         ) -> Result<RunStatusResponse, ServeError> {
             unimplemented!()
         }
-    }
-
-    struct RetractPrincipalProbe;
-
-    #[async_trait::async_trait]
-    impl ServeHandler for RetractPrincipalProbe {
-        async fn authorize_session_owner(
-            &self,
-            _: &BrocaBindIdentity,
-            _: Option<&broca_protocol::BindPrincipal>,
-            _: &broca_protocol::SendScope,
-        ) -> Result<(), ServeError> {
-            Err(ServeError::ScopeRefused(
-                broca_core::ScopeRefusal::SenderNotOwner,
-            ))
-        }
-        async fn authorize_session_retract(
-            &self,
-            _: &BrocaBindIdentity,
-            principal: Option<&broca_protocol::BindPrincipal>,
-            _: &broca_protocol::SendScope,
-            id: Option<&str>,
-        ) -> Result<(), ServeError> {
-            assert_eq!(id, Some("pending"));
-            if principal
-                == Some(&broca_protocol::BindPrincipal::Reserved {
-                    module_id: "actual".into(),
-                })
-            {
-                Ok(())
-            } else {
-                Err(ServeError::ScopeRefused(
-                    broca_core::ScopeRefusal::SenderNotOwner,
-                ))
-            }
-        }
-        async fn retract(
-            &self,
-            _: &BrocaBindIdentity,
-            _: broca_protocol::SubmissionId,
-        ) -> Result<RetractResponse, ServeError> {
-            Ok(RetractResponse::Retracted)
-        }
-        async fn send(&self, _: SendRequest) -> Result<SendResponse, ServeError> {
-            unreachable!()
-        }
-        async fn subscribe(
-            &self,
-            _: &BrocaBindIdentity,
-            _: SubscribeFrom,
-            _: mpsc::Sender<Delivery>,
-        ) -> Result<(), ServeError> {
-            unreachable!()
-        }
-        async fn read(&self, _: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
-            unreachable!()
-        }
-        async fn cancel(
-            &self,
-            _: &BrocaBindIdentity,
-            _: broca_protocol::RunId,
-        ) -> Result<CancelResponse, ServeError> {
-            unreachable!("run.cancel must remain owner-only")
-        }
-        async fn status(&self, _: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
-            unreachable!()
-        }
-        async fn run_status(
-            &self,
-            _: &BrocaBindIdentity,
-            _: broca_protocol::RunId,
-        ) -> Result<RunStatusResponse, ServeError> {
-            unreachable!()
-        }
-    }
-
-    #[tokio::test]
-    async fn retract_own_send_uses_only_the_bound_daemon_principal_and_never_extends_run_cancel() {
-        let (mut daemon, mut written, serve) =
-            bound_frame_loop(Arc::new(RetractPrincipalProbe), "retract-principal").await;
-        for (epoch, principal, sender, accepted) in [
-            (1, None, "actual", false),
-            (
-                2,
-                Some(subc_protocol::Principal::Reserved {
-                    module_id: "actual".into(),
-                }),
-                "forged",
-                true,
-            ),
-            (
-                3,
-                Some(subc_protocol::Principal::Unverified),
-                "actual",
-                false,
-            ),
-            (4, Some(subc_protocol::Principal::Direct), "actual", false),
-        ] {
-            if epoch > 1 {
-                let bind = ModuleControlRequest::RouteBind {
-                    route_channel: 7,
-                    epoch,
-                    target: subc_protocol::RouteTarget::ManagementSurface {
-                        module_id: "broca".into(),
-                    },
-                    identity: SubcBindIdentity::new("/tmp", "runner", "retract-principal"),
-                    principal,
-                    consumer_capabilities: None,
-                    admission_facts: None,
-                    scope: None,
-                    role_versions: None,
-                    call_mode: None,
-                };
-                write_frame(
-                    &mut daemon,
-                    &Frame::build(
-                        FrameType::Request,
-                        control_flags(),
-                        0,
-                        0,
-                        20,
-                        serde_json::to_vec(&bind).unwrap(),
-                    )
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-                assert_eq!(
-                    next_written(&mut written).await.header.ty,
-                    FrameType::Response
-                );
-            }
-            for method in [OP_RETRACT, OP_CANCEL] {
-                let params = serde_json::json!({"method":method,"params":{"submission_id":"pending","run_id":"running","sender":sender}});
-                write_frame(
-                    &mut daemon,
-                    &Frame::build(
-                        FrameType::Request,
-                        control_flags(),
-                        7,
-                        epoch,
-                        21,
-                        serde_json::to_vec(&params).unwrap(),
-                    )
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-                let reply = next_written(&mut written).await;
-                assert_eq!(
-                    reply.header.ty,
-                    if accepted && method == OP_RETRACT {
-                        FrameType::Response
-                    } else {
-                        FrameType::Error
-                    }
-                );
-                if reply.header.ty == FrameType::Response {
-                    assert_eq!(
-                        serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap()["result"],
-                        "retracted"
-                    );
-                }
-            }
-        }
-        drop(daemon);
-        serve.await.unwrap().unwrap();
     }
 
     /// Start a frame loop serving `handler`, complete its handshake, and bind route channel 7
