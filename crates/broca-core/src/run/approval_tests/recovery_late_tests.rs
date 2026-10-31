@@ -120,6 +120,9 @@ async fn next_turn(rig: &Rig, id: &str) {
     .expect("next-turn run must finish")
     .unwrap();
     assert_eq!(summary.reason, RunFinishReason::Completed);
+    for call in provider.calls() {
+        broca_crash_harness::check_tool_pairing(&call.prompt).unwrap();
+    }
     assert!(rig.frames().iter().any(|frame| matches!(&frame.record,
         WalRecord::RunStarted { run_id, .. } if run_id.0 == id)));
 }
@@ -136,7 +139,7 @@ async fn completed_origin_without_a_late_intent_still_executes_once() {
         rig.frames()
             .iter()
             .filter(|frame| matches!(&frame.record,
-        WalRecord::LateResult { call_key, .. } if call_key == &key))
+                WalRecord::LateResult { call_key, .. } if call_key == &key))
             .count(),
         1
     );
@@ -145,15 +148,20 @@ async fn completed_origin_without_a_late_intent_still_executes_once() {
 
 #[tokio::test]
 async fn recovery_cut_late_intent_never_resends_from_completed_origin() {
-    check_cut_late_intent(false).await;
+    check_cut_late_intent(false, false).await;
 }
 
 #[tokio::test]
 async fn recovery_cut_late_intent_keeps_its_prepared_owner_after_a_later_episode() {
-    check_cut_late_intent(true).await;
+    check_cut_late_intent(true, false).await;
 }
 
-async fn check_cut_late_intent(later_episode: bool) {
+#[tokio::test]
+async fn recovery_undecodable_late_intent_never_resends_from_completed_origin() {
+    check_cut_late_intent(false, true).await;
+}
+
+async fn check_cut_late_intent(later_episode: bool, undecodable: bool) {
     let (mut rig, key) = expired_overhaul().await;
     let origin = rig
         .frames()
@@ -206,6 +214,16 @@ async fn check_cut_late_intent(later_episode: bool) {
         })
         .into_result()
         .unwrap();
+    if undecodable {
+        // Keep a complete later frame so damage to the authorized late intent
+        // cannot be mistaken for an ordinary unsynced final append.
+        rig.writer
+            .record(WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(99),
+            })
+            .into_result()
+            .unwrap();
+    }
     rig.writer.sync().await.unwrap();
     let source = rig.tools.store.wal_path(&rig.bind);
     let mut bytes = std::fs::read(&source).unwrap();
@@ -216,6 +234,10 @@ async fn check_cut_late_intent(later_episode: bool) {
             framing::DecodeStep::Record { framed, consumed } => {
                 if matches!(&framed.record, WalRecord::LateDispatchIntent { call_key, .. } if call_key == &key)
                 {
+                    if undecodable {
+                        bytes[offset..offset + consumed].fill(0);
+                        break (offset, bytes[offset..].to_vec());
+                    }
                     let mut metadata = framing::v4::decode_header(&bytes[offset..])
                         .unwrap()
                         .unwrap()
@@ -290,8 +312,9 @@ async fn check_cut_late_intent(later_episode: bool) {
         WalRecord::LateDispatchIntent { call_key, .. } if call_key == &key)));
     let unknown = |frames: &[broca_wal::FramedRecord]| {
         frames.iter().filter(|frame| matches!(&frame.record,
-        WalRecord::LateResult { call_key, outcome: broca_wal::LateOutcome::Unknown, result }
-        if call_key == &key && result.as_ref() == &crate::outcome_unknown_result(&broca_protocol::ToolCallId("c".into())))).count()
+        WalRecord::RecoveryCallClosed { run_id, call_key: Some(call_key),
+            outcome: broca_wal::recovery::RecoveryOutcome::Unknown, result, .. }
+        if run_id == &origin && call_key == &key && result.as_ref() == &crate::outcome_unknown_result(&broca_protocol::ToolCallId("c".into())))).count()
     };
     assert_eq!(unknown(&frames), 1);
     let split = repaired_before_drive
@@ -325,7 +348,9 @@ async fn check_cut_late_intent(later_episode: bool) {
         rig.frames()
             .iter()
             .filter(|frame| matches!(&frame.record,
-        WalRecord::LateResult { call_key, .. } if call_key == &key))
+                WalRecord::LateResult { call_key, .. }
+                | WalRecord::RecoveryCallClosed { call_key: Some(call_key), .. }
+                if call_key == &key))
             .count(),
         1
     );

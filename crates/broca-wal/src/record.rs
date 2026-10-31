@@ -590,6 +590,30 @@ pub enum WalRecord {
         #[serde(flatten)]
         recovery: Box<crate::recovery::RecoveryCut>,
     },
+    /// A prompt-free Unknown terminal for an attributed call whose model turn
+    /// was removed. Ownership comes from preserved recovery evidence, never a
+    /// reconstructed RunStarted or the episode current when this is appended.
+    /// Unknown batch/step identities remain separate entries. When their exact
+    /// effect cannot be proven, duplicate Unknown results are safer than losing
+    /// an attributable call by merging it with another step's same-ID terminal.
+    RecoveryCallClosed {
+        cut_id: String,
+        run_id: RunId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<BatchId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_id: Option<StepId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_key: Option<String>,
+        tool_call_id: ToolCallId,
+        outcome: crate::recovery::RecoveryOutcome,
+        /// A plain outcome_unknown error, never restored media or successful output.
+        #[serde(
+            serialize_with = "serialize_recovery_unknown",
+            deserialize_with = "deserialize_recovery_unknown"
+        )]
+        result: Arc<ToolResult>,
+    },
     /// A new writer has durably taken responsibility for this log's recovered prefix.
     WriterOpened {
         writer_id: [u8; 16],
@@ -1895,6 +1919,38 @@ pub enum WalRecord {
     Unknown,
 }
 
+fn is_recovery_unknown(result: &ToolResult) -> bool {
+    result.is_error
+        && matches!(&result.output, broca_protocol::ToolOutput::Error {
+        message, module, code: _, detail, nothing_sent, retry,
+    } if message.starts_with("outcome_unknown") && module.is_none() && detail.is_none()
+        && nothing_sent.is_none() && retry.is_none())
+}
+
+fn serialize_recovery_unknown<S: serde::Serializer>(
+    result: &Arc<ToolResult>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if !is_recovery_unknown(result) {
+        return Err(<S::Error as serde::ser::Error>::custom(
+            "recovery completion result must be a plain outcome_unknown error",
+        ));
+    }
+    result.serialize(serializer)
+}
+
+fn deserialize_recovery_unknown<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Arc<ToolResult>, D::Error> {
+    let result = Arc::<ToolResult>::deserialize(deserializer)?;
+    if !is_recovery_unknown(&result) {
+        return Err(<D::Error as serde::de::Error>::custom(
+            "recovery completion result must be a plain outcome_unknown error",
+        ));
+    }
+    Ok(result)
+}
+
 impl WalRecord {
     /// The WAL record for one provider attempt of `step_id`.
     pub fn model_attempt_finished(step_id: StepId, attempt: ModelAttempt) -> Self {
@@ -1989,7 +2045,10 @@ impl WalRecord {
     /// on its own, so no caller can write a must-understand value into a frame an older build
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
-        if matches!(self, Self::RecoveryCut { .. }) {
+        if matches!(
+            self,
+            Self::RecoveryCut { .. } | Self::RecoveryCallClosed { .. }
+        ) {
             return &[crate::recovery::FEATURE];
         }
         if matches!(self, Self::VisibilityLate { .. }) {
@@ -2541,6 +2600,7 @@ impl WalRecord {
             | Self::WriterClosed { .. }
             | Self::VisibilityLate { .. }
             | Self::RecoveryCut { .. }
+            | Self::RecoveryCallClosed { .. }
             | Self::Unknown => false,
         }
     }

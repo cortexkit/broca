@@ -2070,7 +2070,7 @@ where
 {
     require_agent_run_scope_writer(req.scope.as_ref())?;
     let mut offset_prior = None;
-    let snapshot = if let Some(prepared) = offsets {
+    let mut snapshot = if let Some(prepared) = offsets {
         if prior_snapshot_matches_writer_head(writer, &prepared.snapshot)
             && prepared.lineage == writer.lineage_id()
         {
@@ -2146,6 +2146,20 @@ where
     writer.seed_lineage_tags(lineage_tags);
     if offset_prior.is_none() {
         seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
+    }
+    if !writer.recovery_cut_ids().is_empty() {
+        if snapshot.base_watermark != 0 {
+            snapshot = complete_snapshot(wal_store, &req.session)?;
+            offset_prior = None;
+        }
+        if crate::recovery_close_out::complete(writer, &snapshot.tail)
+            .await
+            .map_err(|error| RunError::Wal(error.to_string()))?
+        {
+            snapshot = complete_snapshot(wal_store, &req.session)?;
+            offset_prior = None;
+            seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
+        }
     }
     let episode = snapshot.checkpoint_at_head.last_episode.as_ref();
     let is_resume = episode.is_some();
@@ -9963,11 +9977,18 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
             plan.push(CallPlan::Already(prior));
             continue;
         }
-        if writer.recovery_tombstoned(run_id, &call.tool_call_id)
-            || existing_intents
+        if writer.recovery_tombstoned(
+            run_id,
+            &call.tool_call_id,
+            &batch_id,
+            Some(step_id),
+            existing_intents
                 .get(&call.tool_call_id)
-                .and_then(|dispatch| dispatch.call_key.as_deref())
-                .is_some_and(|key| writer.recovery_tombstoned_key(key))
+                .and_then(|dispatch| dispatch.call_key.as_deref()),
+        ) || existing_intents
+            .get(&call.tool_call_id)
+            .and_then(|dispatch| dispatch.call_key.as_deref())
+            .is_some_and(|key| writer.recovery_tombstoned_key(key))
         {
             plan.push(CallPlan::Recovered(call.tool_call_id.clone()));
             continue;
@@ -10450,6 +10471,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 .lock()
                 .expect("provider-held close-out")
                 .batch = Some(crate::replay::OpenToolBatch {
+                needs_start: false,
                 batch_id: batch_id.clone(),
                 step_id,
                 calls: unfinished
@@ -16722,12 +16744,24 @@ mod approval_gate {
                 .and_then(|queue| queue.pop_front())
             {
                 Slot::Ready(Some(CallPlan::Already(result)))
-            } else if writer.recovery_tombstoned(run_id, &call.tool_call_id)
-                || resume
-                    .intents
-                    .get(&call.tool_call_id)
-                    .and_then(|dispatch| dispatch.call_key.as_deref())
-                    .is_some_and(|key| writer.recovery_tombstoned_key(key))
+            } else if writer.recovery_tombstoned(
+                run_id,
+                &call.tool_call_id,
+                &ctx.batch_id,
+                Some(step),
+                held.get(&call.tool_call_id)
+                    .map(|prepared| prepared.key.as_str())
+                    .or_else(|| {
+                        resume
+                            .intents
+                            .get(&call.tool_call_id)
+                            .and_then(|dispatch| dispatch.call_key.as_deref())
+                    }),
+            ) || resume
+                .intents
+                .get(&call.tool_call_id)
+                .and_then(|dispatch| dispatch.call_key.as_deref())
+                .is_some_and(|key| writer.recovery_tombstoned_key(key))
                 || held
                     .get(&call.tool_call_id)
                     .is_some_and(|prepared| writer.recovery_tombstoned_key(&prepared.key))
@@ -17227,6 +17261,7 @@ mod approval_gate {
                     .lock()
                     .expect("provider-held close-out")
                     .batch = Some(crate::replay::OpenToolBatch {
+                    needs_start: false,
                     batch_id: ctx.batch_id.clone(),
                     step_id: step,
                     calls: slots
@@ -17940,12 +17975,29 @@ mod approval_gate {
         writer: &WalHandle,
         call: &crate::replay::ProjectedDeferredCall,
     ) -> bool {
+        let key = broca_wal::recovery::physical_call_key(
+            &projection.lineage_id,
+            call.prepared_seq,
+            call.recovery_generation.as_deref(),
+        );
+        let identity = projection.effect_identity(call);
         projection.recovery_tombstoned(call)
-            || matches!(&*call.prepared, WalRecord::ToolCallDeferred { call_id, .. }
-                if call.run_id.as_ref().is_some_and(|run| writer.recovery_tombstoned(run, call_id)))
-            || writer
-                .call_key(call.prepared_seq)
-                .is_some_and(|key| writer.recovery_tombstoned_key(&key))
+            || call
+                .run_id
+                .as_ref()
+                .zip(identity.as_ref())
+                .is_some_and(|(run, identity)| {
+                    identity.batch_id.as_ref().is_some_and(|batch| {
+                        writer.recovery_tombstoned(
+                            run,
+                            &identity.tool_call_id,
+                            batch,
+                            identity.step_id,
+                            Some(&key),
+                        )
+                    })
+                })
+            || writer.recovery_tombstoned_key(&key)
     }
 
     async fn close_stopped_late(
@@ -18060,6 +18112,49 @@ mod approval_gate {
             rebuilt.fold_frames(&history.frames.base);
             rebuilt.fold_frames(&history.frames.appended);
             history.projection = rebuilt;
+        }
+        // Recovery receipts close the effect before admission can dispatch it.
+        // Report that durable outcome through the existing idempotent approval
+        // channel without manufacturing a second LateResult terminal.
+        if let Some(plane) = &control.elicitation_plane {
+            for call in history.projection.calls.values() {
+                if !matches!(
+                    call.late_result.as_deref(),
+                    Some(WalRecord::RecoveryCallClosed { .. })
+                ) || !matches!(
+                    call.late_approval.as_deref(),
+                    Some(WalRecord::LateApprovalRecorded {
+                        decision: LateDecision::Approved,
+                        ..
+                    })
+                ) {
+                    continue;
+                }
+                if let (
+                    Some(id),
+                    Some(run_id),
+                    WalRecord::ToolCallDeferred {
+                        batch_id, scope, ..
+                    },
+                ) = (&call.elicitation_id, &call.run_id, call.prepared.as_ref())
+                {
+                    let ctx = BatchCtx {
+                        media_capture: writer.media_capture(),
+                        batch_id: batch_id.clone(),
+                        bind: session.clone(),
+                        run_id: run_id.clone(),
+                        scope: Some(scope.clone()),
+                    };
+                    crate::consent::report(
+                        plane.as_ref(),
+                        &ctx,
+                        id,
+                        crate::tool_plane::ApprovalExecution::OutcomeUnknown,
+                        None,
+                    )
+                    .await;
+                }
+            }
         }
         close_stopped_late(history, writer, session, control).await?;
         if control.elicitation_plane.is_none() {

@@ -425,8 +425,21 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         // deletion or admission validation still touches this address.
         let authority = tokio::task::spawn_blocking(move || {
             let work = || {
-                wal.recover_existing(&session)
-                    .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))?;
+                match wal.recover_existing(&session) {
+                    Ok(()) => {}
+                    Err(broca_wal::WalError::RelocationIncomplete { .. })
+                        if wal.wal_config().is_overhaul()
+                            && matches!(&authority, OpenAuthority::Tenure(_)) =>
+                    {
+                        // Only the owned open can verify that duplicate filenames
+                        // are hard links to one unstarted WAL, then finish its
+                        // relocation before exposing indexed state.
+                        return Ok(authority);
+                    }
+                    Err(error) => {
+                        return Err(OpenError::from_wal_read(error.to_string(), &error));
+                    }
+                }
                 if wal.wal_config().is_overhaul() {
                     if let Some(service) = &service {
                         if let Err(
@@ -597,6 +610,38 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 (writer, None)
             }
         };
+        // Tuple fields drop in order: a cancelled completion joins the writer
+        // before releasing a separately held lease.
+        let opening = (writer, lease);
+        if opening.0.has_recovery_cuts() {
+            let completion = async {
+                let head = opening
+                    .0
+                    .durable_head()
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let wal = self.wal_store.clone();
+                let session = key.clone();
+                let range = tokio::task::spawn_blocking(move || {
+                    wal.read_records_range(&session, 0, Some(head), None)
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+                let broca_wal::WalRangeRecords::Complete(frames) = range.into_records() else {
+                    return Err("recovery close-out requires the complete durable WAL".to_owned());
+                };
+                broca_core::recovery_close_out::complete(&opening.0, &frames)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(())
+            }
+            .await;
+            if let Err(error) = completion {
+                let _ = tokio::task::spawn_blocking(move || drop(opening)).await;
+                return Err(OpenError::Open(error));
+            }
+        }
+        let (writer, lease) = opening;
         if retention.is_some() || writer.is_retention_lineage() == Some(true) {
             if let Some(service) = registry.retention_service() {
                 service.remember_session(key).map_err(OpenError::Open)?;
@@ -1026,6 +1071,60 @@ mod tests {
                 .expect("the refused open released its tenure"),
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(feature = "test-clock", unix))]
+    #[tokio::test]
+    async fn owned_admission_finishes_incomplete_relocation_before_recovery_preflight() {
+        let root = broca_test_support::scratch_root().join(format!(
+            "owned-relocation-before-recovery-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(broca_wal::state_format::MARKER_FILENAME),
+            b"broca-state/2\n",
+        )
+        .unwrap();
+        let key = BindIdentity::new("/relocation-project", "runner", "unstarted");
+        let wal = Arc::new(broca_core::FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
+        drop(wal.open(&key).unwrap());
+        let source = wal.wal_path(&key);
+        let alias = wal.ephemeral_wal_path(&key);
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::fs::hard_link(&source, &alias).unwrap();
+        let original = std::fs::read(&source).unwrap();
+        assert!(matches!(
+            wal.resolve_live_path(&key),
+            Err(broca_wal::WalError::RelocationIncomplete { .. })
+        ));
+        let opener = Arc::new(
+            DefaultOpener::with_file_leases(
+                root.join("leases"),
+                wal.clone(),
+                Arc::new(NeverExecutor),
+            )
+            .with_lease_domain(WalLeaseDomain::new(root.join("leases")))
+            .unwrap(),
+        );
+        let registry = LineageRegistry::new(opener);
+        registry
+            .actor_for(&key)
+            .await
+            .expect("owned admission must reach placement repair");
+        assert_eq!(wal.resolve_live_path(&key).unwrap(), Some(source.clone()));
+        assert!(!alias.exists());
+        assert!(std::fs::read(&source).unwrap().starts_with(&original));
+        assert!(!wal
+            .read_records(&key)
+            .unwrap()
+            .iter()
+            .any(|frame| matches!(frame.record, broca_wal::WalRecord::RunStarted { .. })));
+        assert!(registry.stop_and_seal().await);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(all(feature = "test-clock", unix))]

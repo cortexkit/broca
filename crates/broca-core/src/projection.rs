@@ -876,6 +876,17 @@ fn project_control_record<S: ControlProjectionSink>(
                 }
             }
         }
+        WalRecord::RecoveryCallClosed {
+            run_id,
+            tool_call_id,
+            ..
+        } => {
+            if state.run_id.as_ref() == Some(run_id) {
+                state
+                    .indeterminate_tool_calls
+                    .record_dispatch_terminal(tool_call_id, true);
+            }
+        }
         WalRecord::ToolDispatchIntent {
             tool_call_id,
             tool_name,

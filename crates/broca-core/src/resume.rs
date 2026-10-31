@@ -1413,35 +1413,7 @@ pub fn close_out_open_batch(
     prior: &ReplayState,
     deferred_close: impl FnMut(&ToolCallId) -> DeferredCloseKind,
 ) -> Vec<WalRecord> {
-    let mut records = close_out_surviving_batch(prior, deferred_close);
-    if matches!(prior.resolution, ReplayResolution::Interrupted { .. }) {
-        // These calls have no surviving model step. Close their batches only after
-        // the surviving batch, without inventing unpaired prompt content.
-        for batch in &prior.recovery_tool_batches {
-            records.push(WalRecord::ToolBatchStarted {
-                batch_id: batch.batch_id.clone(),
-                step_id: batch.step_id,
-                planned_calls: batch.calls.iter().map(|(id, _)| id.clone()).collect(),
-            });
-            for (id, _) in &batch.calls {
-                records.push(WalRecord::ToolResult {
-                    finished_at_ms: None,
-                    tags: None,
-                    hooks: None,
-                    batch_id: batch.batch_id.clone(),
-                    result: Arc::new(outcome_unknown_result(id)),
-                    outcome: DispatchOutcome::Unknown,
-                    reason: None,
-                    withdraw_elicitation: None,
-                    provider_held: None,
-                });
-            }
-            records.push(WalRecord::ToolBatchFinished {
-                batch_id: batch.batch_id.clone(),
-            });
-        }
-    }
-    records
+    close_out_surviving_batch(prior, deferred_close)
 }
 
 fn close_out_surviving_batch(
@@ -1470,6 +1442,13 @@ fn close_out_surviving_batch(
         broca_protocol::RunFinishReason::Interrupted
     };
     let mut records = Vec::with_capacity(batch.calls.len() + 2);
+    if batch.needs_start {
+        records.push(WalRecord::ToolBatchStarted {
+            batch_id: batch.batch_id.clone(),
+            step_id: batch.step_id,
+            planned_calls: batch.calls.iter().map(|(id, _)| id.clone()).collect(),
+        });
+    }
     for (tool_call_id, state) in &batch.calls {
         let withdraw_elicitation = if *state == OpenCallState::Deferred {
             match deferred_close(tool_call_id) {
@@ -1534,7 +1513,6 @@ pub fn close_out_open_batch_for(
 ) -> Vec<WalRecord> {
     let mut closing = crate::replay::replay(&[]).expect("empty WAL has a valid replay");
     closing.open_tool_batch = prior.open_tool_batch.clone();
-    closing.recovery_tool_batches = prior.recovery_tool_batches.clone();
     closing.resolution = ReplayResolution::Interrupted {
         indeterminate: Vec::new(),
     };
@@ -1711,27 +1689,36 @@ mod tests {
         });
         let marker = records.last().unwrap().clone();
         records.push(marker.clone());
-        let close = close_out_open_batch(&replay(&records).unwrap(), |_| {
-            DeferredCloseKind::NotDispatched
-        });
+        let plan = |records: &[WalRecord]| {
+            let frames: Vec<_> = records
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, record)| broca_wal::FramedRecord {
+                    seq: index as u64 + 1,
+                    fence: 1,
+                    record,
+                })
+                .collect();
+            crate::recovery_close_out::plan(&frames, "lineage", frames.len() as u64).unwrap()
+        };
+        let close = plan(&records);
         for cut in 0..=close.len() {
             let mut partial = records.clone();
             partial.extend_from_slice(&close[..cut]);
             partial.push(marker.clone());
-            let retry = close_out_open_batch(&replay(&partial).unwrap(), |_| {
-                DeferredCloseKind::NotDispatched
-            });
+            let retry = plan(&partial);
             partial.extend(retry);
             for (id, batch) in [("removed-a", "later-a"), ("removed-b", "later-b")] {
                 let results: Vec<_> = partial
                     .iter()
                     .filter_map(|record| match record {
-                        WalRecord::ToolResult {
+                        WalRecord::RecoveryCallClosed {
                             result,
-                            batch_id,
-                            outcome,
+                            run_id,
+                            tool_call_id,
                             ..
-                        } if result.tool_call_id.0 == id => Some((batch_id, result, outcome)),
+                        } if tool_call_id.0 == id => Some((run_id, result)),
                         _ => None,
                     })
                     .collect();
@@ -1740,16 +1727,21 @@ mod tests {
                     1,
                     "one Unknown per removed call after close-out cut {cut}"
                 );
-                assert_eq!(results[0].0, &BatchId(batch.into()));
+                assert_eq!(results[0].0, &RunId("r".into()));
                 assert_eq!(
                     results[0].1.as_ref(),
                     &outcome_unknown_result(&ToolCallId(id.into()))
                 );
-                assert_eq!(results[0].2, &DispatchOutcome::Unknown);
+                assert!(records.iter().any(
+                    |record| matches!(record, WalRecord::RecoveryCut { recovery }
+                    if recovery.runs.iter().any(|run| run.calls.iter().any(|call|
+                        call.tool_call_id.0 == id && call.batch_id == Some(BatchId(batch.into())))))
+                ));
             }
             let closed = replay(&partial).unwrap();
+            broca_crash_harness::check_tool_pairing(&closed.prompt).unwrap();
             assert!(closed.open_tool_batch.is_none());
-            assert!(close_out_open_batch(&closed, |_| DeferredCloseKind::NotDispatched).is_empty());
+            assert!(plan(&partial).is_empty());
             assert_eq!(
                 closed
                     .prompt

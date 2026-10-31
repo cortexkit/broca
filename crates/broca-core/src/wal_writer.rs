@@ -3615,20 +3615,38 @@ pub struct WalHandle {
 }
 
 impl WalHandle {
+    /// Whether startup must reconcile owner-scoped physical recovery evidence.
+    /// This is cached from the configured open and performs no filesystem probe.
+    pub fn has_recovery_cuts(&self) -> bool {
+        !self.recovery_cut_ids.is_empty()
+    }
+
     pub(crate) fn recovery_cut_ids(&self) -> &std::collections::BTreeSet<String> {
         &self.recovery_cut_ids
     }
-    /// Model-facing call IDs are scoped to a run, not reserved across the session.
+    /// Model-facing IDs require their owner and effect scope; another step may
+    /// legitimately reuse the same ID under a different batch or physical key.
     pub(crate) fn recovery_tombstoned(
         &self,
         run: &broca_protocol::RunId,
         call: &broca_protocol::ToolCallId,
+        batch: &broca_protocol::BatchId,
+        step: Option<broca_protocol::StepId>,
+        key: Option<&str>,
     ) -> bool {
+        let identity = broca_wal::recovery::RecoveryCall {
+            tool_call_id: call.clone(),
+            batch_id: Some(batch.clone()),
+            step_id: step,
+            call_keys: key.into_iter().map(str::to_owned).collect(),
+        };
         self.recovery_calls
             .iter()
             .filter(|recovered| &recovered.run_id == run)
             .flat_map(|r| &r.calls)
-            .any(|c| &c.tool_call_id == call)
+            .any(|c| {
+                &c.tool_call_id == call && (!c.has_effect_identity() || c.matches_effect(&identity))
+            })
     }
     pub(crate) fn recovery_tombstoned_key(&self, key: &str) -> bool {
         self.recovery_call_keys.contains(key)
@@ -4293,6 +4311,22 @@ impl WalHandle {
             .iter()
             .filter_map(|frame| match &frame.record {
                 WalRecord::RecoveryCut { recovery } => Some(recovery.runs.clone()),
+                WalRecord::RecoveryCallClosed {
+                    run_id,
+                    tool_call_id,
+                    call_key,
+                    batch_id,
+                    step_id,
+                    ..
+                } => Some(vec![broca_wal::recovery::RecoveryRun {
+                    run_id: run_id.clone(),
+                    calls: vec![broca_wal::recovery::RecoveryCall {
+                        tool_call_id: tool_call_id.clone(),
+                        step_id: *step_id,
+                        batch_id: batch_id.clone(),
+                        call_keys: call_key.iter().cloned().collect(),
+                    }],
+                }]),
                 _ => None,
             })
             .flatten()
@@ -4325,6 +4359,14 @@ impl WalHandle {
                     .chain(cut.unowned_calls.iter().flat_map(|call| &call.call_keys))
             })
             .cloned()
+            .chain(
+                recovered_frames
+                    .iter()
+                    .filter_map(|frame| match &frame.record {
+                        WalRecord::RecoveryCallClosed { call_key, .. } => call_key.clone(),
+                        _ => None,
+                    }),
+            )
             .collect();
         let unstarted = last_seq == 0
             || (v4
@@ -5083,6 +5125,129 @@ impl WalHandle {
         let _guard = self.lock_enqueue();
         for record in records {
             self.enqueue_record(record, false).into_result()?;
+        }
+        Ok(())
+    }
+
+    /// Admit an entire recovery close-out before publishing any of its records.
+    /// A crash can still preserve a frame prefix, which the recovery planner must
+    /// reconcile on reopen. A byte-cap refusal publishes no prefix or terminal.
+    pub fn record_recovery_close_out(&self, records: Vec<WalRecord>) -> Result<(), WalWriteError> {
+        let _guard = self.lock_enqueue();
+        if !self.v4 {
+            return Err(WalWriteError::Failed(
+                "recovery close-out requires an overhaul writer".into(),
+            ));
+        }
+        if let Some(error) = current_write_error(&self.poisoned) {
+            return Err(error);
+        }
+        let mut tags = *self.lineage_tags.lock().unwrap();
+        let mut prepared_records = Vec::with_capacity(records.len());
+        let mut frame_bytes = 0u64;
+        for mut record in records {
+            if !matches!(
+                &record,
+                WalRecord::ResumeStarted { .. }
+                    | WalRecord::ToolBatchStarted { .. }
+                    | WalRecord::ToolBatchFinished { .. }
+                    | WalRecord::TurnFinished { .. }
+                    | WalRecord::ToolResult {
+                        outcome: broca_wal::DispatchOutcome::Unknown,
+                        ..
+                    }
+                    | WalRecord::RecoveryCallClosed { .. }
+            ) {
+                return Err(WalWriteError::Failed(
+                    "record is not a recovery close-out record".into(),
+                ));
+            }
+            if let WalRecord::ToolResult {
+                finished_at_ms: at, ..
+            } = &mut record
+            {
+                if at.is_none() {
+                    *at = crate::run::epoch_millis();
+                }
+            }
+            let assigned = match tags.as_mut() {
+                Some(state) => crate::tags::stamp(state, &mut record),
+                None if crate::tags::tag_shape(&record).is_some()
+                    && record.runner_tags().is_empty() =>
+                {
+                    return Err(WalWriteError::Failed(
+                        "recovery close-out requires seeded runner tags".into(),
+                    ));
+                }
+                None => None,
+            };
+            let prepared = self
+                .prepare_v4(&record)?
+                .expect("overhaul writer prepares v4 frames");
+            frame_bytes = frame_bytes.saturating_add(prepared.frame_len() as u64);
+            prepared_records.push((record, prepared, assigned));
+        }
+        if let Some(budget) = &self.append_budget {
+            let mut budget = budget.lock().unwrap();
+            if budget.refused {
+                return Err(budget.refusal());
+            }
+            let end = budget
+                .used_bytes
+                .saturating_add(frame_bytes)
+                .saturating_add(
+                    budget
+                        .overhead
+                        .saturating_mul(prepared_records.len() as u64),
+                );
+            if end
+                .saturating_add(self.publication_bytes.load(Ordering::SeqCst))
+                .saturating_add(budget.reserve)
+                .saturating_add(budget.reopen_reserve)
+                .saturating_add(budget.writer_close_reserve)
+                > budget.max_bytes
+            {
+                budget.refused = true;
+                return Err(budget.refusal());
+            }
+            budget.used_bytes = end;
+        }
+        *self.lineage_tags.lock().unwrap() = tags;
+        for (record, prepared, assigned) in prepared_records {
+            let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+            if let (Some(assigned), WalRecord::ToolResult { result, .. }) = (&assigned, &record) {
+                if let Some(live) = self.live_tags.lock().unwrap().as_mut() {
+                    live.calls
+                        .entry(result.tool_call_id.clone())
+                        .or_default()
+                        .push_back(assigned[0].clone());
+                }
+            }
+            {
+                let mut placement = self.display_placement.lock().unwrap();
+                if placement
+                    .as_mut()
+                    .is_some_and(|p| p.observe(&record).is_err())
+                {
+                    *placement = None;
+                }
+            }
+            self.capture_for_append(seq, &record);
+            if self
+                .tx
+                .send(WalCommand::AppendV4 {
+                    seq,
+                    record: Box::new(record),
+                    prepared,
+                })
+                .is_err()
+            {
+                let error = format!(
+                    "recovery close-out command for seq {seq} could not reach the writer task"
+                );
+                set_poison(&self.poisoned, error.clone());
+                return Err(WalWriteError::Failed(error));
+            }
         }
         Ok(())
     }

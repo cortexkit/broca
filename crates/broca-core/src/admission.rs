@@ -928,6 +928,45 @@ impl AdmissionCheckpointV1 {
                     self.recovery_cuts.push((**recovery).clone());
                 }
             }
+            WalRecord::RecoveryCallClosed {
+                cut_id,
+                run_id,
+                batch_id,
+                step_id,
+                call_key,
+                tool_call_id,
+                result,
+                ..
+            } => {
+                let terminal = broca_wal::recovery::RecoveryCall {
+                    tool_call_id: tool_call_id.clone(),
+                    batch_id: batch_id.clone(),
+                    step_id: *step_id,
+                    call_keys: call_key.iter().cloned().collect(),
+                };
+                let attributed = self.recovery_cuts.iter().any(|cut| {
+                    cut.cut_id == *cut_id
+                        && cut.runs.iter().any(|run| {
+                            run.run_id == *run_id
+                                && run.calls.iter().any(|call| {
+                                    call.tool_call_id == *tool_call_id
+                                        && call_key
+                                            .as_ref()
+                                            .is_none_or(|key| call.call_keys.contains(key))
+                                        && (call.terminal_matches(&terminal)
+                                            || (!call.has_effect_identity()
+                                                && !terminal.has_effect_identity()))
+                                })
+                        })
+                });
+                if !attributed || result.tool_call_id != *tool_call_id {
+                    return Err(ReplayError::CorruptLineage {
+                        episode_run_id: run_id.clone(),
+                        reason: "recovery completion does not match its durable cut attribution"
+                            .into(),
+                    });
+                }
+            }
             WalRecord::RunStarted {
                 session_class,
                 retention,
@@ -2295,7 +2334,8 @@ impl AdmissionContinuation {
             | WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::OutputReservationClamped { .. }
             | WalRecord::RunFinished { .. }
-            | WalRecord::RecoveryCut { .. } => true,
+            | WalRecord::RecoveryCut { .. }
+            | WalRecord::RecoveryCallClosed { .. } => true,
             // Session changes only set ownership.session_change_recorded, which is kept
             // in the scalars. Capture/advance strip ownership.latest_manifest and hydration
             // rebuilds it from the episode's RunStarted, not from these change records.

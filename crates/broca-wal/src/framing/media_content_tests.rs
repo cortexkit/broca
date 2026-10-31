@@ -272,6 +272,39 @@ fn typed_view_scan_keeps_media_gate_beside_dropped_edits() {
 }
 
 #[test]
+fn recovery_completion_rejects_native_media_instead_of_restoring_content() {
+    for result in [result(false), result(true)] {
+        let value = json!({"type":"recovery_call_closed","cut_id":"cut","run_id":"r",
+            "tool_call_id":"call","outcome":"unknown","result":result});
+        assert!(serde_json::from_value::<WalRecord>(value.clone()).is_err());
+        let result: broca_protocol::ToolResult =
+            serde_json::from_value(value["result"].clone()).unwrap();
+        let record = WalRecord::RecoveryCallClosed {
+            cut_id: "cut".into(),
+            run_id: broca_protocol::RunId("r".into()),
+            batch_id: None,
+            step_id: None,
+            call_key: None,
+            tool_call_id: broca_protocol::ToolCallId("call".into()),
+            outcome: crate::recovery::RecoveryOutcome::Unknown,
+            result: std::sync::Arc::new(result),
+        };
+        assert!(serde_json::to_vec(&record).is_err());
+        assert!(encode_v4(
+            v4::Metadata {
+                seq: 1,
+                fence: 1,
+                appended_ms: 0,
+                writer_id: [1; 16]
+            },
+            &[FRAME_STAMPS_FEATURE],
+            &record
+        )
+        .is_err());
+    }
+}
+
+#[test]
 fn media_carrier_inventory_covers_every_content_field() {
     // Audit field types, not just today's hand-written feature match. A newly added carrier
     // requires a test case even when a wildcard in the production scan would silently skip it.
@@ -319,6 +352,10 @@ fn media_carrier_inventory_covers_every_content_field() {
         .into_iter()
         .map(|(slot, _)| slot.to_owned())
         .collect();
+    // RecoveryCallClosed accepts only plain Unknown errors. Its result field
+    // rejects native content rather than restoring it behind a media feature.
+    recovery_completion_rejects_native_media_instead_of_restoring_content();
+    covered.insert("RecoveryCallClosed.result".to_owned());
     // These JSON fields are configuration, conditions or pre-tool arguments, never native content.
     covered.extend(
         [

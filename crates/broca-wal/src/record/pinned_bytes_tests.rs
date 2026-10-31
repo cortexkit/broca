@@ -15,6 +15,8 @@ use super::*;
 // Pin scoped execution identities and evidence whose run cannot be recovered.
 // An unowned entry's bare ID is evidence, not an executable identity.
 const RECOVERY_PINNED: &[&str] = &[
+    r#"{"type":"recovery_call_closed","cut_id":"cut-1","run_id":"r","batch_id":"b","step_id":1,"call_key":"lineage:4","tool_call_id":"call_0","outcome":"unknown","result":{"tool_call_id":"call_0","output":{"kind":"error","message":"outcome_unknown"},"is_error":true}}"#,
+    r#"{"type":"recovery_call_closed","cut_id":"cut-2","run_id":"removed-r","tool_call_id":"call_0","outcome":"unknown","result":{"tool_call_id":"call_0","output":{"kind":"error","message":"outcome_unknown"},"is_error":true}}"#,
     r#"{"type":"recovery_cut","cut_id":"cut-1","sidecar_basename":"log.cut-1","cut_offset":128,"removed_len":64,"removed_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reason":"unpublished_tail","active_run":"r","runs":[{"run_id":"r","calls":[{"tool_call_id":"call_0","step_id":1,"batch_id":"b","call_keys":["lineage:4"]}]}],"unowned_calls":[{"outcome":"unknown","tool_call_id":"call_0","batch_id":"unknown-b","call_keys":["lineage:9"]},{"outcome":"unknown","tool_call_id":"call_0"}],"unattributed_tool_risk":true}"#,
 ];
 
@@ -162,6 +164,7 @@ fn attempt_progress_fields_roundtrip_without_a_reader_feature() {
 fn tag_of(record: &WalRecord) -> &'static str {
     match record {
         WalRecord::RecoveryCut { .. } => "recovery_cut",
+        WalRecord::RecoveryCallClosed { .. } => "recovery_call_closed",
         WalRecord::WriterOpened { .. } => "writer_opened",
         WalRecord::WriterClosed { .. } => "writer_closed",
         WalRecord::VisibilityLate { .. } => "visibility_late",
@@ -822,6 +825,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "compaction_ride_wait_ended",
         "output_reservation_clamped",
         "recovery_cut",
+        "recovery_call_closed",
     ];
     assert_eq!(pinned, every_kind.into_iter().collect());
     assert_eq!(tag_of(&WalRecord::Unknown), "unknown");

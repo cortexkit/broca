@@ -714,6 +714,9 @@ async fn check_recovery_seal(model_step_cut: bool) {
             WalRecord::ToolResult {
                 result, outcome, ..
             } => Some((result.as_ref().clone(), *outcome)),
+            WalRecord::RecoveryCallClosed { run_id, result, .. } if run_id.0 == ORPHAN => {
+                Some((result.as_ref().clone(), broca_wal::DispatchOutcome::Unknown))
+            }
             _ => None,
         })
         .collect();
@@ -724,6 +727,25 @@ async fn check_recovery_seal(model_step_cut: bool) {
             broca_wal::DispatchOutcome::Unknown
         )]
     );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::RecoveryCallClosed { .. }))
+            .count(),
+        usize::from(model_step_cut),
+        "only removed model turns use owner receipts"
+    );
+    let prompt = broca_core::replay(&records).unwrap().prompt;
+    broca_crash_harness::check_tool_pairing(&prompt).unwrap();
+    if model_step_cut {
+        assert!(!prompt
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
+            )));
+    }
     let state = broca_core::reconcile_run_state(&records, ORPHAN).unwrap();
     assert_eq!(state.state, RunIndexState::Interrupted);
     assert_eq!(
@@ -1393,6 +1415,331 @@ async fn keyed_resend_reconciles_stale_index_to_finished() {
 }
 
 #[tokio::test]
+#[cfg(feature = "test-clock")]
+async fn recovery_cap_refuses_the_first_unknown_without_publishing_a_terminal() {
+    check_recovery_close_out_cap(false).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "test-clock")]
+async fn recovery_cap_refuses_a_later_unknown_without_publishing_a_terminal() {
+    check_recovery_close_out_cap(true).await;
+}
+
+#[cfg(feature = "test-clock")]
+async fn check_recovery_close_out_cap(large_last: bool) {
+    let f = Fixture::build_with_config(|index| index, None, None, broca_wal::WalConfig::OVERHAUL);
+    let large = ToolCallId(format!("large-{}", "x".repeat(32_000)));
+    let ids = if large_last {
+        vec![ToolCallId(CALL.into()), large.clone()]
+    } else {
+        vec![large.clone(), ToolCallId(CALL.into())]
+    };
+    let mut step = model_step_with_tool_call();
+    if let WalRecord::ModelStepFinished {
+        assistant_message, ..
+    } = &mut step
+    {
+        let message = Arc::make_mut(assistant_message);
+        let ContentBlock::ToolCall(template) = &message.content[0] else {
+            unreachable!()
+        };
+        message.content = ids
+            .iter()
+            .map(|id| {
+                let mut call = template.clone();
+                call.tool_call_id = id.clone();
+                ContentBlock::ToolCall(call)
+            })
+            .collect();
+    }
+    let mut batch = batch_started();
+    if let WalRecord::ToolBatchStarted { planned_calls, .. } = &mut batch {
+        *planned_calls = ids.clone();
+    }
+    let mut records = vec![run_started(&f.key), step, batch];
+    records.extend(ids.iter().map(|id| {
+        let mut intent = dispatch_intent();
+        if let WalRecord::ToolDispatchIntent { tool_call_id, .. } = &mut intent {
+            *tool_call_id = id.clone();
+        }
+        intent
+    }));
+    f.seed(records);
+    let path = f.wal_store().wal_path(&f.key);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut offset = 0;
+    loop {
+        match broca_wal::framing::decode_next(&bytes[offset..]) {
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
+            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                if matches!(framed.record, WalRecord::ToolDispatchIntent { .. }) {
+                    bytes[offset + consumed - 1] ^= 1;
+                    break;
+                }
+                offset += consumed;
+            }
+            _ => panic!("fixture must decode before the cut intent"),
+        }
+    }
+    std::fs::write(&path, bytes).unwrap();
+    let repaired = f.wal_store().open(&f.key).unwrap();
+    let through = repaired.last_seq();
+    drop(repaired);
+    assert!(f
+        .records()
+        .iter()
+        .any(|r| matches!(r, WalRecord::RecoveryCut { .. })));
+    // Leave room for the large indeterminate list in ResumeStarted and for
+    // lifecycle reserves, but not its additional large Unknown result.
+    let prior = broca_core::replay(&f.records()).unwrap();
+    let resume = broca_core::resume_started_record(&prior, through, Vec::new());
+    let resume_bytes = broca_wal::PreparedV4Frame::prepare(&resume)
+        .unwrap()
+        .frame_len() as u64;
+    let cap = std::fs::metadata(&path).unwrap().len() + resume_bytes + 16_384;
+    let cap_file = f.root.join("test-session-wal-cap");
+    std::fs::write(&cap_file, cap.to_string()).unwrap();
+    f.sweep(Fixture::boot_after_seed()).await;
+    let records = f.records();
+    let unknowns = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                WalRecord::ToolResult {
+                    outcome: broca_wal::DispatchOutcome::Unknown,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(f.terminals().is_empty(),
+        "a required Unknown did not fit, but the seal published a terminal after {unknowns} Unknowns");
+    assert_eq!(
+        unknowns, 0,
+        "capacity refusal must not publish a partial close-out group"
+    );
+    assert!(std::fs::metadata(&path).unwrap().len() <= cap);
+    f.stop().await;
+    std::fs::remove_file(cap_file).unwrap();
+
+    for second_crash in [false, true] {
+        let wal = Arc::new(f.wal_store());
+        let opener = DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(f.root.join("leases"))),
+            wal.clone(),
+            f.executor.clone(),
+        )
+        .with_run_index(f.index.clone())
+        .with_materialized_store(f.index.clone());
+        let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal, None);
+        let marked = registry.mark_crash_orphans(
+            &f.wal_store(),
+            vec![(RunId(ORPHAN.into()), f.key.clone())],
+            Fixture::boot_after_seed(),
+        );
+        let sweep = registry.seal_marked_crash_orphans(marked).await;
+        assert_eq!(sweep.sealed, 1, "second crash: {second_crash}; {sweep:?}");
+        let records = f.records();
+        for id in &ids {
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|r| matches!(r, WalRecord::ToolResult {
+                result, outcome: broca_wal::DispatchOutcome::Unknown, .. }
+                if result.tool_call_id == *id))
+                    .count(),
+                1
+            );
+        }
+        broca_crash_harness::check_tool_pairing(&broca_core::replay(&records).unwrap().prompt)
+            .unwrap();
+        assert!(registry.stop_and_seal().await);
+        if !second_crash {
+            let image = broca_crash_harness::LogImage::read(&path);
+            let after_first = image
+                .records()
+                .iter()
+                .position(|r| {
+                    matches!(
+                        r,
+                        WalRecord::ToolResult {
+                            outcome: broca_wal::DispatchOutcome::Unknown,
+                            ..
+                        }
+                    )
+                })
+                .unwrap()
+                + 1;
+            std::fs::write(&path, &image.bytes[..image.end_of_records(after_first)]).unwrap();
+        }
+    }
+    assert!(f.executor.executed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn recovery_closes_a_wholly_removed_owner_without_reopening_the_completed_run() {
+    use broca_protocol::provider::{NormalizedEvent, ProviderControl};
+    let provider = broca_core::StubProvider::new(vec![vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: AssistantMessage {
+                message_id: MessageId("after-removed-owner".into()),
+                content: vec![ContentBlock::Text {
+                    text: "continued".into(),
+                }],
+            },
+        }),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: broca_protocol::Usage::default(),
+            finish_reason: broca_protocol::FinishReason::Stop,
+            retries_used: 0,
+        }),
+    ]]);
+    let f = Fixture::build_with_config(
+        |index| index,
+        None,
+        Some(provider.clone()),
+        broca_wal::WalConfig::OVERHAUL,
+    );
+    let mut completed = run_started(&f.key);
+    if let WalRecord::RunStarted { run_id, .. } = &mut completed {
+        *run_id = broca_protocol::RunId("completed-before-cut".into());
+    }
+    f.seed(vec![
+        completed,
+        WalRecord::RunFinished {
+            interrupt_reason: None,
+            reason: RunFinishReason::Completed,
+            ts_ms: None,
+            usage: broca_protocol::Usage::default(),
+            error: None,
+            retries_used: 0,
+        },
+        WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(99),
+        },
+        run_started(&f.key),
+        model_step_with_tool_call(),
+        batch_started(),
+        dispatch_intent(),
+    ]);
+    let path = f.wal_store().wal_path(&f.key);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut offset = 0;
+    loop {
+        match broca_wal::framing::decode_next(&bytes[offset..]) {
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
+            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                if matches!(framed.record, WalRecord::StepStarted { step_id } if step_id.0 == 99) {
+                    bytes[offset + consumed - 1] ^= 1;
+                    break;
+                }
+                offset += consumed;
+            }
+            _ => panic!("fixture must decode before the removed owner"),
+        }
+    }
+    std::fs::write(&path, bytes).unwrap();
+    f.sweep(Fixture::boot_after_seed()).await;
+    let records = f.records();
+    assert!(
+        records.iter().any(
+            |record| matches!(record, WalRecord::RecoveryCut { recovery }
+        if recovery.runs.iter().any(|run| run.run_id.0 == ORPHAN
+            && run.calls.iter().any(|call| call.tool_call_id.0 == CALL)))
+        ),
+        "the removed run and call must be attributable from preserved evidence"
+    );
+    let receipts: Vec<_> = records
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap())
+        .filter(|value| value["type"] == "recovery_call_closed" && value["run_id"] == ORPHAN)
+        .collect();
+    assert_eq!(
+        receipts.len(),
+        1,
+        "a removed owner needs one durable owner-addressed Unknown"
+    );
+    assert_eq!(receipts[0]["tool_call_id"], CALL);
+    assert_eq!(
+        receipts[0]["result"],
+        serde_json::to_value(broca_core::outcome_unknown_result(&ToolCallId(CALL.into()))).unwrap()
+    );
+    assert!(
+        !records.iter().any(
+            |record| matches!(record, WalRecord::RunStarted { run_id, .. } if run_id.0 == ORPHAN)
+        ),
+        "completion must not invent the removed run's input or configuration"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(
+                record,
+                WalRecord::RunFinished {
+                    reason: RunFinishReason::Completed,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    broca_crash_harness::check_tool_pairing(&broca_core::replay(&records).unwrap().prompt).unwrap();
+    assert!(
+        provider.calls().is_empty(),
+        "recovery must not execute the removed owner"
+    );
+    let status = broca_core::reconcile_run_state(&records, ORPHAN).unwrap();
+    assert_eq!(status.state, RunIndexState::Interrupted);
+    assert_eq!(
+        status.indeterminate_tool_calls,
+        Some(vec![ToolCallId(CALL.into())])
+    );
+    assert_eq!(
+        broca_core::reconcile_run_state(&records, "completed-before-cut")
+            .unwrap()
+            .state,
+        RunIndexState::Completed
+    );
+    f.registry
+        .route_send(
+            &f.key,
+            super::tests::text_req(&f.key, "after-removed-owner"),
+            RunKind::FreshOrResume,
+        )
+        .await
+        .unwrap();
+    broca_test_support::wait_until("the next run after a removed owner to end", || async {
+        let terminals = f.terminals();
+        if terminals.len() == 2 {
+            Ok(())
+        } else {
+            Err(format!("terminals: {terminals:?}"))
+        }
+    })
+    .await;
+    let calls = provider.calls();
+    let [request] = calls.as_slice() else {
+        panic!("only the new run may call the model")
+    };
+    broca_crash_harness::check_tool_pairing(&request.prompt).unwrap();
+    assert!(
+        !request
+            .prompt
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(
+                block,
+                ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
+            )),
+        "a removed owner's receipt must not manufacture provider prompt content"
+    );
+    assert!(f.executor.executed.lock().unwrap().is_empty());
+    f.stop().await;
+}
+
+#[tokio::test]
 async fn crash_orphan_seal_closes_later_batch_calls_while_an_older_batch_remains_open() {
     let f = Fixture::build_with_config(|index| index, None, None, broca_wal::WalConfig::OVERHAUL);
     let later_id = ToolCallId("later-removed-call".into());
@@ -1481,18 +1828,18 @@ async fn crash_orphan_seal_closes_later_batch_calls_while_an_older_batch_remains
     let later: Vec<_> = records
         .iter()
         .filter_map(|record| match record {
-            WalRecord::ToolResult {
-                result, outcome, ..
-            } if result.tool_call_id == later_id => Some((result.as_ref().clone(), *outcome)),
+            WalRecord::RecoveryCallClosed {
+                run_id,
+                tool_call_id,
+                result,
+                ..
+            } if run_id.0 == ORPHAN && tool_call_id == &later_id => Some(result.as_ref().clone()),
             _ => None,
         })
         .collect();
     assert_eq!(
         later,
-        [(
-            broca_core::outcome_unknown_result(&later_id),
-            broca_wal::DispatchOutcome::Unknown
-        )],
+        [broca_core::outcome_unknown_result(&later_id)],
         "every attributable later-batch call needs exactly one durable Unknown"
     );
     assert_eq!(records.iter().filter(|record| matches!(record,

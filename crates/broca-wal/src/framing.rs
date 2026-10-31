@@ -1082,6 +1082,33 @@ mod reader_release_tests;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn recovery_completion_requires_the_recovery_reader_feature() {
+        use super::*;
+        let record: WalRecord = serde_json::from_str(
+            r#"{"type":"recovery_call_closed","cut_id":"cut-1","run_id":"removed-r","call_key":"lineage:4","tool_call_id":"call_0","outcome":"unknown","result":{"tool_call_id":"call_0","output":{"kind":"error","message":"outcome_unknown"},"is_error":true}}"#,
+        ).unwrap();
+        let bytes = encode_v4(
+            v4::Metadata {
+                seq: 1,
+                fence: 1,
+                appended_ms: 0,
+                writer_id: [1; 16],
+            },
+            &[FRAME_STAMPS_FEATURE],
+            &record,
+        )
+        .unwrap();
+        assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|feature| *feature != crate::recovery::FEATURE)
+            .collect();
+        assert!(matches!(decode_next_with(&bytes, &older),
+            DecodeStep::NewerWriter { missing, .. } if missing == [crate::recovery::FEATURE]));
+    }
+
+    #[test]
     fn message_times_require_an_understanding_reader() {
         use super::*;
         let old = include_str!("../tests/fixtures/before_message_times.jsonl");

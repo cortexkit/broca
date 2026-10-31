@@ -82,6 +82,28 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   of a synced final frame cannot be distinguished from an unacknowledged torn
   append. The existing final-tail discard rule therefore cannot provide a
   stronger guarantee against post-sync storage corruption.
+
+  A previously repaired log still pays a recurring verification cost. For a
+  clean, unchanged writable `FileWal` open with completed same-lineage manifests
+  and no projection hooks, recovery performs two complete WAL read/decode passes,
+  one retained-prefix SHA-256 pass per applicable manifest, one parent-directory
+  sync call, and one WAL-file sync. It does not reread the raw removed suffix.
+  With the default 1 GiB WAL cap and one completed cut near EOF, that is up to
+  2 GiB of WAL reads plus 1 GiB of prefix hashing on every later open, separately
+  from reading and validating the manifest. Each manifest is individually capped
+  at the supplied WAL cap; directory entries, manifest count and aggregate
+  manifest bytes are not bounded by that cap. For WAL length L and M matching
+  manifests of sizes J_i, content reads are 2L + sum(J_i), and prefix-hash input
+  is at most K times L for K applicable manifests. These are source-level byte
+  budgets, not measured physical I/O or latency guarantees. Projection hooks,
+  full admission replay and writer-lifecycle publication add work outside this
+  core-open budget. Run admission still requires complete WAL replay rather than
+  resuming execution from a stored message-prefix checkpoint for a repaired history.
+  Owner-completion preflight adds one more full-WAL read at the synced writer
+  head on each repaired session open (up to another 1 GiB at the default cap),
+  even when every completion is already present. Its in-memory owner/terminal
+  fold and replay also scale with that history. These checks are not cached as
+  an assumption that an old completed manifest makes later opens free.
   Real repair handles both unpublished non-tail damage and
   damage within a published prefix. The `.head` proof is evidence for the WARN
   reason (`unpublished_tail`, `published_region_corruption`, or
@@ -165,7 +187,8 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   subsequent opens. Logs without recovery markers do no recovery projection
   reads or writes.
 
-  `RecoveryCut` is overhaul-only and requires `wal-recovery/v1`, raised in the
+  `RecoveryCut` and `RecoveryCallClosed` may be written only to version 4 logs
+  on boot-selected `broca-state/2` roots. Both require `wal-recovery/v1`, raised in the
   machine feature floor before writing recovery history. This durable list of
   required log features prevents rollback to a reader that cannot understand the
   recovery tombstones. The record includes readable removed ordinary/late
@@ -177,11 +200,43 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   Close-out writes `outcome_unknown_result` with
   `DispatchOutcome::Unknown`, never a never-executed result, and the existing
   `ResumeStarted`/terminal projection and `run.status` report the indeterminate
-  calls. If a model step was removed too, a close-out-only recovery batch records
-  Unknown outcomes without inventing assistant prompt content. Calls outside a
-  surviving batch's plan close in separate, assistant-free batches after that
-  batch commits, preserving their evidenced batch identities. Durable terminals
-  take precedence over repeated recovery attribution on every close-out retry. Recovery
+  calls. Close-out consumes the attributed call set from every durable cut,
+  grouped by owner rather than only by the currently surviving episode. An intact
+  assistant turn keeps ordinary start/result/finish records; if its batch start
+  was removed, close-out writes the missing start before its Unknown results.
+  A removed model turn or wholly removed owner instead receives a prompt-free
+  `RecoveryCallClosed`: cut id, owner run, batch/step identity when known,
+  model-facing call id, exact call key when one survived,
+  and explicit Unknown result. It never invents `RunStarted`, input or assistant
+  content. A missing exact physical key stays absent, not guessed from a name.
+  Durable ordinary/late terminals and completion receipts take precedence over
+  repeated cut attribution; an earlier expiry result does not settle a possible
+  subsequently authorized late effect.
+  Model-facing IDs such as Gemini's `call_0` can recur in another step of the same
+  run. A terminal must match the owner, known batch/step scope and known exact
+  physical key; an earlier step's same-ID result cannot satisfy it. Entries with
+  neither scope nor key remain separate under their cut, with durable receipt
+  multiplicity surviving a second crash. Unprovable identity may produce two
+  Unknown results for one physical effect; losing an attributable call by merging
+  it into another step is not an acceptable alternative.
+
+  Required close-out frames are prepared together using a temporary copy of the
+  numbering state that assigns stable numeric tags to message parts. A refusal
+  cannot consume numbers from the real state. Frames are admitted against their
+  aggregate byte cost, including existing
+  lifecycle/terminal reserves, before any frame is enqueued. A byte-cap refusal
+  writes no partial group and publishes no `RunFinished`; the writable open or
+  run admission refuses. Admission is atomic, not the individual disk writes:
+  a second crash can preserve a frame prefix. The cut remains the durable work
+  set, and a later open writes only missing terminals/receipt records. The group
+  is synced before a caller may append `RunFinished` for the current run.
+
+  Default `session.read` gets no message or ordinary tool-result event from a
+  `RecoveryCallClosed` record. `run.status` continues to use the cut's existing Interrupted and
+  indeterminate-call evidence for a removed owner; an unrelated surviving
+  completed owner is not reopened. Existing late-approval metadata/reporting can
+  show `outcome_unknown`, as it did for a durable Unknown late result, without a
+  new field or a new provider-prompt part. Recovery
   tombstones match exact Prepared/intent `call_key` values or an owning run and
   call ID, never a bare model-facing ID across the session. A later run may use
   its own Gemini-style `call_0`. After a repair, physical keys include the latest

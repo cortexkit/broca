@@ -69,6 +69,54 @@ pub struct RecoveryCall {
     pub call_keys: Vec<String>,
 }
 
+impl RecoveryCall {
+    /// Whether evidence identifies more than the model-facing ID alone.
+    pub fn has_effect_identity(&self) -> bool {
+        self.batch_id.is_some() || self.step_id.is_some() || !self.call_keys.is_empty()
+    }
+
+    /// Within an already matched owner, compare effect identity rather than a
+    /// run-wide model-facing ID. Unknown
+    /// batch/step identities without an exact key do not even match each other.
+    pub fn matches_effect(&self, other: &Self) -> bool {
+        if self.tool_call_id != other.tool_call_id
+            || self
+                .batch_id
+                .as_ref()
+                .zip(other.batch_id.as_ref())
+                .is_some_and(|(a, b)| a != b)
+            || self.step_id.zip(other.step_id).is_some_and(|(a, b)| a != b)
+        {
+            return false;
+        }
+        let shared_key = self
+            .call_keys
+            .iter()
+            .any(|key| other.call_keys.contains(key));
+        if !self.call_keys.is_empty() && !other.call_keys.is_empty() && !shared_key {
+            return false;
+        }
+        shared_key
+            || self
+                .batch_id
+                .as_ref()
+                .zip(other.batch_id.as_ref())
+                .is_some_and(|(a, b)| a == b)
+            || self.step_id.zip(other.step_id).is_some_and(|(a, b)| a == b)
+    }
+
+    /// A known physical key requires a terminal identifying that exact effect;
+    /// a same-ID result from another step is never sufficient evidence.
+    pub fn terminal_matches(&self, terminal: &Self) -> bool {
+        self.matches_effect(terminal)
+            && (self.call_keys.is_empty()
+                || self
+                    .call_keys
+                    .iter()
+                    .any(|key| terminal.call_keys.contains(key)))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryOutcome {
@@ -240,11 +288,24 @@ struct Calls {
     runs: Vec<RecoveryRun>,
     planned: Vec<RecoveryCall>,
     cut_ids: BTreeSet<String>,
+    attribution_cut_ids: BTreeSet<String>,
+    batch_steps: std::collections::BTreeMap<(String, String), StepId>,
     prepared: std::collections::BTreeMap<String, (Option<RunId>, RecoveryCall)>,
+    approved_late: BTreeSet<String>,
+    late_batches: std::collections::BTreeMap<String, BatchId>,
+    retained_late_terminals: BTreeSet<String>,
+    completed_calls: Vec<(RunId, RecoveryCall)>,
     unowned: Vec<UnownedRecoveryCall>,
 }
 
 impl Calls {
+    fn step_for_batch(&self, batch: &BatchId) -> Option<StepId> {
+        self.active.as_ref().and_then(|run| {
+            self.batch_steps
+                .get(&(run.0.clone(), batch.0.clone()))
+                .copied()
+        })
+    }
     fn anchor_prepared(
         &mut self,
         frame: &crate::FramedRecord,
@@ -271,6 +332,7 @@ impl Calls {
                 call_keys: Vec::new(),
             });
         call.batch_id = Some(batch_id.clone());
+        call.step_id = call.step_id.or_else(|| self.step_for_batch(batch_id));
         let key = physical_call_key(
             &lineage.to_string(),
             frame.seq,
@@ -279,6 +341,15 @@ impl Calls {
         call.call_keys.push(key.clone());
         call.call_keys.sort();
         call.call_keys.dedup();
+        if let Some(planned) = self
+            .planned
+            .iter_mut()
+            .find(|planned| planned.matches_effect(&call))
+        {
+            planned.call_keys.extend(call.call_keys.iter().cloned());
+            planned.call_keys.sort();
+            planned.call_keys.dedup();
+        }
         // The Prepared frame owns late execution even after its run completes or
         // another episode starts. Its sequence, not the active run, names the key.
         self.prepared
@@ -334,7 +405,7 @@ impl Calls {
         if let Some(existing) = self.runs[index]
             .calls
             .iter_mut()
-            .find(|c| c.tool_call_id == call.tool_call_id)
+            .find(|c| c.matches_effect(&call))
         {
             if existing.step_id.is_none() {
                 existing.step_id = call.step_id;
@@ -376,9 +447,17 @@ impl Calls {
                     })
                     .collect();
             }
-            WalRecord::ToolBatchStarted { batch_id, .. } if !removed => {
-                for call in &mut self.planned {
-                    call.batch_id = Some(batch_id.clone());
+            WalRecord::ToolBatchStarted {
+                batch_id, step_id, ..
+            } => {
+                if let Some(run) = &self.active {
+                    self.batch_steps
+                        .insert((run.0.clone(), batch_id.0.clone()), *step_id);
+                }
+                if !removed {
+                    for call in &mut self.planned {
+                        call.batch_id = Some(batch_id.clone());
+                    }
                 }
             }
             WalRecord::ToolResult { result, .. } if !removed => self
@@ -401,7 +480,7 @@ impl Calls {
                         self.active.clone(),
                         RecoveryCall {
                             tool_call_id: tool_call_id.clone(),
-                            step_id: None,
+                            step_id: self.step_for_batch(batch_id),
                             batch_id: Some(batch_id.clone()),
                             call_keys: keys,
                         },
@@ -426,7 +505,7 @@ impl Calls {
                     self.active.clone(),
                     RecoveryCall {
                         tool_call_id: result.tool_call_id.clone(),
-                        step_id: None,
+                        step_id: self.step_for_batch(batch_id),
                         batch_id: Some(batch_id.clone()),
                         call_keys: provider_held
                             .iter()
@@ -444,7 +523,7 @@ impl Calls {
                     self.active.clone(),
                     RecoveryCall {
                         tool_call_id: tool_call_id.clone(),
-                        step_id: None,
+                        step_id: self.step_for_batch(batch_id),
                         batch_id: Some(batch_id.clone()),
                         call_keys: Vec::new(),
                     },
@@ -460,17 +539,88 @@ impl Calls {
                     self.active.clone(),
                     RecoveryCall {
                         tool_call_id: tool_call_id.clone(),
-                        step_id: None,
+                        step_id: self.step_for_batch(batch_id),
                         batch_id: Some(batch_id.clone()),
                         call_keys: vec![call_key.clone()],
                     },
                 );
             }
-            WalRecord::LateDispatchIntent { call_key, .. }
-            | WalRecord::LateResult { call_key, .. }
-                if removed =>
-            {
-                if let Some((run, call)) = self.prepared.get(call_key).cloned() {
+            WalRecord::LateApprovalRecorded {
+                call_key,
+                decision: crate::LateDecision::Approved,
+                late_execution: Some(crate::LateExecution::Execute),
+                ..
+            } => {
+                self.approved_late.insert(call_key.clone());
+            }
+            WalRecord::LateDispatchIntent {
+                call_key, batch_id, ..
+            } if !removed => {
+                self.approved_late.insert(call_key.clone());
+                self.late_batches.insert(call_key.clone(), batch_id.clone());
+            }
+            WalRecord::LateResult { call_key, .. } if !removed => {
+                self.retained_late_terminals.insert(call_key.clone());
+            }
+            WalRecord::RecoveryCallClosed {
+                cut_id,
+                run_id,
+                call_key,
+                tool_call_id,
+                batch_id,
+                step_id,
+                ..
+            } => {
+                let terminal = RecoveryCall {
+                    tool_call_id: tool_call_id.clone(),
+                    step_id: *step_id,
+                    batch_id: batch_id.clone(),
+                    call_keys: call_key.iter().cloned().collect(),
+                };
+                if !removed {
+                    self.completed_calls
+                        .push((run_id.clone(), terminal.clone()));
+                    self.retained_late_terminals
+                        .extend(call_key.iter().cloned());
+                    if self.active.as_ref() == Some(run_id) {
+                        self.planned
+                            .retain(|call| !call.terminal_matches(&terminal));
+                    }
+                }
+                if removed
+                    || !self.attribution_cut_ids.contains(cut_id)
+                    || terminal.batch_id.is_some()
+                    || terminal.step_id.is_some()
+                    || !terminal.call_keys.is_empty()
+                {
+                    self.remember(Some(run_id.clone()), terminal);
+                }
+            }
+            WalRecord::LateDispatchIntent {
+                call_key, batch_id, ..
+            } if removed => {
+                self.late_batches.insert(call_key.clone(), batch_id.clone());
+                if let Some((run, mut call)) = self.prepared.get(call_key).cloned() {
+                    call.batch_id = Some(batch_id.clone());
+                    self.remember(run, call);
+                } else {
+                    self.remember_unowned(UnownedRecoveryCall {
+                        outcome: RecoveryOutcome::Unknown,
+                        tool_call_id: None,
+                        step_id: None,
+                        batch_id: None,
+                        call_keys: vec![call_key.clone()],
+                    });
+                }
+            }
+            WalRecord::LateResult { call_key, .. } if removed => {
+                if let Some((run, mut call)) = self.prepared.get(call_key).cloned() {
+                    call.batch_id = Some(
+                        self.late_batches
+                            .get(call_key)
+                            .cloned()
+                            .unwrap_or_else(|| BatchId(format!("late:{call_key}"))),
+                    );
                     self.remember(run, call);
                 } else {
                     self.remember_unowned(UnownedRecoveryCall {
@@ -487,11 +637,13 @@ impl Calls {
                 if !removed {
                     self.cut_ids.insert(recovery.cut_id.clone());
                 }
-                for run in &recovery.runs {
-                    self.merge_run(run);
-                }
-                for call in &recovery.unowned_calls {
-                    self.remember_unowned(call.clone());
+                if self.attribution_cut_ids.insert(recovery.cut_id.clone()) {
+                    for run in &recovery.runs {
+                        self.merge_run(run);
+                    }
+                    for call in &recovery.unowned_calls {
+                        self.remember_unowned(call.clone());
+                    }
                 }
             }
             WalRecord::ToolBatchFinished { .. } if !removed => self.planned.clear(),
@@ -507,6 +659,40 @@ impl Calls {
             for call in std::mem::take(&mut self.planned) {
                 self.add(run.clone(), call);
             }
+        }
+    }
+
+    fn freeze_approved_late(&mut self) {
+        // An undecodable suffix can hide the late intent itself. A surviving
+        // approved Prepared anchor still identifies the effect that must not repeat.
+        let pending: Vec<_> = self
+            .approved_late
+            .iter()
+            .filter(|key| !self.retained_late_terminals.contains(*key))
+            .filter_map(|key| {
+                self.prepared.get(key).map(|(run, call)| {
+                    let mut call = call.clone();
+                    // Late execution has its own deterministic batch scope. The
+                    // retained approval identifies it even if its intent is unreadable.
+                    call.batch_id = Some(
+                        self.late_batches
+                            .get(key)
+                            .cloned()
+                            .unwrap_or_else(|| BatchId(format!("late:{key}"))),
+                    );
+                    (run.clone(), call)
+                })
+            })
+            .filter(|(run, call)| {
+                !run.as_ref().is_some_and(|run| {
+                    self.completed_calls
+                        .iter()
+                        .any(|(owner, terminal)| owner == run && call.terminal_matches(terminal))
+                })
+            })
+            .collect();
+        for (run, call) in pending {
+            self.remember(run, call);
         }
     }
 }
@@ -1095,6 +1281,9 @@ pub(crate) fn before_open_with_hooks(
     } else {
         let active_run = scan.calls.active.clone();
         let unattributed_tool_risk = inspect_removed(&bytes[scan.end..], &mut scan)?;
+        if unattributed_tool_risk {
+            scan.calls.freeze_approved_late();
+        }
         for prior in &pending {
             for run in &prior.runs {
                 scan.calls.merge_run(run);
@@ -1225,6 +1414,62 @@ pub(crate) fn before_open_with_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_effect_matching_requires_scope_and_known_physical_key() {
+        let call = RecoveryCall {
+            tool_call_id: ToolCallId("call_0".into()),
+            step_id: Some(StepId(1)),
+            batch_id: Some(BatchId("b1".into())),
+            call_keys: vec!["prepared-key".into(), "intent-key".into()],
+        };
+        let mut terminal = call.clone();
+        terminal.call_keys = vec!["intent-key".into()];
+        assert!(call.terminal_matches(&terminal));
+        terminal.step_id = Some(StepId(2));
+        terminal.batch_id = Some(BatchId("b2".into()));
+        assert!(!call.terminal_matches(&terminal));
+        terminal = call.clone();
+        terminal.call_keys = vec!["different-key".into()];
+        assert!(!call.terminal_matches(&terminal));
+        terminal.call_keys.clear();
+        assert!(!call.terminal_matches(&terminal));
+        let unknown = RecoveryCall {
+            tool_call_id: call.tool_call_id,
+            step_id: None,
+            batch_id: None,
+            call_keys: Vec::new(),
+        };
+        assert!(!unknown.matches_effect(&unknown));
+    }
+
+    #[test]
+    fn recovery_collection_keeps_distinct_steps_and_unknown_entries() {
+        let mut calls = Calls::default();
+        for (step, batch, key) in [(1, "b1", "key1"), (2, "b2", "key2")] {
+            calls.add(
+                RunId("r".into()),
+                RecoveryCall {
+                    tool_call_id: ToolCallId("call_0".into()),
+                    step_id: Some(StepId(step)),
+                    batch_id: Some(BatchId(batch.into())),
+                    call_keys: vec![key.into()],
+                },
+            );
+        }
+        for _ in 0..2 {
+            calls.add(
+                RunId("r".into()),
+                RecoveryCall {
+                    tool_call_id: ToolCallId("call_0".into()),
+                    step_id: None,
+                    batch_id: None,
+                    call_keys: Vec::new(),
+                },
+            );
+        }
+        assert_eq!(calls.runs[0].calls.len(), 4);
+    }
 
     #[test]
     fn recovery_cannot_bind_old_tombstones_to_a_missing_or_fresh_lineage() {
