@@ -245,6 +245,65 @@ fn tagged_prompt() -> (Vec<Message>, Vec<Message>) {
 }
 
 #[test]
+fn assistant_part_edits_preserve_runner_authored_tag_references() {
+    use cortexkit_role_llm_runner::tags::TruncateMode;
+    let mut stored = stamped(vec![text(Role::Assistant, "model-authored text")]);
+    broca_protocol::tags::number_message(
+        &mut stored[0],
+        broca_protocol::tags::ComputedRules {
+            render: true,
+            clean: true,
+        },
+        &mut 1,
+    )
+    .unwrap();
+    let mut prompt = stored.clone();
+    broca_protocol::tags::render_tags_into(
+        &mut prompt,
+        broca_protocol::tags::TagRendering::default(),
+    );
+    for (edit, expected) in [
+        (
+            PartEdit::truncate(0, "m0", "m0#0", TruncateMode::Placeholder),
+            "§2§ [dropped §2§]",
+        ),
+        (
+            PartEdit::replace(
+                0,
+                "m0",
+                "m0#0",
+                r#"{"type":"text","text":"provider reference §99§"}"#,
+            ),
+            "§2§ provider reference §99§",
+        ),
+    ] {
+        let (view, ready) = make_view(2, 0, vec![ViewRange::keep_with_edits(0, 1, vec![edit])]);
+        let mut state = CompactionState::default();
+        state.fold(&negotiated_setup(None));
+        assert_eq!(
+            decide(&view, &ready, &state, LINEAGE, &prompt, &stored, false),
+            Decision::Apply(CompactionViewChoice::Applied)
+        );
+        state.fold(&WalRecord::CompactionViewApplied {
+            provider: "provider".into(),
+            view_version: 2,
+            view: broca_wal::OpaqueJson::from_json_text(serde_json::to_string(&view).unwrap())
+                .unwrap(),
+            choice: CompactionViewChoice::Applied,
+        });
+        let rendered = render(&CallOptions::new(prompt.clone()), &state, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rendered.prompt[0].content,
+            vec![ContentBlock::Text {
+                text: expected.into()
+            }]
+        );
+    }
+}
+
+#[test]
 fn negotiated_part_edits_use_the_parts_own_tags_and_replay_old_bytes_verbatim() {
     use cortexkit_role_llm_runner::tags::TruncateMode;
     let (stored, prompt) = tagged_prompt();

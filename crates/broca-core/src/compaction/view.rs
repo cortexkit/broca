@@ -246,6 +246,12 @@ fn assemble_judged(
                                         let mut probe = Message::new(message.role, vec![part]);
                                         let mut tags = message.tags.get().expect("numbered part").clone();
                                         tags.parts = vec![number];
+                                        // These bytes are authored by the runner or compaction
+                                        // provider, not the model. Keep their inline references
+                                        // while rendering the original part's own tag.
+                                        if let Some(computed) = &mut tags.computed {
+                                            computed.clean = false;
+                                        }
                                         probe.tags = broca_protocol::tags::TagSlot::new(Some(std::sync::Arc::new(tags)));
                                         broca_protocol::tags::render_tags_into(std::slice::from_mut(&mut probe), broca_protocol::tags::TagRendering { assistant_text: true });
                                         part = probe.content.remove(0);
