@@ -1,0 +1,10 @@
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/cortexkit/commons?rev=46853185cd2ee6b6bcb684ca7d63663d59d6c8cb"]
+git = "https://github.com/cortexkit/commons"
+rev = "46853185cd2ee6b6bcb684ca7d63663d59d6c8cb"
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "@BROCA_VENDOR_ROOT@/subconscious"
