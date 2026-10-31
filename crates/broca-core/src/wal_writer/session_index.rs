@@ -191,6 +191,13 @@ impl AdmissionWal {
 }
 
 impl Wal for AdmissionWal {
+    fn durable_publication(&self) -> Option<broca_wal::file_wal::DurablePublication> {
+        if self.wal.wal_config().is_overhaul() {
+            self.wal.durable_publication()
+        } else {
+            None
+        }
+    }
     fn log_path(&self) -> Option<&std::path::Path> {
         self.wal.log_path()
     }
