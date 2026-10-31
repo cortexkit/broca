@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use broca_core::{agent_session_ref, session_addr, ReadOnlyWalReader, RunIndexState};
+use broca_core::{agent_session_ref, session_addr, ReadOnlyWalReader, RunIndexState, WalStore};
 use broca_protocol::BindIdentity;
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 
 use crate::{session_refs, SqliteStore};
@@ -35,6 +35,33 @@ pub struct DiscoveryRemoval {
     pub address: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProjectionTableRows {
+    pub table: String,
+    pub rows: u64,
+    pub remove: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProjectionMeta {
+    pub lineage_id: Option<String>,
+    pub watermark_seq: u64,
+}
+
+// These rows are derived from WAL history, not billing, deletion or move authority.
+// Unknown tables with stale-key rows refuse cleanup instead of being guessed at.
+const PROJECTION_TABLES: &[&str] = &[
+    "bus_event_open",
+    "bus_event_projection",
+    "compaction_facts",
+    "episode_span",
+    "message",
+    "message_tag",
+    "meta",
+    "retained_head",
+    "retention_lineage",
+];
+
 /// Every row to change is exposed before mutation. An empty plan is an idempotent no-op.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SessionRootRepair {
@@ -48,6 +75,11 @@ pub struct SessionRootRepair {
     pub remove_v1_refs: Vec<RefRemoval>,
     pub remove_v2_aliases: Vec<RefRemoval>,
     pub remove_discovery_rows: Vec<DiscoveryRemoval>,
+    pub stale_projection_tables: Vec<ProjectionTableRows>,
+    pub stale_meta: Option<ProjectionMeta>,
+    pub live_log_lineage: Option<String>,
+    pub live_meta_present: bool,
+    pub remove_retention_discovery_rows: u64,
 }
 
 impl SqliteStore {
@@ -140,6 +172,27 @@ impl SqliteStore {
                 [&row.address],
             )?;
         }
+        let stale_key = Self::key(actual.stale_identity.as_ref().unwrap());
+        for table in actual
+            .stale_projection_tables
+            .iter()
+            .filter(|table| table.remove && table.rows > 0)
+        {
+            let removed = tx.execute(
+                &format!(
+                    "DELETE FROM {} WHERE session=?1",
+                    quoted_identifier(&table.table)
+                ),
+                [&stale_key],
+            )?;
+            if removed as u64 != table.rows {
+                return Err(format!(
+                    "orphaned projection count changed for table {}; preview again",
+                    table.table
+                )
+                .into());
+            }
+        }
         tx.execute("DELETE FROM agent_data_writer", [])?;
         tx.commit()?;
         Ok(())
@@ -207,6 +260,11 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
         remove_v1_refs: Vec::new(),
         remove_v2_aliases: Vec::new(),
         remove_discovery_rows: Vec::new(),
+        stale_projection_tables: Vec::new(),
+        stale_meta: None,
+        live_log_lineage: None,
+        live_meta_present: false,
+        remove_retention_discovery_rows: 0,
     };
     if roots.len() == 1 {
         return Ok(result);
@@ -232,16 +290,6 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
     let live = &roots[live_address];
     check_fences(conn, root, stale_address, stale)?;
     check_fences(conn, root, live_address, live)?;
-    for table in ["meta", "message", "retention_lineage"] {
-        let occupied: bool = conn.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE session=?1)"),
-            [SqliteStore::key(stale)],
-            |row| row.get(0),
-        )?;
-        if occupied {
-            return Err(format!("stale root still has {table} state; session-root repair cannot safely merge projections").into());
-        }
-    }
     let foreign: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM agent_data_session_ref WHERE address=?1 AND (harness<>?2 OR session<>?3))",
         params![stale_address,harness,session], |row| row.get(0))?;
@@ -251,8 +299,8 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
     let (records, _) = reader.records(live_address)?;
     let mut current = None;
     let mut finished = BTreeSet::new();
-    for frame in records {
-        match frame.record {
+    for frame in &records {
+        match &frame.record {
             broca_wal::WalRecord::RunStarted {
                 run_id,
                 session: identity,
@@ -260,8 +308,8 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
             } => {
                 current = (identity.harness == harness
                     && identity.session == session
-                    && (identity == *stale || identity == *live))
-                    .then_some(run_id.0);
+                    && (identity == stale || identity == live))
+                    .then_some(run_id.0.clone());
             }
             broca_wal::WalRecord::RunFinished { .. } => {
                 if let Some(run_id) = current.take() {
@@ -345,7 +393,124 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
             });
         }
     }
+    plan_projection_cleanup(conn, root, stale, live, &mut result)?;
     Ok(result)
+}
+
+fn quoted_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn plan_projection_cleanup(
+    conn: &Connection,
+    root: &Path,
+    stale: &BindIdentity,
+    live: &BindIdentity,
+    result: &mut SessionRootRepair,
+) -> Result<()> {
+    let key = SqliteStore::key(stale);
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for table in tables {
+        let session_column: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name='session')",
+            [&table],
+            |row| row.get(0),
+        )?;
+        if !session_column {
+            continue;
+        }
+        let rows = conn.query_row(
+            &format!(
+                "SELECT count(*) FROM {} WHERE session=?1",
+                quoted_identifier(&table)
+            ),
+            [&key],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let remove = PROJECTION_TABLES.contains(&table.as_str());
+        if !remove && rows > 0 {
+            return Err(format!("table {table} has stale-key rows but is not a known per-session projection; refusing cleanup").into());
+        }
+        result.stale_projection_tables.push(ProjectionTableRows {
+            table,
+            rows,
+            remove,
+        });
+    }
+    result.stale_meta = conn
+        .query_row(
+            "SELECT lineage_id,watermark_seq FROM meta WHERE session=?1",
+            [&key],
+            |row| {
+                Ok(ProjectionMeta {
+                    lineage_id: row.get(0)?,
+                    watermark_seq: row.get(1)?,
+                })
+            },
+        )
+        .optional()?;
+    result.live_meta_present = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE session=?1)",
+        [SqliteStore::key(live)],
+        |row| row.get(0),
+    )?;
+    // The existing lineage-delete trigger removes this derived discovery hint.
+    // Report its count as well; it is not deletion or withdrawal authority.
+    result.remove_retention_discovery_rows = conn.query_row(
+        "SELECT count(*) FROM retention_discovery WHERE lineage_id IN
+         (SELECT lineage_id FROM retention_lineage WHERE session=?1)",
+        [&key],
+        |row| row.get(0),
+    )?;
+    let wal = broca_core::FileWalStore::new(root.join("wal"));
+    let range = wal.read_records_range(live, 0, None, None)?;
+    result.live_log_lineage = range.lineage_id.map(|id| id.to_string());
+    if let Some(meta) = &result.stale_meta {
+        if result.live_log_lineage.is_none() || meta.lineage_id != result.live_log_lineage {
+            return Err(format!("stale meta lineage_id {:?} at watermark_seq {} differs from verified live log lineage {:?}; refusing orphaned projection cleanup",
+                meta.lineage_id, meta.watermark_seq, result.live_log_lineage).into());
+        }
+    }
+    // Every projection's lineage must match the surviving log. A matching meta
+    // row does not prove that another table's rows came from that same log.
+    for table in ["compaction_facts", "retained_head", "retention_lineage"] {
+        let different: bool = conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE session=?1 AND lineage_id IS NOT ?2)"
+            ),
+            params![key, result.live_log_lineage],
+            |row| row.get(0),
+        )?;
+        if different {
+            return Err(format!("stale projection table {table} has a different or unverified lineage; refusing cleanup").into());
+        }
+    }
+    if !result.live_meta_present {
+        let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+            return Err(
+                "live key has no meta row and the complete log needed to rebuild it is unavailable"
+                    .into(),
+            );
+        };
+        // Prepare from an empty snapshot without committing it: prove rebuilding
+        // succeeds, but leave every live-key row untouched during maintenance.
+        SqliteStore::prepare_projection(
+            broca_core::projection_plan::ProjectionSnapshot {
+                attribution_complete: true,
+                seed: None,
+                watermark: 0,
+                lineage_id: None,
+                next_ord: 0,
+                previous_control_head: None,
+            },
+            records,
+            Some(&range),
+        )?;
+    }
+    Ok(())
 }
 
 fn check_fences(

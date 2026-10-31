@@ -1,5 +1,5 @@
 use super::*;
-use broca_core::{RunIndex, RunIndexRow, WalStore};
+use broca_core::{MaterializedStore, Persister, RunIndex, RunIndexRow, WalStore};
 use broca_protocol::{caller::RunFinishReason, ModelHandle};
 use broca_wal::WalRecord;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -122,6 +122,52 @@ impl Fixture {
         self.root.join("wal/a88b374690b4cdd7.wal")
     }
 
+    fn seed_orphaned_projection(&self, include_live: bool) {
+        let wal = broca_core::FileWalStore::new(self.root.join("wal"));
+        let prefix = wal
+            .read_records_range(&self.live, 0, Some(32), None)
+            .unwrap();
+        self.store.project_range(&self.stale, &prefix).unwrap();
+        assert_eq!(
+            self.store
+                .read_prefix_with_watermark(&self.stale)
+                .unwrap()
+                .prefix
+                .len(),
+            16
+        );
+        if include_live {
+            let complete = wal.read_records_range(&self.live, 0, None, None).unwrap();
+            self.store.project_range(&self.live, &complete).unwrap();
+        }
+    }
+
+    fn projection_rows(
+        &self,
+        identity: &BindIdentity,
+    ) -> BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+        let conn = self.store.conn.lock().unwrap();
+        let mut snapshot = BTreeMap::new();
+        for table in PROJECTION_TABLES {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} WHERE session=?1"))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement
+                .query_map([SqliteStore::key(identity)], |row| {
+                    (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows.sort_by_key(|row| format!("{row:?}"));
+            snapshot.insert(table.to_string(), rows);
+        }
+        snapshot
+    }
+
     fn archive(&self, identity: &BindIdentity, directory: &str) {
         let address = session_addr(identity);
         let live = self.root.join("wal").join(format!("{address}.wal"));
@@ -163,6 +209,280 @@ impl Fixture {
         assert_eq!(self.snapshot(), before);
         assert_eq!(std::fs::read(self.wal_path()).unwrap(), bytes);
     }
+}
+
+#[test]
+fn orphaned_projection_repair_preserves_all_24_run_transcript() {
+    let f = Fixture::new();
+    f.seed_orphaned_projection(true);
+    let live_before = f.store.read_prefix_with_watermark(&f.live).unwrap();
+    let live_rows_before = f.projection_rows(&f.live);
+    let stale_before = f.store.read_prefix_with_watermark(&f.stale).unwrap();
+    let stale_rows_before = f.projection_rows(&f.stale);
+    assert_eq!(live_before.prefix.len(), 48);
+    let bytes = std::fs::read(f.wal_path()).unwrap();
+    assert_eq!(
+        f.store
+            .resolve_session_address(&f.live, None)
+            .unwrap_err()
+            .code(),
+        "session_address_ambiguous"
+    );
+    let plan = f.preview().unwrap();
+    assert_eq!(
+        plan.stale_meta,
+        Some(ProjectionMeta {
+            lineage_id: stale_before.lineage_id.clone(),
+            watermark_seq: stale_before.watermark_seq,
+        })
+    );
+    assert_eq!(plan.live_log_lineage, live_before.lineage_id);
+    assert!(plan.live_meta_present);
+    let counts: BTreeMap<_, _> = plan
+        .stale_projection_tables
+        .iter()
+        .map(|table| (table.table.as_str(), table.rows))
+        .collect();
+    assert_eq!(counts["meta"], 1);
+    assert_eq!(counts["message"], 16);
+    assert_eq!(counts["retention_lineage"], 0);
+    assert_eq!(
+        plan.stale_projection_tables
+            .iter()
+            .filter(|table| table.remove)
+            .map(|table| table.table.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "bus_event_open",
+            "bus_event_projection",
+            "compaction_facts",
+            "episode_span",
+            "message",
+            "message_tag",
+            "meta",
+            "retained_head",
+            "retention_lineage"
+        ]
+    );
+    assert_eq!(
+        f.projection_rows(&f.stale),
+        stale_rows_before,
+        "preview must not delete orphaned projections"
+    );
+    f.store.apply_session_root_repair(&plan).unwrap();
+    let resolved = f.store.resolve_session_address(&f.stale, None).unwrap();
+    assert_eq!(resolved, f.live);
+    let transcript = f.store.read_prefix_with_watermark(&resolved).unwrap();
+    assert_eq!(transcript, live_before);
+    for n in 0..24 {
+        assert!(transcript.prefix.iter().any(|message| message.content.iter().any(|part| {
+            matches!(part, broca_protocol::ContentBlock::Text { text } if text == &format!("reply-{n:02}"))
+        })), "missing reply from run {n}");
+    }
+    assert!(f
+        .store
+        .read_prefix_with_watermark(&f.stale)
+        .unwrap()
+        .prefix
+        .is_empty());
+    assert!(f.projection_rows(&f.stale).values().all(Vec::is_empty));
+    assert_eq!(f.projection_rows(&f.live), live_rows_before);
+    assert_eq!(std::fs::read(f.wal_path()).unwrap(), bytes);
+    let second = f.preview().unwrap();
+    assert!(second.stale_identity.is_none());
+    assert!(second.stale_projection_tables.is_empty());
+    assert!(second.stale_meta.is_none());
+    let before_second = f.projection_rows(&f.live);
+    f.store.apply_session_root_repair(&second).unwrap();
+    assert_eq!(
+        f.store.read_prefix_with_watermark(&f.live).unwrap(),
+        live_before
+    );
+    assert_eq!(f.projection_rows(&f.live), before_second);
+}
+
+#[test]
+fn orphaned_projection_with_a_different_lineage_is_left_alone() {
+    let f = Fixture::new();
+    f.seed_orphaned_projection(true);
+    let different = "11111111-2222-4333-8444-555555555555";
+    f.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE meta SET lineage_id=?1 WHERE session=?2",
+            params![different, SqliteStore::key(&f.stale)],
+        )
+        .unwrap();
+    let stale_before = f.projection_rows(&f.stale);
+    let live_before = f.projection_rows(&f.live);
+    f.refuses_unchanged("stale meta lineage_id");
+    let error = f.preview().unwrap_err().to_string();
+    assert!(error.contains(different), "{error}");
+    assert!(
+        error.contains("differs from verified live log lineage"),
+        "{error}"
+    );
+    assert_eq!(f.projection_rows(&f.stale), stale_before);
+    assert_eq!(f.projection_rows(&f.live), live_before);
+}
+
+#[test]
+fn orphaned_projection_without_live_meta_is_rebuildable_from_live_or_archived_log() {
+    for archive in [false, true] {
+        let f = Fixture::new();
+        f.seed_orphaned_projection(false);
+        if archive {
+            f.archive(&f.live, "wal-archive-durable");
+        }
+        let plan = f.preview().unwrap();
+        assert!(!plan.live_meta_present);
+        assert!(plan.stale_meta.is_some());
+        f.store.apply_session_root_repair(&plan).unwrap();
+        assert!(
+            f.projection_rows(&f.live).values().all(Vec::is_empty),
+            "repair must not write a live projection"
+        );
+        let resolved = f.store.resolve_session_address(&f.stale, None).unwrap();
+        let range = broca_core::FileWalStore::new(f.root.join("wal"))
+            .read_records_range(&resolved, 0, None, None)
+            .unwrap();
+        f.store.project_range(&resolved, &range).unwrap();
+        assert_eq!(
+            f.store
+                .read_prefix_with_watermark(&resolved)
+                .unwrap()
+                .prefix
+                .len(),
+            48
+        );
+        assert!(f.projection_rows(&f.stale).values().all(Vec::is_empty));
+    }
+}
+
+#[test]
+fn orphaned_projection_cleanup_includes_all_flat_key_projection_tables() {
+    let f = Fixture::new();
+    f.seed_orphaned_projection(true);
+    let mut conn = f.store.conn.lock().unwrap();
+    let tx = conn.transaction().unwrap();
+    let key = SqliteStore::key(&f.stale);
+    let live = SqliteStore::key(&f.live);
+    let lineage = tx
+        .query_row(
+            "SELECT lineage_id FROM meta WHERE session=?1",
+            [&key],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    tx.execute("INSERT INTO message_tag VALUES(?1,1,0,0)", [&key])
+        .unwrap();
+    for session in [&key, &live] {
+        tx.execute(
+            "INSERT INTO compaction_facts VALUES(?1,?2,'{}')",
+            params![session, lineage],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO bus_event_projection VALUES(?1,'epoch',1,'{}')",
+            [session],
+        )
+        .unwrap();
+        tx.execute("INSERT INTO bus_event_open VALUES(?1,'{}')", [session])
+            .unwrap();
+    }
+    tx.execute(
+        "INSERT INTO retained_head VALUES(?1,?2,1,'{}')",
+        params![lineage, key],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO retention_lineage VALUES(?1,?2,1,0,NULL,1,NULL)",
+        params![lineage, key],
+    )
+    .unwrap();
+    tx.execute("INSERT INTO retention_discovery VALUES(?1)", [&lineage])
+        .unwrap();
+    tx.commit().unwrap();
+    drop(conn);
+    let live_before = f.projection_rows(&f.live);
+    let plan = f.preview().unwrap();
+    assert!(plan
+        .stale_projection_tables
+        .iter()
+        .filter(|table| table.remove)
+        .all(|table| table.rows > 0));
+    assert_eq!(plan.remove_retention_discovery_rows, 1);
+    f.store.apply_session_root_repair(&plan).unwrap();
+    assert!(f.projection_rows(&f.stale).values().all(Vec::is_empty));
+    assert_eq!(f.projection_rows(&f.live), live_before);
+    assert_eq!(
+        f.store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM retention_discovery", [], |row| row
+                .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn orphaned_projection_cleanup_failure_rolls_back_the_entire_repair() {
+    let f = Fixture::new();
+    f.seed_orphaned_projection(true);
+    let plan = f.preview().unwrap();
+    let before = f.snapshot();
+    let stale_before = f.projection_rows(&f.stale);
+    let live_before = f.projection_rows(&f.live);
+    f.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_orphan_cleanup BEFORE DELETE ON message
+         BEGIN SELECT RAISE(ABORT,'injected orphan cleanup failure'); END;",
+        )
+        .unwrap();
+    assert!(f
+        .store
+        .apply_session_root_repair(&plan)
+        .unwrap_err()
+        .to_string()
+        .contains("injected orphan cleanup failure"));
+    assert_eq!(f.snapshot(), before);
+    assert_eq!(f.projection_rows(&f.stale), stale_before);
+    assert_eq!(f.projection_rows(&f.live), live_before);
+}
+
+#[test]
+fn unknown_stale_key_table_refuses_instead_of_discarding_authority() {
+    let f = Fixture::new();
+    f.seed_orphaned_projection(true);
+    f.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch("CREATE TABLE unrecognized_authority(session TEXT, payload TEXT)")
+        .unwrap();
+    f.store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO unrecognized_authority VALUES(?1,'keep')",
+            [SqliteStore::key(&f.stale)],
+        )
+        .unwrap();
+    let stale_before = f.projection_rows(&f.stale);
+    let live_before = f.projection_rows(&f.live);
+    f.refuses_unchanged(
+        "unrecognized_authority has stale-key rows but is not a known per-session projection",
+    );
+    assert_eq!(f.projection_rows(&f.stale), stale_before);
+    assert_eq!(f.projection_rows(&f.live), live_before);
 }
 
 #[test]

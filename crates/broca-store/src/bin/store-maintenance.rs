@@ -505,12 +505,15 @@ fn require_stopped_writer(
 
 fn repair_session_root(args: &[String]) -> ExitCode {
     const HELP: &str = "usage: store-maintenance repair-session-root <state-root> --harness H --session S [--write]\n\
-        Preview by default: prints every run row, v1 ref and v2 alias to change as JSON.\n\
+        Preview by default: prints every run row, ref, alias and projection table count\n\
+        as JSON, including the stale meta lineage_id and watermark_seq.\n\
         --write requires broca AND its supervisor STOPPED for the entire operation.\n\
         Live or unknown writer liveness refuses before SQLite opens; both session leases\n\
         also exclude standalone writers. No log bytes are changed. Only a two-root pair\n\
         with one log (live or archived), no deletion or move fences, and terminal stale\n\
-        run rows proven in that log can be repaired. Keep a backup of the stopped store.";
+        run rows proven in that log can be repaired. Orphaned projections are deleted,\n\
+        never merged; stale meta must have the surviving log's lineage. Live key rows\n\
+        are untouched. Keep a backup of the stopped store.";
     if args.is_empty() || args == ["--help"] {
         eprintln!("{HELP}");
         return if args.is_empty() {

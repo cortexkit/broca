@@ -165,7 +165,8 @@ store-maintenance repair-session-root STATE_ROOT --harness HARNESS --session SES
 
 This is **preview-only by default**. The JSON lists each terminal run row to
 re-point (run ID, old and new identities), each v1 ref and v2 alias to remove
-(including root and session), and any obsolete address discovery rows. Keep a
+(including root and session), orphaned projection table row counts, the stale
+meta row's lineage and watermark, and any obsolete address discovery rows. Keep a
 backup, review that plan, then repeat with `--write` to apply it. The write prints
 and flushes its plan before applying, rechecks under a SQLite writer transaction,
 and refuses a changed preview. A repaired one-root pair is a no-op on repeat.
@@ -179,12 +180,29 @@ without schema initialization or leases.
 Repair requires a complete inventory, exactly two roots, and exactly one address
 with a WAL across all live trees and sealed archive trees. It refuses deletion
 ledgers/tombstones, expired lineage records, move/cut fences, unreadable sources,
-competing logs, and stale transcript/retention projections requiring a merge.
+and competing logs.
 Each stale run must be terminal and its ID must occur in a matching completed
 episode in the surviving verified WAL. Otherwise repair refuses rather than
 deleting unproven run metadata. Successful repair changes only the proven run
-identities and stale inventory/discovery mappings, in one transaction. It never
-changes log bytes or extracts an archive. All other run metadata is retained.
+identities, stale inventory/discovery mappings, and the stale key's orphaned
+projection rows, in one transaction. It never merges projections, changes live
+key rows, changes log bytes or extracts an archive. All other run metadata is
+retained. A stale meta row must identify the surviving log's lineage; different
+or unverified lineages refuse cleanup. The live key must have its own meta row,
+or the verified log must support rebuilding the projection. Cleanup never
+rebuilds or rewrites the live key itself.
+
+The flat-session-key projection tables checked for cleanup are `meta`, `message`,
+`message_tag`, `episode_span`, `retention_lineage`, `retained_head`,
+`compaction_facts`, `bus_event_projection` and `bus_event_open`. Preview lists
+every existing table with a `session` column and its exact stale-key row count;
+`remove` identifies the known projections. An unrecognized table with stale-key
+rows refuses rather than risking authoritative data. Tables using JSON identities
+or bare session names do not match that flat key and are not deleted. Billing
+facts, `export_imported_runs` records preventing double billing of imported runs,
+`retention_withdrawal` provider-withdrawal work, deletion ledgers and move fences
+remain intact. The existing `retention_lineage` delete trigger also removes its
+derived `retention_discovery` hint; preview reports that count separately.
 
 The bind-time ambiguity rule is unchanged: a missing log alone is not proof that
 an inventory identity can be discarded. Interrupted admissions, expiry and moves
