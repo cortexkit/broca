@@ -219,7 +219,7 @@ async fn assert_media_free_sparse_resume_legacy_render_and_decode(with_tools: bo
         1,
         "only the ordinary final materialization tail read is allowed"
     );
-    let eager_media_setup = usize::from(cfg!(feature = "test-attachments") && with_tools);
+    let eager_media_setup = usize::from(with_tools);
     assert_eq!(
         after_resume.identities - after_setup.identities,
         eager_media_setup
@@ -230,7 +230,7 @@ async fn assert_media_free_sparse_resume_legacy_render_and_decode(with_tools: bo
     );
     assert_eq!(
         after_resume.uploads - after_setup.uploads,
-        usize::from(cfg!(feature = "test-attachments"))
+        1
     );
     {
         let requests = http.requests.lock().unwrap();

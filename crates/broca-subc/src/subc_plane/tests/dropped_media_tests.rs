@@ -32,6 +32,14 @@ fn result_record(ctx: &BatchCtx, result: ToolResult) -> WalRecord {
 }
 
 async fn record_reply(raw: serde_json::Value, negotiated: bool) -> ToolResult {
+    record_reply_with_capture(raw, negotiated, true).await
+}
+
+async fn record_reply_with_capture(
+    raw: serde_json::Value,
+    negotiated: bool,
+    capture: bool,
+) -> ToolResult {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let root = broca_test_support::scratch_root().join(format!(
         "dropped-media-{}-{}",
@@ -47,11 +55,8 @@ async fn record_reply(raw: serde_json::Value, negotiated: bool) -> ToolResult {
         WalHandle::open_and_spawn_observed(store.clone(), ctx.bind.clone(), lease, None)
             .await
             .unwrap();
-    ctx.media_capture = writer.media_capture();
-    assert_eq!(
-        ctx.media_capture.is_some(),
-        cfg!(feature = "test-attachments")
-    );
+    ctx.media_capture = writer.media_capture().filter(|_| capture);
+    assert_eq!(ctx.media_capture.is_some(), capture);
 
     let rig = Rig::new(true, true, negotiated, false);
     *rig.reply.lock().unwrap() = raw;
@@ -103,7 +108,7 @@ async fn record_reply(raw: serde_json::Value, negotiated: bool) -> ToolResult {
         crate::content_v1::tests::render_model_request((**stored).clone()),
         crate::content_v1::tests::render_model_request(result.clone())
     );
-    if !cfg!(feature = "test-attachments") {
+    if !capture {
         for directory in ["media", "media-durable", "media-ephemeral", "media-uploads"] {
             assert!(
                 !root.join(directory).exists(),
@@ -133,11 +138,12 @@ async fn dropped_tool_media_is_recorded_or_captured_at_dispatch() {
             vec!["image/png", "image/gif"],
         ),
     ];
-    for negotiated in [false, true] {
+    for (negotiated, capture) in [(false, false), (false, true), (true, false), (true, true)] {
         for (content, expected, mimes) in &cases {
-            let result = record_reply(json!({"content":content}), negotiated).await;
+            let result =
+                record_reply_with_capture(json!({"content":content}), negotiated, capture).await;
             assert!(!result.is_error);
-            if cfg!(feature = "test-attachments") {
+            if capture {
                 let ToolOutput::Parts { parts } = &result.output else {
                     panic!("images must be captured")
                 };
