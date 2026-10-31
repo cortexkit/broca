@@ -1490,7 +1490,7 @@ impl SubcConnection {
             .await
     }
 
-    /// Open an unscoped module-level role using the same bind translation and retry machinery
+    /// Open a module-level role using the same bind translation and retry machinery
     /// as step-transform hooks. The caller bounds the entire route-open future.
     pub(crate) async fn route_open_role_within(
         &self,
@@ -1498,6 +1498,7 @@ impl SubcConnection {
         identity: &BindIdentity,
         role: &str,
         version: &str,
+        scope: Option<subc_protocol::scope::ScopeSelector>,
         retry: RouteOpenRetry,
     ) -> ConnResult<RouteHandle> {
         self.retry_open_through_gate(GateTarget::tool_provider(module_id), retry, || {
@@ -1506,7 +1507,7 @@ impl SubcConnection {
                     module_id: module_id.to_string(),
                 },
                 identity,
-                None,
+                scope.clone(),
                 Some(std::collections::BTreeMap::from([(
                     role.to_owned(),
                     version.to_owned(),

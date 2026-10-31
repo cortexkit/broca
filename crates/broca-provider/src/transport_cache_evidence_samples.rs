@@ -121,12 +121,12 @@ impl broca_core::compaction::CompactionViews for Views {
 
 #[async_trait::async_trait]
 impl broca_core::compaction::CompactionPlane for Views {
-    async fn setup(&self, _: &str, _: &BindIdentity, request: broca_core::compaction_provider::setup::SetupRequest) -> Result<broca_core::compaction_provider::setup::SetupAnswer, broca_core::compaction::CompactionUnavailable> {
+    async fn setup(&self, _: &str, _: &BindIdentity, _scope: Option<&broca_protocol::SessionScope>, request: broca_core::compaction_provider::setup::SetupRequest) -> Result<broca_core::compaction_provider::setup::SetupAnswer, broca_core::compaction::CompactionUnavailable> {
         if let Some(lineage) = &request.lineage_id { *self.lineage.lock().unwrap() = lineage.clone(); }
         Ok(serde_json::from_value(json!({"request_id":request.request_id,"answer":"ready","initial":{"compaction_id":"synthetic-context","version":1,"range":{"from":0,"to":0},"replacement":[]}})).unwrap())
     }
 
-    async fn view_get(&self, _: &str, _: &BindIdentity, request: broca_core::compaction_provider::view::ViewGetRequest) -> Result<broca_core::compaction_provider::view::ViewGetAnswer, broca_core::compaction::CompactionUnavailable> {
+    async fn view_get(&self, _: &str, _: &BindIdentity, _scope: Option<&broca_protocol::SessionScope>, request: broca_core::compaction_provider::view::ViewGetRequest) -> Result<broca_core::compaction_provider::view::ViewGetAnswer, broca_core::compaction::CompactionUnavailable> {
         Ok(broca_core::compaction_provider::view::ViewGetAnswer::view(self.candidate(&request.session_ref, request.view_version)))
     }
 }

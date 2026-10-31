@@ -464,8 +464,13 @@ pub async fn apply_idle(
             "compaction view decided at the idle boundary");
         Ok(false)
     };
-    let Some((config, run_id)) = records.iter().rev().find_map(|record| match record {
-        broca_wal::WalRecord::RunStarted { config, run_id, .. } => Some((config.as_ref(), run_id)),
+    let Some((config, run_id, scope)) = records.iter().rev().find_map(|record| match record {
+        broca_wal::WalRecord::RunStarted {
+            config,
+            run_id,
+            scope,
+            ..
+        } => Some((config.as_ref(), run_id, scope.as_ref())),
         _ => None,
     }) else {
         return deferred("no_run");
@@ -487,6 +492,7 @@ pub async fn apply_idle(
         .ok_or("compaction wire renderer absent")?;
     broca_core::compaction::apply_idle_view(
         session,
+        scope,
         writer,
         plane,
         views,

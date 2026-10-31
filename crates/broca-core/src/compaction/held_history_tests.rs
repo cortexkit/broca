@@ -135,6 +135,7 @@ impl CompactionPlane for Windows {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         let mut answer = ready();
@@ -153,6 +154,7 @@ impl CompactionPlane for Windows {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, CompactionUnavailable> {
         Ok(ViewGetAnswer::view(
@@ -164,6 +166,7 @@ impl CompactionPlane for Windows {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::ride::RideRequest,
     ) -> Result<crate::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
         if self.wait != WaitViews::Off

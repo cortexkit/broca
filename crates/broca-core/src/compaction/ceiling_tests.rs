@@ -81,6 +81,7 @@ impl CompactionPlane for CeilingPlane {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         *self.lineage.lock().unwrap() = request.lineage_id.unwrap();
@@ -94,6 +95,7 @@ impl CompactionPlane for CeilingPlane {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: RideRequest,
     ) -> Result<RideAnswer, CompactionUnavailable> {
         assert_eq!(request.cause, RideCause::Ceiling);
@@ -116,6 +118,7 @@ impl CompactionPlane for CeilingPlane {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, CompactionUnavailable> {
         if self.fetches.fetch_add(1, Ordering::SeqCst) == 0 {

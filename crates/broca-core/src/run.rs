@@ -3878,10 +3878,12 @@ where
         return Err(error);
     }
     let hook_bind = req.session.clone();
+    let hook_scope = req.scope.clone();
     let hooks = hook_plan
         .as_ref()
         .zip(control.hook_plane.as_ref())
         .map(|(plan, plane)| crate::hooks::HookRuntime {
+            scope: hook_scope.as_ref(),
             plan,
             plane,
             bind: &hook_bind,
@@ -4108,6 +4110,7 @@ where
         compaction_item
             .as_ref()
             .map(|(provider, _, _, _)| crate::compaction::runtime::Runtime {
+                scope: req.scope.as_ref(),
                 provider,
                 bind: &hook_bind,
                 plane: control.compaction_plane.as_ref(),
@@ -18384,6 +18387,7 @@ mod approval_gate {
                 .as_ref()
                 .zip(control.hook_plane.as_ref())
                 .map(|(plan, adapter)| crate::hooks::HookRuntime {
+                    scope: ctx.scope.as_ref(),
                     plan,
                     plane: adapter,
                     bind: session,

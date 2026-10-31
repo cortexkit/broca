@@ -425,6 +425,7 @@ impl CompactionPlane for Scripted {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         self.setups.fetch_add(1, Ordering::SeqCst);
@@ -472,6 +473,7 @@ async fn run_setup_for(
         setups: AtomicUsize::new(0),
     });
     let runtime = runtime::Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: Some(&plane),
@@ -615,6 +617,7 @@ impl CompactionPlane for SlowRide {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         Err(CompactionUnavailable)
@@ -623,6 +626,7 @@ impl CompactionPlane for SlowRide {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::ride::RideRequest,
     ) -> Result<crate::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
         self.deadlines.lock().unwrap().push(request.deadline_ms);
@@ -647,6 +651,7 @@ async fn ride_after(
     });
     let plane: Arc<dyn CompactionPlane> = slow.clone();
     let runtime = runtime::Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: Some(&plane),
@@ -1139,6 +1144,7 @@ impl CompactionPlane for OneView {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         let mut answer = ready();
@@ -1153,6 +1159,7 @@ impl CompactionPlane for OneView {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::view::ViewGetRequest,
     ) -> Result<crate::compaction_provider::view::ViewGetAnswer, CompactionUnavailable> {
         use crate::compaction_provider::view::ViewGetAnswer;
@@ -1183,6 +1190,7 @@ impl CompactionPlane for OneView {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::ride::RideRequest,
     ) -> Result<crate::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
         use crate::compaction_provider::ride::RideAnswer;
@@ -1244,6 +1252,7 @@ async fn presetless_compaction_setup_omits_the_member_on_the_real_call() {
             &self,
             _: &str,
             _: &BindIdentity,
+            _scope: Option<&broca_protocol::SessionScope>,
             request: SetupRequest,
         ) -> Result<SetupAnswer, CompactionUnavailable> {
             assert!(serde_json::to_value(&request)
@@ -1977,6 +1986,7 @@ impl CompactionPlane for RacingViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         Err(CompactionUnavailable)
@@ -1985,6 +1995,7 @@ impl CompactionPlane for RacingViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::view::ViewGetRequest,
     ) -> Result<crate::compaction_provider::view::ViewGetAnswer, CompactionUnavailable> {
         self.fetches.lock().unwrap().push(request.view_version);
@@ -2035,6 +2046,7 @@ async fn idle_boundary_applies_only_the_newest_view_announced_during_its_fetch()
     let (applied, ()) = tokio::join!(
         runtime::apply_idle_view(
             &session,
+            None,
             &writer,
             &plane,
             Some(views),
@@ -2095,6 +2107,7 @@ async fn step_boundary_logs_applied_and_superseded_views_with_session_ref() {
         ..Default::default()
     };
     let runtime = runtime::Runtime {
+        scope: None,
         provider: "provider",
         bind: &session,
         plane: Some(&plane),
@@ -2190,6 +2203,7 @@ async fn idle_view_records_lower_estimate_and_repairs_every_cut_before_wake() {
         let plane: Arc<dyn CompactionPlane> = plane;
         assert!(runtime::apply_idle_view(
             &bind(),
+            None,
             &writer,
             &plane,
             None,
