@@ -16,6 +16,8 @@ use std::{
 };
 
 pub const FEATURE: &str = "wal-recovery/v1";
+/// Named execution refusal when repair could have removed late authorization.
+pub const LATE_APPROVAL_EVIDENCE_LOST: &str = "late_approval_evidence_lost";
 
 /// Physical call identities keep their legacy spelling until a repair. The cut
 /// identity separates new calls from removed records whose sequences may recur.
@@ -292,6 +294,9 @@ struct Calls {
     batch_steps: std::collections::BTreeMap<(String, String), StepId>,
     prepared: std::collections::BTreeMap<String, (Option<RunId>, RecoveryCall)>,
     approved_late: BTreeSet<String>,
+    late_execute: BTreeSet<String>,
+    expired_late: BTreeSet<String>,
+    closed_late_decisions: BTreeSet<String>,
     late_batches: std::collections::BTreeMap<String, BatchId>,
     retained_late_terminals: BTreeSet<String>,
     completed_calls: Vec<(RunId, RecoveryCall)>,
@@ -314,7 +319,10 @@ impl Calls {
         let (
             Some(lineage),
             WalRecord::ToolCallDeferred {
-                call_id, batch_id, ..
+                call_id,
+                batch_id,
+                ask,
+                ..
             },
         ) = (lineage, &frame.record)
         else {
@@ -338,6 +346,9 @@ impl Calls {
             frame.seq,
             self.recovery_generation.as_deref(),
         );
+        if ask.late_execution == crate::LateExecution::Execute {
+            self.late_execute.insert(key.clone());
+        }
         call.call_keys.push(key.clone());
         call.call_keys.sort();
         call.call_keys.dedup();
@@ -466,6 +477,15 @@ impl Calls {
             WalRecord::ToolNoDispatch { tool_call_id, .. } if !removed => {
                 self.planned.retain(|c| &c.tool_call_id != tool_call_id)
             }
+            WalRecord::ApprovalRecorded {
+                call_key, decision, ..
+            } if !removed => {
+                if *decision == crate::DeferredDecision::Expired {
+                    self.expired_late.insert(call_key.clone());
+                } else {
+                    self.expired_late.remove(call_key);
+                }
+            }
             WalRecord::ToolDispatchIntent {
                 tool_call_id,
                 batch_id,
@@ -552,6 +572,12 @@ impl Calls {
                 ..
             } => {
                 self.approved_late.insert(call_key.clone());
+                if !removed {
+                    self.closed_late_decisions.remove(call_key);
+                }
+            }
+            WalRecord::LateApprovalRecorded { call_key, .. } if !removed => {
+                self.closed_late_decisions.insert(call_key.clone());
             }
             WalRecord::LateDispatchIntent {
                 call_key, batch_id, ..
@@ -662,11 +688,14 @@ impl Calls {
         }
     }
 
-    fn freeze_approved_late(&mut self) {
-        // An undecodable suffix can hide the late intent itself. A surviving
-        // approved Prepared anchor still identifies the effect that must not repeat.
-        let pending: Vec<_> = self
-            .approved_late
+    fn freeze_late_open(&mut self) {
+        // Unreadable bytes can hide both approval and intent. An expired,
+        // Execute-capable Prepared call may already have run even without a
+        // surviving approval; a later answer cannot make it safe to send again.
+        let mut candidates = self.approved_late.clone();
+        candidates.extend(self.expired_late.intersection(&self.late_execute).cloned());
+        candidates.retain(|key| !self.closed_late_decisions.contains(key));
+        let pending: Vec<_> = candidates
             .iter()
             .filter(|key| !self.retained_late_terminals.contains(*key))
             .filter_map(|key| {
@@ -1282,7 +1311,7 @@ pub(crate) fn before_open_with_hooks(
         let active_run = scan.calls.active.clone();
         let unattributed_tool_risk = inspect_removed(&bytes[scan.end..], &mut scan)?;
         if unattributed_tool_risk {
-            scan.calls.freeze_approved_late();
+            scan.calls.freeze_late_open();
         }
         for prior in &pending {
             for run in &prior.runs {
@@ -1414,6 +1443,49 @@ pub(crate) fn before_open_with_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_late_candidate_requires_execute_expiry_and_no_terminal() {
+        for (execute, expired, declined, terminal, expected) in [
+            (true, true, false, false, 1),
+            (false, true, false, false, 0),
+            (true, false, false, false, 0),
+            (true, true, true, false, 0),
+            (true, true, false, true, 0),
+        ] {
+            let mut calls = Calls::default();
+            calls.prepared.insert(
+                "key".into(),
+                (
+                    Some(RunId("owner".into())),
+                    RecoveryCall {
+                        tool_call_id: ToolCallId("call_0".into()),
+                        batch_id: Some(BatchId("b".into())),
+                        step_id: Some(StepId(1)),
+                        call_keys: vec!["key".into()],
+                    },
+                ),
+            );
+            if execute {
+                calls.late_execute.insert("key".into());
+            }
+            if expired {
+                calls.expired_late.insert("key".into());
+            }
+            if declined {
+                calls.approved_late.insert("key".into());
+                calls.closed_late_decisions.insert("key".into());
+            }
+            if terminal {
+                calls.retained_late_terminals.insert("key".into());
+            }
+            calls.freeze_late_open();
+            assert_eq!(
+                calls.runs.iter().map(|run| run.calls.len()).sum::<usize>(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn recovery_effect_matching_requires_scope_and_known_physical_key() {

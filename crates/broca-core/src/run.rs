@@ -17665,6 +17665,14 @@ mod approval_gate {
         let Feedback::Released(held, Some(answer)) = event else {
             return Ok(());
         };
+        if history
+            .projection
+            .calls
+            .get(&held.key)
+            .is_some_and(lost_approval_terminal)
+        {
+            return late_answer(history, writer, &held.ctx(ctx), control, &held.key, answer).await;
+        }
         let Some(projected) = history.projection.calls.get(&held.key) else {
             return Ok(());
         };
@@ -17853,6 +17861,12 @@ mod approval_gate {
             }
         }
     }
+    fn lost_approval_terminal(call: &crate::replay::ProjectedDeferredCall) -> bool {
+        call.late_result
+            .as_deref()
+            .is_some_and(crate::recovery_close_out::is_lost_approval_receipt)
+    }
+
     async fn late_answer(
         history: &mut History,
         writer: &WalHandle,
@@ -17868,7 +17882,8 @@ mod approval_gate {
         }) else {
             return Ok(());
         };
-        if call.late_result.is_some() || !history.projection.late_allowed(call) {
+        let frozen = lost_approval_terminal(call);
+        if !frozen && (call.late_result.is_some() || !history.projection.late_allowed(call)) {
             return Ok(());
         }
         let WalRecord::ToolCallDeferred { ask, .. } = &*call.prepared else {
@@ -17889,7 +17904,11 @@ mod approval_gate {
             Err(error) if error.retryable => return Ok(()),
             Err(error) => return late_refusal(history, writer, key, &error).await,
         };
-        record_late_answer(history, writer, key, authorized_late, late_execution).await
+        record_late_answer(history, writer, key, authorized_late, late_execution).await?;
+        if frozen {
+            report_late(control, ctx, &held, LateOutcome::Unknown).await;
+        }
+        Ok(())
     }
 
     pub(super) async fn record_late_answer(
@@ -17940,6 +17959,21 @@ mod approval_gate {
         }) else {
             return Ok(());
         };
+        if lost_approval_terminal(call) {
+            let id = call.elicitation_id.clone().unwrap_or_default();
+            history.record(
+                writer,
+                WalRecord::LateApprovalRecorded {
+                    call_key: key.into(),
+                    elicitation_id: id,
+                    decision: LateDecision::None,
+                    approval_digest: None,
+                    late_execution: None,
+                },
+            );
+            writer.sync().await?;
+            return Ok(());
+        }
         if call.late_result.is_some() || !history.projection.late_allowed(call) {
             return Ok(());
         }
@@ -18165,10 +18199,10 @@ mod approval_gate {
             .calls
             .iter()
             .filter(|(_, call)| {
-                history.projection.late_allowed(call)
+                (lost_approval_terminal(call) || history.projection.late_allowed(call))
                     && call.decision == Some(DeferredDecision::Expired)
                     && call.late_approval.is_none()
-                    && call.late_result.is_none()
+                    && (lost_approval_terminal(call) || call.late_result.is_none())
             })
             .map(|(key, call)| (key.clone(), call.clone()))
             .collect();

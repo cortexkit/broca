@@ -212,6 +212,22 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   Durable ordinary/late terminals and completion receipts take precedence over
   repeated cut attribution; an earlier expiry result does not settle a possible
   subsequently authorized late effect.
+  If a real cut contains undecodable bytes, every still-late-open Prepared call
+  whose ask permits late Execute is frozen, even when its approval record is
+  missing: the unreadable bytes might have contained both approval and a synced
+  dispatch intent. Notify-only asks, recorded closed late decisions and retained
+  late terminals do not enter that set. Fully decoded cuts keep the prior
+  approved-only boundary; ordinary silent final-tail recovery creates no such cut.
+
+  A completion with missing live approval evidence carries the existing error
+  code `late_approval_evidence_lost` and an Unknown message that does not claim the
+  call definitely ran. A later genuine answer is authenticated and recorded as
+  `LateApprovalRecorded`, but cannot override the completion or create another
+  result/intent. The existing approval execution report remains `outcome_unknown`;
+  unrelated new runs continue. A reader finds the named execution rejection on
+  `session.read` at `$.result.late_approvals[i].result.output.code`, with outcome
+  `unknown`. This is a new value in the existing optional open-string code field,
+  not a new reply member or a top-level RPC error. It is dormant on legacy logs.
   Model-facing IDs such as Gemini's `call_0` can recur in another step of the same
   run. A terminal must match the owner, known batch/step scope and known exact
   physical key; an earlier step's same-ID result cannot satisfy it. Entries with

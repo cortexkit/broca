@@ -11,6 +11,21 @@ use broca_wal::{FramedRecord, WalRecord};
 
 use crate::replay::{DeferredCallProjection, OpenCallState, ReplayError, ReplayResolution};
 
+fn lost_approval_result(id: &ToolCallId) -> broca_protocol::ToolResult {
+    let mut result = crate::outcome_unknown_result(id);
+    if let broca_protocol::ToolOutput::Error { message, code, .. } = &mut result.output {
+        *message = "outcome_unknown: WAL repair lost late approval/dispatch evidence. This call may or may not already have been approved and sent. It will not be sent again; a later approval is refused (late_approval_evidence_lost).".into();
+        *code = Some(broca_wal::recovery::LATE_APPROVAL_EVIDENCE_LOST.into());
+    }
+    result
+}
+
+pub(crate) fn is_lost_approval_receipt(record: &WalRecord) -> bool {
+    matches!(record, WalRecord::RecoveryCallClosed { result, .. }
+        if matches!(&result.output, broca_protocol::ToolOutput::Error { code: Some(code), .. }
+            if code == broca_wal::recovery::LATE_APPROVAL_EVIDENCE_LOST))
+}
+
 struct AttributedCall {
     sources: Vec<(String, RecoveryCall)>,
     run_id: RunId,
@@ -322,6 +337,8 @@ pub fn plan(
             continue;
         }
         let late_open = prepared.is_some_and(|(_, call)| DeferredCallProjection::late_open(call));
+        let approval_evidence_lost =
+            late_open && prepared.is_some_and(|(_, call)| call.late_approval.is_none());
         let mut settled = false;
         for terminal in terminals
             .iter_mut()
@@ -418,7 +435,11 @@ pub fn plan(
             call_key: key,
             tool_call_id: attributed.call.tool_call_id.clone(),
             outcome: RecoveryOutcome::Unknown,
-            result: Arc::new(crate::outcome_unknown_result(&attributed.call.tool_call_id)),
+            result: Arc::new(if approval_evidence_lost {
+                lost_approval_result(&attributed.call.tool_call_id)
+            } else {
+                crate::outcome_unknown_result(&attributed.call.tool_call_id)
+            }),
         });
     }
     let mut completion = Vec::new();

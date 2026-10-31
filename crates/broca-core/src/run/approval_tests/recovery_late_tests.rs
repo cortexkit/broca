@@ -51,11 +51,16 @@ async fn replace_writer(rig: &mut Rig, root: &std::path::Path) {
 }
 
 async fn expired_overhaul() -> (Rig, String) {
+    let (rig, key) = expired_overhaul_unanswered().await;
+    record_late_consent(&rig).await;
+    (rig, key)
+}
+
+async fn expired_overhaul_unanswered() -> (Rig, String) {
     let mut rig = Rig::file_backed("pass");
     let root = rig.root.join("overhaul/wal");
     replace_writer(&mut rig, &root).await;
     let rig = expire_rig(rig).await;
-    record_late_consent(&rig).await;
     let prepared = rig
         .frames()
         .into_iter()
@@ -128,6 +133,73 @@ async fn next_turn(rig: &Rig, id: &str) {
 }
 
 #[tokio::test]
+async fn fully_decoded_cut_keeps_an_unapproved_late_question_executable() {
+    let (mut rig, key) = expired_overhaul_unanswered().await;
+    *rig.questions.answer.lock().unwrap() = "none";
+    rig.writer
+        .record(WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(99),
+        })
+        .into_result()
+        .unwrap();
+    rig.writer.sync().await.unwrap();
+    let mut bytes = std::fs::read(rig.tools.store.wal_path(&rig.bind)).unwrap();
+    let mut offset = 0;
+    loop {
+        match framing::decode_next(&bytes[offset..]) {
+            framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
+            framing::DecodeStep::Record { framed, consumed } => {
+                if matches!(framed.record, WalRecord::StepStarted { step_id } if step_id.0 == 99) {
+                    let mut metadata = framing::v4::decode_header(&bytes[offset..])
+                        .unwrap()
+                        .unwrap()
+                        .metadata;
+                    metadata.seq += 1;
+                    let frame = framing::encode_v4(
+                        metadata,
+                        &[framing::FRAME_STAMPS_FEATURE],
+                        &framed.record,
+                    )
+                    .unwrap();
+                    assert_eq!(frame.len(), consumed);
+                    bytes[offset..offset + consumed].copy_from_slice(&frame);
+                    break;
+                }
+                offset += consumed;
+            }
+            _ => panic!("source must decode before its clean sequence gap"),
+        }
+    }
+    let root = rig.root.join("fully-decoded-cut/wal");
+    let path = store(&root).wal_path(&rig.bind);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+    replace_writer(&mut rig, &root).await;
+    let frames = rig.frames();
+    let cut = frames
+        .iter()
+        .find_map(|frame| match &frame.record {
+            WalRecord::RecoveryCut { recovery } => Some(recovery),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!cut.unattributed_tool_risk);
+    assert!(!cut
+        .runs
+        .iter()
+        .flat_map(|run| &run.calls)
+        .any(|call| call.call_keys.contains(&key)));
+    *rig.questions.answer.lock().unwrap() = "approve";
+    next_turn(&rig, "after-fully-decoded-cut").await;
+    assert_eq!(rig.tools.sent.lock().unwrap().len(), 1);
+    assert!(rig.frames().iter().any(|frame| matches!(&frame.record,
+        WalRecord::LateResult { call_key, outcome: broca_wal::LateOutcome::Completed, .. } if call_key == &key)));
+    assert!(!rig.frames().iter().any(|frame| matches!(&frame.record,
+        WalRecord::RecoveryCallClosed { call_key: Some(call_key), .. } if call_key == &key)));
+    rig.finish().await;
+}
+
+#[tokio::test]
 async fn completed_origin_without_a_late_intent_still_executes_once() {
     let (mut rig, key) = expired_overhaul().await;
     let root = rig.root.join("overhaul/wal");
@@ -148,21 +220,43 @@ async fn completed_origin_without_a_late_intent_still_executes_once() {
 
 #[tokio::test]
 async fn recovery_cut_late_intent_never_resends_from_completed_origin() {
-    check_cut_late_intent(false, false).await;
+    check_cut_late_intent(false, LateDamage::ReadableGap, false).await;
 }
 
 #[tokio::test]
 async fn recovery_cut_late_intent_keeps_its_prepared_owner_after_a_later_episode() {
-    check_cut_late_intent(true, false).await;
+    check_cut_late_intent(true, LateDamage::ReadableGap, false).await;
 }
 
 #[tokio::test]
 async fn recovery_undecodable_late_intent_never_resends_from_completed_origin() {
-    check_cut_late_intent(false, true).await;
+    check_cut_late_intent(false, LateDamage::UndecodableIntent, false).await;
 }
 
-async fn check_cut_late_intent(later_episode: bool, undecodable: bool) {
+#[tokio::test]
+async fn recovery_destroyed_late_approval_and_intent_never_resends() {
+    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, false).await;
+}
+
+#[tokio::test]
+async fn recovery_frozen_question_records_a_later_approval_without_execution() {
+    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, true).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LateDamage {
+    ReadableGap,
+    UndecodableIntent,
+    LostApprovalAndIntent,
+}
+
+async fn check_cut_late_intent(later_episode: bool, damage: LateDamage, later_answer: bool) {
     let (mut rig, key) = expired_overhaul().await;
+    let lost_approval = damage == LateDamage::LostApprovalAndIntent;
+    let undecodable = damage != LateDamage::ReadableGap;
+    if lost_approval {
+        *rig.questions.answer.lock().unwrap() = if later_answer { "none" } else { "approve" };
+    }
     let origin = rig
         .frames()
         .iter()
@@ -228,37 +322,59 @@ async fn check_cut_late_intent(later_episode: bool, undecodable: bool) {
     let source = rig.tools.store.wal_path(&rig.bind);
     let mut bytes = std::fs::read(&source).unwrap();
     let mut offset = 0;
-    let (cut_at, removed) = loop {
-        match framing::decode_next(&bytes[offset..]) {
-            framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
-            framing::DecodeStep::Record { framed, consumed } => {
-                if matches!(&framed.record, WalRecord::LateDispatchIntent { call_key, .. } if call_key == &key)
-                {
-                    if undecodable {
+    let (cut_at, removed) = if lost_approval {
+        let mut first = None;
+        while offset < bytes.len() {
+            match framing::decode_next(&bytes[offset..]) {
+                framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
+                framing::DecodeStep::Record { framed, consumed } => {
+                    if matches!(&framed.record,
+                        WalRecord::LateApprovalRecorded { call_key, .. }
+                        | WalRecord::LateDispatchIntent { call_key, .. } if call_key == &key)
+                    {
+                        first.get_or_insert(offset);
                         bytes[offset..offset + consumed].fill(0);
-                        break (offset, bytes[offset..].to_vec());
                     }
-                    let mut metadata = framing::v4::decode_header(&bytes[offset..])
-                        .unwrap()
-                        .unwrap()
-                        .metadata;
-                    metadata.seq += 1;
-                    let wrong_sequence = framing::encode_v4(
-                        metadata,
-                        &[framing::FRAME_STAMPS_FEATURE],
-                        &framed.record,
-                    )
-                    .unwrap();
-                    assert_eq!(wrong_sequence.len(), consumed);
-                    bytes[offset..offset + consumed].copy_from_slice(&wrong_sequence);
-                    assert!(matches!(framing::decode_next(&bytes[offset..]),
+                    offset += consumed;
+                }
+                _ => panic!("source must decode before removing both late records"),
+            }
+        }
+        let first = first.unwrap();
+        (first, bytes[first..].to_vec())
+    } else {
+        loop {
+            match framing::decode_next(&bytes[offset..]) {
+                framing::DecodeStep::Lineage { consumed, .. } => offset += consumed,
+                framing::DecodeStep::Record { framed, consumed } => {
+                    if matches!(&framed.record, WalRecord::LateDispatchIntent { call_key, .. } if call_key == &key)
+                    {
+                        if undecodable {
+                            bytes[offset..offset + consumed].fill(0);
+                            break (offset, bytes[offset..].to_vec());
+                        }
+                        let mut metadata = framing::v4::decode_header(&bytes[offset..])
+                            .unwrap()
+                            .unwrap()
+                            .metadata;
+                        metadata.seq += 1;
+                        let wrong_sequence = framing::encode_v4(
+                            metadata,
+                            &[framing::FRAME_STAMPS_FEATURE],
+                            &framed.record,
+                        )
+                        .unwrap();
+                        assert_eq!(wrong_sequence.len(), consumed);
+                        bytes[offset..offset + consumed].copy_from_slice(&wrong_sequence);
+                        assert!(matches!(framing::decode_next(&bytes[offset..]),
                         framing::DecodeStep::Record { framed, .. }
                         if matches!(&framed.record, WalRecord::LateDispatchIntent { call_key, .. } if call_key == &key)));
-                    break (offset, bytes[offset..].to_vec());
+                        break (offset, bytes[offset..].to_vec());
+                    }
+                    offset += consumed;
                 }
-                offset += consumed;
+                _ => panic!("the synced fixture must decode before its late intent"),
             }
-            _ => panic!("the synced fixture must decode before its late intent"),
         }
     };
     let root = rig.root.join("repaired/wal");
@@ -314,7 +430,11 @@ async fn check_cut_late_intent(later_episode: bool, undecodable: bool) {
         frames.iter().filter(|frame| matches!(&frame.record,
         WalRecord::RecoveryCallClosed { run_id, call_key: Some(call_key),
             outcome: broca_wal::recovery::RecoveryOutcome::Unknown, result, .. }
-        if run_id == &origin && call_key == &key && result.as_ref() == &crate::outcome_unknown_result(&broca_protocol::ToolCallId("c".into())))).count()
+        if run_id == &origin && call_key == &key && if lost_approval {
+            result.is_error && result.tool_call_id.0 == "c" && matches!(&result.output,
+                broca_protocol::ToolOutput::Error { code: Some(code), message, .. }
+                if code == "late_approval_evidence_lost" && message.contains("late_approval_evidence_lost"))
+        } else { result.as_ref() == &crate::outcome_unknown_result(&broca_protocol::ToolCallId("c".into())) })).count()
     };
     assert_eq!(unknown(&frames), 1);
     let split = repaired_before_drive
@@ -335,13 +455,101 @@ async fn check_cut_late_intent(later_episode: bool, undecodable: bool) {
         !full_projection.late_allowed(full_projection.calls.get(&key).unwrap()),
         "Completed origin must not authorize a recovery-tombstoned call"
     );
-    assert!(rig
-        .questions
-        .reports
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|(_, outcome)| matches!(outcome, ApprovalExecution::OutcomeUnknown)));
+    if !later_answer {
+        assert!(rig
+            .questions
+            .reports
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, ApprovalExecution::OutcomeUnknown)));
+    }
+    if later_answer {
+        assert!(!rig.frames().iter().any(|frame| matches!(&frame.record,
+            WalRecord::LateApprovalRecorded { call_key, .. } if call_key == &key)));
+        let old_head = std::fs::read(broca_wal::head_proof::sidecar_path(&path)).ok();
+        *rig.questions.answer.lock().unwrap() = "approve";
+        next_turn(&rig, "late-arrived-after-freeze").await;
+        assert!(rig.tools.sent.lock().unwrap().is_empty());
+        assert_eq!(unknown(&rig.frames()), 1);
+        assert_eq!(rig.frames().iter().filter(|frame| matches!(&frame.record,
+            WalRecord::LateApprovalRecorded { call_key, decision: broca_wal::LateDecision::Approved, .. }
+            if call_key == &key)).count(), 1);
+        let mut projection =
+            crate::replay::DeferredCallProjection::new(rig.writer.lineage_id().unwrap());
+        projection.fold_frames(&rig.frames());
+        let views = projection.late_approvals();
+        let view = views.iter().find(|view| view.call_key == key).unwrap();
+        assert_eq!(view.outcome, Some(broca_wal::LateOutcome::Unknown));
+        assert!(matches!(&view.result.as_ref().unwrap().output,
+            broca_protocol::ToolOutput::Error { code: Some(code), .. } if code == "late_approval_evidence_lost"));
+        assert!(rig
+            .questions
+            .reports
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, ApprovalExecution::OutcomeUnknown)));
+
+        // Keep the valid record prefix at the answer boundary, before the new
+        // run's model work. The older head publication is an allowed survivor.
+        let image = broca_crash_harness::LogImage::read(&path);
+        let boundary = image
+            .records()
+            .iter()
+            .position(|record| {
+                matches!(record,
+            WalRecord::LateApprovalRecorded { call_key, .. } if call_key == &key)
+            })
+            .unwrap()
+            + 1;
+        let reopened_root = rig.root.join("reopened-after-answer/wal");
+        let target = store(&reopened_root).wal_path(&rig.bind);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, &image.bytes[..image.end_of_records(boundary)]).unwrap();
+        let stem = format!("{}.cut-", path.file_name().unwrap().to_string_lossy());
+        for entry in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with(&stem)
+                && entry.file_type().unwrap().is_file()
+            {
+                std::fs::copy(
+                    entry.path(),
+                    target.parent().unwrap().join(entry.file_name()),
+                )
+                .unwrap();
+            }
+        }
+        let floor = root
+            .parent()
+            .unwrap()
+            .join(broca_wal::FEATURE_FLOOR_FILENAME);
+        std::fs::copy(
+            floor,
+            reopened_root
+                .parent()
+                .unwrap()
+                .join(broca_wal::FEATURE_FLOOR_FILENAME),
+        )
+        .unwrap();
+        if let Some(head) = old_head {
+            std::fs::write(broca_wal::head_proof::sidecar_path(&target), head).unwrap();
+        }
+        replace_writer(&mut rig, &reopened_root).await;
+        next_turn(&rig, "late-arrived-after-freeze").await;
+        assert_eq!(unknown(&rig.frames()), 1);
+        assert_eq!(
+            rig.frames()
+                .iter()
+                .filter(|frame| matches!(&frame.record,
+            WalRecord::LateApprovalRecorded { call_key, .. } if call_key == &key))
+                .count(),
+            1
+        );
+        assert!(rig.tools.sent.lock().unwrap().is_empty());
+        assert!(!rig.frames().iter().any(|frame| matches!(&frame.record,
+            WalRecord::LateDispatchIntent { call_key, .. } if call_key == &key)));
+    }
     next_turn(&rig, "late-after-recovery-again").await;
     assert_eq!(unknown(&rig.frames()), 1);
     assert_eq!(
