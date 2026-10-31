@@ -752,6 +752,7 @@ pub enum CutLockMode {
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 
 struct Inner {
+    episode_source: std::sync::OnceLock<Arc<EpisodeReadSource>>,
     #[cfg(test)]
     raw_pages: std::sync::OnceLock<Arc<RawPageTestBundle>>,
     tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
@@ -1095,6 +1096,38 @@ struct ReadSources {
     store: Option<Arc<dyn broca_core::MaterializedStore>>,
 }
 
+type EpisodePublication = dyn Fn(&LineageKey, Option<u64>) -> Result<broca_wal::file_wal::DurablePublication, String>
+    + Send
+    + Sync;
+
+/// Opt-in database composition. The callback supplies the writer's durable publication
+/// at the sequence requested for an attach, or the latest publication for a page.
+/// Existing constructors never install this source.
+pub struct EpisodeReadSource {
+    db: Arc<broca_store::db::OverhaulDb>,
+    publication: Arc<EpisodePublication>,
+}
+
+impl EpisodeReadSource {
+    pub fn new(db: Arc<broca_store::db::OverhaulDb>, publication: Arc<EpisodePublication>) -> Self {
+        Self { db, publication }
+    }
+
+    pub(crate) fn reader(
+        &self,
+        key: &LineageKey,
+        head: Option<u64>,
+    ) -> Result<broca_store::db::DatabaseEpisodeReader, String> {
+        let publication = (self.publication)(key, head)?;
+        if head.is_some_and(|head| publication.sequence() != head) {
+            return Err("episode publication does not name attach barrier".into());
+        }
+        self.db
+            .episode_reader(key.clone(), publication)
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Explicitly supplied by tests; boot and all legacy constructors leave this absent.
 #[cfg(test)]
 pub(crate) struct RawPageTestBundle {
@@ -1211,6 +1244,11 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    /// Install database episode reads explicitly; boot-time store selection is unchanged.
+    pub fn with_episode_source(self, source: Arc<EpisodeReadSource>) -> Self {
+        assert!(self.inner.episode_source.set(source).is_ok());
+        self
+    }
     #[cfg(test)]
     pub(crate) fn with_raw_pages_for_test(self, bundle: Arc<RawPageTestBundle>) -> Self {
         assert!(self.inner.raw_pages.set(bundle).is_ok());
@@ -1506,6 +1544,7 @@ impl LineageRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                episode_source: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 raw_pages: std::sync::OnceLock::new(),
                 tool_route_health: std::sync::OnceLock::new(),
@@ -3664,6 +3703,21 @@ impl LineageRegistry {
         model: Option<&broca_core::ModelPageRequest>,
     ) -> Result<RoutedPage, OpenError> {
         self.check_expired(key, None).await?;
+        if let (Some(request), Some(source)) = (model, self.inner.episode_source.get()) {
+            let source = source.clone();
+            let key = key.clone();
+            let request = request.clone();
+            return spawn_blocking(JobKind::StoreRead, move || {
+                source
+                    .reader(&key, None)?
+                    .read_model_page(&request)
+                    .map(|page| RoutedPage::Model(page.page))
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| OpenError::Open(error.to_string()))?
+            .map_err(OpenError::Open);
+        }
         #[cfg(test)]
         if model.is_none() {
             if let Some(bundle) = self.inner.raw_pages.get() {

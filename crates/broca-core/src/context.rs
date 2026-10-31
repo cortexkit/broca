@@ -42,7 +42,8 @@ pub enum ReadView {
 
 mod model_page;
 pub use model_page::{
-    read_session_model_page, ModelEntry, ModelPage, ModelPageError, ModelPageRequest,
+    read_session_model_page, read_session_model_page_by_episode, EpisodeFrames, EpisodeModelPage,
+    EpisodePageIndex, ModelEntry, ModelPage, ModelPageError, ModelPageRequest,
 };
 
 /// One atomic read from the materialized store: the reconstructed prefix + the

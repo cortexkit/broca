@@ -240,6 +240,22 @@ pub(super) fn index_in_tx(
                 framed: *frame.clone(),
             },
         )?;
+        if matches!(
+            frame.record,
+            broca_wal::WalRecord::TurnFinished { .. }
+                | broca_wal::WalRecord::RunFinished { .. }
+                | broca_wal::WalRecord::RunStarted { .. }
+                | broca_wal::WalRecord::ModelStepFinished { .. }
+        ) {
+            let read = |off: u64, len: u64| {
+                Ok(log
+                    .bytes
+                    .get(off as usize..(off + len) as usize)
+                    .unwrap_or_default()
+                    .to_vec())
+            };
+            super::publication::publish_seeds(tx, &key, &read)?;
+        }
         last_seq = Some(frame.seq);
         last_off = offset;
         identity = Some(frame_identity);
@@ -277,6 +293,15 @@ pub(super) fn apply_frame(
     frame: &IndexedFrame,
 ) -> Result<(), DbError> {
     let delta = seed.observe(&frame.framed, frame.off, frame.end)?;
+    if matches!(
+        frame.framed.record,
+        broca_wal::WalRecord::CompactionMessage { .. }
+            | broca_wal::WalRecord::CompactionAnswer { .. }
+    ) {
+        // Even an answer that leaves the compaction fold unchanged needs an
+        // authenticated locator. Its offset is published with the locator seed.
+        tx.execute("INSERT INTO source_auth (sid,frame_off,frame_end,seq,frame_identity) VALUES (?1,?2,?3,?4,?5)",params![key,frame.off,frame.end,frame.framed.seq,frame.identity])?;
+    }
     if let Some(to) = delta.truncate {
         tx.execute(
             "DELETE FROM message WHERE sid=?1 AND ord>=?2",
