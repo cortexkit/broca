@@ -53,6 +53,81 @@ struct Session {
 }
 
 impl OverhaulDb {
+    /// Content-free run discovery. Terminal metadata is hydrated from the WAL, not SQL.
+    pub fn lookup_run(&self, run_id: &str) -> Result<Option<broca_core::RunIndexRow>, DbError> {
+        self.read_snapshot(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT s.project_root,s.harness,s.session_key,r.submission_id,
+                        r.request_identity_digest,r.state
+                 FROM run r JOIN session s ON s.sid=r.sid WHERE r.run_id=?1",
+                    [run_id],
+                    |r| {
+                        Ok((
+                            BindIdentity::new(
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                            ),
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, String>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(|(session, submission_id, request_identity_digest, state)| {
+                Ok(broca_core::RunIndexRow {
+                    run_id: run_id.into(),
+                    session,
+                    submission_id,
+                    request_identity_digest,
+                    state: broca_core::RunIndexState::parse(&state)
+                        .ok_or_else(|| invalid(format!("unknown run state: {state}")))?,
+                    usage: None,
+                    final_step_finish_reason: None,
+                    retries_used: 0,
+                    title: None,
+                    withdrawals_owed: false,
+                })
+            })
+            .transpose()
+        })
+    }
+
+    /// Advisory orphan candidates; the caller must reconcile each against its durable WAL.
+    pub fn active_runs(&self) -> Result<Vec<(String, BindIdentity)>, DbError> {
+        self.run_candidates(false)
+    }
+
+    /// Include active rows because a durable restart pause may precede its index update.
+    pub fn restart_resume_candidates(&self) -> Result<Vec<(String, BindIdentity)>, DbError> {
+        self.run_candidates(true)
+    }
+
+    fn run_candidates(&self, include_paused: bool) -> Result<Vec<(String, BindIdentity)>, DbError> {
+        self.read_snapshot(|tx| {
+            let mut stmt = tx.prepare(
+                "SELECT r.run_id,s.project_root,s.harness,s.session_key
+                 FROM run r JOIN session s ON s.sid=r.sid
+                 WHERE r.state='active' OR (?1 AND r.state='paused') ORDER BY r.run_id",
+            )?;
+            let rows = stmt
+                .query_map([include_paused], |r| {
+                    Ok((
+                        r.get(0)?,
+                        BindIdentity::new(
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ),
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     pub fn read_raw_tag_location(
         &self,
         bind: &BindIdentity,
