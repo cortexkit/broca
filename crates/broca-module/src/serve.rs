@@ -2490,9 +2490,7 @@ impl ServeHandler for crate::LineageRegistry {
                 Some(broca_protocol::ErrorClass::Permanent),
             )
         })?;
-        if broca_protocol::attachments_enabled()
-            && req.media == cortexkit_role_llm_runner::read::MediaMode::Inline
-        {
+        if req.media == cortexkit_role_llm_runner::read::MediaMode::Inline {
             page.render_inline_media();
         }
         let subject = model_group_reply_too_large_subject(&page);
@@ -3245,11 +3243,7 @@ impl ServeHandler for crate::LineageRegistry {
             .await?;
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Blocks {
             for entry in &mut response.messages {
-                if broca_protocol::attachments_enabled() {
-                    entry.show_media_blocks_with_identity();
-                } else {
-                    entry.show_media_blocks();
-                }
+                entry.show_media_blocks_with_identity();
             }
         }
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
@@ -3330,23 +3324,19 @@ impl ServeHandler for crate::LineageRegistry {
                 .find_map(|framed| broca_core::record_time_ms(&framed.record))
                 .unwrap_or(0),
         };
-        let media_facts = if broca_protocol::attachments_enabled() {
-            Some(
-                self.media_facts_for_head(
-                    session,
-                    crate::registry::media_head::Request {
-                        lineage: lineage_id,
-                        at_seq,
-                        run_id: page.lineage_state.last_run_id.as_ref(),
-                        state: page.lineage_state.state.as_str(),
-                        model: head_facts.model.as_ref(),
-                    },
-                )
-                .await?,
+        let media_facts = Some(
+            self.media_facts_for_head(
+                session,
+                crate::registry::media_head::Request {
+                    lineage: lineage_id,
+                    at_seq,
+                    run_id: page.lineage_state.last_run_id.as_ref(),
+                    state: page.lineage_state.state.as_str(),
+                    model: head_facts.model.as_ref(),
+                },
             )
-        } else {
-            None
-        };
+            .await?,
+        );
         let interrupted_reason = if page.lineage_state.state.as_str() == "interrupted" {
             if let Some(facts) = &media_facts {
                 facts.interrupt_reason.clone()

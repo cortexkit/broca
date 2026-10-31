@@ -2119,6 +2119,12 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if matches!(self, Self::Queued { request, .. } if request.service_tier_level.is_some())
+        {
+            with_feature(base, crate::framing::SERVICE_TIER_QUEUE_FEATURE)
+        } else {
+            base
+        };
         let identity_digest = match self {
             WalRecord::RunStarted {
                 request_identity_digest,
@@ -5114,6 +5120,7 @@ mod schema_tests {
                 delivery: None,
                 submission_id: SubmissionId("sub2".into()),
                 request: Box::new(SubmissionRequest {
+                    service_tier_level: None,
                     staged_uploads: None,
                     content: Vec::new(),
                     directives: None,

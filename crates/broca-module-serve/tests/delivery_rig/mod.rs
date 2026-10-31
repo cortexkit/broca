@@ -261,7 +261,7 @@ impl ScriptedProvider {
 #[async_trait]
 impl Provider for ScriptedProvider {
     fn supports_media_renderer(&self) -> bool {
-        broca_protocol::attachments_enabled() && self.0.media_frozen.lock().unwrap().is_some()
+        self.0.media_frozen.lock().unwrap().is_some()
     }
 
     fn set_media_request_renderer(
@@ -534,6 +534,16 @@ impl RunExecutor for CoreExec {
             .as_ref()
             .and_then(|frozen| frozen.media.as_ref())
             .cloned()
+            // The default scripted model is known to be text-only, not an unavailable catalog row.
+            .or_else(|| {
+                Some(broca_provider::media_profile::select_media_profile(
+                    broca_provider::spec::WireFamilyId::OpenAiChat,
+                    None,
+                    "fake",
+                    broca_provider::spec::InputModalities::from_value(&serde_json::json!(["text"])),
+                    None,
+                ))
+            })
             .map(Box::new))
     }
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::compaction::CompactionPlane>> {
@@ -720,6 +730,7 @@ pub struct Rig {
     registry: Arc<LineageRegistry>,
     daemon_scopes: bool,
     corr: u64,
+    next_subscription_read_delay: Option<Duration>,
 }
 
 pub struct FailureDiagnostics {
@@ -897,6 +908,7 @@ impl Rig {
             registry,
             daemon_scopes,
             corr: 1,
+            next_subscription_read_delay: None,
         };
         rig.bind(7).await;
         rig
@@ -1042,6 +1054,12 @@ impl Rig {
         .await
     }
 
+    /// Delay receipt, not production, of the next subscription's replay. This lets a
+    /// regression exercise a slow transport without relying on runner contention.
+    pub fn delay_next_subscription_reads(&mut self, delay: Duration) {
+        self.next_subscription_read_delay = Some(delay);
+    }
+
     async fn subscribe_collect_inner(
         &mut self,
         channel: u16,
@@ -1066,6 +1084,20 @@ impl Rig {
         )
         .unwrap();
         write_frame(&mut self.writer, &frame).await.unwrap();
+        if let Some(delay) = self.next_subscription_read_delay.take() {
+            let mut reader = DelayedSubscriptionReader {
+                reader: &mut self.reader,
+                delay: Box::pin(tokio::time::sleep(delay)),
+            };
+            return collect_subscription_frames_at(
+                &mut reader,
+                corr,
+                quiet,
+                on_attach,
+                attach_condition,
+            )
+            .await;
+        }
         collect_subscription_frames_at(&mut self.reader, corr, quiet, on_attach, attach_condition)
             .await
     }
@@ -1536,6 +1568,23 @@ pub fn result(frame: &Frame) -> serde_json::Value {
         String::from_utf8_lossy(&frame.body)
     );
     serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone()
+}
+
+struct DelayedSubscriptionReader<'a, R> {
+    reader: &'a mut R,
+    delay: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for DelayedSubscriptionReader<'_, R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::task::ready!(std::future::Future::poll(this.delay.as_mut(), cx));
+        std::pin::Pin::new(&mut *this.reader).poll_read(cx, buf)
+    }
 }
 
 async fn collect_subscription_frames(

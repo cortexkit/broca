@@ -1,0 +1,1 @@
+{"requires":["service-tier-queue/v1"],"record":{"type":"queued","submission_id":"sub-tier","request":{"model":{"provider_module_id":"openai","model_id":"gpt-6.1-sol"},"input":[],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"service_tier_level":"ultrafast","stop_when":[]}}}

@@ -2651,8 +2651,7 @@ where
         );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
         let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
-            || (broca_protocol::attachments_enabled()
-                && method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ);
+            || method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ;
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -2768,9 +2767,7 @@ where
         }
     }
     match req.method.as_str() {
-        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ
-            if broca_protocol::attachments_enabled() =>
-        {
+        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ => {
             match handler.media_read(session, req.params).await {
                 Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
                 Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
@@ -3610,8 +3607,7 @@ where
                 handler.compaction_supported(),
                 crate::RETENTION_WRITER_ENABLED,
                 handler.hook_plane_available(),
-            )
-            .with_media(broca_protocol::attachments_enabled());
+            );
             describe.session_class.backup_classes = handler.backup_classes();
             trace_describe("response_ready", channel, epoch, corr);
             let sent = send_json_response(writer, ver, channel, epoch, corr, &describe).await;
@@ -6232,7 +6228,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|_| panic!("reader did not reach {phase:?} gate"));
-            let snapshot = witness.snapshot().await;
+            let snapshot = witness.reader_phase_snapshot(phase).await;
             task.abort();
             let _ = task.await;
             assert_eq!(snapshot["kind"], "reader_phase", "{phase:?}");

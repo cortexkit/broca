@@ -84,7 +84,7 @@ impl Drop for CeilingTime {
 #[tokio::test]
 async fn compaction_requests_match_the_pre_windowing_bytes() {
     let mut requests = Vec::new();
-    for scenario in [SCENARIO, SIGNED_SCENARIO] {
+    for scenario in [LEGACY_SCENARIO, SIGNED_SCENARIO] {
         let handle = RunnerHandle::new(scenario).await;
         requests.push(
             handle
@@ -98,6 +98,115 @@ async fn compaction_requests_match_the_pre_windowing_bytes() {
     let expected: Vec<Vec<String>> =
         serde_json::from_str(include_str!("fixtures/compaction_request_bytes.json")).unwrap();
     assert_eq!(requests, expected);
+}
+
+#[tokio::test]
+async fn compaction_requests_with_declared_features_match_the_producer_bytes() {
+    let mut requests = Vec::new();
+    for scenario in [SCENARIO, DECLARED_SIGNED_SCENARIO] {
+        let handle = RunnerHandle::new(scenario).await;
+        let records = handle.reference.log.records();
+        let features = records.iter().find_map(|record| match record {
+            WalRecord::CompactionMessage {
+                kind: CompactionMessageKind::Setup,
+                view_features,
+                ..
+            } => view_features.as_ref(),
+            _ => None,
+        });
+        assert_eq!(features.unwrap(), &["truncate", "tag_bytes_edits"]);
+        requests.push(
+            handle
+                .reference
+                .sent
+                .values()
+                .map(|bytes| String::from_utf8(bytes.clone()).expect("canonical request JSON"))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let expected: Vec<Vec<String>> = serde_json::from_str(include_str!(
+        "fixtures/compaction_request_bytes_declared.json"
+    ))
+    .unwrap();
+    assert_eq!(requests, expected);
+    assert!(requests[1][1].contains("§4§ edited (short)"));
+}
+
+#[tokio::test]
+async fn bytes_edit_resume_uses_the_recorded_setup_features() {
+    for (scenario, declared, fixture) in [
+        (
+            SIGNED_SCENARIO,
+            false,
+            include_str!("fixtures/compaction_request_bytes.json"),
+        ),
+        (
+            DECLARED_SIGNED_SCENARIO,
+            true,
+            include_str!("fixtures/compaction_request_bytes_declared.json"),
+        ),
+    ] {
+        let handle = RunnerHandle::new(scenario).await;
+        let records = handle.reference.log.records();
+        let applied = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record,
+                    WalRecord::CompactionViewApplied {
+                        view_version: 3,
+                        ..
+                    }
+                )
+            })
+            .expect("the bytes edit was applied");
+        let kill = handle
+            .kill_at(
+                KillPoint::RecordBoundary {
+                    records: applied + 1,
+                    torn: false,
+                },
+                KillTrigger::Truncate,
+            )
+            .await;
+        let compaction = Arc::new(ScriptedCompaction::signed());
+        let resumed = resume_with(scenario, &kill, compaction.clone()).await;
+        handle.check(&kill, &resumed);
+        assert_eq!(compaction.setups.load(Ordering::SeqCst), 0);
+        for log in [&kill.durable, &resumed.log] {
+            let records = log.records();
+            let setup = records
+                .iter()
+                .find(|record| {
+                    matches!(
+                        record,
+                        WalRecord::CompactionMessage {
+                            kind: CompactionMessageKind::Setup,
+                            ..
+                        }
+                    )
+                })
+                .expect("the session has a recorded Setup");
+            let json = serde_json::to_value(setup).unwrap();
+            if declared {
+                assert_eq!(
+                    json["view_features"],
+                    json!(["truncate", "tag_bytes_edits"])
+                );
+            } else {
+                assert!(json.get("view_features").is_none());
+            }
+            assert!(json.get("view_due").is_none());
+        }
+        let expected: Vec<Vec<String>> = serde_json::from_str(fixture).unwrap();
+        let sent = resumed.provider.sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "only the request after the bytes edit resumes"
+        );
+        assert_eq!(sent.get(&1).unwrap(), expected[1][1].as_bytes());
+    }
 }
 
 fn request() -> RunRequest {
@@ -156,7 +265,7 @@ fn with_compaction(mut control: RunControl, provider: Arc<ScriptedCompaction>) -
 /// runner also queries newer versions before applying a fetched view, so a version filter
 /// alone cannot show whether the run has reached the next view's publication point.
 pub(crate) fn schedule_views(control: &mut RunControl, request: &RunRequest, state_root: &Path) {
-    if request.session != signed_request().session {
+    if request.run_id != signed_request().run_id {
         return;
     }
     if let Some(source) = control.compaction_views.take() {
@@ -165,6 +274,41 @@ pub(crate) fn schedule_views(control: &mut RunControl, request: &RunRequest, sta
             wal: wal_path(state_root, &request.session),
         }));
     }
+}
+
+/// Model a session enrolled before view features existed. Seeding the actual WAL makes both
+/// an ordinary run and a killed child recover the old declaration instead of calling Setup.
+pub(crate) fn seed_legacy_setup(store: &impl broca_core::WalStore, request: &RunRequest) {
+    if request.session != legacy_request().session && request.session != signed_request().session {
+        return;
+    }
+    let mut wal = store.open(&request.session).unwrap();
+    if !wal.replay().unwrap().is_empty() {
+        return;
+    }
+    let replacement = Arc::new(vec![serde_json::from_value(json!({
+        "role":"user", "content":[{"type":"text", "text":"setup head"}]
+    }))
+    .unwrap()]);
+    let setup = WalRecord::CompactionMessage {
+        provider: PROVIDER.into(),
+        kind: CompactionMessageKind::Setup,
+        compaction_id: "summary".into(),
+        version: 1,
+        range: broca_wal::CompactionRange { from: 0, to: 0 },
+        sha256: broca_wal::compaction_replacement_sha256(&replacement).unwrap(),
+        replacement,
+        request_id: None,
+        cursor: None,
+        call_when: None,
+        stability: None,
+        ceiling: None,
+        tag_checkpoint: None,
+        ride_wait_ms: None,
+        view_features: None,
+        view_due: None,
+    };
+    wal.append(1, &setup, true).unwrap();
 }
 
 struct SignedAnnouncements {
@@ -265,6 +409,18 @@ const SCENARIO: Scenario = Scenario {
     render: Render::Canonical,
     plane: tools,
     expected: RunFinishReason::Completed,
+};
+
+fn legacy_request() -> RunRequest {
+    let mut request = request();
+    request.session.session = "legacy-session".into();
+    request
+}
+
+const LEGACY_SCENARIO: Scenario = Scenario {
+    name: "compaction-legacy",
+    request: legacy_request,
+    ..SCENARIO
 };
 
 const TOOL_SCENARIO: Scenario = Scenario {
@@ -373,6 +529,7 @@ fn signed_scripts() -> Vec<Vec<NormalizedEvent>> {
 /// Signed reasoning on a prefix-bound provider, runner tags, and two views: the first folds
 /// the first question and strips the signed reasoning after it; the second, at the next
 /// boundary, compresses the tool's output after the open tool turn and so applies as is.
+/// The recorded Setup omits `tag_bytes_edits`, so the tool-result bytes edit gets no runner tag.
 const SIGNED_SCENARIO: Scenario = Scenario {
     name: "compaction-signed",
     request: signed_request,
@@ -383,11 +540,25 @@ const SIGNED_SCENARIO: Scenario = Scenario {
     expected: RunFinishReason::Completed,
 };
 
+fn declared_signed_request() -> RunRequest {
+    let mut request = signed_request();
+    request.session.session = "declared-session".into();
+    request
+}
+
+const DECLARED_SIGNED_SCENARIO: Scenario = Scenario {
+    name: "compaction-signed-declared",
+    request: declared_signed_request,
+    ..SIGNED_SCENARIO
+};
+
 pub(crate) fn find(name: &str) -> Option<Scenario> {
     [
         SCENARIO,
+        LEGACY_SCENARIO,
         TOOL_SCENARIO,
         SIGNED_SCENARIO,
+        DECLARED_SIGNED_SCENARIO,
         CEILING_SCENARIO,
         CEILING_TIMEOUT_SCENARIO,
     ]

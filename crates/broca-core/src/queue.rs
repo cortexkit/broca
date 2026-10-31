@@ -318,6 +318,43 @@ mod tests {
         queued_as(id, text, Some(broca_protocol::Delivery::Interrupt))
     }
 
+    #[test]
+    fn queued_abstract_tier_survives_replay_checkpoints_and_keeps_retry_identity() {
+        for level in ["standard", "fast", "ultrafast", "future-level"] {
+            let mut record = queued("tier", "original");
+            let WalRecord::Queued { request, .. } = &mut record else {
+                unreachable!()
+            };
+            let legacy = request.clone();
+            request.service_tier_level = Some(level.into());
+            assert_eq!(
+                crate::submission_difference(&legacy, request),
+                Some("service_tier_level")
+            );
+            assert_ne!(
+                crate::submission_identity_digest(&legacy),
+                crate::submission_identity_digest(request)
+            );
+            let pending = pending_submissions(&[record.clone()]);
+            assert_eq!(
+                pending[0].request.service_tier_level.as_deref(),
+                Some(level)
+            );
+            let mut checkpoint = crate::AdmissionCheckpointV1::default();
+            checkpoint.fold_record(1, &record).unwrap();
+            let encoded = crate::encode_admission_checkpoint(&checkpoint).unwrap();
+            let decoded = crate::decode_admission_checkpoint(&encoded).unwrap();
+            assert_eq!(
+                decoded.pending_fifo[0]
+                    .request
+                    .service_tier_level
+                    .as_deref(),
+                Some(level)
+            );
+            assert_eq!(decoded.pending_fifo.as_ref(), &pending);
+        }
+    }
+
     fn queued_as(id: &str, text: &str, delivery: Option<broca_protocol::Delivery>) -> WalRecord {
         WalRecord::Queued {
             written_at_ms: None,
@@ -331,6 +368,7 @@ mod tests {
             send_id: None,
             submission_id: SubmissionId(id.into()),
             request: Box::new(SubmissionRequest {
+                service_tier_level: None,
                 staged_uploads: None,
                 content: Vec::new(),
                 directives: None,

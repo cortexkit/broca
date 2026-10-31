@@ -198,6 +198,7 @@ impl RunRequest {
     /// [`from_submission`]: RunRequest::from_submission
     pub fn to_submission(&self) -> SubmissionRequest {
         SubmissionRequest {
+            service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
             directives: self.directives.clone(),
@@ -3979,8 +3980,7 @@ where
             }),
         )
     };
-    let defer_media_tags =
-        broca_protocol::attachments_enabled() && provider.defer_media_tags(render_tags);
+    let defer_media_tags = provider.defer_media_tags(render_tags);
     writer.retain_live_tags(render_tags && computed_tags.is_none());
     let context_limit = if is_resume && !append_episode {
         prior
@@ -5791,7 +5791,12 @@ where
                     context_limit,
                     opts.generation.max_output_tokens,
                 )
-                .with_ride_wait_max_ms(crate::compaction::runtime::RIDE_WAIT_MAX_MS);
+                .with_ride_wait_max_ms(crate::compaction::runtime::RIDE_WAIT_MAX_MS)
+                .with_view_due_max_ms(crate::compaction::runtime::VIEW_DUE_MAX_MS)
+                .with_view_features(vec![
+                    crate::compaction_provider::setup::VIEW_FEATURE_TRUNCATE.into(),
+                    crate::compaction_provider::setup::VIEW_FEATURE_TAG_BYTES_EDITS.into(),
+                ]);
                 setup.lineage_id = Some(lineage_id.clone());
                 setup.newest = raw
                     .last()
@@ -9846,6 +9851,10 @@ struct CallResolution {
     hooks: Option<Box<broca_wal::Hooks>>,
     hook_stage: Option<crate::shutdown_seal::HookStage>,
     plane_subject: bool,
+    /// Resolution time for definite parallel tool replies, retained while their siblings finish.
+    /// Synthetic interruption, cancellation and unknown results leave this absent, as do
+    /// sequential calls, so the writer still timestamps those when enqueued for recording.
+    finished_at_ms: Option<u64>,
 }
 
 impl CallResolution {
@@ -9859,6 +9868,7 @@ impl CallResolution {
             hooks: None,
             hook_stage: None,
             plane_subject: false,
+            finished_at_ms: None,
         }
     }
 }
@@ -10443,7 +10453,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     for r in &mut resolutions {
         if let Some(outcome) = r.outcome {
             let record = WalRecord::ToolResult {
-                finished_at_ms: None,
+                finished_at_ms: r.finished_at_ms,
                 tags: None,
                 hooks: r.hooks.take(),
                 batch_id: batch_id.clone(),
@@ -10837,7 +10847,7 @@ async fn resolve_provider_held_batch<T: ToolPlane>(
             };
             let stopped = tripped && matches!(plan, CallPlan::Dispatch(_));
             jobs.push(async move {
-                let result = if stopped {
+                let mut result = if stopped {
                     let CallPlan::Dispatch(call) = plan else {
                         unreachable!()
                     };
@@ -10845,6 +10855,9 @@ async fn resolve_provider_held_batch<T: ToolPlane>(
                 } else {
                     resolve_held_hooked(plan, index, step, ctx, plane, cancel, stop, hooks).await
                 };
+                if !plane.sequential && result.plane_subject {
+                    result.finished_at_ms = epoch_millis();
+                }
                 (index, result)
             });
         }
@@ -11891,6 +11904,9 @@ async fn send(out: &mpsc::Sender<OutputEvent>, ev: OutputEvent) -> bool {
     out.send(ev).await.is_ok()
 }
 
+#[cfg(test)]
+#[path = "run/answer_time_tests.rs"]
+mod answer_time_tests;
 #[cfg(test)]
 #[path = "run/boundary_cancel_tests.rs"]
 mod boundary_cancel_tests;

@@ -43,9 +43,15 @@ mod gated {
     fn install() {
         static INSTALLED: Once = Once::new();
         INSTALLED.call_once(|| {
-            let response: FusiformCatalogResponse =
+            let mut fixture: Value =
                 serde_json::from_str(include_str!("fixtures/fusiform_service_tier_modes.json"))
-                    .expect("fixture is a catalog.get response");
+                    .unwrap();
+            let mut ultra = fixture["models"]["openai/gpt-5.6-luna"].clone();
+            ultra["rate.input.mode.ultrafast"] = ultra["rate.input.mode.fast"].clone();
+            ultra["rate.output.mode.ultrafast"] = ultra["rate.output.mode.fast"].clone();
+            fixture["models"]["openai/test-ultrafast"] = ultra;
+            let response: FusiformCatalogResponse =
+                serde_json::from_value(fixture).expect("fixture is a catalog.get response");
             let cache = Arc::new(CatalogCache::empty());
             cache
                 .install_for_test(response, CatalogSource::Fusiform)
@@ -65,6 +71,16 @@ mod gated {
         tier: Option<ServiceTier>,
         restored: Option<ServiceTier>,
     ) -> Result<Resolved, String> {
+        resolve_with_queued(model, method, tier, restored, None)
+    }
+
+    fn resolve_with_queued(
+        model: &str,
+        method: AuthMethod,
+        tier: Option<ServiceTier>,
+        restored: Option<ServiceTier>,
+        queued: Option<&str>,
+    ) -> Result<Resolved, String> {
         install();
         let family_override = match method {
             AuthMethod::Antigravity => Some(WireFamilyId::GoogleCodeAssist),
@@ -76,6 +92,7 @@ mod gated {
             family_override,
             project_id: Some("test-project"),
             service_tier: tier,
+            queued_service_tier: queued,
             ..ResolveOptions::default()
         };
         let resolved = if method == AuthMethod::Chatgpt {
@@ -102,9 +119,18 @@ mod gated {
         .map_err(|error| error.to_string())?;
         let frozen = serde_json::from_value(resolved.provider.render_config_blob())
             .expect("resolved provider exposes its frozen config");
-        let body = resolved
-            .provider
-            .render_request(&CallOptions::new(Vec::new()));
+        let mut call = CallOptions::new(Vec::new());
+        if resolved.family_id == WireFamilyId::GoogleCodeAssist {
+            call.step_context = Some(broca_protocol::request::StepContext {
+                run_id: "tier-reader".into(),
+                step_index: 1,
+                session_address: None,
+                credential_id: None,
+                account_ref: None,
+                max_output_tokens: None,
+            });
+        }
+        let body = resolved.provider.render_request(&call);
         Ok(Resolved { frozen, body })
     }
 
@@ -360,5 +386,61 @@ mod gated {
                 .map(|request| request.tier),
             Some(ServiceTier::Priority)
         );
+    }
+
+    #[test]
+    fn a_replayed_queued_ultrafast_level_freezes_the_model_specific_wire_tier() {
+        let record = serde_json::from_str(r#"{"type":"queued","submission_id":"tier","request":{"model":{"provider_module_id":"openai","model_id":"test-ultrafast"},"input":[],"service_tier_level":"ultrafast"}}"#).unwrap();
+        let mut checkpoint = broca_core::AdmissionCheckpointV1::default();
+        checkpoint.fold_record(1, &record).unwrap();
+        let bytes = broca_core::encode_admission_checkpoint(&checkpoint).unwrap();
+        let restored = broca_core::decode_admission_checkpoint(&bytes).unwrap();
+        let request = &restored.pending_fifo[0].request;
+        let resolved = resolve_with_queued(
+            "openai/test-ultrafast",
+            AuthMethod::ApiKey,
+            request.service_tier,
+            None,
+            request.service_tier_level.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(body_of(&resolved)["service_tier"], "ultrafast");
+        assert_eq!(resolved.frozen.service_tier.as_deref(), Some("ultrafast"));
+        assert!(
+            resolved.frozen.service_tier_request.is_none(),
+            "the legacy stored enum is not extended"
+        );
+        for (level, wire) in [("standard", "default"), ("fast", "priority")] {
+            let resolved = resolve_with_queued(
+                "openai/test-ultrafast",
+                AuthMethod::ApiKey,
+                None,
+                None,
+                Some(level),
+            )
+            .unwrap();
+            assert_eq!(body_of(&resolved)["service_tier"], wire);
+        }
+        let standard_code_assist = resolve_with_queued(
+            "google/antigravity-gemini-3.8-flash",
+            AuthMethod::Antigravity,
+            None,
+            None,
+            Some("standard"),
+        )
+        .unwrap();
+        assert!(standard_code_assist.frozen.service_tier.is_none());
+        for (model, level) in [
+            ("openai/gpt-5.6-luna", "ultrafast"),
+            ("openai/test-ultrafast", "future-level"),
+        ] {
+            let error = resolve_with_queued(model, AuthMethod::ApiKey, None, None, Some(level))
+                .err()
+                .expect("unsupported queued tier must not downgrade");
+            assert!(
+                error.contains("service_tier_level") && error.contains("unsupported"),
+                "{error}"
+            );
+        }
     }
 }

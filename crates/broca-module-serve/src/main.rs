@@ -141,8 +141,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(ServeIoError)?;
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
-    let media = broca_module_serve::config::MediaConfig::load_default().map_err(ServeIoError)?;
-    broca_protocol::configure_media(media.enabled).map_err(|error| ServeIoError(error.into()))?;
+    broca_module_serve::config::warn_obsolete_media_default().map_err(ServeIoError)?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
         .map_err(ServeIoError)?;
     let bus_event_config =
@@ -4257,7 +4256,7 @@ mod executor {
                 None
             };
             let resolve_options = broca_catalog::live::ResolveOptions {
-                media: fresh_episode && broca_protocol::attachments_enabled(),
+                media: fresh_episode,
                 media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
                 claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,
@@ -4271,6 +4270,7 @@ mod executor {
                 // Only fresh admissions resolve caller render choices; resume uses the bundle.
                 variant: job.req.variant.as_deref().filter(|_| fresh_episode),
                 service_tier: job.req.service_tier.filter(|_| fresh_episode),
+                queued_service_tier: job.queued_service_tier.as_deref().filter(|_| fresh_episode),
                 clock: Some(&self.clock),
                 frozen_account_ref: if fresh_episode {
                     resolution
@@ -4440,11 +4440,7 @@ mod executor {
                 }
             }
 
-            let uploads = if broca_protocol::attachments_enabled() {
-                self.wal_store.uploads()
-            } else {
-                None
-            };
+            let uploads = self.wal_store.uploads();
             if let Some(uploads) = uploads.filter(|_| {
                 resolved.provider.supports_media_renderer()
                     && (job.has_media_input()
@@ -4819,6 +4815,7 @@ mod executor {
         use super::*;
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
+        include!("queued_service_tier_tests.rs");
         include!("vault_request_tests.rs");
         include!("role_plane_tests.rs");
         include!("admission_wal_read_budget_tests.rs");
@@ -4945,6 +4942,7 @@ mod executor {
             let summary = executor
                 .execute(
                     RunJob {
+                        queued_service_tier: None,
                         media: Vec::new(),
                         media_profile: None,
                         conversation_key: None,
@@ -5477,6 +5475,7 @@ mod executor {
                     prompt_cache_key: None,
                     variant: None,
                     service_tier: None,
+                    queued_service_tier: None,
                     secret_refresher: None,
                     structured_output: None,
                     frozen_account_ref: None,
@@ -5507,6 +5506,7 @@ mod executor {
                 prompt_cache_key: None,
                 variant: None,
                 service_tier: None,
+                queued_service_tier: None,
                 secret_refresher: None,
                 structured_output: None,
                 frozen_account_ref: None,

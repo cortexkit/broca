@@ -294,8 +294,7 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Disabled media admission refuses uploads by name before decoding a send. Neither
-/// runtime mode permits a client to supply stored media references inline.
+/// A client supplies uploads, never stored media references inline.
 pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String> {
     if let Some(content) = params.get("content").filter(|value| !value.is_null()) {
         // A content part is an upload reference and nothing else. A `media` block, or a tool
@@ -311,18 +310,9 @@ pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String>
                  upload references"
             ));
         }
-        let parts: Vec<cortexkit_role_llm_runner::attachments::ContentPart> =
+        let _: Vec<cortexkit_role_llm_runner::attachments::ContentPart> =
             serde_json::from_value(content.clone())
                 .map_err(|error| format!("invalid content: {error}"))?;
-        if broca_protocol::attachments_enabled() {
-            return Ok(());
-        }
-        if let Some(part) = parts.first() {
-            return Err(format!(
-                "upload {} cannot be sent: attachment admission is unavailable",
-                part.upload_id()
-            ));
-        }
     }
     Ok(())
 }
