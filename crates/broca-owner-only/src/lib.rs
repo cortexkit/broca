@@ -300,4 +300,19 @@ mod windows_tests {
         reset_acl(&path);
         assert_eq!(std::fs::read(&path).unwrap(), b"unchanged");
     }
+
+    #[test]
+    fn windows_acl_fixture_mutates_only_dacl_and_can_reset_without_acl_read() {
+        let fixture = BroadParent::new("dacl-only-fixture");
+        let path = fixture.path.join("file");
+        std::fs::write(&path, b"fixture bytes").unwrap();
+        let before = test_support::acl_snapshot(&path);
+        broaden(&path);
+        let after = test_support::acl_snapshot(&path);
+        assert_eq!(before.split("D:").next(), after.split("D:").next());
+        test_support::deny_acl_read(&path);
+        reset_acl(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"fixture bytes");
+        assert!(!test_support::acl_snapshot(&path).is_empty());
+    }
 }

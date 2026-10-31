@@ -1685,15 +1685,25 @@ mod tests {
             log.raw.extend(lineage_frame(log.head.lineage_id));
             log.push(reserved(2, true), W);
             log.push(finished(2, true), W);
-            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/scratch")
-                .join(format!(
-                    "billing-{}-{}.wal",
-                    std::process::id(),
-                    SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                ));
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, &log.raw).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "broca-billing-{}-{}-{}.wal",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&path).unwrap();
+            std::io::Write::write_all(&mut file, &log.raw).unwrap();
+            drop(file);
             let source = Counted {
                 source: crate::open_log(&path).unwrap(),
                 bytes: Cell::new(0),

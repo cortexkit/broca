@@ -30,9 +30,11 @@ fn tree(parent: &Path) -> (PathBuf, Vec<PathBuf>) {
 fn windows_private_mode_dry_run_and_idempotent_repair() {
     let fixture = BroadParent::new("repair");
     let (root, paths) = tree(&fixture.path);
-    // Windows CI runs as an administrator; a group-owned file distinguishes owner
-    // preservation from silently replacing every owner with the current account.
-    set_owner_to_administrators(&root.join("run-index.db"));
+    // Admin CI keeps the distinct owner that detects silently resetting it to the user.
+    // A non-admin token must still exercise all repair assertions without claiming that case.
+    if !set_owner_to_administrators(&root.join("run-index.db")) {
+        eprintln!("owner-distinct check not run: token cannot assign a foreign owner");
+    }
     let owners: Vec<_> = paths
         .iter()
         .map(|p| acl_snapshot(p).split("D:").next().unwrap().to_owned())

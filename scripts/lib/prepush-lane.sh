@@ -18,6 +18,8 @@ case "$platform:$(uname -s)" in
   *) echo "prepush: invalid lane/platform: $lane/$(uname -s)" >&2; exit 2 ;;
 esac
 if [[ "$lane" == windows ]]; then
+  CARGO_TARGET_DIR="$(cygpath -m "${CARGO_TARGET_DIR:-C:/t}")"
+  export CARGO_TARGET_DIR
   BROCA_PREPUSH_INPUTS="$(cygpath -m "$root/prepush-inputs")"
   export BROCA_PREPUSH_INPUTS
   command -v powershell.exe >/dev/null || {
@@ -61,7 +63,12 @@ else
 fi
 export TMPDIR="$scratch"
 export TMP="$scratch" TEMP="$scratch"
+if [[ "$lane" == windows ]]; then
+  # The checkout's target is a cache junction; archive extraction must not cross it.
+  export BROCA_PREPUSH_ARCHIVE_EXTRACT_TO="$scratch/nextest-replay"
+fi
 labels=() codes=() times=() files=()
+owner_partial=0
 last_rc=0
 begin=$SECONDS
 source scripts/lib/prepush-report.sh
@@ -80,6 +87,9 @@ step() {
   wait "$pid" || rc=$?
   printf '[step exit=%s wall=%ss]\n' "$rc" "$((SECONDS - start))" >> "$file"
   cat "$file"
+  if grep -Fq 'owner-distinct check not run: token cannot assign a foreign owner' "$file"; then
+    owner_partial=1
+  fi
   labels+=("$label") codes+=("$rc") times+=("$((SECONDS - start))") files+=("$file")
   last_rc=$rc
 }
@@ -97,6 +107,9 @@ summary() {
       cat "${files[$i]}"
     fi
   done
+  if [[ "$owner_partial" == 1 ]]; then
+    echo 'prepush: known partial Windows coverage: owner-distinct check not run: token cannot assign a foreign owner'
+  fi
   echo "prepush: $lane wall $((SECONDS - begin))s; logs: $log_dir; private runtime: $scratch"
   exit "$failed"
 }
@@ -505,7 +518,8 @@ case "$lane" in
     if [[ $deployment == 1 ]]; then
       step 'ELF deployment' deploy
     fi
-    step 'clean worktree' clean
+    # Windows receives a source export without .git; the caller and fast/Linux lanes own this check.
+    if [[ "$platform" != windows ]]; then step 'clean worktree' clean; fi
     ;;
 esac
 summary

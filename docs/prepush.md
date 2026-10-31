@@ -132,11 +132,26 @@ test failure or pass; connection-loss outcomes are **UNKNOWN**. Either fails the
 gate. Setup failures explicitly mark dependent suites **NOT RUN** and return
 failure, never a passing skip. No retries or timeout increases mask tests.
 
+A non-admin Windows token may be unable to assign a foreign file owner. The
+owner-preservation integration makes that actual ownership probe; on refusal
+it runs every remaining assertion and prints
+`owner-distinct check not run: token cannot assign a foreign owner`. The Windows
+lane and dispatcher summaries label that result **PARTIAL**, not a full PASS.
+GitHub's admin Windows CI still constructs the Administrators-owned fixture
+and proves the strong distinct-owner preservation case. Fixture writes change
+only the discretionary access-control list (DACL), never the system audit
+access-control list (SACL); cleanup can replace a DACL without reading it.
+
 Daemon/test temporary files are separate from each lane worktree's logs and
 artifacts. On Unix, `$HOME/.broca-prepush-runtime` and its per-job leaves are
 explicitly 0700. Windows instead creates a fresh native-temp directory through
 `broca-owner-only`'s protected owner/SYSTEM ACL creator, then validates its
 inheritable ACL. It never applies Unix modes or adopts the old shared HOME path.
+Windows explicitly exports Motor's `CARGO_TARGET_DIR` (normally `C:/t`) inside
+the command. Archive creation uses that target directory. Replay takes its
+target layout from the archive, with no incompatible build-selection flags,
+and extracts under the private `TMPDIR` rather than through the checkout's
+`target/` junction. GitHub CI retains its existing checkout extraction default.
 Test processes use CI's **umask 022**, not 077: owner-only tests must distinguish
 an explicit private-file mode from the ambient default.
 `TMPDIR`, `TMP` and `TEMP` point at the private directory,
@@ -319,13 +334,16 @@ Windows network as a workaround.
 Audit source: all jobs in `.github/workflows/ci.yml` and the called
 `.github/workflows/fixtures.yml`. CI is unchanged. `--lane` commands below are
 machine-side commands and must run on the named platform; the normal dispatcher
-runs fast, the split Linux jobs, windows and macos. All lanes finish with CI's clean-worktree check.
+runs fast, the split Linux jobs, windows and macos. The caller checks its committed
+candidate before and after dispatch, and Git-backed Linux/macOS lanes retain
+CI's clean-worktree check. Windows is a source-only export without `.git`, so
+it does not run a meaningless Git command there.
 Stable-toolchain version and host OS image must also match CI when comparing a
 failure; Windows-target clippy on Linux is **not** native Windows coverage.
 
 | CI job / expanded lanes | Pre-push equivalent | Selection and remaining differences |
 | --- | --- | --- |
-| `fixtures` → `fixtures.yml: fixtures` (Linux, Windows) | Fixture setup in Linux unit/integration/production/small and Windows jobs | Same pinned source SHAs and locked build/package/unpack. Windows receives Subc's full Git source and a checked plain Claustrum archive, then builds offline. |
+| `fixtures` → `fixtures.yml: fixtures` (Linux, Windows) | Fixture setup in Linux unit/integration/production/deploy and Windows jobs | Same pinned source SHAs and locked build/package/unpack. Windows receives Subc's full Git source and a checked plain Claustrum archive, then builds offline. |
 | Scheduled fixture variant (Linux, Windows) | **Not part of the pre-push gate** | Schedule resolves both siblings' current `master` tips. A pre-push result cannot attest to future moving tips at 06:00 UTC. Daily compatibility remains CI-owned; push/PR fixtures are pinned. |
 | `lint` (Ubuntu, Windows) | `linux-lint` / Windows native clippy | `cargo fmt --all -- --check`; `cargo clippy --locked --workspace --all-targets` with the four features from `rust-test-gate.sh`, `-- -D warnings`. Linux preflight additionally cross-clippies `x86_64-pc-windows-gnu`. |
 | `scripts` (Ubuntu) | `fast` guards then the required `linux-small` job | Train preconditions and locked fetch remain before native jobs. `linux-small` runs unchanged `bash scripts/script-suites.sh`; same shared inventory and self-tests. |
@@ -337,8 +355,10 @@ failure; Windows-target clippy on Linux is **not** native Windows coverage.
 | `unit` / Lib/bin/doc (Ubuntu, Windows) | `linux-unit` / CI lib/bin/doc step in windows | Path-dependency checker + tests; `cargo test --locked --workspace --lib --bins --no-fail-fast` with the four features; independent doctest count and full doctests if positive. Includes store contention; no portable unit exclusions. |
 | `production-features`: stable clippy | `linux-production` | `cargo clippy --locked -p broca-core -p broca-module -p broca-module-serve --all-targets -- -D warnings`, without test-clock or other test-gate features. |
 | `production-features`: stable lib/bin | `linux-production` | `cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast`, without test-clock, with required Linux fixtures/aimock. |
-| `production-features`: MSRV | MSRV step in `linux-small` | CI installs `1.96` and runs `cargo +1.96 check --locked --workspace --all-targets`. Motor runs the same check using its preinstalled `+1.96.0` compiler: the uninstalled minor alias tries to sync into read-only RUSTUP_HOME. This still checks the promised 1.96 MSRV, not the default compiler. |
-| `linux-deploy` / real ELF deployment | Deployment step in `linux-small` | Same locked release build of ck-broca, broca-session, broca-run; `BROCA_REQUIRE_LINUX_DEPLOY=1`, actual subc and `LinuxDeployTests.test_real_linux_subc_stage_place_restart_verify -v`; uses motor's target directory rather than checkout-local target. |
+| `production-features`: MSRV | `linux-msrv` | CI installs `1.96` and runs `cargo +1.96 check --locked --workspace --all-targets`. Motor runs the same check using its preinstalled `+1.96.0` compiler: the uninstalled minor alias tries to sync into read-only RUSTUP_HOME. This still checks the promised 1.96 MSRV, not the default compiler. |
+| `linux-deploy` / real ELF deployment | `linux-deploy` | Same locked release build of ck-broca, broca-session, broca-run; `BROCA_REQUIRE_LINUX_DEPLOY=1`, actual subc and `LinuxDeployTests.test_real_linux_subc_stage_place_restart_verify -v`; uses motor's target directory rather than checkout-local target. |
+| Windows owner-preservation fixture | Windows integration replay; full distinct-owner proof on GitHub admin Windows CI | Non-admin Motor tokens that cannot assign Administrators as owner retain every repair assertion but name the unproved owner-distinct property as PARTIAL. |
+| CI clean-worktree checks | Caller candidate checks before/after dispatch; Git-backed fast/Linux/macOS checks | The Windows source export has no `.git`; no Windows Git check is skipped elsewhere or replaced with a separate integrity mechanism. |
 | `test` aggregate (Ubuntu, Windows display names) | Dispatcher's nonzero result on any lane failure | Includes targeted macOS results as well as both full fixture platforms. A missing, cancelled or failed lane never counts as success. |
 
 Actions-only checkout/cache telemetry, wait/download/upload-artifact plumbing,

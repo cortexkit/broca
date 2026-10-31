@@ -316,12 +316,24 @@ fn recorded_synchronous_compaction_still_renders_and_survives_a_checkpoint() {
     );
 }
 
+fn fixture_lineage_path() -> std::path::PathBuf {
+    broca_test_support::scratch_root()
+        .join(format!("compaction-lineage-{}.wal", std::process::id()))
+}
+
+#[test]
+fn compaction_lineage_fixture_uses_private_scratch() {
+    let path = fixture_lineage_path();
+    assert!(path.starts_with(broca_test_support::scratch_root()));
+    assert!(!path.starts_with(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))));
+    assert_eq!(fixture_lineage_id(), fixture_lineage_id());
+}
+
 fn fixture_lineage_id() -> broca_wal::WalLineageId {
     static LINEAGE: std::sync::OnceLock<broca_wal::WalLineageId> = std::sync::OnceLock::new();
     *LINEAGE.get_or_init(|| {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(format!("compaction-lineage-{}.wal", std::process::id()));
+        // Cargo's target can be a junction, which private WAL creation must refuse.
+        let path = fixture_lineage_path();
         let wal = broca_wal::FileWal::open(&path).unwrap();
         let lineage = wal.lineage_id().unwrap();
         drop(wal);

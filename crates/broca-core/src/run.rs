@@ -12230,12 +12230,10 @@ mod tests {
     #[ignore = "explicit disk-fsync latency measurement on each target"]
     async fn attempt_hook_render_to_send_latency_and_fsync_cost() {
         use crate::durability_counters::{counts_for_fence, FsyncCause};
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/scratch")
-            .join(format!(
-                "attempt-latency-{}",
-                crate::attempt_id::mint_attempt_id().unwrap().as_str()
-            ));
+        let root = broca_test_support::scratch_root().join(format!(
+            "attempt-latency-{}",
+            crate::attempt_id::mint_attempt_id().unwrap().as_str()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
         let template = attempt_template();

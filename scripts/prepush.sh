@@ -151,7 +151,11 @@ launch() {
       rc=204
     else
       requested_ms="$(timestamp_ms)"
-      ck motor run "${args[@]}" -- "bash scripts/prepush.sh --lane $name" || rc=$?
+      command="bash scripts/prepush.sh --lane $name"
+      if [[ "$platform" == windows ]]; then
+        command='export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-C:/t}"; bash scripts/prepush.sh --lane windows'
+      fi
+      ck motor run "${args[@]}" -- "$command" || rc=$?
     fi
     if [[ "$name" == windows && "$prepared" == 1 && "$rc" != 201 ]]; then
       rm -rf -- "$checkouts/windows/prepush-inputs"
@@ -181,6 +185,10 @@ summarize() {
   echo '==> prepush lane summary (wall seconds, including dispatch)'
   for i in "${!names[@]}"; do
     state="$(dispatch_state "${results[$i]}")"
+    if [[ "$state" == PASS && "${names[$i]}" == windows ]] &&
+       grep -Fq 'owner-distinct check not run: token cannot assign a foreign owner' "$logs/windows.log"; then
+      state=PARTIAL
+    fi
     printf '%-24s %-10s exit=%-3s wall=%ss' "${names[$i]}" "$state" "${results[$i]}" "${durations[$i]}"
     if [[ -f "$logs/${names[$i]}.timing.json" ]]; then
       python3 - "$logs/${names[$i]}.timing.json" <<'PY'

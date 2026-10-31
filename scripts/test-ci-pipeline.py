@@ -181,6 +181,8 @@ if lane == os.environ.get('FAIL_LANE'):
         print('error[E0599]: fixture MSRV compiler error')
     print('FAIL broca-module::it permissions::warming_route')
     sys.exit(19)
+if lane == 'windows' and os.environ.get('OWNER_PARTIAL'):
+    print('owner-distinct check not run: token cannot assign a foreign owner')
 print('Summary: 1 test run: 1 passed')
 ''')
         ck.chmod(0o755)
@@ -214,6 +216,7 @@ print('Summary: 1 test run: 1 passed')
         self.assertNotIn('--net', windows)
         self.assertNotIn('--sibling', windows)
         self.assertIn('--vcpus 8', windows)
+        self.assertIn('export CARGO_TARGET_DIR=', windows)
         requests = {e.split('--lane ')[-1].strip("'\""): shlex.split(e) for e in events}
         sizes = {'fast': 2, 'linux-small': 2, 'linux-production': 4, 'macos': 2,
                  'linux-lint': 8, 'linux-unit': 4, 'windows': 8, 'linux-msrv': 8, 'linux-deploy': 8,
@@ -248,6 +251,13 @@ print('Summary: 1 test run: 1 passed')
         lane_common = subprocess.check_output(['git', '-C', str(self.root / 'lane-pool/linux-unit'),
                                                'rev-parse', '--path-format=absolute', '--git-common-dir'], text=True).strip()
         self.assertEqual(lane_common, common)
+
+    def test_windows_foreign_owner_gap_is_named_partial_not_full_pass(self):
+        result = self.run_prepush(OWNER_PARTIAL='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r'windows\s+PARTIAL\s+exit=0')
+        self.assertNotRegex(result.stdout, r'windows\s+PASS\s+exit=0')
+        self.assertIn('owner-distinct check not run: token cannot assign a foreign owner', result.stdout)
 
     def test_concurrent_cpu_requests_never_exceed_32(self):
         (self.root / 'target').mkdir()
@@ -800,6 +810,20 @@ class ArchiveShards(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('differs from independent libtest', result.stderr)
         self.assertFalse(self.archive.exists())
+
+    def test_archive_build_uses_exported_target_but_replay_does_not_mix_build_options(self):
+        result = self.run_mode('build', str(self.archive), CARGO_TARGET_DIR='C:/t')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        archive = self.commands()[-1]
+        self.assertEqual(archive[archive.index('--target-dir')+1], 'C:/t')
+        self.events.unlink()
+        extracted = self.root / 'private-temp/replay'
+        result = self.run_mode('run', str(self.archive), '2/4', CARGO_TARGET_DIR='C:/t',
+                               BROCA_PREPUSH_ARCHIVE_EXTRACT_TO=str(extracted))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for command in self.commands():
+            self.assertNotIn('--target-dir', command)
+            self.assertEqual(command[command.index('--extract-to')+1], str(extracted))
 
     def test_run_uses_archive_partition_and_original_selection_without_compiling(self):
         result = self.run_mode('run', str(self.archive), '3/4')

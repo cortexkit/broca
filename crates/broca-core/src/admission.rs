@@ -3071,7 +3071,7 @@ mod tests {
     #[test]
     fn offset_admission_crash_cut_after_wal_barrier_before_seed_commit() {
         use std::io::{Read, Seek, SeekFrom, Write};
-        let dir = std::path::Path::new("target/scratch").join(format!(
+        let dir = broca_test_support::scratch_root().join(format!(
             "admission-cut-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
