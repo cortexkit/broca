@@ -2212,9 +2212,31 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // Idle commands and delegated warm/recovery work can advance the writer without
         // starting an episode. Keep a cached admission view only while its head still matches.
         self.discard_stale_admission_view();
+        // The executor already owns its resume snapshot while dependencies are unresolved.
+        // Postpone session-change metadata writes, without changing run-control handling.
+        if self.restart_admitting && Self::defer_restart_command(&cmd) {
+            if let Some(error) = self.observe_writer_poison() {
+                return self.reply_writer_poisoned(cmd, error);
+            }
+            // This queue is not polled inside the admission wait. Its existing close paths
+            // also return typed replies for work that cannot run after shutdown.
+            if let Err(error) = self.terminal_tx.send(cmd) {
+                Self::reply_retired(error.0);
+            }
+            return false;
+        }
         let exit = self.handle_cmd_inner(cmd).await;
         self.discard_stale_admission_view();
         exit
+    }
+
+    fn defer_restart_command(cmd: &LineageCmd) -> bool {
+        matches!(
+            cmd,
+            LineageCmd::SessionRefresh { .. }
+                | LineageCmd::SessionRefreshPolicy { .. }
+                | LineageCmd::SessionFlushPrefix { .. }
+        )
     }
 
     async fn handle_cmd_inner(&mut self, cmd: LineageCmd) -> bool {
@@ -5391,7 +5413,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Ok(Err(error)) => Err(StartRunFailure::Admission(error)),
                     Err(_) => Err(StartRunFailure::Infrastructure("run ended before admission".into())),
                 },
-                Some(command) = self.rx.recv(), if restart_resuming => {
+                // Keep back-pressure instead of draining a bounded command lane into an
+                // unbounded deferred queue while a dependency remains unavailable.
+                Some(command) = self.rx.recv(), if restart_resuming && self.terminal_rx.len() < self.rx.max_capacity() => {
                     // Commands are served while a restart-paused episode waits for its
                     // dependencies, so this one runs inside the suspended admission. Its exit
                     // request and any writer poison it observed must end this admission too:

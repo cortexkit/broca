@@ -11,6 +11,9 @@ use broca_core::{FileLeaseStore, FileWalStore, LeaseStore};
 use broca_protocol::BindIdentity;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+#[path = "actor_restart_admission_tests.rs"]
+mod restart_writes;
+
 /// File-backed WAL store with the two failures these tests inject.
 struct ProbeWal {
     inner: Arc<FileWalStore>,
@@ -119,11 +122,17 @@ impl broca_wal::Wal for FailableWal {
     }
 }
 
-/// Completes runs immediately, or holds every run before its admission until the test releases
-/// it and then refuses that admission, like a tool route the run depends on never coming up.
+/// Complete simple lifecycle probes immediately, or hold before admission. Held media
+/// probes run the real core after release; other held probes refuse a dependency.
 struct ProbeExecutor {
+    wal_store: Arc<ProbeWal>,
     hold_admission: bool,
     release: tokio::sync::Notify,
+    entered: tokio::sync::Notify,
+    /// Zero refuses held admission; one checks media initialization; two emulates media off.
+    media_probe: AtomicUsize,
+    requests: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    completed_probe: tokio::sync::Notify,
     session_closes: AtomicUsize,
 }
 
@@ -132,10 +141,14 @@ impl RunExecutor for ProbeExecutor {
     async fn execute(
         &self,
         job: crate::executor::RunJob,
-        _: mpsc::Sender<broca_core::OutputEvent>,
+        out: mpsc::Sender<broca_core::OutputEvent>,
     ) -> Result<RunSummary, RunError> {
         if self.hold_admission {
+            self.entered.notify_one();
             self.release.notified().await;
+            if self.media_probe.load(Ordering::SeqCst) != 0 {
+                return restart_writes::execute_probe(self, job, out).await;
+            }
             return Err(RunError::Config("dependency refused admission".into()));
         }
         if let Some(ack) = job.on_admitted {
@@ -170,6 +183,8 @@ enum Seed {
     Retained,
     /// One episode paused by a daemon restart, waiting to resume.
     RestartPaused,
+    MediaRestartPaused,
+    MediaOffRestartPaused,
 }
 
 /// Retention deadline of a [`Seed::Retained`] lineage, and a clock reading past it.
@@ -202,6 +217,30 @@ impl Fixture {
             read_starved_runtime: AtomicBool::new(false),
         });
         let retained = seed == Seed::Retained;
+        let media_probe = matches!(seed, Seed::MediaRestartPaused | Seed::MediaOffRestartPaused);
+        let restart_paused = media_probe || seed == Seed::RestartPaused;
+        let mut config = min_config();
+        if media_probe {
+            let mut frozen = broca_provider::families::openai_chat_frozen_config("fake");
+            if seed == Seed::MediaRestartPaused {
+                frozen.media = Some(broca_provider::media_profile::select_media_profile(
+                    broca_provider::spec::WireFamilyId::OpenAiChat,
+                    Some(broca_provider::media_profile::MediaQuirk::Openai),
+                    "fake",
+                    broca_provider::spec::InputModalities::from_value(&serde_json::json!([
+                        "text", "image"
+                    ])),
+                    Some(128000),
+                ));
+            }
+            config.renderer_version = frozen.renderer_version;
+            config.frozen_render_config = serde_json::to_value(frozen).unwrap();
+            config.tools = vec![serde_json::from_value(serde_json::json!({
+                "name":"work","description":"work","input_schema":{"type":"object"}
+            }))
+            .unwrap()]
+            .into();
+        }
         let mut wal = wal_store
             .inner
             .open_with_retention(&key, retained.then_some(3600))
@@ -215,8 +254,7 @@ impl Fixture {
                 retention: retained.then_some(3600),
                 hooks: None,
                 title: None,
-                on_restart: (seed == Seed::RestartPaused)
-                    .then_some(broca_protocol::request::OnRestart::Resume),
+                on_restart: restart_paused.then_some(broca_protocol::request::OnRestart::Resume),
                 keep_warm: None,
                 marker_order_version: None,
                 manifest: None,
@@ -228,7 +266,7 @@ impl Fixture {
                 ts_ms: None,
                 run_id: RunId("prior".into()),
                 session: key.clone(),
-                config: Box::new(min_config()),
+                config: Box::new(config),
                 input: text_req(&key, "prior").input.into(),
                 origin: broca_wal::RunOrigin::Fresh,
                 submission_id: None,
@@ -236,7 +274,21 @@ impl Fixture {
             false,
         )
         .unwrap();
-        let end = if seed == Seed::RestartPaused {
+        if media_probe {
+            wal.append(
+                1,
+                &WalRecord::SessionRefreshAccepted {
+                    generation: 1,
+                    policy: "on_prefix_rebuild".into(),
+                    manifest: Box::new(restart_writes::manifest("pending")),
+                    run_in_progress: false,
+                    applies_from_next_run: false,
+                },
+                false,
+            )
+            .unwrap();
+        }
+        let end = if restart_paused {
             WalRecord::RunPaused {
                 run_id: RunId("prior".into()),
                 ts_ms: None,
@@ -269,8 +321,13 @@ impl Fixture {
             .acquire(&broca_core::lease_key_for(&key))
             .unwrap();
         let executor = Arc::new(ProbeExecutor {
+            wal_store: wal_store.clone(),
             hold_admission,
             release: tokio::sync::Notify::new(),
+            entered: tokio::sync::Notify::new(),
+            media_probe: AtomicUsize::new(0),
+            requests: Arc::default(),
+            completed_probe: tokio::sync::Notify::new(),
             session_closes: AtomicUsize::new(0),
         });
         let registry = crate::registry::LineageRegistry::new(Arc::new(super::tests::SeamOpener {
