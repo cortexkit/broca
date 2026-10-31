@@ -800,7 +800,7 @@ Usage facts for metering: one row per billing-homogeneous slice of a finished ru
 Older files had a `session` column and a second `fact_id` index; both are dropped when the
 database is opened.
 
-**`segment_json` fields:** `run_id`, `session` (triple object), `segment_ordinal`,
+**`segment_json` fields:** `run_id`, `session` (identity object), `segment_ordinal`,
 `fact_id`, `provider`, `model`, `auth_selection` (credential id or null), `account_ref`,
 `resolved_credential_id`, `vault_request`, `work_class` (these four absent when unset),
 `charge_basis` (`metered_api`, `subscription_included`, `unknown`),
@@ -810,6 +810,13 @@ separate-reasoning normalizer), `usage` (`Usage`, section 2.5), `usage_by_servic
 (absent when no step reported a tier; buckets need not sum to `usage`), `retries_used`,
 `pricing_at_ms`, `pricing_at_precision`, `occurred_at_ms`, `occurred_at_precision`,
 `terminal_reason` (final slice only). New fields are only ever added.
+
+For a session whose frozen storage root is exactly `broca-unscoped-v1`, the fact's
+`session` object contains `harness` and `session` but omits `project_root`: the
+namespace is not a project. Every other root retains the original triple bytes.
+Fact ids still hash the full storage triple, including the namespace for an
+unscoped session; no new no-project marker or id algorithm is introduced. The WAL
+retains that storage root, and existing stored facts and ids are never rewritten.
 
 A slice ends at a refreeze, and also where a model call is answered by another model than the
 slice's: a step routed to the refusal-fallback model (`route`) or served by an Anthropic

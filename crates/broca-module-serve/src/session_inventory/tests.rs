@@ -106,8 +106,8 @@ async fn held_migration_serves_known_pairs_and_signals_new_pairs_single_flight()
     assert!(!second.is_finished());
     assert_eq!(fixture.inventory.inner.attempts.load(Ordering::SeqCst), 1);
     drop(held);
-    assert_eq!(first.await.unwrap().unwrap(), fixture.bind("new-first"));
-    assert_eq!(second.await.unwrap().unwrap(), fixture.bind("new-second"));
+    assert_eq!(first.await.unwrap().unwrap(), new_unscoped("new-first"));
+    assert_eq!(second.await.unwrap().unwrap(), new_unscoped("new-second"));
     assert!(
         fixture
             .index
@@ -130,7 +130,7 @@ async fn failed_migration_refuses_new_pairs_and_can_be_retried() {
     std::fs::remove_file(fixture.root.join("wal")).unwrap();
     assert_eq!(
         fixture.resolve("recovered").await.unwrap().unwrap(),
-        fixture.bind("recovered")
+        new_unscoped("recovered")
     );
     assert_eq!(fixture.inventory.inner.attempts.load(Ordering::SeqCst), 2);
 }
@@ -161,7 +161,7 @@ async fn bounded_wait_expires_without_cancelling_shared_migration() {
     assert_eq!(fixture.inventory.inner.attempts.load(Ordering::SeqCst), 1);
     assert_eq!(
         fixture.resolve("after-timeout").await.unwrap().unwrap(),
-        fixture.bind("after-timeout")
+        new_unscoped("after-timeout")
     );
 }
 
@@ -175,7 +175,7 @@ async fn a_mid_run_gap_marker_is_repaired_by_the_next_new_pair_bind() {
     .unwrap();
     assert_eq!(
         fixture.resolve("first").await.unwrap().unwrap(),
-        fixture.bind("first")
+        new_unscoped("first")
     );
     assert_eq!(fixture.inventory.inner.attempts.load(Ordering::SeqCst), 0);
     let marker = fixture
@@ -191,7 +191,7 @@ async fn a_mid_run_gap_marker_is_repaired_by_the_next_new_pair_bind() {
     );
     assert_eq!(
         fixture.resolve("after-gap").await.unwrap().unwrap(),
-        fixture.bind("after-gap")
+        new_unscoped("after-gap")
     );
     assert!(!marker.exists());
     assert!(
@@ -202,4 +202,8 @@ async fn a_mid_run_gap_marker_is_repaired_by_the_next_new_pair_bind() {
             .complete
     );
     assert_eq!(fixture.inventory.inner.attempts.load(Ordering::SeqCst), 1);
+}
+
+fn new_unscoped(name: &str) -> BindIdentity {
+    BindIdentity::new("broca-unscoped-v1", "runner", name)
 }

@@ -72,12 +72,9 @@ impl std::fmt::Display for SessionAddressError {
 
 impl std::error::Error for SessionAddressError {}
 
-// Outgoing tool binds still require a real folder: a relative namespace would be
-// resolved against the daemon's cwd. Switch this branch to
-// broca_protocol::session::UNSCOPED_SESSION_ROOT with subc-protocol 0.34.0 adoption,
-// when outgoing binds can express no folder without sending a pretend path.
-fn new_unscoped_storage_root(bind: &BindIdentity) -> &Path {
-    &bind.project_root
+// This namespace is only a durable storage key, never an outgoing route folder.
+fn new_unscoped_storage_root() -> &'static Path {
+    Path::new(broca_protocol::session::UNSCOPED_SESSION_ROOT)
 }
 
 fn require_no_gap(root: Option<&Path>) -> Result<(), SessionAddressError> {
@@ -187,7 +184,7 @@ impl SqliteStore {
             None => {
                 require_complete(&tx, root.as_deref())?;
                 let identity = BindIdentity::new(
-                    stamped_workdir.unwrap_or_else(|| new_unscoped_storage_root(bind)),
+                    stamped_workdir.unwrap_or_else(|| new_unscoped_storage_root()),
                     &bind.harness,
                     &bind.session,
                 );

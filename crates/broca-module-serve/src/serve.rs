@@ -451,11 +451,9 @@ fn send_id_scope(session: &BrocaBindIdentity) -> String {
 
 /// Refuse an execute-class op whose bound project root no longer exists.
 ///
-/// Two ops need the directory to be real. `session.send` USES it: tools dispatched to the
-/// tool module resolve paths beneath it, so admitting a send into a vanished root produces a
-/// run that dies at its first tool call, several steps from the cause. `session.import`
-/// CREATES durable state under that name, and seeding a session under a root that does not
-/// exist is how an unreachable session gets manufactured in the first place.
+/// Directory-keyed sessions retain the legacy admission guard for `session.send` and
+/// `session.import`: both create durable state under a folder-derived identity. The fixed
+/// unscoped namespace is not a folder and is exempt from the directory check.
 ///
 /// Every other op — cancel, status, read, subscribe, retract — only reads or ends something
 /// that already exists, and must keep working when the root is gone. A paused run's only exit
@@ -473,6 +471,12 @@ fn send_id_scope(session: &BrocaBindIdentity) -> String {
 /// the same reason, so a caller that already handles it sees no change when the refusal moves
 /// from bind time to op time.
 async fn execute_class_root_refusal(session: &BrocaBindIdentity) -> Option<String> {
+    // The unscoped namespace is a storage key, not a directory, so this guard does not apply.
+    if session.project_root.as_os_str()
+        == std::ffi::OsStr::new(broca_protocol::session::UNSCOPED_SESSION_ROOT)
+    {
+        return None;
+    }
     // `tokio::fs` runs the stat on the blocking pool: a slow or network filesystem must not
     // stall the runtime worker that also carries other sessions' frames and streams.
     if tokio::fs::metadata(&session.project_root).await.is_ok() {
@@ -510,11 +514,15 @@ fn run_id_for_import(session: &BrocaBindIdentity, import_id: &str) -> broca_prot
 
 fn to_broca_identity(id: &SubcBindIdentity) -> BrocaBindIdentity {
     BrocaBindIdentity {
-        project_root: id.project_root.clone(),
+        project_root: broca_protocol::session::UNSCOPED_SESSION_ROOT.into(),
         harness: id.harness.clone(),
         session: id.session.clone(),
     }
 }
+
+#[cfg(test)]
+#[path = "serve_project_identity_tests.rs"]
+mod project_identity_tests;
 
 /// What a `route.bind` said about its caller beyond the session identity. Both values are
 /// recorded on the `RunStarted` of every send or import made over the route, and neither keys
@@ -1855,7 +1863,7 @@ async fn handle_control_request(
                 } else {
                     RouteRole::LlmRunner
                 },
-                project_id: identity.project_id.clone(),
+                project_id: scope.as_ref().and_then(|stamp| stamp.project_id.clone()),
                 principal: principal.as_ref().map(to_bind_principal),
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
                 stamped_project: scope
@@ -7663,7 +7671,7 @@ mod tests {
                 target: subc_protocol::RouteTarget::ManagementSurface {
                     module_id: "broca".into(),
                 },
-                identity: SubcBindIdentity::new("/tmp/project-a", "runner", session),
+                identity: SubcBindIdentity::new("runner", session),
                 principal: Some(owner.clone()),
                 consumer_capabilities: None,
                 admission_facts: None,
@@ -8245,7 +8253,7 @@ mod tests {
             target: subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new("/tmp/project-a", "runner", "slow-bind"),
+            identity: SubcBindIdentity::new("runner", "slow-bind"),
             principal: Some(owner.clone()),
             consumer_capabilities: None,
             admission_facts: None,
@@ -8420,7 +8428,7 @@ mod tests {
             target: subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new("/tmp/project-a", "runner", session),
+            identity: SubcBindIdentity::new("runner", session),
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
@@ -8682,7 +8690,7 @@ mod tests {
                 target: subc_protocol::RouteTarget::ManagementSurface {
                     module_id: "broca".into(),
                 },
-                identity: SubcBindIdentity::new("/tmp/project-a", "runner", format!("s{index}")),
+                identity: SubcBindIdentity::new("runner", format!("s{index}")),
                 principal: None,
                 consumer_capabilities: None,
                 admission_facts: None,
@@ -8910,7 +8918,7 @@ mod tests {
                     target: subc_protocol::RouteTarget::ManagementSurface {
                         module_id: "broca".into(),
                     },
-                    identity: SubcBindIdentity::new("/tmp", "runner", "retract-principal"),
+                    identity: SubcBindIdentity::new("runner", "retract-principal"),
                     principal,
                     consumer_capabilities: None,
                     admission_facts: None,
@@ -9037,7 +9045,7 @@ mod tests {
             target: subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new("/tmp", "runner", session),
+            identity: SubcBindIdentity::new("runner", session),
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
@@ -9210,7 +9218,7 @@ mod tests {
             target: subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new("/tmp/project-a", "runner", "panicking-status"),
+            identity: SubcBindIdentity::new("runner", "panicking-status"),
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
@@ -9472,11 +9480,7 @@ mod tests {
             target: subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(
-                std::path::PathBuf::from("/tmp/project-a"),
-                "runner",
-                "s1",
-            ),
+            identity: SubcBindIdentity::new("runner", "s1"),
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
@@ -9684,11 +9688,7 @@ mod tests {
             target: subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(
-                std::path::PathBuf::from("/tmp/project-a"),
-                "runner",
-                "s1",
-            ),
+            identity: SubcBindIdentity::new("runner", "s1"),
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,

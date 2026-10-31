@@ -156,8 +156,9 @@ A consumer can be both. The surface is **session-centric**: consumers address
   **WAL**, one **store** partition, keyed `{project_root, harness, session}`.
   The storage root is resolved before acknowledging a session bind: an existing
   `(harness, session)` pair keeps its unique inventory root; a new scoped pair uses
-  stamped `workdir`. On subc-protocol 0.33, a new pair without stamped workdir still
-  uses the route root, including for outgoing transport. A stamp's `project_id` never
+  stamped `workdir`. A new pair without stamped workdir uses the fixed storage namespace
+  `broca-unscoped-v1`, not a directory. WALs still live in the state root's log folders,
+  at the inventory-assigned address. A stamp's `project_id` never
   keys a session. Two inventory roots refuse `session_address_ambiguous` (permanent);
    Known pairs resolve immediately from positive inventory evidence even during repair.
    An absent pair waits on shared discovery readiness for at most 60 seconds; incomplete
@@ -166,6 +167,12 @@ A consumer can be both. The surface is **session-centric**: consumers address
    `gap_marker`. Boot and on-demand repairs are single-flight and do not block serve
    startup. Existing-pair lookups use a read transaction; only absent pairs take the
    write lock, recheck discovery, and reserve a root before any actor or WAL opens.
+  Wire binds carry only `harness` and `session` on subc-protocol 0.34. Broca declares
+  `bind-no-project/v1` and ignores stray legacy bind project members. Project attribution
+  comes only from the daemon's scope stamp (`workdir`, optional `project_id`), never
+  the inbound connection. Scoped outgoing tool/catalog routes select the frozen scope;
+  unscoped routes carry no folder. Compaction, hook and vault module-level routes are
+  unscoped. Neither storage roots nor the namespace are sent as wire bind projects.
 - **Run = one turn's loop execution** — a user message in → the agent loops until its
   response → a terminal. Each run begins with a `RunStarted` **episode marker** (input +
   frozen config + `origin` + `submission_id`). Runs **accumulate** in the lineage WAL:
@@ -814,7 +821,8 @@ queued changed system prompt is.
 With the field omitted on a session's first send, the first match wins:
 
 1. `broca.jsonc` `context_management.projects["<project_root>"]`, keyed by the session's
-   `project_root` as broca receives it (the daemon canonicalises it; a trailing `/` is ignored);
+   resolved storage `project_root` (the inventory's existing root or stamped workdir for
+   a new scoped session; a trailing `/` is ignored);
 2. `broca.jsonc` `context_management.default`;
 3. `"none"`.
 
@@ -1116,6 +1124,9 @@ not by session:
 
 The refusal is a typed `invalid_project_root` naming the exact path. Recreating the
 directory revives the session; nothing about it was destroyed.
+The exact `broca-unscoped-v1` storage namespace is exempt: it is never a filesystem
+directory, even if a directory with that name exists in the process's working directory.
+Legacy directory-root sessions retain the guard.
 
 **This is deliberate.** Writes create durable state under a key derived from the bind
 triple, and appending new state beneath a root that is gone (or running tools there) is

@@ -521,6 +521,7 @@ pub fn manifest_configured(
         // `scope-workdir/v1` asks the daemon to stamp a scope's session folder and project id
         // on its binds. New scoped sessions take workdir; the inventory preserves existing
         // addresses. Project id never keys a session.
+        // `bind-no-project/v1` promises that only scope supplies project attribution.
         provides: vec![
             broca_wire::LLM_RUNNER_V1.to_string(),
             broca_wire::agent_data::PROVIDES.to_string(),
@@ -533,6 +534,7 @@ pub fn manifest_configured(
             subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.to_string(),
             subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
+            subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
         ],
         requires: Vec::new(),
         must_never_reach: Vec::new(),
@@ -646,7 +648,7 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1", "scope-workdir/v1"],
+                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1", "scope-workdir/v1", "bind-no-project/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),

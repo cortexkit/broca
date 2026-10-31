@@ -304,18 +304,10 @@ impl Rig {
 
     /// Open a tool-provider route to one broca process in this rig.
     async fn open_to(&self, target: &str, scope_ref: &str, flow: bool) -> Route {
-        self.open_with_bind_project(target, scope_ref, flow, None, false)
-            .await
+        self.open_with_held(target, scope_ref, flow, false).await
     }
 
-    async fn open_with_bind_project(
-        &self,
-        target: &str,
-        scope_ref: &str,
-        flow: bool,
-        project_id: Option<&str>,
-        held: bool,
-    ) -> Route {
+    async fn open_with_held(&self, target: &str, scope_ref: &str, flow: bool, held: bool) -> Route {
         // A run scope is opened by its owner; the flow carrier is Basal, whose calls carry the
         // flow's scope.
         let caller = if flow { "basal" } else { "owner" };
@@ -344,15 +336,7 @@ impl Rig {
             scope_ref,
             Some(1),
         );
-        served_route_with_bind_project(
-            &connection,
-            target,
-            &identity,
-            Some(scope),
-            project_id,
-            held,
-        )
-        .await
+        served_route(&connection, target, &identity, Some(scope), held).await
     }
 
     fn calls(&self) -> usize {
@@ -530,12 +514,11 @@ async fn an_empty_consumer_nonce_is_not_readiness() {
 /// then see the route bind before it has registered its own providers. The first call on such
 /// a route is answered by whatever guards it has, which for this route means it fails closed.
 /// Waiting for the catalog keeps the first tool call on a served route. Returns the route.
-async fn served_route_with_bind_project(
+async fn served_route(
     connection: &Arc<SubcConnection>,
     target: &str,
     identity: &broca_protocol::BindIdentity,
     scope: Option<subc_protocol::scope::ScopeSelector>,
-    project_id: Option<&str>,
     held: bool,
 ) -> Route {
     // A daemon admits a route to a module whose registration it has not finished handling,
@@ -552,14 +535,18 @@ async fn served_route_with_bind_project(
                 let target = target.to_owned();
                 async move {
                     #[cfg(debug_assertions)]
-                    let opened = connection
-                        .route_open_tool_provider_with_bind_project_for_tests(
-                            &target, &identity, scope, project_id, held,
-                        )
-                        .await;
+                    let opened = if held {
+                        connection
+                            .route_open_tool_provider_held_v1_for_tests(&target, &identity, scope)
+                            .await
+                    } else {
+                        connection
+                            .route_open_tool_provider_v1(&target, &identity, scope)
+                            .await
+                    };
                     #[cfg(not(debug_assertions))]
                     let opened = {
-                        assert!(project_id.is_none() && !held);
+                        assert!(!held);
                         connection
                             .route_open_tool_provider_v1(&target, &identity, scope)
                             .await
@@ -984,7 +971,7 @@ async fn an_unmarked_run_calls_an_unlisted_provider() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg(debug_assertions)]
-async fn always_grant_uses_the_daemon_project_not_the_bind_project_or_workdir() {
+async fn always_grant_uses_the_daemon_project_not_the_workdir() {
     let Some(rig) = Rig::start(
         "always-project",
         Stub::Answering(CEREBELLUM_MARKED),
@@ -1027,28 +1014,16 @@ async fn always_grant_uses_the_daemon_project_not_the_bind_project_or_workdir() 
         .unwrap();
     assert!(admitted_with_retry(&rig, &first, "first-a").await["cost_usd"].is_number());
     let later = rig
-        .open_with_bind_project(
-            "broca",
-            "project-a-later",
-            false,
-            Some("client-project-b"),
-            false,
-        )
+        .open_with_held("broca", "project-a-later", false, false)
         .await;
     assert!(admitted_with_retry(&rig, &later, "later-a").await["cost_usd"].is_number());
     assert_eq!(rig.calls(), 2);
     for run in ["project-b", "run"] {
-        let route = rig
-            .open_with_bind_project("broca", run, false, Some("project-a"), false)
-            .await;
+        let route = rig.open_with_held("broca", run, false, false).await;
         let error = refused_once_the_route_is_served(&rig, &route, run).await;
         assert_eq!(error["detail"]["consent"], "consent_required");
     }
-    assert_eq!(
-        rig.calls(),
-        2,
-        "a shared workdir or client bind project must not match"
-    );
+    assert_eq!(rig.calls(), 2, "a shared workdir must not match");
     assert!(store.revoke("always-card").unwrap());
     assert_eq!(store.generation("agent", "typesafe").unwrap(), 1);
     let error = refused_once_the_route_is_served(&rig, &later, "revoked-a").await;
@@ -1068,25 +1043,21 @@ async fn consent_card_content_uses_only_the_daemon_stamped_project() {
     else {
         return;
     };
-    for (run, claim, fixture, expected_project) in [
+    for (run, fixture, expected_project) in [
         (
             "run",
-            "project-a",
             include_str!("../../broca-subc/tests/fixtures/consent/broca/private-content-card.json"),
             None,
         ),
         (
             "project-a-first",
-            "client-project-b",
             include_str!(
                 "../../broca-subc/tests/fixtures/consent/broca/private-content-card-project.json"
             ),
             Some("project-a"),
         ),
     ] {
-        let route = rig
-            .open_with_bind_project("broca", run, false, Some(claim), true)
-            .await;
+        let route = rig.open_with_held("broca", run, false, true).await;
         broca_test_support::wait_until("Cingulate's consent capability", || async {
             let ready = route
                 .connection

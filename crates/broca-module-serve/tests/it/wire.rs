@@ -936,7 +936,7 @@ async fn vault_audit_is_answered_by_the_daemon_auditor_without_opening_a_session
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(dir.join("proj"), "runner", "audit"),
+        identity: SubcBindIdentity::new("runner", "audit"),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -1024,18 +1024,14 @@ async fn retired_usage_export_is_unknown_and_terminal_facts_remain() {
     .unwrap();
     write_frame(&mut cwriter, &hello_ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "export");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "export");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 2,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -1169,18 +1165,14 @@ async fn removed_spend_cap_operations_are_unknown_methods_that_write_nothing() {
     .unwrap();
     write_frame(&mut cwriter, &hello_ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "removed-cap-ops");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "removed-cap-ops");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 2,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -1310,14 +1302,14 @@ async fn bind_ack_precedes_route_egress_and_stale_epoch_is_silent() {
     .unwrap();
     write_frame(&mut cwriter, &hello_ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "ordered");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "ordered");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 2,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(session.project_root, session.harness, session.session),
+        identity: SubcBindIdentity::new(session.harness, session.session),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -1365,8 +1357,8 @@ async fn bind_ack_precedes_route_egress_and_stale_epoch_is_silent() {
 async fn separator_collision_bind_is_rejected_before_any_durable_state() {
     let dir = tmpdir("bind-separator-collision");
     let (registry, wal) = registry_and_wal(&dir);
-    let colliding = BindIdentity::new(dir.join("proj\u{1f}runner"), "a", "b");
-    let invalid = BindIdentity::new(dir.join("proj"), "runner\u{1f}a", "b");
+    let colliding = BindIdentity::new("broca-unscoped-v1\u{1f}runner", "a", "b");
+    let invalid = BindIdentity::new("broca-unscoped-v1", "runner\u{1f}a", "b");
     let wal_path = wal.wal_path(&invalid);
     assert_ne!(colliding, invalid);
     assert_eq!(wal.wal_path(&colliding), wal_path);
@@ -1412,11 +1404,7 @@ async fn separator_collision_bind_is_rejected_before_any_durable_state() {
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            invalid.project_root.clone(),
-            invalid.harness.clone(),
-            invalid.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(invalid.harness.clone(), invalid.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -1561,18 +1549,14 @@ async fn hello_bind_send_with_system_writes_leading_system_message() {
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "s1");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "s1");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -1674,18 +1658,14 @@ async fn session_send_rejects_reserved_seed_from_before_starting_a_run() {
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "seed-from");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "seed-from");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -1770,18 +1750,14 @@ async fn session_send_refuses_an_unknown_context_management_value_before_startin
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "context-management");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "context-management");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -1879,18 +1855,14 @@ async fn session_send_refuses_an_unknown_service_tier_before_starting_a_run() {
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "service-tier");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "service-tier");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -2068,18 +2040,14 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         .as_u64()
         .expect("initial health.check includes the stale-epoch counter");
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "s1");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "s1");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -2547,17 +2515,20 @@ async fn a_vanished_project_root_refuses_execute_ops_but_still_admits_run_ops() 
 
     let root = dir.join("proj");
     let session = BindIdentity::new(root.clone(), "runner", "vanished");
+    let inventory = broca_store::SqliteStore::open(dir.join("store.db")).unwrap();
+    broca_core::SessionRefIndex::record_session(
+        &inventory,
+        &broca_core::session_addr(&session),
+        &session,
+    )
+    .unwrap();
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 2,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -2833,18 +2804,14 @@ async fn hello_bind_send_status_roundtrip() {
     write_frame(&mut cwriter, &ack).await.unwrap();
 
     // 2. route.bind on channel 7 for a session.
-    let session = BindIdentity::new(dir.join("proj"), "runner", "s1");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "s1");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -2940,18 +2907,14 @@ async fn slow_request_on_one_session_does_not_block_another_session() {
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
 
-    let slow_session = BindIdentity::new(dir.join("proj"), "runner", "slow");
+    let slow_session = BindIdentity::new("broca-unscoped-v1", "runner", "slow");
     let slow_bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            slow_session.project_root.clone(),
-            slow_session.harness.clone(),
-            slow_session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(slow_session.harness.clone(), slow_session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -2968,18 +2931,14 @@ async fn slow_request_on_one_session_does_not_block_another_session() {
     .await;
     let _ = read_one(&mut creader).await;
 
-    let fast_session = BindIdentity::new(dir.join("proj"), "runner", "fast");
+    let fast_session = BindIdentity::new("broca-unscoped-v1", "runner", "fast");
     let fast_bind = ModuleControlRequest::RouteBind {
         route_channel: 8,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            fast_session.project_root.clone(),
-            fast_session.harness.clone(),
-            fast_session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(fast_session.harness.clone(), fast_session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -3082,18 +3041,14 @@ async fn pipelined_requests_for_one_session_reach_the_handler_in_wire_order() {
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "ordered");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "ordered");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -3229,18 +3184,14 @@ async fn read_route_manifest_and_page_roundtrip() {
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "s1");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "s1");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -3386,18 +3337,14 @@ async fn same_send_id_same_prompt_reuses_one_episode() {
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "s1");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "s1");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -3552,18 +3499,14 @@ async fn chatgpt_needs_reauth_pauses_and_resumes_original_send() {
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "reauth");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "reauth");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -3784,7 +3727,7 @@ async fn chatgpt_needs_reauth_send_durably_pauses_then_resumes_same_run() {
             .with_idle_ttl(Duration::from_secs(5))
             .with_run_index(store),
     ))));
-    let session = BindIdentity::new(dir.join("proj"), "runner", "fresh-reauth");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "fresh-reauth");
     let request = chatgpt_send(session.clone(), "run-chatgpt-reauth", "resume me");
 
     let first = registry.send(request.clone()).await.unwrap();
@@ -3938,7 +3881,7 @@ async fn queued_chatgpt_needs_reauth_pauses_instead_of_being_tombstoned() {
             .with_idle_ttl(Duration::from_secs(5))
             .with_run_index(store),
     ))));
-    let session = BindIdentity::new(dir.join("proj"), "runner", "queued-reauth");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "queued-reauth");
 
     let first = registry
         .send(chatgpt_send(session.clone(), "run-before-reauth", "first"))
@@ -4121,18 +4064,14 @@ async fn subscribe_streams_then_egress_close_tears_down_cleanly() {
     write_frame(&mut cwriter, &ack).await.unwrap();
 
     // bind + send a run (so there's a RunStarted + terminal to stream).
-    let session = BindIdentity::new(dir.join("proj"), "runner", "s1");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "s1");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 3,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -4151,11 +4090,7 @@ async fn subscribe_streams_then_egress_close_tears_down_cleanly() {
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -4452,7 +4387,7 @@ async fn attach_after_rewriting_the_wal(
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "s1");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "s1");
     for (route_channel, corr) in [(3, 1), (4, 2)] {
         let bind = ModuleControlRequest::RouteBind {
             route_channel,
@@ -4460,11 +4395,7 @@ async fn attach_after_rewriting_the_wal(
             target: RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(
-                session.project_root.clone(),
-                session.harness.clone(),
-                session.session.clone(),
-            ),
+            identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
@@ -4751,12 +4682,12 @@ async fn serve_ends_ok_when_the_daemon_resets_the_socket() {
 }
 
 #[tokio::test]
-async fn project_id_some_then_none_preserves_wal_address_and_lineage() {
+async fn stray_bind_project_members_do_not_change_send_address_or_attribution() {
     project_observation_wire(false).await;
 }
 
 #[tokio::test]
-async fn project_id_import_is_carried_into_run_started() {
+async fn stray_bind_project_members_do_not_change_import_address_or_attribution() {
     project_observation_wire(true).await;
 }
 
@@ -4819,36 +4750,33 @@ async fn project_observation_wire(import: bool) {
     )
     .unwrap();
     write_frame(&mut writer, &ack).await.unwrap();
-    let session = BindIdentity::new(dir.join("proj"), "runner", "observed");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "observed");
     let address = broca_core::session_addr(&session);
     let path = wal.wal_path(&session);
     let mut lineage_id = None;
     let mut previous_bytes = Vec::new();
     for (index, project_id) in [Some("pj-wire"), None].into_iter().enumerate() {
-        let mut identity =
-            SubcBindIdentity::new(session.project_root.clone(), "runner", "observed");
-        identity.project_id = project_id.map(str::to_owned);
-        write_req(
-            &mut writer,
-            0,
-            10,
-            serde_json::to_value(ModuleControlRequest::RouteBind {
-                route_channel: 7,
-                epoch: 1,
-                target: RouteTarget::ManagementSurface {
-                    module_id: "broca".into(),
-                },
-                identity,
-                principal: None,
-                consumer_capabilities: None,
-                admission_facts: None,
-                scope: None,
-                role_versions: None,
-                call_mode: None,
-            })
-            .unwrap(),
-        )
-        .await;
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 1,
+            target: RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new("runner", "observed"),
+            principal: None,
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        if let Some(project_id) = project_id {
+            bind["identity"]["project_root"] = serde_json::json!("/stray/legacy/folder");
+            bind["identity"]["project_id"] = serde_json::json!(project_id);
+        }
+        let _: ModuleControlRequest = serde_json::from_value(bind.clone()).unwrap();
+        write_req(&mut writer, 0, 10, bind).await;
         assert_eq!(read_one(&mut reader).await.header.ty, FrameType::Response);
         let request = if !import || index > 0 {
             serde_json::json!({"method":"session.send", "params": {
@@ -4921,7 +4849,7 @@ async fn project_observation_wire(import: bool) {
                 _ => None,
             })
             .collect();
-        assert_eq!(episodes, [Some("pj-wire"), None][..=index]);
+        assert_eq!(episodes, [None, None][..=index]);
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.starts_with(&previous_bytes));
         previous_bytes = bytes;
@@ -5040,7 +4968,6 @@ struct PrincipalRig {
     reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     serve: tokio::task::JoinHandle<Result<ServeEnd, broca_module_serve::serve::ServeIoError>>,
-    session: BindIdentity,
     wal_path: std::path::PathBuf,
     gate: Arc<Notify>,
     corr: u64,
@@ -5116,14 +5043,13 @@ impl PrincipalRig {
         )
         .unwrap();
         write_frame(&mut writer, &ack).await.unwrap();
-        let session = BindIdentity::new(dir.join("proj"), "runner", "bound");
+        let session = BindIdentity::new("broca-unscoped-v1", "runner", "bound");
         let wal_path = wal.wal_path(&session);
         Self {
             dir,
             reader,
             writer,
             serve,
-            session,
             wal_path,
             gate,
             corr: 1,
@@ -5149,11 +5075,7 @@ impl PrincipalRig {
                 target: RouteTarget::ManagementSurface {
                     module_id: "broca".into(),
                 },
-                identity: SubcBindIdentity::new(
-                    self.session.project_root.clone(),
-                    "runner",
-                    "bound",
-                ),
+                identity: SubcBindIdentity::new("runner", "bound"),
                 principal,
                 consumer_capabilities: None,
                 admission_facts: None,
@@ -5498,13 +5420,24 @@ impl PreparedWalRoute {
                     hold: None,
                 }),
             );
-            reg = Arc::new(test_registry(LineageRegistry::new_with_reader(
+            reg = Arc::new(LineageRegistry::new_with_reader(
                 Arc::new(opener),
                 reader,
                 None,
-            )));
+            ));
+            reg.set_session_address_inventory(Arc::new(
+                broca_store::SqliteStore::open(dir.join("store.db")).unwrap(),
+            ));
         }
         let session = BindIdentity::new(dir.join("proj"), "runner", "s1");
+        // The damaged/moved WAL fixtures represent known legacy identities, not new binds.
+        let inventory = broca_store::SqliteStore::open(dir.join("store.db")).unwrap();
+        broca_core::SessionRefIndex::record_session(
+            &inventory,
+            &broca_core::session_addr(&session),
+            &session,
+        )
+        .unwrap();
         {
             let mut file = wal.open(&session).expect("create the session WAL");
             if let Some(principal) = first_principal {
@@ -5627,11 +5560,7 @@ impl PreparedWalRoute {
             target: RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(
-                session.project_root.clone(),
-                session.harness.clone(),
-                session.session.clone(),
-            ),
+            identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
             principal,
             consumer_capabilities: None,
             admission_facts: None,
@@ -6052,14 +5981,14 @@ impl SendKeyRig {
         )
         .unwrap();
         write_frame(&mut writer, &ack).await.unwrap();
-        let session = BindIdentity::new(dir.join("proj"), "runner", "keyed");
+        let session = BindIdentity::new("broca-unscoped-v1", "runner", "keyed");
         let bind = ModuleControlRequest::RouteBind {
             route_channel: 7,
             epoch: 1,
             target: RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(session.project_root.clone(), "runner", "keyed"),
+            identity: SubcBindIdentity::new("runner", "keyed"),
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
@@ -6643,7 +6572,7 @@ async fn undecodable_control_request_errors_and_keeps_connection_alive() {
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(dir.join("proj"), "runner", "invalid-control-request"),
+        identity: SubcBindIdentity::new("runner", "invalid-control-request"),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -6733,18 +6662,14 @@ async fn session_send_invalid_on_restart_matches_golden_and_writes_nothing() {
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
 
-    let session = BindIdentity::new(dir.join("proj"), "runner", "restart-policy");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "restart-policy");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -7197,18 +7122,14 @@ async fn send_declared_tool_reply_is_validated_frozen_and_inherited_over_the_ser
     )
     .unwrap();
     write_frame(&mut cwriter, &ack).await.unwrap();
-    let session = BindIdentity::new(dir.join("proj"), "runner", "lead");
+    let session = BindIdentity::new("broca-unscoped-v1", "runner", "lead");
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
         epoch: 1,
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(
-            session.project_root.clone(),
-            session.harness.clone(),
-            session.session.clone(),
-        ),
+        identity: SubcBindIdentity::new(session.harness.clone(), session.session.clone()),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,

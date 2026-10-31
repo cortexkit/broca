@@ -1460,36 +1460,6 @@ impl SubcConnection {
         .await
     }
 
-    /// Probe an untrusted bind project claim independently of the daemon's scope stamp.
-    /// This opener is absent from release builds and confers no project authority.
-    #[cfg(debug_assertions)]
-    pub async fn route_open_tool_provider_with_bind_project_for_tests(
-        &self,
-        module_id: &str,
-        identity: &BindIdentity,
-        scope: Option<subc_protocol::scope::ScopeSelector>,
-        client_project_id: Option<&str>,
-        held: bool,
-    ) -> ConnResult<RouteHandle> {
-        let target = RouteTarget::ToolProvider {
-            module_id: module_id.into(),
-        };
-        let role_versions = Some(std::collections::BTreeMap::from([(
-            "tool-provider".into(),
-            "v1".into(),
-        )]));
-        let mut identity = to_subc_bind(identity, &target, role_versions.as_ref());
-        identity.project_id = client_project_id.map(str::to_owned);
-        let capabilities = held.then(|| {
-            vec![
-                cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
-                cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
-            ]
-        });
-        self.route_open_wire_target(target, identity, scope, role_versions, capabilities)
-            .await
-    }
-
     /// Open an unscoped module-level role using the same bind translation and retry machinery
     /// as step-transform hooks. The caller bounds the entire route-open future.
     pub(crate) async fn route_open_role_within(
@@ -4405,15 +4375,6 @@ fn declares_compaction_provider(
     role_versions.is_some_and(|roles| roles.contains_key(broca_core::compaction_provider::ROLE))
 }
 
-/// Storage resolution preserves an existing session's original transport folder.
-/// Keep this choice separate from storage addressing when adopting folderless binds.
-fn outgoing_project_root(
-    storage_identity: &BindIdentity,
-    _current_bind: &BindIdentity,
-) -> std::path::PathBuf {
-    storage_identity.project_root.clone()
-}
-
 fn to_subc_bind(
     identity: &BindIdentity,
     target: &RouteTarget,
@@ -4467,18 +4428,9 @@ fn to_subc_bind(
     // WAL name with nothing recording the move. Measured when this was chosen: 395 live
     // sessions would have been stranded by the caller-side revert.
     //
-    // `project_id` is None here BY CONSTRUCTION, not by default. subc's contract on the field
-    // is that a producer sends it on every bind of a session or on none, because alternating
-    // silently forks the consumer's lineage. Broca's own `BindIdentity` does not yet carry the
-    // inbound id, so nothing is persisted with the session to forward consistently -- and a
-    // value that is only sometimes available must be sent never. When the inbound id is
-    // carried and persisted (the session-identity re-key), this becomes "forward what was
-    // persisted with the session, else None"; it must not become "forward whatever arrived".
-    SubcBindIdentity::new(
-        outgoing_project_root(identity, identity),
-        harness,
-        identity.session.clone(),
-    )
+    // Project attribution travels only through the route's scope selector. A storage key
+    // may be a legacy folder or the unscoped namespace; neither belongs in a wire bind.
+    SubcBindIdentity::new(harness, identity.session.clone())
 }
 
 /// The far end of an in-process connection with no socket, for tests OUTSIDE this module that
@@ -4651,19 +4603,7 @@ impl InProcessModuleEnd {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn outgoing_folder_uses_the_resolved_storage_identity_not_a_new_route_claim() {
-        let stored = broca_protocol::BindIdentity::new("/original/checkout", "runner", "s");
-        let rebound = broca_protocol::BindIdentity::new("/later/checkout", "runner", "s");
-        assert_eq!(
-            super::outgoing_project_root(&stored, &rebound),
-            std::path::PathBuf::from("/original/checkout")
-        );
-        assert_eq!(
-            super::outgoing_project_root(&rebound, &rebound),
-            std::path::PathBuf::from("/later/checkout")
-        );
-    }
+    include!("connection/project_identity_tests.rs");
     include!("connection/route_close_followup_tests.rs");
     #[tokio::test]
     async fn a_registered_call_waiting_for_egress_cannot_use_a_closing_route() {
@@ -5266,7 +5206,7 @@ mod tests {
     }
 
     #[test]
-    fn route_open_retryable_codes_match_only_the_four_temporary_refusals() {
+    fn route_open_retryable_codes_include_inventory_unavailability_not_permanent_errors() {
         use subc_protocol::error_codes::{is_retryable_route_open, *};
 
         for code in [
@@ -5274,6 +5214,7 @@ mod tests {
             MODULE_WARMING,
             TARGET_UNAVAILABLE,
             MODULE_TIMEOUT,
+            "session_address_unavailable",
         ] {
             assert!(is_retryable_route_open(code), "{code} should retry");
         }
@@ -5293,6 +5234,7 @@ mod tests {
             "unknown_module is terminal"
         );
         assert!(!is_retryable_route_open(MODULE_REMOVED));
+        assert!(!is_retryable_route_open("session_address_ambiguous"));
         assert!(!is_retryable_route_open("some_future_code"));
 
         // AN UNDECODABLE BODY MUST BE TERMINAL, and this is the arm a future "robustness"
@@ -5392,10 +5334,8 @@ mod tests {
                 outbound.harness, TOOL_MODULE_HARNESS,
                 "a {caller_harness:?} bind must still attach as {TOOL_MODULE_HARNESS:?}"
             );
-            // The other two fields are NOT translated: they carry the caller's real identity and
-            // the tool module scopes its work by them.
+            // The session still carries the caller's identity; scope supplies project attribution.
             assert_eq!(outbound.session, identity.session);
-            assert_eq!(outbound.project_root, identity.project_root);
         }
     }
 
@@ -5484,7 +5424,6 @@ mod tests {
             let outbound = to_subc_bind(&identity, &target, Some(&compaction));
             assert_eq!(outbound.harness, caller_harness);
             assert_eq!(outbound.session, identity.session);
-            assert_eq!(outbound.project_root, identity.project_root);
 
             for other in [
                 Some(role("step-transform-provider")),

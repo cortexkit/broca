@@ -298,11 +298,7 @@ impl Rig {
             target: subc_protocol::RouteTarget::ToolProvider {
                 module_id: "broca".into(),
             },
-            identity: subc_protocol::BindIdentity::new(
-                self.root.join("project").canonicalize().unwrap(),
-                "runner",
-                "catalog",
-            ),
+            identity: subc_protocol::BindIdentity::new("runner", "catalog"),
             consumer_identity: Some(subc_control::ConsumerIdentity {
                 module_id: "basal".into(),
                 launch_nonce: nonce.trim().into(),

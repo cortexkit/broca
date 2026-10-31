@@ -165,11 +165,7 @@ impl FlowFrames {
             target: subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(
-                project.to_string_lossy().into_owned(),
-                "runner",
-                format!("flow-{channel}"),
-            ),
+            identity: SubcBindIdentity::new("runner", format!("flow-{channel}")),
             principal: Some(principal),
             scope,
             role_versions: None,
@@ -177,6 +173,8 @@ impl FlowFrames {
             admission_facts: None,
             call_mode: None,
         };
+        let mut request = serde_json::to_value(request).unwrap();
+        request["identity"]["project_root"] = serde_json::json!(project);
         self.frame(
             Frame::build(
                 FrameType::Request,

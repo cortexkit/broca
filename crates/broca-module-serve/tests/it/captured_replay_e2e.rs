@@ -1069,7 +1069,7 @@ async fn a_variant_send_renders_its_mapped_parameters_and_an_undefined_one_is_re
 }
 
 // Read the actual Error frame: SessionClient intentionally reduces errors to display strings.
-async fn refused_variant_frame(daemon: &Daemon, project_root: &Path) -> subc_protocol::ErrorBody {
+async fn refused_variant_frame(daemon: &Daemon, _project_root: &Path) -> subc_protocol::ErrorBody {
     use subc_control::{ClientControlRequest, ClientControlResponse};
     use subc_protocol::{Flags, Frame, FrameType, Priority, PROTOCOL_VERSION};
     use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
@@ -1082,11 +1082,7 @@ async fn refused_variant_frame(daemon: &Daemon, project_root: &Path) -> subc_pro
         .await
         .unwrap();
     let open = ClientControlRequest::RouteOpen {
-        identity: subc_protocol::BindIdentity::new(
-            project_root.to_path_buf(),
-            "variant-e2e",
-            "undefined-variant",
-        ),
+        identity: subc_protocol::BindIdentity::new("variant-e2e", "undefined-variant"),
         target: subc_protocol::RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },

@@ -250,7 +250,7 @@ fn bind_identity(args: &Args) -> Result<broca_protocol::BindIdentity, String> {
             return Err(format!("session {id:?} does not match --harness"));
         }
         if let Some(project) = &args.project_root {
-            let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.clone());
+            let project = local_storage_root(project);
             if project != bind.project_root {
                 return Err(format!("session {id:?} does not match --project-root; pass both --project-root and --harness for literal addressing"));
             }
@@ -261,6 +261,13 @@ fn bind_identity(args: &Args) -> Result<broca_protocol::BindIdentity, String> {
         return Ok(broca_protocol::BindIdentity::new(project, "broca", id));
     }
     Err("--project-root is required for this command".into())
+}
+
+fn local_storage_root(root: &std::path::Path) -> PathBuf {
+    if root.as_os_str() == std::ffi::OsStr::new(broca_protocol::session::UNSCOPED_SESSION_ROOT) {
+        return root.to_path_buf();
+    }
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
 fn cache_dump(args: CacheDumpArgs) -> Result<i32, String> {
@@ -792,37 +799,10 @@ async fn run(args: Args) -> Result<i32, String> {
     )
     .await
     .map_err(|e| format!("bind management surface '{}': {e}", args.module_id))?;
-    // PRINT THE WHOLE BIND TRIPLE, not just the session name.
-    //
-    // iceteaSA's issue #22: a client-side defect made --harness inert, so every command
-    // answered about a DIFFERENT session than the one named -- run.status Unknown,
-    // session.read 0 messages, status Idle. All three read as broca failing to report a
-    // cancelled run. What eventually gave it away was a 69-byte lineage file appearing on
-    // disk during a READ-ONLY check.
-    //
-    // The drop is fixed (efc40996). This line is the other half and is the one that
-    // generalises: the WAL name is FNV over project_root/harness/session, so any of the
-    // three differing silently addresses another session. Printing one component means a
-    // mismatch in the other two is invisible in the output and discoverable only by
-    // noticing a file appear.
-    //
-    // THE ROOT IS PRINTED AS THE DAEMON WILL KEY IT, not as it was typed, and that
-    // distinction cost me two probes within minutes of fixing the harness half.
-    //
-    // The daemon canonicalises `project_root`. On macOS /tmp is a symlink to /private/tmp,
-    // so a session bound as `/tmp/x` is keyed under `/private/tmp/x`. Reproducing the
-    // reporter's own diagnostic -- compute FNV over the triple, look for that file -- I used
-    // the typed path and got ABSENT for BOTH candidate harnesses. Two absences is not a
-    // wrong answer, it is an uninterpretable one: it reads as "neither identity was used",
-    // which is impossible, and there is nothing in it to say the root was the problem.
-    //
-    // So printing the typed string would have reproduced the very defect this line fixes,
-    // one component over. Canonicalised locally, which is not a promise that the daemon's
-    // canonicalisation agrees -- only the daemon knows that. When they differ the typed form
-    // is printed too, because a caller who typed a path and sees a different one needs to
-    // know it is the same path and not a silently redirected bind.
-    let keyed_root = std::fs::canonicalize(&session.project_root)
-        .unwrap_or_else(|_| session.project_root.clone());
+    // Show project_root/harness/session from local lookup or the caller's CLI flags.
+    // The root is not transmitted in the wire bind: the server's inventory decides the address.
+    // Canonicalize directory hints locally, but never interpret the namespace as a folder.
+    let keyed_root = local_storage_root(&session.project_root);
     let root_display = if keyed_root == session.project_root {
         keyed_root.display().to_string()
     } else {
@@ -2354,6 +2334,44 @@ fn emit_to(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn namespace_diagnostic_never_canonicalizes_a_cwd_directory() {
+        const CHILD: &str = "BROCA_NAMESPACE_DIAGNOSTIC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = broca_test_support::scratch_root()
+                .join(format!("namespace-diagnostic-{}", std::process::id()));
+            std::fs::create_dir_all(root.join("broca-unscoped-v1")).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("tests::namespace_diagnostic_never_canonicalizes_a_cwd_directory")
+                .arg("--exact")
+                .current_dir(&root)
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let namespace = std::path::Path::new("broca-unscoped-v1");
+        assert_eq!(
+            super::local_storage_root(namespace).as_os_str(),
+            namespace.as_os_str()
+        );
+        for spelling in ["./broca-unscoped-v1", "broca-unscoped-v1/"] {
+            let path = std::path::Path::new(spelling);
+            assert_eq!(
+                super::local_storage_root(path),
+                std::fs::canonicalize(path).unwrap()
+            );
+        }
+        let missing = std::path::Path::new("missing-directory");
+        assert_eq!(super::local_storage_root(missing), missing);
+    }
     #[test]
     fn cache_diagnose_accepts_task_ids_and_explicit_offline_binding() {
         use clap::Parser;

@@ -532,9 +532,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         let credential_ids =
             broca_module_serve::VaultCredentialIds::load_default_path().map_err(ServeIoError)?;
         let addressing = broca_module_serve::VaultAddressing::new(credential_ids);
-        // A process-global bind for the vault route. The vault ignores the bind identity
-        // (reads are authorized by this module's grant, not by bind), but subc's daemon canonicalizes
-        // and REJECTS a non-existent project_root — so use the state root, which exists.
+        // A process-global identity for broca's vault calls, not a conversation identity.
+        // Only harness/session travel in the wire bind; the local storage-root field is not sent.
         let vault_bind = broca_protocol::BindIdentity::new(
             state_root.to_string_lossy().to_string(),
             "broca",

@@ -48,7 +48,7 @@ pub(super) struct CompactionCall {
     /// The bind identity of the route that delivered this call, as the daemon bound it at this
     /// provider's ingress. It is recorded separately from the call's body so a test can compare
     /// what the route said about the session with what Setup said.
-    pub route_identity: Option<broca_protocol::BindIdentity>,
+    pub route_identity: Option<subc_protocol::BindIdentity>,
     /// The `harness` and `session` the Setup body reported.
     pub setup_harness: String,
     pub setup_session: String,
@@ -84,7 +84,7 @@ pub(super) struct Provider {
     pub shared: Arc<Shared>,
     /// Each route's bind identity, keyed by its channel and epoch, recorded when the daemon
     /// binds the route to this provider.
-    pub binds: Mutex<HashMap<(u16, u32), broca_protocol::BindIdentity>>,
+    pub binds: Mutex<HashMap<(u16, u32), subc_protocol::BindIdentity>>,
 }
 
 impl Session {
@@ -116,11 +116,7 @@ impl subc_client_rs::ModuleHandler for Provider {
         let identity = &request.identity;
         self.binds.lock().unwrap().insert(
             (request.handle.channel, request.handle.epoch),
-            broca_protocol::BindIdentity::new(
-                identity.project_root.clone(),
-                identity.harness.as_str(),
-                identity.session.as_str(),
-            ),
+            identity.clone(),
         );
         subc_client_rs::BindDecision::accept()
     }
@@ -1012,7 +1008,8 @@ impl BrocaSubject {
                                     cortexkit_role_llm_runner_conformance::CompactionRouteIdentity {
                                         harness: bound.harness.clone(),
                                         session: bound.session.clone(),
-                                        project_root: bound.project_root.display().to_string(),
+                                        // Protocol 0.34 transmits no root; the kit's observation still has the field.
+                                        project_root: String::new(),
                                     }
                                 },
                             ),
@@ -1625,7 +1622,12 @@ async fn a_compaction_provider_reads_the_session_back_over_the_identity_its_rout
             )
             .await
             .unwrap();
-        let read_back = read_over(&subject, &reader, &bound).await;
+        let callback_identity = broca_protocol::BindIdentity::new(
+            broca_protocol::session::UNSCOPED_SESSION_ROOT,
+            &bound.harness,
+            &bound.session,
+        );
+        let read_back = read_over(&subject, &reader, &callback_identity).await;
         assert!(
             read_back["lineage_id"]
                 .as_str()
@@ -1641,13 +1643,15 @@ async fn a_compaction_provider_reads_the_session_back_over_the_identity_its_rout
             "a read-back over the compaction route's bind must see the session's own transcript"
         );
         assert_eq!(
-            bound,
-            subject.bind_identity(session),
+            (&bound.harness, &bound.session),
+            (
+                &subject.bind_identity(session).harness,
+                &subject.bind_identity(session).session
+            ),
             "the compaction route must be bound with the session's own identity"
         );
-        // The identity a provider uses for calls about the conversation is Setup's harness
-        // and session with the route's project root. The route names that same session and
-        // harness, so the session shows one identity on the wire.
+        // A provider calls back with Setup's harness/session; Broca's inventory resolves
+        // the storage root without requiring a project on the callback route.
         assert_eq!(
             (bound.harness.as_str(), bound.session.as_str()),
             (setup_harness.as_str(), setup_session.as_str()),

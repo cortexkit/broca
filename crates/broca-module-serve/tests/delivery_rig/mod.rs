@@ -884,6 +884,13 @@ impl Rig {
         .unwrap();
         write_frame(&mut writer, &ack).await.unwrap();
         let session = BindIdentity::new(dir.join("proj"), harness, "delivery");
+        // Delivery fixtures use an already-recorded directory-root session address; record it explicitly.
+        broca_core::SessionRefIndex::record_session(
+            store.as_ref(),
+            &broca_core::session_addr(&session),
+            &session,
+        )
+        .unwrap();
         let wal_path = wal.wal_path(&session);
         let mut rig = Self {
             store,
@@ -1177,17 +1184,24 @@ impl Rig {
     /// Bind `channel` to another session of the rig's project, `session_id`, and return that
     /// session's identity.
     pub async fn bind_session(&mut self, channel: u16, session_id: &str) -> BindIdentity {
+        let session = BindIdentity::new(
+            &self.session.project_root,
+            &self.session.harness,
+            session_id,
+        );
+        broca_core::SessionRefIndex::record_session(
+            self.store.as_ref(),
+            &broca_core::session_addr(&session),
+            &session,
+        )
+        .unwrap();
         let bind = ModuleControlRequest::RouteBind {
             route_channel: channel,
             epoch: 1,
             target: RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(
-                self.session.project_root.clone(),
-                self.session.harness.clone(),
-                session_id,
-            ),
+            identity: SubcBindIdentity::new(self.session.harness.clone(), session_id),
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
@@ -1197,11 +1211,7 @@ impl Rig {
         };
         let reply = self.request(0, serde_json::to_value(bind).unwrap()).await;
         assert_eq!(reply.header.ty, FrameType::Response);
-        BindIdentity::new(
-            self.session.project_root.clone(),
-            self.session.harness.clone(),
-            session_id,
-        )
+        session
     }
 
     /// Bind `channel` to the rig's session with the daemon stamping `principal` on it.
@@ -1221,11 +1231,7 @@ impl Rig {
             target: RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(
-                self.session.project_root.clone(),
-                self.session.harness.clone(),
-                "delivery",
-            ),
+            identity: SubcBindIdentity::new(self.session.harness.clone(), "delivery"),
             principal,
             consumer_capabilities: None,
             admission_facts: None,

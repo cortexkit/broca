@@ -102,7 +102,7 @@ broca-subc = { path = "../broca-subc", features = ["test-clock"] }
 cortexkit-llm-tools = { workspace = true, features = ["test-vectors"] }
 broca-catalog = { path = "../broca-catalog", features = ["test-support"] }
 futures.workspace = true
-cortexkit-bus-testkit = "=0.1.3"
+cortexkit-bus-testkit = "=0.3.0"
 nkeys = "0.4.5"
 cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }
 broca-owner-only = { workspace = true, features = ["test-support"] }
