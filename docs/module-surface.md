@@ -352,6 +352,24 @@ request increments after authorization and migration checks, even when its param
 later return an error. Authorization and migration refusals are not counted. The existing
 `session_reads` and `actor_opens` counters remain available with their existing meanings.
 
+`health.check.metrics.session_readers` is a process-wide, in-memory census of authorized
+read attempts, separate from the legacy numeric `metrics.session_reads`. Its `entries` array
+contains `{principal, op, owner, count, last_ms}` for `session.read`, `session.history`,
+`session.head`, `session.subscribe`, `run.status`, `run.result`, `run.tool_calls`, `send.status`
+and `session.media_read`. Authorization and migration refusals are excluded; later parameter
+or handler errors still count. Subscriptions count once when opened, not once per frame.
+The principal is rendered from the daemon's route stamp (`reserved:<module_id>`, `direct`,
+`unverified`, or the existing principal type's other rendering); a bind from an older daemon
+with no stamp is named `unattested`. Request parameters cannot change that attribution.
+`owner` is true for the recorded first sender or scope owner, false for other callers, and
+null when ordinary requests have not yet loaded ownership into the cache. Unknown reads
+retain their own keys rather than being reclassified later. Telemetry never reads storage
+or opens an actor to discover ownership. The key is `(principal, op, owner)` with at most 256
+distinct keys; attempts introducing further keys increment `overflow`, while existing keys
+continue counting. Counts, `overflow` and the epoch-millisecond `last_ms` values reset on
+restart; `since_ms` is the daemon's process-start coverage timestamp. No census is written
+to a log or store.
+
 To see one debug record per served operation, add a `CK_LOG` value to broca's module environment
 in `subc.jsonc`:
 

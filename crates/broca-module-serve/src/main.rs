@@ -43,6 +43,7 @@ const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module::diagnostics::initialize();
+    broca_module_serve::serve::initialize_session_readers();
     #[cfg(feature = "heap-profile")]
     broca_heap_profile::start();
     run_runtime(serve_main())?

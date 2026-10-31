@@ -72,6 +72,11 @@ const MAX_INFLIGHT_ROUTE_REQUESTS: usize = 64;
 const DISPATCH_LANE_SWEEP_MIN: usize = 64;
 const DROP_LOG_KEY_LIMIT: usize = 256;
 
+/// Start reader-census coverage at daemon startup, before accepting any routes.
+pub fn initialize_session_readers() {
+    crate::session_readers::initialize();
+}
+
 // Serve-side drops are inbound daemon frames rejected by broca's route-binding guard below.
 // They are distinct from broca_subc::FRAME_DROPS, which counts frames dropped on the
 // client-side outbound routes.
@@ -532,6 +537,8 @@ struct BindObservation {
     /// The daemon-stamped principal, converted without change. `None` when the bind carried
     /// none, which is what a daemon that predates principal stamping sends.
     principal: Option<broca_protocol::BindPrincipal>,
+    /// Render once per bind so repeated status polls never allocate a census key.
+    reader_principal: Option<Arc<str>>,
     /// The daemon's scope stamp on the bind, or why there is none. Every send over the route
     /// carries it to admission, which decides the owner check and the scope to freeze.
     scope: broca_protocol::SendScope,
@@ -1080,6 +1087,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
     H: ServeHandler + 'static,
 {
+    initialize_session_readers();
     let stall_state = stall::connection_state();
     let (tx, rx) = broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, stall_state.egress.clone());
     let mut writer = tokio::spawn(drain_writer(write_half, rx));
@@ -1843,6 +1851,7 @@ async fn handle_control_request(
             // records who started it. A session may later adopt a scope only if the scope's
             // owner is the principal on every earlier episode, and an episode recorded without
             // one can never satisfy that.
+            let principal_observation = principal.as_ref().map(to_bind_principal);
             let bind = BindObservation {
                 management: matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. }),
                 agent_data: matches!(&target, subc_protocol::RouteTarget::InternalService { service_id, .. }
@@ -1856,7 +1865,10 @@ async fn handle_control_request(
                     RouteRole::LlmRunner
                 },
                 project_id: identity.project_id.clone(),
-                principal: principal.as_ref().map(to_bind_principal),
+                reader_principal: Some(crate::session_readers::principal_label(
+                    principal_observation.as_ref(),
+                )),
+                principal: principal_observation,
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
                 stamped_project: scope
                     .as_ref()
@@ -2188,6 +2200,7 @@ async fn handle_control_request(
             // this process serves no model-tool route.
             "llm_tools_consent": routes.llm_tools.as_ref().map(|tools| tools.consent_health()),
                 });
+            metrics["session_readers"] = crate::session_readers::health();
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
                 // status Ok. Fusiform reachability is deliberately absent because health never
@@ -2658,6 +2671,12 @@ where
             }
         }
         count_management_operation(method);
+        if let Some(op) = crate::session_readers::operation(method) {
+            crate::session_readers::record(
+                bind.reader_principal.as_ref(), op,
+                handler.cached_session_owner(&session, bind.principal.as_ref()),
+            );
+        }
         if describe {
             trace_describe("task_started", channel, epoch, corr);
         }
@@ -8336,6 +8355,7 @@ mod tests {
                     role: RouteRole::LlmRunner,
                     project_id: None,
                     principal: None,
+                    reader_principal: None,
                     scope: broca_protocol::SendScope::Unstamped,
                     stamped_project: None,
                     consumer_format: Default::default(),

@@ -49,6 +49,7 @@ mod session_address_health;
 pub mod session_class;
 mod session_inventory;
 pub mod session_lookup;
+mod session_readers;
 pub mod stall;
 pub mod state_root;
 pub mod state_root_lock;

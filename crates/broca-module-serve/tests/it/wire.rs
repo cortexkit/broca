@@ -2172,6 +2172,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         "stream_chunks",
         "display_index_resets",
         "session_reads",
+        "session_readers",
         "actor_opens",
         "management_ops",
         // The liveness signal for the scheduled WAL archive. Present even when the knob
@@ -2274,6 +2275,21 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
          daemon and assert that below, because an unasserted metric is one the fleet reads \
          during an incident and nothing defends."
     );
+    let readers = metrics["session_readers"]
+        .as_object()
+        .expect("reader census is present");
+    assert!(readers["since_ms"].as_i64().is_some_and(|ms| ms > 0));
+    assert!(readers["overflow"].is_u64());
+    for entry in readers["entries"]
+        .as_array()
+        .expect("reader census entries")
+    {
+        assert!(entry["count"].is_u64());
+        assert!(entry["last_ms"].is_i64());
+        assert!(entry["principal"].is_string());
+        assert!(entry["op"].is_string());
+        assert!(entry["owner"].is_boolean() || entry["owner"].is_null());
+    }
     // This in-process adapter has no daemon bootstrap or watchdog file. The real
     // binary enables the witness during boot; a library-only connection says so.
     assert_eq!(
