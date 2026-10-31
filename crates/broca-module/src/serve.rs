@@ -4872,6 +4872,8 @@ mod offset_head_tests {
                     cut: "m1".into(),
                 }),
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         });
         assert!(head_tail_needs_index_up(&with_setup));

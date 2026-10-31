@@ -7415,6 +7415,8 @@ mod offset_page_tests {
                     cut: "m1".into(),
                 }),
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         });
         assert!(setup_in_tail_needs_index_up(&with_setup));

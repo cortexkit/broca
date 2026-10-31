@@ -37,6 +37,19 @@ pub const RIDE_WAIT_MAX_MS: u64 = 120_000;
 #[derive(Debug, Clone)]
 pub struct CompactionUnavailable;
 
+/// The host's maximum hold from each model step's start for Setup's required view.
+pub const VIEW_DUE_MAX_MS: u64 = 30_000;
+
+pub(crate) struct DueViewAt<'a> {
+    pub session_ref: &'a str,
+    pub lineage_id: &'a str,
+    pub prompt: &'a [Message],
+    pub stored: super::StoredTranscript<'a>,
+    pub prefix_bound: bool,
+    pub run_start: bool,
+    pub step_start_ms: u64,
+}
+
 async fn cancelled(control: &crate::RunControl) {
     async fn token(token: Option<&tokio_util::sync::CancellationToken>) {
         match token {
@@ -339,6 +352,11 @@ pub async fn apply_idle_view(
     window: Option<u64>,
     render_size: impl Fn(&CompactionState) -> Result<usize, String>,
 ) -> Result<bool, crate::RunError> {
+    // A notice cannot stand in for Setup's immutable due-view claim check. The next
+    // model step fetches that exact version against Setup's digest instead.
+    if state.view_due.is_some() {
+        return Ok(false);
+    }
     let lineage = writer
         .lineage_id()
         .ok_or_else(|| crate::RunError::Wal("compaction requires a lineage".into()))?
@@ -884,7 +902,7 @@ impl Runtime<'_> {
         };
         request.now = self.now();
         let request_id = request.request_id.clone();
-        // Kept to check the answer against: `ride_wait_ms` must lie within this request's cap.
+        // Keep the actual declarations to validate the answer against what was requested.
         let asked = request.clone();
         let answer = tokio::select! {
             answer = plane.setup(self.provider, self.bind, request) => answer.ok(),
@@ -893,11 +911,22 @@ impl Runtime<'_> {
         if answer.request_id() != request_id {
             return Err(unavailable());
         }
-        // A `ready` answer whose `ride_wait_ms` is 0, above the cap broca sent, or present
-        // without one is a failed Setup (compaction-provider 0.5.1 §4, `SetupAnswer::check_for`),
-        // never clamped. A refusal passes this check and is reported with its own code below.
-        if answer.is_ready() && answer.check_for(&asked).is_err() {
-            return Err(unavailable());
+        // The shared checker names an invalid ride wait or due-view claim check; neither
+        // may be clamped or ignored. A refusal retains its provider code below.
+        if let Err(reason) = answer.check_for(&asked) {
+            if reason != crate::compaction_provider::setup::VIEW_DUE {
+                return Err(unavailable());
+            }
+            return Err(Box::new(error(
+                Some(Box::new(ProviderRefusal {
+                    provider: self.provider.into(),
+                    reason: Some(reason.into()),
+                    provider_detail_code: None,
+                })),
+                reason,
+                Some("compaction_unavailable".into()),
+                false,
+            )));
         }
         let ride_wait_ms = answer.ride_wait_ms();
         let (initial, ceiling, checkpoint) = match answer {
@@ -960,6 +989,8 @@ impl Runtime<'_> {
             // Frozen with the session like `ceiling`, so every later ride, a resumed run's
             // included, waits as long as this answer said.
             ride_wait_ms,
+            view_features: None,
+            view_due: None,
         };
         let mut state = CompactionState::default();
         self.commit(&mut state, record)
@@ -988,6 +1019,60 @@ impl Runtime<'_> {
             // The answer decodes strictly on `answer`, so no other kind reaches here.
             #[allow(unreachable_patterns)]
             Some(_) | None => Fetch::Unavailable,
+        }
+    }
+
+    /// Dispose Setup's required view before ordinary rides or announcements can change it.
+    /// Only a durable application clears the claim check; a later send retries any failure.
+    pub(crate) async fn apply_due_view(
+        &self,
+        state: &mut CompactionState,
+        at: DueViewAt<'_>,
+    ) -> Result<bool, crate::RunError> {
+        let DueViewAt {
+            session_ref,
+            lineage_id,
+            prompt,
+            stored,
+            prefix_bound,
+            run_start,
+            step_start_ms,
+        } = at;
+        let Some(due) = state.view_due.clone() else {
+            return Ok(true);
+        };
+        let deadline = step_start_ms.saturating_add(VIEW_DUE_MAX_MS);
+        if self.now() >= deadline {
+            return Ok(false);
+        }
+        let ready = ViewReady::new(session_ref, due.version, 0, due.digest);
+        let attempt = async {
+            let Fetch::View(fetched) = self.view_get(&ready).await else {
+                return Ok(false);
+            };
+            let decision = view::decide_stored_at(
+                &fetched,
+                &ready,
+                state,
+                lineage_id,
+                prompt,
+                stored,
+                prefix_bound,
+                run_start,
+            );
+            if let view::Decision::Apply(choice) = decision {
+                self.apply_view(state, &fetched, choice).await?;
+                Ok(state.view_due.is_none() && self.now() <= deadline)
+            } else {
+                if let Some(event) = decision.event(fetched.view_version) {
+                    state.unannounced.push(event.token());
+                }
+                Ok(false)
+            }
+        };
+        tokio::select! {
+            result = attempt => result,
+            _ = clock_deadline(self.control.clock.as_ref(), deadline) => Ok(false),
         }
     }
 
@@ -1326,6 +1411,9 @@ impl Runtime<'_> {
         prefix_bound: bool,
         run_start: bool,
     ) -> Result<(view::Decision, Option<Event>), crate::RunError> {
+        if state.view_due.is_some() {
+            return Ok((view::Decision::Stale, None));
+        }
         // The newest version wins. One announced (and so durably receipted) while this one was
         // fetched, or one the provider answered in its place, supersedes it. The check runs just
         // before the decision, with no wait between them; a version announced later, while the

@@ -6005,6 +6005,8 @@ mod offset_tail_tests {
                     cut: "m1".into(),
                 }),
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         }
     }
@@ -6323,6 +6325,8 @@ mod offset_tail_tests {
                 ceiling: None,
                 tag_checkpoint: None,
                 ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
             },
         };
         assert!(!tail_contains_compaction_setup(&[step_answer]));

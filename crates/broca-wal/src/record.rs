@@ -1586,6 +1586,14 @@ pub enum WalRecord {
         /// reader that dropped it would give the session's rides its own short deadline.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ride_wait_ms: Option<u64>,
+        /// Setup's declared view features. Absent on older lineages, whose edited bytes
+        /// remain final. Requires `compaction-view-negotiation/v1` when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_features: Option<Vec<String>>,
+        /// A published view that must apply before any model request in this lineage.
+        /// Requires `compaction-view-negotiation/v1` when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_due: Option<SetupViewDue>,
     },
     /// Every other step outcome and the cursor it moves, in one durable frame. A wait
     /// answer is itself the wait entry, with the reason and bound in the same record.
@@ -2185,6 +2193,20 @@ impl WalRecord {
             }
         ) {
             with_feature(base, crate::framing::COMPACTION_RIDE_WAIT_FEATURE)
+        } else {
+            base
+        };
+        let base = if matches!(
+            self,
+            WalRecord::CompactionMessage {
+                view_features: Some(_),
+                ..
+            } | WalRecord::CompactionMessage {
+                view_due: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::COMPACTION_VIEW_NEGOTIATION_FEATURE)
         } else {
             base
         };
@@ -3616,6 +3638,13 @@ pub struct ComputedTagRules {
 pub struct SetupTagCheckpoint {
     pub tag_checkpoint: u64,
     pub cut: String,
+}
+
+/// Setup's immutable claim check for a view required before the first model request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupViewDue {
+    pub version: u64,
+    pub digest: String,
 }
 
 /// The credential a run resolved at start, frozen for resume. A struct (not a bare string)

@@ -1258,3 +1258,34 @@ fn tool_reply_run_started_matches_golden() {
         )
     );
 }
+
+#[test]
+fn setup_view_negotiation_is_optional_byte_stable_and_must_understand() {
+    let legacy = r#"{"type":"compaction_message","provider":"mc","kind":"setup","compaction_id":"c","version":1,"range":{"from":0,"to":0},"replacement":[],"sha256":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"}"#;
+    let old: WalRecord = serde_json::from_str(legacy).unwrap();
+    assert_eq!(serde_json::to_string(&old).unwrap(), legacy);
+    assert!(!old
+        .required_features()
+        .contains(&crate::framing::COMPACTION_VIEW_NEGOTIATION_FEATURE));
+    for member in [
+        r#", "view_features":["truncate","tag_bytes_edits"]"#.replace(", ", ","),
+        format!(
+            r#", "view_due":{{"version":7,"digest":"{}"}}"#,
+            "a".repeat(64)
+        )
+        .replace(", ", ","),
+    ] {
+        let with = format!("{}{}{}", &legacy[..legacy.len() - 1], member, "}");
+        let record: WalRecord = serde_json::from_str(&with).unwrap();
+        assert_eq!(serde_json::to_string(&record).unwrap(), with);
+        assert!(record
+            .required_features()
+            .contains(&crate::framing::COMPACTION_VIEW_NEGOTIATION_FEATURE));
+        let frame = crate::framing::encode(1, 1, &record).unwrap();
+        assert_eq!(frame[4], crate::framing::GATED_FRAMING_VERSION);
+        assert!(matches!(
+            crate::framing::decode_next(&frame),
+            crate::framing::DecodeStep::Record { .. }
+        ));
+    }
+}

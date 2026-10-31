@@ -110,6 +110,22 @@ fn snapshot(
         decode(&bytes, boundary.frame_end)?
     };
     let projection = stored.hydrate(&read, &tail, safe_head)?;
+    // When a compaction Setup record requires a view, its initial replacement
+    // range cannot discard original rows while that view is pending.
+    let mut compaction = projection
+        .admission_checkpoint
+        .compaction
+        .clone()
+        .unwrap_or(broca_core::compaction::CompactionCheckpoint::None);
+    for frame in &tail {
+        compaction.fold(&frame.framed.record);
+    }
+    if compaction
+        .state()
+        .is_some_and(|state| state.view_due.is_some())
+    {
+        return Err(bad("offset resume negotiated view is pending"));
+    }
     let mut ranges: Vec<_> = std::iter::once(0..projection.prefix_len).collect();
     let mut window = None;
     if let Some(compaction) = projection
@@ -610,6 +626,8 @@ mod tests {
             ceiling: None,
             tag_checkpoint: None,
             ride_wait_ms: None,
+            view_features: None,
+            view_due: None,
         }
     }
 
@@ -1369,5 +1387,168 @@ mod tests {
                 }
             );
         }
+    }
+
+    fn negotiated_setup(fixture: &Fixture) -> (WalRecord, WalRecord) {
+        use broca_core::compaction_provider::view::{CompactionView, ViewRange};
+        let replacement = serde_json::to_string(&vec![text(Role::User, "published head")]).unwrap();
+        let applied = view_record(
+            fixture,
+            7,
+            vec![ViewRange::keep(0, 2), ViewRange::replace(2, 4, replacement)],
+            3,
+        );
+        let WalRecord::CompactionViewApplied { view, .. } = &applied else {
+            unreachable!()
+        };
+        let view: CompactionView = serde_json::from_str(view.as_json_text()).unwrap();
+        let mut setup = setup(4);
+        if let WalRecord::CompactionMessage {
+            view_features,
+            view_due,
+            ..
+        } = &mut setup
+        {
+            *view_features = Some(vec!["truncate".into(), "tag_bytes_edits".into()]);
+            *view_due = Some(broca_wal::SetupViewDue {
+                version: view.view_version,
+                digest: view.digest,
+            });
+        }
+        (setup, applied)
+    }
+
+    #[test]
+    fn negotiated_setup_pending_view_with_nonempty_initial_requires_named_full_replay() {
+        for stored in [true, false] {
+            let mut fixture = Fixture::new();
+            let records = corpus(false);
+            let turn = records.len() - 2;
+            if stored {
+                fixture.append(&records[..turn], false);
+                let (setup, _) = negotiated_setup(&fixture);
+                fixture.append(&[setup, records[turn].clone()], true);
+            } else {
+                fixture.append(&records[..=turn], true);
+                let (setup, _) = negotiated_setup(&fixture);
+                fixture.append(&[setup], false);
+            }
+            let full = full(&fixture);
+            let state = full.compaction.state().unwrap();
+            assert!(state.view_due.is_some() && state.view.is_none());
+            let initial = state.applied.as_ref().unwrap().range;
+            assert!(initial.from < initial.to);
+            assert_eq!(
+                full.prompt.len(),
+                4,
+                "pending Setup must retain the raw transcript"
+            );
+            assert!(full.prompt[1].ordinal < Some(initial.to));
+            assert!(
+                broca_core::compaction::model_options(
+                    &CallOptions::new(full.prompt.clone()),
+                    state
+                )
+                .is_err(),
+                "pending promises may not render the initial replacement"
+            );
+            let publication = fixture.wal.durable_publication().unwrap();
+            let reader = fixture
+                .db
+                .resume_reader(fixture.bind.clone(), publication.clone());
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let selected = counter
+                .operation("negotiated pending resume")
+                .run(|| reader.snapshot(publication.sequence()));
+            let fallback = match selected {
+                Err(fallback) => fallback,
+                Ok(snapshot) => panic!(
+                    "pending view admitted resident ordinals {:?}",
+                    snapshot
+                        .prefix
+                        .iter()
+                        .map(|m| m.ordinal)
+                        .collect::<Vec<_>>()
+                ),
+            };
+            assert_eq!(fallback.reason, "offset resume negotiated view is pending");
+            assert_eq!(
+                counter.snapshot()[0].seed_fallbacks,
+                vec!["offset resume negotiated view is pending"]
+            );
+            assert!(counter.snapshot()[0]
+                .reads
+                .iter()
+                .all(|r| r.class != broca_wal::access_counter::ReadClass::Origin));
+        }
+    }
+
+    #[test]
+    fn negotiated_setup_applied_due_view_preserves_sparse_request_bytes_at_every_cut() {
+        let mut fixture = Fixture::new();
+        let records = corpus(false);
+        let turn = records.len() - 2;
+        fixture.append(&records[..turn], false);
+        let (setup, applied) = negotiated_setup(&fixture);
+        fixture.append(&[setup, records[turn].clone()], true);
+        let mut opened = records[0].clone();
+        if let WalRecord::RunStarted { run_id, input, .. } = &mut opened {
+            run_id.0.push_str("-after-view");
+            *input = vec![text(Role::User, "after view")].into();
+        }
+        let mut terminal = records.last().unwrap().clone();
+        if let WalRecord::RunFinished { reason, .. } = &mut terminal {
+            *reason = broca_protocol::caller::RunFinishReason::Completed;
+        }
+        fixture.append(
+            &[records.last().unwrap().clone(), applied, opened, terminal],
+            true,
+        );
+        let root = fixture._scratch.0.clone();
+        drop(fixture.db);
+        fixture.db = Arc::new(OverhaulDb::open(&root).unwrap());
+        let mut next = records.clone();
+        if let WalRecord::RunStarted { run_id, input, .. } = &mut next[0] {
+            run_id.0.push_str("-negotiated");
+            *input = vec![text(Role::User, "next")].into();
+        }
+        let tail = next;
+        for cut in 0..=tail.len() {
+            if cut > 0 {
+                fixture.append(&tail[cut - 1..cut], false);
+            }
+            let publication = fixture.wal.durable_publication().unwrap();
+            let reader = fixture
+                .db
+                .resume_reader(fixture.bind.clone(), publication.clone());
+            let snapshot = reader.snapshot(publication.sequence()).unwrap();
+            assert!(snapshot.window.is_some());
+            assert_eq!(
+                snapshot
+                    .prefix
+                    .iter()
+                    .map(|m| m.ordinal)
+                    .collect::<Vec<_>>(),
+                vec![Some(0), Some(1), Some(4)]
+            );
+            let loaded = broca_core::resume::reconstruct_from_offsets(
+                &|off, len| reader.read_at(off, len),
+                snapshot,
+                publication.sequence(),
+            )
+            .unwrap();
+            let expected = full(&fixture);
+            assert!(expected.compaction.state().unwrap().view_due.is_none());
+            assert_eq!(
+                request(&loaded.prior, true, false),
+                request(&expected, true, true),
+                "negotiated cut {cut}"
+            );
+            let bytes = String::from_utf8(request(&loaded.prior, true, false)).unwrap();
+            assert!(bytes.contains("question") && bytes.contains("published head"));
+        }
+        fixture.publish();
+        let loaded = fixture.load();
+        assert!((loaded.prior.prompt.len() as u64) < loaded.prior.extent);
     }
 }
