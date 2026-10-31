@@ -10,6 +10,43 @@ use super::*;
 
 const PROVIDER: &str = "scoped-compaction";
 
+fn compaction_manifest() -> subc_protocol::manifest::ModuleManifest {
+    use subc_protocol::manifest::{
+        CapabilityDeclarations, Concurrency, ModuleManifest, ProviderRole,
+    };
+
+    ModuleManifest::builder(PROVIDER, env!("CARGO_PKG_VERSION"))
+        .provides(vec![ProviderRole::ToolProvider {
+            tools: vec![],
+            identity_scope: vec![],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: false,
+            sub_supervises: false,
+        }])
+        // The daemon omits scope.workdir and scope.project_id unless the recipient opts in.
+        .capabilities(Some(CapabilityDeclarations {
+            provides: vec![subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_owned()],
+            requires: vec![],
+            must_never_reach: vec![],
+        }))
+        .build()
+}
+
+#[test]
+fn compaction_standin_opts_into_scope_workdir_stamp() {
+    let manifest = compaction_manifest();
+    let capabilities = manifest
+        .capabilities
+        .expect("the stand-in declares its capabilities");
+    assert!(
+        capabilities
+            .provides
+            .iter()
+            .any(|cap| cap == "scope-workdir/v1"),
+        "the daemon strips scope.workdir without the recipient's scope-workdir/v1 opt-in"
+    );
+}
+
 fn compaction_plan() -> Value {
     let composition = json!({"providers":[{"provider":PROVIDER,"tools":[]}],
         "compaction":{"provider":PROVIDER}, "step_transform_items":[]});
@@ -91,8 +128,6 @@ impl ModuleHandler for Compactor {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scoped_worker_send_stamps_compaction_setup_with_scope_workdir() {
-    use subc_protocol::manifest::{Concurrency, ModuleManifest, ProviderRole};
-
     let Some(rig) = Rig::start_with_compaction_writer().await else {
         return;
     };
@@ -110,15 +145,7 @@ async fn scoped_worker_send_stamps_compaction_setup_with_scope_workdir() {
     let seen = Arc::new(Seen::default());
     let (_, serve) = subc_client_rs::serve_with_handle(
         &rig.connection_file,
-        ModuleManifest::builder(PROVIDER, env!("CARGO_PKG_VERSION"))
-            .provides(vec![ProviderRole::ToolProvider {
-                tools: vec![],
-                identity_scope: vec![],
-                concurrency: Concurrency::ModuleManaged,
-                emits_push: false,
-                sub_supervises: false,
-            }])
-            .build(),
+        compaction_manifest(),
         Compactor(seen.clone()),
     )
     .await

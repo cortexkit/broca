@@ -2223,10 +2223,12 @@ async fn real_unscoped_session_uses_only_attested_first_sender() {
         .await;
     let direct = SubcConnection::connect(&rig.connection_file).await.unwrap();
     let session = rig.session("unscoped-owner-cleanup");
-    let sending = owner
-        .route_open_management("broca", &session)
-        .await
-        .unwrap();
+    let sending = broca_test_support::wait_for(
+        "live broca management route for unscoped owner",
+        project_identity_open(&owner, &session, false),
+        || broca_test_support::rig_process_logs(&rig.dir, "daemon"),
+    )
+    .await;
     let started = send(&owner, &sending, "first").await.unwrap();
     let run_id = started["result"]["run_id"].as_str().unwrap();
     model.wait_request().await;
