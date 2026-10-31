@@ -1193,7 +1193,6 @@ struct BrocaSubject {
     backup_classes: Option<Vec<String>>,
     bus_events_enabled: bool,
     process_kills_disabled: bool,
-    media_enabled: bool,
     reserved_reader: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
@@ -1217,8 +1216,6 @@ impl BrocaSubject {
             backup_classes: None,
             bus_events_enabled: true,
             process_kills_disabled: false,
-            media_enabled: std::env::var_os("BROCA_CONFORMANCE_MEDIA").is_some()
-                || cfg!(feature = "test-attachments"),
             reserved_reader: false,
             #[cfg(feature = "test-clock")]
             bus: None,
@@ -2325,9 +2322,7 @@ impl LlmRunnerSubject for BrocaSubject {
         if broca_module_serve::RETENTION_WRITER_ENABLED {
             capabilities.extend([Capability::Retention, Capability::RetentionClock]);
         }
-        if self.media_enabled {
-            capabilities.insert(Capability::Attachments);
-        }
+        capabilities.insert(Capability::Attachments);
         capabilities
     }
 
@@ -2443,7 +2438,7 @@ impl LlmRunnerSubject for BrocaSubject {
             .unwrap()
             .get(session)
             .copied()
-            .or_else(|| (self.media_enabled && session.contains("attachments")).then_some(true))
+            .or_else(|| session.contains("attachments").then_some(true))
         {
             let mut fields =
                 json!({"model":{"provider":"xai","model":format!("conformance-media-{accepts}")}});
@@ -3028,13 +3023,6 @@ impl LlmRunnerSubject for BrocaSubject {
     ) -> Option<Value> {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use cortexkit_role_llm_runner::tags::ToolResultBlock;
-        if !self.media_enabled
-            && blocks
-                .iter()
-                .any(|block| matches!(block, ToolResultBlock::Image | ToolResultBlock::Media))
-        {
-            return None;
-        }
         if blocks.is_empty() {
             return Some(json!({OWN_STRUCTURED: {"marker": marker}}));
         }
@@ -3090,13 +3078,10 @@ impl LlmRunnerSubject for BrocaSubject {
         result.tags.get(index).map(|row| row.part.clone())
     }
 
-    /// The older image fixture requires marker text in the stored payload. Captured references
-    /// cannot carry arbitrary text; the marker-free numbering fixture checks those images.
-    /// Without capture, the legacy placeholder's MIME type can carry the marker.
+    /// The image-only tag case locates its result by `marker` text in session.read.
+    /// Keep that marker in the MIME name and use invalid bytes so dispatch stores a
+    /// failure notice. `numbering_tool_result` checks valid native-image tag numbers.
     fn image_tool_result(&self, marker: &str) -> Option<Value> {
-        if self.media_enabled {
-            return None;
-        }
         Some(json!({ OWN_CONTENT: [{
             "type": "image",
             "mimeType": format!("image/png; name={marker}"),
@@ -3751,15 +3736,12 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
-    if subject.media_enabled {
-        for case in report
-            .cases
-            .iter()
-            .filter(|case| case.case.starts_with("attachments_"))
-        {
-            assert_eq!(case.outcome, CaseOutcome::Passed, "{}", report.render());
-        }
-    }
+    let attachment_gaps = attachment_contract_gaps(&report);
+    assert!(
+        attachment_gaps.is_empty(),
+        "unchecked attachment cases: {attachment_gaps:?}\n{}",
+        report.render()
+    );
     // Broca declares these operations, so a case that drifts to skipped or inapplicable
     // must not silently pass. Input-cap and structured-output outcomes are checked by name
     // below, including the undeclared streamed-sibling behavior.
@@ -3787,11 +3769,8 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "output_refs_reference_limit",
         "output_refs_read_limits",
         "output_refs_snapshot_budget",
-        if subject.media_enabled {
-            "tags_tool_result_blocks_share_one_number"
-        } else {
-            "tags_count_only_parts_rendered_with_a_number"
-        },
+        "tags_tool_result_blocks_share_one_number",
+        "tags_count_only_parts_rendered_with_a_number",
         "compaction_setup_durable_once",
         "model_view_half_open_ranges_and_travel",
         "compaction_unavailable_distinct_from_refuse",
@@ -4040,6 +4019,12 @@ async fn kit_compaction_cases_without_process_kills() {
         "disabling kills changed daemon capability declarations"
     );
     let report = run_suite(&subject, &root.join("suite")).await.unwrap();
+    let attachment_gaps = attachment_contract_gaps(&report);
+    assert!(
+        attachment_gaps.is_empty(),
+        "unchecked attachment cases: {attachment_gaps:?}\n{}",
+        report.render()
+    );
     println!("{}", report.render());
     assert!(report.kills.is_empty());
     assert!(
@@ -5458,7 +5443,6 @@ mod held_call_tests {
             backup_classes: None,
             bus_events_enabled: false,
             process_kills_disabled: true,
-            media_enabled: false,
             reserved_reader: false,
             #[cfg(feature = "test-clock")]
             bus: None,
@@ -6021,4 +6005,71 @@ async fn scripted_model_failure_ends_one_turn_and_preserves_fractional_retry_hin
     assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
     assert!(recovered.contains("recovered"));
     assert_eq!(shared.failure_turns.lock().unwrap()[session], 2);
+}
+
+#[tokio::test]
+async fn conformance_subject_always_declares_attachments() {
+    let root = broca_test_support::scratch_root().join("subject-attachments");
+    let subject = BrocaSubject::new(&root).await;
+    assert!(subject.capabilities().contains(&Capability::Attachments));
+    assert!(subject
+        .numbering_tool_result(
+            "image-block",
+            &[cortexkit_role_llm_runner::tags::ToolResultBlock::Image]
+        )
+        .is_some());
+    assert!(subject.image_tool_result("old-image-rule").is_some());
+}
+
+fn attachment_contract_gaps(
+    report: &cortexkit_role_llm_runner_conformance::SuiteReport,
+) -> Vec<&'static str> {
+    let specs = cortexkit_role_llm_runner_conformance::CASES
+        .iter()
+        .filter(|spec| spec.name.starts_with("attachments_"))
+        .collect::<Vec<_>>();
+    assert!(
+        !specs.is_empty(),
+        "the shared suite must contain attachment cases"
+    );
+    specs
+        .into_iter()
+        .filter(|spec| !matches!(report.outcome(spec.name), Some(CaseOutcome::Passed)))
+        .map(|spec| spec.name)
+        .collect()
+}
+
+#[test]
+fn attachment_report_guard_rejects_missing_or_skipped_cases() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, SuiteReport, SuiteVerdict, CASES};
+    let mut report = SuiteReport {
+        cases: CASES
+            .iter()
+            .filter(|spec| spec.name.starts_with("attachments_"))
+            .map(|spec| CaseReport {
+                case: spec.name,
+                requires: spec.requires.to_vec(),
+                outcome: CaseOutcome::Passed,
+            })
+            .collect(),
+        kills: vec![],
+        verdict: SuiteVerdict::Passed,
+    };
+    assert!(attachment_contract_gaps(&report).is_empty());
+    for index in 0..report.cases.len() {
+        let name = report.cases[index].case;
+        report.cases[index].outcome = CaseOutcome::Skipped {
+            missing: vec![Capability::Attachments],
+        };
+        assert_eq!(attachment_contract_gaps(&report), vec![name]);
+        report.cases[index].outcome = CaseOutcome::Passed;
+    }
+    let missing = report.cases.pop().unwrap();
+    assert_eq!(attachment_contract_gaps(&report), vec![missing.case]);
+    report.cases.push(missing);
+    let name = report.cases[0].case;
+    report.cases[0].outcome = CaseOutcome::PassedWithInapplicableRule {
+        reason: "not checked".into(),
+    };
+    assert_eq!(attachment_contract_gaps(&report), vec![name]);
 }
