@@ -4243,7 +4243,7 @@ fn limit_live_arguments(
         if let cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(event) = &frame.2 {
             let arguments: serde_json::Value =
                 serde_json::from_str(&event.arguments).expect("projected arguments are JSON");
-            let limited = cortexkit_role_llm_runner::live::ToolStarted::new(
+            let mut limited = cortexkit_role_llm_runner::live::ToolStarted::new(
                 &event.mid,
                 &event.tool_call_id,
                 &event.name,
@@ -4251,6 +4251,11 @@ fn limit_live_arguments(
                 Some(limits),
                 event.started_at,
             );
+            // `new` only re-cuts the arguments; the call identity the projector already
+            // attached must survive the cut, or a limited stream loses what lets a client
+            // join this event to its display row.
+            limited.call_key.clone_from(&event.call_key);
+            limited.schema_pin.clone_from(&event.schema_pin);
             return Delivery::Control(Arc::new((
                 frame.0,
                 frame.1.clone(),
