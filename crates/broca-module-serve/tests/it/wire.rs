@@ -5690,6 +5690,9 @@ fn status_request() -> serde_json::Value {
     serde_json::json!({ "method": "run.status", "params": {} })
 }
 
+#[path = "wire_generation.rs"]
+mod generation;
+
 #[tokio::test]
 async fn run_status_frozen_auth_selection_matches_served_golden() {
     let mut route = PreparedWalRoute::start_prepared(
