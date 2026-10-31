@@ -5612,7 +5612,12 @@ where
                     context_limit,
                     opts.generation.max_output_tokens,
                 )
-                .with_ride_wait_max_ms(crate::compaction::runtime::RIDE_WAIT_MAX_MS);
+                .with_ride_wait_max_ms(crate::compaction::runtime::RIDE_WAIT_MAX_MS)
+                .with_view_due_max_ms(crate::compaction::runtime::VIEW_DUE_MAX_MS)
+                .with_view_features(vec![
+                    crate::compaction_provider::setup::VIEW_FEATURE_TRUNCATE.into(),
+                    crate::compaction_provider::setup::VIEW_FEATURE_TAG_BYTES_EDITS.into(),
+                ]);
                 setup.lineage_id = Some(lineage_id.clone());
                 setup.newest = raw
                     .last()
