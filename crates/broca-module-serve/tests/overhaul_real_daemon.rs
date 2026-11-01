@@ -1366,7 +1366,7 @@ async fn live_tail(
     resumed_run: &str,
 ) {
     let trace = rig.trace.clone();
-    let (subscription, mut stream, mut events) = trace
+    let (mut stream, mut events) = trace
         .phase("live attach: historical handoff", async {
             let subscription = connection
                 .route_open_management("broca", &rig.identity())
@@ -1401,7 +1401,7 @@ async fn live_tail(
                     break;
                 }
             }
-            (subscription, stream, events)
+            (stream, events)
         })
         .await;
     let run = trace
@@ -1440,8 +1440,8 @@ async fn live_tail(
                     break;
                 }
             }
+            // SubscribeStream::drop invalidates this route's handle, so do not close it again.
             drop(stream);
-            connection.route_close(&subscription).await.unwrap();
             let status = rig.state(connection, route, &run, "completed").await;
             rig.replies
                 .push(json!({"method":"run.status.tail","reply":status}));
@@ -1506,8 +1506,8 @@ async fn live_tail(
                     break;
                 }
             }
+            // SubscribeStream::drop invalidates this route's handle, so do not close it again.
             drop(replay);
-            connection.route_close(&replay_route).await.unwrap();
             replayed
         })
         .await;
