@@ -767,6 +767,62 @@ struct Sources {
     overhaul: bool,
 }
 
+fn decode_sources(bytes: &[u8]) -> (String, Vec<Source>) {
+    let mut at = 0;
+    let mut records = vec![];
+    let mut lineage: Option<broca_wal::WalLineageId> = None;
+    let mut next_seq = 1;
+    while at < bytes.len() {
+        match decode_next(&bytes[at..]) {
+            DecodeStep::Lineage {
+                lineage_id,
+                consumed,
+            } => {
+                // Mirror FileWal recovery: crates/broca-wal/src/file_wal.rs:3115-3125,3278-3289.
+                // Repeated headers authenticate the first lineage; only records advance sequence.
+                if let Some(first) = lineage {
+                    assert_eq!(lineage_id, first, "lineage changed at byte {at}");
+                    if let Some(incarnation) = first.incarnation() {
+                        assert_eq!(
+                            lineage_id.incarnation(),
+                            Some(incarnation),
+                            "incarnation changed at byte {at}"
+                        );
+                    }
+                } else {
+                    assert_eq!(at, 0, "the first lineage frame must start the WAL");
+                    lineage = Some(lineage_id);
+                }
+                at += consumed;
+            }
+            DecodeStep::Record { framed, consumed } => {
+                assert!(
+                    lineage.is_some(),
+                    "record before the initial lineage frame at byte {at}"
+                );
+                assert_eq!(
+                    framed.seq, next_seq,
+                    "noncontiguous record sequence at byte {at}"
+                );
+                next_seq += 1;
+                at += consumed;
+                records.push(Source {
+                    seq: framed.seq,
+                    end: at as u64,
+                    record: serde_json::to_value(framed.record).unwrap(),
+                });
+            }
+            _ => panic!("invalid or incomplete WAL at {at}"),
+        }
+    }
+    (
+        lineage
+            .expect("WAL must have an initial lineage frame")
+            .to_string(),
+        records,
+    )
+}
+
 impl Sources {
     fn assert_api_key_attempts(&self, reports: &[Value], expected_statuses: &[u64]) {
         // API keys bypass the subscription-account chooser; a vault-supplied account_ref
@@ -826,31 +882,7 @@ impl Sources {
         logs(&rig.state, &mut paths);
         assert_eq!(paths.len(), 1, "one lineage WAL: {paths:?}");
         let bytes = std::fs::read(&paths[0]).unwrap();
-        let mut at = 0;
-        let mut records = vec![];
-        let mut lineage = None;
-        while at < bytes.len() {
-            match decode_next(&bytes[at..]) {
-                DecodeStep::Lineage {
-                    lineage_id,
-                    consumed,
-                } => {
-                    assert_eq!(at, 0);
-                    assert!(lineage_id.incarnation().is_some());
-                    lineage = Some(lineage_id.to_string());
-                    at += consumed;
-                }
-                DecodeStep::Record { framed, consumed } => {
-                    at += consumed;
-                    records.push(Source {
-                        seq: framed.seq,
-                        end: at as u64,
-                        record: serde_json::to_value(framed.record).unwrap(),
-                    });
-                }
-                _ => panic!("invalid or incomplete WAL at {at}"),
-            }
-        }
+        let (lineage, records) = decode_sources(&bytes);
         let logical = records
             .iter()
             .filter(|s| !lifecycle(&s.record))
@@ -887,7 +919,7 @@ impl Sources {
             .map(|(c, _)| (c.wal_seq, u64::from(c.sub_index)))
             .collect();
         Self {
-            lineage: lineage.unwrap(),
+            lineage,
             records,
             logical,
             root: rig.state.to_string_lossy().into_owned(),
@@ -1816,6 +1848,240 @@ async fn differential_phase_diagnostic_names_root_and_observed_state() {
     assert!(diagnostic.contains(&rig.root.display().to_string()));
     assert_eq!(rig.trace.phase("helper completion", async { 42 }).await, 42);
     rig.completed = true;
+}
+
+#[tokio::test]
+async fn differential_source_oracle_accepts_repeated_lineage_after_reopen() {
+    use broca_wal::{FileWal, Wal, WalConfig, WalRecord};
+
+    let mut legacy = diagnostic_rig("differential-lineage-legacy", false);
+    let mut overhaul = diagnostic_rig("differential-lineage-format-2", true);
+    let mut decoded = vec![];
+    for rig in [&mut legacy, &mut overhaul] {
+        let config = if rig.overhaul {
+            std::fs::write(rig.state.join("state-format"), b"broca-state/2\n").unwrap();
+            WalConfig::OVERHAUL
+        } else {
+            WalConfig::LEGACY
+        };
+        let path = rig.state.join("wal/source.wal");
+        let floor = rig.state.join(broca_wal::floor::FEATURE_FLOOR_FILENAME);
+        let open = || {
+            FileWal::open_with_recovery(&path, config, floor.clone())
+                .unwrap()
+                .with_feature_floor(floor.clone())
+                .with_wal_config(config)
+                .unwrap()
+        };
+        let mut wal = open();
+        let previous_writer = wal.writer_id();
+        if let Some(writer_id) = previous_writer {
+            wal.append(
+                1,
+                &WalRecord::WriterOpened {
+                    writer_id,
+                    previous_writer_id: None,
+                    recovered_through_seq: 0,
+                    cause: "open".into(),
+                },
+                true,
+            )
+            .unwrap();
+        }
+        wal.append(
+            1,
+            &WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+            true,
+        )
+        .unwrap();
+        if let Some(writer_id) = previous_writer {
+            wal.append(1, &WalRecord::WriterClosed { writer_id }, true)
+                .unwrap();
+        }
+        let lineage = wal.lineage_id().unwrap();
+        assert!(lineage.incarnation().is_some());
+        let recovered_through_seq = wal.last_seq();
+        drop(wal);
+        let mut wal = open();
+        assert_eq!(wal.lineage_id(), Some(lineage));
+        if let Some(writer_id) = wal.writer_id() {
+            wal.append(
+                1,
+                &WalRecord::WriterOpened {
+                    writer_id,
+                    previous_writer_id: previous_writer,
+                    recovered_through_seq,
+                    cause: "reopen".into(),
+                },
+                true,
+            )
+            .unwrap();
+        }
+        wal.append(
+            1,
+            &WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(2),
+            },
+            true,
+        )
+        .unwrap();
+        drop(wal);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let header = &bytes[..broca_wal::framing::LINEAGE_FRAME_LEN];
+        assert!(
+            bytes
+                .windows(header.len())
+                .filter(|window| *window == header)
+                .count()
+                >= 3,
+            "the production writer must supply recurring lineage metadata"
+        );
+        let sources = Sources::read(rig);
+        assert_eq!(sources.lineage, lineage.to_string());
+        let expected_sequences = if rig.overhaul {
+            vec![1, 2, 3, 4, 5]
+        } else {
+            vec![1, 2]
+        };
+        assert_eq!(
+            sources
+                .records
+                .iter()
+                .map(|source| source.seq)
+                .collect::<Vec<_>>(),
+            expected_sequences
+        );
+        assert_eq!(
+            sources.logical.len(),
+            2,
+            "headers and writer markers are not logical records"
+        );
+        assert_eq!(sources.position(if rig.overhaul { 2 } else { 1 }), 1);
+        assert_eq!(sources.position(if rig.overhaul { 5 } else { 2 }), 2);
+        decoded.push(sources);
+    }
+    correspondence(&decoded[0], &decoded[1]);
+    legacy.completed = true;
+    overhaul.completed = true;
+}
+
+fn source_lineage_header(tag: &str) -> Vec<u8> {
+    use broca_wal::Wal;
+    let root = broca_test_support::scratch_root().join(tag);
+    let path = root.join("source.wal");
+    let mut wal = broca_wal::FileWal::open(&path).unwrap();
+    wal.append(
+        1,
+        &broca_wal::WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
+        true,
+    )
+    .unwrap();
+    drop(wal);
+    let bytes = std::fs::read(&path).unwrap();
+    let header = bytes[..broca_wal::framing::LINEAGE_FRAME_LEN].to_vec();
+    broca_test_support::remove_rig_dir(root);
+    header
+}
+
+fn source_header_without_incarnation(header: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut header = header.to_vec();
+    // Older lineage identities are opaque bytes, not necessarily UUID-v4 incarnations.
+    header[broca_wal::framing::HEADER_LEN + 6] &= 0x0f;
+    let digest_start = broca_wal::framing::HEADER_LEN - 32;
+    let mut digest = Sha256::new();
+    digest.update(&header[4..digest_start]);
+    digest.update(&header[broca_wal::framing::HEADER_LEN..]);
+    header[digest_start..broca_wal::framing::HEADER_LEN].copy_from_slice(&digest.finalize());
+    header
+}
+
+#[test]
+fn differential_source_oracle_rejects_changed_lineage_and_sequence_gaps() {
+    let header = source_lineage_header("differential-lineage-original");
+    let foreign = source_lineage_header("differential-lineage-foreign");
+    assert_ne!(header, foreign);
+    let no_incarnation = source_header_without_incarnation(&header);
+    let record = |seq| {
+        broca_wal::framing::encode(
+            seq,
+            1,
+            &broca_wal::WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(seq),
+            },
+        )
+        .unwrap()
+    };
+    let first = record(1);
+    let second = record(2);
+    for (name, bytes) in [
+        (
+            "foreign lineage",
+            [&header[..], &first, &foreign, &header, &second].concat(),
+        ),
+        (
+            "changed incarnation",
+            [&header[..], &first, &no_incarnation, &second].concat(),
+        ),
+        (
+            "sequence gap",
+            [&header[..], &first, &header, &record(3)].concat(),
+        ),
+        (
+            "duplicate sequence",
+            [&header[..], &first, &header, &first].concat(),
+        ),
+        ("late first header", [&first[..], &header].concat()),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| decode_sources(&bytes)).is_err(),
+            "accepted {name}"
+        );
+    }
+}
+
+#[test]
+fn differential_source_oracle_preserves_optional_initial_incarnation() {
+    let header =
+        source_header_without_incarnation(&source_lineage_header("differential-lineage-opaque"));
+    let lineage = match decode_next(&header) {
+        DecodeStep::Lineage { lineage_id, .. } => lineage_id,
+        _ => panic!("fixture must contain valid lineage metadata"),
+    };
+    assert!(lineage.incarnation().is_none());
+    let first = broca_wal::framing::encode(
+        1,
+        1,
+        &broca_wal::WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
+    )
+    .unwrap();
+    let second = broca_wal::framing::encode(
+        2,
+        1,
+        &broca_wal::WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(2),
+        },
+    )
+    .unwrap();
+    let bytes = [&header[..], &header, &first, &header, &second, &header].concat();
+    let (actual_lineage, records) = decode_sources(&bytes);
+    assert_eq!(actual_lineage, lineage.to_string());
+    assert_eq!(
+        records.iter().map(|record| record.seq).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(records[0].end as usize, header.len() * 2 + first.len());
+    assert_eq!(
+        records[1].end as usize,
+        header.len() * 3 + first.len() + second.len()
+    );
 }
 
 #[test]
