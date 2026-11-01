@@ -29,6 +29,7 @@ const MANAGEMENT_OPERATIONS: &[&str] = &[
     "run.status",
     "run.event.get",
     "session.read",
+    "session.media_read",
     "role.describe",
     "session.resolve",
     "session.head",
