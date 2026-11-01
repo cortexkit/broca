@@ -66,6 +66,26 @@ fn state_root_refusal(
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    match dispatch(&args) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn dispatch(args: &[String]) -> Result<ExitCode, broca_store::LegacyOnlyOperator> {
+    if let (Some(operation), Some(root)) = (args.get(1), args.get(2)) {
+        broca_store::require_legacy_operator_root(
+            std::path::Path::new(root),
+            format!("store-maintenance {operation}"),
+        )?;
+    }
+    Ok(run(args))
+}
+
+fn run(args: &[String]) -> ExitCode {
     if args
         .get(1)
         .is_some_and(|operation| operation == "repair-session-root")
@@ -983,7 +1003,9 @@ fn private_mode(_state_root: &std::path::Path, _dry_run: bool) -> ExitCode {
 }
 
 fn wal_fold(root: &std::path::Path, args: &[String]) -> ExitCode {
-    if let Err(error) = broca_core::wal_fold::ensure_legacy_root(root) {
+    if let Err(error) =
+        broca_store::require_legacy_operator_root(root, "store-maintenance wal-fold")
+    {
         eprintln!("store-maintenance: wal-fold refused: {error}");
         return ExitCode::from(2);
     }
@@ -1032,6 +1054,104 @@ fn wal_fold(root: &std::path::Path, args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::open_maintenance_store;
+    #[test]
+    fn every_operator_dispatch_refuses_marked_roots_before_legacy_access() {
+        for marker in [
+            Some(b"broca-state/2\n".as_slice()),
+            Some(b"malformed"),
+            None,
+        ] {
+            for existing in [false, true] {
+                let root = temp_root("legacy-only-operators");
+                std::fs::create_dir_all(&root).unwrap();
+                match marker {
+                    Some(bytes) => std::fs::write(root.join("state-format"), bytes).unwrap(),
+                    None => std::fs::create_dir(root.join("state-format")).unwrap(),
+                }
+                let mut preserved = vec![("operator-data", b"keep".as_slice())];
+                if existing {
+                    preserved.extend([
+                        ("run-index.db", b"not SQLite".as_slice()),
+                        ("run-index.db-wal", b"keep WAL"),
+                        ("run-index.db-shm", b"keep SHM"),
+                    ]);
+                }
+                for (name, bytes) in &preserved {
+                    std::fs::write(root.join(name), bytes).unwrap();
+                }
+                for (operation, options) in [
+                    ("page-usage", vec![]),
+                    ("page-usage", vec!["--dry-run"]),
+                    ("reconcile-active", vec![]),
+                    ("control-head", vec![]),
+                    ("private-mode", vec!["--dry-run"]),
+                    ("wal-manifest", vec!["--write"]),
+                    ("wal-fold", vec![]),
+                    ("wal-fold", vec!["--write"]),
+                    ("wal-fold", vec!["--resume", "fold-test"]),
+                    ("wal-fold", vec!["--unfold"]),
+                    ("wal-fold", vec!["--abandon"]),
+                    ("media-sweep", vec!["--write"]),
+                    (
+                        "repair-session-root",
+                        vec!["--harness", "h", "--session", "s", "--write"],
+                    ),
+                ] {
+                    let mut args = vec![
+                        "store-maintenance".into(),
+                        operation.into(),
+                        root.to_str().unwrap().into(),
+                    ];
+                    args.extend(options.into_iter().map(String::from));
+                    let error = super::dispatch(&args).unwrap_err();
+                    assert_eq!(error.operator, format!("store-maintenance {operation}"));
+                    assert_eq!(error.root, root);
+                    assert!(error.to_string().contains("is legacy-only"));
+                }
+                assert_eq!(
+                    std::fs::read_dir(&root).unwrap().count(),
+                    preserved.len() + 1
+                );
+                for (name, bytes) in preserved {
+                    assert_eq!(std::fs::read(root.join(name)).unwrap(), bytes);
+                }
+                match marker {
+                    Some(bytes) => {
+                        assert_eq!(std::fs::read(root.join("state-format")).unwrap(), bytes)
+                    }
+                    None => assert!(root.join("state-format").is_dir()),
+                }
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn missing_marker_keeps_legacy_maintenance_dispatch() {
+        let root = temp_root("legacy-dispatch");
+        std::fs::create_dir_all(&root).unwrap();
+        let args = [
+            "store-maintenance".into(),
+            "page-usage".into(),
+            root.to_str().unwrap().into(),
+            "--dry-run".into(),
+        ];
+        assert_eq!(
+            super::dispatch(&args).unwrap(),
+            std::process::ExitCode::from(2)
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        drop(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
+        let before = std::fs::read(root.join("run-index.db")).unwrap();
+        assert_eq!(
+            super::dispatch(&args).unwrap(),
+            std::process::ExitCode::SUCCESS
+        );
+        assert_eq!(std::fs::read(root.join("run-index.db")).unwrap(), before);
+        assert!(!root.join("state-format").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn reports_and_previews_open_read_only_without_schema_initialization() {
         let root = temp_root("read-only-maintenance");
