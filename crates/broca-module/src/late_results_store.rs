@@ -18,6 +18,12 @@ use serde::{Deserialize, Serialize};
 pub(crate) const REGISTRATION_MARKER: &str = "late-results-registered";
 pub const REBUILD_REQUIRED_MARKER: &str = "late-results-rebuild-required";
 
+// subc-protocol 0.33.4 defines these two route-open refusals for a missing or ended
+// scope. Keep the durable outbox states unchanged: even old failed rows are diagnostic
+// rather than health failures, without making any completed attempt eligible for retry.
+// A provider answer, including a refused answer, is not a route-open refusal.
+const WITHDRAWAL_SCOPE_GONE: &str = "COALESCE(json_extract(detail, '$.code') IN ('scope_not_live', 'scope_ended') AND json_type(detail, '$.answer') IS NULL, 0)";
+
 fn sync_marker(root: &Path, name: &str) -> Result<(), String> {
     let marker = root.join(name);
     broca_store::create_private_sqlite(&marker).map_err(|error| error.to_string())?;
@@ -762,10 +768,10 @@ impl LateResultsStore {
             .transpose()
     }
 
-    pub fn withdrawal_counts(&self) -> Result<(usize, usize, usize), String> {
+    pub fn withdrawal_counts(&self) -> Result<(usize, usize, usize, usize), String> {
         self.lock()?.query_row(
-            "SELECT count(CASE WHEN state='watching' THEN 1 END), count(CASE WHEN state='pending' THEN 1 END), count(CASE WHEN state='failed' THEN 1 END) FROM held_withdrawals",
-            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            &format!("SELECT count(CASE WHEN state='watching' THEN 1 END), count(CASE WHEN state='pending' THEN 1 END), count(CASE WHEN state='failed' AND NOT ({WITHDRAWAL_SCOPE_GONE}) THEN 1 END), count(CASE WHEN state='failed' AND ({WITHDRAWAL_SCOPE_GONE}) THEN 1 END) FROM held_withdrawals"),
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).map_err(|error| error.to_string())
     }
 
@@ -794,11 +800,11 @@ impl LateResultsStore {
         Ok(removed)
     }
 
-    pub fn withdrawal_failure_details(&self) -> Result<Vec<serde_json::Value>, String> {
+    pub fn withdrawal_details(&self, scope_gone: bool) -> Result<Vec<serde_json::Value>, String> {
         let connection = self.lock()?;
-        let mut query = connection.prepare("SELECT detail FROM held_withdrawals WHERE state='failed' ORDER BY module, call_key LIMIT 10").map_err(|error| error.to_string())?;
+        let mut query = connection.prepare(&format!("SELECT detail FROM held_withdrawals WHERE state='failed' AND ({WITHDRAWAL_SCOPE_GONE}) = ?1 ORDER BY module, call_key LIMIT 10")).map_err(|error| error.to_string())?;
         let rows = query
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([scope_gone], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?;
         rows.map(|row| {
             serde_json::from_str(&row.map_err(|error| error.to_string())?)
@@ -1013,6 +1019,44 @@ mod tests {
             store.withdrawal_rows().unwrap().is_empty(),
             "expired calls are pruned before recovery reads any WAL or sends a withdrawal"
         );
+    }
+
+    #[test]
+    fn withdrawal_diagnostics_are_separated_bounded_and_keep_provider_refusals_failed() {
+        let path = scratch("withdrawal-diagnostics.db");
+        let store = LateResultsStore::open(&path).unwrap();
+        for (prefix, code) in [
+            ("scope", "scope_not_live"),
+            ("failure", "scope_not_carrier"),
+        ] {
+            for index in 0..12 {
+                let call = call(&format!("{prefix}:{index}"));
+                store.register_calls(std::slice::from_ref(&call)).unwrap();
+                store
+                    .record_withdrawal(&call, "failed", 1, &serde_json::json!({"code":code}))
+                    .unwrap();
+            }
+        }
+        let refused = call("provider:refused");
+        store
+            .register_calls(std::slice::from_ref(&refused))
+            .unwrap();
+        store
+            .record_withdrawal(
+                &refused,
+                "failed",
+                1,
+                &serde_json::json!({
+                    "answer":"refused", "reason":"scope_ended", "code":"scope_ended"
+                }),
+            )
+            .unwrap();
+        assert_eq!(store.withdrawal_counts().unwrap(), (0, 0, 13, 12));
+        for (scope_gone, code) in [(true, "scope_not_live"), (false, "scope_not_carrier")] {
+            let details = store.withdrawal_details(scope_gone).unwrap();
+            assert_eq!(details.len(), 10);
+            assert!(details.iter().all(|detail| detail["code"] == code));
+        }
     }
 
     #[test]

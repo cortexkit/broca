@@ -184,6 +184,7 @@ pub fn health_gauges() -> serde_json::Value {
                 serde_json::json!({
                     "failed": 0,
                     "pending": 0,
+                    "scope_gone": 0,
                     "sweep_running": false,
                     "rows_remaining": 0,
                 }),

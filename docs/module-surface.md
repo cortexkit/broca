@@ -1703,7 +1703,13 @@ for an already-durably-cancelled call. Neither shutdown nor restart creates a wi
 by itself, and a call that completed before its sibling was cancelled is not withdrawn. The
 registry's stop signal suppresses new withdrawal attempts and retries during drain; an earlier
 request may already have reached the provider. Health exposes pending/failed withdrawals and
-their refusal codes.
+their refusal codes. Route refusals `scope_not_live` and `scope_ended` mean withdrawal is
+impossible under the original scope, not that the held call was cancelled or its outcome is
+known. They count in `provider_held.withdrawals.scope_gone`, not `failed`, and do not degrade
+health; `scope_gone_details` retains at most ten diagnostics with the same `code`, `answer`
+and `reason` fields as `failure_details`. All other refusals and errors still count as failures.
+After a cancelled call's terminal is durable, a later result is only receipted and acked as a
+no-op when the module's on-demand feed next drains, not guaranteed to be delivered to the run.
 
 Late-result pullers start before withdrawal recovery, which runs independently and obeys the
 registry's stop signal. Withdrawal recovery snapshots the outbox once, groups rows by session,
