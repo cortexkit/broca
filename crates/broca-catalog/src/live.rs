@@ -946,6 +946,9 @@ fn resolve_provider_inner(
             "openai-compatible",
             opts.auth_method,
         );
+        // Opaque endpoints share fresh-episode render rules with catalog routes.
+        // Recorded episodes take the earlier recorded-config branch instead.
+        let frozen = episode_render.apply(frozen);
         let provider =
             resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
         return Ok(ProviderResolution {
