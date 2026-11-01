@@ -510,6 +510,17 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   With the service-tier writer enabled, `service_tier` follows the fixed-run rules below
   instead of inheriting from an ended run.
 
+- Ordered delivery advertises `tool_result`, `turn_system`, `steer` and `idle_start` globally.
+  A `turn_system` delivery requires a validated plan template and a legal position on the
+  frozen provider route. Responses renders a `developer` input item in conversation order,
+  never top-level `instructions`. Anthropic requires the provider's explicit
+  `capability.mid_conversation_system` catalog fact and renders a persistent `system` message
+  after a user turn or tool result, at the end of the request; it adds neither `clear_at` nor
+  a beta header. An absent fact is unsupported, not an admission failure. Gemini and other
+  unsupported routes skip to the next listed mode, or keep the send pending if none is
+  possible. A stored system entry switched to an unsupported route renders as user text
+  without changing the stored role, text or delivery mode.
+
 Broca does not send `service_tier` to account routing; a tier chosen by a router reaches broca
 only through the caller's send. Broca does not report `service_tier_applied` or
 `service_tier_served` to account routing.

@@ -1225,6 +1225,13 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
+    fn turn_system_possible(
+        &self,
+        preceding: Option<&broca_protocol::Message>,
+        followed_by_user: bool,
+    ) -> bool {
+        crate::turn_system::possible_after(&self.route_frozen(), preceding, followed_by_user)
+    }
     fn history_edit_cost(
         &self,
     ) -> Option<broca_core::compaction_provider::notice::HistoryEditCost> {

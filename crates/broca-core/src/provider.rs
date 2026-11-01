@@ -48,6 +48,15 @@ pub struct StepRuntime {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Whether template text can be delivered at system authority at this boundary.
+    /// `followed_by_user` accounts for other staged sends in the same request.
+    fn turn_system_possible(
+        &self,
+        _preceding: Option<&broca_protocol::Message>,
+        _followed_by_user: bool,
+    ) -> bool {
+        false
+    }
     /// Pricing of edits on the route the next model call would use; unknown routes omit it.
     fn history_edit_cost(&self) -> Option<crate::compaction_provider::notice::HistoryEditCost> {
         None
@@ -323,6 +332,13 @@ pub trait Provider: Send + Sync {
 /// `run_loop` directly, without the loop needing to know the concrete type.
 #[async_trait]
 impl Provider for Box<dyn Provider> {
+    fn turn_system_possible(
+        &self,
+        preceding: Option<&broca_protocol::Message>,
+        followed_by_user: bool,
+    ) -> bool {
+        (**self).turn_system_possible(preceding, followed_by_user)
+    }
     fn history_edit_cost(&self) -> Option<crate::compaction_provider::notice::HistoryEditCost> {
         (**self).history_edit_cost()
     }

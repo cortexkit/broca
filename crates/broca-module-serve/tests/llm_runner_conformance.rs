@@ -2732,6 +2732,12 @@ impl LlmRunnerSubject for BrocaSubject {
         )
     }
 
+    fn turn_system_supported(&self) -> bool {
+        // The kit's scripted mock route speaks OpenAI Chat, not Responses. Its template
+        // cases therefore exercise the required user-authority fall-through, without skips.
+        false
+    }
+
     /// A plan for `session.refresh` of `session`. `ChangedTools` is a tool-free plan: the
     /// session's first plan offers the scripted tool, so the next run offering no tools
     /// differs and the cases can tell whether it applied. The host fixes no tool set at
