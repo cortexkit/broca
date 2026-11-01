@@ -106,6 +106,64 @@ pub(crate) fn resolve_sender_run_id(
     }
 }
 
+/// The durable sender used to authorize a receipt. Ordered records preserve the delegated
+/// sender; ordinary queued or started sends carry their principal. Legacy `Steered` records
+/// carry no sender stamp, so retain the status API's original fallback to the principal in
+/// the first `RunStarted` record. Never use the current plan or caller as historical evidence.
+pub(crate) fn recorded_send_sender<'a>(
+    records: &'a [WalRecord],
+    own_run: &RunId,
+) -> Option<&'a BindPrincipal> {
+    let submission = format!("sub-{}", own_run.0);
+    records
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::DeliveryOrdered {
+                submission_id,
+                sent_by: Some(sender),
+                ..
+            } if submission_id.0 == submission => Some(Some(sender)),
+            WalRecord::Queued {
+                submission_id,
+                principal,
+                ..
+            } if submission_id.0 == submission => Some(principal.as_ref()),
+            WalRecord::RunStarted {
+                run_id, principal, ..
+            } if run_id == own_run => Some(principal.as_ref()),
+            _ => None,
+        })
+        .or_else(|| {
+            records.iter().find_map(|record| match record {
+                WalRecord::RunStarted { principal, .. } => Some(principal.as_ref()),
+                _ => None,
+            })
+        })
+        .flatten()
+}
+
+/// A `DeliveryOrdered` record selects that send's own receipt, not an unstamped `Steered`
+/// record that happens to carry the same `send_id`.
+pub(crate) fn legacy_steers_allowed(records: &[WalRecord], own_run: &RunId) -> bool {
+    let submission = format!("sub-{}", own_run.0);
+    !records.iter().any(|record| {
+        matches!(record,
+        WalRecord::DeliveryOrdered { submission_id, .. } if submission_id.0 == submission)
+    })
+}
+
+pub(crate) fn legacy_steer_sender<'a>(
+    records: &'a [WalRecord],
+    own_run: &RunId,
+    send_id: &str,
+) -> Option<&'a BindPrincipal> {
+    if legacy_steers_allowed(records, own_run) && recorded_steers(records).contains_key(send_id) {
+        recorded_send_sender(records, own_run)
+    } else {
+        None
+    }
+}
+
 /// A succession selects only one predecessor's durable key, never its grants or its own
 /// predecessor. Absence falls back to the caller's namespace; a found record must be compared
 /// by the ordinary retry path, so a payload conflict cannot fall through to another send.
@@ -124,7 +182,9 @@ pub(crate) fn resolve_retry_run_id(
                 module_id: module.into(),
             };
             let id = resolve_sender_run_id(records, base, send_id, &predecessor)?;
-            if run_sender(records, &id).flatten().as_ref() == Some(&predecessor) {
+            if run_sender(records, &id).flatten().as_ref() == Some(&predecessor)
+                || legacy_steer_sender(records, &id, send_id) == Some(&predecessor)
+            {
                 return Ok((id, predecessor));
             }
         }

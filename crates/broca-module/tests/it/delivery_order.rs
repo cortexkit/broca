@@ -149,6 +149,113 @@ async fn successor_prefers_removed_predecessor_receipts_after_refresh_and_restar
     assert_ne!(fresh, predecessor);
 }
 
+#[tokio::test]
+async fn successor_retries_legacy_owner_steers_with_the_original_receipt_without_delivery() {
+    let (exec, gate) = FakeExecutor::gated_with_step_boundary();
+    let mut rig = Rig::new("owner-succession", exec, LONG_TTL);
+    let key = rig.key("owner-steer");
+    let mut first = send(&key, "owner-run", None);
+    first.request.principal = reserved("owner");
+    first.plan = Some(plan_naming("old-module", false));
+    rig.registry.send(first).await.unwrap();
+    let mut legacy = send(&key, "legacy-note", None);
+    legacy.delivery = broca_protocol::Delivery::Steer;
+    legacy.request.principal = reserved("owner");
+    assert!(
+        matches!(rig.registry.send(legacy.clone()).await.unwrap(), SendResponse::Active { ref run_id, .. } if run_id == "owner-run")
+    );
+    gate.release().await;
+    wait_idle(&rig, &key).await;
+    let receipt = serde_json::to_value(rig.registry.send(legacy.clone()).await.unwrap()).unwrap();
+    let mut plan = plan_naming("phone", true);
+    let manifest = std::sync::Arc::make_mut(plan.manifest.as_mut().unwrap());
+    let mut value: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+    value["senders"][0]["succeeds"] = serde_json::json!("owner");
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap();
+    refresh_senders(&rig, &key, 1, "on_prefix_rebuild", plan).await;
+    legacy.request.principal = reserved("phone");
+    for restarted in [false, true] {
+        if restarted {
+            restart_registry(&mut rig).await;
+        }
+        let before = records(&rig, &key);
+        assert_eq!(
+            serde_json::to_value(rig.registry.send(legacy.clone()).await.unwrap()).unwrap(),
+            receipt
+        );
+        let status = rig
+            .registry
+            .send_status(
+                &key,
+                broca_protocol::RunId("legacy-note".into()),
+                "send-legacy-note",
+                reserved("phone").as_ref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_value(status).unwrap(), receipt);
+        let mut conflicting = legacy.clone();
+        conflicting.request.input[0].content = vec![broca_protocol::ContentBlock::Text {
+            text: "different".into(),
+        }];
+        assert!(matches!(
+            rig.registry.send(conflicting).await,
+            Err(ServeError::SendIdReuse { .. })
+        ));
+        assert_eq!(
+            records(&rig, &key),
+            before,
+            "a predecessor receipt never delivers another message"
+        );
+    }
+    assert!(matches!(
+        rig.registry
+            .send_status(
+                &key,
+                broca_protocol::RunId("legacy-note".into()),
+                "send-legacy-note",
+                reserved("stranger").as_ref()
+            )
+            .await,
+        Err(ServeError::UnknownSend)
+    ));
+    assert!(rig
+        .registry
+        .authorize_session_owner(
+            &key,
+            reserved("phone").as_ref(),
+            &broca_protocol::SendScope::Unstamped
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn successor_retries_legacy_owner_started_sends_with_unchanged_receipts() {
+    let rig = Rig::new("owner-start-succession", FakeExecutor::auto(), LONG_TTL);
+    let key = rig.key("owner-start");
+    let mut original = send(&key, "owner-turn", None);
+    original.request.principal = reserved("owner");
+    original.plan = Some(plan_naming("old-module", false));
+    rig.registry.send(original.clone()).await.unwrap();
+    wait_idle(&rig, &key).await;
+    original.plan = None;
+    let receipt = serde_json::to_value(rig.registry.send(original.clone()).await.unwrap()).unwrap();
+    let mut plan = plan_naming("phone", true);
+    let manifest = std::sync::Arc::make_mut(plan.manifest.as_mut().unwrap());
+    let mut value: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+    value["senders"][0]["succeeds"] = serde_json::json!("owner");
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap();
+    refresh_senders(&rig, &key, 1, "on_prefix_rebuild", plan).await;
+    original.request.principal = reserved("phone");
+    let before = records(&rig, &key);
+    assert_eq!(
+        serde_json::to_value(rig.registry.send(original).await.unwrap()).unwrap(),
+        receipt
+    );
+    assert_eq!(records(&rig, &key), before);
+}
+
 async fn retract_as(
     rig: &Rig,
     key: &broca_protocol::BindIdentity,

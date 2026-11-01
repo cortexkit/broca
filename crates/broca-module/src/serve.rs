@@ -2824,39 +2824,12 @@ impl ServeHandler for crate::LineageRegistry {
             } else {
                 (own_run, principal.cloned())
             };
-        // Ordered senders share a session, not each other's send keys. Legacy owner records
-        // omit sent_by, so their principal is the one on Queued or RunStarted.
-        let submission = format!("sub-{}", own_run.0);
-        let sender = records.iter().find_map(|record| match record {
-            broca_wal::WalRecord::DeliveryOrdered {
-                submission_id,
-                sent_by: Some(sender),
-                ..
-            } if submission_id.0 == submission => Some(Some(sender)),
-            broca_wal::WalRecord::Queued {
-                submission_id,
-                principal,
-                ..
-            } if submission_id.0 == submission => Some(principal.as_ref()),
-            broca_wal::WalRecord::RunStarted {
-                run_id, principal, ..
-            } if run_id == &own_run => Some(principal.as_ref()),
-            _ => None,
-        });
-        let sender = sender.or_else(|| {
-            records.iter().find_map(|record| match record {
-                broca_wal::WalRecord::RunStarted { principal, .. } => Some(principal.as_ref()),
-                _ => None,
-            })
-        });
-        if sender
-            .flatten()
+        if crate::send_fate::recorded_send_sender(&records, &own_run)
             .is_some_and(|sender| Some(sender) != lookup_sender.as_ref())
         {
             return Err(ServeError::UnknownSend);
         }
-        let legacy_steers = !records.iter().any(|record| matches!(record,
-            broca_wal::WalRecord::DeliveryOrdered { submission_id, .. } if submission_id.0 == submission));
+        let legacy_steers = crate::send_fate::legacy_steers_allowed(&records, &own_run);
         let outcome =
             crate::send_fate::recorded_send_outcome(&records, &own_run, send_id, legacy_steers)
                 .ok_or(ServeError::UnknownSend)?;
