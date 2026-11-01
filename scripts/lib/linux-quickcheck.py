@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Build one workspace configuration, then check only the attested packages."""
+"""Build one workspace configuration, then check only the attested packages.
+
+`--tests EXPR` runs only the nextest filterset EXPR in that same configuration, so a worker's
+iterations and its final commit attestation share one warm build. It writes no attestation
+and fails when the filter selects no test.
+"""
 
 import json
 import os
@@ -41,7 +46,12 @@ def rows(filename):
 def test_filter(wanted):
     # nextest consumes the already-built binary inventory; filters never reach
     # Cargo's package selection or create another set of dependency artifacts.
-    selections = [f"(package(={p}) & (kind(lib) | kind(bin)))" for p in sorted(wanted)]
+    # Exhaustive sweeps listed in quickcheck-slow-tests.list run once per batch in the Linux
+    # preflight instead of in every commit attestation.
+    slow = [f"(package(={package}) & test(={name}))"
+            for package, name, *_ in rows("quickcheck-slow-tests.list") if package in wanted]
+    unit = "(kind(lib) | kind(bin))" if not slow else f"(kind(lib) | kind(bin)) & not ({' | '.join(slow)})"
+    selections = [f"(package(={p}) & {unit})" for p in sorted(wanted)]
     for package, target, *_ in rows("quickcheck-feature-tests.list"):
         if package in wanted:
             selections.append(f"(package(={package}) & binary(={target}))")
@@ -84,11 +94,33 @@ def rustdoc():
     subprocess.run([os.environ["BROCA_ATTEST_RUSTDOC"], *args], check=True)
 
 
-def main(wanted):
+def prepare():
     os.chdir(ROOT)
     os.environ["PATH"] = str(Path.home() / ".cargo/bin") + os.pathsep + os.environ["PATH"]
     os.environ.setdefault("CARGO_BUILD_JOBS", "2")
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
+
+def filtered(expression):
+    prepare()
+    if not expression.strip():
+        raise RuntimeError("--tests needs a nextest filterset, for example 'test(/restart_writes/)'")
+    metadata_text = cargo("metadata", "--locked", "--format-version", "1", *FEATURES, capture=True)
+    with tempfile.TemporaryDirectory(prefix="broca-fixed-filtered-") as temporary:
+        temporary = Path(temporary)
+        binaries = temporary / "binaries.json"
+        binaries.write_text(cargo("nextest", "list", *FIXED, "--lib", "--bins", "--tests",
+                                  "--list-type", "binaries-only", "--message-format", "json", capture=True))
+        metadata_path = temporary / "metadata.json"
+        metadata_path.write_text(metadata_text)
+        # `--no-tests fail`: a filter that matches nothing must not read as a pass.
+        cargo("nextest", "run", "--cargo-metadata", str(metadata_path), "--binaries-metadata", str(binaries),
+              "--ignore-default-filter", "--no-tests", "fail", "-E", expression)
+    print("==> filtered tests OK (no attestation written): " + expression, flush=True)
+
+
+def main(wanted):
+    prepare()
     if not wanted:
         raise RuntimeError("at least one workspace package is required")
     metadata_text = cargo("metadata", "--locked", "--format-version", "1", *FEATURES, capture=True)
@@ -132,6 +164,10 @@ if __name__ == "__main__":
     try:
         if os.environ.get("BROCA_ATTEST_RUSTDOC"):
             rustdoc()
+        elif sys.argv[1:2] == ["--tests"]:
+            if len(sys.argv) != 3:
+                raise RuntimeError("usage: linux-quickcheck.py --tests '<nextest filterset>'")
+            filtered(sys.argv[2])
         else:
             main(set(sys.argv[1:]))
     except (RuntimeError, ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:

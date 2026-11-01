@@ -7,8 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use broca_catalog::live::{AuthMode, ResolveOptions, WireFamilyId};
 use broca_core::{
-    AllowAll, FileLeaseStore, FileWalStore, OutputEvent, RunError, RunSummary, StartMode,
-    StubToolPlane,
+    AllowAll, FileWalStore, OutputEvent, RunError, RunSummary, StartMode, StubToolPlane,
 };
 use broca_module::executor::{RunExecutor, RunJob, RunKind};
 use broca_module::serve::{ServeHandler, SessionImportRequest};
@@ -117,6 +116,10 @@ fn history(session: usize) -> Vec<Message> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     broca_heap_profile::start();
     let args: Vec<_> = std::env::args().collect();
+    serve(&args).await
+}
+
+async fn serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !(4..=5).contains(&args.len()) {
         return Err(
             "usage: memory-load-server <state-root> <stub-base-url> <sessions> [idle-ttl-ms]"
@@ -124,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let root = PathBuf::from(&args[1]);
+    broca_store::require_legacy_operator_root(&root, "memory-load-server")?;
     let sessions: usize = args[3].parse()?;
     // Without the argument the opener keeps the production idle TTL. A TTL longer than the
     // whole load keeps every short session's actor warm until the steady snapshot, so two
@@ -136,10 +140,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let catalog = Arc::new(broca_catalog::CatalogCache::open(root.join("catalog.json")));
     assert!(catalog.lkg_load_error().is_none(), "catalog load failed");
     broca_catalog::install_global_catalog_cache(catalog.clone());
-    let wal = Arc::new(FileWalStore::new(root.join("wal")));
-    let leases = Arc::new(FileLeaseStore::new(root.join("leases")));
-    let store = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db"))?);
-    wal.set_session_ref_index(store.clone());
+    let broca_module_serve::bundle::LegacyBundle { wal, leases, store } =
+        broca_module_serve::bundle::open_legacy_bundle(&root, "memory-load-server")?;
     let exec = Arc::new(Executor {
         wal: wal.clone(),
         store: store.clone(),
@@ -239,4 +241,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     registry.stop_and_seal().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn load_server_refuses_before_creating_project_catalog_or_index() {
+        for (index, marker) in [
+            Some(b"broca-state/2\n".as_slice()),
+            Some(b"malformed"),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for existing in [false, true] {
+                let root = broca_test_support::scratch_root().join(format!(
+                    "load-root-{}-{index}-{existing}",
+                    std::process::id()
+                ));
+                std::fs::create_dir(&root).unwrap();
+                match marker {
+                    Some(bytes) => std::fs::write(root.join("state-format"), bytes).unwrap(),
+                    None => std::fs::create_dir(root.join("state-format")).unwrap(),
+                }
+                for name in [
+                    "run-index.db",
+                    "run-index.db-wal",
+                    "run-index.db-shm",
+                    "operator-data",
+                ] {
+                    if existing || name == "operator-data" {
+                        std::fs::write(root.join(name), name).unwrap();
+                    }
+                }
+                let error = serve(&[
+                    "memory-load-server".into(),
+                    root.to_str().unwrap().into(),
+                    "http://unused.invalid".into(),
+                    "0".into(),
+                ])
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    std::fs::read_dir(&root).unwrap().count(),
+                    if existing { 5 } else { 2 }
+                );
+                let refusal = error
+                    .downcast_ref::<broca_store::LegacyOnlyOperator>()
+                    .unwrap();
+                assert_eq!(refusal.operator, "memory-load-server");
+                assert_eq!(refusal.root, root);
+                for name in [
+                    "run-index.db",
+                    "run-index.db-wal",
+                    "run-index.db-shm",
+                    "operator-data",
+                ] {
+                    if existing || name == "operator-data" {
+                        assert_eq!(std::fs::read(root.join(name)).unwrap(), name.as_bytes());
+                    } else {
+                        assert!(!root.join(name).exists());
+                    }
+                }
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn load_server_missing_marker_keeps_legacy_argument_validation() {
+        let root =
+            broca_test_support::scratch_root().join(format!("legacy-load-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let error = serve(&[
+            "memory-load-server".into(),
+            root.to_str().unwrap().into(),
+            "http://unused.invalid".into(),
+            "not-a-count".into(),
+        ])
+        .await
+        .unwrap_err();
+        assert!(error.downcast_ref::<std::num::ParseIntError>().is_some());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir(root).unwrap();
+    }
 }

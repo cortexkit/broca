@@ -421,8 +421,17 @@ PROVIDER-INVALID (Anthropic rejects it).
 
 1. **Acquire the lease** (new lease-tenure stamp — §5). Open the WAL; validate each
    record's digest + monotonic `seq` (the `fence` is retained as forensic metadata, not a
-   replay gate). Discard a torn/corrupt TRAILING record (never committed); **FAIL LOUD on
-    non-tail corruption**. A digest-verified frame that this reader cannot interpret
+   replay gate). Legacy writable recovery and read-only replay discard a damaged
+   physical tail and **FAIL LOUD on non-tail corruption**. Overhaul writable
+   recovery defaults to `wal_recovery: "repair"`: preserve the entire removed
+   suffix in durable `.cut-<unix_ms>` evidence before truncation, retain the intact
+   prefix, and durably tombstone attributed tool calls under `wal-recovery/v1`.
+   The visibility proof names the damage reason but is never a safety boundary.
+   `wal_recovery: "refuse"` rejects damaged overhaul files without changing them.
+   See `wal-and-resume-design.md` for crash ordering, immutable manifests and the
+   non-blocking `unattributed_tool_risk` warning when storage damage destroyed
+   attribution. Unknown must-understand features refuse in either mode. For legacy
+   recovery, a digest-verified frame that this reader cannot interpret
     is intact authority data, not evidence of crash damage: it refuses replay/open,
     even at EOF, and is never repaired or truncated. Trailing lineage metadata
     (reserved frames carrying the WAL's durable 128-bit identity, rather than run
@@ -527,4 +536,6 @@ each barrier fsync.
   process-local diagnostics; they do not replace WAL replay after a process restart.
 - **Non-idempotent INDETERMINATE** → interrupt / operator recovery, never a
   silent continue.
-- **Non-tail WAL corruption** (digest/seq mismatch mid-log) → FAIL LOUD.
+- **Non-tail WAL corruption** (digest/seq mismatch mid-log): legacy/read-only
+  paths fail loud; overhaul writable recovery follows the configured repair or
+  refuse policy in §4, with loss-preserving sidecars and tool-call tombstones.

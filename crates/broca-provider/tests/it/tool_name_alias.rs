@@ -18,6 +18,7 @@ const CANONICAL: &str = "mcp.server/list-files";
 
 fn options() -> CallOptions {
     let mut options = CallOptions::new(vec![Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,

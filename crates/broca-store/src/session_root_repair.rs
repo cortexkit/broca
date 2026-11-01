@@ -642,6 +642,8 @@ fn plan_projection_cleanup(
         // cache: the WAL can prove a prefix even if the live key was never read.
         Ok(SqliteStore::prepare_projection(
             broca_core::projection_plan::ProjectionSnapshot {
+                context_epoch: 0,
+                required_recovery_cuts: Vec::new(),
                 attribution_complete: true,
                 seed: None,
                 watermark: 0,

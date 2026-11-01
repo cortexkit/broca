@@ -176,7 +176,7 @@ fn read(
     .transpose()
 }
 
-fn write(
+pub(super) fn write(
     tx: &rusqlite::Transaction<'_>,
     session: &str,
     lineage_id: &str,

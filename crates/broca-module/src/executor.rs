@@ -39,7 +39,7 @@ pub struct RunJob {
     pub media_profile: Option<Box<broca_provider::media_profile::MediaProfile>>,
     /// Routing affinity supplied by the admitting send, including a drained queued send.
     pub conversation_key: Option<String>,
-    /// Abstract level recovered from a durable queued request, not a fresh public send.
+    /// Abstract level from the submission, separate from core's legacy provider-tier enum.
     pub queued_service_tier: Option<String>,
     pub req: RunRequest,
     /// Caller-scoped credential selection carried separately from core's provider-agnostic request.
@@ -125,6 +125,13 @@ impl RunJob {
 /// fake.
 #[async_trait]
 pub trait RunExecutor: Send + Sync + 'static {
+    /// Validate the abstract level before a send can enter the durable queue.
+    fn check_service_tier(
+        &self,
+        _request: &broca_protocol::request::SubmissionRequest,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Current operator opt-in for source-cache maintenance, independent of durable routing.
     fn source_warm_enabled(&self) -> bool {
         false

@@ -33,6 +33,7 @@ fn request() -> CallOptions {
         serde_json::from_value(json!([{"op":"append","block":1,"text":"+hook"}])).unwrap();
     broca_core::hooks::apply_message_ops(&mut content, &ops).unwrap();
     CallOptions::new(vec![Message {
+        turn_system: false,
         role: Role::Assistant,
         content,
         origin: None,
@@ -56,6 +57,7 @@ fn tool_call_only_request() -> CallOptions {
     assert!(broca_core::hooks::apply_message_ops(&mut content, &ops).is_err());
     assert_eq!(content, before);
     CallOptions::new(vec![Message {
+        turn_system: false,
         role: Role::Assistant,
         content,
         origin: None,

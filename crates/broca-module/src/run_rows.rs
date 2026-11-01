@@ -436,6 +436,8 @@ mod tests {
         source: Arc<OverhaulRunSource>,
         publish_on_append: bool,
         media: bool,
+        // Fields are dropped in order; remove the directory only after closing its files.
+        _scratch: Scratch,
     }
     impl Fixture {
         fn new(name: &str) -> Self {
@@ -454,6 +456,7 @@ mod tests {
                 store,
             ));
             Self {
+                _scratch: Scratch(root.clone()),
                 root,
                 key,
                 wal,
@@ -479,11 +482,13 @@ mod tests {
             // so publication can use the durable byte end recorded by its successful sync.
             drop(store.open(key).unwrap());
             Box::new(
-                broca_wal::FileWal::open(store.wal_path(key))
-                    .unwrap()
-                    .with_feature_floor(root.join("wal-floor"))
-                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                    .unwrap(),
+                broca_wal::FileWal::open_with_recovery(
+                    store.wal_path(key),
+                    broca_wal::WalConfig::OVERHAUL,
+                    root.join("wal-floor"),
+                )
+                .unwrap()
+                .with_feature_floor(root.join("wal-floor")),
             )
         }
         fn append(&mut self, record: WalRecord) {
@@ -649,10 +654,19 @@ mod tests {
             self.append(WalRecord::TurnFinished { step_id: StepId(1) });
         }
     }
-    impl Drop for Fixture {
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn fixture_cleanup_closes_database_and_wal() {
+        let fixture = Fixture::new("cleanup");
+        let root = fixture.root.clone();
+        drop(fixture);
+        assert!(!root.exists(), "fixture left its scratch directory behind");
     }
 
     struct ReadPlan {
@@ -1052,6 +1066,7 @@ mod tests {
         f.history();
         f.start("paused");
         f.append(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("paused".into()),
             ts_ms: None,
             reason: broca_protocol::PauseReason::Restart,
@@ -1561,6 +1576,7 @@ mod tests {
         };
         assert!(!qualified(), "a start alone is not a committed cut");
         f.append(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("zero-step".into()),
             ts_ms: None,
             reason: broca_protocol::PauseReason::AuthRequired,

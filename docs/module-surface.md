@@ -352,6 +352,24 @@ request increments after authorization and migration checks, even when its param
 later return an error. Authorization and migration refusals are not counted. The existing
 `session_reads` and `actor_opens` counters remain available with their existing meanings.
 
+`health.check.metrics.session_readers` is a process-wide, in-memory census of authorized
+read attempts, separate from the legacy numeric `metrics.session_reads`. Its `entries` array
+contains `{principal, op, owner, count, last_ms}` for `session.read`, `session.history`,
+`session.head`, `session.subscribe`, `run.status`, `run.result`, `run.tool_calls`, `send.status`
+and `session.media_read`. Authorization and migration refusals are excluded; later parameter
+or handler errors still count. Subscriptions count once when opened, not once per frame.
+The principal is rendered from the daemon's route stamp (`reserved:<module_id>`, `direct`,
+`unverified`, or the existing principal type's other rendering); a bind from an older daemon
+with no stamp is named `unattested`. Request parameters cannot change that attribution.
+`owner` is true for the recorded first sender or scope owner, false for other callers, and
+null when ordinary requests have not yet loaded ownership into the cache. Unknown reads
+retain their own keys rather than being reclassified later. Telemetry never reads storage
+or opens an actor to discover ownership. The key is `(principal, op, owner)` with at most 256
+distinct keys; attempts introducing further keys increment `overflow`, while existing keys
+continue counting. Counts, `overflow` and the epoch-millisecond `last_ms` values reset on
+restart; `since_ms` is the daemon's process-start coverage timestamp. No census is written
+to a log or store.
+
 To see one debug record per served operation, add a `CK_LOG` value to broca's module environment
 in `subc.jsonc`:
 
@@ -489,10 +507,56 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   omission for every send. Any other send must name `model`. When an inheriting send is
   queued behind a running turn, its recorded request carries the frozen model itself, so a
   build that does not know the inherited set still runs it on the session's model.
+  With the service-tier writer enabled, `service_tier` follows the fixed-run rules below
+  instead of inheriting from an ended run.
 
 Broca does not send `service_tier` to account routing; a tier chosen by a router reaches broca
 only through the caller's send. Broca does not report `service_tier_applied` or
 `service_tier_served` to account routing.
+
+#### Service-tier writer switch
+
+The boot-only root setting in `broca.jsonc` is `"service_tier": {"enabled": true}`.
+An absent block, an empty block or `"enabled": false` leaves it **off**. A bare boolean,
+an unknown member in the block, or a non-boolean `enabled` refuses boot naming
+`service_tier.enabled`. Other root settings remain owned by their existing loaders.
+Like `anthropic_fallbacks.refusal_resend.enabled`, changing this switch requires a restart.
+
+Off preserves the legacy `flex`/`default`/`priority` admission and frozen bundles, WAL bytes,
+discovery, default replies and provider requests. It does not declare the `service_tier`
+group or add tier members to default run usage. Queue reading remains available
+even when the writer switch is off.
+
+On declares `service_tier` and `role.describe.service_tiers`, and accepts only the abstract
+`standard`, `fast` and `ultrafast` levels on `session.send`. A new run without the member
+starts at standard; a send into an unfinished run inherits its fixed tier when absent.
+Explicitly changing that tier, including explicitly asking for standard, refuses
+`invalid_params` with detail `{field: "service_tier", reason: "run_tier_fixed"}`.
+Unknown levels and unsupported routes refuse before a model call with reason
+`unsupported_tier`, naming the level and, for route refusals, the model. Fast renders
+OpenAI `priority`; ultrafast is available only on an OpenAI wire whose model row has priced
+input and output ultrafast modes. Non-standard modes are never priced from base rates.
+Discovery lists family support, not a promise that every model on that family prices a mode.
+
+Tier-bearing queued sends retain the open `service_tier_level` string and require a reader
+supporting `service-tier-queue/v1`, available since broca 0.3.298. Admitted runs render their recorded configuration on resume,
+without consulting the current catalog for tier eligibility. The legacy closed
+`service_tier_request` decoder stays for old render bundles; it does not gain abstract variants.
+
+With the switch on, `run.status` and `run.result` add optional
+`usage.service_tier_applied` (non-standard only) and `usage.service_tier_served`. Served comes
+only from provider statements, including an explicitly reported standard. Missing reports do
+not vote; conflicting reports leave served absent, including after restart. Unmapped served
+strings remain verbatim. The existing durable run/step records rebuild this projection;
+there is no new durable usage accumulator. A compaction session sends `compaction.ride` with
+cause `service_tier_change` to its compaction provider before the first changed-tier request,
+including a return to standard, and its next notice
+carries the change event and non-standard condition. Unchanged tiers do not ride.
+
+The service-tier switch does not depend on role-routing's route-selection and reporting
+contract. Broca uses its own `route.account_for` / `route.account_observe` protocol instead.
+Those calls still carry neither the applied nor served tier.
+The switch adopts llm-runner service tiers, not a second account-routing path.
 
 #### Hard session input-token cap
 
@@ -1541,29 +1605,29 @@ refusal is counted in `health.check` as `reverse_requests_refused`.
 
 **Tool result formats and provider-held calls.** The daemon's dispatch routes declare
 `consumer_capabilities: ["tool-result/v1", "held-reply/v1"]` in every build. Typed result
-decoding still requires the result-format opt-in in the provider's frozen catalog. Negotiating
-`tool-result/v1` does not change the stored text or error payload bytes. Dispatch captures images
-and PDFs through the session's
-media-capture handle. The frozen model's media profile decides which captures reach a model
-request; unsupported kinds remain text markers. Role discovery and management routes do not
+decoding still requires the result-format opt-in in the provider's frozen catalog. Text and errors use the same
+stored bytes as legacy replies. With media disabled, builds append the existing
+"not shown to the model" notice for each omitted image. With media enabled, dispatch captures
+images and PDFs through the session's media-capture handle. Role discovery and management routes do not
 negotiate tool results.
 
-### Model-based media input
+### Runtime media opt-in
 
-Media input follows the frozen model's catalog input modalities for every session class,
-including heads, workers and sidekicks. No process configuration is required.
-`test-attachments` provides attachment test helpers that cannot be built into release binaries;
-it is not a deployment prerequisite.
+In `broca.jsonc`, `"media": {"enabled": true}` enables media for the process.
+The section is optional and `enabled` defaults to `false`. Only a boolean is accepted;
+unknown keys inside `media` refuse boot by name. The decision is read once before stores
+are opened: enabling or disabling media requires restarting broca. `test-attachments`
+remains a non-shipping feature for test seams, not a deployment prerequisite.
 
-Every fresh episode whose model explicitly supports a non-text input modality
+Every fresh enabled episode whose model explicitly supports a non-text input modality
 freezes its adapter media profile, even for text-only input: a tool may return an image
 after the first model request. Requests without media retain their ordinary rendered bytes.
 Resume never adds a profile to an older recorded configuration; those runs keep their media
 markers until a fresh episode is admitted. Existing per-family carrier gates remain in force.
 
-`role.describe` always declares the llm-runner `attachments` group and its upload
-and `session.media_read` operations. Upload staging is available independently of the model;
-sending an upload requires the frozen profile to accept its kind and exact MIME type.
+When enabled, `role.describe` declares the llm-runner `attachments` group and its upload
+and `session.media_read` operations. When disabled, it declares neither the group nor
+`session.media_read`; existing upload staging remains available but cannot be sent.
 The operations follow the pinned llm-runner contract §9.12. In particular,
 `session.media_read {sha256, offset, length}` serves at most 2,097,152 decoded bytes as
 `{data, size, mime}`. Zero length omits `data`; EOF returns empty data, and an offset
@@ -1574,13 +1638,13 @@ Capture authorization uses the stored admission checkpoint and a strictly anchor
 WAL tail, not a replay of the transcript for every chunk. A missing or unusable checkpoint
 requires a named, counted full-replay repair through the shared media-seed fallback counter.
 
-Upload appends are strictly contiguous; replaying a chunk refuses
-`upload_offset_mismatch` with the current `received` count. Sends preserve the upload refusal
-codes (`unknown_upload`, `upload_gone`, `upload_not_committed`) instead of reporting a failed
-session open. A send carrying a kind the model cannot accept is refused before admission.
+Enabled upload appends are strictly contiguous; replaying a chunk refuses
+`upload_offset_mismatch` with the current `received` count. Disabled legacy staging keeps
+its existing identical-chunk retry behavior. Sends preserve the upload refusal codes
+(`unknown_upload`, `upload_gone`, `upload_not_committed`) instead of reporting a failed
+session open. A disabled send carrying an upload is still refused before admission.
 
-`session.head.input` reports a finished episode's next model's accepted input kinds and exact
-MIME types from the in-memory catalog
+Enabled `session.head.input` quotes a finished episode's next model from the in-memory catalog
 and adapter MIME filter without changing the recorded config or fetching catalog data.
 Active resident heads use frozen facts published by the writer's durable metadata tap.
 Nonresident resumable heads cache the frozen facts by session, lineage and WAL sequence;
@@ -1588,13 +1652,13 @@ only a cold position requires a historical read. No stored head-projection shape
 
 Default reads keep media as text markers. `session.read` with `media: "blocks"` returns
 stored references; descriptors and history display rows expose refs rather than payload
-bytes. Blocks reads include a digest of each media-bearing message and digests identifying
-each of its content parts. Default model-view reads also use not-requested text markers; explicit
+bytes. Enabled blocks reads include stored-content message/part identities for media-bearing
+entries. Default enabled model-view reads also use not-requested text markers; explicit
 blocks mode keeps native media references. Provider rendering uses the frozen family's media profile; unsupported person input
 is refused before publication, including ChatGPT audio. Sessions holding media refuse
 agent-data moves before any cut or freeze because move transport currently carries WALs
 only. The existing Engram catalog already includes `media-durable` as a portable filetree
-and excludes temporary, retained and ephemeral media stores; model-based admission needs no
+and excludes temporary, retained and ephemeral media stores; enabling media needs no
 descriptor change.
 
 ### Provider-held calls
@@ -1685,7 +1749,13 @@ for an already-durably-cancelled call. Neither shutdown nor restart creates a wi
 by itself, and a call that completed before its sibling was cancelled is not withdrawn. The
 registry's stop signal suppresses new withdrawal attempts and retries during drain; an earlier
 request may already have reached the provider. Health exposes pending/failed withdrawals and
-their refusal codes.
+their refusal codes. Route refusals `scope_not_live` and `scope_ended` mean withdrawal is
+impossible under the original scope, not that the held call was cancelled or its outcome is
+known. They count in `provider_held.withdrawals.scope_gone`, not `failed`, and do not degrade
+health; `scope_gone_details` retains at most ten diagnostics with the same `code`, `answer`
+and `reason` fields as `failure_details`. All other refusals and errors still count as failures.
+After a cancelled call's terminal is durable, a later result is only receipted and acked as a
+no-op when the module's on-demand feed next drains, not guaranteed to be delivered to the run.
 
 Late-result pullers start before withdrawal recovery, which runs independently and obeys the
 registry's stop signal. Withdrawal recovery snapshots the outbox once, groups rows by session,

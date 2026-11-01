@@ -168,14 +168,18 @@ impl Rig {
 
     // A caller may register a live catalog producer before opening the first broca route.
     async fn launch(model_url: &str, catalog: Option<Value>) -> Option<Self> {
-        Self::launch_configured(model_url, catalog).await
+        Self::launch_configured(model_url, catalog, cfg!(feature = "test-attachments")).await
     }
 
     async fn launch_media(model_url: &str, catalog: Option<Value>) -> Option<Self> {
-        Self::launch_configured(model_url, catalog).await
+        Self::launch_configured(model_url, catalog, true).await
     }
 
-    async fn launch_configured(model_url: &str, catalog: Option<Value>) -> Option<Self> {
+    async fn launch_configured(
+        model_url: &str,
+        catalog: Option<Value>,
+        media: bool,
+    ) -> Option<Self> {
         let subc_source = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
         let fake_aft = broca_test_support::subc_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
         for bin in [&subc_source, &fake_aft] {
@@ -210,7 +214,11 @@ impl Rig {
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let broca_config = dir.join("broca.jsonc");
-        std::fs::write(&broca_config, b"{}").unwrap();
+        std::fs::write(
+            &broca_config,
+            serde_json::to_vec(&serde_json::json!({"media":{"enabled":media}})).unwrap(),
+        )
+        .unwrap();
         // A seeded catalog keeps renderer-version tests offline. Leaving it absent
         // requires bootstrap to fetch facts from the live catalog module.
         if let Some(catalog) = catalog {
@@ -656,8 +664,8 @@ async fn person_pdf_reaches_debug_gate_and_is_refused_without_any_session_write(
         .await
         .unwrap();
     assert!(
-        describe.to_string().contains("\"attachments\""),
-        "attachments are declared even when the selected model refuses PDFs: {describe}"
+        !describe.to_string().contains("\"attachments\""),
+        "the debug ingress does not promise media.read: {describe}"
     );
     let reply = conn.route_request(&route, serde_json::to_vec(&serde_json::json!({
         "method":"session.send", "params": {"prompt":"inspect", "send_id":"pdf-gate", "model":{"provider":PROVIDER,"model":MODEL}, "content":[{"type":"upload","upload_id":id}]}

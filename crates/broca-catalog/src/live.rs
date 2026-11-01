@@ -128,8 +128,7 @@ pub struct ResolveOptions<'a> {
     /// refused, naming the offered tiers. A resume passes the frozen tier through
     /// `EpisodeRenderConfig` instead.
     pub service_tier: Option<ServiceTier>,
-    /// Abstract level recovered from a durable queue written by a later release. Fresh public
-    /// sends never set this reader-only input. Resumed runs use their recorded render bundle.
+    /// Abstract level from a public send or durable queue. Resumed runs use their recorded bundle.
     pub queued_service_tier: Option<&'a str>,
     /// Where a fresh token for the run's own credential comes from when the provider rejects
     /// the served one with a 401 mid-run or its token is about to expire. Used only with
@@ -1800,8 +1799,7 @@ fn apply_service_tier(
     broca_provider::service_tier::freeze_service_tier(frozen, provider_id, requested)
 }
 
-/// Interpret the abstract level retained by a queued request without extending the legacy
-/// stored enum. Public send admission cannot set this input until the writer release ships.
+/// Interpret an abstract level without extending the legacy stored enum.
 fn apply_queued_service_tier(
     frozen: &mut FrozenRenderConfig,
     level: &str,
@@ -1851,6 +1849,20 @@ fn apply_queued_service_tier(
         provider_id,
         catalog_model,
         priced_modes,
+    )
+}
+
+/// Check an enqueue against its model row and selected family without making a model call.
+pub fn check_service_tier_level(
+    family: WireFamilyId,
+    level: &str,
+    provider_id: &str,
+    catalog_model: &str,
+    priced_modes: &[String],
+) -> Result<(), String> {
+    let mut frozen = broca_provider::families::frozen_config_for_family(family, catalog_model);
+    apply_queued_service_tier(&mut frozen, level, provider_id, catalog_model, priced_modes).map_err(
+        |error| format!("service_tier {level:?} is unsupported for {catalog_model}: {error}"),
     )
 }
 

@@ -738,6 +738,7 @@ async fn source_schedule_rebuilds_from_log_after_shutdown_and_restart_pause() {
     f.start().await;
     f.warm(2).await;
     f.record(WalRecord::RunPaused {
+        account_limit: None,
         run_id: RunId("r".into()),
         reason: broca_protocol::PauseReason::Restart,
         error: None,
@@ -877,6 +878,7 @@ impl Fixture {
 
     async fn pause_resume(&mut self) {
         self.record(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r".into()),
             reason: broca_protocol::PauseReason::Restart,
             error: None,

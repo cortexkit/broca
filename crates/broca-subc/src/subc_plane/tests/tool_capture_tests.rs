@@ -24,6 +24,7 @@ fn media_block(kind: &str, mime: &str, bytes: &[u8]) -> serde_json::Value {
 }
 
 fn capture_ctx(batch: &str) -> (PathBuf, BatchCtx, MediaStore) {
+    assert!(broca_protocol::attachments_enabled());
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let root = broca_test_support::scratch_root().join(format!(
         "tool-capture-{}-{}",

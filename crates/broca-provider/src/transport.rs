@@ -1244,14 +1244,16 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     }
 
     fn supports_media_renderer(&self) -> bool {
-        true
+        broca_protocol::attachments_enabled()
     }
 
     fn set_media_request_renderer(
         &self,
         renderer: Arc<broca_core::provider::MediaRequestRenderer>,
     ) {
-        *self.media_renderer.write().unwrap() = Some(renderer);
+        if broca_protocol::attachments_enabled() {
+            *self.media_renderer.write().unwrap() = Some(renderer);
+        }
     }
 
     fn defer_media_tags(&self, render_tags: bool) -> bool {
@@ -7989,11 +7991,15 @@ mod tests {
         let floor = phase.join(broca_wal::FEATURE_FLOOR_FILENAME);
         broca_wal::floor::raise_floor(&floor, broca_wal::framing::KNOWN_FEATURES).unwrap();
         {
-            let mut wal = FileWal::open(phase.join(&log))
-                .unwrap()
-                .with_feature_floor(floor.clone())
-                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                .unwrap();
+            let mut wal = FileWal::open_with_recovery(
+                phase.join(&log),
+                broca_wal::WalConfig::OVERHAUL,
+                floor.clone(),
+            )
+            .unwrap()
+            .with_feature_floor(floor.clone())
+            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+            .unwrap();
             let opened = WalRecord::WriterOpened {
                 writer_id: wal.writer_id().unwrap(),
                 previous_writer_id: None,
@@ -8011,11 +8017,15 @@ mod tests {
         }
         let recording = Arc::new(RecordingFs::new(&phase).unwrap());
         broca_wal::fs_ops::with_fs_ops(recording.clone(), || {
-            let mut wal = FileWal::open(phase.join(&log))
-                .unwrap()
-                .with_feature_floor(floor)
-                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                .unwrap();
+            let mut wal = FileWal::open_with_recovery(
+                phase.join(&log),
+                broca_wal::WalConfig::OVERHAUL,
+                floor.clone(),
+            )
+            .unwrap()
+            .with_feature_floor(floor)
+            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+            .unwrap();
             wal.append_v4(
                 1,
                 &reservation,
@@ -8083,6 +8093,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     async fn run_recorded_attempt<P: broca_core::Provider>(
         root: &std::path::Path,
         provider: &P,
@@ -8280,7 +8291,9 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct LargeAttemptFamily;
+    #[cfg(unix)]
     impl WireFamily for LargeAttemptFamily {
         fn shape(&self, _frozen: &crate::wire::FrozenRenderConfig, _opts: &CallOptions) -> Value {
             serde_json::json!({"model":"m", "padding":"x".repeat(100_000)})
@@ -8416,6 +8429,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(all(feature = "portable-power-loss", target_os = "linux"))]
     fn raw_attempt_frames(mut bytes: &[u8]) -> Vec<broca_wal::FramedRecord> {
         use broca_wal::framing::{decode_next, DecodeStep};
         let mut frames = Vec::new();
@@ -8429,7 +8443,8 @@ mod tests {
                 DecodeStep::TornTail => break,
                 // Unsynced block holes can leave a zero version byte or a failed digest.
                 // Count only the intact prefix here; real FileWal recovery below must
-                // prove this is a repairable tail, not silently skip interior corruption.
+                // save every byte from the first damaged frame onward in a sidecar
+                // and append RecoveryCut, not silently skip damaged bytes.
                 DecodeStep::Corrupt(_) => break,
                 DecodeStep::NewerWriter { .. } => panic!("unsupported power-loss image"),
             }
@@ -8437,6 +8452,7 @@ mod tests {
         frames
     }
 
+    #[cfg(unix)]
     async fn reclaim_attempt_image(
         root: &std::path::Path,
         fs: Arc<dyn broca_wal::fs_ops::FsOps>,
@@ -8462,241 +8478,10 @@ mod tests {
         store.read_records(&session).unwrap()
     }
 
-    #[tokio::test]
-    #[ignore = "requires v4 unsynced-tail recovery: FileWal refuses a zero-filled unsynced append tail"]
-    async fn attempt_hook_power_loss_send_refusal_outcome_terminal_and_reclaim() {
-        use broca_crash_harness::power_loss::RecordingFs;
-        use broca_wal::{FileWal, PreparedV4Frame, Wal, WalRecord};
-        let server = ScriptedServer::start(vec![
-            ScriptResponse::Http {
-                status: 415,
-                headers: vec![],
-                body: b"",
-            },
-            ScriptResponse::Http {
-                status: 400,
-                headers: vec![],
-                body: b"invalid",
-            },
-        ])
-        .await;
-        let address: std::net::SocketAddr =
-            server.url.strip_prefix("http://").unwrap().parse().unwrap();
-        let client = ProviderHttpClient::resolving_anthropic_api_to(address, true);
-        let mut frozen = crate::families::anthropic_frozen_config("m");
-        frozen.base_url = Some(format!("http://api.anthropic.com:{}", address.port()));
-        let provider = LiveProvider::with_client_and_clock(
-            client,
-            LargeAttemptFamily,
-            frozen,
-            AuthHandle::None,
-            Clock::default(),
-        );
-        let root = attempt_scratch("attempt-power-loss");
-        let capture = root.join("capture");
-        std::fs::create_dir_all(&capture).unwrap();
-        let recording = Arc::new(RecordingFs::new(&capture).unwrap());
-        let frames = run_recorded_attempt(&capture, &provider, Default::default(), recording).await;
-        assert_eq!(assert_attempts_settled_or_superseded(&frames), 2);
-        let records: Vec<_> = frames
-            .into_iter()
-            .map(|frame| frame.record)
-            .filter(|record| {
-                matches!(
-                    record,
-                    WalRecord::AttemptReserved { .. }
-                        | WalRecord::ModelAttemptFinished {
-                            attempt_id: Some(_),
-                            ..
-                        }
-                        | WalRecord::RunFinished { .. }
-                )
-            })
-            .collect();
-        assert_eq!(records.len(), 5);
-        let log = PathBuf::from("wal").join(format!(
-            "{}.wal",
-            broca_core::wal_writer::session_addr(&attempt_session())
-        ));
-        let mut first_cuts = 0;
-        let mut second_cuts = 0;
-        let mut phases = std::collections::BTreeSet::new();
-        // Replay the real transport's records through the unmodified filesystem harness in
-        // bounded durability intervals. The channel tests prove when these appends occur;
-        // these intervals exhaust loss/tearing of each append, including both paired barriers.
-        for (phase, prefix, end) in [
-            ("before_first_send", 0, 1),
-            ("send_to_outcome", 1, 2),
-            ("refusal_to_resend", 1, 3),
-            ("resend_to_outcome", 3, 4),
-            ("outcome_to_terminal", 3, 5),
-        ] {
-            let phase_root = root.join(phase);
-            std::fs::create_dir_all(phase_root.join("wal")).unwrap();
-            broca_wal::floor::raise_floor(
-                &phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
-                broca_wal::framing::KNOWN_FEATURES,
-            )
-            .unwrap();
-            // Initial file creation/lineage recovery is covered separately. A send starts
-            // from a log with an authentic durable header, never a newly created zero hole.
-            let previous_writer_id = {
-                let mut wal = FileWal::open(phase_root.join(&log))
-                    .unwrap()
-                    .with_feature_floor(phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
-                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                    .unwrap();
-                let id = wal.writer_id().unwrap();
-                let record = WalRecord::WriterOpened {
-                    writer_id: id,
-                    previous_writer_id: None,
-                    recovered_through_seq: 0,
-                    cause: "test".into(),
-                };
-                wal.append_v4(
-                    1,
-                    &record,
-                    true,
-                    PreparedV4Frame::prepare(&record).unwrap(),
-                    1,
-                )
-                .unwrap();
-                id
-            };
-            let recording = Arc::new(RecordingFs::new(&phase_root).unwrap());
-            broca_wal::fs_ops::with_fs_ops(recording.clone(), || {
-                let mut wal = FileWal::open(phase_root.join(&log))
-                    .unwrap()
-                    .with_feature_floor(phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
-                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                    .unwrap();
-                let opened = WalRecord::WriterOpened {
-                    writer_id: wal.writer_id().unwrap(),
-                    previous_writer_id: Some(previous_writer_id),
-                    recovered_through_seq: wal.last_seq(),
-                    cause: "test".into(),
-                };
-                wal.append_v4(
-                    1,
-                    &opened,
-                    true,
-                    PreparedV4Frame::prepare(&opened).unwrap(),
-                    1,
-                )
-                .unwrap();
-                for (index, record) in records[..end].iter().enumerate() {
-                    let sync = index < prefix
-                        || index + 1 == end
-                            && matches!(
-                                record,
-                                WalRecord::AttemptReserved { .. } | WalRecord::RunFinished { .. }
-                            );
-                    wal.append_v4(
-                        1,
-                        record,
-                        sync,
-                        PreparedV4Frame::prepare(record).unwrap(),
-                        2 + index as u64,
-                    )
-                    .unwrap();
-                }
-            });
-            let cuts = recording.enumerate(100_000).unwrap();
-            first_cuts += cuts.len();
-            for (index, cut) in cuts.iter().enumerate() {
-                let bytes = cut
-                    .state
-                    .files
-                    .get(&log)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                let raw = raw_attempt_frames(bytes);
-                let reserved = raw
-                    .iter()
-                    .filter(|frame| matches!(frame.record, WalRecord::AttemptReserved { .. }))
-                    .count();
-                let finished = raw
-                    .iter()
-                    .filter(|frame| {
-                        matches!(
-                            frame.record,
-                            WalRecord::ModelAttemptFinished {
-                                attempt_id: Some(_),
-                                ..
-                            }
-                        )
-                    })
-                    .count();
-                phases.insert((
-                    reserved,
-                    finished,
-                    raw.iter()
-                        .any(|frame| matches!(frame.record, WalRecord::RunFinished { .. })),
-                ));
-                let recovered_root = root.join(format!("first-{phase}-{index}"));
-                cut.state.install(&recovered_root).unwrap();
-                let recovery = Arc::new(RecordingFs::new(&recovered_root).unwrap());
-                // Enumerate a second loss while the physical WAL recovers its torn tail.
-                // Writer identity/publication cuts are proved by the writer lifecycle tests;
-                // every image here then goes through the real reclaim opener and close.
-                broca_wal::fs_ops::with_fs_ops(recovery.clone(), || {
-                    match FileWal::open(recovered_root.join(&log)) {
-                        Ok(wal) => {
-                            wal.replay().unwrap();
-                        }
-                        Err(error) => {
-                            if let Some(output) =
-                                std::env::var_os("BROCA_ATTEMPT_FAILURE_FIXTURE_DIR")
-                            {
-                                let output = PathBuf::from(output);
-                                std::fs::create_dir_all(&output).unwrap();
-                                std::fs::write(output.join("v4-unsynced-tail.wal"), bytes).unwrap();
-                                std::fs::write(output.join("README.md"), format!(
-                                    "# Unsynced v4 append-tail recovery fixture\n\nSynthetic billing records captured from the real HTTP gzip-refusal/resend path.\n\n- Durability interval: `{phase}`.\n- H1 image: index `{index}`, filesystem cut `{:?}`, persistence family `{:?}`.\n- Existing `FileWal::open` refuses with `{error:?}`.\n- The intact prefix contains {reserved} reservation(s) and {finished} settlement(s).\n\nThe bytes contain synthetic identities only. No real credentials or message content is present.\n\nReproduce the generating acceptance test on Linux:\n\n```sh\ncargo test --locked -p broca-provider -F live -F test-harness attempt_hook_power_loss --lib -- --ignored --nocapture\n```\n\nThe recovery fix must distinguish this unsynced append-tail loss from damage in the synced prefix. Do not skip refused images or relax the H1 harness. After physical recovery, the test uses the real reclaim writer opener/close and checks each reservation has exactly one settlement or a superseding writer, never both counted as separate attempts.\n", cut.cut, cut.family)).unwrap();
-                            }
-                            panic!("power-loss interval={phase} image={index} cut={:?} family={:?}: {error:?}", cut.cut, cut.family);
-                        }
-                    }
-                });
-                let second_images = recovery.enumerate(100_000).unwrap();
-                let recovered =
-                    reclaim_attempt_image(&recovered_root, Arc::new(broca_wal::fs_ops::RealFs))
-                        .await;
-                assert_eq!(assert_attempts_settled_or_superseded(&recovered), reserved);
-                for second in second_images {
-                    second_cuts += 1;
-                    assert!(second_cuts <= 100_000, "recovery cut budget exceeded");
-                    let again_root = root.join("second");
-                    second.state.install(&again_root).unwrap();
-                    let recovered =
-                        reclaim_attempt_image(&again_root, Arc::new(broca_wal::fs_ops::RealFs))
-                            .await;
-                    assert_eq!(assert_attempts_settled_or_superseded(&recovered), reserved);
-                    std::fs::remove_dir_all(again_root).unwrap();
-                }
-                std::fs::remove_dir_all(recovered_root).unwrap();
-            }
-        }
-        assert!(
-            phases.contains(&(1, 0, false)),
-            "cut after reservation, before outcome"
-        );
-        assert!(
-            phases.contains(&(1, 1, false)),
-            "cut between refusal outcome and resend reservation"
-        );
-        assert!(
-            phases.contains(&(2, 1, false)),
-            "cut before resend and before its outcome"
-        );
-        assert!(
-            phases.contains(&(2, 2, false)),
-            "cut between outcomes and terminal"
-        );
-        println!(
-            "attempt power-loss cuts: first={first_cuts} second={second_cuts} phases={phases:?}"
-        );
-        std::fs::remove_dir_all(root).unwrap();
+    #[cfg(all(feature = "portable-power-loss", target_os = "linux"))]
+    mod attempt_hook_power_loss_portable {
+        use super::*;
+        include!("transport_power_loss_tests.rs");
     }
 
     async fn read_http_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {

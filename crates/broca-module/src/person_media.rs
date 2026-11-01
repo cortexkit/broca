@@ -1,7 +1,11 @@
 //! Read-only staging and the publication boundary for person attachments.
 //!
-//! Person input must fit the frozen model's kind, MIME and encoded-payload limits
-//! before publication.
+//! Admission currently checks an encoded-payload bound for protected media.
+//! Before attachments are enabled in release builds, the byte check must use a
+//! shared measurement of the real rendered would-be request, including history,
+//! tools and new media. This gate must call that measurement before publication;
+//! neither falsely refusing a fitting bundle nor admitting an oversized wire body
+//! is acceptable for the shipping attachment contract.
 
 use broca_core::{media_uploads::Uploads, RunError};
 use broca_protocol::{
@@ -39,6 +43,12 @@ pub fn stage(
 ) -> Result<Vec<StagedMedia>, RunError> {
     if request.content.is_empty() {
         return Ok(Vec::new());
+    }
+    if !broca_protocol::attachments_enabled() {
+        return Err(RunError::Config(format!(
+            "upload {} cannot be sent: attachment admission is unavailable",
+            request.content[0].upload_id()
+        )));
     }
     // A queued request already owns durable references; its upload may have expired.
     if broca_provider::person_media::references(&request.input).count() == request.content.len() {

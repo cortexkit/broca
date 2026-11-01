@@ -722,6 +722,7 @@ async fn paused_restart_steer_is_transformed_and_retry_is_hookless() {
     wal.append(
         1,
         &WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("seed".into()),
             reason: broca_protocol::PauseReason::Restart,
             error: None,

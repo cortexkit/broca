@@ -2731,8 +2731,9 @@ fn upload_staging_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, V
     entries
 }
 
+#[cfg(not(feature = "test-attachments"))]
 #[tokio::test]
-async fn upload_staging_is_declared_but_invalid_pdf_is_not_admitted() {
+async fn upload_roundtrip_is_staged_but_not_advertised_or_admitted() {
     let mut rig = Rig::start("upload-roundtrip").await;
     broca_core::media_store::create_media_directories(&rig.dir).unwrap();
     let begin = serde_json::json!({"mime":"application/pdf","bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"});
@@ -2750,8 +2751,7 @@ async fn upload_staging_is_declared_but_invalid_pdf_is_not_admitted() {
     assert_eq!(result(&first)["received"], 3);
     let before = upload_staging_snapshot(&rig.dir);
     let retry = call(&mut rig, "session.upload_append", append).await;
-    assert_eq!(refusal(&retry)["code"], "upload_offset_mismatch");
-    assert_eq!(refusal(&retry)["detail"]["received"], 3);
+    assert_eq!(result(&retry), result(&first));
     assert_eq!(upload_staging_snapshot(&rig.dir), before);
     let conflict = call(
         &mut rig,
@@ -2781,16 +2781,13 @@ async fn upload_staging_is_declared_but_invalid_pdf_is_not_admitted() {
             serde_json::json!({"content":[{"type":"upload","upload_id":id}]}),
         )
         .await;
-    assert_eq!(refusal(&refused)["code"], "media_unsupported");
-    assert!(refusal(&refused)["message"]
-        .as_str()
-        .unwrap()
-        .contains("pdf"));
+    assert_eq!(refusal(&refused)["code"], "invalid_params");
+    assert!(refusal(&refused)["message"].as_str().unwrap().contains(&id));
     assert_eq!(upload_staging_snapshot(&rig.dir), before);
     assert_eq!(rig.wal_bytes(), wal_before);
     let describe = call(&mut rig, "role.describe", serde_json::json!({})).await;
     let checked = cortexkit_role_llm_runner::describe::check_describe(&result(&describe)).unwrap();
-    assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
+    assert!(!checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
     rig.finish().await;
 }
 

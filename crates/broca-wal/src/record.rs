@@ -584,6 +584,36 @@ fn released_envelope<'de, D: serde::Deserializer<'de>>(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WalRecord {
+    /// Durable attribution of data removed by overhaul recovery. Readers must
+    /// retain these call tombstones even when a later episode starts.
+    RecoveryCut {
+        #[serde(flatten)]
+        recovery: Box<crate::recovery::RecoveryCut>,
+    },
+    /// A prompt-free Unknown terminal for an attributed call whose model turn
+    /// was removed. Ownership comes from preserved recovery evidence, never a
+    /// reconstructed RunStarted or the episode current when this is appended.
+    /// Unknown batch/step identities remain separate entries. When their exact
+    /// effect cannot be proven, duplicate Unknown results are safer than losing
+    /// an attributable call by merging it with another step's same-ID terminal.
+    RecoveryCallClosed {
+        cut_id: String,
+        run_id: RunId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<BatchId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_id: Option<StepId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_key: Option<String>,
+        tool_call_id: ToolCallId,
+        outcome: crate::recovery::RecoveryOutcome,
+        /// A plain outcome_unknown error, never restored media or successful output.
+        #[serde(
+            serialize_with = "serialize_recovery_unknown",
+            deserialize_with = "deserialize_recovery_unknown"
+        )]
+        result: Arc<ToolResult>,
+    },
     /// A new writer has durably taken responsibility for this log's recovered prefix.
     WriterOpened {
         writer_id: [u8; 16],
@@ -855,6 +885,9 @@ pub enum WalRecord {
     /// skip [`WalRecord::Unknown`], so a WAL with these records removed reads as the same
     /// session. `retries_used` on `ModelStepFinished` stays the authoritative retry count.
     ModelAttemptFinished {
+        /// Source classification retained only on runs admitted with timed account recovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_limit_disposition: Option<broca_protocol::provider::AccountLimitDisposition>,
         /// The only billing join key; absent on legacy, non-billing records.
         #[serde(
             default,
@@ -1233,11 +1266,9 @@ pub enum WalRecord {
         at: RunCancelAt,
     },
     /// Episode PAUSE — a NON-terminal durable record (distinct from `RunFinished`).
-    /// Written when a run cannot proceed but is RESUMABLE: a mid-run auth failure
-    /// (`needs_reauth`/revoke) pauses the episode rather than ending it, so replay
-    /// continues the SAME run_id after the cause is resolved. Replay treats this as
-    /// `AuthRequired`, never terminal (a terminal would seal a resumable run). Always
-    /// the last record of its episode (no new episode starts until the pause resolves).
+    /// Written when a run cannot proceed but remains resumable: authentication, restart,
+    /// held tools or a timed account limit. Replay continues the same run_id after the cause
+    /// clears; no new episode starts until the pause resolves or is cancelled.
     RunPaused {
         run_id: RunId,
         /// Wall-clock pause time, used as the terminal time when this is the final record.
@@ -1247,6 +1278,9 @@ pub enum WalRecord {
         /// The error detail behind the pause, persisted for `run.status`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ProviderError>,
+        /// Recovery evidence for a timed account pause; absent on every older pause.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_limit: Option<Box<AccountLimitPause>>,
     },
     /// Replaces the episode's initially frozen provider render config after an auth-at-start
     /// pause. This is legal only before the first provider call: the initial credential lookup
@@ -1892,6 +1926,38 @@ pub enum WalRecord {
     Unknown,
 }
 
+fn is_recovery_unknown(result: &ToolResult) -> bool {
+    result.is_error
+        && matches!(&result.output, broca_protocol::ToolOutput::Error {
+        message, module, code: _, detail, nothing_sent, retry,
+    } if message.starts_with("outcome_unknown") && module.is_none() && detail.is_none()
+        && nothing_sent.is_none() && retry.is_none())
+}
+
+fn serialize_recovery_unknown<S: serde::Serializer>(
+    result: &Arc<ToolResult>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if !is_recovery_unknown(result) {
+        return Err(<S::Error as serde::ser::Error>::custom(
+            "recovery completion result must be a plain outcome_unknown error",
+        ));
+    }
+    result.serialize(serializer)
+}
+
+fn deserialize_recovery_unknown<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Arc<ToolResult>, D::Error> {
+    let result = Arc::<ToolResult>::deserialize(deserializer)?;
+    if !is_recovery_unknown(&result) {
+        return Err(<D::Error as serde::de::Error>::custom(
+            "recovery completion result must be a plain outcome_unknown error",
+        ));
+    }
+    Ok(result)
+}
+
 impl WalRecord {
     /// The WAL record for one provider attempt of `step_id`.
     pub fn model_attempt_finished(step_id: StepId, attempt: ModelAttempt) -> Self {
@@ -1920,6 +1986,7 @@ impl WalRecord {
             account_observation: _,
         } = attempt;
         WalRecord::ModelAttemptFinished {
+            account_limit_disposition: None,
             attempt_id: None,
             reservation: None,
             envelope: None,
@@ -1988,6 +2055,12 @@ impl WalRecord {
     /// on its own, so no caller can write a must-understand value into a frame an older build
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
+        if matches!(
+            self,
+            Self::RecoveryCut { .. } | Self::RecoveryCallClosed { .. }
+        ) {
+            return &[crate::recovery::FEATURE];
+        }
         if matches!(self, Self::VisibilityLate { .. }) {
             return &[crate::head_proof::VISIBILITY_LATE_FEATURE];
         }
@@ -2295,6 +2368,32 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if matches!(
+            self,
+            Self::RunPaused {
+                reason: PauseReason::AccountLimit,
+                ..
+            } | Self::RunPaused {
+                account_limit: Some(_),
+                ..
+            }
+        ) || matches!(self, Self::RunStarted { config, .. } if config.account_limit_pause)
+            || matches!(
+                self,
+                Self::ModelAttemptFinished {
+                    account_limit_disposition: Some(_),
+                    ..
+                }
+            ) {
+            with_feature(base, crate::framing::ACCOUNT_LIMIT_PAUSE_FEATURE)
+        } else {
+            base
+        };
+        let base = if self.carries_turn_system() {
+            with_feature(base, crate::framing::TURN_SYSTEM_FEATURE)
+        } else {
+            base
+        };
         if matches!(
             self,
             Self::ToolDispatchIntent {
@@ -2542,6 +2641,8 @@ impl WalRecord {
             | Self::WriterOpened { .. }
             | Self::WriterClosed { .. }
             | Self::VisibilityLate { .. }
+            | Self::RecoveryCut { .. }
+            | Self::RecoveryCallClosed { .. }
             | Self::Unknown => false,
         }
     }
@@ -2650,6 +2751,40 @@ impl WalRecord {
             } => blocks(&assistant_message.content),
             Self::Queued { request, .. } => messages(&request.input),
             Self::Steered { input, .. } => messages(input),
+            Self::CompactionMessage { replacement, .. } => messages(replacement),
+            _ => false,
+        }
+    }
+
+    fn carries_turn_system(&self) -> bool {
+        let messages = |input: &[Message]| input.iter().any(|message| message.turn_system);
+        let hooks_carry = |hooks: &Option<Box<Hooks>>| {
+            hooks.as_ref().is_some_and(|hooks| {
+                hooks
+                    .original
+                    .iter()
+                    .chain(hooks.final_value.iter())
+                    .any(|value| {
+                        value.as_array().is_some_and(|messages| {
+                            messages.iter().any(|message| {
+                                message
+                                    .get("turn_system")
+                                    .and_then(serde_json::Value::as_bool)
+                                    == Some(true)
+                            })
+                        })
+                    })
+            })
+        };
+        match self {
+            Self::RunStarted { input, hooks, .. } | Self::Steered { input, hooks, .. } => {
+                messages(input) || hooks_carry(hooks)
+            }
+            Self::Queued { request, hooks, .. } => messages(&request.input) || hooks_carry(hooks),
+            Self::SendDelivered { input, mode, .. } => {
+                *mode == broca_protocol::DeliveryMode::TurnSystem
+                    || input.as_deref().is_some_and(|input| messages(input))
+            }
             Self::CompactionMessage { replacement, .. } => messages(replacement),
             _ => false,
         }
@@ -3111,6 +3246,36 @@ fn view_carries_media_content(view: &OpaqueJson) -> bool {
 
 /// Cancellation points recorded in the WAL. The run.cancel endpoint rejects all other strings
 /// before writing, rather than interpreting an unknown point as immediate cancellation.
+/// The failed request boundary and selection retained by an account-limit pause. The WAL
+/// sequence identifies its failed physical attempt even when no billing reservation is recorded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountLimitPause {
+    pub failed_step: StepId,
+    pub failed_attempt_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<AttemptId>,
+    pub attempt: u32,
+    pub paused_at_ms: u64,
+    pub observed_at_ms: u64,
+    pub auth_method: String,
+    pub credential_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_ref: Option<String>,
+    pub disposition: broca_protocol::provider::AccountLimitDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<f64>,
+    pub resume_not_before_ms: u64,
+    pub request_body_len: u64,
+    pub request_body_sha256: String,
+    pub selection_round: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_routing_check_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunCancelAt {
@@ -3573,6 +3738,9 @@ pub enum SeedOriginKind {
 /// across a run and its resume.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunConfig {
+    /// Frozen operator consent to automatic same-selection recovery. Omitted on legacy runs.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub account_limit_pause: bool,
     /// Opts a run into the role crate's stable wake-directive grammar. Replay always uses
     /// that grammar with `parse_trailing`; a grammar change needs a new versioned field/name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4132,6 +4300,7 @@ mod schema_tests {
     #[test]
     fn run_config_tools_arc_keeps_existing_wal_bytes() {
         let config = RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -4233,6 +4402,7 @@ mod schema_tests {
 
     fn user_msg(text: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
@@ -4244,6 +4414,7 @@ mod schema_tests {
 
     fn min_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -4267,6 +4438,38 @@ mod schema_tests {
             stop_when: Vec::new(),
             context_management: None,
         })
+    }
+
+    #[test]
+    fn account_limit_pause_consent_is_optional_and_requires_its_reader() {
+        let mut config = min_config();
+        let legacy = serde_json::to_string(&config).unwrap();
+        assert!(!legacy.contains("account_limit_pause"));
+        assert!(
+            !serde_json::from_str::<RunConfig>(&legacy)
+                .unwrap()
+                .account_limit_pause
+        );
+        config.account_limit_pause = true;
+        assert_eq!(
+            serde_json::to_string(&config).unwrap(),
+            format!("{{\"account_limit_pause\":true,{}", &legacy[1..])
+        );
+        let mut record: WalRecord = serde_json::from_str(
+            include_str!("../tests/fixtures/pre_compaction_records.jsonl")
+                .lines()
+                .find(|line| line.contains("\"type\":\"run_started\""))
+                .unwrap(),
+        )
+        .unwrap();
+        if let WalRecord::RunStarted { config: stored, .. } = &mut record {
+            *stored = config;
+        } else {
+            panic!("fixture has a run start");
+        }
+        assert!(record
+            .required_features()
+            .contains(&crate::framing::ACCOUNT_LIMIT_PAUSE_FEATURE));
     }
 
     #[test]
@@ -5078,6 +5281,7 @@ mod schema_tests {
                 retries_used: 0,
             },
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r1".into()),
                 ts_ms: None,
                 reason: PauseReason::AuthRequired,
@@ -5216,6 +5420,7 @@ mod schema_tests {
             retries_used: 1,
         };
         let paused = WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r1".into()),
             ts_ms: Some(1_790_000_000_001),
             reason: PauseReason::AuthRequired,
@@ -5361,6 +5566,7 @@ mod schema_tests {
             ),
             (
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r2".into()),
                     ts_ms: Some(1_790_000_000_005),
                     reason: PauseReason::AuthRequired,

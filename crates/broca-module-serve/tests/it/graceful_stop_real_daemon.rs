@@ -930,6 +930,10 @@ async fn idle_module_restart_declares_busy_gauges_and_ends_drain_early() {
         }
     );
     let metrics = rig.health().await;
+    assert_eq!(
+        metrics["provider_held"]["withdrawals"]["scope_gone"], 0,
+        "a healthy idle daemon has no withdrawals refused by an ended scope"
+    );
     for gauge in [
         "runs_in_flight",
         "opening",

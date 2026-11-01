@@ -117,6 +117,7 @@ fn request(session: BindIdentity, tools: Vec<Tool>) -> RunRequest {
         session,
         model: ModelHandle::new("test", "test"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

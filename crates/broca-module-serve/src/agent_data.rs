@@ -976,74 +976,84 @@ mod operational_port_tests {
         }
     }
 
-    #[tokio::test]
-    async fn boot_and_move_discovery_use_the_selected_inventory_port() {
+    #[test]
+    fn boot_and_move_discovery_use_the_selected_inventory_port() {
         for overhaul in [false, true] {
-            let root = broca_test_support::scratch_root().join(format!(
-                "agent-inventory-port-{}-{overhaul}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(root.join("wal")).unwrap();
-            let wal = Arc::new(FileWalStore::new(root.join("wal")));
-            let registry =
-                LineageRegistry::new_with_sources(Arc::new(NeverOpen), Some(wal.clone()), None);
-            let (index, service): (Arc<dyn InventoryPort>, AgentDataService) = if overhaul {
-                std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
-                let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
-                (
-                    db.clone(),
-                    AgentDataService::with_ports(
-                        root.clone(),
-                        registry,
-                        wal.clone(),
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let root = runtime.block_on(async {
+                let root = broca_test_support::scratch_root().join(format!(
+                    "agent-inventory-port-{}-{overhaul}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(root.join("wal")).unwrap();
+                let wal = Arc::new(FileWalStore::new(root.join("wal")));
+                let registry =
+                    LineageRegistry::new_with_sources(Arc::new(NeverOpen), Some(wal.clone()), None);
+                let (index, service): (Arc<dyn InventoryPort>, AgentDataService) = if overhaul {
+                    std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+                    let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+                    (
                         db.clone(),
-                        db,
-                        Arc::new(NoDoor),
-                    ),
-                )
-            } else {
-                let db =
-                    Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
-                (
-                    db.clone(),
-                    AgentDataService::new(
-                        root.clone(),
-                        registry,
-                        wal.clone(),
-                        db,
-                        Arc::new(NoDoor),
-                    ),
-                )
-            };
-            let session = BindIdentity::new("/project", "runner", "moved");
-            index
-                .record_session(&broca_core::session_addr(&session), &session)
-                .unwrap();
-            let refs: Refs =
-                serde_json::from_value(serde_json::json!([contract::session_reference(
-                    "runner", "/project", "moved"
-                )]))
-                .unwrap();
-            let driver = Driver {
-                root: root.clone(),
-                wal,
-                index: index.clone(),
-                door: Arc::new(NoDoor),
-            };
-            assert!(!driver.local_sessions(&refs).unreadable.is_empty());
-            index.rebuild_inventory(&root).unwrap();
-            service.reconcile_boot().await.unwrap();
-            let found = driver.local_sessions(&refs);
-            assert!(found.unreadable.is_empty());
-            assert_eq!(found.sessions.len(), 1);
-            driver.drop_projection(&session).unwrap();
-            assert_eq!(driver.local_sessions(&refs).sessions.len(), 1);
-            if overhaul {
-                assert!(!root.join("run-index.db").exists());
-            }
-            drop(service);
-            drop(driver);
-            drop(index);
+                        AgentDataService::with_ports(
+                            root.clone(),
+                            registry,
+                            wal.clone(),
+                            db.clone(),
+                            db,
+                            Arc::new(NoDoor),
+                        ),
+                    )
+                } else {
+                    let db = Arc::new(
+                        broca_store::SqliteStore::open(root.join("run-index.db")).unwrap(),
+                    );
+                    (
+                        db.clone(),
+                        AgentDataService::new(
+                            root.clone(),
+                            registry,
+                            wal.clone(),
+                            db,
+                            Arc::new(NoDoor),
+                        ),
+                    )
+                };
+                let session = BindIdentity::new("/project", "runner", "moved");
+                index
+                    .record_session(&broca_core::session_addr(&session), &session)
+                    .unwrap();
+                let refs: Refs =
+                    serde_json::from_value(serde_json::json!([contract::session_reference(
+                        "runner", "/project", "moved"
+                    )]))
+                    .unwrap();
+                let driver = Driver {
+                    root: root.clone(),
+                    wal,
+                    index: index.clone(),
+                    door: Arc::new(NoDoor),
+                };
+                assert!(!driver.local_sessions(&refs).unreadable.is_empty());
+                index.rebuild_inventory(&root).unwrap();
+                service.reconcile_boot().await.unwrap();
+                let found = driver.local_sessions(&refs);
+                assert!(found.unreadable.is_empty());
+                assert_eq!(found.sessions.len(), 1);
+                driver.drop_projection(&session).unwrap();
+                assert_eq!(driver.local_sessions(&refs).sessions.len(), 1);
+                if overhaul {
+                    assert!(!root.join("run-index.db").exists());
+                }
+                drop(service);
+                drop(driver);
+                drop(index);
+                root
+            });
+            // Drain the spawned inventory readiness work so SQLite files are closed on Windows.
+            drop(runtime);
             std::fs::remove_dir_all(root).unwrap();
         }
     }

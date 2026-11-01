@@ -1539,6 +1539,10 @@ pub enum ServeError {
     },
     RetentionInvalid(crate::retention::InvalidRetention),
     VariantUnsupported(broca_core::run::VariantRefusal),
+    ServiceTierInvalid {
+        reason: &'static str,
+        message: String,
+    },
     /// The session is held by another live writer (another process/host).
     SessionHeld(String),
     /// Opening or admission failed. The optional class is set only from a known cause.
@@ -1689,6 +1693,7 @@ impl std::fmt::Display for ServeError {
             ServeError::RetentionInvalid(_) => write!(f, "invalid retention"),
             ServeError::SessionHeld(s) => write!(f, "session '{s}' held by a live writer"),
             ServeError::VariantUnsupported(e) => write!(f, "open failed: run resolution failed: {e}"),
+            ServeError::ServiceTierInvalid { message, .. } => f.write_str(message),
             ServeError::SessionTooLarge { max_bytes } => write!(f, "session log cannot exceed {max_bytes} bytes"),
             ServeError::RetainedSessionTooLarge { max_bytes } => write!(f, "retained session log cannot exceed {max_bytes} bytes"),
             ServeError::Open(s, _)
@@ -1825,6 +1830,16 @@ pub trait ServeHandler: Send + Sync {
         _principal: Option<&broca_protocol::BindPrincipal>,
     ) -> Result<(), ServeError> {
         Ok(())
+    }
+
+    /// Diagnostic ownership observation only; a cold cache is unknown, not a non-owner.
+    /// Implementations must not read storage or open an actor to answer this query.
+    fn cached_session_owner(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        None
     }
 
     /// Owner-only authorization for cancel/retract, independent of route scope and epoch.
@@ -2402,6 +2417,13 @@ impl crate::LineageRegistry {
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
+    fn cached_session_owner(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        crate::LineageRegistry::cached_session_owner(self, session, principal)
+    }
     async fn run_event_get(
         &self,
         session: &LineageKey,
@@ -2498,7 +2520,9 @@ impl ServeHandler for crate::LineageRegistry {
                 Some(broca_protocol::ErrorClass::Permanent),
             )
         })?;
-        if req.media == cortexkit_role_llm_runner::read::MediaMode::Inline {
+        if broca_protocol::attachments_enabled()
+            && req.media == cortexkit_role_llm_runner::read::MediaMode::Inline
+        {
             page.render_inline_media();
         }
         let subject = model_group_reply_too_large_subject(&page);
@@ -2763,6 +2787,9 @@ impl ServeHandler for crate::LineageRegistry {
                 message: format!("joining steer cannot change the active run's frozen {field}"),
             }),
             SendOutcome::VariantUnsupported(e) => Err(ServeError::VariantUnsupported(e)),
+            SendOutcome::ServiceTierInvalid { reason, message } => {
+                Err(ServeError::ServiceTierInvalid { reason, message })
+            }
             SendOutcome::Upload(error) => Err(ServeError::Upload(error)),
             // Actor errors can combine replay, storage and lifecycle failures after type erasure.
             SendOutcome::Error(e) => Err(ServeError::Open(e, None)),
@@ -3254,7 +3281,11 @@ impl ServeHandler for crate::LineageRegistry {
             .await?;
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Blocks {
             for entry in &mut response.messages {
-                entry.show_media_blocks_with_identity();
+                if broca_protocol::attachments_enabled() {
+                    entry.show_media_blocks_with_identity();
+                } else {
+                    entry.show_media_blocks();
+                }
             }
         }
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
@@ -3335,19 +3366,23 @@ impl ServeHandler for crate::LineageRegistry {
                 .find_map(|framed| broca_core::record_time_ms(&framed.record))
                 .unwrap_or(0),
         };
-        let media_facts = Some(
-            self.media_facts_for_head(
-                session,
-                crate::registry::media_head::Request {
-                    lineage: lineage_id,
-                    at_seq,
-                    run_id: page.lineage_state.last_run_id.as_ref(),
-                    state: page.lineage_state.state.as_str(),
-                    model: head_facts.model.as_ref(),
-                },
+        let media_facts = if broca_protocol::attachments_enabled() {
+            Some(
+                self.media_facts_for_head(
+                    session,
+                    crate::registry::media_head::Request {
+                        lineage: lineage_id,
+                        at_seq,
+                        run_id: page.lineage_state.last_run_id.as_ref(),
+                        state: page.lineage_state.state.as_str(),
+                        model: head_facts.model.as_ref(),
+                    },
+                )
+                .await?,
             )
-            .await?,
-        );
+        } else {
+            None
+        };
         let interrupted_reason = if page.lineage_state.state.as_str() == "interrupted" {
             if let Some(facts) = &media_facts {
                 facts.interrupt_reason.clone()
@@ -4411,6 +4446,7 @@ mod held_status_tests {
 
     fn state(index: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            account_limit_pause: None,
             state: index,
             held_calls: Vec::new(),
             budget_detail: None,
@@ -4515,6 +4551,7 @@ mod paused_auth_tests {
                 broca_protocol::PauseReason::AuthRequired,
             ] {
                 let state = broca_core::ReconciledRunState {
+                    account_limit_pause: None,
                     held_calls: Vec::new(),
                     run_usage: Default::default(),
                     budget_detail: None,
@@ -4594,6 +4631,7 @@ mod context_ceiling_tests {
     use super::*;
     fn reconciled(state: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            account_limit_pause: None,
             held_calls: Vec::new(),
             state,
             context_ceiling: None,
@@ -4754,6 +4792,7 @@ mod offset_head_tests {
             run_id: RunId("r1".into()),
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,

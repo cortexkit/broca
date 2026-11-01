@@ -1944,6 +1944,46 @@ impl LineageRegistry {
         Ok(sender)
     }
 
+    /// Observe ownership already learned by ordinary requests, without telemetry-only IO.
+    /// Only a current live summary is authoritative while an actor is open. A closed session
+    /// can reuse frozen owner identities from a nonempty ownership summary; an empty ownership
+    /// summary does not establish an owner.
+    pub(crate) fn cached_session_owner(
+        &self,
+        key: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        fn matches(
+            ownership: &broca_core::SessionOwnershipV1,
+            principal: Option<&broca_protocol::BindPrincipal>,
+        ) -> Option<bool> {
+            (ownership.episodes > 0).then(|| {
+                principal.is_some()
+                    && (ownership.first_principal.as_ref() == principal
+                        || ownership
+                            .scope
+                            .as_ref()
+                            .is_some_and(|scope| Some(&scope.owner) == principal))
+            })
+        }
+        let slots = self.inner.slots.lock().unwrap();
+        if let Some(Entry::Open { handle, .. }) = slots.get(key) {
+            let live = self.inner.live_ownership.lock().unwrap();
+            return live.get(key).and_then(|cached| {
+                (cached.generation == handle.gen
+                    && cached.head == handle.durable_head.load(Ordering::Acquire))
+                .then(|| matches(&cached.ownership, principal))
+                .flatten()
+            });
+        }
+        self.inner
+            .owner_snapshots
+            .lock()
+            .unwrap()
+            .get(key)
+            .and_then(|snapshot| matches(&snapshot.ownership, principal))
+    }
+
     /// Cancel/retract ownership from a live reader, a checkpoint plus its durable suffix, or
     /// the complete WAL when no checkpoint is usable. Never open an actor to obtain it.
     pub(crate) async fn owner_ownership(
@@ -4830,6 +4870,7 @@ impl LineageRegistry {
                 broca_core::ReplayResolution::AuthRequired { reason, .. } => match reason {
                     broca_protocol::PauseReason::Restart => true,
                     broca_protocol::PauseReason::AuthRequired
+                    | broca_protocol::PauseReason::AccountLimit
                     | broca_protocol::PauseReason::ToolHeld => false,
                 },
                 broca_core::ReplayResolution::ProviderHeld {
@@ -6437,6 +6478,7 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -7102,6 +7144,7 @@ mod offset_page_tests {
 
     fn run_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

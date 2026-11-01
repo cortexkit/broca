@@ -299,6 +299,7 @@ mod tests {
 
     fn msg(role: Role, content: Vec<ContentBlock>) -> Message {
         Message {
+            turn_system: false,
             role,
             content,
             cache_prefix_blocks: None,

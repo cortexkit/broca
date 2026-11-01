@@ -1315,6 +1315,7 @@ where
     let pause_tail = [framed(
         4,
         WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r".into()),
             ts_ms: None,
             reason: PauseReason::AuthRequired,
@@ -2305,7 +2306,7 @@ pub(crate) fn text_turn(seq_base: u64, step: u64, text: &str) -> Vec<FramedRecor
     ]
 }
 
-fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
+pub(crate) fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
     let batch_id = BatchId(format!("b{step}"));
     let tool_call_id = ToolCallId(format!("c{step}"));
     vec![
@@ -2437,6 +2438,7 @@ pub(crate) fn run_started(
             run_id: RunId(run_id.into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -2461,6 +2463,7 @@ pub(crate) fn run_started(
                 context_management: None,
             }),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,

@@ -231,6 +231,10 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    service_tier_sessions: Mutex<BTreeSet<String>>,
+    service_tier_keys: Mutex<HashMap<String, String>>,
+    service_tier_rides: Mutex<HashMap<String, Vec<Value>>>,
+    service_tier_request_rides: Mutex<HashMap<String, Vec<u64>>>,
     fixture_connection: Mutex<Option<PathBuf>>,
     default_text_module: Mutex<Option<String>>,
     default_text_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -424,6 +428,12 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
         };
         models.insert(format!("xai/conformance-media-{accepts}"), facts);
     }
+    let mut tier = row(None);
+    tier["rate.input.mode.priority"] =
+        json!({"currency":"USD","exponent":9,"state":"priced","units":2_000_000_000_u64});
+    tier["rate.output.mode.priority"] =
+        json!({"currency":"USD","exponent":9,"state":"priced","units":4_000_000_000_u64});
+    models.insert("xai/conformance-service-tier".into(), tier);
     models.insert(
         format!("{}/{}", output_refs::PROVIDER, output_refs::MODEL),
         output_refs::catalog_row(),
@@ -591,7 +601,12 @@ async fn serve_model_request(
     let messages = request["messages"].as_array().cloned().unwrap_or_default();
     let model = request["model"].as_str().unwrap_or_default();
     let model = model.strip_prefix("mock/").unwrap_or(model);
-    let session = if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
+    let tier_session = request["prompt_cache_key"]
+        .as_str()
+        .and_then(|key| shared.service_tier_keys.lock().unwrap().get(key).cloned());
+    let session = if let Some(session) = tier_session {
+        Some(session)
+    } else if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
         shared
             .scripts
             .lock()
@@ -699,6 +714,26 @@ async fn serve_model_request(
         return Ok(());
     };
     let session = session.expect("a turn was found for it");
+    if shared
+        .service_tier_sessions
+        .lock()
+        .unwrap()
+        .contains(&session)
+    {
+        let rides = shared
+            .service_tier_rides
+            .lock()
+            .unwrap()
+            .get(&session)
+            .map_or(0, |rides| rides.len() as u64);
+        shared
+            .service_tier_request_rides
+            .lock()
+            .unwrap()
+            .entry(session.clone())
+            .or_default()
+            .push(rides);
+    }
     if let Some(served) = shared.failure_turns.lock().unwrap().get_mut(&session) {
         *served += 1;
     }
@@ -1194,6 +1229,7 @@ struct BrocaSubject {
     bus_events_enabled: bool,
     process_kills_disabled: bool,
     media_enabled: bool,
+    service_tier_enabled: bool,
     reserved_reader: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
@@ -1219,6 +1255,7 @@ impl BrocaSubject {
             process_kills_disabled: false,
             media_enabled: std::env::var_os("BROCA_CONFORMANCE_MEDIA").is_some()
                 || cfg!(feature = "test-attachments"),
+            service_tier_enabled: std::env::var_os("BROCA_CONFORMANCE_SERVICE_TIER").is_some(),
             reserved_reader: false,
             #[cfg(feature = "test-clock")]
             bus: None,
@@ -1336,8 +1373,8 @@ impl BrocaSubject {
                 &self
                     .backup_classes
                     .as_ref()
-                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled}))
-                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled})),
+                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled,"media":{"enabled":self.media_enabled},"service_tier":{"enabled":self.service_tier_enabled}}))
+                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled,"media":{"enabled":self.media_enabled},"service_tier":{"enabled":self.service_tier_enabled}})),
             )
             .unwrap(),
         )
@@ -2074,6 +2111,44 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    async fn configure_service_tier(
+        &self,
+        session: &str,
+        case: &str,
+    ) -> Result<bool, HarnessError> {
+        if !self.service_tier_enabled {
+            return Ok(false);
+        }
+        self.shared
+            .service_tier_sessions
+            .lock()
+            .unwrap()
+            .insert(session.to_owned());
+        self.shared.service_tier_keys.lock().unwrap().insert(
+            broca_provider::hash::clamp_prompt_cache_key(&format!("tier-fixture-{session}")),
+            session.to_owned(),
+        );
+        self.shared
+            .failure_turns
+            .lock()
+            .unwrap()
+            .insert(session.to_owned(), 0);
+        if case == "service_tier_ride_before_changed_request" {
+            self.install_setup(
+                session,
+                cortexkit_role_llm_runner_conformance::CompactionSetup::Ready(
+                    cortexkit_role_llm_runner_conformance::CompactionMessage {
+                        compaction_id: "tier-setup".into(),
+                        version: 1,
+                        from: 0,
+                        to: 0,
+                        replacement: vec![],
+                    },
+                ),
+            );
+        }
+        Ok(true)
+    }
     fn attachment_model_fields(&self, session: &str, accepts: bool) -> Option<Map<String, Value>> {
         self.shared
             .attachment_models
@@ -2422,6 +2497,25 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if self
+            .shared
+            .service_tier_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+        {
+            let mut fields = self.compaction_fields(session, first).unwrap_or_default();
+            fields.insert(
+                "model".into(),
+                json!({"provider":"xai","model":"conformance-service-tier"}),
+            );
+            // Cache scope carries fixture identity without adding system text beside a plan.
+            fields.insert(
+                "cache".into(),
+                json!({"key":format!("tier-fixture-{session}")}),
+            );
+            return fields;
+        }
         if session_change_kit_session(session)
             && !self.shared.plan_sessions.lock().unwrap().contains(session)
         {
@@ -2912,10 +3006,25 @@ impl LlmRunnerSubject for BrocaSubject {
             .unwrap_or_default();
         bodies
             .iter()
-            .map(|body| {
+            .enumerate()
+            .map(|(index, body)| {
                 let request: Value = serde_json::from_slice(body)
                     .map_err(|e| HarnessError::new(format!("a model request is not JSON: {e}")))?;
-                Ok(observe_model_request(&request))
+                let mut observation = observe_model_request(&request);
+                observation.service_tier_applied = request
+                    .get("service_tier")
+                    .and_then(Value::as_str)
+                    .filter(|tier| *tier != "default")
+                    .map(|tier| if tier == "priority" { "fast" } else { tier }.to_owned());
+                observation.service_tier_change_rides = self
+                    .shared
+                    .service_tier_request_rides
+                    .lock()
+                    .unwrap()
+                    .get(session)
+                    .and_then(|counts| counts.get(index))
+                    .copied();
+                Ok(observation)
             })
             .collect()
     }
@@ -3927,6 +4036,22 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         );
     }
     check_named_contract_cases(&report.cases, skip_crash_kills()).unwrap();
+    for name in [
+        "service_tier_unsupported_before_model",
+        "service_tier_run_fixed",
+        "service_tier_ride_before_changed_request",
+        "service_tier_unknown_never_echoed",
+    ] {
+        let case = report.cases.iter().find(|case| case.case == name).unwrap();
+        let expected = if subject.service_tier_enabled {
+            CaseOutcome::Passed
+        } else {
+            CaseOutcome::Inapplicable {
+                reason: "role.describe does not declare service_tier".into(),
+            }
+        };
+        assert_eq!(case.outcome, expected, "{name}: {:?}", case.outcome);
+    }
     if skip_crash_kills() {
         assert!(report.kills.is_empty());
         println!("Crash kills disabled: the kit's overall verdict remains non-conforming without a real kill; run natively without BROCA_CONFORMANCE_SKIP_CRASH_KILLS to verify durability.");
@@ -5446,6 +5571,36 @@ async fn pending_delivery_order_send_is_retracted_before_tool_result() {
 #[cfg(test)]
 mod held_call_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn service_tier_fixture_uses_cache_scope_identity_for_plan_sends() {
+        let shared = Arc::new(Shared::default());
+        let mut subject = subject(shared.clone());
+        subject.service_tier_enabled = true;
+        let session = "tier-compaction-fixture-with-a-long-session-name-that-needs-clamping";
+        assert!(subject
+            .configure_service_tier(session, "service_tier_ride_before_changed_request")
+            .await
+            .unwrap());
+        let fields = subject.send_fields(session, true);
+        assert!(fields.get("plan").is_some());
+        assert!(
+            fields.get("system").is_none(),
+            "plan fixture identity must not alter system text"
+        );
+        let key =
+            broca_provider::hash::clamp_prompt_cache_key(fields["cache"]["key"].as_str().unwrap());
+        assert_eq!(key.len(), 32, "exercise the renderer's long-key spelling");
+        assert_eq!(
+            shared
+                .service_tier_keys
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(String::as_str),
+            Some(session)
+        );
+    }
     use std::sync::atomic::Ordering;
 
     fn subject(shared: Arc<Shared>) -> BrocaSubject {
@@ -5459,6 +5614,7 @@ mod held_call_tests {
             bus_events_enabled: false,
             process_kills_disabled: true,
             media_enabled: false,
+            service_tier_enabled: false,
             reserved_reader: false,
             #[cfg(feature = "test-clock")]
             bus: None,
