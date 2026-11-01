@@ -68,6 +68,12 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args
         .get(1)
+        .is_some_and(|operation| operation == "prepare-session-log-indexes")
+    {
+        return prepare_session_log_indexes(&args[2..]);
+    }
+    if args
+        .get(1)
         .is_some_and(|operation| operation == "repair-session-root")
     {
         return repair_session_root(&args[2..]);
@@ -314,6 +320,69 @@ fn audit_session_refs(root: &std::path::Path) -> ExitCode {
     }
 }
 
+fn prepare_session_log_indexes(args: &[String]) -> ExitCode {
+    const HELP: &str = "usage: store-maintenance prepare-session-log-indexes STATE_ROOT [--write]\nPreview by default: lists each evidence index, whether it exists, and its DDL.\n--write requires broca AND its supervisor STOPPED, as for repair-session-root.\nOnly additive indexes are created; session rows and log bytes are unchanged.";
+    if args.is_empty() || args == ["--help"] {
+        eprintln!("{HELP}");
+        return if args.is_empty() {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
+    if !(args.len() == 1 || args.len() == 2 && args[1] == "--write") {
+        eprintln!("{HELP}");
+        return ExitCode::from(2);
+    }
+    let root = PathBuf::from(&args[0]);
+    if let Some(refusal) = state_root_refusal(
+        "prepare-session-log-indexes",
+        &root,
+        root.join("run-index.db").is_file(),
+        true,
+    ) {
+        eprintln!("{refusal}");
+        return ExitCode::from(2);
+    }
+    let write = args.len() == 2;
+    if write {
+        if let Err(code) = require_stopped_writer(&root, &writer_liveness(&root)) {
+            return code;
+        }
+    }
+    let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = SqliteStore::open_read_only(root.join("run-index.db"))?;
+        let indexes = store.preview_session_log_indexes()?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"mode": if write { "write" } else { "preview" }, "indexes": indexes})
+            )?
+        );
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        drop(store);
+        if write
+            && indexes
+                .iter()
+                .any(|index| index.applicable && !index.exists)
+        {
+            let store =
+                SqliteStore::open_existing_for_session_root_repair(&root.join("run-index.db"))?;
+            store.prepare_session_log_indexes()?;
+            println!("session-log evidence indexes prepared; rows and logs unchanged");
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("store-maintenance: prepare-session-log-indexes refused: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// Exit 1 when any row declined, so a partial repair cannot read as a complete one.
 ///
 /// NOTE ON THE STEADY STATE, measured after both repairs ran against production: the
@@ -343,6 +412,7 @@ fn print_usage() {
                  store-maintenance media-sweep <state-root> [--write]\n\
                  store-maintenance repair-session-root <state-root> --harness H --session S [--write]\n\
                  store-maintenance audit-session-refs <state-root> (read-only; JSONL; exit 1 for findings)\n\
+                 store-maintenance prepare-session-log-indexes <state-root> [--write]\n\
                  store-maintenance wal-fold <state-root> [--write] [--resume fold-<unix-ms>.journal] [--abandon|--unfold]"
     );
 }

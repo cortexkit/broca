@@ -36,6 +36,7 @@ impl SqliteStore {
         mut emit: impl FnMut(&SessionRefFinding) -> Result<()>,
     ) -> Result<u64> {
         let mut conn = self.conn.lock().map_err(|error| error.to_string())?;
+        session_log_evidence::indexes::require(&conn)?;
         let root = state_root(&conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let wal = FileWalStore::new(root.join("wal"));

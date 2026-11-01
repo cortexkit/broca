@@ -6,6 +6,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 type EvidenceError = Box<dyn std::error::Error + Send + Sync>;
 
+pub mod indexes;
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionLogEvidence {
     pub content: bool,
@@ -137,8 +139,16 @@ pub(crate) fn evidence(
         "retention_deletion",
     ] {
         if table_exists(conn, table)? {
+            let source = match table {
+                "retained_head" => format!("{table} INDEXED BY {}", indexes::RETAINED),
+                "retention_lineage" => format!("{table} INDEXED BY {}", indexes::RETENTION),
+                "retention_deletion" => {
+                    format!("{table} INDEXED BY {}", indexes::DELETION_SESSIONS)
+                }
+                _ => table.to_owned(),
+            };
             content |= conn.query_row(
-                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE session=?1)"),
+                &format!("SELECT EXISTS(SELECT 1 FROM {source} WHERE session=?1 LIMIT 1)"),
                 [&key],
                 |row| row.get::<_, bool>(0),
             )?;
@@ -153,35 +163,43 @@ pub(crate) fn evidence(
                 } else {
                     ""
                 };
-                let mut query = conn.prepare(&format!("SELECT lineage_id FROM {table} WHERE session=?1 AND lineage_id IS NOT NULL{active}"))?;
-                for id in query.query_map([&key], |row| row.get::<_, String>(0))? {
-                    lineages.insert(id?);
-                }
+                let source = indexes::lineage_index(table).map_or_else(
+                    || table.to_owned(),
+                    |index| format!("{table} INDEXED BY {index}"),
+                );
+                lineages.extend(distinct_lineages(
+                    conn,
+                    &source,
+                    &format!("session=?1{active}"),
+                    &[&key],
+                    true,
+                )?);
             }
         }
     }
     let run_match = "json_valid(session) AND json_extract(session,'$.project_root')=?1 AND json_extract(session,'$.harness')=?2 AND json_extract(session,'$.session')=?3";
+    let run_source = format!("run_index INDEXED BY {}", indexes::RUNS);
     let args = params![
         session.project_root.to_string_lossy(),
         session.harness,
         session.session
     ];
     let (runs, unexpired): (bool, bool) = conn.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM run_index WHERE {run_match}), EXISTS(SELECT 1 FROM run_index WHERE {run_match} AND expired_at_ms IS NULL)"),
+        &format!("SELECT EXISTS(SELECT 1 FROM {run_source} WHERE {run_match} LIMIT 1), EXISTS(SELECT 1 FROM {run_source} WHERE {run_match} AND expired_at_ms IS NULL LIMIT 1)"),
         args, |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     content |= runs;
-    let mut query = conn.prepare(&format!("SELECT lineage_id FROM run_index WHERE {run_match} AND expired_at_ms IS NULL AND lineage_id IS NOT NULL"))?;
-    for id in query.query_map(
-        params![
-            session.project_root.to_string_lossy(),
-            session.harness,
-            session.session
-        ],
-        |row| row.get::<_, String>(0),
-    )? {
-        lineages.insert(id?);
-    }
+    let root_text = session.project_root.to_string_lossy();
+    let identity_values: [&dyn rusqlite::ToSql; 3] =
+        [&root_text, &session.harness, &session.session];
+    let run_lineages = distinct_lineages(
+        conn,
+        &run_source,
+        &format!("{run_match} AND expired_at_ms IS NULL"),
+        &identity_values,
+        true,
+    )?;
+    lineages.extend(run_lineages.iter().cloned());
     if table_exists(conn, "agent_data_census")? {
         content |= conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_data_census WHERE address=?1 AND covered=1)",
@@ -189,20 +207,18 @@ pub(crate) fn evidence(
             |row| row.get::<_, bool>(0),
         )?;
     }
-    let mut deletion_lineages = std::collections::HashSet::new();
-    let mut ledger_query = conn.prepare(&format!(
-        "SELECT lineage_id FROM retention_deletion WHERE {run_match}"
-    ))?;
-    for id in ledger_query.query_map(
-        params![
-            session.project_root.to_string_lossy(),
-            session.harness,
-            session.session
-        ],
-        |row| row.get::<_, String>(0),
-    )? {
-        deletion_lineages.insert(id?);
-    }
+    let deletion_lineages: std::collections::HashSet<_> = distinct_lineages(
+        conn,
+        &format!(
+            "retention_deletion INDEXED BY {}",
+            indexes::DELETION_IDENTITIES
+        ),
+        run_match,
+        &identity_values,
+        false,
+    )?
+    .into_iter()
+    .collect();
     let ledger = !deletion_lineages.is_empty();
     content |= ledger;
     let mut removed = ledger || (runs && !unexpired);
@@ -251,8 +267,9 @@ pub(crate) fn evidence(
         let retired_lineages: std::collections::HashSet<String> =
             deletion_lineages.union(&stones).cloned().collect();
         let mut proven_retired_runs = None;
+        unremoved_run |= run_lineages.iter().any(|id| !retired_lineages.contains(id));
         let mut query = conn.prepare(&format!(
-            "SELECT run_id,lineage_id FROM run_index WHERE {run_match} AND expired_at_ms IS NULL"
+            "SELECT run_id FROM {run_source} WHERE {run_match} AND expired_at_ms IS NULL AND lineage_id IS NULL"
         ))?;
         let mut rows = query.query(params![
             session.project_root.to_string_lossy(),
@@ -260,19 +277,15 @@ pub(crate) fn evidence(
             session.session
         ])?;
         while let Some(row) = rows.next()? {
-            if let Some(id) = row.get::<_, Option<String>>(1)? {
-                unremoved_run |= !retired_lineages.contains(&id);
-            } else {
-                // An older expiry cannot excuse a newer run whose lineage has
-                // not been projected yet. A verified deleting log must name it.
-                if proven_retired_runs.is_none() {
-                    proven_retired_runs = Some(deleting_run_ids(conn, session, &retired_lineages)?);
-                }
-                unremoved_run |= !proven_retired_runs
-                    .as_ref()
-                    .unwrap()
-                    .contains(&row.get::<_, String>(0)?);
+            // An older expiry cannot excuse a newer run whose lineage has
+            // not been projected yet. A verified deleting log must name it.
+            if proven_retired_runs.is_none() {
+                proven_retired_runs = Some(deleting_run_ids(conn, session, &retired_lineages)?);
             }
+            unremoved_run |= !proven_retired_runs
+                .as_ref()
+                .unwrap()
+                .contains(&row.get::<_, String>(0)?);
         }
     }
     let meta: Option<Option<String>> = conn
@@ -294,6 +307,49 @@ pub(crate) fn evidence(
         removed: removed && !unremoved_run,
         lineages,
     })
+}
+
+/// Seek past the previous value instead of visiting every duplicate entry.
+/// A DISTINCT query may still visit every duplicate entry rather than skip it.
+fn distinct_lineages(
+    conn: &Connection,
+    source: &str,
+    predicate: &str,
+    values: &[&dyn rusqlite::ToSql],
+    skip_null: bool,
+) -> Result<std::collections::BTreeSet<String>, EvidenceError> {
+    let non_null = if skip_null {
+        " AND lineage_id IS NOT NULL"
+    } else {
+        ""
+    };
+    let first = format!("SELECT lineage_id FROM {source} WHERE {predicate}{non_null} ORDER BY lineage_id COLLATE BINARY LIMIT 1");
+    let next = format!("SELECT lineage_id FROM {source} WHERE {predicate} AND lineage_id COLLATE BINARY>?{} ORDER BY lineage_id COLLATE BINARY LIMIT 1", values.len() + 1);
+    let mut initial = conn.prepare(&first)?;
+    let mut subsequent = conn.prepare(&next)?;
+    let mut cursor: Option<String> = None;
+    let mut result = std::collections::BTreeSet::new();
+    loop {
+        let mut parameters = values.to_vec();
+        if let Some(value) = &cursor {
+            parameters.push(value);
+        }
+        let query = if cursor.is_some() {
+            &mut subsequent
+        } else {
+            &mut initial
+        };
+        let value: Option<String> = query
+            .query_row(parameters.as_slice(), |row| row.get(0))
+            .optional()?;
+        match value {
+            Some(value) => {
+                result.insert(value.clone());
+                cursor = Some(value);
+            }
+            None => return Ok(result),
+        }
+    }
 }
 
 fn deleting_run_ids(
@@ -346,3 +402,6 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, EvidenceError> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cost_tests;

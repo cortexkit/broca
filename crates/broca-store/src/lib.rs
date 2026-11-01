@@ -1290,6 +1290,7 @@ impl SqliteStore {
         diagnostics::init_schema(conn)?;
         compaction_receipts::init_schema(conn)?;
         compaction_facts::init_schema(conn)?;
+        session_log_evidence::indexes::install(conn)?;
         let source = export_index::init_schema(conn).map_err(StoreError::from)?;
         if from_version < STORE_SCHEMA_VERSION {
             // `user_version` provides one global checkpoint for this idempotent schema path.

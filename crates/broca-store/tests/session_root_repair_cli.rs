@@ -170,3 +170,84 @@ fn audit_cli_keeps_ref_only_reservations_new_and_rejects_write_options() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn index_preview_is_read_only_and_audit_refuses_a_missing_index_first() {
+    let root =
+        broca_test_support::scratch_root().join(format!("index-preview-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("run-index.db");
+    drop(broca_store::SqliteStore::open(&database).unwrap());
+    {
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch("DROP INDEX session_log_evidence_runs")
+            .unwrap();
+    }
+    let before = std::fs::read(&database).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_store-maintenance"))
+        .arg("prepare-session-log-indexes")
+        .arg(&root)
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["mode"], "preview");
+    let run_index = plan["indexes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|index| index["name"] == "session_log_evidence_runs")
+        .unwrap();
+    assert_eq!(run_index["exists"], false);
+    assert_eq!(run_index["applicable"], true);
+    assert!(run_index["sql"]
+        .as_str()
+        .unwrap()
+        .starts_with("CREATE INDEX IF NOT EXISTS"));
+    let output = Command::new(env!("CARGO_BIN_EXE_store-maintenance"))
+        .arg("audit-session-refs")
+        .arg(&root)
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("session_log_evidence_index_missing"),
+        "{error}"
+    );
+    assert!(error.contains("session_log_evidence_runs"), "{error}");
+    assert!(
+        error.contains("store-maintenance prepare-session-log-indexes")
+            && error.contains("--write"),
+        "{error}"
+    );
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read(&database).unwrap(), before);
+    assert!(!root.join("leases").exists());
+}
+
+#[test]
+fn index_write_unknown_liveness_refuses_before_opening_sqlite() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("index-cli-liveness-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("run-index.db");
+    std::fs::write(&database, []).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_store-maintenance"))
+        .arg("prepare-session-log-indexes")
+        .arg(&root)
+        .arg("--write")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("liveness unknown; refusing offline mutation"));
+    assert!(std::fs::read(database).unwrap().is_empty());
+}

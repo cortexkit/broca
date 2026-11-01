@@ -185,6 +185,25 @@ report op, cut id, ref count and elapsed milliseconds, including cancelled calls
 
 ## Offline reference audit
 
+On a store created by an older build, prepare the additive evidence indexes
+before auditing. Preview does not write:
+
+```sh
+store-maintenance prepare-session-log-indexes STATE_ROOT
+# Stop broca and its supervisor before applying the preview:
+store-maintenance prepare-session-log-indexes STATE_ROOT --write
+```
+
+Preview lists each index's name, SQL, whether it already exists, and whether its
+columns are present. Both this command and normal schema initialization use the
+same `CREATE INDEX IF NOT EXISTS` definitions; a repeat does not rebuild them.
+Only SQLite indexes are added, not session rows or WAL records. Normal boot
+installs them synchronously before serving requests. The explicit command lets
+operators prepare a stopped store without starting a daemon or resuming runs.
+The read-only audit refuses a missing required index immediately as
+`session_log_evidence_index_missing`, naming the index and the exact preparation
+command. It never falls back to an unindexed scan.
+
 ```sh
 store-maintenance audit-session-refs STATE_ROOT
 ```
@@ -207,6 +226,15 @@ folder. Without historical lineage evidence it reports a missing address without
 claiming a matching alternate. It retains compact address/root sets and streams
 references, rather than loading a join of the run history into memory. Findings
 are evidence for repair preview, not permission to merge transcripts.
+
+Evidence lookups seek the exact logical bind identity in covering indexes,
+including JSON-encoded run/deletion identities. Lineage enumeration seeks one
+distinct value at a time, skipping duplicate entries rather than walking a
+session's messages or repeated per-run lineage values. All distinct lineages
+remain in the evidence set. Work scales with distinct lineage values, and with
+unidentified unexpired run IDs when retirement proof is needed, not with the
+materialized message count. Verifying a pending-deletion WAL or a candidate
+alternate still reads its actual log bytes, as before.
 
 ## Offline split-root repair
 
