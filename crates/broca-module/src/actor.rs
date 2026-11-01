@@ -3331,6 +3331,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // the frozen scope (its tool routes carry the owner's) and never freezes, adopts or
         // reopens one. The sender itself is recorded only on its `DeliveryOrdered` record.
         self.admitting_sent_by = None;
+        let incoming_legacy_delivery = self.admitting_order.is_none();
         // A plan-named sender may also send a legacy string `delivery` (llm-runner 0.5.2 §9.7):
         // `queue` and `steer` stand for the lists `[idle_start]` and `[steer, idle_start]` and
         // are admitted and delivered exactly as those lists, through the ordered path below;
@@ -3362,6 +3363,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 request.scope = broca_protocol::SendScope::Internal;
             }
         }
+        let mut borrowing_legacy_steer = false;
         let run_id = if let (
             Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }),
             Some(send_id),
@@ -3386,7 +3388,21 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 &sender,
                 &ownership.effective_senders(),
             ) {
-                Ok((run_id, _)) => run_id,
+                Ok((run_id, retry_sender)) => {
+                    borrowing_legacy_steer = retry_sender != sender
+                        && crate::send_fate::legacy_steer_sender(&records, &run_id, send_id)
+                            == Some(&retry_sender);
+                    if retry_sender != sender
+                        && incoming_legacy_delivery
+                        && crate::send_fate::legacy_steers_allowed(&records, &run_id)
+                    {
+                        // The send resolved to run_id has no DeliveryOrdered record. Compare
+                        // its retry against the original wire delivery string, not the list
+                        // derived only for named-sender grant checks.
+                        self.admitting_order = None;
+                    }
+                    run_id
+                }
                 Err(error) => return SendOutcome::Error(error),
             }
         } else {
@@ -3612,8 +3628,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // A key already used by a steer is answered from that steer's record: a steer opens no
         // episode of its own, so the run-id lookup below cannot find it. This also refuses a
         // later send of another mode under the same key, naming `delivery`.
+        // `succeeds` names another module whose receipts the latest accepted plan lets this
+        // caller read. A legacy Steered receipt enters this comparison only when
+        // `recorded_send_sender` assigns it to that named module; it cannot be delivered again.
         if let (true, Some(send_id), Some(request_digest)) = (
-            self.admitting_sent_by.is_none(),
+            self.admitting_sent_by.is_none() || borrowing_legacy_steer,
             key.send_id(),
             request_identity_digest.as_deref(),
         ) {
