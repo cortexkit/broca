@@ -392,6 +392,11 @@ fn health_status(details: &[String]) -> subc_protocol::session::HealthStatus {
     }
 }
 
+fn held_withdrawal_health_detail(withdrawals: &serde_json::Value) -> Option<String> {
+    (withdrawals["failed"].as_u64().unwrap_or(0) > 0 || withdrawals.get("error").is_some())
+        .then(|| "provider-held tool.withdraw failures need attention".into())
+}
+
 fn now_epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2049,10 +2054,8 @@ async fn handle_control_request(
                 details
                     .push("late-results-rebuild-required: intake completeness is unknown".into());
             }
-            if held_runtime["withdrawals"]["failed"].as_u64().unwrap_or(0) > 0
-                || held_runtime["withdrawals"].get("error").is_some()
-            {
-                details.push("provider-held tool.withdraw failures need attention".into());
+            if let Some(detail) = held_withdrawal_health_detail(&held_runtime["withdrawals"]) {
+                details.push(detail);
             }
             if retention_unreadable > 0 {
                 details.push(format!("{retention_unreadable} retained logs blocked by unreadability without a current projection"));
@@ -6129,6 +6132,83 @@ mod tests {
         assert_eq!(logs[1].fields["phase"], "close");
         assert_eq!(logs[1].fields["outcome"], "cancelled");
         assert_eq!(logs[0].fields["session"], logs[1].fields["session"]);
+    }
+
+    #[tokio::test]
+    async fn scope_gone_withdrawals_do_not_degrade_health_but_other_failures_do() {
+        struct NoRetry;
+        #[async_trait::async_trait]
+        impl broca_module::held_withdrawals::WithdrawTransport for NoRetry {
+            async fn withdraw(
+                &self,
+                _: &broca_core::tool_plane::LateResultRegistration,
+            ) -> (
+                cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+                serde_json::Value,
+            ) {
+                panic!("a terminal refusal must not be retried");
+            }
+        }
+        for (code, failed, scope_gone, expected) in [
+            (
+                subc_protocol::error_codes::SCOPE_NOT_LIVE,
+                0,
+                1,
+                subc_protocol::session::HealthStatus::Ok,
+            ),
+            (
+                subc_protocol::error_codes::SCOPE_ENDED,
+                0,
+                1,
+                subc_protocol::session::HealthStatus::Ok,
+            ),
+            (
+                subc_protocol::error_codes::SCOPE_NOT_CARRIER,
+                1,
+                0,
+                subc_protocol::session::HealthStatus::Degraded,
+            ),
+        ] {
+            let root = broca_test_support::scratch_root().join(format!("withdrawal-health-{code}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let store = Arc::new(
+                broca_module::late_results_store::LateResultsStore::open(
+                    &root.join("late-results.db"),
+                )
+                .unwrap(),
+            );
+            let call = broca_core::tool_plane::LateResultRegistration {
+                lineage: "lineage".into(),
+                call_key: "lineage:4".into(),
+                module: "tools".into(),
+                bind: BrocaBindIdentity::new("/project", "broca", code),
+                scope: None,
+            };
+            store.register_calls(std::slice::from_ref(&call)).unwrap();
+            // Existing outbox rows keep their terminal state; only health accounting changes.
+            store
+                .record_withdrawal(&call, "failed", 1, &serde_json::json!({"code":code}))
+                .unwrap();
+            let service = broca_module::held_withdrawals::HeldWithdrawals::new(
+                store,
+                Arc::new(broca_core::FileWalStore::new(root.join("wal"))),
+                Arc::new(NoRetry),
+            );
+            service.bind_stopping_signal(CancellationToken::new());
+            service.recover().await.unwrap();
+            let withdrawals = service.health();
+            assert_eq!(withdrawals["failed"], failed, "{code}: {withdrawals}");
+            assert_eq!(
+                withdrawals["scope_gone"], scope_gone,
+                "{code}: {withdrawals}"
+            );
+            let details: Vec<_> = held_withdrawal_health_detail(&withdrawals)
+                .into_iter()
+                .collect();
+            assert_eq!(health_status(&details), expected, "{withdrawals}");
+        }
+        let error = serde_json::json!({"failed": 0, "error": "unreadable"});
+        assert!(held_withdrawal_health_detail(&error).is_some());
     }
 
     #[test]

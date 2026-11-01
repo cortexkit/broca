@@ -2377,8 +2377,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         })
     );
     // `rebuild_required: true` would mean late results may be missing from the intake, and a
-    // failed withdrawal is a held call whose provider was never told it was cancelled. Both
-    // degrade health; neither can happen on a root that never held a call. A root that never
+    // failed withdrawal needs attention. Both degrade health; neither can happen on a root
+    // that never held a call. A scope-gone refusal is reported without degrading health, and
+    // its counter must also be zero on this healthy, never-held root. A root that never
     // held a call also has no boot withdrawal sweep (nothing running, no rows left to recover)
     // and no late-results entry pinned past the five-minute warning.
     assert_eq!(
@@ -2393,6 +2394,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
             "withdrawals": {
                 "failed": 0,
                 "pending": 0,
+                "scope_gone": 0,
                 "sweep_running": false,
                 "rows_remaining": 0,
             },
