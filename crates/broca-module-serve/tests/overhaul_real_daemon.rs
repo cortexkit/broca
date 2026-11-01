@@ -768,6 +768,49 @@ struct Sources {
 }
 
 impl Sources {
+    fn assert_api_key_attempts(&self, reports: &[Value], expected_statuses: &[u64]) {
+        // API keys bypass the subscription-account chooser; a vault-supplied account_ref
+        // does not create a chooser decision. In legacy and format-2 state storage, this
+        // run's attempt evidence is ModelAttemptFinished in the WAL, not subscription-account
+        // reports through route.account_observe.
+        let starts: Vec<_> = self
+            .records
+            .iter()
+            .filter(|source| source.record["type"] == "run_started")
+            .collect();
+        assert!(
+            !starts.is_empty(),
+            "attempt evidence must name an admitted run"
+        );
+        for start in starts {
+            let selection = &start.record["config"]["auth_selection"];
+            assert_eq!(selection["credential_id"], "apikey:xai");
+            assert_eq!(selection["account_ref"], "acct-fixture");
+            assert!(
+                selection.get("account_decision").is_none_or(Value::is_null),
+                "an API-key run has no subscription-account admission decision"
+            );
+        }
+        let statuses: Vec<_> = self
+            .records
+            .iter()
+            .filter(|source| source.record["type"] == "model_attempt_finished")
+            .map(|source| {
+                source.record["http_status"]
+                    .as_u64()
+                    .expect("scripted HTTP attempt status")
+            })
+            .collect();
+        assert_eq!(
+            statuses, expected_statuses,
+            "durable model-attempt evidence"
+        );
+        assert!(
+            reports.is_empty(),
+            "API-key runs must not produce subscription-account reports: {reports:?}"
+        );
+    }
+
     fn read(rig: &Rig) -> Self {
         fn logs(dir: &Path, found: &mut Vec<PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
@@ -1513,21 +1556,10 @@ async fn differential() {
             "two real dispatched calls"
         );
         trace
-            .phase(
-                "pre-restart accounting reports",
-                broca_test_support::wait_until(
-                    &format!("{} pre-restart durable attempt reports", trace.label),
-                    || async {
-                        rig.check();
-                        let reports = rig.script.reports.lock().unwrap();
-                        if reports.iter().filter(|v| v["kind"] == "attempt").count() == 3 {
-                            Ok(())
-                        } else {
-                            Err(format!("reports={reports:?}"))
-                        }
-                    },
-                ),
-            )
+            .phase("pre-restart API-key attempt evidence", async {
+                Sources::read(rig)
+                    .assert_api_key_attempts(&rig.script.reports.lock().unwrap(), &[200, 200, 401]);
+            })
             .await;
         let head = trace
             .phase(
@@ -1628,26 +1660,13 @@ async fn differential() {
     for rig in [&legacy, &overhaul] {
         let trace = rig.trace.clone();
         trace
-            .phase(
-                "final accounting reports",
-                broca_test_support::wait_until(
-                    &format!("{} routing reports for both completed runs", trace.label),
-                    || async {
-                        rig.check();
-                        let reports = rig.script.reports.lock().unwrap();
-                        if reports
-                            .iter()
-                            .filter(|v| v["kind"] == "run_finished")
-                            .count()
-                            == 2
-                        {
-                            Ok(())
-                        } else {
-                            Err(format!("reports={reports:?}"))
-                        }
-                    },
-                ),
-            )
+            .phase("final API-key attempt evidence", async {
+                rig.check();
+                Sources::read(rig).assert_api_key_attempts(
+                    &rig.script.reports.lock().unwrap(),
+                    &[200, 200, 401, 200, 200],
+                );
+            })
             .await;
     }
     let left = Sources::read(&legacy);
@@ -1683,14 +1702,6 @@ async fn differential() {
     assert_eq!(
         left.normalize(&json!(*legacy.script.dispatches.lock().unwrap())),
         right.normalize(&json!(*overhaul.script.dispatches.lock().unwrap()))
-    );
-    let left_reports = legacy.script.reports.lock().unwrap().clone();
-    let right_reports = overhaul.script.reports.lock().unwrap().clone();
-    assert!(left_reports.iter().any(|v| v["kind"] == "attempt"));
-    assert_eq!(
-        left.normalize(&json!(left_reports)),
-        right.normalize(&json!(right_reports)),
-        "accounting event source identity"
     );
     assert!(
         legacy.state.join("run-index.db").exists(),
@@ -1805,6 +1816,49 @@ async fn differential_phase_diagnostic_names_root_and_observed_state() {
     assert!(diagnostic.contains(&rig.root.display().to_string()));
     assert_eq!(rig.trace.phase("helper completion", async { 42 }).await, 42);
     rig.completed = true;
+}
+
+#[test]
+fn differential_api_key_attempts_use_wal_without_routing_reports() {
+    for overhaul in [false, true] {
+        let mut sources = Sources {
+            lineage: "own-lineage".into(),
+            root: "/state".into(),
+            runs: vec!["run-a".into()],
+            file_id: 7,
+            projected: BTreeSet::new(),
+            logical: BTreeMap::new(),
+            overhaul,
+            records: vec![Source {
+                seq: 1,
+                end: 100,
+                record: json!({"type":"run_started","config":{"auth_selection":{
+                    "credential_id":"apikey:xai","account_ref":"acct-fixture"
+                }}}),
+            }],
+        };
+        for (index, status) in [200, 200, 401].into_iter().enumerate() {
+            sources.records.push(Source {
+                seq: index as u64 + 2,
+                end: 200 + index as u64 * 100,
+                record: json!({"type":"model_attempt_finished","http_status":status}),
+            });
+        }
+        sources.assert_api_key_attempts(&[], &[200, 200, 401]);
+        assert!(std::panic::catch_unwind(
+            || sources.assert_api_key_attempts(&[json!({"kind":"attempt"})], &[200, 200, 401])
+        )
+        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| sources.assert_api_key_attempts(&[], &[200, 200])).is_err()
+        );
+        sources.records[0].record["config"]["auth_selection"]["account_decision"] =
+            json!({"admission_id":"run-a"});
+        assert!(
+            std::panic::catch_unwind(|| sources.assert_api_key_attempts(&[], &[200, 200, 401]))
+                .is_err()
+        );
+    }
 }
 
 #[test]
