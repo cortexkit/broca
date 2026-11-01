@@ -16,6 +16,7 @@ impl broca_core::CompactionPlane for Plane {
         &self,
         _: &str,
         _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, broca_core::CompactionUnavailable> {
         Ok(serde_json::from_value(json!({
@@ -28,6 +29,7 @@ impl broca_core::CompactionPlane for Plane {
         &self,
         _: &str,
         _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
         _: ViewGetRequest,
     ) -> Result<ViewGetAnswer, broca_core::CompactionUnavailable> {
         Ok(ViewGetAnswer::view(self.0.lock().unwrap().clone().unwrap()))

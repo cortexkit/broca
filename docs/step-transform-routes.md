@@ -1,13 +1,28 @@
 # Step-transform routes
 
 `SubcHookPlane::new(Arc<SubcConnection>)` implements `broca_core::HookPlane`.
-It opens an unscoped module route with `step-transform-provider: v1` and the
+It opens a module route with `step-transform-provider: v1` and the
 connection's tool-module bind harness (`runner`). `transform.hook` uses the
 commons `OpRequest<HookCall>` wire envelope, preserving the caller's harness,
 session, lineage and flattened subject. Discovery uses commons `check_describe`
 before any declaration or hook is sent.
 
-Routes are cached by the complete caller `BindIdentity` and provider. Calls on
+Scoped sessions open under the same frozen `(owner, ref, epoch)` selector as tool
+routes, including admission's declaration and every hook phase. Unscoped sessions
+omit the selector as before. A scoped-open refusal is returned without falling
+back to an unscoped route. Compaction uses the same scope selection and role-route
+machinery for discovery, Setup, `view.get` and ride, but keeps the session's real
+harness rather than translating it to `runner`.
+
+Daemon refusals of scoped role opens are counted by code in
+`health.check.metrics.scoped_role_route_refusals`. The routing WARN names the
+session identity, provider, role and refusal code, at most once per minute per
+`(provider, code)`. Counts include suppressed warnings. Setup and hook failure
+classification is unchanged: these diagnostics do not turn a failed call into
+a successful unscoped retry or change the run's terminal error.
+
+Routes are cached by the complete caller `BindIdentity`, provider and scope selector
+(including owner and frozen epoch). Calls on
 the same route serialize, including discovery and any retries; that wait is
 inside the deadline. A refusal, transport/decode failure, timeout or cancellation
 evicts the route, and the next call opens and discovers again. Failed known
@@ -24,7 +39,7 @@ use `SubcHookPlane::hook_with_deadline`.
 
 ## Declarations
 
-`SubcHookPlane::declare(provider, bind, &DeclareRequest, deadline)` sends
+`SubcHookPlane::declare(provider, bind, scope, &DeclareRequest, deadline)` sends
 `transform.declare` on the same role route and discovery, with the caller's
 shared `tokio::time::Instant` deadline. It returns the complete declaration
 JSON and propagates `FetchError`, including refusal details and retryability.

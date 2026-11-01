@@ -11,8 +11,8 @@ use broca_protocol::{
     BindIdentity,
 };
 use broca_store::{
-    bus_events::{BusPublisher, DrainResult, Metrics},
-    SqliteStore,
+    bus_events::RunEventStore,
+    bus_events::{drain_bus_event, BusPublisher, DrainResult, Metrics},
 };
 use cortexkit_bus_naming::AccountNames;
 use std::{
@@ -252,7 +252,7 @@ fn record_ts(record: &broca_wal::WalRecord) -> Option<u64> {
 /// quadruples until that holds or the read covers the whole file, so the cost follows what is
 /// new rather than how long the session's history is. `None` means the WAL does not exist.
 fn read_for_projection(
-    store: &SqliteStore,
+    store: &dyn RunEventStore,
     wal: &FileWalStore,
     session: &BindIdentity,
 ) -> Result<Option<ProjectionRead>, ReadError> {
@@ -319,7 +319,7 @@ enum VisitError {
 /// value is deliberately ignored here. A session whose
 /// projection already stands at the head needs no flush: it has nothing left to publish.
 fn recover_session(
-    store: &SqliteStore,
+    store: &dyn RunEventStore,
     wal: &FileWalStore,
     session: &BindIdentity,
     now: u64,
@@ -390,7 +390,7 @@ const DRAIN_SLICE: Duration = Duration::from_millis(200);
 /// Visit queued sessions until `budget` has passed, at least one per call so a walk always
 /// advances. Returns the sessions still queued.
 fn walk_step(
-    store: &SqliteStore,
+    store: &dyn RunEventStore,
     wal: &FileWalStore,
     mut queue: std::collections::VecDeque<BindIdentity>,
     budget: Duration,
@@ -423,7 +423,7 @@ fn walk_step(
 }
 
 /// Begin or continue the enabled period, logging which. Returns whether it is in force.
-fn begin_period(store: &SqliteStore) -> bool {
+fn begin_period(store: &dyn RunEventStore) -> bool {
     match store.begin_bus_event_period(now_ms()) {
         Ok(start) if start.fresh => {
             tracing::info!(target: "bus", discarded = start.discarded, "run events on: a new period begins, so only runs written from now on become events");
@@ -442,7 +442,7 @@ fn begin_period(store: &SqliteStore) -> bool {
 
 pub struct Service {
     pub config: Config,
-    pub store: Arc<SqliteStore>,
+    pub store: Arc<dyn RunEventStore>,
     pub wal: Arc<FileWalStore>,
     pub registry: LineageRegistry,
     pub connector: Option<Arc<dyn BusConnector>>,
@@ -474,7 +474,7 @@ impl Service {
         // Begin the period before this process writes any WAL, so every run it starts records
         // where its events begin. A failure is retried on each pass, and nothing is projected
         // until it succeeds.
-        let mut period_ready = begin_period(&store);
+        let mut period_ready = begin_period(store.as_ref());
         Some(tokio::spawn(async move {
             let mut publisher = None;
             let mut account_known = false;
@@ -560,7 +560,7 @@ impl Service {
                     let s = store.clone();
                     period_ready = broca_diagnostics::spawn_blocking(
                         broca_diagnostics::JobKind::StoreWrite,
-                        move || begin_period(&s),
+                        move || begin_period(s.as_ref()),
                     )
                     .await
                     .unwrap_or(false);
@@ -586,13 +586,15 @@ impl Service {
                         match broca_diagnostics::spawn_blocking(
                             broca_diagnostics::JobKind::Projection,
                             move || {
-                                let (records, lineage) = match read_for_projection(&s, &w, &session)
-                                {
-                                    Ok(Some(read)) => read,
-                                    Ok(None) => return Err("run event WAL is absent".to_string()),
-                                    Err(ReadError::Wal(e)) => return Err(e.to_string()),
-                                    Err(ReadError::Store(e)) => return Err(e),
-                                };
+                                let (records, lineage) =
+                                    match read_for_projection(s.as_ref(), &w, &session) {
+                                        Ok(Some(read)) => read,
+                                        Ok(None) => {
+                                            return Err("run event WAL is absent".to_string())
+                                        }
+                                        Err(ReadError::Wal(e)) => return Err(e.to_string()),
+                                        Err(ReadError::Store(e)) => return Err(e),
+                                    };
                                 if lineage.as_deref() != Some(epoch.as_str()) {
                                     return Err(
                                         "WAL epoch changed during run event projection".into()
@@ -661,7 +663,7 @@ impl Service {
                         let w = wal.clone();
                         match broca_diagnostics::spawn_blocking(
                             broca_diagnostics::JobKind::WalRead,
-                            move || walk_step(&s, &w, queue, WALK_SLICE, now),
+                            move || walk_step(s.as_ref(), &w, queue, WALK_SLICE, now),
                         )
                         .await
                         {
@@ -735,7 +737,7 @@ impl Service {
                         // backlog clears at the broker's pace rather than a fixed count per pass.
                         let drain_started = tokio::time::Instant::now();
                         while drain_started.elapsed() < DRAIN_SLICE {
-                            match store.drain_bus_event(bus.as_ref(), now_ms()).await {
+                            match drain_bus_event(store.as_ref(), bus.as_ref(), now_ms()).await {
                                 Ok(DrainResult::Published) => {
                                     backoff = Duration::from_secs(1);
                                 }
@@ -841,6 +843,8 @@ impl ProgressThrottle {
     }
 }
 
+#[cfg(test)]
+use broca_store::SqliteStore;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

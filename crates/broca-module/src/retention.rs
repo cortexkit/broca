@@ -80,79 +80,263 @@ pub trait RetentionIndex: Send + Sync {
     }
 }
 
-impl RetentionIndex for SqliteStore {
-    fn live_inventory(&self) -> Result<Option<Vec<RetentionLineageRow>>, String> {
-        self.retention_live_inventory()
-            .map(Some)
-            .map_err(|e| e.to_string())
+macro_rules! impl_retention_index {
+    ($store:ty) => {
+        impl RetentionIndex for $store {
+            fn live_inventory(&self) -> Result<Option<Vec<RetentionLineageRow>>, String> {
+                self.retention_live_inventory()
+                    .map(Some)
+                    .map_err(|e| e.to_string())
+            }
+            fn pending_deletions(&self) -> Result<Option<Vec<BindIdentity>>, String> {
+                self.retention_pending_deletions()
+                    .map(Some)
+                    .map_err(|e| e.to_string())
+            }
+            fn deletion_pending(
+                &self,
+                id: &str,
+                key: &BindIdentity,
+                pending: bool,
+            ) -> Result<(), String> {
+                self.retention_deletion_pending(id, key, pending)
+                    .map_err(|e| e.to_string())
+            }
+            fn runs(&self, lineage: &str) -> Result<Vec<RetentionRunRow>, String> {
+                self.retention_run_rows(lineage)
+            }
+            fn retained_sessions(&self) -> Result<Vec<BindIdentity>, String> {
+                <$store>::retained_sessions(self).map_err(|e| e.to_string())
+            }
+            fn expire_with_withdrawals(
+                &self,
+                row: &RetentionLineageRow,
+                runs: &[RetentionRunRow],
+                questions: &[broca_store::retention_withdrawals::RetentionWithdrawal],
+            ) -> Result<(), String> {
+                self.upsert_retention_lineage_with_withdrawals(row, runs, questions)
+                    .map_err(|e| e.to_string())
+            }
+            fn pending_withdrawals(
+                &self,
+            ) -> Result<Vec<broca_store::retention_withdrawals::RetentionWithdrawal>, String> {
+                self.pending_retention_withdrawals()
+                    .map_err(|e| e.to_string())
+            }
+            fn settle_withdrawal(&self, lineage: &str, key: &str) -> Result<bool, String> {
+                self.settle_retention_withdrawal(lineage, key)
+                    .map_err(|e| e.to_string())
+            }
+            fn give_up_withdrawal(&self, lineage: &str, key: &str) -> Result<bool, String> {
+                self.give_up_retention_withdrawal(lineage, key)
+                    .map_err(|e| e.to_string())
+            }
+            fn discovery_lineages(&self) -> Result<Vec<BindIdentity>, String> {
+                self.retention_lineages_with_discovery()
+                    .map_err(|e| e.to_string())
+            }
+            fn live(&self, session: &BindIdentity) -> Result<Option<RetentionLineageRow>, String> {
+                self.lookup_live_retention_lineage(session)
+                    .map_err(|e| e.to_string())
+            }
+            fn lineage(&self, id: &str) -> Result<Option<RetentionLineageRow>, String> {
+                self.lookup_retention_lineage(id).map_err(|e| e.to_string())
+            }
+            fn candidates(&self, now_ms: u64) -> Result<Vec<RetentionLineageRow>, String> {
+                self.retention_candidates(now_ms).map_err(|e| e.to_string())
+            }
+            fn run(&self, id: &str) -> Result<Option<RunRetention>, String> {
+                self.lookup_run_retention(id).map_err(|e| e.to_string())
+            }
+            fn upsert(
+                &self,
+                row: &RetentionLineageRow,
+                runs: &[RetentionRunRow],
+            ) -> Result<(), String> {
+                self.upsert_retention_lineage(row, runs)
+                    .map_err(|e| e.to_string())
+            }
+            fn stamp_run_lineage(
+                &self,
+                run_id: &str,
+                session: &BindIdentity,
+                lineage_id: &str,
+            ) -> Result<bool, String> {
+                self.stamp_retained_run_lineage(run_id, session, lineage_id)
+                    .map_err(|e| e.to_string())
+            }
+        }
+    };
+}
+
+impl_retention_index!(SqliteStore);
+impl_retention_index!(broca_store::db::OverhaulDb);
+
+#[cfg(test)]
+mod operational_port_tests {
+    use super::*;
+    use broca_store::retention_withdrawals::{RetentionQuestionId, RetentionWithdrawal};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Root(PathBuf);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
-    fn pending_deletions(&self) -> Result<Option<Vec<BindIdentity>>, String> {
-        self.retention_pending_deletions()
-            .map(Some)
-            .map_err(|e| e.to_string())
+    fn root() -> Root {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = broca_test_support::scratch_root().join(format!(
+            "retention-ports-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        Root(root)
     }
-    fn deletion_pending(&self, id: &str, key: &BindIdentity, pending: bool) -> Result<(), String> {
-        self.retention_deletion_pending(id, key, pending)
-            .map_err(|e| e.to_string())
+    fn open(root: &Path, overhaul: bool) -> Arc<dyn RetentionIndex> {
+        if overhaul {
+            fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+            Arc::new(broca_store::db::OverhaulDb::open(root).unwrap())
+        } else {
+            Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap())
+        }
     }
-    fn runs(&self, lineage: &str) -> Result<Vec<RetentionRunRow>, String> {
-        self.retention_run_rows(lineage)
+
+    #[test]
+    fn operational_retention_recovery_needs_no_legacy_export_on_overhaul_roots() {
+        let root = root();
+        fs::write(root.0.join("state-format"), b"broca-state/2\n").unwrap();
+        let index = Arc::new(broca_store::db::OverhaulDb::open(&root.0).unwrap());
+        let session = BindIdentity::new("/project", "runner", "retained");
+        index
+            .retention_deletion_pending("pending", &session, true)
+            .unwrap();
+        let wal = Arc::new(FileWalStore::with_config(
+            root.0.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
+        let leases = Arc::new(broca_core::FileLeaseStore::new(root.0.join("leases")));
+        let service =
+            RetentionService::without_usage_export(wal, index.clone(), leases.clone()).unwrap();
+        assert!(service.resume_deletions(1000).unwrap().is_empty());
+        assert_eq!(service.enroll().unwrap(), 0);
+        assert_eq!(index.retention_pending_deletions().unwrap(), vec![session]);
+        assert!(!root.0.join("run-index.db").exists());
+        let legacy_wal = Arc::new(FileWalStore::new(root.0.join("wal")));
+        assert!(RetentionService::without_usage_export(legacy_wal, index, leases).is_err());
     }
-    fn retained_sessions(&self) -> Result<Vec<BindIdentity>, String> {
-        SqliteStore::retained_sessions(self).map_err(|e| e.to_string())
-    }
-    fn expire_with_withdrawals(
-        &self,
-        row: &RetentionLineageRow,
-        runs: &[RetentionRunRow],
-        questions: &[broca_store::retention_withdrawals::RetentionWithdrawal],
-    ) -> Result<(), String> {
-        self.upsert_retention_lineage_with_withdrawals(row, runs, questions)
-            .map_err(|e| e.to_string())
-    }
-    fn pending_withdrawals(
-        &self,
-    ) -> Result<Vec<broca_store::retention_withdrawals::RetentionWithdrawal>, String> {
-        self.pending_retention_withdrawals()
-            .map_err(|e| e.to_string())
-    }
-    fn settle_withdrawal(&self, lineage: &str, key: &str) -> Result<bool, String> {
-        self.settle_retention_withdrawal(lineage, key)
-            .map_err(|e| e.to_string())
-    }
-    fn give_up_withdrawal(&self, lineage: &str, key: &str) -> Result<bool, String> {
-        self.give_up_retention_withdrawal(lineage, key)
-            .map_err(|e| e.to_string())
-    }
-    fn discovery_lineages(&self) -> Result<Vec<BindIdentity>, String> {
-        self.retention_lineages_with_discovery()
-            .map_err(|e| e.to_string())
-    }
-    fn live(&self, session: &BindIdentity) -> Result<Option<RetentionLineageRow>, String> {
-        self.lookup_live_retention_lineage(session)
-            .map_err(|e| e.to_string())
-    }
-    fn lineage(&self, id: &str) -> Result<Option<RetentionLineageRow>, String> {
-        self.lookup_retention_lineage(id).map_err(|e| e.to_string())
-    }
-    fn candidates(&self, now_ms: u64) -> Result<Vec<RetentionLineageRow>, String> {
-        self.retention_candidates(now_ms).map_err(|e| e.to_string())
-    }
-    fn run(&self, id: &str) -> Result<Option<RunRetention>, String> {
-        self.lookup_run_retention(id).map_err(|e| e.to_string())
-    }
-    fn upsert(&self, row: &RetentionLineageRow, runs: &[RetentionRunRow]) -> Result<(), String> {
-        self.upsert_retention_lineage(row, runs)
-            .map_err(|e| e.to_string())
-    }
-    fn stamp_run_lineage(
-        &self,
-        run_id: &str,
-        session: &BindIdentity,
-        lineage_id: &str,
-    ) -> Result<bool, String> {
-        self.stamp_retained_run_lineage(run_id, session, lineage_id)
-            .map_err(|e| e.to_string())
+
+    #[test]
+    fn retention_ports_preserve_expiry_deletion_and_withdrawal_work_across_restart() {
+        for overhaul in [false, true] {
+            let root = root();
+            let index = open(&root.0, overhaul);
+            let session = BindIdentity::new("/project", "runner", "retained");
+            let mut row = RetentionLineageRow {
+                lineage_id: "old".into(),
+                session: session.clone(),
+                retention_s: 1,
+                last_activity_ms: 10,
+                expires_at_ms: Some(1010),
+                wal_bytes: 500,
+                expired_at_ms: None,
+            };
+            let run = RetentionRunRow {
+                attribution: None,
+                state_changed_ms: Some(10),
+                run: RunIndexRow {
+                    run_id: "old-run".into(),
+                    session: session.clone(),
+                    state: broca_core::RunIndexState::Completed,
+                    submission_id: None,
+                    request_identity_digest: None,
+                    usage: None,
+                    final_step_finish_reason: None,
+                    retries_used: 0,
+                    title: Some("NEVER_COPY_RETENTION_TITLE".into()),
+                    withdrawals_owed: true,
+                },
+            };
+            index.upsert(&row, std::slice::from_ref(&run)).unwrap();
+            let mut conflicting = row.clone();
+            conflicting.lineage_id = "other-live-lineage".into();
+            assert!(
+                index.upsert(&conflicting, &[]).is_err(),
+                "one live lineage must own a retained address"
+            );
+            assert_eq!(index.live(&session).unwrap(), Some(row.clone()));
+            assert!(index.candidates(1009).unwrap().is_empty());
+            assert_eq!(index.candidates(1010).unwrap(), vec![row.clone()]);
+            assert_eq!(index.discovery_lineages().unwrap(), vec![session.clone()]);
+            assert!(index.run("missing").unwrap().is_none());
+            assert!(index.run("old-run").unwrap().unwrap().withdrawals_owed);
+            index.deletion_pending("old", &session, true).unwrap();
+            drop(index);
+            let index = open(&root.0, overhaul);
+            assert_eq!(
+                index.pending_deletions().unwrap().unwrap(),
+                vec![session.clone()]
+            );
+            assert_eq!(index.runs("old").unwrap()[0].run.run_id, "old-run");
+            assert!(index.runs("old").unwrap()[0].run.title.is_none());
+            row.expired_at_ms = Some(1010);
+            row.expires_at_ms = None;
+            let mut expired_run = run.clone();
+            expired_run.run.withdrawals_owed = false;
+            let question = |key: &str, id: RetentionQuestionId| RetentionWithdrawal {
+                lineage_id: "old".into(),
+                session: session.clone(),
+                call_key: key.into(),
+                scope: None,
+                question: id,
+                provider_id: "approvals".into(),
+                provider_incarnation: Some("incarnation".into()),
+                expires_at_ms: u64::MAX,
+            };
+            let questions = vec![
+                question("known", RetentionQuestionId::Known("question".into())),
+                question("unknown", RetentionQuestionId::Unknown),
+            ];
+            index
+                .expire_with_withdrawals(&row, std::slice::from_ref(&expired_run), &questions)
+                .unwrap();
+            assert!(index.live(&session).unwrap().is_none());
+            assert!(index.discovery_lineages().unwrap().is_empty());
+            assert_eq!(index.pending_withdrawals().unwrap().len(), 2);
+            assert!(index.settle_withdrawal("old", "known").unwrap());
+            assert!(index.give_up_withdrawal("old", "unknown").unwrap());
+            drop(index);
+            let index = open(&root.0, overhaul);
+            index
+                .expire_with_withdrawals(&row, std::slice::from_ref(&expired_run), &questions)
+                .unwrap();
+            assert!(
+                index.pending_withdrawals().unwrap().is_empty(),
+                "recovery must not resurrect settled or stopped questions"
+            );
+            let mut revived = row.clone();
+            revived.expired_at_ms = None;
+            revived.expires_at_ms = Some(2000);
+            assert!(index.upsert(&revived, &[]).is_err());
+            let mut fresh = revived;
+            fresh.lineage_id = "fresh".into();
+            index.upsert(&fresh, &[]).unwrap();
+            assert_eq!(index.live(&session).unwrap(), Some(fresh));
+            assert_eq!(index.lineage("old").unwrap(), Some(row));
+            index.deletion_pending("old", &session, false).unwrap();
+            assert!(index.pending_deletions().unwrap().unwrap().is_empty());
+            if overhaul {
+                assert!(!root.0.join("run-index.db").exists());
+                for name in ["broca.db", "broca.db-wal"] {
+                    if let Ok(bytes) = fs::read(root.0.join(name)) {
+                        assert!(!bytes
+                            .windows(26)
+                            .any(|s| s == b"NEVER_COPY_RETENTION_TITLE"));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -468,10 +652,14 @@ pub struct RetentionService {
     pub clock: Clock,
     evict: std::sync::OnceLock<Arc<EvictCaches>>,
     acquire: Arc<AcquireLease>,
-    export: Arc<dyn broca_core::ExportIndex>,
-    resolver: Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>,
+    export: Option<UsageExport>,
     #[cfg(test)]
     before_enroll: Mutex<Option<Arc<EnrollmentHook>>>,
+}
+
+struct UsageExport {
+    index: Arc<dyn broca_core::ExportIndex>,
+    resolver: Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>,
 }
 
 #[derive(Default)]
@@ -598,6 +786,38 @@ impl RetentionService {
         export: Arc<dyn broca_core::ExportIndex>,
         resolver: Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>,
     ) -> io::Result<Self> {
+        Self::with_export(
+            wal,
+            index,
+            leases,
+            Some(UsageExport {
+                index: export,
+                resolver,
+            }),
+        )
+    }
+
+    /// Overhaul roots retain the recovery service but have no legacy billing
+    /// export capability. Destructive retention remains format-gated below.
+    pub fn without_usage_export<L: LeaseStore + 'static>(
+        wal: Arc<FileWalStore>,
+        index: Arc<dyn RetentionIndex>,
+        leases: Arc<L>,
+    ) -> io::Result<Self> {
+        if !wal.wal_config().is_overhaul() {
+            return Err(io::Error::other(
+                "legacy retention requires its usage export index",
+            ));
+        }
+        Self::with_export(wal, index, leases, None)
+    }
+
+    fn with_export<L: LeaseStore + 'static>(
+        wal: Arc<FileWalStore>,
+        index: Arc<dyn RetentionIndex>,
+        leases: Arc<L>,
+        export: Option<UsageExport>,
+    ) -> io::Result<Self> {
         let clock = Clock::for_state_root(wal.ephemeral_root().parent().unwrap_or(Path::new("")))?;
         Ok(Self {
             withdrawal_adapter: std::sync::OnceLock::new(),
@@ -619,7 +839,6 @@ impl RetentionService {
             index,
             clock,
             export,
-            resolver,
             acquire: Arc::new(move |session| {
                 leases
                     .acquire(&broca_core::lease_key_for(session))
@@ -1624,6 +1843,10 @@ impl RetentionService {
             .lock()
             .unwrap()
             .remove(&broca_core::session_addr(key));
+        let export = self
+            .export
+            .as_ref()
+            .ok_or("retention deletion requires its legacy usage export index")?;
         let mut failed_exports = Vec::new();
         if let Ok(read) = &read {
             let raw: Vec<_> = frames(read).iter().map(|f| f.record.clone()).collect();
@@ -1631,9 +1854,9 @@ impl RetentionService {
                 if let WalRecord::RunStarted { run_id, .. } = &frame.record {
                     if broca_core::reconcile_run_state(&raw, &run_id.0)
                         .is_some_and(|state| state.state.is_terminal())
-                        && self
-                            .export
-                            .emit_run(frames(read), run_id, self.resolver.as_ref())
+                        && export
+                            .index
+                            .emit_run(frames(read), run_id, export.resolver.as_ref())
                             .is_err()
                     {
                         failed_exports.push(run_id.0.clone());
@@ -1641,7 +1864,7 @@ impl RetentionService {
                 }
             }
         } else {
-            let discovered = self.export.missing_terminal_runs().map(|runs| {
+            let discovered = export.index.missing_terminal_runs().map(|runs| {
                 runs.into_iter()
                     .filter(|run| run.session == *key)
                     .map(|run| run.run_id.0)

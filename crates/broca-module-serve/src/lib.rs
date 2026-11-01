@@ -17,6 +17,7 @@ pub mod account_routing;
 pub mod agent_data;
 pub mod auth_routing;
 pub mod billing_routing;
+pub mod bundle;
 pub mod bus_events;
 pub mod bus_events_nats;
 pub mod cache_diagnose;

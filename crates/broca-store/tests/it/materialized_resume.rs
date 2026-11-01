@@ -728,6 +728,13 @@ impl MaterializedStore for LaggingStore {
 }
 
 impl Persister for LaggingStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        self.inner.repair_sender_policy(session, range)
+    }
     fn projection_seed(
         &self,
         session: &BindIdentity,
@@ -858,6 +865,13 @@ impl MaterializedStore for CountingStore {
 }
 
 impl Persister for CountingStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        self.inner.repair_sender_policy(session, range)
+    }
     fn projection_seed(
         &self,
         session: &BindIdentity,
@@ -2283,6 +2297,7 @@ impl broca_core::compaction::CompactionPlane for HeldViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, broca_core::compaction::CompactionUnavailable> {
         if let Some(lineage) = &request.lineage_id {
@@ -2301,6 +2316,7 @@ impl broca_core::compaction::CompactionPlane for HeldViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, broca_core::compaction::CompactionUnavailable> {
         Ok(ViewGetAnswer::view(
@@ -2611,6 +2627,13 @@ impl MaterializedStore for CountedStore {
 }
 
 impl Persister for CountedStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        self.inner.repair_sender_policy(session, range)
+    }
     fn projection_seed(
         &self,
         session: &BindIdentity,

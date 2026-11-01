@@ -136,9 +136,28 @@ pub struct FileCutArtifacts {
     registry: LineageRegistry,
     wal: Arc<FileWalStore>,
     leases: FileLeaseStore,
-    export: Arc<dyn ExportIndex>,
+    export: Arc<dyn broca_core::ImportedRunExclusions>,
     driver: Arc<dyn MoveDriver>,
     plans: Arc<Mutex<HashMap<String, LockedPlans>>>,
+}
+
+struct LegacyExclusions(Arc<dyn ExportIndex>);
+impl broca_core::ImportedRunExclusions for LegacyExclusions {
+    fn record_imported_runs(
+        &self,
+        session: &BindIdentity,
+        cut_id: &str,
+        runs: &[broca_protocol::RunId],
+    ) -> Result<(), broca_core::ExportError> {
+        self.0.record_imported_runs(session, cut_id, runs)
+    }
+    fn is_imported_run(
+        &self,
+        session: &BindIdentity,
+        run: &broca_protocol::RunId,
+    ) -> Result<bool, broca_core::ExportError> {
+        self.0.is_imported_run(session, run)
+    }
 }
 fn unavailable(e: impl std::fmt::Display) -> ErrorBody {
     refusal("unavailable", e.to_string(), Value::Null)
@@ -353,6 +372,22 @@ impl FileCutArtifacts {
         registry: LineageRegistry,
         wal: Arc<FileWalStore>,
         export: Arc<dyn ExportIndex>,
+        driver: Arc<dyn MoveDriver>,
+    ) -> Self {
+        Self::with_exclusions(
+            state_root,
+            registry,
+            wal,
+            Arc::new(LegacyExclusions(export)),
+            driver,
+        )
+    }
+
+    pub fn with_exclusions(
+        state_root: PathBuf,
+        registry: LineageRegistry,
+        wal: Arc<FileWalStore>,
+        export: Arc<dyn broca_core::ImportedRunExclusions>,
         driver: Arc<dyn MoveDriver>,
     ) -> Self {
         let root = wal.root().parent().unwrap_or(std::path::Path::new("."));

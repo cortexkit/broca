@@ -2249,6 +2249,8 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // storage root. Every route.bind request in this probe omits the scope stamp;
         // assert all four counters and no dedupe-set overflow below.
         "scoped_session_workdirs",
+        // No scoped provider route opens in this healthy probe, so no refusal codes were counted.
+        "scoped_role_route_refusals",
         // A complete inventory and valid session identities refuse no binds in this isolated
         // healthy process. Pin all reason counters at zero below, not just their presence.
         "session_address_refusals",
@@ -2273,6 +2275,11 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
          failure to fix by adding it to the list -- decide what it must read on a healthy \
          daemon and assert that below, because an unasserted metric is one the fleet reads \
          during an incident and nothing defends."
+    );
+    assert_eq!(
+        metrics["scoped_role_route_refusals"],
+        serde_json::json!({}),
+        "a process with no refused scoped role opens has an empty refusal-code map"
     );
     // This in-process adapter has no daemon bootstrap or watchdog file. The real
     // binary enables the witness during boot; a library-only connection says so.
@@ -5689,6 +5696,9 @@ fn send_request() -> serde_json::Value {
 fn status_request() -> serde_json::Value {
     serde_json::json!({ "method": "run.status", "params": {} })
 }
+
+#[path = "wire_generation.rs"]
+mod generation;
 
 #[tokio::test]
 async fn run_status_frozen_auth_selection_matches_served_golden() {

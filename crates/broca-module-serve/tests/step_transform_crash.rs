@@ -216,6 +216,7 @@ async fn drive(
     if writer.next_record_seq() == 1 && installed {
         let plan = broca_core::hooks::HookPlan::from_manifest(&manifest).unwrap();
         let runtime = broca_core::hooks::HookRuntime {
+            scope: None,
             plan: &plan,
             plane: &plane,
             bind: &req.session,
@@ -681,6 +682,7 @@ async fn pre_user_answer_lost_before_send_record_retries_once() {
     let plane: Arc<dyn broca_core::HookPlane> = Arc::new(broca_subc::SubcHookPlane::new(conn));
     let plan = broca_core::hooks::HookPlan::from_manifest(&manifest).unwrap();
     let runtime = broca_core::hooks::HookRuntime {
+        scope: None,
         plan: &plan,
         plane: &plane,
         bind: &req.session,

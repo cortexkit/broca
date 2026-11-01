@@ -84,11 +84,16 @@ impl Metrics {
 #[derive(Default)]
 pub(crate) struct State {
     account: Mutex<Option<AccountNames>>,
-    metrics: Arc<Metrics>,
+    pub(crate) metrics: Arc<Metrics>,
     /// When the current enabled period began, in Unix milliseconds; zero while none is active.
     /// Read on the WAL writer's thread before every run start, so it is kept in memory.
     period_started_ms: AtomicU64,
+    #[cfg(test)]
+    before_write_unlock: Mutex<Option<WriteObserver>>,
 }
+
+#[cfg(test)]
+type WriteObserver = Box<dyn Fn(&Connection) + Send + Sync>;
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
@@ -110,6 +115,51 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
          CREATE INDEX IF NOT EXISTS bus_event_live_runs ON run_index(state_changed_ms)
             WHERE state IN ('active','paused');
          CREATE TABLE IF NOT EXISTS bus_event_projection (
+            session TEXT PRIMARY KEY, epoch TEXT NOT NULL, seq INTEGER NOT NULL,
+            state_json TEXT NOT NULL
+         );
+         -- Sessions whose projection has a run started and not yet seen finish. Recovery after
+         -- process loss visits these and the run index's live runs of the current period.
+         CREATE TABLE IF NOT EXISTS bus_event_open (
+            session TEXT PRIMARY KEY, identity TEXT NOT NULL
+         );
+         -- The one row says when the current enabled period began. Absent means events were
+         -- off at the last start, so the next enable begins a new period.
+         CREATE TABLE IF NOT EXISTS bus_event_period (
+            id INTEGER PRIMARY KEY CHECK (id = 1), started_ms INTEGER NOT NULL
+         );
+         -- Compaction advance notices (compaction-provider/v1 §5), projected from the durable
+         -- WAL like run events. A notice is headers only: the bus message id names the session
+         -- and the notice's sequence number, and the bus digest is the notice digest.
+         CREATE TABLE IF NOT EXISTS compaction_notice_outbox (
+            message_id TEXT PRIMARY KEY, session TEXT NOT NULL, subject TEXT NOT NULL,
+            headers TEXT NOT NULL, digest TEXT NOT NULL, at_ms INTEGER NOT NULL,
+            published_ms INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS compaction_notice_unpublished
+            ON compaction_notice_outbox(at_ms) WHERE published_ms IS NULL;",
+    )
+}
+
+pub(crate) fn init_overhaul_event_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS bus_event_outbox (
+            event_key TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL,
+            subject TEXT NOT NULL, epoch TEXT NOT NULL, session TEXT NOT NULL,
+            body BLOB NOT NULL, at_ms INTEGER NOT NULL, published_ms INTEGER,
+            best_effort INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(epoch, run_id, seq, subject)
+         );
+         CREATE INDEX IF NOT EXISTS bus_event_pending ON bus_event_outbox(published_ms, at_ms);
+         -- Unpublished lifecycle rows only, in insertion order (every key is 0, so entries sort
+         -- by rowid). The drain's next-row query and the startup depth count read this index
+         -- instead of scanning a table that also holds a day of published bodies.
+         CREATE INDEX IF NOT EXISTS bus_event_unpublished ON bus_event_outbox(best_effort)
+            WHERE published_ms IS NULL AND best_effort=0;
+          CREATE INDEX IF NOT EXISTS bus_event_age ON bus_event_outbox(at_ms);",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS bus_event_projection (
             session TEXT PRIMARY KEY, epoch TEXT NOT NULL, seq INTEGER NOT NULL,
             state_json TEXT NOT NULL
          );
@@ -204,7 +254,343 @@ pub enum DrainResult {
     Retry,
 }
 
+/// Durable lifecycle publications and a checkpoint of the last projected write-ahead log record.
+/// A broker acknowledgement is required before a pending publication is retired.
+pub trait RunEventStore: Send + Sync {
+    fn enable_bus_events(&self, account: &str) -> Result<(), String>;
+    fn bus_metrics(&self) -> &Metrics;
+    fn bus_metrics_arc(&self) -> Arc<Metrics>;
+    fn begin_bus_event_period(&self, now_ms: u64) -> Result<PeriodStart, StoreError>;
+    fn end_bus_event_period(&self) -> Result<bool, StoreError>;
+    fn bus_event_open_sessions(&self) -> Result<Vec<BindIdentity>, StoreError>;
+    fn bus_event_period_started_ms(&self) -> u64;
+    fn bus_event_checkpoint(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<(String, u64)>, StoreError>;
+    fn bus_event_position(&self, session: &BindIdentity, epoch: &str) -> Result<u64, StoreError>;
+    fn project_new_bus_events(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        records: &[FramedRecord],
+        now_ms: u64,
+    ) -> Result<(), StoreError>;
+    fn retain_bus_progress(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        event: &RunEvent,
+        now_ms: u64,
+    ) -> Result<Option<Publication>, StoreError>;
+    fn get_bus_event(&self, event_key: &str)
+        -> Result<Option<(BindIdentity, Vec<u8>)>, StoreError>;
+    fn pending_bus_event(&self) -> Result<Option<Publication>, StoreError>;
+    fn acknowledge_bus_event(
+        &self,
+        event: &Publication,
+        receipt: PublishReceipt,
+        now_ms: u64,
+    ) -> Result<(), StoreError>;
+    fn skip_stale_bus_events(&self, now_ms: u64) -> Result<SkipSummary, StoreError>;
+    fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError>;
+}
+
+/// Drain orchestration belongs to the publisher, not the object-safe storage port.
+pub async fn drain_bus_event<S: RunEventStore + ?Sized>(
+    store: &S,
+    publisher: &dyn BusPublisher,
+    now_ms: u64,
+) -> Result<DrainResult, StoreError> {
+    let Some(event) = store.pending_bus_event()? else {
+        return Ok(DrainResult::Empty);
+    };
+    match publisher.publish(&event).await {
+        Ok(receipt) => {
+            store.acknowledge_bus_event(&event, receipt, now_ms)?;
+            Ok(DrainResult::Published)
+        }
+        Err(_) => {
+            store
+                .bus_metrics()
+                .bus_publish_failures
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(DrainResult::Retry)
+        }
+    }
+}
+
+impl RunEventStore for SqliteStore {
+    fn enable_bus_events(&self, account: &str) -> Result<(), String> {
+        self.enable_bus_events(account)
+    }
+    fn bus_metrics(&self) -> &Metrics {
+        self.bus_metrics()
+    }
+    fn bus_metrics_arc(&self) -> Arc<Metrics> {
+        self.bus_metrics_arc()
+    }
+    fn begin_bus_event_period(&self, now_ms: u64) -> Result<PeriodStart, StoreError> {
+        self.begin_bus_event_period(now_ms)
+    }
+    fn end_bus_event_period(&self) -> Result<bool, StoreError> {
+        self.end_bus_event_period()
+    }
+    fn bus_event_open_sessions(&self) -> Result<Vec<BindIdentity>, StoreError> {
+        self.bus_event_open_sessions()
+    }
+    fn bus_event_period_started_ms(&self) -> u64 {
+        self.bus_event_period_started_ms()
+    }
+    fn bus_event_checkpoint(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<(String, u64)>, StoreError> {
+        self.bus_event_checkpoint(session)
+    }
+    fn bus_event_position(&self, session: &BindIdentity, epoch: &str) -> Result<u64, StoreError> {
+        self.bus_event_position(session, epoch)
+    }
+    fn project_new_bus_events(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        records: &[FramedRecord],
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.project_new_bus_events(session, epoch, records, now_ms)
+    }
+    fn retain_bus_progress(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        event: &RunEvent,
+        now_ms: u64,
+    ) -> Result<Option<Publication>, StoreError> {
+        self.retain_bus_progress(session, epoch, event, now_ms)
+    }
+    fn get_bus_event(
+        &self,
+        event_key: &str,
+    ) -> Result<Option<(BindIdentity, Vec<u8>)>, StoreError> {
+        self.get_bus_event(event_key)
+    }
+    fn pending_bus_event(&self) -> Result<Option<Publication>, StoreError> {
+        self.pending_bus_event()
+    }
+    fn acknowledge_bus_event(
+        &self,
+        event: &Publication,
+        receipt: PublishReceipt,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.acknowledge_bus_event(event, receipt, now_ms)
+    }
+    fn skip_stale_bus_events(&self, now_ms: u64) -> Result<SkipSummary, StoreError> {
+        self.skip_stale_bus_events(now_ms)
+    }
+    fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError> {
+        self.prune_bus_events(now_ms)
+    }
+}
+
 impl SqliteStore {
+    pub fn enable_bus_events(&self, account: &str) -> Result<(), String> {
+        self.event_store().enable_bus_events(account)
+    }
+    pub fn bus_metrics(&self) -> &Metrics {
+        &self.bus_events.metrics
+    }
+    pub fn bus_metrics_arc(&self) -> Arc<Metrics> {
+        self.bus_events.metrics.clone()
+    }
+    pub fn begin_bus_event_period(&self, now_ms: u64) -> Result<PeriodStart, StoreError> {
+        self.event_store().begin_bus_event_period(now_ms)
+    }
+    pub fn end_bus_event_period(&self) -> Result<bool, StoreError> {
+        self.event_store().end_bus_event_period()
+    }
+    pub fn bus_event_open_sessions(&self) -> Result<Vec<BindIdentity>, StoreError> {
+        self.event_store().bus_event_open_sessions()
+    }
+    pub fn bus_event_period_started_ms(&self) -> u64 {
+        self.event_store().bus_event_period_started_ms()
+    }
+    pub fn bus_event_checkpoint(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<(String, u64)>, StoreError> {
+        self.event_store().bus_event_checkpoint(session)
+    }
+    pub fn bus_event_position(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+    ) -> Result<u64, StoreError> {
+        self.event_store().bus_event_position(session, epoch)
+    }
+    pub fn project_new_bus_events(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        records: &[FramedRecord],
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.project_legacy_compaction_facts(session, epoch, records)?;
+        self.event_store()
+            .project_new_bus_events(session, epoch, records, now_ms)
+    }
+    pub fn retain_bus_progress(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        event: &RunEvent,
+        now_ms: u64,
+    ) -> Result<Option<Publication>, StoreError> {
+        self.event_store()
+            .retain_bus_progress(session, epoch, event, now_ms)
+    }
+    pub fn get_bus_event(
+        &self,
+        event_key: &str,
+    ) -> Result<Option<(BindIdentity, Vec<u8>)>, StoreError> {
+        self.event_store().get_bus_event(event_key)
+    }
+    pub fn pending_bus_event(&self) -> Result<Option<Publication>, StoreError> {
+        self.event_store().pending_bus_event()
+    }
+    pub fn acknowledge_bus_event(
+        &self,
+        event: &Publication,
+        receipt: PublishReceipt,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.event_store()
+            .acknowledge_bus_event(event, receipt, now_ms)
+    }
+    pub fn skip_stale_bus_events(&self, now_ms: u64) -> Result<SkipSummary, StoreError> {
+        self.event_store().skip_stale_bus_events(now_ms)
+    }
+    pub fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError> {
+        self.event_store().prune_bus_events(now_ms)
+    }
+
+    fn event_store(&self) -> EventStore<'_> {
+        EventStore {
+            conn: &self.conn,
+            bus_events: &self.bus_events,
+            legacy: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn resync_bus_depth(&self) -> Result<(), StoreError> {
+        self.event_store().resync_bus_depth()
+    }
+
+    fn project_legacy_compaction_facts(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        records: &[FramedRecord],
+    ) -> Result<(), StoreError> {
+        if records
+            .iter()
+            .any(|r| crate::compaction_facts::is_compaction_record(&r.record))
+        {
+            self.project_compaction_facts_records(session, epoch, records, None, None)?;
+        }
+        Ok(())
+    }
+
+    pub fn project_bus_events(
+        &self,
+        session: &BindIdentity,
+        epoch: &str,
+        records: &[FramedRecord],
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.project_legacy_compaction_facts(session, epoch, records)?;
+        self.event_store()
+            .project_bus_events(session, epoch, records, now_ms)
+    }
+
+    pub async fn drain_bus_event(
+        &self,
+        publisher: &dyn BusPublisher,
+        now_ms: u64,
+    ) -> Result<DrainResult, StoreError> {
+        let Some(event) = self.pending_bus_event()? else {
+            return Ok(DrainResult::Empty);
+        };
+        match publisher.publish(&event).await {
+            Ok(receipt) => {
+                self.acknowledge_bus_event(&event, receipt, now_ms)?;
+                Ok(DrainResult::Published)
+            }
+            Err(_) => {
+                self.bus_metrics()
+                    .bus_publish_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(DrainResult::Retry)
+            }
+        }
+    }
+}
+
+pub(crate) struct EventStore<'a> {
+    pub(crate) conn: &'a Mutex<Connection>,
+    pub(crate) bus_events: &'a State,
+    pub(crate) legacy: bool,
+}
+
+impl EventStore<'_> {
+    fn key(session: &BindIdentity) -> String {
+        SqliteStore::key(session)
+    }
+
+    fn write<T>(
+        &self,
+        legacy_transaction: bool,
+        write: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.write_with_locked_effect(legacy_transaction, write, |_| {})
+    }
+
+    fn write_with_locked_effect<T>(
+        &self,
+        legacy_transaction: bool,
+        write: impl FnOnce(&Connection) -> Result<T, StoreError>,
+        after_write: impl FnOnce(&T),
+    ) -> Result<T, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        if !self.legacy {
+            conn.pragma_update(None, "synchronous", "FULL")?;
+        }
+        let result = if legacy_transaction || !self.legacy {
+            let behavior = if self.legacy {
+                rusqlite::TransactionBehavior::Deferred
+            } else {
+                rusqlite::TransactionBehavior::Immediate
+            };
+            let tx = conn.transaction_with_behavior(behavior)?;
+            let result = write(&tx)?;
+            tx.commit()?;
+            Ok(result)
+        } else {
+            write(&conn)
+        };
+        if let Ok(value) = &result {
+            // A depth resync takes the same mutex, so notice gauges must move before unlock.
+            after_write(value);
+            #[cfg(test)]
+            if let Some(observe) = &*self.bus_events.before_write_unlock.lock().unwrap() {
+                observe(&conn);
+            }
+        }
+        result
+    }
+
     /// Called only after the bus client attests its machine account and dotted event support.
     pub fn enable_bus_events(&self, account: &str) -> Result<(), String> {
         let names = AccountNames::derive(account).map_err(|e| e.to_string())?;
@@ -237,45 +623,44 @@ impl SqliteStore {
     /// reads until pruned), every projection checkpoint and the open-session list, so each
     /// session starts again from its head when it next writes.
     pub fn begin_bus_event_period(&self, now_ms: u64) -> Result<PeriodStart, StoreError> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        let existing: Option<u64> = tx
-            .query_row(
-                "SELECT started_ms FROM bus_event_period WHERE id=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let start = match existing {
-            Some(started_ms) => PeriodStart {
-                started_ms,
-                fresh: false,
-                discarded: 0,
-            },
-            None => {
-                let discarded = tx.execute(
-                    "DELETE FROM bus_event_outbox WHERE published_ms IS NULL AND best_effort=0",
+        let start = self.write(true, |tx| {
+            let existing: Option<u64> = tx
+                .query_row(
+                    "SELECT started_ms FROM bus_event_period WHERE id=1",
                     [],
-                )? as u64;
-                tx.execute(
-                    "DELETE FROM compaction_notice_outbox WHERE published_ms IS NULL",
-                    [],
-                )?;
-                tx.execute("DELETE FROM bus_event_projection", [])?;
-                tx.execute("DELETE FROM bus_event_open", [])?;
-                tx.execute(
-                    "INSERT INTO bus_event_period(id, started_ms) VALUES(1, ?1)",
-                    [now_ms],
-                )?;
-                PeriodStart {
-                    started_ms: now_ms,
-                    fresh: true,
-                    discarded,
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let start = match existing {
+                Some(started_ms) => PeriodStart {
+                    started_ms,
+                    fresh: false,
+                    discarded: 0,
+                },
+                None => {
+                    let discarded = tx.execute(
+                        "DELETE FROM bus_event_outbox WHERE published_ms IS NULL AND best_effort=0",
+                        [],
+                    )? as u64;
+                    tx.execute(
+                        "DELETE FROM compaction_notice_outbox WHERE published_ms IS NULL",
+                        [],
+                    )?;
+                    tx.execute("DELETE FROM bus_event_projection", [])?;
+                    tx.execute("DELETE FROM bus_event_open", [])?;
+                    tx.execute(
+                        "INSERT INTO bus_event_period(id, started_ms) VALUES(1, ?1)",
+                        [now_ms],
+                    )?;
+                    PeriodStart {
+                        started_ms: now_ms,
+                        fresh: true,
+                        discarded,
+                    }
                 }
-            }
-        };
-        tx.commit()?;
-        drop(conn);
+            };
+            Ok(start)
+        })?;
         self.bus_events
             .period_started_ms
             .store(start.started_ms, Ordering::Relaxed);
@@ -294,19 +679,20 @@ impl SqliteStore {
         self.bus_events
             .period_started_ms
             .store(0, Ordering::Relaxed);
-        let conn = self.conn.lock().unwrap();
-        let recorded: Option<u64> = conn
-            .query_row(
-                "SELECT started_ms FROM bus_event_period WHERE id=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if recorded.is_none() {
-            return Ok(false);
-        }
-        conn.execute("DELETE FROM bus_event_period", [])?;
-        Ok(true)
+        self.write(false, |conn| {
+            let recorded: Option<u64> = conn
+                .query_row(
+                    "SELECT started_ms FROM bus_event_period WHERE id=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if recorded.is_none() {
+                return Ok(false);
+            }
+            conn.execute("DELETE FROM bus_event_period", [])?;
+            Ok(true)
+        })
     }
 
     /// The only sessions recovery after process loss needs to visit: those whose projection
@@ -322,7 +708,7 @@ impl SqliteStore {
             .query_map([], |r| r.get::<_, String>(0))?
             .map(|r| Ok(serde_json::from_str(&r?)?))
             .collect::<Result<Vec<BindIdentity>, StoreError>>()?;
-        if period != 0 {
+        if period != 0 && self.legacy {
             let admitted = conn
                 .prepare(
                     "SELECT DISTINCT session FROM run_index INDEXED BY bus_event_live_runs
@@ -331,6 +717,22 @@ impl SqliteStore {
                 .query_map([period], |r| r.get::<_, String>(0))?
                 .map(|r| Ok(serde_json::from_str(&r?)?))
                 .collect::<Result<Vec<BindIdentity>, StoreError>>()?;
+            sessions.extend(admitted);
+        } else if period != 0 {
+            let admitted = conn
+                .prepare(
+                    "SELECT DISTINCT s.project_root,s.harness,s.session_key FROM run r
+                     JOIN session s ON s.sid=r.sid JOIN operational_run o USING(run_id)
+                     WHERE r.state IN ('active','paused') AND o.state_changed_ms>=?1",
+                )?
+                .query_map([period], |r| {
+                    Ok(BindIdentity {
+                        project_root: std::path::PathBuf::from(r.get::<_, String>(0)?),
+                        harness: r.get(1)?,
+                        session: r.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             sessions.extend(admitted);
         }
         sessions.sort_by_key(Self::key);
@@ -359,11 +761,11 @@ impl SqliteStore {
             }
             Err(e) => return Err(StoreError::BusEvent(e.to_string())),
         };
-        let conn = self.conn.lock().unwrap();
         // Progress is retained for claim-check reads but never retried as lifecycle work, so it
         // is written best-effort and never counts toward the outbox depth.
-        let (event_key, _) =
-            insert_event(&conn, &account, session, epoch, event, &bytes, now_ms, true)?;
+        let (event_key, _) = self.write(false, |conn| {
+            insert_event(conn, &account, session, epoch, event, &bytes, now_ms, true)
+        })?;
         Ok(Some(Publication {
             event_key,
             subject: event
@@ -465,17 +867,10 @@ impl SqliteStore {
         now_ms: u64,
         baseline: Baseline,
     ) -> Result<(), StoreError> {
-        if records
-            .iter()
-            .any(|r| crate::compaction_facts::is_compaction_record(&r.record))
-        {
-            self.project_compaction_facts_records(session, epoch, records, None, None)?;
-        }
         let Some(account) = self.bus_events.account.lock().unwrap().clone() else {
             return Ok(());
         };
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let (inserted, _, oversize, dropped) = self.write_with_locked_effect(true, |tx| {
         let key = Self::key(session);
         let saved: Option<(String, u64, String)> = tx
             .query_row(
@@ -532,15 +927,17 @@ impl SqliteStore {
                         open: true,
                         ..Projection::default()
                     };
-                    state.attribution.observe(&frame.record);
+                    if self.legacy { state.attribution.observe(&frame.record); }
                     // Event projection can create the row before the actor's active-index
                     // write. Record its session reference in the same managed transaction so
                     // the legacy-write triggers do not invalidate a complete inventory.
+                    if self.legacy {
                     tx.execute("INSERT INTO agent_data_writer VALUES(1)", [])?;
-                    crate::session_refs::insert(&tx, &broca_core::session_addr(session), session)?;
+                    crate::session_refs::insert(tx, &broca_core::session_addr(session), session)?;
                     tx.execute("INSERT OR IGNORE INTO run_index(run_id,session,submission_id,request_identity_digest,state,state_changed_ms,title) VALUES(?1,?2,?3,?4,'active',?5,?6)",
                         params![run_id.0, serde_json::to_string(session)?, submission_id.as_ref().map(|s| &s.0), request_identity_digest, ts_ms, title])?;
                     tx.execute("DELETE FROM agent_data_writer", [])?;
+                    }
                     Some(RunEventDetail::Started {})
                 }
                 WalRecord::Steered { send_id, ts_ms, .. } => {
@@ -585,9 +982,9 @@ impl SqliteStore {
                     ..
                 } => {
                     state.last_at_ms = ts_ms.unwrap_or(state.last_at_ms);
-                    state.attribution.observe(&frame.record);
-                    crate::diagnostics::write_lifecycle(
-                        &tx,
+                    if self.legacy { state.attribution.observe(&frame.record); }
+                    if self.legacy { crate::diagnostics::write_lifecycle(
+                        tx,
                         &run_id.0,
                         "paused",
                         None,
@@ -595,6 +992,7 @@ impl SqliteStore {
                         0,
                         Some(&state.attribution),
                     )?;
+                    }
                     Some(RunEventDetail::Paused {
                         pause_reason: *reason,
                     })
@@ -602,7 +1000,7 @@ impl SqliteStore {
                 // Notices are not run lifecycle work, so they stay out of the outbox depth.
                 WalRecord::CompactionNotice { headers, .. } => {
                     inserted_notices += u64::from(insert_notice(
-                        &tx,
+                        tx,
                         &account,
                         session,
                         headers,
@@ -621,11 +1019,11 @@ impl SqliteStore {
                 } => {
                     state.last_at_ms = ts_ms.unwrap_or(state.last_at_ms);
                     state.open = false;
-                    state.attribution.observe(&frame.record);
-                    if let Some(run_id) = &state.run_id {
+                    if self.legacy { state.attribution.observe(&frame.record); }
+                    if let Some(run_id) = state.run_id.as_ref().filter(|_| self.legacy) {
                         let terminal = serde_json::to_value(reason)?.as_str().unwrap().to_owned();
                         crate::diagnostics::write_lifecycle(
-                            &tx,
+                            tx,
                             run_id,
                             &terminal,
                             Some(&serde_json::to_string(usage)?),
@@ -664,7 +1062,7 @@ impl SqliteStore {
                     }
                     Ok(bytes) => {
                         let (_, new_row) = insert_event(
-                            &tx, &account, session, epoch, &event, &bytes, now_ms, false,
+                            tx, &account, session, epoch, &event, &bytes, now_ms, false,
                         )?;
                         inserted += u64::from(new_row);
                     }
@@ -677,8 +1075,16 @@ impl SqliteStore {
             }
             seq = frame.seq;
         }
+        let state_json = if self.legacy {
+            serde_json::to_string(&state)?
+        } else {
+            // Run diagnostics are independently indexed; the outbox needs only event state.
+            let mut value = serde_json::to_value(&state)?;
+            value.as_object_mut().unwrap().remove("attribution");
+            serde_json::to_string(&value)?
+        };
         tx.execute("INSERT INTO bus_event_projection(session,epoch,seq,state_json) VALUES(?1,?2,?3,?4) ON CONFLICT(session) DO UPDATE SET epoch=excluded.epoch,seq=excluded.seq,state_json=excluded.state_json",
-            params![key,epoch,seq,serde_json::to_string(&state)?])?;
+            params![key,epoch,seq,state_json])?;
         if state.open {
             tx.execute(
                 "INSERT OR IGNORE INTO bus_event_open(session, identity) VALUES(?1, ?2)",
@@ -687,11 +1093,10 @@ impl SqliteStore {
         } else {
             tx.execute("DELETE FROM bus_event_open WHERE session=?1", [&key])?;
         }
-        tx.commit()?;
-        self.bus_metrics()
-            .compaction_notice_outbox_pending
-            .fetch_add(inserted_notices, Ordering::Relaxed);
-        drop(conn);
+        Ok((inserted, inserted_notices, oversize, dropped))
+        }, |(_, inserted_notices, _, _)| {
+            self.bus_metrics().compaction_notice_outbox_pending.fetch_add(*inserted_notices, Ordering::Relaxed);
+        })?;
         self.bus_metrics()
             .bus_outbox_depth
             .fetch_add(inserted, Ordering::Relaxed);
@@ -784,28 +1189,6 @@ impl SqliteStore {
         .transpose()
     }
 
-    pub async fn drain_bus_event(
-        &self,
-        publisher: &dyn BusPublisher,
-        now_ms: u64,
-    ) -> Result<DrainResult, StoreError> {
-        let Some(event) = self.pending_bus_event()? else {
-            return Ok(DrainResult::Empty);
-        };
-        match publisher.publish(&event).await {
-            Ok(receipt) => {
-                self.acknowledge_bus_event(&event, receipt, now_ms)?;
-                Ok(DrainResult::Published)
-            }
-            Err(_) => {
-                self.bus_metrics()
-                    .bus_publish_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(DrainResult::Retry)
-            }
-        }
-    }
-
     /// Replace queued run events older than [`STALE_BACKLOG_MS`] with one `run.skipped` marker
     /// per session. Call it when a bus connection comes up, before the first publish on it.
     ///
@@ -837,8 +1220,7 @@ impl SqliteStore {
             epoch: String,
             at_ms: u64,
         }
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let summary = self.write(true, |tx| {
         // Sessions in the order their first queued row appears, each with its rows in order.
         let mut sessions: Vec<(String, Vec<Row>)> = Vec::new();
         {
@@ -916,8 +1298,8 @@ impl SqliteStore {
             summary.sessions += 1;
             summary.skipped += marker.count;
         }
-        tx.commit()?;
-        drop(conn);
+        Ok(summary)
+        })?;
         // Each session's rows became one pending marker.
         self.lower_bus_depth(summary.skipped - summary.sessions);
         Ok(summary)
@@ -929,7 +1311,7 @@ impl SqliteStore {
         _receipt: PublishReceipt,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let (lifecycle, lifecycle_updated, notices_updated) = self.write_with_locked_effect(false, |conn| {
         let lifecycle: Option<bool> = conn
             .query_row(
                 "SELECT best_effort=0 FROM bus_event_outbox WHERE event_key=?1 AND published_ms IS NULL",
@@ -946,9 +1328,9 @@ impl SqliteStore {
                  WHERE message_id=?1 AND published_ms IS NULL",
             params![event.event_key, now_ms],
         )? as u64;
-        self.lower_notice_depth(notices_updated);
+        Ok((lifecycle, lifecycle_updated, notices_updated))
+        }, |(_, _, notices_updated)| self.lower_notice_depth(*notices_updated))?;
         let updated = lifecycle_updated + notices_updated;
-        drop(conn);
         self.bus_metrics()
             .bus_events_published
             .fetch_add(updated, Ordering::Relaxed);
@@ -959,7 +1341,7 @@ impl SqliteStore {
     }
 
     pub fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let (deleted, dropped, _) = self.write_with_locked_effect(false, |conn| {
         let cutoff = now_ms.saturating_sub(RETENTION_MS);
         let dropped: u64 = conn.query_row(
             "SELECT count(*) FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0 AND at_ms<?1",
@@ -975,8 +1357,8 @@ impl SqliteStore {
                 "DELETE FROM compaction_notice_outbox WHERE at_ms<?1",
                 [cutoff],
             )?;
-        self.lower_notice_depth(notices_dropped);
-        drop(conn);
+        Ok((deleted, dropped, notices_dropped))
+        }, |(_, _, notices_dropped)| self.lower_notice_depth(*notices_dropped))?;
         if dropped > 0 {
             self.lower_bus_depth(dropped);
             self.bus_metrics()
@@ -1107,6 +1489,106 @@ fn insert_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_event_schema_matches_frozen_catalog() {
+        // The fixture records sqlite_schema.sql from the legacy initializer at 6ce6d968d1f5.
+        let expected: Vec<(String, String)> =
+            serde_json::from_str(include_str!("../tests/fixtures/legacy-bus-schema.json")).unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let actual = conn.prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND (name LIKE 'bus_event_%' OR name LIKE 'compaction_notice_%') ORDER BY name").unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    fn notice_gauge_precedes_unlock(operation: &str) {
+        use broca_core::compaction_provider::notice::AdvanceNotice;
+        let store = enabled();
+        let notice = AdvanceNotice::new(
+            agent_session_ref(&session()),
+            1,
+            "epoch",
+            0,
+            "a".repeat(64),
+            10,
+            "model",
+        );
+        let frames = [
+            start(),
+            FramedRecord {
+                seq: 2,
+                fence: 1,
+                record: WalRecord::CompactionNotice {
+                    seq: 1,
+                    headers: notice.to_headers(),
+                },
+            },
+        ];
+        if operation != "enqueue" {
+            store
+                .project_bus_events(&session(), "epoch", &frames, 1000)
+                .unwrap();
+        }
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let captured = observations.clone();
+        let metrics = store.bus_metrics_arc();
+        *store.bus_events.before_write_unlock.lock().unwrap() = Some(Box::new(move |conn| {
+            let pending: u64 = conn
+                .query_row(
+                    "SELECT count(*) FROM compaction_notice_outbox WHERE published_ms IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            captured.lock().unwrap().push((
+                metrics
+                    .compaction_notice_outbox_pending
+                    .load(Ordering::Relaxed),
+                pending,
+            ));
+        }));
+        match operation {
+            "enqueue" => store
+                .project_bus_events(&session(), "epoch", &frames, 1000)
+                .unwrap(),
+            "ack" => {
+                let notice = store
+                    .event_store()
+                    .pending_compaction_notice()
+                    .unwrap()
+                    .unwrap();
+                store
+                    .acknowledge_bus_event(&notice, PublishReceipt::new(1, false), 1100)
+                    .unwrap();
+            }
+            "prune" => {
+                store.prune_bus_events(1001 + RETENTION_MS).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        *store.bus_events.before_write_unlock.lock().unwrap() = None;
+        let expected = if operation == "enqueue" { 1 } else { 0 };
+        assert_eq!(
+            *observations.lock().unwrap(),
+            [(expected, expected)],
+            "notice gauge must match committed rows before releasing the connection guard"
+        );
+    }
+
+    #[test]
+    fn legacy_notice_enqueue_gauge_precedes_unlock() {
+        notice_gauge_precedes_unlock("enqueue");
+    }
+    #[test]
+    fn legacy_notice_ack_gauge_precedes_unlock() {
+        notice_gauge_precedes_unlock("ack");
+    }
+    #[test]
+    fn legacy_notice_prune_gauge_precedes_unlock() {
+        notice_gauge_precedes_unlock("prune");
+    }
     use broca_core::{RunIndex, RunIndexState};
     use broca_protocol::{request::ModelHandle, RunFinishReason, StepId, Usage};
     use std::sync::atomic::AtomicBool;

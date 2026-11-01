@@ -20,6 +20,7 @@ impl broca_core::HookPlane for ObservedHook {
         &self,
         provider: &str,
         bind: &broca_protocol::BindIdentity,
+        scope: Option<&broca_protocol::SessionScope>,
         call: broca_core::hooks::HookCall,
     ) -> Result<HookAnswer, broca_core::HookUnavailable> {
         struct Completion<'a> {
@@ -35,7 +36,7 @@ impl broca_core::HookPlane for ObservedHook {
             completed: false,
             observed: &self.completions,
         };
-        let answer = self.inner.hook(provider, bind, call).await;
+        let answer = self.inner.hook(provider, bind, scope, call).await;
         completion.completed = true;
         answer
     }
@@ -58,6 +59,7 @@ async fn controlled_hook_deadlines() {
             &self,
             _: &str,
             _: &broca_protocol::BindIdentity,
+            _scope: Option<&broca_protocol::SessionScope>,
             _: broca_core::hooks::HookCall,
         ) -> Result<HookAnswer, broca_core::HookUnavailable> {
             tokio::time::sleep(self.delay).await;
@@ -113,6 +115,7 @@ async fn controlled_hook_deadlines() {
         let store = broca_core::FileWalStore::new(root.join("wal"));
         let writer = broca_core::WalHandle::spawn(store.open(&bind).unwrap(), 1).unwrap();
         let runtime = HookRuntime {
+            scope: None,
             plan: &plan,
             plane: &plane,
             bind: &bind,

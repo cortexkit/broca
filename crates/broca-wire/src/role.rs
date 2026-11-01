@@ -214,8 +214,8 @@ pub struct FinalMessage {
     pub text: String,
 }
 
-/// Accept older status fixtures that predate the usage counters while keeping the published
-/// role type as the only representation of run usage.
+/// Accept older status fixtures that predate the usage counters. The shared role totals
+/// retain their representation, with broca's optional generation measurements alongside them.
 pub(crate) fn deserialize_optional_run_usage<'de, D>(
     deserializer: D,
 ) -> Result<Option<broca_protocol::usage::RunUsage>, D::Error>

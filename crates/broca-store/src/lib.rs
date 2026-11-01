@@ -51,7 +51,7 @@ pub mod session_address;
 pub mod session_refs;
 pub mod session_root_repair;
 pub mod system_one;
-pub use fold_identities::fold_identities;
+pub use fold_identities::{fold_identities, require_legacy_operator_root, LegacyOnlyOperator};
 
 pub use system_one::SystemOneStore;
 
@@ -1467,6 +1467,16 @@ impl SqliteStore {
         records: &[FramedRecord],
         range: Option<&WalRangeRead>,
     ) -> Result<u64, StoreError> {
+        self.project_records_with_sender_policy(session, records, range, false)
+    }
+
+    fn project_records_with_sender_policy(
+        &self,
+        session: &BindIdentity,
+        records: &[FramedRecord],
+        range: Option<&WalRangeRead>,
+        repair_sender_policy: bool,
+    ) -> Result<u64, StoreError> {
         if records
             .iter()
             .any(|r| compaction_facts::is_compaction_record(&r.record))
@@ -1477,7 +1487,10 @@ impl SqliteStore {
         }
         let key = Self::key(session);
         for _ in 0..OPTIMISTIC_PROJECTION_ATTEMPTS {
-            let snapshot = self.projection_snapshot(&key)?;
+            let mut snapshot = self.projection_snapshot(&key)?;
+            if repair_sender_policy {
+                snapshot.attribution_complete = false;
+            }
             let plan = Self::prepare_projection(snapshot, records, range)?;
             match self.try_commit_projection(&key, plan)? {
                 ProjectionCommit::Applied(watermark) => return Ok(watermark),
@@ -1490,7 +1503,7 @@ impl SqliteStore {
         // therefore limited to direct store callers or an external writer; different sessions do
         // not conflict. Bound retries anyway so unusual contention cannot starve projection, then
         // preserve correctness by computing once under the lock held through commit.
-        self.project_records_locked(&key, records, range)
+        self.project_records_locked(&key, records, range, repair_sender_policy)
     }
 
     fn projection_snapshot(&self, key: &str) -> Result<ProjectionSnapshot, StoreError> {
@@ -1639,10 +1652,14 @@ impl SqliteStore {
         key: &str,
         records: &[FramedRecord],
         range: Option<&WalRangeRead>,
+        repair_sender_policy: bool,
     ) -> Result<u64, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let snapshot = Self::projection_snapshot_from_tx(&tx, key)?;
+        let mut snapshot = Self::projection_snapshot_from_tx(&tx, key)?;
+        if repair_sender_policy {
+            snapshot.attribution_complete = false;
+        }
         let plan = Self::prepare_projection(snapshot, records, range)?;
         Self::commit_projection_plan(tx, key, plan)
     }
@@ -2079,7 +2096,7 @@ impl MaterializedStore for SqliteStore {
         limit: u64,
         view: broca_core::context::ReadView,
     ) -> Result<StorePageSnapshot, String> {
-        self.read_page_with_attribution(session, from_ordinal, limit, view)
+        self.read_page_internal(session, from_ordinal, limit, view, false)
             .map_err(|error| error.to_string())
     }
 
@@ -2120,6 +2137,29 @@ impl MaterializedStore for SqliteStore {
         from_ordinal: Option<u64>,
         limit: u64,
         view: broca_core::context::ReadView,
+    ) -> Result<StorePageSnapshot, broca_core::StorePageReadError> {
+        self.read_page_internal(session, from_ordinal, limit, view, true)
+    }
+
+    fn reproject_if_lineage_mismatch(
+        &self,
+        session: &BindIdentity,
+        stale_lineage_id: Option<&str>,
+        complete_wal: &WalRangeRead,
+    ) -> Result<(), String> {
+        self.reproject_if_lineage_mismatch_inner(session, stale_lineage_id, complete_wal)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl SqliteStore {
+    fn read_page_internal(
+        &self,
+        session: &BindIdentity,
+        from_ordinal: Option<u64>,
+        limit: u64,
+        view: broca_core::context::ReadView,
+        require_sender_policy: bool,
     ) -> Result<StorePageSnapshot, broca_core::StorePageReadError> {
         let key = Self::key(session);
         let conn = self.conn.lock().unwrap();
@@ -2431,7 +2471,7 @@ impl MaterializedStore for SqliteStore {
             .optional()
             .map_err(|e| e.to_string())?
             .flatten();
-        let head = head_json
+        let mut head: Option<broca_core::head::HeadProjection> = head_json
             .as_deref()
             .map(serde_json::from_str)
             .transpose()
@@ -2439,6 +2479,19 @@ impl MaterializedStore for SqliteStore {
             .flatten();
         if watermark_seq > 0 && head.is_none() {
             return Err(broca_core::StorePageReadError::AttributionStale);
+        }
+        if let Some(facts) = &head {
+            if !retained_head::sender_admission_current(&tx, &key, facts)
+                .map_err(|e| e.to_string())?
+            {
+                if !require_sender_policy {
+                    // Execution page reads need transcript/approval metadata, not sender
+                    // permissions. Omit the unknown head rather than forcing a policy replay.
+                    head = None;
+                } else {
+                    return Err(broca_core::StorePageReadError::AttributionStale);
+                }
+            }
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(StorePageSnapshot {
@@ -2461,19 +2514,21 @@ impl MaterializedStore for SqliteStore {
             tag_seed,
         })
     }
-
-    fn reproject_if_lineage_mismatch(
-        &self,
-        session: &BindIdentity,
-        stale_lineage_id: Option<&str>,
-        complete_wal: &WalRangeRead,
-    ) -> Result<(), String> {
-        self.reproject_if_lineage_mismatch_inner(session, stale_lineage_id, complete_wal)
-            .map_err(|error| error.to_string())
-    }
 }
 
 impl Persister for SqliteStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &WalRangeRead,
+    ) -> Result<u64, String> {
+        let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+            return Err("sender policy repair requires a complete WAL prefix".into());
+        };
+        self.project_records_with_sender_policy(session, records, Some(range), true)
+            .map_err(|error| error.to_string())
+    }
+
     fn project_retained_head(
         &self,
         session: &BindIdentity,
@@ -5438,6 +5493,7 @@ mod tests {
             }),
             latest_manifest: None,
             session_change_recorded: false,
+            sender_admission: None,
             plan_manifest_folded: true,
         };
         let snapshot =
@@ -5542,6 +5598,325 @@ mod tests {
         );
         crate::conformance::projection_range_co_commits_anchor(sqlite_store());
         crate::conformance::failed_projection_keeps_checkpoint_and_messages_atomic(sqlite_store());
+    }
+
+    #[test]
+    fn old_sender_checkpoint_rebuilds_once_and_repairs_head() {
+        let root = broca_test_support::scratch_root().join(format!(
+            "sender-checkpoint-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let wal_store = CountingWalStore::new(root.clone());
+        let session = crate::conformance::session("sender-checkpoint");
+        let mut records = crate::conformance::base_records(&session);
+        let manifest: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
+            "plan":"{\"senders\":[{\"module\":\"occipital\",\"idle_start\":true}]}",
+            "plan_identity":"refresh", "composition_digest":"composition", "fetches":[],
+            "tools":[], "system_text":"", "system_digest":"system", "join_version":1, "role_versions":{}
+        })).unwrap();
+        if let broca_wal::WalRecord::RunStarted { principal, .. } = &mut records[0].record {
+            *principal = Some(broca_protocol::BindPrincipal::Reserved {
+                module_id: "owner".into(),
+            });
+        }
+        let mut wal = wal_store.open(&session).unwrap();
+        wal.append(1, &records[0].record, true).unwrap();
+        wal.append(
+            1,
+            &broca_wal::WalRecord::SessionRefreshAccepted {
+                generation: 1,
+                policy: "on_prefix_rebuild".into(),
+                manifest: Box::new(manifest),
+                run_in_progress: true,
+                applies_from_next_run: false,
+            },
+            true,
+        )
+        .unwrap();
+        for frame in crate::conformance::text_turn(3, 1, "projected") {
+            wal.append(1, &frame.record, true).unwrap();
+        }
+        let safe_head = wal.replay().unwrap().last().unwrap().seq;
+        drop(wal);
+        let store = SqliteStore::open_in_memory().unwrap();
+        let range = wal_store
+            .inner
+            .read_records_range(&session, 0, Some(safe_head), None)
+            .unwrap();
+        Persister::project_range(&store, &session, &range).unwrap();
+        let mut legacy = MaterializedStore::read_admission_snapshot(&store, &session)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        legacy.ownership.as_mut().unwrap().sender_admission = None;
+        let mut old_head = broca_core::head::HeadProjection::default();
+        old_head.observe(&records[0].record);
+        legacy.head = Some(old_head.clone());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET admission_checkpoint_json=?2, head_json=?3 WHERE session=?1",
+                rusqlite::params![
+                    SqliteStore::key(&session),
+                    broca_core::encode_admission_checkpoint(&legacy).unwrap(),
+                    serde_json::to_string(&old_head).unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            MaterializedStore::read_page_with_attribution(
+                &store,
+                &session,
+                Some(0),
+                100,
+                broca_core::context::ReadView::Raw
+            ),
+            Err(broca_core::StorePageReadError::AttributionStale)
+        ));
+        let execution_metadata = MaterializedStore::read_page_with_watermark(
+            &store,
+            &session,
+            Some(0),
+            0,
+            broca_core::context::ReadView::Raw,
+        )
+        .unwrap();
+        assert!(execution_metadata.watermark_seq > 0);
+        assert!(
+            execution_metadata.head.is_none(),
+            "unknown sender permissions must not escape through metadata-only reads"
+        );
+        let execution_page = MaterializedStore::read_page_with_watermark(
+            &store,
+            &session,
+            Some(0),
+            100,
+            broca_core::context::ReadView::Raw,
+        )
+        .unwrap();
+        assert!(!execution_page.rows.is_empty());
+        assert!(
+            execution_page.head.is_none(),
+            "execution pages must not replay the WAL for unknown sender permissions"
+        );
+        Persister::project_range(&store, &session, &range).unwrap();
+        assert!(
+            !MaterializedStore::read_admission_snapshot(&store, &session)
+                .unwrap()
+                .unwrap()
+                .checkpoint
+                .unwrap()
+                .ownership
+                .unwrap()
+                .sender_admission_complete(),
+            "ordinary projection must not migrate sender policy at an unchanged boundary"
+        );
+        broca_core::run::repair_sender_admission_checkpoint(
+            &wal_store,
+            &session,
+            safe_head,
+            Some(&store),
+        )
+        .unwrap();
+        let repaired_reads = wal_store.range_reads.load(Ordering::SeqCst);
+        assert_eq!(repaired_reads, 1);
+        broca_core::run::repair_sender_admission_checkpoint(
+            &wal_store,
+            &session,
+            safe_head,
+            Some(&store),
+        )
+        .unwrap();
+        assert_eq!(wal_store.range_reads.load(Ordering::SeqCst), repaired_reads);
+        let snapshot =
+            broca_core::load_prior_wal_snapshot(&wal_store, &session, safe_head, Some(&store))
+                .unwrap();
+        assert!(snapshot.base_watermark > 0);
+        assert_eq!(
+            snapshot
+                .checkpoint_at_head
+                .ownership
+                .unwrap()
+                .effective_senders()[0]
+                .module,
+            "occipital"
+        );
+        assert_eq!(wal_store.full_reads.load(Ordering::SeqCst), 0);
+        let page = MaterializedStore::read_page_with_attribution(
+            &store,
+            &session,
+            Some(0),
+            100,
+            broca_core::context::ReadView::Raw,
+        )
+        .unwrap();
+        assert!(page
+            .head
+            .unwrap()
+            .sender(
+                Some(&broca_protocol::BindPrincipal::Reserved {
+                    module_id: "occipital".into()
+                }),
+                &broca_protocol::SendScope::Internal,
+                &[broca_protocol::DeliveryMode::IdleStart]
+            )
+            .is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn sender_first_open_cost(messages: usize, refreshed: bool) {
+        let root = broca_test_support::scratch_root().join(format!(
+            "sender-first-open-{}-{:?}-{messages}-{refreshed}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let wal_store = CountingWalStore::new(root.clone());
+        let session = crate::conformance::session("sender-first-open");
+        let mut start = crate::conformance::base_records(&session).remove(0).record;
+        let baseline: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
+            "plan":"{\"senders\":[{\"module\":\"baseline\",\"idle_start\":true}]}",
+            "plan_identity":"baseline", "composition_digest":"composition", "fetches":[],
+            "tools":[], "system_text":"", "system_digest":"system", "join_version":1,"role_versions":{}
+        })).unwrap();
+        if let broca_wal::WalRecord::RunStarted { manifest, .. } = &mut start {
+            *manifest = Some(Box::new(baseline.clone()));
+        }
+        let mut wal = wal_store.open(&session).unwrap();
+        wal.append(1, &start, false).unwrap();
+        if refreshed {
+            let mut next = baseline;
+            next.plan = broca_wal::OpaqueJson::from_json_text(
+                r#"{"senders":[{"module":"latest","idle_start":true}]}"#,
+            )
+            .unwrap();
+            next.plan_identity = "latest".into();
+            wal.append(
+                1,
+                &broca_wal::WalRecord::SessionRefreshAccepted {
+                    generation: 1,
+                    policy: "on_prefix_rebuild".into(),
+                    manifest: Box::new(next),
+                    run_in_progress: true,
+                    applies_from_next_run: false,
+                },
+                false,
+            )
+            .unwrap();
+        }
+        for n in 1..messages {
+            for frame in crate::conformance::text_turn(0, n as u64, "measurement message") {
+                wal.append(1, &frame.record, false).unwrap();
+            }
+        }
+        let finished = serde_json::from_value(serde_json::json!({"type":"run_finished","reason":"completed","usage":{},"retries_used":0})).unwrap();
+        let safe_head = wal.append(1, &finished, true).unwrap();
+        drop(wal);
+        let store = SqliteStore::open_in_memory().unwrap();
+        let range = wal_store
+            .inner
+            .read_records_range(&session, 0, Some(safe_head), None)
+            .unwrap();
+        Persister::project_range(&store, &session, &range).unwrap();
+        drop(range);
+        let mut old = MaterializedStore::read_admission_snapshot(&store, &session)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        old.ownership.as_mut().unwrap().sender_admission = None;
+        let old = broca_core::encode_admission_checkpoint(&old).unwrap();
+        store.conn.lock().unwrap().execute_batch("CREATE TABLE sender_repair_writes(n INTEGER); INSERT INTO sender_repair_writes VALUES(0); CREATE TRIGGER observe_sender_repair AFTER UPDATE OF admission_checkpoint_json ON meta BEGIN UPDATE sender_repair_writes SET n=n+1; END; CREATE TRIGGER observe_sender_repair_insert AFTER INSERT ON meta BEGIN UPDATE sender_repair_writes SET n=n+1; END;").unwrap();
+        for mode in ["before", "after_owner", "after_sender"] {
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute("UPDATE meta SET admission_checkpoint_json=?1", [&old])
+                    .unwrap();
+                conn.execute("UPDATE sender_repair_writes SET n=0", [])
+                    .unwrap();
+            }
+            wal_store.full_reads.store(0, Ordering::SeqCst);
+            wal_store.range_reads.store(0, Ordering::SeqCst);
+            wal_store.range_records.store(0, Ordering::SeqCst);
+            let started = std::time::Instant::now();
+            if mode != "after_owner" {
+                broca_core::run::repair_sender_admission_checkpoint(
+                    &wal_store,
+                    &session,
+                    safe_head,
+                    Some(&store),
+                )
+                .unwrap();
+            }
+            let snapshot =
+                broca_core::load_prior_wal_snapshot(&wal_store, &session, safe_head, Some(&store))
+                    .unwrap();
+            let elapsed = started.elapsed();
+            let reads = wal_store.range_reads.load(Ordering::SeqCst);
+            let records = wal_store.range_records.load(Ordering::SeqCst);
+            let full = wal_store.full_reads.load(Ordering::SeqCst);
+            let writes: u64 = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT n FROM sender_repair_writes", [], |row| row.get(0))
+                .unwrap();
+            let needs_policy = mode != "after_owner";
+            assert_eq!(full, 0);
+            assert_eq!(reads, if refreshed && needs_policy { 2 } else { 1 });
+            assert_eq!(
+                records,
+                if refreshed && needs_policy {
+                    usize::try_from(safe_head + 1).unwrap()
+                } else {
+                    1
+                }
+            );
+            assert_eq!(writes, u64::from(refreshed && needs_policy));
+            if needs_policy || !refreshed {
+                assert_eq!(
+                    snapshot
+                        .checkpoint_at_head
+                        .ownership
+                        .unwrap()
+                        .effective_senders()[0]
+                        .module,
+                    if refreshed { "latest" } else { "baseline" }
+                );
+                broca_core::run::repair_sender_admission_checkpoint(
+                    &wal_store,
+                    &session,
+                    safe_head,
+                    Some(&store),
+                )
+                .unwrap();
+                assert_eq!(
+                    wal_store.range_reads.load(Ordering::SeqCst),
+                    reads,
+                    "a second policy check must read no WAL"
+                );
+            }
+            println!("sender_first_open messages={messages} refreshed={refreshed} mode={mode} elapsed_ms={:.3} range_reads={reads} records_read={records} full_reads={full} reprojections={writes}", elapsed.as_secs_f64()*1000.0);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_refresh_prefield_sender_policy_needs_no_repair_reads() {
+        sender_first_open_cost(8, false);
+    }
+
+    #[test]
+    #[ignore = "explicit sender admission first-open measurement at 1k and 150k messages"]
+    fn sender_admission_first_open_cost_at_1k_and_150k_messages() {
+        for messages in [1_000, 150_000] {
+            for refreshed in [false, true] {
+                sender_first_open_cost(messages, refreshed);
+            }
+        }
     }
 
     #[test]

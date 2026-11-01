@@ -117,12 +117,12 @@ async fn session_close_releases_hook_and_compaction_routes() {
     call["harness"] = serde_json::json!(bind.harness);
     for pass in 0..2 {
         hooks.hook_with_deadline(
-            "retirement-provider", &bind, serde_json::from_value(call.clone()).unwrap(),
+            "retirement-provider", &bind, None, serde_json::from_value(call.clone()).unwrap(),
             tokio::time::Instant::now() + std::time::Duration::from_secs(2),
         ).await.unwrap();
         use broca_core::CompactionPlane;
         compaction.setup(
-            "retirement-provider", &bind,
+            "retirement-provider", &bind, None,
             broca_core::compaction_provider::setup::SetupRequest::new(
                 bind.session.clone(), bind.harness.clone(), format!("setup-{pass}"),
                 serde_json::Map::new(), "model", 0,
