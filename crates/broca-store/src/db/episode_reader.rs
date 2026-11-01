@@ -385,16 +385,27 @@ mod tests {
         db: Arc<OverhaulDb>,
         wal: broca_wal::FileWal,
         bind: BindIdentity,
+        // Fields are dropped in order; remove the directory only after closing its files.
+        _scratch: Scratch,
     }
 
-    impl Drop for Fixture {
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
     fn text(value: &str) -> Message {
         Message::new(Role::User, vec![ContentBlock::Text { text: value.into() }])
+    }
+
+    #[test]
+    fn fixture_cleanup_closes_database_and_wal() {
+        let fixture = Fixture::new(&corpus(0));
+        let root = fixture.root.clone();
+        drop(fixture);
+        assert!(!root.exists(), "fixture left its scratch directory behind");
     }
 
     fn corpus(prefix: usize) -> Vec<WalRecord> {
@@ -459,15 +470,18 @@ mod tests {
                 unreachable!()
             };
             let bind = session.clone();
-            let wal = broca_wal::FileWal::open(root.join("session.wal"))
-                .unwrap()
-                .with_feature_floor(root.join("wal-floor"))
-                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                .unwrap();
+            let wal = broca_wal::FileWal::open_with_recovery(
+                root.join("session.wal"),
+                broca_wal::WalConfig::OVERHAUL,
+                root.join("wal-floor"),
+            )
+            .unwrap()
+            .with_feature_floor(root.join("wal-floor"));
             Self {
                 db: Arc::new(OverhaulDb::open(&root).unwrap()),
                 wal,
                 bind,
+                _scratch: Scratch(root.clone()),
                 root,
             }
         }

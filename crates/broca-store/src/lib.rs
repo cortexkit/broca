@@ -44,6 +44,8 @@ pub mod export_index;
 mod fold_identities;
 pub mod grants;
 pub mod late_results_store;
+#[cfg(test)]
+mod legacy_sql_trace_tests;
 mod retained_head;
 pub mod retention;
 pub mod retention_withdrawals;
@@ -51,6 +53,7 @@ pub mod session_address;
 pub mod session_refs;
 pub mod session_root_repair;
 pub mod system_one;
+mod wal_recovery;
 pub use fold_identities::{fold_identities, require_legacy_operator_root, LegacyOnlyOperator};
 
 /// Reserve a logical session's storage address in the format-selected inventory.
@@ -333,6 +336,7 @@ pub enum StoreError {
     /// The WAL being projected is a corrupt lineage (replay refused to fabricate a
     /// prefix). Surfaced rather than silently materializing a wrong projection.
     Replay(broca_core::ReplayError),
+    AttributionStale,
     InconsistentSnapshot(&'static str),
     BusEvent(String),
     LegacyOnly(LegacyOnlyOperator),
@@ -349,6 +353,9 @@ impl std::fmt::Display for StoreError {
             StoreError::Sqlite(e) => write!(f, "sqlite: {e}"),
             StoreError::Json(e) => write!(f, "json: {e}"),
             StoreError::Replay(e) => write!(f, "replay: {e}"),
+            StoreError::AttributionStale => {
+                std::fmt::Display::fmt(&broca_core::StorePageReadError::AttributionStale, f)
+            }
             StoreError::BusEvent(e) => write!(f, "run event: {e}"),
             StoreError::LegacyOnly(e) => write!(f, "{e}"),
             StoreError::InconsistentSnapshot(message) => {
@@ -398,6 +405,7 @@ impl From<broca_core::ReplayError> for StoreError {
 /// only for the short snapshot and commit phases.
 pub struct SqliteStore {
     conn: Mutex<Connection>,
+    wal_config: broca_wal::WalConfig,
     bus_events: bus_events::State,
     pub(crate) export_high_water: AtomicU64,
     pub(crate) export_source_instance_id: String,
@@ -442,14 +450,18 @@ const OPTIMISTIC_PROJECTION_ATTEMPTS: usize = 3;
 
 enum ProjectionPlan {
     NoChange {
+        expected_epoch: i64,
         expected_watermark: u64,
         expected_lineage_id: Option<String>,
     },
     Reset {
+        expected_epoch: i64,
+        preserve_recovery_fence: bool,
         expected_watermark: u64,
         expected_lineage_id: Option<String>,
     },
     RetentionMetadata {
+        expected_epoch: i64,
         expected_watermark: u64,
         expected_lineage_id: Option<String>,
         metadata: broca_core::projection_plan::RetainedWithdrawalProjection,
@@ -458,30 +470,41 @@ enum ProjectionPlan {
 }
 
 impl ProjectionPlan {
-    fn expected_state(&self) -> (u64, Option<&str>) {
+    fn expected_state(&self) -> (u64, Option<&str>, i64) {
         match self {
             Self::NoChange {
                 expected_watermark,
                 expected_lineage_id,
+                expected_epoch,
             }
             | Self::Reset {
                 expected_watermark,
                 expected_lineage_id,
+                expected_epoch,
+                ..
             }
             | Self::RetentionMetadata {
                 expected_watermark,
                 expected_lineage_id,
+                expected_epoch,
                 ..
-            } => (*expected_watermark, expected_lineage_id.as_deref()),
+            } => (
+                *expected_watermark,
+                expected_lineage_id.as_deref(),
+                *expected_epoch,
+            ),
             Self::Write(prepared) => (
                 prepared.expected_watermark,
                 prepared.expected_lineage_id.as_deref(),
+                prepared.expected_epoch,
             ),
         }
     }
 }
 
 struct PreparedProjection {
+    expected_epoch: i64,
+    recovery_epoch: Option<i64>,
     head_json: String,
     message_times: Vec<Option<u64>>,
     episode_spans: Vec<std::ops::Range<u64>>,
@@ -699,6 +722,7 @@ impl SqliteStore {
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: bus_events::State::default(),
             export_source_instance_id: source_instance_id,
             export_source_epoch: source_epoch,
@@ -744,6 +768,7 @@ impl SqliteStore {
         restrict_to_owner(path);
         Ok(Self {
             conn: Mutex::new(conn),
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             export_high_water: AtomicU64::new(high_water),
             export_source_instance_id: source_instance_id,
@@ -757,11 +782,19 @@ impl SqliteStore {
         let (source_instance_id, source_epoch, high_water) = Self::init(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             export_high_water: AtomicU64::new(high_water),
             export_source_instance_id: source_instance_id,
             export_source_epoch: source_epoch,
         })
+    }
+
+    /// Supply the root format decided by the caller before sharing this connection.
+    /// Unconfigured stores retain legacy SQL and never probe the root for recovery.
+    pub fn with_wal_config(mut self, config: broca_wal::WalConfig) -> Self {
+        self.wal_config = config;
+        self
     }
 
     /// Discard one session's derived transcript and its last projected WAL sequence
@@ -1648,6 +1681,13 @@ impl SqliteStore {
         range: Option<&WalRangeRead>,
         repair_sender_policy: bool,
     ) -> Result<u64, StoreError> {
+        let key = Self::key(session);
+        if repair_sender_policy && self.wal_config.is_overhaul() {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction()?;
+            self.check_sender_repair_fence(&tx, &key, true)?;
+            tx.commit()?;
+        }
         if records
             .iter()
             .any(|r| compaction_facts::is_compaction_record(&r.record))
@@ -1656,14 +1696,13 @@ impl SqliteStore {
                 self.project_compaction_facts(session, range)?;
             }
         }
-        let key = Self::key(session);
         for _ in 0..OPTIMISTIC_PROJECTION_ATTEMPTS {
             let mut snapshot = self.projection_snapshot(&key)?;
             if repair_sender_policy {
                 snapshot.attribution_complete = false;
             }
             let plan = Self::prepare_projection(snapshot, records, range)?;
-            match self.try_commit_projection(&key, plan)? {
+            match self.try_commit_projection(&key, plan, repair_sender_policy)? {
                 ProjectionCommit::Applied(watermark) => return Ok(watermark),
                 ProjectionCommit::Conflict => continue,
             }
@@ -1680,7 +1719,7 @@ impl SqliteStore {
     fn projection_snapshot(&self, key: &str) -> Result<ProjectionSnapshot, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let snapshot = Self::projection_snapshot_from_tx(&tx, key)?;
+        let snapshot = Self::projection_snapshot_from_tx(&tx, key, self.wal_config.is_overhaul())?;
         tx.commit()?;
         Ok(snapshot)
     }
@@ -1688,13 +1727,22 @@ impl SqliteStore {
     fn projection_snapshot_from_tx(
         tx: &rusqlite::Transaction<'_>,
         key: &str,
+        overhaul: bool,
     ) -> Result<ProjectionSnapshot, StoreError> {
         let complete = attribution_complete(tx, key)?;
         let seed = projection_seed_from_complete_tx(tx, key, complete)?;
         let (watermark, next_ord) = current_projection_position(tx, key)?;
-        let lineage_id = current_projection_lineage_id(tx, key)?;
+        let (lineage_id, context_epoch, checkpoint) =
+            current_projection_metadata(tx, key, seed.is_none(), overhaul)?;
+        let required_recovery_cuts = if overhaul {
+            wal_recovery::required_cut_ids(checkpoint.as_deref(), seed.as_ref())?
+        } else {
+            Vec::new()
+        };
         let previous_control_head = current_control_head(tx, key)?;
         Ok(ProjectionSnapshot {
+            context_epoch,
+            required_recovery_cuts,
             attribution_complete: complete,
             seed,
             watermark,
@@ -1710,12 +1758,37 @@ impl SqliteStore {
         range: Option<&WalRangeRead>,
     ) -> Result<ProjectionPlan, StoreError> {
         use broca_core::projection_plan::ProjectionPlan as NeutralPlan;
+        let expected_epoch = snapshot.context_epoch;
+        let recovery = !snapshot.required_recovery_cuts.is_empty()
+            || records
+                .iter()
+                .any(|frame| matches!(frame.record, broca_wal::WalRecord::RecoveryCut { .. }));
+        let new_cut = records.iter().any(|frame| match &frame.record {
+            broca_wal::WalRecord::RecoveryCut { recovery } => {
+                !snapshot.required_recovery_cuts.contains(&recovery.cut_id)
+            }
+            _ => false,
+        });
+        let recovery_epoch = recovery
+            .then(|| {
+                if new_cut {
+                    expected_epoch
+                        .checked_add(1)
+                        .ok_or(StoreError::InconsistentSnapshot(
+                            "recovery context epoch overflow",
+                        ))
+                } else {
+                    Ok(expected_epoch)
+                }
+            })
+            .transpose()?;
         Ok(
             match broca_core::projection_plan::plan_projection(snapshot, records, range)? {
                 NeutralPlan::NoChange {
                     expected_watermark,
                     expected_lineage_id,
                 } => ProjectionPlan::NoChange {
+                    expected_epoch,
                     expected_watermark,
                     expected_lineage_id,
                 },
@@ -1723,6 +1796,8 @@ impl SqliteStore {
                     expected_watermark,
                     expected_lineage_id,
                 } => ProjectionPlan::Reset {
+                    expected_epoch,
+                    preserve_recovery_fence: recovery,
                     expected_watermark,
                     expected_lineage_id,
                 },
@@ -1731,12 +1806,15 @@ impl SqliteStore {
                     expected_lineage_id,
                     metadata,
                 } => ProjectionPlan::RetentionMetadata {
+                    expected_epoch,
                     expected_watermark,
                     expected_lineage_id,
                     metadata,
                 },
                 NeutralPlan::Write(prepared) => {
                     ProjectionPlan::Write(Box::new(PreparedProjection {
+                        expected_epoch,
+                        recovery_epoch,
                         message_times: prepared.message_times,
                         head_json: prepared.head_json,
                         episode_spans: prepared.episode_spans,
@@ -1795,12 +1873,14 @@ impl SqliteStore {
         &self,
         key: &str,
         plan: ProjectionPlan,
+        repair_sender_policy: bool,
     ) -> Result<ProjectionCommit, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         // A deferred read-to-write upgrade can return SQLITE_BUSY immediately,
         // bypassing the busy timeout even for a short migration transaction.
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let current_state = current_projection_state(&tx, key)?;
+        self.check_sender_repair_fence(&tx, key, repair_sender_policy)?;
+        let current_state = current_projection_state(&tx, key, self.wal_config.is_overhaul())?;
         #[cfg(test)]
         PROJECTION_AFTER_STATE_READ_HOOK.with(|slot| {
             if let Some(hook) = slot.borrow_mut().take() {
@@ -1809,13 +1889,32 @@ impl SqliteStore {
         });
         let conflict = {
             let expected_state = plan.expected_state();
-            current_state.0 != expected_state.0 || current_state.1.as_deref() != expected_state.1
+            current_state.0 != expected_state.0
+                || current_state.1.as_deref() != expected_state.1
+                || current_state.2 != expected_state.2
         };
         if conflict {
             tx.commit()?;
             return Ok(ProjectionCommit::Conflict);
         }
         Self::commit_projection_plan(tx, key, plan).map(ProjectionCommit::Applied)
+    }
+
+    fn check_sender_repair_fence(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        key: &str,
+        repair_sender_policy: bool,
+    ) -> Result<(), StoreError> {
+        // Sender-policy migration cannot publish recovery's projection. Recheck in
+        // the writing transaction even when the earlier read saw no pending fence.
+        if repair_sender_policy
+            && self.wal_config.is_overhaul()
+            && wal_recovery::read_fence(tx, key)?.is_some_and(|fence| fence.pending)
+        {
+            return Err(StoreError::AttributionStale);
+        }
+        Ok(())
     }
 
     fn project_records_locked(
@@ -1827,7 +1926,9 @@ impl SqliteStore {
     ) -> Result<u64, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut snapshot = Self::projection_snapshot_from_tx(&tx, key)?;
+        self.check_sender_repair_fence(&tx, key, repair_sender_policy)?;
+        let mut snapshot =
+            Self::projection_snapshot_from_tx(&tx, key, self.wal_config.is_overhaul())?;
         if repair_sender_policy {
             snapshot.attribution_complete = false;
         }
@@ -1840,19 +1941,32 @@ impl SqliteStore {
         key: &str,
         plan: ProjectionPlan,
     ) -> Result<u64, StoreError> {
+        let result = Self::apply_projection_plan(&tx, key, plan)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn apply_projection_plan(
+        tx: &rusqlite::Transaction<'_>,
+        key: &str,
+        plan: ProjectionPlan,
+    ) -> Result<u64, StoreError> {
         let prepared = match plan {
             ProjectionPlan::NoChange {
                 expected_watermark, ..
             } => {
-                tx.commit()?;
                 return Ok(expected_watermark);
             }
-            ProjectionPlan::Reset { .. } => {
+            ProjectionPlan::Reset {
+                preserve_recovery_fence,
+                ..
+            } => {
                 tx.execute("DELETE FROM episode_span WHERE session=?1", [key])?;
                 tx.execute("DELETE FROM message WHERE session=?1", [key])?;
                 tx.execute("DELETE FROM message_tag WHERE session=?1", [key])?;
-                tx.execute("DELETE FROM meta WHERE session=?1", [key])?;
-                tx.commit()?;
+                if !preserve_recovery_fence {
+                    tx.execute("DELETE FROM meta WHERE session=?1", [key])?;
+                }
                 return Ok(0);
             }
             ProjectionPlan::RetentionMetadata {
@@ -1860,11 +1974,15 @@ impl SqliteStore {
                 metadata,
                 ..
             } => {
-                Self::commit_retention_metadata(&tx, key, &metadata)?;
-                tx.commit()?;
+                Self::commit_retention_metadata(tx, key, &metadata)?;
                 return Ok(expected_watermark);
             }
             ProjectionPlan::Write(prepared) => *prepared,
+        };
+        let recovery_fence = if prepared.recovery_epoch.is_some() {
+            wal_recovery::read_fence(tx, key)?
+        } else {
+            None
         };
 
         if prepared.reset {
@@ -1946,9 +2064,10 @@ impl SqliteStore {
                  last_episode_usage_json, prefix_len, admission_checkpoint_json, wal_anchor_file_id,
                  wal_anchor_seq, wal_anchor_byte_end, control_head_wal_seq, control_head_sub_index,
                   last_title, compaction_setup_seen, head_json
-               ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                ) VALUES (?1, ?2, ?3, ?21, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
               ON CONFLICT(session) DO UPDATE SET
-                 watermark_seq=?2, lineage_id=?3, completed_steps=?4, usage_json=?5,
+                  watermark_seq=?2, lineage_id=?3, completed_steps=?4, usage_json=?5,
+                  context_epoch=CASE WHEN ?22 THEN ?21 ELSE meta.context_epoch END,
                  retries_used=?6, last_step_usage_json=?7, last_step_finish_reason_json=?8,
                  last_run_id=?9, last_episode_usage_json=?10, prefix_len=?11,
                  admission_checkpoint_json=?12, wal_anchor_file_id=?13, wal_anchor_seq=?14,
@@ -1982,6 +2101,8 @@ impl SqliteStore {
                 prepared.last_title,
                 prepared.compaction_setup_seen,
                 prepared.head_json,
+                prepared.recovery_epoch.unwrap_or(0),
+                prepared.recovery_epoch.is_some(),
             ],
         )?;
         tx.execute(
@@ -2008,7 +2129,9 @@ impl SqliteStore {
                 [run_id],
             )?;
         }
-        tx.commit()?;
+        if let Some(fence) = recovery_fence {
+            wal_recovery::preserve_fence(tx, key, &fence)?;
+        }
         Ok(prepared.new_watermark)
     }
 
@@ -2063,7 +2186,7 @@ impl SqliteStore {
                 },
                 Some(complete_wal),
             )?;
-            match self.try_commit_projection(&key, plan)? {
+            match self.try_commit_projection(&key, plan, false)? {
                 ProjectionCommit::Applied(_) => return Ok(()),
                 ProjectionCommit::Conflict => continue,
             }
@@ -2071,7 +2194,7 @@ impl SqliteStore {
 
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let snapshot = Self::projection_snapshot_from_tx(&tx, &key)?;
+        let snapshot = Self::projection_snapshot_from_tx(&tx, &key, self.wal_config.is_overhaul())?;
         if snapshot.lineage_id.as_deref() != stale_lineage_id {
             tx.commit()?;
             return Ok(());
@@ -2092,6 +2215,30 @@ impl SqliteStore {
 }
 
 impl MaterializedStore for SqliteStore {
+    fn invalidate_wal_recovery(
+        &self,
+        session: &BindIdentity,
+        cut: &broca_wal::recovery::RecoveryCut,
+    ) -> Result<(), String> {
+        self.invalidate_wal_recovery_inner(session, cut)
+            .map_err(|e| e.to_string())
+    }
+    fn needs_wal_recovery_projection(
+        &self,
+        session: &BindIdentity,
+        cut_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<bool, String> {
+        self.needs_wal_recovery_projection_inner(session, cut_ids)
+            .map_err(|e| e.to_string())
+    }
+    fn reproject_wal_recovery(
+        &self,
+        session: &BindIdentity,
+        range: &WalRangeRead,
+    ) -> Result<(), String> {
+        self.reproject_wal_recovery_inner(session, range)
+            .map_err(|e| e.to_string())
+    }
     fn read_retained_head(
         &self,
         session: &BindIdentity,
@@ -2728,7 +2875,7 @@ impl Persister for SqliteStore {
             .map_err(|error| error.to_string())?;
         let seed = projection_seed_from_tx(&tx, &key).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(seed)
+        Ok(seed.filter(|seed| seed.admission_checkpoint.recovery_cuts.is_empty()))
     }
 
     fn project(&self, session: &BindIdentity, records: &[FramedRecord]) -> Result<u64, String> {
@@ -2931,7 +3078,16 @@ impl RunIndex for SqliteStore {
 
     fn lookup_run(&self, run_id: &str) -> Result<Option<RunIndexRow>, String> {
         let conn = self.conn.lock().unwrap();
-        let row = conn
+        let tx = if self.wal_config.is_overhaul() {
+            Some(
+                conn.unchecked_transaction()
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+        let connection = tx.as_deref().unwrap_or(&conn);
+        let row = connection
             .query_row(
                 "SELECT session, submission_id, request_identity_digest, state, usage_json, \
                            final_step_finish_reason_json, retries_used, title, withdrawals_owed \
@@ -2968,6 +3124,18 @@ impl RunIndex for SqliteStore {
             )) => {
                 let session: BindIdentity =
                     serde_json::from_str(&session_json).map_err(|e| e.to_string())?;
+                if tx
+                    .as_ref()
+                    .map(|tx| wal_recovery::read_fence(tx, &Self::key(&session)))
+                    .transpose()
+                    .map_err(|error| error.to_string())?
+                    .flatten()
+                    .is_some_and(|fence| fence.pending)
+                {
+                    return Err(format!(
+                        "WAL recovery is pending for run {run_id}; run summary is unavailable"
+                    ));
+                }
                 let state = RunIndexState::parse(&state_str)
                     .ok_or_else(|| format!("unknown run-index state '{state_str}'"))?;
                 let usage = usage_json
@@ -3033,34 +3201,58 @@ fn current_control_head(
 fn current_projection_state(
     tx: &rusqlite::Transaction<'_>,
     key: &str,
-) -> Result<(u64, Option<String>), StoreError> {
+    overhaul: bool,
+) -> Result<(u64, Option<String>, i64), StoreError> {
+    if !overhaul {
+        return Ok(tx
+            .query_row(
+                "SELECT watermark_seq, lineage_id FROM meta WHERE session=?1",
+                [key],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, 0)),
+            )
+            .optional()?
+            .unwrap_or((0, None, 0)));
+    }
     Ok(tx
         .query_row(
-            "SELECT watermark_seq, lineage_id FROM meta WHERE session=?1",
+            "SELECT watermark_seq, lineage_id, context_epoch FROM meta WHERE session=?1",
             [key],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)? as u64,
                     row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
                 ))
             },
         )
         .optional()?
-        .unwrap_or((0, None)))
+        .unwrap_or((0, None, 0)))
 }
 
-fn current_projection_lineage_id(
+fn current_projection_metadata(
     tx: &rusqlite::Transaction<'_>,
     key: &str,
-) -> Result<Option<String>, StoreError> {
+    read_checkpoint: bool,
+    overhaul: bool,
+) -> Result<(Option<String>, i64, Option<String>), StoreError> {
+    if !overhaul {
+        return Ok(tx
+            .query_row(
+                "SELECT lineage_id FROM meta WHERE session=?1",
+                [key],
+                |row| Ok((row.get(0)?, 0, None)),
+            )
+            .optional()?
+            .unwrap_or((None, 0, None)));
+    }
     Ok(tx
         .query_row(
-            "SELECT lineage_id FROM meta WHERE session=?1",
-            [key],
-            |row| row.get::<_, Option<String>>(0),
+            "SELECT lineage_id,context_epoch,CASE WHEN ?2 THEN admission_checkpoint_json ELSE NULL END FROM meta WHERE session=?1",
+            rusqlite::params![key, read_checkpoint],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
         )
         .optional()?
-        .flatten())
+        .unwrap_or((None, 0, None)))
 }
 
 /// An older projector can advance the transcript without knowing the episode-span columns.
@@ -4725,6 +4917,7 @@ mod tests {
         let (source_instance_id, source_epoch, high_water) =
             SqliteStore::init(&conn).expect("migrate legacy store");
         let store = SqliteStore {
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             conn: std::sync::Mutex::new(conn),
             export_high_water: AtomicU64::new(high_water),
@@ -4783,6 +4976,7 @@ mod tests {
             assert_eq!(present, 1, "{table}.{column} is added");
         }
         let store = SqliteStore {
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             conn: std::sync::Mutex::new(conn),
             export_high_water: AtomicU64::new(high_water),
@@ -5440,6 +5634,7 @@ mod tests {
         )
         .unwrap();
         let store = SqliteStore {
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             conn: std::sync::Mutex::new(conn),
             export_high_water: AtomicU64::new(high_water),
@@ -5526,7 +5721,9 @@ mod tests {
         records.extend(crate::conformance::text_turn(6, 3, "third"));
         assert_eq!(store.project(&session, &records).unwrap(), 7);
         assert!(matches!(
-            store.try_commit_projection(&key, stale_plan).unwrap(),
+            store
+                .try_commit_projection(&key, stale_plan, false)
+                .unwrap(),
             ProjectionCommit::Conflict
         ));
         let prefix = MaterializedStore::read_prefix_with_watermark(&store, &session).unwrap();
@@ -6541,6 +6738,8 @@ mod projection_planner_tests {
         // independent unknown-policy refusal.
         seed.admission_checkpoint.lineage_retention = Some(broca_core::LineageRetention::Forever);
         let snapshot = ProjectionSnapshot {
+            context_epoch: 0,
+            required_recovery_cuts: Vec::new(),
             attribution_complete: true,
             seed: Some(seed),
             watermark: 0,

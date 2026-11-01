@@ -600,7 +600,9 @@ async fn restarted_delivery(restarts: usize, refused: bool, queued: bool, seeded
             "database admission needs no legacy checkpoint store"
         );
     }
-    let _ = std::fs::remove_dir_all(root);
+    drop(store);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -657,9 +659,12 @@ impl broca_core::WalStore for CountingWal {
             // Expose FileWal::durable_publication, the byte end proven by this descriptor's
             // sync, without changing the file store's read-side path or frame format.
             Ok(Box::new(
-                broca_wal::FileWal::open(self.inner.wal_path(key))?
-                    .with_wal_config(self.inner.wal_config())?
-                    .with_feature_floor(floor),
+                broca_wal::FileWal::open_with_recovery(
+                    self.inner.wal_path(key),
+                    self.inner.wal_config(),
+                    floor.clone(),
+                )?
+                .with_feature_floor(floor),
             ))
         } else {
             self.inner.open(key)
@@ -733,6 +738,7 @@ async fn finished_materialized_open_keeps_baseline_read_counts() {
     })
     .await;
     assert!(registry.stop_and_seal().await);
+    drop(registry);
     store
         .project_range(&key, &wal.read_records_range(&key, 0, None, None).unwrap())
         .unwrap();
@@ -762,5 +768,6 @@ async fn finished_materialized_open_keeps_baseline_read_counts() {
         "preserve the baseline range read"
     );
     assert!(registry.stop_and_seal().await);
-    let _ = std::fs::remove_dir_all(root);
+    drop(registry);
+    std::fs::remove_dir_all(root).unwrap();
 }

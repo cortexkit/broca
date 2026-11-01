@@ -1132,6 +1132,14 @@ impl Runtime<'_> {
                 request = request.with_account(label);
             }
         }
+        if request.cause == RideCause::ServiceTierChange {
+            if let Some(level) = &state.current_service_tier {
+                request = request.with_service_tier(
+                    cortexkit_role_llm_runner::service_tier::ServiceTier::parse(level)
+                        .expect("current tier comes from the frozen applied level"),
+                );
+            }
+        }
         let ride = plane.ride(self.provider, self.bind, self.scope, request);
         tokio::pin!(ride);
         let report_at = started.saturating_add(COMPACTION_WAIT_REPORT_AFTER_MS);

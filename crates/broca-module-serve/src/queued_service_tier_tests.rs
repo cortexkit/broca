@@ -4,7 +4,7 @@ fn install_queued_ultrafast_catalog() {
             "currency": "USD", "exponent": 9, "state": "priced", "units": units
         })
     };
-    let response = serde_json::from_value(serde_json::json!({
+    let mut value = serde_json::json!({
         "source": "test", "resolved_at_ms": 0, "catalog_version": 1,
         "models": {"openai/test-ultrafast": {
             "existence": "present",
@@ -14,11 +14,16 @@ fn install_queued_ultrafast_catalog() {
             "capability.attachment": false, "capability.reasoning": false,
             "capability.tool_call": true,
             "rate.input": rate(1_000_000_000), "rate.output": rate(2_000_000_000),
+            "rate.input.mode.fast": rate(2_000_000_000),
+            "rate.output.mode.fast": rate(3_000_000_000),
             "rate.input.mode.ultrafast": rate(3_000_000_000),
             "rate.output.mode.ultrafast": rate(4_000_000_000)
         }}
-    }))
-    .unwrap();
+    });
+    let mut standard = value["models"]["openai/test-ultrafast"].clone();
+    standard.as_object_mut().unwrap().retain(|key, _| !key.contains(".mode."));
+    value["models"]["openai/test-standard-only"] = standard;
+    let response = serde_json::from_value(value).unwrap();
     let cache = Arc::new(broca_catalog::CatalogCache::empty());
     cache
         .install_for_test(response, broca_catalog::CatalogSource::Fusiform)
@@ -53,7 +58,7 @@ async fn queued_ultrafast_restart_drains_through_the_real_executor_without_chang
     let key = req.session.clone();
     let mut request = serde_json::to_value(req.to_submission()).unwrap();
     request["service_tier_level"] = serde_json::json!("ultrafast");
-    // Seed the later writer's durable record, then discard all in-memory queue state.
+    // Seed a tier-bearing durable record, then discard all in-memory queue state.
     let queued: WalRecord = serde_json::from_value(serde_json::json!({
         "type":"queued", "submission_id":"sub-reader-tier", "request":request
     }))

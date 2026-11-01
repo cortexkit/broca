@@ -30,6 +30,7 @@ TEST_ATTRIBUTE = re.compile(r"(?:^|::)(?:test|rstest|test_case)(?:\s|\(|,|$)")
 PREFLIGHT_FEATURE_FLAGS = (
     "broca-provider/live",
     "broca-provider/test-harness",
+    "broca-provider/portable-power-loss",
     "broca-catalog/live",
     "broca-module-serve/test-clock",
 )

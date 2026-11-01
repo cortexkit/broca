@@ -44,6 +44,7 @@ pub enum WalFormat {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WalConfig {
     pub format: WalFormat,
+    pub recovery: crate::recovery::RecoveryPolicy,
 }
 
 /// A root decision made once at boot. Tokens borrow this checked root rather
@@ -80,9 +81,11 @@ pub fn decide_state_root(root: &Path) -> Result<StateRootDecision<'_>, StateRoot
 impl WalConfig {
     pub const LEGACY: Self = Self {
         format: WalFormat::Legacy,
+        recovery: crate::recovery::RecoveryPolicy::Repair,
     };
     pub const OVERHAUL: Self = Self {
         format: WalFormat::Overhaul,
+        recovery: crate::recovery::RecoveryPolicy::Repair,
     };
 
     pub fn is_overhaul(self) -> bool {

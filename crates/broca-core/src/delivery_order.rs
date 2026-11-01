@@ -214,6 +214,26 @@ pub fn steered(send: &OrderedSend, run_id: &RunId) -> WalRecord {
     }
 }
 
+/// Freeze a rendered template at its conversation position. Admission chooses whether
+/// system authority is possible; replay uses the stored message without re-rendering slots.
+pub fn system_delivered(send: &OrderedSend, run_id: &RunId) -> WalRecord {
+    let mut input = send.input.clone();
+    for message in &mut input {
+        message.role = Role::System;
+        message.turn_system = true;
+    }
+    WalRecord::SendDelivered {
+        written_at_ms: send.admitted_at_ms,
+        tags: None,
+        submission_id: send.submission_id.clone(),
+        run_id: run_id.clone(),
+        mode: DeliveryMode::TurnSystem,
+        input: Some(Arc::new(input)),
+        tool_call_id: None,
+        appended_text: None,
+    }
+}
+
 /// The record of a `tool_result` delivery of `send` into `run_id`, riding on `tool_call_id`.
 pub fn with_tool_result(
     send: &OrderedSend,

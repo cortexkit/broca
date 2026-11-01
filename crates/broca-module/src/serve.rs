@@ -1535,6 +1535,10 @@ pub enum ServeError {
     },
     RetentionInvalid(crate::retention::InvalidRetention),
     VariantUnsupported(broca_core::run::VariantRefusal),
+    ServiceTierInvalid {
+        reason: &'static str,
+        message: String,
+    },
     /// The session is held by another live writer (another process/host).
     SessionHeld(String),
     /// Opening or admission failed. The optional class is set only from a known cause.
@@ -1681,6 +1685,7 @@ impl std::fmt::Display for ServeError {
             ServeError::RetentionInvalid(_) => write!(f, "invalid retention"),
             ServeError::SessionHeld(s) => write!(f, "session '{s}' held by a live writer"),
             ServeError::VariantUnsupported(e) => write!(f, "open failed: run resolution failed: {e}"),
+            ServeError::ServiceTierInvalid { message, .. } => f.write_str(message),
             ServeError::SessionTooLarge { max_bytes } => write!(f, "session log cannot exceed {max_bytes} bytes"),
             ServeError::RetainedSessionTooLarge { max_bytes } => write!(f, "retained session log cannot exceed {max_bytes} bytes"),
             ServeError::Open(s, _)
@@ -1817,6 +1822,16 @@ pub trait ServeHandler: Send + Sync {
         _principal: Option<&broca_protocol::BindPrincipal>,
     ) -> Result<(), ServeError> {
         Ok(())
+    }
+
+    /// Diagnostic ownership observation only; a cold cache is unknown, not a non-owner.
+    /// Implementations must not read storage or open an actor to answer this query.
+    fn cached_session_owner(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        None
     }
 
     /// Owner-only authorization for cancel/retract, independent of route scope and epoch.
@@ -2394,6 +2409,13 @@ impl crate::LineageRegistry {
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
+    fn cached_session_owner(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        crate::LineageRegistry::cached_session_owner(self, session, principal)
+    }
     async fn run_event_get(
         &self,
         session: &LineageKey,
@@ -2757,6 +2779,9 @@ impl ServeHandler for crate::LineageRegistry {
                 message: format!("joining steer cannot change the active run's frozen {field}"),
             }),
             SendOutcome::VariantUnsupported(e) => Err(ServeError::VariantUnsupported(e)),
+            SendOutcome::ServiceTierInvalid { reason, message } => {
+                Err(ServeError::ServiceTierInvalid { reason, message })
+            }
             SendOutcome::Upload(error) => Err(ServeError::Upload(error)),
             // Actor errors can combine replay, storage and lifecycle failures after type erasure.
             SendOutcome::Error(e) => Err(ServeError::Open(e, None)),
@@ -4410,6 +4435,7 @@ mod held_status_tests {
 
     fn state(index: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            account_limit_pause: None,
             state: index,
             held_calls: Vec::new(),
             budget_detail: None,
@@ -4514,6 +4540,7 @@ mod paused_auth_tests {
                 broca_protocol::PauseReason::AuthRequired,
             ] {
                 let state = broca_core::ReconciledRunState {
+                    account_limit_pause: None,
                     held_calls: Vec::new(),
                     run_usage: Default::default(),
                     budget_detail: None,
@@ -4593,6 +4620,7 @@ mod context_ceiling_tests {
     use super::*;
     fn reconciled(state: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            account_limit_pause: None,
             held_calls: Vec::new(),
             state,
             context_ceiling: None,
@@ -4753,6 +4781,7 @@ mod offset_head_tests {
             run_id: RunId("r1".into()),
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,

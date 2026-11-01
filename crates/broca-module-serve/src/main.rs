@@ -44,6 +44,7 @@ const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module::diagnostics::initialize();
+    broca_module_serve::serve::initialize_session_readers();
     #[cfg(feature = "heap-profile")]
     broca_heap_profile::start();
     run_runtime(serve_main())?
@@ -144,6 +145,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
     let media = broca_module_serve::config::MediaConfig::load_default().map_err(ServeIoError)?;
     broca_protocol::configure_media(media.enabled).map_err(|error| ServeIoError(error.into()))?;
+    let service_tier =
+        broca_module_serve::config::ServiceTierConfig::load_default().map_err(ServeIoError)?;
+    broca_protocol::configure_service_tier(service_tier.enabled)
+        .map_err(|error| ServeIoError(error.into()))?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
         .map_err(ServeIoError)?;
     let bus_event_config =
@@ -162,8 +167,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .base_url(broca_module_serve::system_one::workers_ai::PROVIDER_ID)
         .map(str::to_owned);
     // Whether a NEW state root is created in the overhaul format; see `state_format`.
-    let state_format_config =
-        broca_module_serve::config::StateFormatConfig::load_default().map_err(ServeIoError)?;
+    let (state_format_config, wal_recovery) =
+        broca_module_serve::config::StateFormatConfig::load_default_with_recovery()
+            .map_err(ServeIoError)?;
     let stop_signal = shutdown_signal()?;
     // Where the WAL, leases and run index live. Resolved before any connection is made so a
     // machine that cannot place its durable state refuses to start by name instead of first
@@ -199,7 +205,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // root, refuses boot instead.
     let wal_decision =
         state_format::wal_decision(&state_root, state_format).map_err(ServeIoError)?;
-    let wal_config = wal_decision.config();
+    let mut wal_config = wal_decision.config();
+    wal_config.recovery = wal_recovery;
     let _stall_watchdog = broca_module_serve::stall::start(&state_root)?;
     // An optional provider base_url override (the mock/openai-compatible path; e.g. aimock).
     // When unset, the run's model id is resolved through the catalog.
@@ -397,9 +404,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     if state_format == state_format::StateFormat::Legacy {
         stores = composition::Stores::open_boot_legacy(
             wal_decision.legacy().expect("legacy boot decision"),
+            wal_config,
         )
         .map_err(ServeIoError)?;
-        wal_store.set_session_ref_index(stores.legacy.as_ref().unwrap().clone());
+        let index = stores.legacy.as_ref().unwrap().clone();
+        wal_store.set_session_ref_index(index.clone());
+        broca_core::WalStore::bind_recovery_projection(wal_store.as_ref(), None, index);
     }
     let run_index = stores.legacy.clone();
     // Older builds kept spend caps in `caps.db` beside this file. Spend caps were removed, so the
@@ -408,7 +418,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Load the last-known-good before any admission is possible. The fetch leg gets its own
     // consumer connection, but construction performs no fusiform route.open; only the detached
     // poll below can dial that sibling module.
-    broca_module_serve::diagnostics::install(state_root.clone());
+    broca_module_serve::diagnostics::install(state_root.clone(), wal_config);
     let catalog_cache = Arc::new(broca_catalog::CatalogCache::open(
         state_root.join("catalog/fusiform-lkg.json"),
     ));
@@ -3844,6 +3854,70 @@ mod executor {
 
     #[async_trait]
     impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
+        fn check_service_tier(
+            &self,
+            request: &broca_protocol::request::SubmissionRequest,
+        ) -> Result<(), String> {
+            let Some(level) = request.service_tier_level.as_deref() else {
+                return Ok(());
+            };
+            if level == "standard" {
+                return Ok(());
+            }
+            let catalog = broca_catalog::catalog()
+                .map_err(|error| format!("service_tier {level:?}: catalog unavailable: {error}"))?;
+            let (provider, _) = catalog
+                .model_for_serving(&request.model.provider_module_id, &request.model.model_id)
+                .ok_or_else(|| {
+                    format!(
+                        "service_tier {level:?}: unknown model {}/{}",
+                        request.model.provider_module_id, request.model.model_id
+                    )
+                })?;
+            let (pin, account) =
+                caller_auth_for_episode(request.auth.as_ref(), EpisodeAuthContext::FreshSession)
+                    .map_err(|error| format!("service_tier {level:?}: {error}"))?;
+            let method = if self.provider_base_url.is_some() {
+                None
+            } else {
+                self.vault
+                    .as_ref()
+                    .map(|vault| {
+                        broca_module_serve::auth_routing::resolve_credential_id(
+                            &request.model.provider_module_id,
+                            pin,
+                            account,
+                            &vault.methods,
+                            FALLBACK_METHOD,
+                        )
+                        .method
+                    })
+                    .or(pin)
+            };
+            let family = match method.and_then(family_for_method) {
+                Some(family) => family,
+                None if catalog
+                    .routing_facts(&request.model.provider_module_id, &request.model.model_id)
+                    .is_some() =>
+                {
+                    catalog
+                        .resolve_route(&request.model.provider_module_id, &request.model.model_id)
+                        .map_err(|error| format!("service_tier {level:?}: {error}"))?
+                        .0
+                }
+                None => provider.wire_family,
+            };
+            broca_catalog::live::check_service_tier_level(
+                family,
+                level,
+                &provider.id,
+                &format!(
+                    "{}/{}",
+                    request.model.provider_module_id, request.model.model_id
+                ),
+                &catalog.priced_modes(&request.model.provider_module_id, &request.model.model_id),
+            )
+        }
         fn source_warm_enabled(&self) -> bool {
             self.anthropic_fallbacks.refusal_resend.is_enabled()
         }
@@ -4969,6 +5043,7 @@ mod executor {
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
         include!("queued_service_tier_tests.rs");
+        include!("service_tier_writer_tests.rs");
         include!("vault_request_tests.rs");
         include!("role_plane_tests.rs");
         include!("admission_wal_read_budget_tests.rs");
@@ -5168,6 +5243,7 @@ mod executor {
             frozen.prompt_cache_key = Some("frozen-key".into());
             let mut req = drift_request(std::path::Path::new("/inherit-cache"));
             let config = broca_wal::RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -6308,6 +6384,7 @@ mod executor {
             framed(
                 seq,
                 broca_wal::WalRecord::RunPaused {
+                    account_limit: None,
                     ts_ms: None,
                     run_id: broca_protocol::RunId("run-1".into()),
                     reason: broca_protocol::PauseReason::AuthRequired,
@@ -6357,6 +6434,7 @@ mod executor {
                     session: BindIdentity::new("/tmp/project", "harness", "session"),
                     ts_ms: None,
                     config: Box::new(broca_wal::RunConfig {
+                        account_limit_pause: false,
                         turn_directives_v1: None,
                         render_tags: false,
                         computed_tags: None,

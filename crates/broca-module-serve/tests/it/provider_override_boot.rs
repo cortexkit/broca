@@ -1,4 +1,39 @@
-//! Malformed runtime endpoints refuse startup before any subc connection is attempted.
+//! Malformed runtime policy refuses startup before a subconscious daemon connection is attempted.
+
+#[test]
+fn malformed_service_tier_switch_refuses_boot_by_name() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("service-tier-boot-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("broca.jsonc");
+    for value in [
+        serde_json::json!(true),
+        serde_json::json!({"enabled":"yes"}),
+    ] {
+        std::fs::write(&path, serde_json::json!({"service_tier":value}).to_string()).unwrap();
+        let output = broca_test_support::retry_executable_file_busy(|| {
+            broca_test_support::ckdev_command(
+                env!("CARGO_BIN_EXE_ck-broca"),
+                broca_test_support::scratch_root(),
+            )
+            .args(["--subc", "unused-connection.json"])
+            .env("BROCA_CONFIG_PATH", &path)
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("BROCA_STATE_ROOT", root.join("state"))
+            .output()
+        })
+        .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("service_tier.enabled"), "{error}");
+        assert!(
+            !root.join("state").exists(),
+            "refuse malformed policy before opening state"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn malformed_provider_url_refuses_boot_with_provider_and_value() {
     let path = broca_test_support::scratch_root()

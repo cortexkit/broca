@@ -507,6 +507,7 @@ mod end_to_end {
             session: session.clone(),
             model: ModelHandle::new("p", "m"),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,

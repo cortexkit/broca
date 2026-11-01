@@ -73,6 +73,7 @@ async fn run_refusal(host: &str, status: u16, body: &'static str) -> RefusalRun 
         session: session.clone(),
         model: ModelHandle::new("inception", "mercury-2"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

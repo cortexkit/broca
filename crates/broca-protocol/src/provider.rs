@@ -314,6 +314,26 @@ pub struct AttemptAccountLimit {
     pub limit_window: Option<String>,
 }
 
+/// A producer's positive identification of an account-scoped, self-resetting usage limit.
+/// Status codes and provider-detail strings alone never authorize account-specific recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountLimitDisposition {
+    pub kind: AccountLimitKind,
+    pub scope: AccountLimitScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountLimitKind {
+    AccountLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountLimitScope {
+    Account,
+}
+
 /// A token refresh performed inside one step: either after the provider rejected the token the
 /// step was sent with, or just before an attempt because the held token was about to expire.
 /// The credential itself is the one frozen at admission and never changes; only the token served

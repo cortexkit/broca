@@ -3,8 +3,26 @@ use crate::{SqliteStore, StoreError};
 use broca_core::{compaction::CompactionCheckpoint, MaterializedStore};
 use broca_protocol::BindIdentity;
 use broca_wal::{CompactionMessageKind, FramedRecord, WalByteAnchor, WalRangeRead, WalRecord};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SEED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_seed_hook(hook: impl FnOnce() + 'static) {
+    AFTER_SEED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn after_seed() {
+    let hook = AFTER_SEED.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS compaction_facts (
@@ -27,6 +45,14 @@ pub struct CompactionFacts {
     pub refused: u64,
     pub file_id: Option<u64>,
     pub byte_end: Option<u64>,
+}
+
+/// Capture before reading WAL bytes. A later facts write must still see the same
+/// session lineage and recovery epoch; a token from another connection cannot
+/// bypass a pending recovery fence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionProjectionEpoch {
+    state: Option<(String, Option<String>, i64)>,
 }
 impl CompactionFacts {
     pub fn resolved(&self, version: u64) -> bool {
@@ -63,6 +89,49 @@ fn save(conn: &Connection, key: &str, facts: &CompactionFacts) -> Result<(), Sto
 }
 
 impl SqliteStore {
+    pub fn compaction_projection_epoch(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<CompactionProjectionEpoch, StoreError> {
+        if !self.wal_config.is_overhaul() {
+            return Ok(CompactionProjectionEpoch { state: None });
+        }
+        let key = Self::key(session);
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (_, lineage, epoch) = crate::current_projection_state(&tx, &key, true)?;
+        if crate::wal_recovery::read_fence(&tx, &key)?.is_some_and(|fence| fence.pending) {
+            return Err(StoreError::InconsistentSnapshot(
+                "compaction facts unavailable during pending WAL recovery",
+            ));
+        }
+        tx.commit()?;
+        Ok(CompactionProjectionEpoch {
+            state: Some((key, lineage, epoch)),
+        })
+    }
+
+    fn compaction_epoch_matches(
+        &self,
+        tx: &Transaction<'_>,
+        key: &str,
+        captured: &CompactionProjectionEpoch,
+    ) -> Result<bool, StoreError> {
+        if !self.wal_config.is_overhaul() {
+            return Ok(captured.state.is_none());
+        }
+        let Some((session, lineage, epoch)) = &captured.state else {
+            return Ok(false);
+        };
+        if session != key {
+            return Ok(false);
+        }
+        let (_, current_lineage, current_epoch) = crate::current_projection_state(tx, key, true)?;
+        Ok(current_lineage == *lineage
+            && current_epoch == *epoch
+            && !crate::wal_recovery::read_fence(tx, key)?.is_some_and(|fence| fence.pending))
+    }
+
     pub fn current_compaction_facts(
         &self,
         wal: &dyn broca_core::WalStore,
@@ -73,10 +142,20 @@ impl SqliteStore {
                 "legacy compaction-facts writer refuses an overhaul WAL destination".into(),
             );
         }
+        let epoch = self
+            .compaction_projection_epoch(session)
+            .map_err(|e| e.to_string())?;
         let facts = self.compaction_facts(session).map_err(|e| e.to_string())?;
         let identity = wal.file_identity(session).map_err(|e| e.to_string())?;
         let bytes = wal.live_wal_bytes(session).map_err(|e| e.to_string())?;
         if let Some(facts) = facts.filter(|f| f.current_file(identity, bytes)) {
+            if self
+                .compaction_projection_epoch(session)
+                .map_err(|e| e.to_string())?
+                != epoch
+            {
+                return Err("compaction facts changed during recovery".into());
+            }
             return Ok(facts);
         }
         // A bounded suffix keeps projection lag from turning receipt intake into a full read.
@@ -91,7 +170,7 @@ impl SqliteStore {
         {
             return Err("compaction WAL changed during its durability proof".into());
         }
-        self.project_compaction_facts(session, &range)
+        self.project_compaction_facts_at_epoch(session, &range, &epoch)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "compaction facts projection cannot cover the bounded WAL suffix".into())
     }
@@ -102,9 +181,11 @@ impl SqliteStore {
         &self,
         session: &BindIdentity,
     ) -> Result<Option<CompactionFacts>, StoreError> {
+        let captured = self.compaction_projection_epoch(session)?;
         let key = Self::key(session);
-        if let Some(facts) = load(&self.conn.lock().unwrap(), &key)? {
-            return Ok(Some(facts));
+        let loaded = load(&self.conn.lock().unwrap(), &key)?;
+        if let Some(facts) = loaded {
+            return Ok((self.compaction_projection_epoch(session)? == captured).then_some(facts));
         }
         let snapshot = self.read_admission_snapshot(session).map_err(|_| {
             StoreError::InconsistentSnapshot("compaction admission checkpoint unreadable")
@@ -136,10 +217,19 @@ impl SqliteStore {
                 .unwrap_or(0);
         }
         if !facts.setup {
-            return Ok(Some(facts));
+            return Ok((self.compaction_projection_epoch(session)? == captured).then_some(facts));
         }
+        #[cfg(test)]
+        after_seed();
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(if self.wal_config.is_overhaul() {
+            TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Deferred
+        })?;
+        if !self.compaction_epoch_matches(&tx, &key, &captured)? {
+            return Ok(None);
+        }
         let facts = match load(&tx, &key)? {
             Some(current) => current,
             None => {
@@ -180,10 +270,82 @@ impl SqliteStore {
         anchor: Option<WalByteAnchor>,
         complete_end: Option<u64>,
     ) -> Result<Option<CompactionFacts>, StoreError> {
+        self.project_compaction_facts_records_guarded(
+            session,
+            lineage,
+            records,
+            anchor,
+            complete_end,
+            None,
+        )
+    }
+
+    pub fn project_compaction_facts_at_epoch(
+        &self,
+        session: &BindIdentity,
+        range: &WalRangeRead,
+        epoch: &CompactionProjectionEpoch,
+    ) -> Result<Option<CompactionFacts>, StoreError> {
+        let Some(lineage) = range.lineage_id else {
+            return Ok(None);
+        };
+        let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+            return Ok(None);
+        };
+        self.project_compaction_facts_records_guarded(
+            session,
+            &lineage.to_string(),
+            records,
+            range.next_anchor,
+            range.complete_byte_end,
+            Some(epoch),
+        )
+    }
+
+    fn project_compaction_facts_records_guarded(
+        &self,
+        session: &BindIdentity,
+        lineage: &str,
+        records: &[FramedRecord],
+        anchor: Option<WalByteAnchor>,
+        complete_end: Option<u64>,
+        source_epoch: Option<&CompactionProjectionEpoch>,
+    ) -> Result<Option<CompactionFacts>, StoreError> {
+        let captured = self.compaction_projection_epoch(session)?;
+        if source_epoch.is_some_and(|epoch| *epoch != captured) {
+            return Ok(None);
+        }
         let seed = self.compaction_facts(session)?;
+        #[cfg(test)]
+        after_seed();
         let key = Self::key(session);
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(if self.wal_config.is_overhaul() {
+            TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Deferred
+        })?;
+        if !self.compaction_epoch_matches(&tx, &key, &captured)? {
+            return Ok(None);
+        }
+        if let Some((_, Some(expected_lineage), _)) = &captured.state {
+            if expected_lineage != lineage {
+                return Ok(None);
+            }
+        }
+        if self.wal_config.is_overhaul() && source_epoch.is_none() {
+            // Without a token captured before the WAL read, only a source carrying
+            // the complete recovery history can prove it is not a pre-cut range.
+            let required = crate::wal_recovery::required_cut_ids_in_tx(&tx, &key)?;
+            if required.iter().any(|id| {
+                !records.iter().any(|frame| {
+                    matches!(&frame.record,
+                WalRecord::RecoveryCut { recovery } if &recovery.cut_id == id)
+                })
+            }) {
+                return Ok(None);
+            }
+        }
         let held = load(&tx, &key)?.or(seed);
         let mut facts =
             held.filter(|f| f.lineage_id == lineage)

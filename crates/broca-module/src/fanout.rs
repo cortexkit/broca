@@ -1696,6 +1696,7 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -3378,6 +3379,7 @@ mod tests {
                     run_id: RunId("r1".into()),
                     session: BindIdentity::new("/tmp/project-a", "runner", "restart"),
                     config: Box::new(RunConfig {
+                        account_limit_pause: false,
                         turn_directives_v1: None,
                         render_tags: false,
                         computed_tags: None,
@@ -3710,6 +3712,7 @@ mod episode_attach_tests {
             run_id: RunId(run_id.into()),
             session: broca_protocol::BindIdentity::new("/tmp/project", "runner", "attach"),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -4517,11 +4520,13 @@ mod database_attach_tests {
             root.join("wal"),
             broca_wal::classify_state_root(root).unwrap(),
         ));
-        let wal = broca_wal::FileWal::open(store.wal_path(bind))
-            .unwrap()
-            .with_feature_floor(root.join("wal-floor"))
-            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-            .unwrap();
+        let wal = broca_wal::FileWal::open_with_recovery(
+            store.wal_path(bind),
+            broca_wal::WalConfig::OVERHAUL,
+            root.join("wal-floor"),
+        )
+        .unwrap()
+        .with_feature_floor(root.join("wal-floor"));
         (store, Box::new(wal))
     }
 
@@ -4731,9 +4736,10 @@ mod database_attach_tests {
                 op.frames_decoded,
                 op.reads.iter().map(|r| r.length).sum::<u64>(),
             ));
+            drop(reader);
             drop(wal);
             drop(db);
-            let _ = std::fs::remove_dir_all(root);
+            std::fs::remove_dir_all(root).unwrap();
         }
         assert_eq!(measurements[0], measurements[1]);
         eprintln!("bounded attach reads/decodes/bytes: {measurements:?}");
@@ -4862,8 +4868,9 @@ mod database_attach_tests {
         );
         fanout.teardown().await;
         writer.shutdown().await.unwrap();
+        drop(fanout);
         drop(lease);
         drop(db);
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

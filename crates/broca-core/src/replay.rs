@@ -102,6 +102,10 @@ impl std::error::Error for ReplayError {}
 /// The result of replaying a session's WAL — a LINEAGE of one or more episodes.
 #[derive(Debug, Clone)]
 pub struct ReplayState {
+    /// Timed recovery evidence from the current pause, never inferred from an error code.
+    pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
+    /// Session-scoped recovery tombstones survive episode boundaries.
+    pub recovered_calls: Vec<broca_wal::recovery::RecoveryRun>,
     /// Next absolute transcript ordinal, including messages not held in the prompt.
     pub extent: u64,
     /// The last episode renders tags under the computed rules on a compaction-managed session,
@@ -189,8 +193,8 @@ pub struct ReplayState {
     pub episode_step_spans: Option<Vec<std::ops::Range<usize>>>,
     /// All admitted episode render inputs; absent for a materialized prefix without WAL history.
     pub render_episodes: Option<Vec<broca_protocol::request::EpisodeRenderInput>>,
-    /// The last episode's tool batch that was opened (`tool_batch_started` is durable) but
-    /// never committed, with each planned call's durable state. `None` when no batch is open.
+    /// The last episode's uncommitted tool batch, backed by `tool_batch_started`
+    /// or recovery attribution, with each planned call's durable state.
     ///
     /// A resume that seals the episode because a call is indeterminate reads this to write the
     /// results that close the batch, so the next send renders every call paired with a result.
@@ -218,8 +222,10 @@ pub struct ReplayState {
 /// An opened, uncommitted tool batch as the WAL left it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenToolBatch {
+    /// Recovery retained the model turn but removed this batch's start record.
+    pub needs_start: bool,
     pub batch_id: BatchId,
-    /// The model step whose tool calls this batch runs.
+    /// The model step, or zero for close-out-only attribution whose step was lost.
     pub step_id: StepId,
     /// Every planned call in plan order, with its durable state.
     pub calls: Vec<(ToolCallId, OpenCallState)>,
@@ -231,13 +237,13 @@ pub struct OpenToolBatch {
 pub enum OpenCallState {
     /// A terminal is durable (a result of any outcome, or a no-dispatch record).
     Terminated,
-    /// A dispatch intent is durable and no terminal is: the call may or may not have run.
+    /// An intent or recovery tombstone is durable and no terminal is: the call may have run.
     Dispatched,
     /// The provider durably accepted responsibility for returning a late result.
     ProviderHeld,
     /// A sequential intent behind an open or closed-out held call; it was never sent.
     HeldSuccessor,
-    /// Neither Prepared, intent nor terminal is durable: the call never left the process.
+    /// No Prepared, intent, recovery tombstone or terminal: no attributed dispatch occurred.
     NotSent,
     /// Prepared arguments are durable, but no approval or terminal is durable.
     Deferred,
@@ -376,6 +382,7 @@ impl ProviderHeldCall {
 /// Keys include the batch because a model may reuse a call id in a later step.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct HeldCallsProjection {
+    recoveries: Vec<broca_wal::recovery::RecoveryRun>,
     tool_names: HashMap<ToolCallId, String>,
     calls: Vec<(
         BatchId,
@@ -470,6 +477,42 @@ impl HeldCallsProjection {
                 tool_call_id,
                 ..
             } => return self.remove(batch_id, tool_call_id),
+            WalRecord::RecoveryCut { recovery } => {
+                self.recoveries.extend(recovery.runs.iter().cloned())
+            }
+            WalRecord::RecoveryCallClosed {
+                run_id,
+                call_key,
+                tool_call_id,
+                batch_id,
+                step_id,
+                ..
+            } => {
+                let mut terminal = broca_wal::recovery::RecoveryCall {
+                    tool_call_id: tool_call_id.clone(),
+                    batch_id: batch_id.clone(),
+                    step_id: *step_id,
+                    call_keys: call_key.iter().cloned().collect(),
+                };
+                for run in self.recoveries.iter().filter(|run| &run.run_id == run_id) {
+                    for call in &run.calls {
+                        if call.terminal_matches(&terminal) {
+                            terminal.call_keys.extend(call.call_keys.iter().cloned());
+                        }
+                    }
+                }
+                let previous = self.calls.len();
+                self.calls.retain(|(batch, id, held)| {
+                    let identity = broca_wal::recovery::RecoveryCall {
+                        tool_call_id: id.clone(),
+                        batch_id: Some(batch.clone()),
+                        step_id: None,
+                        call_keys: vec![held.call_key.clone()],
+                    };
+                    !identity.terminal_matches(&terminal)
+                });
+                return (previous != self.calls.len()).then(|| self.status());
+            }
             _ => {}
         }
         None
@@ -573,7 +616,47 @@ impl HeldCallFacts {
 /// (the entry is then classed rather than delivered), and only that read also lists the
 /// sequential held successors, which no delivery needs.
 pub fn held_call_facts(records: &[FramedRecord], call_key: Option<&str>) -> HeldCallFacts {
+    if records.iter().any(|frame| {
+        matches!(
+            frame.record,
+            WalRecord::RecoveryCut { .. } | WalRecord::RecoveryCallClosed { .. }
+        )
+    }) {
+        if let Some(key) = call_key {
+            return recovered_held_call_facts(records, key);
+        }
+        let mut facts = held_call_facts_inner(records, None);
+        facts.held.clear();
+        facts.terminals.clear();
+        let keys: std::collections::BTreeSet<_> = records
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                WalRecord::ToolCallProviderHeld { call_key, .. } => Some(call_key.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut pending = std::collections::BTreeSet::new();
+        for key in keys {
+            let named = recovered_held_call_facts(records, &key);
+            facts.unreadable |= named.unreadable;
+            for held in &named.held {
+                if named.terminal(&held.tool_call_id).is_none() {
+                    pending.insert(held.tool_call_id.0.clone());
+                }
+            }
+            facts.held.extend(named.held);
+            facts.terminals.extend(named.terminals);
+        }
+        facts.terminals.retain(|(id, _)| !pending.contains(&id.0));
+        return facts;
+    }
+    held_call_facts_inner(records, call_key)
+}
+
+fn held_call_facts_inner(records: &[FramedRecord], call_key: Option<&str>) -> HeldCallFacts {
     let mut facts = HeldCallFacts::default();
+    let mut recovery_aliases = BTreeMap::new();
+    let mut recovery_closed = std::collections::BTreeSet::new();
     for frame in records {
         match &frame.record {
             WalRecord::RunStarted { session, .. } => facts.session = Some(session.clone()),
@@ -631,6 +714,35 @@ pub fn held_call_facts(records: &[FramedRecord], call_key: Option<&str>) -> Held
                     .terminals
                     .push((tool_call_id.clone(), DispatchOutcome::Interrupted));
             }
+            WalRecord::RecoveryCut { recovery } => {
+                for run in &recovery.runs {
+                    for call in &run.calls {
+                        for key in &call.call_keys {
+                            recovery_aliases.insert(
+                                key.clone(),
+                                (run.run_id.0.clone(), call.tool_call_id.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+            WalRecord::RecoveryCallClosed {
+                run_id,
+                call_key,
+                tool_call_id,
+                ..
+            } => {
+                recovery_closed.insert((run_id.0.clone(), tool_call_id.0.clone()));
+                if let Some(key) = call_key {
+                    recovery_aliases.insert(key.clone(), (run_id.0.clone(), tool_call_id.clone()));
+                    if facts.held.iter().any(|held| held.call_key == *key) {
+                        facts.terminals.retain(|(call, _)| call != tool_call_id);
+                        facts
+                            .terminals
+                            .push((tool_call_id.clone(), DispatchOutcome::Unknown));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -638,6 +750,24 @@ pub fn held_call_facts(records: &[FramedRecord], call_key: Option<&str>) -> Held
     // per-registration scan stays linear.
     let registered = call_key.is_some();
     if let Some(key) = call_key {
+        if let Some((_, id)) = recovery_aliases
+            .get(key)
+            .filter(|(owner, id)| recovery_closed.contains(&(owner.clone(), id.0.clone())))
+        {
+            facts.terminals.retain(|(call, _)| call != id);
+            facts.terminals.push((id.clone(), DispatchOutcome::Unknown));
+            if !facts.held.iter().any(|held| held.call_key == key) {
+                facts.held.push(ProviderHeldCall {
+                    tool_call_id: id.clone(),
+                    call_key: key.to_owned(),
+                    module: String::new(),
+                    reason: String::new(),
+                    detail_digest: None,
+                    held_at_ms: 0,
+                    sequential: false,
+                });
+            }
+        }
         if !facts.held.iter().any(|held| held.call_key == key) {
             // An approved call's key is its deferred anchor, so the intent carries it.
             let anchor = records.iter().find_map(|frame| match &frame.record {
@@ -646,6 +776,11 @@ pub fn held_call_facts(records: &[FramedRecord], call_key: Option<&str>) -> Held
                     call_key: Some(intent_key),
                     ..
                 } if intent_key == key => Some(tool_call_id.clone()),
+                WalRecord::RecoveryCallClosed {
+                    call_key: Some(closed_key),
+                    tool_call_id,
+                    ..
+                } if closed_key == key => Some(tool_call_id.clone()),
                 _ => None,
             });
             if let Some(tool_call_id) = anchor {
@@ -667,6 +802,310 @@ pub fn held_call_facts(records: &[FramedRecord], call_key: Option<&str>) -> Held
         Vec::new()
     };
     facts.barrier_owed = barrier_owed(records);
+    facts
+}
+
+fn recovered_held_call_facts(records: &[FramedRecord], key: &str) -> HeldCallFacts {
+    use crate::recovery_close_out::{enrich_identity, merge_call, merge_effect, BatchEvidence};
+    use broca_wal::recovery::{RecoveryCall, RecoveryRun};
+    let mut facts = held_call_facts_inner(records, None);
+    facts.held.clear();
+    facts.terminals.clear();
+    facts.held_successors = held_successor_calls(records);
+    let projection = project_deferred_calls(None, records, None, None);
+    let mut target = projection.as_ref().and_then(|projection| {
+        projection
+            .calls
+            .get(key)
+            .and_then(|call| call.run_id.clone().zip(projection.effect_identity(call)))
+    });
+    let mut actual = None;
+    let mut anchor = None;
+    let mut cuts: Vec<RecoveryRun> = Vec::new();
+    let mut owner = None;
+    let mut batches = BatchEvidence::new();
+    let add = |target: &mut Option<(RunId, RecoveryCall)>, run: RunId, call: RecoveryCall| {
+        if let Some((known_run, known)) = target {
+            if *known_run != run || !known.matches_effect(&call) {
+                return false;
+            }
+            merge_call(known, &call);
+        } else {
+            *target = Some((run, call));
+        }
+        true
+    };
+    for frame in records {
+        match &frame.record {
+            WalRecord::RunStarted { run_id, .. } => owner = Some(run_id.clone()),
+            WalRecord::ToolBatchStarted {
+                batch_id,
+                step_id,
+                planned_calls,
+            } => {
+                if let Some(run) = &owner {
+                    batches.insert(
+                        (run.0.clone(), batch_id.0.clone()),
+                        (*step_id, planned_calls.clone()),
+                    );
+                }
+            }
+            WalRecord::RecoveryCut { recovery } => {
+                for run in &recovery.runs {
+                    for call in &run.calls {
+                        if call.call_keys.iter().any(|known| known == key)
+                            && !add(
+                                &mut target,
+                                run.run_id.clone(),
+                                enrich_identity(call.clone(), &run.run_id, &batches),
+                            )
+                        {
+                            facts.unreadable = true;
+                            return facts;
+                        }
+                    }
+                    cuts.push(run.clone());
+                }
+            }
+            WalRecord::ToolDispatchIntent {
+                batch_id,
+                tool_call_id,
+                call_key: Some(known),
+                ..
+            } if known == key => {
+                if let Some(run) = &owner {
+                    if !add(
+                        &mut target,
+                        run.clone(),
+                        enrich_identity(
+                            RecoveryCall {
+                                tool_call_id: tool_call_id.clone(),
+                                batch_id: Some(batch_id.clone()),
+                                step_id: None,
+                                call_keys: vec![key.to_owned()],
+                            },
+                            run,
+                            &batches,
+                        ),
+                    ) {
+                        facts.unreadable = true;
+                        return facts;
+                    }
+                    anchor = Some(frame.seq);
+                }
+            }
+            WalRecord::ToolCallProviderHeld {
+                batch_id,
+                tool_call_id,
+                call_key: known,
+                module,
+                reason,
+                detail_digest,
+                held_at_ms,
+                sequential,
+                ..
+            } if known == key => {
+                if let Some(run) = target
+                    .as_ref()
+                    .map(|(run, _)| run.clone())
+                    .or_else(|| owner.clone())
+                {
+                    let identity = projection
+                        .as_ref()
+                        .and_then(|projection| {
+                            projection
+                                .calls
+                                .get(key)
+                                .and_then(|call| projection.effect_identity(call))
+                        })
+                        .unwrap_or_else(|| RecoveryCall {
+                            tool_call_id: tool_call_id.clone(),
+                            batch_id: Some(batch_id.clone()),
+                            step_id: None,
+                            call_keys: vec![key.to_owned()],
+                        });
+                    if !add(
+                        &mut target,
+                        run.clone(),
+                        enrich_identity(identity, &run, &batches),
+                    ) {
+                        facts.unreadable = true;
+                        return facts;
+                    }
+                    actual = Some(ProviderHeldCall {
+                        tool_call_id: tool_call_id.clone(),
+                        call_key: key.to_owned(),
+                        module: module.clone(),
+                        reason: reason.clone(),
+                        detail_digest: detail_digest.clone(),
+                        held_at_ms: *held_at_ms,
+                        sequential: *sequential,
+                    });
+                    anchor = Some(frame.seq);
+                }
+            }
+            WalRecord::RecoveryCallClosed {
+                run_id,
+                batch_id,
+                step_id,
+                tool_call_id,
+                call_key: Some(known),
+                ..
+            } if known == key
+                && !add(
+                    &mut target,
+                    run_id.clone(),
+                    RecoveryCall {
+                        tool_call_id: tool_call_id.clone(),
+                        batch_id: batch_id.clone(),
+                        step_id: *step_id,
+                        call_keys: vec![key.to_owned()],
+                    },
+                ) =>
+            {
+                facts.unreadable = true;
+                return facts;
+            }
+            _ => {}
+        }
+    }
+    let Some((run, target)) = target else {
+        return facts;
+    };
+    let target = enrich_identity(target, &run, &batches);
+    facts.held.push(actual.unwrap_or_else(|| ProviderHeldCall {
+        tool_call_id: target.tool_call_id.clone(),
+        call_key: key.to_owned(),
+        module: String::new(),
+        reason: String::new(),
+        detail_digest: None,
+        held_at_ms: 0,
+        sequential: false,
+    }));
+    let mut contexts = Vec::new();
+    let mut cell = target.clone();
+    cell.call_keys.clear();
+    for cut in cuts.iter().filter(|cut| cut.run_id == run) {
+        for call in &cut.calls {
+            let call = enrich_identity(call.clone(), &run, &batches);
+            if call.matches_effect(&cell) {
+                merge_effect(&mut contexts, call);
+            }
+        }
+    }
+    let mut owner = None;
+    let mut at = BatchEvidence::new();
+    let mut outcome = None;
+    let mut receipted = false;
+    for frame in records {
+        match &frame.record {
+            WalRecord::RunStarted { run_id, .. } => owner = Some(run_id.clone()),
+            WalRecord::ToolBatchStarted {
+                batch_id,
+                step_id,
+                planned_calls,
+            } => {
+                if let Some(run) = &owner {
+                    at.insert(
+                        (run.0.clone(), batch_id.0.clone()),
+                        (*step_id, planned_calls.clone()),
+                    );
+                }
+            }
+            WalRecord::ToolResult {
+                batch_id,
+                result,
+                outcome: value,
+                ..
+            } if !receipted
+                && owner.as_ref() == Some(&run)
+                && result.tool_call_id == target.tool_call_id =>
+            {
+                let candidate = enrich_identity(
+                    RecoveryCall {
+                        tool_call_id: result.tool_call_id.clone(),
+                        batch_id: Some(batch_id.clone()),
+                        step_id: None,
+                        call_keys: Vec::new(),
+                    },
+                    &run,
+                    &at,
+                );
+                if candidate.matches_effect(&target)
+                    && anchor.is_none_or(|seq| frame.seq >= seq)
+                    && (anchor.is_some() || contexts.len() == 1)
+                {
+                    outcome = Some(*value);
+                }
+            }
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } if !receipted
+                && owner.as_ref() == Some(&run)
+                && tool_call_id == &target.tool_call_id =>
+            {
+                let candidate = enrich_identity(
+                    RecoveryCall {
+                        tool_call_id: tool_call_id.clone(),
+                        batch_id: Some(batch_id.clone()),
+                        step_id: None,
+                        call_keys: Vec::new(),
+                    },
+                    &run,
+                    &at,
+                );
+                if candidate.matches_effect(&target)
+                    && anchor.is_none_or(|seq| frame.seq >= seq)
+                    && (anchor.is_some() || contexts.len() == 1)
+                {
+                    outcome = Some(DispatchOutcome::Interrupted);
+                }
+            }
+            WalRecord::LateResult {
+                call_key,
+                outcome: value,
+                ..
+            } if !receipted && call_key == key => {
+                outcome = Some(match value {
+                    broca_wal::LateOutcome::Completed => DispatchOutcome::Completed,
+                    broca_wal::LateOutcome::NotSent => DispatchOutcome::Interrupted,
+                    broca_wal::LateOutcome::Unknown => DispatchOutcome::Unknown,
+                });
+            }
+            WalRecord::RecoveryCallClosed {
+                run_id,
+                batch_id,
+                step_id,
+                tool_call_id,
+                call_key,
+                ..
+            } if run_id == &run => {
+                let mut terminal = RecoveryCall {
+                    tool_call_id: tool_call_id.clone(),
+                    batch_id: batch_id.clone(),
+                    step_id: *step_id,
+                    call_keys: call_key.iter().cloned().collect(),
+                };
+                for cut in cuts.iter().filter(|cut| cut.run_id == run) {
+                    for call in &cut.calls {
+                        if call.terminal_matches(&terminal) {
+                            terminal.call_keys.extend(call.call_keys.iter().cloned());
+                        }
+                    }
+                }
+                if target.terminal_matches(&terminal) {
+                    outcome = Some(DispatchOutcome::Unknown);
+                    receipted = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(outcome) = outcome {
+        facts.terminals.push((target.tool_call_id, outcome));
+    }
     facts
 }
 
@@ -850,10 +1289,24 @@ pub struct DeferredCallProjection {
     /// WAL records from the lineage's origin before deciding whether a run stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped_runs: Option<std::collections::BTreeSet<String>>,
+    /// Physical recovery made these run/call identities outcome-unknown. A bare
+    /// model-facing ID remains usable by a different run.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub recovery_tombstones: std::collections::BTreeSet<(String, String)>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub recovery_call_keys: std::collections::BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_identities: Vec<broca_wal::recovery::RecoveryRun>,
+    /// Latest generation in the folded WAL prefix. Each projected deferred call
+    /// retains the generation that preceded its Prepared frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_generation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectedDeferredCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_generation: Option<String>,
     pub run_id: Option<RunId>,
     pub prepared_seq: u64,
     pub prepared_fence: u64,
@@ -866,6 +1319,34 @@ pub struct ProjectedDeferredCall {
     pub late_approval: Option<Arc<WalRecord>>,
     pub late_dispatch_intent: Option<Arc<WalRecord>>,
     pub late_result: Option<Arc<WalRecord>>,
+}
+
+fn deferred_effect_identity(
+    lineage: &str,
+    call: &ProjectedDeferredCall,
+) -> Option<broca_wal::recovery::RecoveryCall> {
+    let WalRecord::ToolCallDeferred {
+        call_id, batch_id, ..
+    } = call.prepared.as_ref()
+    else {
+        return None;
+    };
+    let key = broca_wal::recovery::physical_call_key(
+        lineage,
+        call.prepared_seq,
+        call.recovery_generation.as_deref(),
+    );
+    let batch = if call.decision == Some(DeferredDecision::Expired) {
+        BatchId(format!("late:{key}"))
+    } else {
+        batch_id.clone()
+    };
+    Some(broca_wal::recovery::RecoveryCall {
+        tool_call_id: call_id.clone(),
+        batch_id: Some(batch),
+        step_id: None,
+        call_keys: vec![key],
+    })
 }
 
 /// A late answer and its isolated execution result, never part of a model prompt.
@@ -884,6 +1365,10 @@ impl DeferredCallProjection {
             last_run_id: None,
             calls: BTreeMap::new(),
             stopped_runs: Some(std::collections::BTreeSet::new()),
+            recovery_tombstones: std::collections::BTreeSet::new(),
+            recovery_call_keys: std::collections::BTreeSet::new(),
+            recovery_identities: Vec::new(),
+            recovery_generation: None,
         }
     }
 
@@ -903,10 +1388,15 @@ impl DeferredCallProjection {
                     }
                 }
                 WalRecord::ToolCallDeferred { .. } => {
-                    let key = format!("{}:{}", self.lineage_id, frame.seq);
+                    let key = broca_wal::recovery::physical_call_key(
+                        &self.lineage_id,
+                        frame.seq,
+                        self.recovery_generation.as_deref(),
+                    );
                     self.calls
                         .entry(key)
                         .or_insert_with(|| ProjectedDeferredCall {
+                            recovery_generation: self.recovery_generation.clone(),
                             run_id: self.last_run_id.clone(),
                             prepared_seq: frame.seq,
                             prepared_fence: frame.fence,
@@ -1025,6 +1515,71 @@ impl DeferredCallProjection {
                         call.late_result = Some(Arc::new(frame.record.clone()));
                     }
                 }
+                WalRecord::RecoveryCallClosed {
+                    run_id,
+                    call_key,
+                    tool_call_id,
+                    batch_id,
+                    step_id,
+                    ..
+                } => {
+                    let mut terminal = broca_wal::recovery::RecoveryCall {
+                        tool_call_id: tool_call_id.clone(),
+                        batch_id: batch_id.clone(),
+                        step_id: *step_id,
+                        call_keys: call_key.iter().cloned().collect(),
+                    };
+                    for run in &self.recovery_identities {
+                        if &run.run_id == run_id {
+                            for call in &run.calls {
+                                if call.terminal_matches(&terminal) {
+                                    terminal.call_keys.extend(call.call_keys.iter().cloned());
+                                }
+                            }
+                        }
+                    }
+                    terminal.call_keys.sort();
+                    terminal.call_keys.dedup();
+                    self.recovery_tombstones
+                        .insert((run_id.0.clone(), tool_call_id.0.clone()));
+                    self.recovery_call_keys.extend(call_key.iter().cloned());
+                    self.recovery_identities
+                        .push(broca_wal::recovery::RecoveryRun {
+                            run_id: run_id.clone(),
+                            calls: vec![terminal.clone()],
+                        });
+                    for call in self.calls.values_mut() {
+                        if call.run_id.as_ref() == Some(run_id)
+                            && deferred_effect_identity(&self.lineage_id, call)
+                                .is_some_and(|identity| identity.terminal_matches(&terminal))
+                        {
+                            call.state = OpenCallState::Terminated;
+                            call.late_result = Some(Arc::new(frame.record.clone()));
+                        }
+                    }
+                }
+                WalRecord::RecoveryCut { recovery } => {
+                    self.recovery_generation = Some(recovery.cut_id.clone());
+                    for run in &recovery.runs {
+                        self.recovery_identities.push(run.clone());
+                        self.recovery_tombstones.extend(
+                            run.calls
+                                .iter()
+                                .map(|call| (run.run_id.0.clone(), call.tool_call_id.0.clone())),
+                        );
+                        self.recovery_call_keys.extend(
+                            run.calls
+                                .iter()
+                                .flat_map(|call| call.call_keys.iter().cloned()),
+                        );
+                    }
+                    self.recovery_call_keys.extend(
+                        recovery
+                            .unowned_calls
+                            .iter()
+                            .flat_map(|call| call.call_keys.iter().cloned()),
+                    );
+                }
                 _ => {}
             }
             let open_runs: std::collections::BTreeSet<_> = self
@@ -1058,11 +1613,54 @@ impl DeferredCallProjection {
     }
 
     pub fn late_allowed(&self, call: &ProjectedDeferredCall) -> bool {
-        self.stopped_runs.as_ref().is_some_and(|stopped| {
-            call.run_id
-                .as_ref()
-                .is_some_and(|run| !stopped.contains(&run.0))
-        })
+        !self.recovery_tombstoned(call)
+            && self.stopped_runs.as_ref().is_some_and(|stopped| {
+                call.run_id
+                    .as_ref()
+                    .is_some_and(|run| !stopped.contains(&run.0))
+            })
+    }
+
+    pub(crate) fn effect_identity(
+        &self,
+        call: &ProjectedDeferredCall,
+    ) -> Option<broca_wal::recovery::RecoveryCall> {
+        deferred_effect_identity(&self.lineage_id, call)
+    }
+
+    pub fn recovery_tombstoned(&self, call: &ProjectedDeferredCall) -> bool {
+        let Some(run_id) = &call.run_id else {
+            return false;
+        };
+        let Some(identity) = self.effect_identity(call) else {
+            return false;
+        };
+        let call_id = &identity.tool_call_id;
+        let key = &identity.call_keys[0];
+        if self.recovery_call_keys.contains(key) {
+            return true;
+        }
+        let mut detailed = false;
+        for run in &self.recovery_identities {
+            if &run.run_id != run_id {
+                continue;
+            }
+            for recovered in &run.calls {
+                if recovered.tool_call_id != *call_id {
+                    continue;
+                }
+                detailed = true;
+                if !recovered.has_effect_identity() || recovered.matches_effect(&identity) {
+                    return true;
+                }
+            }
+        }
+        // Older materialized summaries can only refuse conservatively until a
+        // complete fold restores their batch/key evidence.
+        !detailed
+            && self
+                .recovery_tombstones
+                .contains(&(run_id.0.clone(), call_id.0.clone()))
     }
 
     fn anchor(&self, batch: &BatchId, id: &ToolCallId) -> Option<String> {
@@ -1126,6 +1724,9 @@ impl DeferredCallProjection {
                     Some(WalRecord::LateResult {
                         outcome, result, ..
                     }) => (Some(*outcome), Some(result.clone())),
+                    Some(WalRecord::RecoveryCallClosed { result, .. }) => {
+                        (Some(broca_wal::LateOutcome::Unknown), Some(result.clone()))
+                    }
                     _ if call.late_dispatch_intent.is_some() => {
                         (Some(broca_wal::LateOutcome::Unknown), None)
                     }
@@ -1174,7 +1775,7 @@ pub fn project_deferred_calls(
                     } => &withdrawal.call_key,
                     _ => return None,
                 };
-                Some(key.rsplit_once(':')?.0.to_owned())
+                Some(key.rsplit_once(':')?.0.split('~').next()?.to_owned())
             })
         })?;
     let origin = frames.first().is_some_and(|frame| frame.seq == 1)
@@ -1261,6 +1862,8 @@ fn tagged(mut message: Message, tags: Option<&broca_protocol::tags::MessageTags>
 
 /// State of the currently-open tool batch during the linear walk.
 struct OpenBatch {
+    started: bool,
+    recovered: HashSet<ToolCallId>,
     /// The model step whose tool calls this batch runs, from its `tool_batch_started`.
     step_id: StepId,
     planned: Vec<ToolCallId>,
@@ -1273,6 +1876,8 @@ struct OpenBatch {
 impl OpenBatch {
     fn new(step_id: StepId, planned: Vec<ToolCallId>) -> Self {
         Self {
+            started: true,
+            recovered: HashSet::new(),
             step_id,
             terminals: vec![None; planned.len()],
             prepared: vec![None; planned.len()],
@@ -1283,10 +1888,12 @@ impl OpenBatch {
     }
 
     /// Whether any record after the batch start says something about one of its calls: a
-    /// dispatch intent, a Prepared call, or a terminal. Replacing such a batch would forget
+    /// dispatch intent, a Prepared call, a recovery tombstone, or a terminal.
+    /// Replacing such a batch would forget
     /// that a call may have run, or already ran, and let a resume send it again.
     fn holds_call_evidence(&self) -> bool {
         !self.intents.is_empty()
+            || !self.recovered.is_empty()
             || self.terminals.iter().any(Option::is_some)
             || self.prepared.iter().any(Option::is_some)
     }
@@ -1338,11 +1945,12 @@ impl OpenBatch {
 
     fn has_intent(&self, position: usize) -> bool {
         let id = &self.planned[position];
-        self.intents.contains(id) && !self.planned[..position].contains(id)
+        (self.intents.contains(id) || self.recovered.contains(id))
+            && !self.planned[..position].contains(id)
     }
 
-    /// Calls whose outcome is ambiguous: an `Unknown` terminal, or an intent with
-    /// no terminal at all (the result was lost in the crash).
+    /// Calls whose outcome is ambiguous: an `Unknown` terminal, or an intent or
+    /// recovery tombstone with no terminal (the result may have been lost).
     fn indeterminate(&self) -> Vec<ToolCallId> {
         self.planned
             .iter()
@@ -1366,6 +1974,10 @@ impl OpenBatch {
     fn call_state(&self, position: usize) -> OpenCallState {
         if self.terminals[position].is_some() {
             OpenCallState::Terminated
+        } else if self.recovered.contains(&self.planned[position])
+            && !self.planned[..position].contains(&self.planned[position])
+        {
+            OpenCallState::Dispatched
         } else if self.has_intent(position) {
             if self.provider_held.contains_key(&self.planned[position]) {
                 OpenCallState::ProviderHeld
@@ -1475,6 +2087,7 @@ impl OpenBatch {
 /// (`RunStarted`) opens. Only the lineage-cumulative `prompt` lives outside this.
 #[derive(Default)]
 struct Episode {
+    recovery_interrupted: bool,
     attributable: bool,
     seeded_last_ordinal: Option<u64>,
     /// The index among the replayed records of the step record holding the open tool turn.
@@ -1511,6 +2124,7 @@ struct Episode {
     /// This episode's non-terminal pause (auth-required), if any. Carries the record's
     /// own run_id so the resolution is self-contained.
     paused: Option<(RunId, PauseReason, Option<ProviderError>)>,
+    account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     /// The trailing tool-turn (assistant w/ tool calls) + its batch, held until the
     /// batch completes (then committed to the prompt).
     open_assistant: Option<Arc<AssistantMessage>>,
@@ -1531,7 +2145,7 @@ struct Episode {
     /// Stop reason evaluated from the durable terminal assistant message and frozen policy.
     /// Kept only for natural-end recovery; other terminal classifications take precedence.
     natural_stop_reason: Option<RunFinishReason>,
-    /// Ambiguous calls (an `Unknown` terminal, or an intent with no terminal). Stays
+    /// Ambiguous calls (an `Unknown` terminal, or intent/recovery attribution without one). Stays
     /// set even after the batch commits, so it survives `batch_finished`.
     indeterminate: Vec<ToolCallId>,
     /// Set when a committed batch was a HARD-STOP repair (all synthetic stop terminals).
@@ -1668,6 +2282,15 @@ pub fn replay_projection_tail(
     seed: &ProjectionSeed,
     frames: &[FramedRecord],
 ) -> Result<ProjectionDelta, ReplayError> {
+    if !seed.admission_checkpoint.recovery_cuts.is_empty() {
+        return Err(ReplayError::CorruptLineage {
+            episode_run_id: seed
+                .last_run_id
+                .clone()
+                .unwrap_or_else(|| RunId(String::new())),
+            reason: "recovery tombstones require complete WAL replay".into(),
+        });
+    }
     let seeded_episode = seed.admission_checkpoint.last_episode.as_ref();
     let seeded_budget = seeded_episode.and_then(|episode| episode.config.budget.clone());
     let seeded_budget_state =
@@ -2538,6 +3161,7 @@ fn replay_seeded_with_compaction<'a>(
         pending_steers: held_steers,
         ..Episode::default()
     };
+    let mut recovered_calls: Vec<broca_wal::recovery::RecoveryRun> = Vec::new();
     let mut episode_step_spans: Vec<std::ops::Range<usize>> = Vec::new();
     let mut render_episodes = Vec::new();
     let mut committed_tool_turns: Vec<(usize, usize)> = Vec::new();
@@ -2757,6 +3381,7 @@ fn replay_seeded_with_compaction<'a>(
                     });
                     prompt.push(tagged(
                         Message {
+                            turn_system: false,
                             cache_prefix_blocks: None,
                             role: Role::Assistant,
                             content: assistant_message
@@ -2817,6 +3442,7 @@ fn replay_seeded_with_compaction<'a>(
                     ep.first_step_message.get_or_insert(prompt.len());
                     prompt.push(tagged(
                         Message {
+                            turn_system: false,
                             cache_prefix_blocks: None,
                             role: Role::Assistant,
                             content: assistant_message.content.clone(),
@@ -2848,6 +3474,66 @@ fn replay_seeded_with_compaction<'a>(
                     });
                 }
             }
+            WalRecord::RecoveryCut { recovery } => {
+                if recovery.active_run.is_some()
+                    && recovery.active_run == run_id
+                    && ep.finished.is_none()
+                {
+                    ep.recovery_interrupted = true;
+                }
+                for recovered in &recovery.runs {
+                    recovered_calls.push(recovered.clone());
+                    if Some(&recovered.run_id) != run_id.as_ref() {
+                        continue;
+                    }
+                    for call in &recovered.calls {
+                        if !ep.indeterminate.contains(&call.tool_call_id) {
+                            ep.indeterminate.push(call.tool_call_id.clone());
+                        }
+                    }
+                    if ep.open_batch.is_none() {
+                        if let Some(assistant) = &ep.open_assistant {
+                            let step = ep.open_step.unwrap_or(StepId(0));
+                            ep.open_batch = Some(OpenBatch::new(
+                                step,
+                                assistant
+                                    .tool_calls()
+                                    .map(|c| c.tool_call_id.clone())
+                                    .collect(),
+                            ));
+                            ep.open_batch.as_mut().expect("just created").started = false;
+                            ep.open_batch_id =
+                                Some(BatchId(format!("{}-b{}", recovered.run_id.0, step.0)));
+                        }
+                    }
+                    if let Some(batch) = &mut ep.open_batch {
+                        for call in &recovered.calls {
+                            batch.recovered.insert(call.tool_call_id.clone());
+                        }
+                    }
+                }
+            }
+            WalRecord::RecoveryCallClosed {
+                run_id: owner,
+                batch_id,
+                step_id,
+                call_key,
+                tool_call_id,
+                ..
+            } => {
+                recovered_calls.push(broca_wal::recovery::RecoveryRun {
+                    run_id: owner.clone(),
+                    calls: vec![broca_wal::recovery::RecoveryCall {
+                        tool_call_id: tool_call_id.clone(),
+                        step_id: *step_id,
+                        batch_id: batch_id.clone(),
+                        call_keys: call_key.iter().cloned().collect(),
+                    }],
+                });
+                if run_id.as_ref() == Some(owner) && !ep.indeterminate.contains(tool_call_id) {
+                    ep.indeterminate.push(tool_call_id.clone());
+                }
+            }
             WalRecord::ToolBatchStarted {
                 batch_id,
                 step_id,
@@ -2856,14 +3542,37 @@ fn replay_seeded_with_compaction<'a>(
                 // Every writer starts a batch at most once (a resume reuses the started batch).
                 // A second start over an uncommitted batch that already holds call evidence
                 // would erase it, so the lineage is refused instead of replayed.
+                let inferred = ep.open_batch.as_ref().filter(|batch| {
+                    !batch.started
+                        && ep.open_batch_id.as_ref() == Some(batch_id)
+                        && batch.step_id == *step_id
+                        && batch.planned == *planned_calls
+                        && !batch.terminals.iter().any(Option::is_some)
+                });
                 if ep
                     .open_batch
                     .as_ref()
-                    .is_some_and(OpenBatch::holds_call_evidence)
+                    .is_some_and(|batch| batch.holds_call_evidence() && inferred.is_none())
                 {
                     return Err(overlapping_batch_error(run_id.as_ref()));
                 }
-                ep.open_batch = Some(OpenBatch::new(*step_id, planned_calls.clone()));
+                let mut batch = OpenBatch::new(*step_id, planned_calls.clone());
+                if let Some(inferred) = inferred {
+                    batch.recovered.extend(inferred.recovered.iter().cloned());
+                }
+                for recovered in &recovered_calls {
+                    if Some(&recovered.run_id) == run_id.as_ref() {
+                        for call in &recovered.calls {
+                            let recovered_batch = call.batch_id.clone().unwrap_or_else(|| {
+                                BatchId(format!("{}-recovery", recovered.run_id.0))
+                            });
+                            if &recovered_batch == batch_id {
+                                batch.recovered.insert(call.tool_call_id.clone());
+                            }
+                        }
+                    }
+                }
+                ep.open_batch = Some(batch);
                 ep.open_batch_id = Some(batch_id.clone());
             }
             WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
@@ -3160,6 +3869,7 @@ fn replay_seeded_with_compaction<'a>(
                 // paused-for-auth run writes RunPaused then RunFinished{Interrupted}) —
                 // last-writer-wins, so the run is terminal, not still paused.
                 ep.paused = None;
+                ep.account_limit_pause = None;
             }
             // A non-terminal pause (auth-required) — distinct from a terminal
             // RunFinished. Clears any earlier finished in this episode (last-writer-wins),
@@ -3168,9 +3878,11 @@ fn replay_seeded_with_compaction<'a>(
                 run_id: rid,
                 reason,
                 error,
+                account_limit,
                 ..
             } => {
                 ep.paused = Some((rid.clone(), *reason, error.clone()));
+                ep.account_limit_pause = account_limit.clone();
                 ep.finished = None;
             }
             WalRecord::RunConfigRefrozen {
@@ -3221,6 +3933,7 @@ fn replay_seeded_with_compaction<'a>(
             // attempted, even when the call failed before ModelStepFinished became durable.
             WalRecord::StepStarted { .. } => {
                 ep.paused = None;
+                ep.account_limit_pause = None;
                 ep.provider_call_started = true;
                 // Pending steers are rendered by this step, after everything before it.
                 ep.place_steers(&mut prompt, &actions);
@@ -3337,6 +4050,39 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::SessionRefreshAccepted { .. }
             | WalRecord::SessionRefreshPolicyChanged { .. }
             | WalRecord::SessionPrefixFlushed { .. } => {}
+        }
+        // A model-facing ID may be reused by another run. Only the owning run's
+        // recovered call can turn NotSent into an unknown dispatch here.
+        if matches!(
+            rec,
+            WalRecord::ModelStepFinished { .. } | WalRecord::ToolBatchStarted { .. }
+        ) {
+            if let (Some(assistant), Some(current_run)) = (&ep.open_assistant, &run_id) {
+                let planned: Vec<_> = assistant
+                    .tool_calls()
+                    .map(|call| call.tool_call_id.clone())
+                    .collect();
+                let recovered: Vec<_> = planned
+                    .iter()
+                    .filter(|id| {
+                        recovered_calls
+                            .iter()
+                            .filter(|run| &run.run_id == current_run)
+                            .flat_map(|run| &run.calls)
+                            .any(|call| &call.tool_call_id == *id)
+                    })
+                    .cloned()
+                    .collect();
+                if !recovered.is_empty() {
+                    let step = ep.open_step.unwrap_or(StepId(0));
+                    let batch = ep
+                        .open_batch
+                        .get_or_insert_with(|| OpenBatch::new(step, planned));
+                    batch.recovered.extend(recovered);
+                    ep.open_batch_id
+                        .get_or_insert_with(|| BatchId(format!("{}-b{}", current_run.0, step.0)));
+                }
+            }
         }
         // Placement is the authority for transcript positions, including a seeded prefix and
         // steers held until a boundary. Assign its ordinals as each record places its messages.
@@ -3461,6 +4207,7 @@ fn replay_seeded_with_compaction<'a>(
     let last_step_finish_reason = ep.last_step_finish_reason;
     let open_tool_batch = match (&ep.open_batch, &ep.open_batch_id) {
         (Some(batch), Some(batch_id)) => Some(OpenToolBatch {
+            needs_start: !batch.started,
             batch_id: batch_id.clone(),
             step_id: batch.step_id,
             calls: batch
@@ -3488,6 +4235,7 @@ fn replay_seeded_with_compaction<'a>(
             .map(|(assistant, step_record)| {
                 let mut message = tagged(
                     Message {
+                        turn_system: false,
                         cache_prefix_blocks: None,
                         role: Role::Assistant,
                         content: assistant.content.clone(),
@@ -3529,6 +4277,7 @@ fn replay_seeded_with_compaction<'a>(
         }
     }
     let refused_steps = std::mem::take(&mut ep.refused_steps);
+    let account_limit_pause = ep.account_limit_pause.clone();
     let mut resolution = classify(ep, run_id.as_ref(), cancel_at.is_some());
     if input_budget.exhausted().is_some() {
         match &mut resolution {
@@ -3562,6 +4311,8 @@ fn replay_seeded_with_compaction<'a>(
             .as_ref()
             .is_some_and(|config| config.render_tags && config.computed_tags.is_some());
     Ok(ReplayState {
+        account_limit_pause,
+        recovered_calls,
         extent: placement.next_ordinal(),
         tags_await_setup,
         input_budget,
@@ -3633,6 +4384,9 @@ pub struct RunUsageProjection {
     active: bool,
     model: Option<(broca_protocol::request::ModelHandle, Option<String>)>,
     final_attempt: Option<generation::AttemptTiming>,
+    tier_usage: cortexkit_role_llm_runner::service_tier::RunServiceTierUsage,
+    tier_reported: bool,
+    final_tier_report: Option<String>,
     pub usage: broca_protocol::usage::RunUsage,
 }
 
@@ -3643,6 +4397,9 @@ impl RunUsageProjection {
             active: false,
             model: None,
             final_attempt: None,
+            tier_usage: Default::default(),
+            tier_reported: false,
+            final_tier_report: None,
             usage: Default::default(),
         }
     }
@@ -3657,14 +4414,38 @@ impl RunUsageProjection {
                 self.active = run_id == &self.run_id;
                 if self.active {
                     self.model = Some((config.model.clone(), config.variant.clone()));
+                    if broca_protocol::service_tier_enabled() {
+                        let level =
+                            broca_protocol::frozen_service_tier(&config.frozen_render_config);
+                        self.usage.service_tier_applied =
+                            (level != "standard").then(|| level.to_owned());
+                        self.tier_reported = matches!(
+                            config
+                                .frozen_render_config
+                                .get("family_id")
+                                .and_then(serde_json::Value::as_str),
+                            Some(
+                                "openai_chat"
+                                    | "openai_responses"
+                                    | "openai_responses_chatgpt"
+                                    | "anthropic_messages"
+                                    | "gemini"
+                            )
+                        );
+                    }
                 }
                 self.final_attempt = None;
+                self.final_tier_report = None;
             }
-            WalRecord::StepStarted { .. } if self.active => self.final_attempt = None,
+            WalRecord::StepStarted { .. } if self.active => {
+                self.final_attempt = None;
+                self.final_tier_report = None;
+            }
             WalRecord::ModelAttemptFinished {
                 step_id,
                 sent_at_ms,
                 content_progress,
+                envelope,
                 ..
             } if self.active => {
                 // Replace even an unmeasured attempt: a retry's timing never belongs to
@@ -3675,10 +4456,52 @@ impl RunUsageProjection {
                     first: content_progress.first_content_at_ms,
                     last: content_progress.last_content_at_ms,
                 });
+                self.final_tier_report =
+                    if broca_protocol::service_tier_enabled() && self.tier_reported {
+                        envelope
+                            .as_ref()
+                            .and_then(|envelope| {
+                                envelope
+                                    .speed_used
+                                    .as_deref()
+                                    .or(envelope.service_tier_used.as_deref())
+                            })
+                            .map(abstract_served_tier)
+                    } else {
+                        None
+                    };
             }
             WalRecord::ModelStepFinished { .. } | WalRecord::ModelStepRefused { .. }
                 if self.active =>
             {
+                if broca_protocol::service_tier_enabled() {
+                    let mut step =
+                        cortexkit_role_llm_runner::service_tier::ServiceTierUsage::default();
+                    step.service_tier_applied
+                        .clone_from(&self.usage.service_tier_applied);
+                    if self.tier_reported {
+                        if let WalRecord::ModelStepFinished {
+                            service_tier_used,
+                            speed_used,
+                            ..
+                        } = record
+                        {
+                            step.service_tier_served = speed_used
+                                .as_deref()
+                                .or(service_tier_used.as_deref())
+                                .map(abstract_served_tier);
+                        } else if matches!(record, WalRecord::ModelStepRefused { .. }) {
+                            // Refused source calls are billed too; only a recorded envelope can
+                            // supply their report because legacy refusal records have no tier.
+                            step.service_tier_served = self.final_tier_report.take();
+                        }
+                    }
+                    self.tier_usage
+                        .record_step(&step)
+                        .expect("applied tier is a known non-standard level or absent");
+                    self.usage.service_tier_served = self.tier_usage.usage().service_tier_served;
+                }
+                self.final_tier_report = None;
                 // A refused call was billed, so it counts as a call of the model that refused.
                 if let Some((model, variant)) = &self.model {
                     let variant = variant.as_deref().filter(|value| !value.is_empty());
@@ -3704,6 +4527,16 @@ impl RunUsageProjection {
     }
 }
 
+fn abstract_served_tier(tier: &str) -> String {
+    match tier {
+        "default" | "standard_only" | "STANDARD" | "DEFAULT" => "standard",
+        "priority" | "PRIORITY" | "FAST" => "fast",
+        "ULTRAFAST" => "ultrafast",
+        other => other,
+    }
+    .to_owned()
+}
+
 mod generation;
 
 pub(crate) fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::usage::StepUsage {
@@ -3721,6 +4554,7 @@ pub(crate) fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::u
 /// Not `Eq`: `ProviderError` carries an `f64` retry hint.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReconciledRunState {
+    pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     pub budget_detail: Option<broca_protocol::BudgetExhaustedDetail>,
     pub context_ceiling: Option<broca_protocol::ContextCeilingDetail>,
     pub ceiling_deadline_ms: Option<u64>,
@@ -3758,6 +4592,30 @@ pub struct ReconciledRunState {
     /// The caller's title recorded for this run: its `RunStarted`'s, or, for a queued send that
     /// never started, its `Queued` record's. `None` when the send carried none.
     pub title: Option<String>,
+}
+
+fn interrupted_recovery_state() -> ReconciledRunState {
+    ReconciledRunState {
+        budget_detail: None,
+        context_ceiling: None,
+        ceiling_deadline_ms: None,
+        ride_wait_deadline_ms: None,
+        structured_output: None,
+        live_step: None,
+        held_calls: Vec::new(),
+        state: crate::RunIndexState::Interrupted,
+        undelivered_steers: None,
+        final_step_finish_reason: None,
+        indeterminate_tool_calls: None,
+        usage: None,
+        run_usage: Default::default(),
+        retries_used: 0,
+        error: None,
+        pause_reason: None,
+        account_limit_pause: None,
+        auth_selection: None,
+        title: None,
+    }
 }
 
 /// Walk the WAL to resolve a run and retain terminal metadata that the durable index omits.
@@ -3826,6 +4684,7 @@ pub fn reconcile_run_state<'a>(
                 if rid.0 == run_id {
                     // Seen this run start; default to Active until a terminal/pause appears.
                     found = Some(ReconciledRunState {
+                        account_limit_pause: None,
                         budget_detail: None,
                         context_ceiling: None,
                         ceiling_deadline_ms: None,
@@ -3905,6 +4764,49 @@ pub fn reconcile_run_state<'a>(
             WalRecord::ModelStepRefused { .. } => {
                 total_usage.accumulate(&crate::refusal_fallback::total_step_usage(rec).unwrap());
             }
+            WalRecord::RecoveryCut { recovery } => {
+                let calls: Vec<_> = recovery
+                    .runs
+                    .iter()
+                    .filter(|run| run.run_id.0 == run_id)
+                    .flat_map(|run| run.calls.iter().map(|call| call.tool_call_id.clone()))
+                    .collect();
+                if recovery.runs.iter().any(|run| run.run_id.0 == run_id)
+                    || (recovery
+                        .active_run
+                        .as_ref()
+                        .is_some_and(|run| run.0 == run_id))
+                {
+                    for call in &calls {
+                        indeterminate_tool_calls.record_dispatch_terminal(call, true);
+                    }
+                    let state = found.get_or_insert_with(interrupted_recovery_state);
+                    if matches!(state.state, RunIndexState::Active | RunIndexState::Paused) {
+                        state.state = RunIndexState::Interrupted;
+                    }
+                    let known = state.indeterminate_tool_calls.get_or_insert_with(Vec::new);
+                    for call in calls {
+                        if !known.contains(&call) {
+                            known.push(call);
+                        }
+                    }
+                }
+            }
+            WalRecord::RecoveryCallClosed {
+                run_id: owner,
+                tool_call_id,
+                ..
+            } if owner.0 == run_id => {
+                indeterminate_tool_calls.record_dispatch_terminal(tool_call_id, true);
+                let state = found.get_or_insert_with(interrupted_recovery_state);
+                if matches!(state.state, RunIndexState::Active | RunIndexState::Paused) {
+                    state.state = RunIndexState::Interrupted;
+                }
+                let known = state.indeterminate_tool_calls.get_or_insert_with(Vec::new);
+                if !known.contains(tool_call_id) {
+                    known.push(tool_call_id.clone());
+                }
+            }
             WalRecord::ToolBatchStarted { .. } => indeterminate_tool_calls.reset_batch(),
             WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
                 indeterminate_tool_calls.record_dispatch_intent(tool_call_id);
@@ -3964,6 +4866,7 @@ pub fn reconcile_run_state<'a>(
                         })
                     });
                     found = Some(ReconciledRunState {
+                        account_limit_pause: None,
                         budget_detail: budget_detail.clone(),
                         context_ceiling: context_ceiling.clone(),
                         ceiling_deadline_ms: None,
@@ -3990,9 +4893,11 @@ pub fn reconcile_run_state<'a>(
                 run_id: rid,
                 reason,
                 error,
+                account_limit,
                 ..
             } if rid.0 == run_id => {
                 found = Some(ReconciledRunState {
+                    account_limit_pause: account_limit.clone(),
                     budget_detail: None,
                     context_ceiling: None,
                     ceiling_deadline_ms: None,
@@ -4025,6 +4930,7 @@ pub fn reconcile_run_state<'a>(
                 ..
             } if failure.run_id.0 == run_id => {
                 found = Some(ReconciledRunState {
+                    account_limit_pause: None,
                     budget_detail: None,
                     context_ceiling: None,
                     ceiling_deadline_ms: None,
@@ -4050,6 +4956,7 @@ pub fn reconcile_run_state<'a>(
     }
     if active_run.as_deref() == Some(run_id) && active_zero_step_seed {
         return Some(ReconciledRunState {
+            account_limit_pause: None,
             budget_detail: None,
             context_ceiling: None,
             ceiling_deadline_ms: None,
@@ -4090,6 +4997,11 @@ pub fn reconcile_run_state<'a>(
 /// pauses only at a step-entry boundary after the previous batch finished, but replay enforces this
 /// fail-closed rule as defense in depth.
 fn classify(ep: Episode, run_id: Option<&RunId>, cancelling: bool) -> ReplayResolution {
+    if ep.recovery_interrupted && ep.finished.is_none() {
+        return ReplayResolution::Interrupted {
+            indeterminate: ep.indeterminate,
+        };
+    }
     let closing = ep.open_batch.as_ref().is_some_and(|batch| {
         batch.provider_held.keys().any(|id| {
             batch
@@ -4295,6 +5207,7 @@ fn commit_tool_turn(
 ) {
     prompt.push(tagged(
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::Assistant,
             content: assistant.content.clone(),
@@ -4311,6 +5224,7 @@ fn commit_tool_turn(
         .filter_map(|(position, _)| batch.result_for(position).map(ContentBlock::ToolResult))
         .collect();
     prompt.push(Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::Tool,
         content,
@@ -4323,6 +5237,10 @@ fn commit_tool_turn(
 
 #[cfg(test)]
 mod steer_tests;
+
+#[cfg(test)]
+#[path = "replay/account_limit_pause_tests.rs"]
+mod account_limit_pause_tests;
 
 #[cfg(test)]
 pub(crate) mod projection_boundary_tests {
@@ -4527,6 +5445,7 @@ pub(crate) mod projection_boundary_tests {
         }
         for reason in [PauseReason::Restart, PauseReason::AuthRequired] {
             let pause = WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("first".into()),
                 ts_ms: None,
                 reason,
@@ -4569,6 +5488,7 @@ pub(crate) mod projection_boundary_tests {
                 run_id: RunId(run_id.into()),
                 session: BindIdentity::new("/tmp/project", "runner", "session"),
                 config: Box::new(RunConfig {
+                    account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,
                     computed_tags: None,
@@ -4642,6 +5562,7 @@ pub(crate) mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                recovery_cuts: Vec::new(),
                 has_model_attempt: None,
                 media: None,
                 head: None,
@@ -4657,6 +5578,7 @@ pub(crate) mod projection_boundary_tests {
                 ownership: Some(crate::SessionOwnershipV1::default()),
                 at_seq: 8,
                 last_episode: Some(crate::LastEpisodeV1 {
+                    account_limit_pause: None,
                     cancel_at: None,
                     on_restart: None,
                     pause_reason: None,
@@ -5023,6 +5945,7 @@ pub(crate) mod projection_boundary_tests {
             framed(
                 5,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r1".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -5248,6 +6171,7 @@ pub(crate) mod deferred_tests {
             approval("approved", "key-approved", DeferredDecision::Approved),
             terminal("done", None),
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r".into()),
                 ts_ms: Some(1),
                 reason: PauseReason::Restart,
@@ -5484,6 +6408,7 @@ pub(crate) mod provider_held_tests {
         }
         records.push(second);
         records.push(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r".into()),
             reason: PauseReason::ToolHeld,
             error: None,
@@ -5555,6 +6480,7 @@ pub(crate) mod provider_held_tests {
         for reason in [PauseReason::ToolHeld, PauseReason::Restart] {
             let mut paused = records.clone();
             paused.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r".into()),
                 reason,
                 error: None,
@@ -5663,6 +6589,7 @@ pub(crate) mod provider_held_tests {
         let mut delayed = prefix(false);
         delayed.push(terminal("b", DispatchOutcome::Completed));
         delayed.push(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r".into()),
             reason: PauseReason::ToolHeld,
             error: None,
@@ -5895,6 +6822,7 @@ mod offset_tail_tests {
 
     fn run_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

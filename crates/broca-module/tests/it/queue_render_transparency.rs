@@ -59,6 +59,7 @@ fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("anthropic", "claude-opus-4-8"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -368,6 +369,7 @@ fn text(run: &str, msg: &str, session: &BindIdentity) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("anthropic", "claude-opus-4-8"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -652,6 +654,7 @@ async fn drained_run_renders_identical_bytes_to_idle_send() {
 
 fn recovered_stop_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,

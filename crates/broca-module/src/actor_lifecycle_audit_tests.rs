@@ -238,6 +238,7 @@ impl Fixture {
         .unwrap();
         let end = if seed == Seed::RestartPaused {
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("prior".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::Restart,

@@ -355,6 +355,10 @@ pub enum SendOutcome {
     RetentionInvalid(crate::retention::InvalidRetention),
     SessionClassInvalid(String),
     InputTokenBudgetInvalid(String),
+    ServiceTierInvalid {
+        reason: &'static str,
+        message: String,
+    },
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     /// The send's `structured_output` was refused before anything was written; `field` is the
     /// offending member path the role contract names.
@@ -660,6 +664,7 @@ pub(crate) fn indexed_run_state(
     let use_index_metadata = row.usage.is_some() && row.state != RunIndexState::Interrupted;
     let use_wal_error = !use_index_metadata || row.state == RunIndexState::Error;
     Ok(Some(ReconciledRunState {
+        account_limit_pause: None,
         context_ceiling: reconciled
             .as_ref()
             .and_then(|state| state.context_ceiling.clone()),
@@ -3913,6 +3918,52 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
 
+        if broca_protocol::service_tier_enabled() && !resume_indexed_run {
+            let checkpoint = match self.load_checkpoint_at_head().await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return SendOutcome::Transient(error),
+            };
+            let running = match &self.state {
+                RunState::Active { run_id, .. } => self.durable_finish_of_active(run_id).is_none(),
+                RunState::Idle => checkpoint
+                    .last_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.disposition == EpisodeDisposition::Paused),
+            };
+            if running {
+                if let Some(episode) = &checkpoint.last_episode {
+                    let fixed =
+                        broca_protocol::frozen_service_tier(&episode.config.frozen_render_config);
+                    if request
+                        .service_tier_level
+                        .as_deref()
+                        .is_some_and(|requested| requested != fixed)
+                    {
+                        return SendOutcome::ServiceTierInvalid {
+                            reason: "run_tier_fixed",
+                            message: format!(
+                                "service_tier is fixed at {fixed:?} for run {}",
+                                episode.run_id.0
+                            ),
+                        };
+                    }
+                    request.service_tier_level = (fixed != "standard"
+                        || request.service_tier_level.is_some())
+                    .then(|| fixed.to_owned());
+                }
+            }
+            let mut effective = request.clone();
+            if let Some(episode) = &checkpoint.last_episode {
+                inherit_frozen_parameters(&mut effective, &episode.config);
+            }
+            if let Err(message) = self.executor.check_service_tier(&effective) {
+                return SendOutcome::ServiceTierInvalid {
+                    reason: "unsupported_tier",
+                    message,
+                };
+            }
+        }
+
         // A send that left its model to the session is checked against the plan's model-bearing
         // items here, with the model it inherits: the latest episode's frozen model, which
         // `record_frozen_model` and run start also take. It runs after the same-key receipts
@@ -5614,6 +5665,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // The title is deliberately not compared: it labels the send without being part of
             // its identity, so a retry carrying another title is answered `Pending` and the
             // queued record keeps the title it was written with.
+            if broca_protocol::service_tier_enabled()
+                && request.service_tier_level.is_none()
+                && request_identity_digest.is_some()
+                && existing.request_identity_digest == request_identity_digest
+            {
+                // Admission may have frozen an inherited tier into the queue. An identical
+                // caller retry still omits it; compare with that original caller identity before
+                // restoring the queue's frozen level, so explicit standard never inherits fast.
+                request
+                    .service_tier_level
+                    .clone_from(&existing.request.service_tier_level);
+            }
             return match submission_difference(&existing.request, &request) {
                 None => SendOutcome::Pending { submission_id },
                 Some(differing) => SendOutcome::SendIdReuse { differing },
@@ -7417,6 +7480,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                             .unwrap_or_default()
                     };
                 return Ok(Some(ReconciledRunState {
+                    account_limit_pause: None,
                     run_usage,
                     held_calls,
                     budget_detail: None,
@@ -8350,6 +8414,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if !already_paused {
             writer
                 .record(WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: run_id.clone(),
                     reason: broca_protocol::PauseReason::ToolHeld,
                     error: None,
@@ -8582,29 +8647,52 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // both the shutdown seal's five-second limit and the global exit deadline remain
         // enforceable.
         let lineage = writer.lineage_id();
-        let (prior, attempts_already_recorded, projection, closing, held_replies) =
-            spawn_blocking(JobKind::WalRead, move || {
-                let frames = wal_store
-                    .read_records_range(&key, 0, Some(head), None)
-                    .map_err(|e| e.to_string())?;
-                let frames = crate::approval::complete_frames(frames, head)?;
-                let projection = crate::approval::projection_from_frames(lineage, &frames)?;
-                let records: Vec<_> = frames.into_iter().map(|frame| frame.record).collect();
-                let recorded =
-                    sealed_step.map(|step| attempts_recorded_for_latest_step(&records, step));
-                broca_core::replay(&records)
-                    .map(|prior| {
-                        let closing = broca_core::resume::provider_held_closing_reason(
-                            &prior,
-                            records.iter(),
-                        );
-                        let held_replies = broca_core::resume::closing_held_replies(records.iter());
-                        (prior, recorded, projection, closing, held_replies)
-                    })
-                    .map_err(|e| e.to_string())
-            })
-            .await
-            .map_err(|e| e.to_string())??;
+        let overhaul = writer.is_overhaul();
+        let (
+            prior,
+            attempts_already_recorded,
+            projection,
+            closing,
+            held_replies,
+            resumed_in_tenure,
+        ) = spawn_blocking(JobKind::WalRead, move || {
+            let frames = wal_store
+                .read_records_range(&key, 0, Some(head), None)
+                .map_err(|e| e.to_string())?;
+            let frames = crate::approval::complete_frames(frames, head)?;
+            let projection = crate::approval::projection_from_frames(lineage, &frames)?;
+            let records: Vec<_> = frames.into_iter().map(|frame| frame.record).collect();
+            // The opener may already record ResumeStarted after WriterOpened
+            // while completing recovery, before the log reaches the actor.
+            let resumed_in_tenure = overhaul
+                && records
+                    .iter()
+                    .rposition(|record| matches!(record, WalRecord::WriterOpened { .. }))
+                    .is_some_and(|opened| {
+                        records[opened + 1..]
+                            .iter()
+                            .any(|record| matches!(record, WalRecord::ResumeStarted { .. }))
+                    });
+            let recorded =
+                sealed_step.map(|step| attempts_recorded_for_latest_step(&records, step));
+            broca_core::replay(&records)
+                .map(|prior| {
+                    let closing =
+                        broca_core::resume::provider_held_closing_reason(&prior, records.iter());
+                    let held_replies = broca_core::resume::closing_held_replies(records.iter());
+                    (
+                        prior,
+                        recorded,
+                        projection,
+                        closing,
+                        held_replies,
+                        resumed_in_tenure,
+                    )
+                })
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         if prior.run_id.is_none() || prior.run_finished_durable {
             return Ok(false);
         }
@@ -8682,7 +8770,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             broca_core::close_out_open_batch(&prior, deferred_close)
         };
         let resuming = cause == SealCause::CrashOrphan;
-        if resuming {
+        if resuming && !resumed_in_tenure {
             writer.record(broca_core::resume_started_record(&prior, head, Vec::new()));
         }
         if !held_replies.is_empty() {
@@ -9913,6 +10001,7 @@ mod tests {
             },
         ];
         records.push(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("held".into()),
             reason: broca_protocol::PauseReason::ToolHeld,
             error: None,
@@ -10076,6 +10165,7 @@ mod tests {
                 },
             ];
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 reason: broca_protocol::PauseReason::ToolHeld,
                 error: None,
@@ -10236,6 +10326,7 @@ mod tests {
             }
             let boundary_cut = records.len();
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::AuthRequired,
@@ -10389,6 +10480,7 @@ mod tests {
             // A paused provider-held batch may commit its closing turn before the run's
             // final terminal. A seed at that crash cut already contains the pause.
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::ToolHeld,
@@ -10421,6 +10513,7 @@ mod tests {
         let cut = records.len();
         if !empty_tail {
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::AuthRequired,
@@ -10539,6 +10632,8 @@ mod tests {
         wal: Box<dyn broca_wal::Wal + Send>,
         witness: Arc<std::sync::Mutex<broca_wal::file_wal::DurablePublication>>,
         reader: Arc<dyn broca_core::context::AdmissionReader>,
+        // Fields are dropped in order; remove the directory only after closing its files.
+        _scratch: DatabaseAdmissionScratch,
     }
 
     impl DatabaseAdmissionFixture {
@@ -10553,11 +10648,13 @@ mod tests {
             std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
             let key = BindIdentity::new("/offset-admission", "h", "database");
             let mut wal: Box<dyn broca_wal::Wal + Send> = Box::new(
-                broca_wal::FileWal::open(root.join("wal/log"))
-                    .unwrap()
-                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                    .unwrap()
-                    .with_feature_floor(root.join("wal-floor")),
+                broca_wal::FileWal::open_with_recovery(
+                    root.join("wal/log"),
+                    broca_wal::WalConfig::OVERHAUL,
+                    root.join("wal-floor"),
+                )
+                .unwrap()
+                .with_feature_floor(root.join("wal-floor")),
             );
             for record in records {
                 wal.append(1, record, true).unwrap();
@@ -10574,6 +10671,7 @@ mod tests {
             let source = witness.clone();
             let reader = db.admission_reader(move |_| Ok(source.lock().unwrap().clone()));
             Self {
+                _scratch: DatabaseAdmissionScratch(root.clone()),
                 root,
                 key,
                 db,
@@ -10621,10 +10719,19 @@ mod tests {
         }
     }
 
-    impl Drop for DatabaseAdmissionFixture {
+    struct DatabaseAdmissionScratch(std::path::PathBuf);
+    impl Drop for DatabaseAdmissionScratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn database_admission_fixture_cleanup_closes_database_and_wal() {
+        let fixture = DatabaseAdmissionFixture::new(&database_paused_records(false, 0, false));
+        let root = fixture.root.clone();
+        drop(fixture);
+        assert!(!root.exists(), "fixture left its scratch directory behind");
     }
 
     fn database_paused_records(
@@ -10682,6 +10789,7 @@ mod tests {
             })
             .unwrap();
         records.push(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("held".into()),
             ts_ms: None,
             reason: broca_protocol::PauseReason::AuthRequired,
@@ -11457,7 +11565,7 @@ mod tests {
                 let key = BindIdentity::new(root.join("project"), "broca", "held-cancel");
                 let store = Arc::new(FileWalStore::new(root.join("wal")));
                 let mut records = held_close_seed(&key, true);
-                records.push(WalRecord::RunPaused { run_id: RunId("held".into()), reason: broca_protocol::PauseReason::ToolHeld, error: None, ts_ms: Some(43) });
+                records.push(WalRecord::RunPaused { account_limit: None, run_id: RunId("held".into()), reason: broca_protocol::PauseReason::ToolHeld, error: None, ts_ms: Some(43) });
                 seed_held_wal(&store, &key, &records);
                 let executor = Arc::new(HeldCancelCoreExecutor {
                     wal_store: store.clone(), provider: broca_core::StubProvider::new(vec![]), plane: StubToolPlane::new(),
@@ -11594,6 +11702,7 @@ mod tests {
                 sequential: false,
             },
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 reason: broca_protocol::PauseReason::ToolHeld,
                 error: None,
@@ -11954,6 +12063,7 @@ mod tests {
                         let mut records = held_close_seed(&key, sequential);
                         if paused {
                             records.push(WalRecord::RunPaused {
+                                account_limit: None,
                                 run_id: RunId("held".into()),
                                 reason: broca_protocol::PauseReason::ToolHeld,
                                 error: None,
@@ -12078,6 +12188,7 @@ mod tests {
 
     pub(super) fn min_config() -> broca_wal::RunConfig {
         broca_wal::RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -12183,6 +12294,7 @@ mod tests {
             session: key.clone(),
             model: broca_protocol::request::ModelHandle::new("fake", "fake"),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,

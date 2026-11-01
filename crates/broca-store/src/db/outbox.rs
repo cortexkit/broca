@@ -876,11 +876,13 @@ mod tests {
         }
     }
     fn writer(root: &Root) -> broca_wal::FileWal {
-        broca_wal::FileWal::open(root.0.join("session.wal"))
-            .unwrap()
-            .with_feature_floor(root.0.join("wal-floor"))
-            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-            .unwrap()
+        broca_wal::FileWal::open_with_recovery(
+            root.0.join("session.wal"),
+            broca_wal::WalConfig::OVERHAUL,
+            root.0.join("wal-floor"),
+        )
+        .unwrap()
+        .with_feature_floor(root.0.join("wal-floor"))
     }
     fn corpus(lineage: &str) -> Vec<WalRecord> {
         use broca_core::compaction_provider::{

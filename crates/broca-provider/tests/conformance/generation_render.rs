@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 fn base_request() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -33,6 +34,7 @@ fn base_request() -> CallOptions {
             }],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

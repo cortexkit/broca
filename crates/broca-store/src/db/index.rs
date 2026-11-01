@@ -707,6 +707,7 @@ mod tests {
             })
             .unwrap();
         let paused = WalRecord::RunPaused {
+            account_limit: None,
             run_id: id.clone(),
             ts_ms: Some(200),
             reason: broca_protocol::PauseReason::AuthRequired,
@@ -3307,6 +3308,7 @@ mod tests {
             _ => unreachable!(),
         };
         let paused = WalRecord::RunPaused {
+            account_limit: None,
             run_id,
             ts_ms: None,
             reason: broca_protocol::PauseReason::AuthRequired,

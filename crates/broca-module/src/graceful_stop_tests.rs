@@ -831,6 +831,7 @@ async fn restart_stop_after_call_result_pauses_at_the_durable_boundary() {
 #[test]
 fn restart_pause_is_valid_even_if_teardown_outlasts_grace() {
     let records = [WalRecord::RunPaused {
+        account_limit: None,
         ts_ms: None,
         run_id: RunId("restart-run".into()),
         reason: broca_protocol::PauseReason::Restart,
@@ -853,6 +854,7 @@ fn restart_stop_rejects_premature_interruption_and_other_outcomes() {
         retries_used: 0,
     };
     let other_pause = WalRecord::RunPaused {
+        account_limit: None,
         ts_ms: None,
         run_id: RunId("restart-run".into()),
         reason: broca_protocol::PauseReason::AuthRequired,
@@ -994,6 +996,7 @@ async fn restart_boot_unknown_feature_logs_refusal_without_touching_wal_or_block
             1,
             &["future-restart/v99"],
             &WalRecord::RunPaused {
+                account_limit: None,
                 ts_ms: None,
                 run_id: RunId("restart-run".into()),
                 reason: broca_protocol::PauseReason::Restart,

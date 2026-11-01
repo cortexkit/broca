@@ -404,6 +404,7 @@ fn started(session: &BindIdentity, run: &str) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(1),
         config: Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -927,6 +928,7 @@ async fn retention_marker_never_reaches_the_door() {
     {
         *retention = Some(60_000);
         *input = vec![Message {
+            turn_system: false,
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: marker.into(),
@@ -2159,6 +2161,7 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
             principal: None,
             model: broca_protocol::ModelHandle::new("stub", "m"),
             input: vec![Message {
+                turn_system: false,
                 role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: "queued input".into(),

@@ -1,0 +1,15 @@
+# Exhaustive power-loss and crash-image sweeps that the per-commit Linux attestation skips.
+# Each one alone takes over a minute on linux,8c (measured 2026-11-01), and the slowest set the
+# whole attestation's wall time to about 40 minutes. They still run in full once per merged
+# batch: scripts/linux-preflight.sh runs every workspace unit test, and the native crash-harness
+# lane runs broca-crash-harness.
+#
+# Format: package|exact nextest test name|measured seconds
+broca-crash-harness|v4_recovery_tests::v4_recovery_all_images_with_three_pending_appends|2007
+broca-store|db::index::tests::power_loss_reconciliation_matches_rebuild_for_ahead_and_lagging_indexes|914
+broca-provider|transport::tests::warm_idle_crash_and_power_loss_reclaim_once|639
+broca-module|actor::writer_reclaim::tests::reclaim_crash_and_power_loss_cuts_are_idempotent|328
+broca-store|db::index::tests::boundary_qualification_survives_shared_power_loss_cuts|263
+broca-store|db::index::tests::boot_power_loss_harness_recovers_torn_tail_and_boot_sync_cuts|140
+broca-crash-harness|v4_recovery_tests::v4_recovery_all_images_with_two_pending_appends|86
+broca-store|db::episode_reader::tests::database_model_page_reads_are_independent_of_discarded_prefix|79

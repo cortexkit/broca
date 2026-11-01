@@ -36,6 +36,7 @@ mod gated {
     fn fixed_request() -> CallOptions {
         let mut opts = CallOptions::new(vec![
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -46,6 +47,7 @@ mod gated {
                 }],
             },
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -59,6 +61,7 @@ mod gated {
             // its reasoning is echoed back like every other assistant message's; only a
             // cross-model signature (a different producing model) would be stripped.
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -75,6 +78,7 @@ mod gated {
                 ],
             },
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -87,6 +91,7 @@ mod gated {
             // The LAST assistant turn: signed reasoning (echoed byte-verbatim) + a
             // tool call.
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -107,6 +112,7 @@ mod gated {
             },
             // The tool result turn.
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -203,6 +209,7 @@ mod gated {
     fn cache_marker_request() -> CallOptions {
         CallOptions::new(vec![
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -218,6 +225,7 @@ mod gated {
                 ],
             },
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -228,6 +236,7 @@ mod gated {
                 }],
             },
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -238,6 +247,7 @@ mod gated {
                 }],
             },
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -248,6 +258,7 @@ mod gated {
                 }],
             },
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -258,6 +269,7 @@ mod gated {
                 }],
             },
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -386,6 +398,7 @@ mod gated {
 
     fn assistant_step(n: u32, thinking: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -408,6 +421,7 @@ mod gated {
 
     fn tool_step(n: u32) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -428,6 +442,7 @@ mod gated {
     /// fourth request of the loop, answering the third tool call.
     fn tool_loop_request() -> CallOptions {
         let text = |role: Role, text: &str| Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

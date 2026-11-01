@@ -1,0 +1,25 @@
+[
+  {
+    "contents": [
+      {
+        "parts": [
+          {
+            "text": "Summarize the notes."
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "parts": [
+          {
+            "text": "Keep the summary concise."
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 2048
+    }
+  }
+]
