@@ -195,6 +195,8 @@ pub struct FrozenRenderConfig {
     /// bytes are in `service_tier` / `speed`. Kept so a provider's refusal can be recognised
     /// and reported as a refusal of this tier. `None` (no tier requested) is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Keep this closed legacy decoder until recorded flex/default/priority bundles no longer
+    // need to resume. Abstract levels are retained separately as open frozen request bytes.
     pub service_tier_request: Option<crate::service_tier::ServiceTierRequest>,
     /// Legacy DeepSeek flag, retained only to reproduce pre-policy frozen blobs on resume.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

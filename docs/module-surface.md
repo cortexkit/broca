@@ -507,10 +507,56 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   omission for every send. Any other send must name `model`. When an inheriting send is
   queued behind a running turn, its recorded request carries the frozen model itself, so a
   build that does not know the inherited set still runs it on the session's model.
+  With the service-tier writer enabled, `service_tier` follows the fixed-run rules below
+  instead of inheriting from an ended run.
 
 Broca does not send `service_tier` to account routing; a tier chosen by a router reaches broca
 only through the caller's send. Broca does not report `service_tier_applied` or
 `service_tier_served` to account routing.
+
+#### Service-tier writer switch
+
+The boot-only root setting in `broca.jsonc` is `"service_tier": {"enabled": true}`.
+An absent block, an empty block or `"enabled": false` leaves it **off**. A bare boolean,
+an unknown member in the block, or a non-boolean `enabled` refuses boot naming
+`service_tier.enabled`. Other root settings remain owned by their existing loaders.
+Like `anthropic_fallbacks.refusal_resend.enabled`, changing this switch requires a restart.
+
+Off preserves the legacy `flex`/`default`/`priority` admission and frozen bundles, WAL bytes,
+discovery, default replies and provider requests. It does not declare the `service_tier`
+group or add tier members to default run usage. Queue reading remains available
+even when the writer switch is off.
+
+On declares `service_tier` and `role.describe.service_tiers`, and accepts only the abstract
+`standard`, `fast` and `ultrafast` levels on `session.send`. A new run without the member
+starts at standard; a send into an unfinished run inherits its fixed tier when absent.
+Explicitly changing that tier, including explicitly asking for standard, refuses
+`invalid_params` with detail `{field: "service_tier", reason: "run_tier_fixed"}`.
+Unknown levels and unsupported routes refuse before a model call with reason
+`unsupported_tier`, naming the level and, for route refusals, the model. Fast renders
+OpenAI `priority`; ultrafast is available only on an OpenAI wire whose model row has priced
+input and output ultrafast modes. Non-standard modes are never priced from base rates.
+Discovery lists family support, not a promise that every model on that family prices a mode.
+
+Tier-bearing queued sends retain the open `service_tier_level` string and require a reader
+supporting `service-tier-queue/v1`, available since broca 0.3.298. Admitted runs render their recorded configuration on resume,
+without consulting the current catalog for tier eligibility. The legacy closed
+`service_tier_request` decoder stays for old render bundles; it does not gain abstract variants.
+
+With the switch on, `run.status` and `run.result` add optional
+`usage.service_tier_applied` (non-standard only) and `usage.service_tier_served`. Served comes
+only from provider statements, including an explicitly reported standard. Missing reports do
+not vote; conflicting reports leave served absent, including after restart. Unmapped served
+strings remain verbatim. The existing durable run/step records rebuild this projection;
+there is no new durable usage accumulator. A compaction session sends `compaction.ride` with
+cause `service_tier_change` to its compaction provider before the first changed-tier request,
+including a return to standard, and its next notice
+carries the change event and non-standard condition. Unchanged tiers do not ride.
+
+The service-tier switch does not depend on role-routing's route-selection and reporting
+contract. Broca uses its own `route.account_for` / `route.account_observe` protocol instead.
+Those calls still carry neither the applied nor served tier.
+The switch adopts llm-runner service tiers, not a second account-routing path.
 
 #### Hard session input-token cap
 

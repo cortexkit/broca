@@ -2907,7 +2907,37 @@ where
                 )
                 .await;
             }
-            let mut params: SendParams = match serde_json::from_value(req.params.clone()) {
+            let mut send_params = req.params.clone();
+            let service_tier_level = if broca_protocol::service_tier_enabled() {
+                match cortexkit_role_llm_runner::service_tier::parse_request(
+                    req.params.get("service_tier"),
+                ) {
+                    Ok(level) => {
+                        if let Some(object) = send_params.as_object_mut() {
+                            object.remove("service_tier");
+                        }
+                        level.map(|level| level.as_str().to_owned())
+                    }
+                    Err(problem) => {
+                        return send_error_body(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            ErrorBody::new(
+                                "invalid_params",
+                                format!("unsupported service_tier {}", req.params["service_tier"]),
+                            )
+                            .with_detail(problem.detail()),
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut params: SendParams = match serde_json::from_value(send_params) {
                 Ok(p) => p,
                 Err(e) => {
                     let field = broca_wire::send_budget_refusal_field(&req.params)
@@ -3205,6 +3235,13 @@ where
             };
             send_req.request.project_id = bind.project_id.clone();
             send_req.request.inherit_frozen = inherit_frozen;
+            if broca_protocol::service_tier_enabled() {
+                send_req.request.service_tier_level = service_tier_level;
+                send_req
+                    .request
+                    .inherit_frozen
+                    .retain(|param| *param != broca_protocol::request::InheritedParam::ServiceTier);
+            }
             send_req.stop_sequences_named =
                 req.params.pointer("/generation/stop_sequences").is_some();
             send_req.request.principal = bind.principal.clone();
@@ -4555,6 +4592,7 @@ fn refused_send_code(error: &ServeError) -> String {
             broca_wire::INVALID_PARAMS.into()
         }
         ServeError::VariantUnsupported(_) => "variant_unsupported".into(),
+        ServeError::ServiceTierInvalid { .. } => "invalid_params".into(),
         ServeError::SessionHeld(_) => "session_held".into(),
         ServeError::Open(_, _) => "open_failed".into(),
         ServeError::HistoryUnreachable { .. } => broca_wire::HISTORY_UNREACHABLE.into(),
@@ -4732,6 +4770,7 @@ async fn send_serve_error(
         ServeError::Open(_, _) => "open_failed",
         ServeError::WalNewerWriter { .. } => broca_wire::WAL_NEWER_WRITER,
         ServeError::VariantUnsupported(_) => "variant_unsupported",
+        ServeError::ServiceTierInvalid { .. } => "invalid_params",
         ServeError::SendRetracted { .. } => "send_retracted",
         ServeError::SendEnded {
             submission_id,
@@ -4846,6 +4885,9 @@ async fn send_serve_error(
             "variant": refusal.variant,
             "defined": refusal.defined,
         }));
+    }
+    if let ServeError::ServiceTierInvalid { reason, .. } = err {
+        body = body.with_detail(serde_json::json!({"field":"service_tier", "reason":reason}));
     }
     if let ServeError::WalNewerWriter { missing, .. } = err {
         // Serialized from `broca_wire::WalNewerWriterDetail`, whose bytes the golden file

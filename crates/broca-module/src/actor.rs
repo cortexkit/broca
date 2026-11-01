@@ -368,6 +368,10 @@ pub enum SendOutcome {
     RetentionInvalid(crate::retention::InvalidRetention),
     SessionClassInvalid(String),
     InputTokenBudgetInvalid(String),
+    ServiceTierInvalid {
+        reason: &'static str,
+        message: String,
+    },
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     /// The send's `structured_output` was refused before anything was written; `field` is the
     /// offending member path the role contract names.
@@ -3940,6 +3944,52 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
 
+        if broca_protocol::service_tier_enabled() && !resume_indexed_run {
+            let checkpoint = match self.load_checkpoint_at_head().await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return SendOutcome::Transient(error),
+            };
+            let running = match &self.state {
+                RunState::Active { run_id, .. } => self.durable_finish_of_active(run_id).is_none(),
+                RunState::Idle => checkpoint
+                    .last_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.disposition == EpisodeDisposition::Paused),
+            };
+            if running {
+                if let Some(episode) = &checkpoint.last_episode {
+                    let fixed =
+                        broca_protocol::frozen_service_tier(&episode.config.frozen_render_config);
+                    if request
+                        .service_tier_level
+                        .as_deref()
+                        .is_some_and(|requested| requested != fixed)
+                    {
+                        return SendOutcome::ServiceTierInvalid {
+                            reason: "run_tier_fixed",
+                            message: format!(
+                                "service_tier is fixed at {fixed:?} for run {}",
+                                episode.run_id.0
+                            ),
+                        };
+                    }
+                    request.service_tier_level = (fixed != "standard"
+                        || request.service_tier_level.is_some())
+                    .then(|| fixed.to_owned());
+                }
+            }
+            let mut effective = request.clone();
+            if let Some(episode) = &checkpoint.last_episode {
+                inherit_frozen_parameters(&mut effective, &episode.config);
+            }
+            if let Err(message) = self.executor.check_service_tier(&effective) {
+                return SendOutcome::ServiceTierInvalid {
+                    reason: "unsupported_tier",
+                    message,
+                };
+            }
+        }
+
         // A send that left its model to the session is checked against the plan's model-bearing
         // items here, with the model it inherits: the latest episode's frozen model, which
         // `record_frozen_model` and run start also take. It runs after the same-key receipts
@@ -5641,6 +5691,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // The title is deliberately not compared: it labels the send without being part of
             // its identity, so a retry carrying another title is answered `Pending` and the
             // queued record keeps the title it was written with.
+            if broca_protocol::service_tier_enabled()
+                && request.service_tier_level.is_none()
+                && request_identity_digest.is_some()
+                && existing.request_identity_digest == request_identity_digest
+            {
+                // Admission may have frozen an inherited tier into the queue. An identical
+                // caller retry still omits it; compare with that original caller identity before
+                // restoring the queue's frozen level, so explicit standard never inherits fast.
+                request
+                    .service_tier_level
+                    .clone_from(&existing.request.service_tier_level);
+            }
             return match submission_difference(&existing.request, &request) {
                 None => SendOutcome::Pending { submission_id },
                 Some(differing) => SendOutcome::SendIdReuse { differing },
