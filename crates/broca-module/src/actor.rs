@@ -246,6 +246,13 @@ pub enum LineageCmd {
         at: broca_wal::record::RunCancelAt,
         reply: oneshot::Sender<CancelOutcome>,
     },
+    CancelFrom {
+        run_id: RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<broca_protocol::BindPrincipal>,
+        scope: broca_protocol::SendScope,
+        reply: oneshot::Sender<CancelOutcome>,
+    },
     /// Retract a still-pending queued submission (durable tombstone). Replies the outcome.
     Retract {
         submission_id: broca_protocol::SubmissionId,
@@ -560,6 +567,7 @@ pub enum WarmOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CancelOutcome {
+    ScopeRefused(broca_core::ScopeRefusal),
     Error(String),
     SessionMoving { cut_id: String },
     SessionMoved { holder: String },
@@ -2337,6 +2345,31 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 false
             }
+            LineageCmd::CancelFrom {
+                run_id,
+                at,
+                principal,
+                scope,
+                reply,
+            } => {
+                let held = self.provider_held_episode(&run_id);
+                let outcome = self
+                    .on_cancel_from(&run_id, at, principal.as_ref(), &scope, held)
+                    .await;
+                let acknowledged = matches!(outcome, CancelOutcome::Ack);
+                let _ = reply.send(outcome);
+                if acknowledged
+                    && self.pending_cancels.contains_key(&run_id)
+                    && held != ProviderHeldPresence::NotHeld
+                {
+                    if let RunState::Active { cancel, .. } = &self.state {
+                        cancel.cancel();
+                    } else if let Err(error) = self.retry_pending_cancels().await {
+                        tracing::warn!(%error, "provider-held cancel finalizer failed");
+                    }
+                }
+                false
+            }
             LineageCmd::Retract {
                 submission_id,
                 reply,
@@ -2547,7 +2580,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             LineageCmd::Import { reply, .. } => {
                 let _ = reply.send(ImportOutcome::Error(broca_core::ImportError::Wal(error)));
             }
-            LineageCmd::Cancel { reply, .. } => {
+            LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                 let _ = reply.send(CancelOutcome::Reopen);
             }
             LineageCmd::Retract { reply, .. } => {
@@ -6958,11 +6991,65 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
     }
 
+    async fn on_cancel_from(
+        &mut self,
+        run_id: &RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        held: ProviderHeldPresence,
+    ) -> CancelOutcome {
+        let ownership = match self.load_ownership().await {
+            Ok(ownership) => ownership,
+            Err(error) => return CancelOutcome::Error(error),
+        };
+        let refusal =
+            match broca_core::scope_admission::decide_owner_access(&ownership, principal, scope) {
+                Ok(()) => return self.on_cancel_at(run_id, at, held).await,
+                Err(refusal) => refusal,
+            };
+        let Some(sender @ broca_protocol::BindPrincipal::Reserved { module_id }) = principal else {
+            return CancelOutcome::ScopeRefused(refusal);
+        };
+        if at != broca_wal::record::RunCancelAt::Now {
+            return CancelOutcome::ScopeRefused(refusal);
+        }
+        let ownership = match self.load_sender_ownership(ownership, module_id).await {
+            Ok(ownership) => ownership,
+            Err(SendOutcome::Transient(error)) => return CancelOutcome::Error(error),
+            Err(_) => unreachable!("sender policy loading returns only transient errors"),
+        };
+        if !effective_plan_senders(&ownership)
+            .iter()
+            .any(|sender| sender.module == *module_id && sender.interrupt)
+        {
+            return CancelOutcome::ScopeRefused(refusal);
+        }
+        // Serialize the grant check with refresh and sync the existing cancel record before
+        // acknowledging. Recovery must see the accepted stop even if the process dies before
+        // the executor observes its token. Owners keep their existing cancellation path.
+        let outcome = self.on_cancel_at_inner(run_id, at, held, true).await;
+        if matches!(outcome, CancelOutcome::Ack) {
+            tracing::info!(session = ?self.key, run_id = %run_id.0, sender = %sender.as_owner_string(), "named sender stopped run");
+        }
+        outcome
+    }
+
     async fn on_cancel_at(
         &mut self,
         run_id: &RunId,
         at: broca_wal::record::RunCancelAt,
         held_state: ProviderHeldPresence,
+    ) -> CancelOutcome {
+        self.on_cancel_at_inner(run_id, at, held_state, false).await
+    }
+
+    async fn on_cancel_at_inner(
+        &mut self,
+        run_id: &RunId,
+        at: broca_wal::record::RunCancelAt,
+        held_state: ProviderHeldPresence,
+        durable_now: bool,
     ) -> CancelOutcome {
         if let Err(error) = self.wal_store.check_move(&self.key, true) {
             return match error.into_move_refusal() {
@@ -7042,7 +7129,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     );
                     return CancelOutcome::Ack;
                 }
-                if steer.boundary_cancel().is_cancelled() {
+                if durable_now || steer.boundary_cancel().is_cancelled() {
                     let writer = self
                         .writer
                         .as_ref()
@@ -7082,7 +7169,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
 
         let skip_materialization = self.skip_materialization_runs.contains(run_id);
-        if at == broca_wal::record::RunCancelAt::StepBoundary {
+        if durable_now || at == broca_wal::record::RunCancelAt::StepBoundary {
             let writer = self.writer.as_ref().expect("an open actor owns its writer");
             if let Err(error) = writer
                 .record(WalRecord::RunCancelRequested {
@@ -8008,7 +8095,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 LineageCmd::Import { reply, .. } => {
                     let _ = reply.send(ImportOutcome::Reopen);
                 }
-                LineageCmd::Cancel { reply, .. } => {
+                LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                     let _ = reply.send(CancelOutcome::Reopen);
                 }
                 LineageCmd::Retract { reply, .. } => {
@@ -8954,7 +9041,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             LineageCmd::Import { reply, .. } => {
                 let _ = reply.send(ImportOutcome::Reopen);
             }
-            LineageCmd::Cancel { reply, .. } => {
+            LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                 let _ = reply.send(CancelOutcome::Reopen);
             }
             LineageCmd::Retract { reply, .. } => {

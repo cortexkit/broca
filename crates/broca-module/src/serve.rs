@@ -2062,6 +2062,21 @@ pub trait ServeHandler: Send + Sync {
         }
     }
 
+    /// Cancel with the daemon-attested caller, never an identity from the request body.
+    /// Handlers without named-sender admission retain owner-only cancellation.
+    async fn cancel_from(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<CancelResponse, ServeError> {
+        self.authorize_session_owner(session, principal, scope)
+            .await?;
+        self.cancel_at(session, run_id, at).await
+    }
+
     /// `run.status` / `session.status` — the lineage's current state.
     async fn status(&self, session: &LineageKey) -> Result<StatusResponse, ServeError>;
 
@@ -2536,9 +2551,8 @@ impl ServeHandler for crate::LineageRegistry {
         scope: &broca_protocol::SendScope,
         submission_id: Option<&str>,
     ) -> Result<(), ServeError> {
-        // Runner 0.7.29 CONTRACT.md:2333-2362 (§9.2) extends only session.retract:
-        // owners keep their exact path; another attested sender may withdraw only its
-        // recorded submission. run.cancel remains owner-only, even for that sender.
+        // Retraction grants access to a submission's recorded sender, independently of
+        // whether the current plan grants that sender permission to stop the running turn.
         match self
             .authorize_session_owner(session, principal, scope)
             .await
@@ -4272,6 +4286,52 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<CancelResponse, ServeError> {
         use crate::actor::CancelOutcome;
         match self.route_cancel_at(session, run_id, at).await? {
+            CancelOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
+            CancelOutcome::Error(error) => Err(ServeError::Open(error, None)),
+            CancelOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
+            CancelOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
+            CancelOutcome::Ack => Ok(CancelResponse::Ack),
+            CancelOutcome::NotActive => Ok(CancelResponse::NotActive),
+            CancelOutcome::Reopen => unreachable!("registry retry consumes Reopen"),
+        }
+    }
+
+    async fn cancel_from(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<CancelResponse, ServeError> {
+        use crate::actor::CancelOutcome;
+        let refusal = match self
+            .authorize_session_owner(session, principal, scope)
+            .await
+        {
+            Ok(()) => return self.cancel_at(session, run_id, at).await,
+            Err(ServeError::ScopeRefused(refusal)) => refusal,
+            Err(error) => return Err(error),
+        };
+        let granted = if let (
+            broca_wal::record::RunCancelAt::Now,
+            Some(broca_protocol::BindPrincipal::Reserved { module_id }),
+        ) = (at, principal)
+        {
+            self.interrupt_cancel_granted(session, module_id).await?
+        } else {
+            false
+        };
+        if !granted {
+            return Err(ServeError::ScopeRefused(refusal));
+        }
+        // Refuse before opening an actor: recovery itself can write. The actor checks the
+        // grant again so a refresh accepted after this read cannot leave stale authority.
+        match self
+            .route_cancel_from(session, run_id, at, principal.cloned(), scope.clone())
+            .await?
+        {
+            CancelOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
             CancelOutcome::Error(error) => Err(ServeError::Open(error, None)),
             CancelOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
             CancelOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),

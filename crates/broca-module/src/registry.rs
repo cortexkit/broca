@@ -1967,6 +1967,25 @@ impl LineageRegistry {
         ))
     }
 
+    /// Read sender grants without opening an actor, whose recovery can write history.
+    pub(crate) async fn interrupt_cancel_granted(
+        &self,
+        key: &LineageKey,
+        module_id: &str,
+    ) -> Result<bool, OpenError> {
+        let (records, _) = self
+            .read_durable_wal_for(key, ReadPurpose::Authorization)
+            .await?;
+        let checkpoint = broca_core::AdmissionCheckpointV1::from_frames(&records)
+            .map_err(|error| OpenError::Open(error.to_string()))?;
+        Ok(checkpoint.ownership.is_some_and(|ownership| {
+            ownership
+                .effective_senders()
+                .iter()
+                .any(|sender| sender.module == module_id && sender.interrupt)
+        }))
+    }
+
     /// Upload standing includes every current plan-named sender, not just session owners.
     /// Read the frozen first manifest without retaining its contents in owner caches.
     pub(crate) async fn upload_ownership(
@@ -2878,16 +2897,50 @@ impl LineageRegistry {
         run_id: broca_protocol::RunId,
         at: broca_wal::record::RunCancelAt,
     ) -> Result<crate::actor::CancelOutcome, OpenError> {
+        self.route_cancel_inner(key, run_id, at, None).await
+    }
+
+    pub async fn route_cancel_from(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<broca_protocol::BindPrincipal>,
+        scope: broca_protocol::SendScope,
+    ) -> Result<crate::actor::CancelOutcome, OpenError> {
+        self.route_cancel_inner(key, run_id, at, Some((principal, scope)))
+            .await
+    }
+
+    async fn route_cancel_inner(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        caller: Option<(
+            Option<broca_protocol::BindPrincipal>,
+            broca_protocol::SendScope,
+        )>,
+    ) -> Result<crate::actor::CancelOutcome, OpenError> {
         use crate::actor::{CancelOutcome, LineageCmd};
         loop {
             self.check_move(key, true)?;
             self.check_expired(key, Some(&run_id.0)).await?;
             let handle = self.actor_for(key).await?;
             let (reply, rx) = tokio::sync::oneshot::channel();
-            let cmd = LineageCmd::Cancel {
-                run_id: run_id.clone(),
-                at,
-                reply,
+            let cmd = match &caller {
+                Some((principal, scope)) => LineageCmd::CancelFrom {
+                    run_id: run_id.clone(),
+                    at,
+                    principal: principal.clone(),
+                    scope: scope.clone(),
+                    reply,
+                },
+                None => LineageCmd::Cancel {
+                    run_id: run_id.clone(),
+                    at,
+                    reply,
+                },
             };
             if handle.send(cmd).await.is_err() {
                 continue;
