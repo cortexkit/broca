@@ -1244,14 +1244,16 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     }
 
     fn supports_media_renderer(&self) -> bool {
-        true
+        broca_protocol::attachments_enabled()
     }
 
     fn set_media_request_renderer(
         &self,
         renderer: Arc<broca_core::provider::MediaRequestRenderer>,
     ) {
-        *self.media_renderer.write().unwrap() = Some(renderer);
+        if broca_protocol::attachments_enabled() {
+            *self.media_renderer.write().unwrap() = Some(renderer);
+        }
     }
 
     fn defer_media_tags(&self, render_tags: bool) -> bool {

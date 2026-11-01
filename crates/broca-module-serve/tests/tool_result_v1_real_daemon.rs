@@ -198,9 +198,16 @@ async fn real_daemon_tool_result_v1_read_stores_notice_or_captures_png() {
         before[1],
         json!({"kind":"text","text":"Read image attachment (image/png, 1×1, 69 B)."})
     );
-    assert_eq!(after[1]["kind"], "parts");
-    assert_eq!(after[1]["parts"][1]["kind"], "media");
-    assert_eq!(after[1]["parts"][1]["media"]["mime"], "image/png");
+    if cfg!(feature = "test-attachments") {
+        assert_eq!(after[1]["kind"], "parts");
+        assert_eq!(after[1]["parts"][1]["kind"], "media");
+        assert_eq!(after[1]["parts"][1]["media"]["mime"], "image/png");
+    } else {
+        assert_eq!(
+            after[1],
+            json!({"kind":"text","text":"Read image attachment (image/png, 1×1, 69 B).\n[image/png not shown to the model: this runner does not pass tool images to models yet]"})
+        );
+    }
     if let Some(dir) = std::env::var_os("BROCA_TOOL_RESULT_SAMPLES") {
         let dir = PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
