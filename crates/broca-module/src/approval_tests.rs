@@ -160,6 +160,8 @@ struct Rig {
     executor: Arc<Executor>,
     registry: LineageRegistry,
     full_reads: Arc<std::sync::atomic::AtomicUsize>,
+    // Fields are dropped in order; remove the directory only after closing its files.
+    _scratch: Scratch,
 }
 impl Rig {
     fn new(writer: bool) -> Self {
@@ -194,6 +196,7 @@ impl Rig {
         let registry =
             LineageRegistry::new_with_reader(Arc::new(opener), counted, Some(store.clone()));
         Self {
+            _scratch: Scratch(root.clone()),
             root,
             key,
             wal,
@@ -640,10 +643,20 @@ fn stale_marker_cannot_reopen_an_approved_or_closed_call() {
     assert!(crate::approval::awaiting_approval(&projection, &RunId("r".into())).is_none());
 }
 
-impl Drop for Rig {
+struct Scratch(std::path::PathBuf);
+impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[tokio::test]
+async fn rig_cleanup_closes_store_after_registry() {
+    let rig = Rig::new(false);
+    let root = rig.root.clone();
+    assert!(rig.registry.stop_and_seal().await);
+    drop(rig);
+    assert!(!root.exists(), "fixture left its scratch directory behind");
 }
 
 #[tokio::test]
