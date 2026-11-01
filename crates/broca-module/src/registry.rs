@@ -6404,6 +6404,7 @@ mod tests {
 
     pub(super) fn started_record(session: &LineageKey) -> WalRecord {
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -6460,6 +6461,7 @@ mod tests {
 
     pub(super) fn assistant_record() -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -7076,6 +7078,7 @@ mod offset_page_tests {
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -7103,6 +7106,7 @@ mod offset_page_tests {
 
     fn steered(text: &str) -> WalRecord {
         WalRecord::Steered {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             retention: None,
@@ -7124,6 +7128,7 @@ mod offset_page_tests {
 
     fn text_step(step: u64, text: &str) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -7158,6 +7163,7 @@ mod offset_page_tests {
     fn corpus_wal() -> (Vec<u8>, Vec<WalRecord>) {
         let mut records = vec![run_started("r1", vec![user("task")]), step_started(1)];
         records.push(WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

@@ -791,6 +791,7 @@ async fn serve_model_request(
         .and_then(Value::as_u64)
         .unwrap_or(u64::MAX);
     let mut remaining = output_cap;
+    let mut truncated = false;
     let mut events = vec![chunk(json!({"role": "assistant"}), None)];
     let mut calls = 0;
     for part in &turn.parts {
@@ -798,6 +799,7 @@ async fn serve_model_request(
             ScriptedPart::Text(text) => {
                 let words: Vec<_> = text.split_whitespace().collect();
                 let content = if words.len() as u64 > remaining {
+                    truncated = true;
                     words[..remaining as usize].join(" ")
                 } else {
                     text.clone()
@@ -819,7 +821,11 @@ async fn serve_model_request(
     }
     events.push(chunk(
         json!({}),
-        Some(if calls > 0 { "tool_calls" } else { "stop" }),
+        if truncated {
+            Some("length")
+        } else {
+            turn.finish_reason.as_deref()
+        },
     ));
     if let Some(usage) = &turn.usage {
         events.push(scripted_usage_chunk(&id, usage, output_cap));
@@ -2074,6 +2080,9 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    fn model_finish_reason_source(&self) -> Option<&'static str> {
+        Some("openai.chat_completions")
+    }
     fn attachment_model_fields(&self, session: &str, accepts: bool) -> Option<Map<String, Value>> {
         self.shared
             .attachment_models
@@ -3753,6 +3762,22 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
+    // Runner-room request #1723 tracks the kit's caller-cap prerequisite. Broca cannot
+    // promise that cap on every provider, so preserve the kit's exact missing-capability
+    // outcome rather than disguising it as an inapplicable provider-limit check.
+    assert_eq!(
+        report
+            .cases
+            .iter()
+            .find(|case| case.case == "finish_reason_output_cap")
+            .expect("finish_reason_output_cap")
+            .outcome,
+        CaseOutcome::Skipped {
+            missing: vec![Capability::MaxOutputTokens]
+        },
+        "{}",
+        report.render()
+    );
     for name in [
         "sender_succession_same_payload_receipt",
         "sender_succession_changed_payload_refused",
@@ -3763,6 +3788,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "read_display_facts_default_absent",
         "read_display_facts_opt_in_envelope",
         "read_display_facts_undeclared_refused",
+        "message_senders_rows_name_their_sender",
     ] {
         let case = report
             .cases
@@ -3829,6 +3855,9 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "display_own_run_records_model",
         "client_message_id_on_display_rows_never_in_read",
         "display_row_names_the_sender_never_in_read",
+        "finish_reason_provider_limit",
+        "finish_reason_no_model_step",
+        "finish_reason_last_model_step",
         "output_refs_scanning",
         "output_refs_target_reasons",
         "output_refs_descriptor_digest",

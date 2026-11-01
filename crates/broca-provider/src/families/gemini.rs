@@ -819,6 +819,7 @@ pub(crate) struct GeminiNormalizer {
     next_call_index: u32,
     usage: Usage,
     finish_reason: FinishReason,
+    raw_finish_reason: Option<String>,
     started: bool,
     terminal_observed: bool,
     emitted_final: bool,
@@ -847,6 +848,7 @@ impl GeminiNormalizer {
             next_call_index: 0,
             usage: Usage::default(),
             finish_reason: FinishReason::Other,
+            raw_finish_reason: None,
             started: false,
             terminal_observed: false,
             emitted_final: false,
@@ -1009,6 +1011,7 @@ impl GeminiNormalizer {
         };
 
         if let Some(fr) = candidate.get("finishReason").and_then(Value::as_str) {
+            self.raw_finish_reason = Some(fr.to_owned());
             self.finish_reason = map_finish_reason(fr);
             if let Some(evidence) = &self.response_evidence {
                 evidence.lock().unwrap().finish_reason = Some(self.finish_reason);
@@ -1273,6 +1276,7 @@ impl StreamNormalizer for GeminiNormalizer {
         out.extend([
             NormalizedEvent::Control(ProviderControl::AssistantMessage { message }),
             NormalizedEvent::Control(ProviderControl::StepFinished {
+                raw_finish_reason: self.raw_finish_reason.take(),
                 step_id: self.step_id,
                 usage: self.usage,
                 finish_reason: self.finish_reason,

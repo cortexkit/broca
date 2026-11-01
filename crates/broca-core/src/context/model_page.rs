@@ -988,6 +988,7 @@ mod episode_page_tests {
     /// tag checkpoint can renumber.
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -1044,6 +1045,7 @@ mod episode_page_tests {
 
     fn step(step: u64, content: Vec<ContentBlock>) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -1181,6 +1183,7 @@ mod episode_page_tests {
         records.push(step_started(3));
         records.push(step(3, vec![text("done")]));
         records.push(WalRecord::Steered {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             retention: None,

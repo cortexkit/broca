@@ -260,6 +260,8 @@ fn deserialize_run_usage_value(
 /// as an open string. A run that has not ended carries no `final_message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResultResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<cortexkit_role_llm_runner::finish::Finish>,
     /// The credential id frozen at admission, as in `run.status`; never an empty string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_selection: Option<String>,
@@ -385,6 +387,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
         cortexkit_role_llm_runner::capabilities::RUN_STATUS,
+        cortexkit_role_llm_runner::capabilities::FINISH_REASON,
         cortexkit_role_llm_runner::capabilities::HELD_CALLS,
         cortexkit_role_llm_runner::capabilities::RUN_USAGE,
         cortexkit_role_llm_runner::capabilities::SESSION_USAGE,
@@ -421,6 +424,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::SENDER_SUCCESSION,
         // Client identity belongs to the display envelope, never to a model-visible message.
         cortexkit_role_llm_runner::capabilities::CLIENT_MESSAGE_ID,
+        cortexkit_role_llm_runner::capabilities::MESSAGE_SENDERS,
     ]
     .map(String::from)
     .to_vec();
@@ -1218,7 +1222,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "b224282fbdcdd15bb539b51c71e92c400f56b3f6070ed4a09efdbc894dbc5dd1",
+            "a5b25b2eb1323f66af9961913ecfafcb547740db2fe19cd5df98cf602a8d92dd",
         );
     }
 
@@ -1396,7 +1400,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "3d92e8c1b698275853950cd88f7fbd5fb511c27955957854cc60e8955bb059da";
+        "696198c703d4d2e613f90bd7c3b1415e7fb7892a11ed202fe08796e171ad46bb";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

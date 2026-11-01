@@ -143,6 +143,7 @@ fn queued_record(
     ts_ms: Option<u64>,
 ) -> WalRecord {
     WalRecord::Queued {
+        sent_by: None,
         written_at_ms: None,
         retention,
         ts_ms,
@@ -287,6 +288,7 @@ impl Fixture {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    sent_by: None,
                     written_at_ms: None,
                     tags: None,
                     session_class: None,
@@ -492,6 +494,7 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
             RunId("refused".into()),
             queue.request.clone(),
             SendIdentity {
+                display_sent_by: None,
                 conversation_key: None,
                 title: None,
                 send_id: Some("refused".into()),
@@ -537,6 +540,7 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
             RunId("queued".into()),
             retract.request.clone(),
             SendIdentity {
+                display_sent_by: None,
                 conversation_key: None,
                 title: None,
                 send_id: Some("queued".into()),
@@ -756,6 +760,7 @@ async fn retained_first_send_cut_before_its_index_sync_is_recovered_at_boot() {
     let digest = send_identity_digest(&request, broca_protocol::Delivery::Queue, None);
     writer
         .record(WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,

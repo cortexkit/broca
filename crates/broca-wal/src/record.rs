@@ -615,6 +615,9 @@ pub enum WalRecord {
     /// into the immutable conversation prefix and opens a new one. It is
     /// run_id-authoritative.
     RunStarted {
+        /// Attested route sender for display only, independent of the execution principal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_by: Option<BindPrincipal>,
         /// Admission time of the input, preserved across queue drain and restart.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         written_at_ms: Option<u64>,
@@ -783,6 +786,9 @@ pub enum WalRecord {
         /// Optional so an older-shaped record still deserializes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish_reason: Option<FinishReason>,
+        /// Provider-native terminal token for display only; absent on older records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_finish_reason: Option<String>,
         #[serde(default)]
         retries_used: u32,
         /// The service tier the provider REPORTED serving this step at, verbatim as it spelled
@@ -1326,6 +1332,9 @@ pub enum WalRecord {
     /// dropping path. Consume/retract is unambiguous across a crash: the pending set is
     /// `Queued − Retracted − consumed-by-a-RunStarted`.
     Queued {
+        /// Attested route sender for display only; never grants queue ownership.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_by: Option<BindPrincipal>,
         /// Admission time carried into the input record when this send is delivered.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         written_at_ms: Option<u64>,
@@ -1403,6 +1412,9 @@ pub enum WalRecord {
     /// gated frame requiring [`crate::framing::STEER_QUEUE_FEATURE`] (see
     /// [`WalRecord::required_features`]), which such a build refuses as a newer writer.
     Steered {
+        /// Attested route sender for display only; never used to authorize a retry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_by: Option<BindPrincipal>,
         /// Admission time of this input, not the later boundary that places it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         written_at_ms: Option<u64>,
@@ -4073,6 +4085,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4301,6 +4314,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4358,6 +4372,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4436,6 +4451,7 @@ mod schema_tests {
         // reported. A step whose response reported no tier must keep exactly these bytes, and
         // these bytes must keep decoding to the same record.
         let full = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4459,6 +4475,7 @@ mod schema_tests {
             speed_used: None,
         };
         let bare = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4491,6 +4508,7 @@ mod schema_tests {
     #[test]
     fn old_records_default_retries_used_to_zero() {
         let model = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4533,6 +4551,7 @@ mod schema_tests {
     #[test]
     fn pre_fix_run_started_omits_ts_ms_and_decodes_as_none() {
         let record = WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4587,6 +4606,7 @@ mod schema_tests {
     #[test]
     fn pre_work_class_run_started_bytes_are_pinned() {
         let record = WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4625,6 +4645,7 @@ mod schema_tests {
     #[test]
     fn pre_context_management_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4680,6 +4701,7 @@ mod schema_tests {
     #[test]
     fn pre_variant_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4739,6 +4761,7 @@ mod schema_tests {
     #[test]
     fn pre_service_tier_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4852,6 +4875,7 @@ mod schema_tests {
             let mut config = min_config();
             config.frozen_render_config = frozen_render_config;
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -5016,6 +5040,7 @@ mod schema_tests {
         };
         let records = vec![
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -5040,6 +5065,7 @@ mod schema_tests {
                 submission_id: Some(SubmissionId("sub1".into())),
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -5109,6 +5135,7 @@ mod schema_tests {
                 caller_text: Some("nudge text".into()),
             },
             WalRecord::Queued {
+                sent_by: None,
                 written_at_ms: None,
                 retention: None,
                 ts_ms: None,
@@ -5672,6 +5699,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_preserves_signed_tool_call() {
         let rec = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -5717,6 +5745,7 @@ mod schema_tests {
         assert_eq!(decoded_call, call);
 
         let rec = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

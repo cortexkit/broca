@@ -302,6 +302,7 @@ fn existing_writer_rechecks_freeze_before_every_append() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,

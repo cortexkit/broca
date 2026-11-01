@@ -398,6 +398,7 @@ impl FakeExecutor {
 
     async fn write_started(&self, job: &RunJob) {
         let _seq = job.writer.record(broca_wal::WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,

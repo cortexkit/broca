@@ -521,6 +521,7 @@ mod tests {
             let step_id = StepId(step);
             self.append(WalRecord::StepStarted { step_id });
             self.append(WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 step_id,

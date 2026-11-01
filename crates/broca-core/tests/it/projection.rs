@@ -67,6 +67,7 @@ fn run_config() -> RunConfig {
 
 fn started(run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -126,6 +127,7 @@ fn assistant_two_calls() -> AssistantMessage {
 
 fn step_with_two_calls(step: u64) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -322,6 +324,7 @@ fn projection_shape_and_cursors() {
 #[test]
 fn run_terminal_carries_last_recorded_step_finish_reason() {
     let terminal_step = WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -1171,6 +1174,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             },
         },
         WalRecord::Queued {
+            sent_by: None,
             written_at_ms: None,
             retention: None,
             ts_ms: None,
@@ -1232,6 +1236,7 @@ fn cursor_only_projection_matches_full_projection_for_every_record_prefix() {
 #[test]
 fn a_steered_record_has_no_unit_until_placement_boundary() {
     let steered = WalRecord::Steered {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         retention: None,

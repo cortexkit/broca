@@ -317,6 +317,7 @@ mod offset_resume_tests {
 
     fn step(id: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             hooks: None,

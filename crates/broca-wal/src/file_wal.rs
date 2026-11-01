@@ -3617,6 +3617,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -3744,6 +3745,7 @@ mod tests {
 
     fn run_started(n: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4106,6 +4108,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     fn large_step(n: u64, text_bytes: usize) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4756,6 +4759,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,

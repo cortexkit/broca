@@ -73,6 +73,7 @@ fn run_config() -> RunConfig {
 /// The ONE atomic run-start record (config + input).
 fn start(run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -120,6 +121,7 @@ fn assistant_tool_call(id: &str, name: &str) -> AssistantMessage {
 
 fn step_with_call(step: u64, id: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -153,6 +155,7 @@ fn usage_with_cache(input_tokens: u64, cached_input_tokens: u64, output_tokens: 
 
 fn step_text_with_usage(step: u64, text: &str, usage: Usage) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -801,6 +804,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -847,6 +851,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -1914,6 +1919,7 @@ async fn append_seals_an_inferred_natural_end_before_starting_the_next_episode()
     let mut file = wal.open(&session).expect("open WAL for crash cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -2014,6 +2020,7 @@ async fn append_seals_an_inferred_hard_stop_before_starting_the_next_episode() {
     let mut file = wal.open(&session).expect("open WAL for hard-stop cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -2511,6 +2518,7 @@ async fn cross_episode_resume_is_exactly_once() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -2556,6 +2564,7 @@ async fn cross_episode_resume_is_exactly_once() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3150,6 +3159,7 @@ fn budgeted_start(run: &str) -> WalRecord {
             submission_id,
             ..
         } => WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -3231,6 +3241,7 @@ fn budget_fired_semantic_validation_rejects_wrong_early_reordered_and_duplicate_
     let mut reordered = vec![
         budgeted_start("r"),
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -3492,6 +3503,7 @@ async fn a_new_episode_appends_onto_a_lineage_sealed_by_an_interrupt() {
         w.append(
             1,
             &WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,

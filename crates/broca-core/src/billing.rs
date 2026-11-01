@@ -979,6 +979,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -1015,6 +1016,7 @@ mod tests {
         frame(
             seq,
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -1782,6 +1784,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,

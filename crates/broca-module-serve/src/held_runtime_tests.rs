@@ -101,6 +101,7 @@ fn config() -> broca_wal::RunConfig {
 fn records(bind: &BindIdentity) -> Vec<WalRecord> {
     vec![
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -125,6 +126,7 @@ fn records(bind: &BindIdentity) -> Vec<WalRecord> {
             submission_id: None,
         },
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

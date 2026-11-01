@@ -6481,6 +6481,7 @@ mod tests {
             Ok(vec![
                 NormalizedEvent::Display(DisplayEvent::DisplayGap { dropped: 99 }),
                 NormalizedEvent::Control(ProviderControl::StepFinished {
+                    raw_finish_reason: None,
                     step_id: self.step_id,
                     usage: Usage {
                         output_tokens: Some(999),

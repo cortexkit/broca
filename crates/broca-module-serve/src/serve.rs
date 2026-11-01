@@ -6807,6 +6807,7 @@ mod tests {
             version: None,
         };
         let run_result = broca_wire::RunResultResponse {
+            finish: None,
             auth_selection: None,
             directives: None,
             context_ceiling: None,
@@ -7906,6 +7907,7 @@ mod tests {
     async fn refused_replacement_goodbye_preserves_published_route_and_stream() {
         let session = BrocaBindIdentity::new("/tmp/project-a", "runner", "published");
         let record = broca_wal::WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,

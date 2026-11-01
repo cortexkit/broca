@@ -32,6 +32,7 @@ use tokio::sync::{mpsc, Notify};
 fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
     vec![
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -65,6 +66,7 @@ fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
         },
         WalRecord::StepStarted { step_id: StepId(1) },
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

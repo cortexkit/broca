@@ -6180,6 +6180,7 @@ mod executor {
             framed(
                 seq,
                 broca_wal::WalRecord::RunStarted {
+                    sent_by: None,
                     written_at_ms: None,
                     tags: None,
                     session_class: None,

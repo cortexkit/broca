@@ -1308,6 +1308,7 @@ async fn seal_linearization_keeps_answered_slots_until_handover_and_orders_paral
         tool_call_id: "a".into(),
     };
     let model = WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,

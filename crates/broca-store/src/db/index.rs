@@ -3284,6 +3284,7 @@ mod tests {
             error: None,
         };
         let queued = WalRecord::Queued {
+            sent_by: None,
             written_at_ms: None,
             retention: None,
             ts_ms: None,
@@ -4451,6 +4452,7 @@ mod tests {
             })
             .unwrap();
         let pending = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

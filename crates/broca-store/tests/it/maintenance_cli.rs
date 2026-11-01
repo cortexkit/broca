@@ -34,6 +34,7 @@ fn import_records(session: &BindIdentity) -> Vec<FramedRecord> {
             seq: 1,
             fence: 1,
             record: WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,

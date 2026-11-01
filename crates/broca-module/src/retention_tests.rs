@@ -334,6 +334,7 @@ fn archived_expiry_cache_invalidates_on_publication_conflict_and_corruption() {
 
 fn large_expiry_step() -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -1997,6 +1998,7 @@ async fn status_of_expired_large_session_refuses_in_the_status_opener() {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -3256,6 +3258,7 @@ fn seed_owed_question_with_scope_at(
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4421,6 +4424,7 @@ async fn assert_tight_crash_recovery(open_batch: bool) {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -5027,6 +5031,7 @@ async fn missing_materialized_history_is_not_known_empty_ownership() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -5091,6 +5096,7 @@ async fn zero_record_wal_does_not_hide_materialized_ownership_history() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -5162,6 +5168,7 @@ async fn append_repairs_inferred_prior_terminal_before_refusing_new_admission_at
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -5309,6 +5316,7 @@ async fn cold_forever_status_uses_bounded_wal_without_opening_actor() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

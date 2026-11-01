@@ -1272,6 +1272,7 @@ impl StreamNormalizer for OpenAiChatNormalizer {
         out.extend([
             NormalizedEvent::Control(ProviderControl::AssistantMessage { message }),
             NormalizedEvent::Control(ProviderControl::StepFinished {
+                raw_finish_reason: self.raw_finish_reason.take(),
                 step_id: self.step_id,
                 usage: self.usage,
                 finish_reason,

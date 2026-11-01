@@ -19,6 +19,7 @@ fn user(text: &str) -> Message {
 
 fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
     WalRecord::RunStarted {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -69,6 +70,7 @@ fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
 
 fn steered(text: &str) -> WalRecord {
     WalRecord::Steered {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         retention: None,
@@ -127,6 +129,7 @@ fn seeded_episode_coordinates_are_absolute_and_a_steer_is_not_the_first_user() {
 
 fn text_step(step: u64, text: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -146,6 +149,7 @@ fn text_step(step: u64, text: &str) -> WalRecord {
 
 fn call_step(step: u64, call: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,

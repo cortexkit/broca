@@ -2000,6 +2000,8 @@ pub enum RunStatusResponse {
             skip_serializing_if = "Option::is_none"
         )]
         final_step_finish_reason: Option<FinishReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
         /// the field is omitted when no WAL was read.
@@ -2035,6 +2037,8 @@ pub enum RunStatusResponse {
             skip_serializing_if = "Option::is_none"
         )]
         final_step_finish_reason: Option<FinishReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
         /// the field is omitted when no WAL was read.
@@ -2066,6 +2070,8 @@ pub enum RunStatusResponse {
             skip_serializing_if = "Option::is_none"
         )]
         final_step_finish_reason: Option<FinishReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
         /// the field is omitted when no WAL was read.
@@ -2099,6 +2105,8 @@ pub enum RunStatusResponse {
         )]
         final_step_finish_reason: Option<FinishReason>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<cortexkit_role_llm_runner::finish::Finish>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(
             default,
@@ -2126,6 +2134,8 @@ pub enum RunStatusResponse {
         )]
         final_step_finish_reason: Option<FinishReason>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<cortexkit_role_llm_runner::finish::Finish>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(
             default,
@@ -2149,6 +2159,8 @@ pub enum RunStatusResponse {
             skip_serializing_if = "Option::is_none"
         )]
         final_step_finish_reason: Option<FinishReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
         /// the field is omitted when no WAL was read.
@@ -2180,6 +2192,8 @@ pub enum RunStatusResponse {
             skip_serializing_if = "Option::is_none"
         )]
         final_step_finish_reason: Option<FinishReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
         /// the field is omitted when no WAL was read.
@@ -2215,6 +2229,8 @@ pub enum RunStatusResponse {
             skip_serializing_if = "Option::is_none"
         )]
         final_step_finish_reason: Option<FinishReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
         /// the field is omitted when no WAL was read.
@@ -4847,6 +4863,7 @@ mod tests {
         assert_eq!(
             decoded,
             RunStatusResponse::Error {
+                finish: None,
                 auth_selection: None,
                 title: None,
                 final_step_finish_reason: None,
@@ -5639,6 +5656,7 @@ mod title_wire_tests {
         assert_eq!(
             status,
             RunStatusResponse::Completed {
+                finish: None,
                 auth_selection: None,
                 directives: None,
                 final_step_finish_reason: Some(FinishReason::Stop),

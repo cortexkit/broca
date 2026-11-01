@@ -69,6 +69,9 @@ pub enum ProviderControl {
         step_id: StepId,
         usage: Usage,
         finish_reason: FinishReason,
+        /// Provider-native terminal token, never inferred from the canonical reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_finish_reason: Option<String>,
         /// The service tier the provider says it served this step at, verbatim as the
         /// provider spelled it (`default`, `priority`, `standard`, ...). Taken only from
         /// the response (body or response header), never from the request: providers

@@ -648,6 +648,8 @@ pub(crate) struct ApprovalWaitProbe {
 /// emission defaults to "on" so existing callers retain the complete output stream.
 #[derive(Clone)]
 pub struct RunControl {
+    /// Attested input route, kept out of request rendering and admission identity.
+    pub display_sent_by: Option<broca_protocol::BindPrincipal>,
     #[cfg(test)]
     pub(crate) held_prompt_probe: Option<Arc<held_prompt::Probe>>,
     #[cfg(test)]
@@ -860,6 +862,7 @@ impl RunControl {
 impl Default for RunControl {
     fn default() -> Self {
         Self {
+            display_sent_by: None,
             #[cfg(test)]
             held_prompt_probe: None,
             #[cfg(test)]
@@ -5057,6 +5060,7 @@ where
         let admitted_at_ms = control.now_ms();
         output_history.start_run(&cfg.model);
         let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
+            sent_by: control.display_sent_by.clone(),
             written_at_ms: req
                 .input_written_at_ms
                 .or_else(|| {
@@ -6597,6 +6601,7 @@ where
                 usage,
                 retries_used,
                 mut finish_reason,
+                raw_finish_reason,
                 service_tier_used,
                 speed_used,
                 served_model,
@@ -6807,6 +6812,7 @@ where
                                     false,
                                 );
                                 let mut records = vec![WalRecord::ModelStepFinished {
+                                    raw_finish_reason: raw_finish_reason.clone(),
                                     fallback: step_fallback.clone(),
                                     written_at_ms: step_written_at_ms,
                                     tags: None,
@@ -6914,6 +6920,7 @@ where
                         hooks.is_some(),
                         writer,
                         WalRecord::ModelStepFinished {
+                            raw_finish_reason: raw_finish_reason.clone(),
                             fallback: step_fallback,
                             written_at_ms: step_written_at_ms,
                             tags: None,
@@ -6949,6 +6956,7 @@ where
                 // extraction. The prompt reclaims ownership only after the turn is durable.
                 let message = Arc::new(message);
                 let model_record = WalRecord::ModelStepFinished {
+                    raw_finish_reason: raw_finish_reason.clone(),
                     fallback: step_fallback,
                     written_at_ms: step_written_at_ms,
                     tags: None,
@@ -8809,6 +8817,7 @@ enum StepOutcome {
         /// `length`, surface `content_filter`), and recomputing from message shape
         /// alone would silently drop them.
         finish_reason: Option<FinishReason>,
+        raw_finish_reason: Option<String>,
         /// The service tier the provider's response reported for this step, verbatim; `None`
         /// when the response reported none. Never the requested tier.
         service_tier_used: Option<String>,
@@ -9518,6 +9527,7 @@ async fn run_step<P: Provider>(
     let mut tool_args_cuts = Vec::new();
     let mut usage = Usage::default();
     let mut finish_reason: Option<FinishReason> = None;
+    let mut raw_finish_reason = None;
     let mut service_tier_used: Option<String> = None;
     let mut speed_used: Option<String> = None;
     let mut served_model: Option<String> = None;
@@ -9535,6 +9545,7 @@ async fn run_step<P: Provider>(
                 ProviderControl::StepFinished {
                     usage: u,
                     finish_reason: fr,
+                    raw_finish_reason: raw,
                     service_tier_used: tier,
                     speed_used: speed,
                     served_model: served,
@@ -9543,6 +9554,8 @@ async fn run_step<P: Provider>(
                 } => {
                     usage = u;
                     finish_reason = Some(fr);
+                    // Oversized tokens are omitted, not truncated into invented evidence.
+                    raw_finish_reason = raw.filter(|reason| reason.len() <= 64);
                     // Recorded exactly as the provider reported it; absent stays absent.
                     service_tier_used = tier;
                     speed_used = speed;
@@ -9582,6 +9595,7 @@ async fn run_step<P: Provider>(
 
     Ok(match (message, finished) {
         (Some(message), true) => StepOutcome::Completed {
+            raw_finish_reason,
             tool_args_cuts,
             message,
             usage,
@@ -13211,6 +13225,7 @@ mod tests {
             Ok(StepOutcome::Failed { .. })
         ));
         let completed = Ok(StepOutcome::Completed {
+            raw_finish_reason: None,
             tool_args_cuts: Vec::new(),
             message: AssistantMessage {
                 message_id: broca_protocol::ids::MessageId("m".into()),

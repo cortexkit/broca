@@ -195,6 +195,7 @@ fn compacting_manifest() -> broca_wal::PlanManifest {
 
 fn step(step: u64, content: Vec<ContentBlock>, finish: FinishReason) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -247,6 +248,7 @@ fn seed(rig: &Rig, episodes: u64, compacts: bool) {
         let first = 4 * episode;
         let mut records = vec![
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,

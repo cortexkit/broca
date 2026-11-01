@@ -1159,6 +1159,7 @@ impl AdmissionCheckpointV1 {
             }
             WalRecord::Queued {
                 keep_warm,
+                sent_by: display_sent_by,
                 written_at_ms,
                 ts_ms,
                 submission_id,
@@ -1174,6 +1175,7 @@ impl AdmissionCheckpointV1 {
             } => crate::queue::insert_in_drain_order(
                 Arc::make_mut(&mut self.pending_fifo),
                 PendingSubmission {
+                    display_sent_by: display_sent_by.clone(),
                     admitted_at_ms: written_at_ms.or(*ts_ms),
                     hooks: hooks.clone(),
                     conversation_key: conversation_key.clone(),
@@ -3239,6 +3241,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -3273,6 +3276,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -3360,6 +3364,7 @@ mod tests {
         frame(
             seq,
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3448,6 +3453,7 @@ mod tests {
             frame(
                 6,
                 WalRecord::Queued {
+                    sent_by: None,
                     submission_id: SubmissionId("q".into()),
                     request: Box::new(request("private queued input")),
                     request_identity_digest: None,
@@ -5037,6 +5043,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -5228,6 +5235,7 @@ mod tests {
             frame(
                 1,
                 WalRecord::Queued {
+                    sent_by: None,
                     written_at_ms: None,
                     retention: None,
                     ts_ms: None,
@@ -5246,6 +5254,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::Queued {
+                    sent_by: None,
                     written_at_ms: None,
                     retention: None,
                     ts_ms: None,
@@ -5302,6 +5311,7 @@ mod tests {
             frame(
                 10,
                 WalRecord::Queued {
+                    sent_by: None,
                     written_at_ms: None,
                     retention: None,
                     ts_ms: None,
@@ -5321,6 +5331,7 @@ mod tests {
             frame(
                 12,
                 WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -5413,6 +5424,7 @@ mod tests {
             frame(
                 19,
                 WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -5818,6 +5830,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -5893,6 +5906,7 @@ mod tests {
         };
         config.budget = Some(budget.clone());
         let step = |id, content| WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -6030,6 +6044,7 @@ mod tests {
             at_seq: 7,
             last_episode: None,
             pending_fifo: Arc::new(vec![PendingSubmission {
+                display_sent_by: None,
                 admitted_at_ms: None,
                 order: None,
                 sent_by: None,

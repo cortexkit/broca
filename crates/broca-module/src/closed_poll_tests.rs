@@ -20,6 +20,7 @@ impl RunExecutor for TerminalExecutor {
         _out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
         job.writer.record(WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -48,6 +49,7 @@ impl RunExecutor for TerminalExecutor {
             let _ = ack.send(Ok(job.req.run_id.clone()));
         }
         job.writer.record(WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -407,6 +409,7 @@ async fn closed_polls_distinguish_absent_runs_from_a_pending_crash_orphan() {
 
 fn unsealed_start(key: &BindIdentity, run: &RunId) -> WalRecord {
     WalRecord::RunStarted {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -625,6 +628,7 @@ async fn large_closed_session_status_poll_cost_is_independent_of_history() {
             .append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,

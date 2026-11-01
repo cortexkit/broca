@@ -140,21 +140,25 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, RowMetadat
                 senders.insert(submission_id.0.clone(), sent_by.clone());
             }
             WalRecord::Queued {
+                sent_by,
                 submission_id,
                 request_identity_digest,
                 principal,
                 ..
             } => {
-                let principal = senders
-                    .get(&submission_id.0)
-                    .and_then(Option::as_ref)
-                    .or(principal.as_ref());
+                let principal = sent_by.as_ref().or_else(|| {
+                    senders
+                        .get(&submission_id.0)
+                        .and_then(Option::as_ref)
+                        .or(principal.as_ref())
+                });
                 queued.insert(
                     submission_id.0.clone(),
                     send_metadata(request_identity_digest.as_deref(), principal),
                 );
             }
             WalRecord::RunStarted {
+                sent_by,
                 request_identity_digest,
                 principal,
                 submission_id,
@@ -169,18 +173,22 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, RowMetadat
                         .and_then(|id| queued.get(&id.0))
                         .cloned()
                         .unwrap_or_else(|| {
-                            send_metadata(request_identity_digest.as_deref(), principal.as_ref())
+                            send_metadata(
+                                request_identity_digest.as_deref(),
+                                sent_by.as_ref().or(principal.as_ref()),
+                            )
                         });
                 }
             }
             WalRecord::Steered {
+                sent_by,
                 request_identity_digest,
                 input,
                 ..
             } => {
-                // Legacy steers have no recorded principal; do not guess the session owner's.
+                // Legacy steers have no display stamp; do not guess the session owner's.
                 pending.extend(std::iter::repeat_n(
-                    send_metadata(request_identity_digest.as_deref(), None),
+                    send_metadata(request_identity_digest.as_deref(), sent_by.as_ref()),
                     input.len(),
                 ));
             }

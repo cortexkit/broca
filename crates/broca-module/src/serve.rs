@@ -1346,6 +1346,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
     };
     let auth_selection = frozen_auth_selection(&state);
     let final_step_finish_reason = state.final_step_finish_reason;
+    let finish = state.finish;
     let undelivered_steers = state.undelivered_steers;
     let indeterminate_tool_calls = state.indeterminate_tool_calls;
     // `RunUsage` is the published llm-runner type, so it goes on the wire as it is.
@@ -1440,6 +1441,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             reason: None,
             error,
             final_step_finish_reason,
+            finish,
             undelivered_steers,
             indeterminate_tool_calls,
             usage,
@@ -1451,6 +1453,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             auth_selection,
             directives: None,
             final_step_finish_reason,
+            finish,
             undelivered_steers,
             usage,
             retries_used,
@@ -1460,6 +1463,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
         State::MaxSteps => RunStatusResponse::MaxSteps {
             auth_selection,
             final_step_finish_reason,
+            finish,
             undelivered_steers,
             usage,
             retries_used,
@@ -1472,6 +1476,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
                 .budget_detail
                 .expect("budget terminal retains its durable detail"),
             final_step_finish_reason,
+            finish,
             undelivered_steers,
             usage,
             retries_used,
@@ -1484,6 +1489,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
                 .context_ceiling
                 .expect("ceiling terminal retains its durable detail"),
             final_step_finish_reason,
+            finish,
             undelivered_steers,
             usage,
             retries_used,
@@ -1493,6 +1499,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
         State::Cancelled => RunStatusResponse::Cancelled {
             auth_selection,
             final_step_finish_reason,
+            finish,
             undelivered_steers,
             usage,
             retries_used,
@@ -1502,6 +1509,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
         State::Error => RunStatusResponse::Error {
             auth_selection,
             final_step_finish_reason,
+            finish,
             undelivered_steers,
             usage,
             retries_used,
@@ -1512,6 +1520,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
         State::TransformUnavailable => RunStatusResponse::TransformUnavailable {
             auth_selection,
             final_step_finish_reason,
+            finish,
             undelivered_steers,
             usage,
             retries_used,
@@ -3480,6 +3489,7 @@ impl ServeHandler for crate::LineageRegistry {
             .as_ref()
             .map(|state| state.run_usage.clone())
             .unwrap_or_default();
+        let mut finish = state.as_ref().and_then(|state| state.finish.clone());
         let status = run_status_response(state);
         let (mut state, mut reason, mut error) = match status {
             RunStatusResponse::Unknown => return Err(ServeError::UnknownRun(run_id.0)),
@@ -3524,6 +3534,7 @@ impl ServeHandler for crate::LineageRegistry {
                 context_ceiling = reconciled
                     .as_ref()
                     .and_then(|state| state.context_ceiling.clone());
+                finish = reconciled.as_ref().and_then(|state| state.finish.clone());
                 structured_output = reconciled.and_then(|state| state.structured_output);
                 state = serde_json::to_value(reason)
                     .ok()
@@ -3557,6 +3568,11 @@ impl ServeHandler for crate::LineageRegistry {
             None
         };
         let response = broca_wire::RunResultResponse {
+            finish: if matches!(state.as_str(), "active" | "paused") {
+                None
+            } else {
+                finish
+            },
             auth_selection,
             directives,
             usage,
@@ -4420,6 +4436,7 @@ mod held_status_tests {
 
     fn state(index: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            finish: None,
             state: index,
             held_calls: Vec::new(),
             budget_detail: None,
@@ -4524,6 +4541,7 @@ mod paused_auth_tests {
                 broca_protocol::PauseReason::AuthRequired,
             ] {
                 let state = broca_core::ReconciledRunState {
+                    finish: None,
                     held_calls: Vec::new(),
                     run_usage: Default::default(),
                     budget_detail: None,
@@ -4603,6 +4621,7 @@ mod context_ceiling_tests {
     use super::*;
     fn reconciled(state: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            finish: None,
             held_calls: Vec::new(),
             state,
             context_ceiling: None,
@@ -4744,6 +4763,7 @@ mod offset_head_tests {
 
     fn run_started() -> WalRecord {
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4794,6 +4814,7 @@ mod offset_head_tests {
 
     fn text_step() -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

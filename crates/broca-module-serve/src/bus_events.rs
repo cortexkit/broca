@@ -1005,6 +1005,7 @@ pub(crate) mod tests {
         ts_ms: u64,
     ) -> broca_wal::WalRecord {
         broca_wal::WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             run_id: broca_protocol::RunId(run_id.into()),
