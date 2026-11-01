@@ -780,6 +780,153 @@ async fn recorded_waits_are_sealed_without_a_provider() {
     }
 }
 
+#[tokio::test]
+async fn legacy_wait_resume_is_recorded_before_its_only_closure() {
+    use crate::{FileLeaseStore, FileWalStore, RunControl, RunRequest, WalStore};
+    struct NoProvider;
+    #[async_trait::async_trait]
+    impl crate::Provider for NoProvider {
+        async fn step(
+            &self,
+            _: broca_protocol::StepId,
+            _: &broca_protocol::CallOptions,
+        ) -> tokio::sync::mpsc::Receiver<broca_protocol::NormalizedEvent> {
+            panic!("legacy wait recovery must not request a provider step")
+        }
+    }
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../broca-wal/tests/fixtures/pre_flow_scoped_run_started.json"
+    ))
+    .unwrap();
+    let started: WalRecord = serde_json::from_value(fixture["record"].clone()).unwrap();
+    let WalRecord::RunStarted {
+        run_id,
+        session,
+        config,
+        input,
+        scope,
+        principal,
+        project_id,
+        submission_id,
+        send_id,
+        request_identity_digest,
+        ..
+    } = started.clone()
+    else {
+        unreachable!()
+    };
+    let submission = serde_json::from_value(serde_json::json!({"model":config.model,"input":input,"tools":[],"stop_when":[{"type":"step_count","n":1}]})).unwrap();
+    let mut request = RunRequest::from_submission(
+        submission,
+        run_id.clone(),
+        session,
+        broca_protocol::SubmissionId("old-wait".into()),
+    );
+    request.scope = scope;
+    request.principal = principal;
+    request.project_id = project_id;
+    request.submission_id = submission_id;
+    request.send_id = send_id;
+    request.request_identity_digest = request_identity_digest;
+    let root = broca_test_support::scratch_root().join("legacy-wait-resume-marker");
+    let store = FileWalStore::new(root.join("wal"));
+    let mut wal = store.open(&request.session).unwrap();
+    wal.append(1, &started, true).unwrap();
+    wal.append(1, &setup_record(None), true).unwrap();
+    wal.append(
+        1,
+        &WalRecord::CompactionRequest {
+            provider: "provider".into(),
+            request_id: "old-request".into(),
+        },
+        true,
+    )
+    .unwrap();
+    let lineage = wal.lineage_id().unwrap().to_string();
+    wal.append(
+        1,
+        &WalRecord::CompactionAnswer {
+            provider: "provider".into(),
+            request_id: "old-request".into(),
+            cursor: CompactionCursor {
+                lineage_id: lineage,
+                after_ordinal: None,
+            },
+            disposition: CompactionDisposition::Wait,
+            rejected: None,
+            wait: Some(CompactionWait {
+                reason: "work".into(),
+                bound_ms: 10,
+            }),
+        },
+        true,
+    )
+    .unwrap();
+    drop(wal);
+    let before = store.read_records(&request.session).unwrap();
+    let path = store.wal_path(&request.session);
+    let bytes = std::fs::read(&path).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+    let leases = FileLeaseStore::new(root.join("lease"));
+    let summary = crate::run_loop_with_control(
+        request.clone(),
+        &NoProvider,
+        &crate::StubToolPlane::new(),
+        &leases,
+        &crate::AllowAll,
+        &store,
+        None,
+        RunControl::default(),
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.reason, RunFinishReason::Interrupted);
+    let after = store.read_records(&request.session).unwrap();
+    let appended = &after[before.len()..];
+    assert_eq!(
+        appended
+            .iter()
+            .filter(|frame| matches!(frame.record, WalRecord::ResumeStarted { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        matches!(&appended[0].record, WalRecord::ResumeStarted { episode, resumed_from_seq, redone, indeterminate, .. }
+        if episode == &run_id && *resumed_from_seq == before.last().unwrap().seq && redone.is_empty() && indeterminate.is_empty())
+    );
+    assert!(matches!(
+        appended[1].record,
+        WalRecord::CompactionWait {
+            exited: CompactionWaitExit::Interrupted,
+            ..
+        }
+    ));
+    assert!(matches!(
+        appended[2].record,
+        WalRecord::RunFinished {
+            reason: RunFinishReason::Interrupted,
+            ..
+        }
+    ));
+    assert_eq!(appended.len(), 3);
+    assert!(std::fs::read(&path).unwrap().starts_with(&bytes));
+    crate::run_loop_with_control(
+        request.clone(),
+        &NoProvider,
+        &crate::StubToolPlane::new(),
+        &leases,
+        &crate::AllowAll,
+        &store,
+        None,
+        RunControl::default(),
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(store.read_records(&request.session).unwrap(), after);
+}
+
 /// The replacement ceiling is broca's own, independent of configuration: an initial message
 /// of 8 MiB is refused.
 #[test]

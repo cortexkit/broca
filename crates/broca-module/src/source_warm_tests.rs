@@ -1089,6 +1089,75 @@ async fn paused_source_warm_resume_uses_refrozen_auth_and_running_budget() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn legacy_compaction_wait_clears_warmable_prefix_in_fold_and_live_events() {
+    for live in [false, true] {
+        let mut f = Fixture::new(true, false, 300_000, 1000.0).await;
+        f.start().await;
+        f.warm(1).await;
+        assert_eq!(f.executor.provider.bodies.lock().unwrap().len(), 1);
+        if !live {
+            f.stop().await;
+        }
+        f.record(WalRecord::CompactionAnswer {
+            provider: "old-compactor".into(),
+            request_id: "old-wait".into(),
+            cursor: broca_wal::CompactionCursor {
+                lineage_id: f.writer.lineage_id().unwrap().to_string(),
+                after_ordinal: None,
+            },
+            disposition: broca_wal::CompactionDisposition::Wait,
+            rejected: None,
+            wait: Some(broca_wal::CompactionWait {
+                reason: "work".into(),
+                bound_ms: 10,
+            }),
+        })
+        .await;
+        f.record(WalRecord::ResumeStarted {
+            episode: RunId("r".into()),
+            resumed_from_seq: f.writer.durable_head().load(Ordering::Acquire),
+            replayed: Default::default(),
+            redone: vec![],
+            indeterminate: vec![],
+        })
+        .await;
+        f.record(WalRecord::RunFinished {
+            interrupt_reason: None,
+            reason: broca_protocol::RunFinishReason::Interrupted,
+            ts_ms: Some(epoch_ms()),
+            usage: Usage {
+                cached_input_tokens: Some(1000),
+                ..Default::default()
+            },
+            error: None,
+            retries_used: 0,
+        })
+        .await;
+        if !live {
+            f = f.restart().await;
+            f.start().await;
+        }
+        tokio::time::advance(Duration::from_secs(270)).await;
+        f.stopped_or_warmed(1).await;
+        assert_eq!(
+            f.warms().len(),
+            1,
+            "a legacy wait must discard the old warm candidate (live={live})"
+        );
+        assert_eq!(
+            f.executor.provider.bodies.lock().unwrap().len(),
+            1,
+            "no unrecorded warm may be sent after the wait"
+        );
+        assert!(
+            !f.task.as_ref().unwrap().holds_idle.load(Ordering::Acquire),
+            "the candidate must stay cleared after sealing"
+        );
+        f.stop().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn source_review_direct_compaction_message_permanently_stops_the_prefix() {
     let mut f = Fixture::new(true, false, 300_000, 1000.0).await;
     f.start().await;
