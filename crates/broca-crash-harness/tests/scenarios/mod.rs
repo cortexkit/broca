@@ -412,6 +412,7 @@ pub const TEXT_ONLY_MAX_STEPS: Scenario = Scenario {
 pub const ALL: &[Scenario] = &[
     INHERITED_TOOL_SURFACE,
     TWO_EDITS,
+    ONE_EDIT,
     ANTIGRAVITY_IDENTITY,
     BUDGET_NUDGE,
     INPUT_TOKEN_CAP,
