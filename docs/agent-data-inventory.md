@@ -174,6 +174,31 @@ approvals, with the existing actor, lease and move-fence observations. INFO even
 report op, cut id, ref count and elapsed milliseconds, including cancelled calls.
 `health.check.metrics.agent_data_ops` reports each operation's cumulative count.
 
+## Offline reference audit
+
+```sh
+store-maintenance audit-session-refs STATE_ROOT
+```
+
+The audit is read-only, without schema initialization, leases, extraction or WAL
+writers. It streams JSON lines for missing historical logs and verified forked
+lineage-only stubs, then a `{"findings": N}` summary. Exit 0 means no findings,
+1 means findings, and 2 means the audit could not complete. A bind reservation
+holding only identity and address, with no historical-content evidence, is not
+a finding. Runtime and audit share the decision whether historical content is
+still reachable or was deliberately removed. Archive members remain readable;
+expiry records prove removal. The canonical `.moved` ownership marker excludes
+content owned by another machine, as described under **Read and send fencing**.
+
+Each finding includes the reference and bind identity, the state (`missing` or
+`forked_stub`), and any alternate logs with a matching recorded lineage. Candidate
+root names must already be recorded in the store; log addresses cannot be
+reversed into folder names, and the audit never guesses from a caller's current
+folder. Without historical lineage evidence it reports a missing address without
+claiming a matching alternate. It retains compact address/root sets and streams
+references, rather than loading a join of the run history into memory. Findings
+are evidence for repair preview, not permission to merge transcripts.
+
 ## Offline split-root repair
 
 If a historical WAL re-key left a session's run-index rows and refs under two

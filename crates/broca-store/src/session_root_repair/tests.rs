@@ -1207,3 +1207,43 @@ fn changed_preview_is_refused_and_obsolete_census_rows_are_reported() {
     f.store.apply_session_root_repair(&updated).unwrap();
     assert!(f.preview().unwrap().remove_discovery_rows.is_empty());
 }
+
+#[test]
+fn audit_streams_missing_and_forked_refs_with_matching_alternates_read_only() {
+    for stub in [false, true] {
+        let fixture = Fixture::new();
+        fixture.seed_orphaned_projection(false);
+        let wal = broca_core::FileWalStore::new(fixture.root.join("wal"));
+        if stub {
+            drop(wal.open(&fixture.stale).unwrap());
+        }
+        let before = fixture.snapshot();
+        let real = std::fs::read(fixture.wal_path()).unwrap();
+        let stale = std::fs::read(wal.wal_path(&fixture.stale)).ok();
+        let mut findings = Vec::new();
+        assert_eq!(
+            fixture
+                .store
+                .audit_session_refs(|finding| {
+                    findings.push(serde_json::to_value(finding)?);
+                    Ok(())
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(findings[0]["identity"]["session"], fixture.stale.session);
+        assert_eq!(
+            findings[0]["state"],
+            if stub { "forked_stub" } else { "missing" }
+        );
+        assert_eq!(findings[0]["alternatives"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            findings[0]["alternatives"][0]["address"],
+            session_addr(&fixture.live)
+        );
+        assert_eq!(fixture.snapshot(), before);
+        assert_eq!(std::fs::read(fixture.wal_path()).unwrap(), real);
+        assert_eq!(std::fs::read(wal.wal_path(&fixture.stale)).ok(), stale);
+        assert!(!fixture.root.join("leases").exists());
+    }
+}

@@ -49,6 +49,7 @@ pub mod retention;
 pub mod retention_withdrawals;
 pub mod session_address;
 pub mod session_log_evidence;
+pub mod session_ref_audit;
 pub mod session_refs;
 pub mod session_root_repair;
 pub mod system_one;
