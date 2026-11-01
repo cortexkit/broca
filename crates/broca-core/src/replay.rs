@@ -3633,6 +3633,9 @@ pub struct RunUsageProjection {
     active: bool,
     model: Option<(broca_protocol::request::ModelHandle, Option<String>)>,
     final_attempt: Option<generation::AttemptTiming>,
+    tier_usage: cortexkit_role_llm_runner::service_tier::RunServiceTierUsage,
+    tier_reported: bool,
+    final_tier_report: Option<String>,
     pub usage: broca_protocol::usage::RunUsage,
 }
 
@@ -3643,6 +3646,9 @@ impl RunUsageProjection {
             active: false,
             model: None,
             final_attempt: None,
+            tier_usage: Default::default(),
+            tier_reported: false,
+            final_tier_report: None,
             usage: Default::default(),
         }
     }
@@ -3657,14 +3663,38 @@ impl RunUsageProjection {
                 self.active = run_id == &self.run_id;
                 if self.active {
                     self.model = Some((config.model.clone(), config.variant.clone()));
+                    if broca_protocol::service_tier_enabled() {
+                        let level =
+                            broca_protocol::frozen_service_tier(&config.frozen_render_config);
+                        self.usage.service_tier_applied =
+                            (level != "standard").then(|| level.to_owned());
+                        self.tier_reported = matches!(
+                            config
+                                .frozen_render_config
+                                .get("family_id")
+                                .and_then(serde_json::Value::as_str),
+                            Some(
+                                "openai_chat"
+                                    | "openai_responses"
+                                    | "openai_responses_chatgpt"
+                                    | "anthropic_messages"
+                                    | "gemini"
+                            )
+                        );
+                    }
                 }
                 self.final_attempt = None;
+                self.final_tier_report = None;
             }
-            WalRecord::StepStarted { .. } if self.active => self.final_attempt = None,
+            WalRecord::StepStarted { .. } if self.active => {
+                self.final_attempt = None;
+                self.final_tier_report = None;
+            }
             WalRecord::ModelAttemptFinished {
                 step_id,
                 sent_at_ms,
                 content_progress,
+                envelope,
                 ..
             } if self.active => {
                 // Replace even an unmeasured attempt: a retry's timing never belongs to
@@ -3675,10 +3705,52 @@ impl RunUsageProjection {
                     first: content_progress.first_content_at_ms,
                     last: content_progress.last_content_at_ms,
                 });
+                self.final_tier_report =
+                    if broca_protocol::service_tier_enabled() && self.tier_reported {
+                        envelope
+                            .as_ref()
+                            .and_then(|envelope| {
+                                envelope
+                                    .speed_used
+                                    .as_deref()
+                                    .or(envelope.service_tier_used.as_deref())
+                            })
+                            .map(abstract_served_tier)
+                    } else {
+                        None
+                    };
             }
             WalRecord::ModelStepFinished { .. } | WalRecord::ModelStepRefused { .. }
                 if self.active =>
             {
+                if broca_protocol::service_tier_enabled() {
+                    let mut step =
+                        cortexkit_role_llm_runner::service_tier::ServiceTierUsage::default();
+                    step.service_tier_applied
+                        .clone_from(&self.usage.service_tier_applied);
+                    if self.tier_reported {
+                        if let WalRecord::ModelStepFinished {
+                            service_tier_used,
+                            speed_used,
+                            ..
+                        } = record
+                        {
+                            step.service_tier_served = speed_used
+                                .as_deref()
+                                .or(service_tier_used.as_deref())
+                                .map(abstract_served_tier);
+                        } else if matches!(record, WalRecord::ModelStepRefused { .. }) {
+                            // Refused source calls are billed too; only a recorded envelope can
+                            // supply their report because legacy refusal records have no tier.
+                            step.service_tier_served = self.final_tier_report.take();
+                        }
+                    }
+                    self.tier_usage
+                        .record_step(&step)
+                        .expect("applied tier is a known non-standard level or absent");
+                    self.usage.service_tier_served = self.tier_usage.usage().service_tier_served;
+                }
+                self.final_tier_report = None;
                 // A refused call was billed, so it counts as a call of the model that refused.
                 if let Some((model, variant)) = &self.model {
                     let variant = variant.as_deref().filter(|value| !value.is_empty());
@@ -3702,6 +3774,16 @@ impl RunUsageProjection {
             _ => {}
         }
     }
+}
+
+fn abstract_served_tier(tier: &str) -> String {
+    match tier {
+        "default" | "standard_only" | "STANDARD" | "DEFAULT" => "standard",
+        "priority" | "PRIORITY" | "FAST" => "fast",
+        "ULTRAFAST" => "ultrafast",
+        other => other,
+    }
+    .to_owned()
 }
 
 mod generation;

@@ -143,6 +143,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
     let media = broca_module_serve::config::MediaConfig::load_default().map_err(ServeIoError)?;
     broca_protocol::configure_media(media.enabled).map_err(|error| ServeIoError(error.into()))?;
+    let service_tier =
+        broca_module_serve::config::ServiceTierConfig::load_default().map_err(ServeIoError)?;
+    broca_protocol::configure_service_tier(service_tier.enabled)
+        .map_err(|error| ServeIoError(error.into()))?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
         .map_err(ServeIoError)?;
     let bus_event_config =
@@ -3696,6 +3700,70 @@ mod executor {
 
     #[async_trait]
     impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
+        fn check_service_tier(
+            &self,
+            request: &broca_protocol::request::SubmissionRequest,
+        ) -> Result<(), String> {
+            let Some(level) = request.service_tier_level.as_deref() else {
+                return Ok(());
+            };
+            if level == "standard" {
+                return Ok(());
+            }
+            let catalog = broca_catalog::catalog()
+                .map_err(|error| format!("service_tier {level:?}: catalog unavailable: {error}"))?;
+            let (provider, _) = catalog
+                .model_for_serving(&request.model.provider_module_id, &request.model.model_id)
+                .ok_or_else(|| {
+                    format!(
+                        "service_tier {level:?}: unknown model {}/{}",
+                        request.model.provider_module_id, request.model.model_id
+                    )
+                })?;
+            let (pin, account) =
+                caller_auth_for_episode(request.auth.as_ref(), EpisodeAuthContext::FreshSession)
+                    .map_err(|error| format!("service_tier {level:?}: {error}"))?;
+            let method = if self.provider_base_url.is_some() {
+                None
+            } else {
+                self.vault
+                    .as_ref()
+                    .map(|vault| {
+                        broca_module_serve::auth_routing::resolve_credential_id(
+                            &request.model.provider_module_id,
+                            pin,
+                            account,
+                            &vault.methods,
+                            FALLBACK_METHOD,
+                        )
+                        .method
+                    })
+                    .or(pin)
+            };
+            let family = match method.and_then(family_for_method) {
+                Some(family) => family,
+                None if catalog
+                    .routing_facts(&request.model.provider_module_id, &request.model.model_id)
+                    .is_some() =>
+                {
+                    catalog
+                        .resolve_route(&request.model.provider_module_id, &request.model.model_id)
+                        .map_err(|error| format!("service_tier {level:?}: {error}"))?
+                        .0
+                }
+                None => provider.wire_family,
+            };
+            broca_catalog::live::check_service_tier_level(
+                family,
+                level,
+                &provider.id,
+                &format!(
+                    "{}/{}",
+                    request.model.provider_module_id, request.model.model_id
+                ),
+                &catalog.priced_modes(&request.model.provider_module_id, &request.model.model_id),
+            )
+        }
         fn source_warm_enabled(&self) -> bool {
             self.anthropic_fallbacks.refusal_resend.is_enabled()
         }
@@ -4821,6 +4889,7 @@ mod executor {
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
         include!("queued_service_tier_tests.rs");
+        include!("service_tier_writer_tests.rs");
         include!("vault_request_tests.rs");
         include!("role_plane_tests.rs");
         include!("admission_wal_read_budget_tests.rs");

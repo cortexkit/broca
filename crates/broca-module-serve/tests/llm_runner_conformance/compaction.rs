@@ -169,6 +169,23 @@ impl subc_client_rs::ModuleHandler for Provider {
             return response(answer);
         }
         if method == "compaction.ride" {
+            if request["params"]["cause"] == "service_tier_change" {
+                let handle = ctx.route_handle();
+                if let Some(bind) = self
+                    .binds
+                    .lock()
+                    .unwrap()
+                    .get(&(handle.channel, handle.epoch))
+                {
+                    self.shared
+                        .service_tier_rides
+                        .lock()
+                        .unwrap()
+                        .entry(bind.session.clone())
+                        .or_default()
+                        .push(request["params"].clone());
+                }
+            }
             return response(json!({"answer":"nothing"}));
         }
         if method != "compaction.setup" {
@@ -398,7 +415,7 @@ fn translate(state: &Session, wire: &[Value]) -> Result<Vec<ModelEntry>, String>
     let mut entries = Vec::new();
     let mut at = 0;
     while at < wire.len() {
-        // Compaction plans carry session identity in the model id, never in system text.
+        // These compaction transcript fixtures carry session identity in the model id.
         // Reject an unexpected system message instead of hiding it from capture comparison.
         if wire[at]["role"] == "system" {
             return Err("unexpected system message in compaction model input".into());

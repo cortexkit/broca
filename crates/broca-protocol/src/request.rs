@@ -572,7 +572,7 @@ pub struct SubmissionRequest {
     /// Abstract tier retained by a queued send from a newer writer. Separate from the legacy
     /// provider-tier enum so old recorded requests keep their vocabulary. Records preserve
     /// unfamiliar strings; admission must refuse a level it cannot apply rather than downgrade it.
-    /// This reader accepts the member, but public send admission does not populate it yet.
+    /// The boot-gated serve writer populates this independently of the legacy tier member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier_level: Option<String>,
     #[serde(default)]

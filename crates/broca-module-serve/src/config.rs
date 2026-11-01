@@ -1,6 +1,77 @@
 //! Operator policy for model tools. Missing configuration is deliberately conservative:
 //! private content stays within the explicitly trusted provider set.
 
+/// Opt-in writer policy for the `service-tier-queue/v1` representation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServiceTierConfig {
+    pub enabled: bool,
+}
+
+impl ServiceTierConfig {
+    pub fn load_default() -> Result<Self, String> {
+        match crate::CacheTtlTable::default_path() {
+            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
+            crate::config_home::ConfigHome::Resolved { path, .. } => {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => Self::parse(&text),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(Self::default())
+                    }
+                    Err(error) => Err(format!(
+                        "read service_tier from {}: {error}",
+                        path.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let mut file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|error| format!("parse service_tier.enabled: {error}"))?;
+        match file.remove("service_tier") {
+            None => Ok(Self::default()),
+            Some(value) => serde_json::from_value(value)
+                .map_err(|error| format!("service_tier.enabled: {error}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod service_tier_config_tests {
+    use super::ServiceTierConfig;
+
+    #[test]
+    fn service_tier_defaults_off_and_refuses_malformed_switches_by_name() {
+        for text in [
+            "{}",
+            r#"{"service_tier":{}}"#,
+            r#"{"service_tier":{"enabled":false}}"#,
+        ] {
+            assert!(!ServiceTierConfig::parse(text).unwrap().enabled);
+        }
+        assert!(
+            ServiceTierConfig::parse(r#"{"service_tier":{"enabled":true}}"#)
+                .unwrap()
+                .enabled
+        );
+        for text in [
+            r#"{"service_tier":true}"#,
+            r#"{"service_tier":{"enabled":"yes"}}"#,
+            r#"{"service_tier":null}"#,
+            r#"{"service_tier":{"enable":true}}"#,
+        ] {
+            assert!(ServiceTierConfig::parse(text)
+                .unwrap_err()
+                .contains("service_tier.enabled"));
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmToolsConfig {

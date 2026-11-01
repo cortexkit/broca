@@ -5913,6 +5913,9 @@ where
                 .auth_selection
                 .as_ref()
                 .and_then(crate::compaction::view::selection_account_label);
+            state.current_service_tier = broca_protocol::service_tier_enabled().then(|| {
+                broca_protocol::frozen_service_tier(&provider.render_config_blob()).to_owned()
+            });
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
             if !Box::pin(runtime.apply_due_view(
                 state,

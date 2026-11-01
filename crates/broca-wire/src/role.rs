@@ -477,12 +477,42 @@ pub fn broca_role_describe_with_writers(
             2_592_000, 3_600_000,
         ));
     }
+    if broca_protocol::service_tier_enabled() {
+        describe
+            .capabilities
+            .push(cortexkit_role_llm_runner::capabilities::SERVICE_TIER.into());
+        describe = describe.with_service_tiers(service_tiers());
+    }
     RoleDescribeResponse {
         role: describe,
         session_class: SessionClassCapability {
             backup_classes: vec!["head".into()],
         },
     }
+}
+
+/// Family support is an upper bound; admission also requires that model's priced mode.
+fn service_tiers() -> cortexkit_role_llm_runner::service_tier::ServiceTiers {
+    use cortexkit_role_llm_runner::service_tier::{Served, ServiceTier, Support};
+    [
+        (
+            "openai.responses",
+            vec![ServiceTier::Fast, ServiceTier::Ultrafast],
+        ),
+        (
+            "openai.chatgpt_responses",
+            vec![ServiceTier::Fast, ServiceTier::Ultrafast],
+        ),
+        (
+            "openai.chat_completions",
+            vec![ServiceTier::Fast, ServiceTier::Ultrafast],
+        ),
+        ("anthropic.messages", vec![ServiceTier::Fast]),
+        ("google.generate_content", vec![ServiceTier::Fast]),
+    ]
+    .into_iter()
+    .map(|(wire, levels)| (wire.into(), Support::new(levels, Served::Reported)))
+    .collect()
 }
 
 impl RoleDescribeResponse {
