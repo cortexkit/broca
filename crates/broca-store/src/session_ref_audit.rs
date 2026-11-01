@@ -56,7 +56,11 @@ impl SqliteStore {
                 if address != session_addr(&identity) {
                     return Err("session_ref_address_mismatch".into());
                 }
-                let state = session_log_evidence::log_state(&tx, &identity, &wal)?;
+                let state = session_log_evidence::log_state(
+                    || session_log_evidence::evidence(&tx, &identity),
+                    &identity,
+                    &wal,
+                )?;
                 if !state.missing_history() {
                     continue;
                 }

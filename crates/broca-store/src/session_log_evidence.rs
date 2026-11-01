@@ -35,7 +35,15 @@ impl SqliteStore {
         session: &BindIdentity,
         wal: &dyn broca_core::WalStore,
     ) -> Result<SessionLogState, String> {
-        log_state(&self.conn.lock().unwrap(), session, wal).map_err(|error| error.to_string())
+        log_state(
+            || {
+                let conn = self.conn.lock().unwrap();
+                evidence(&conn, session)
+            },
+            session,
+            wal,
+        )
+        .map_err(|error| error.to_string())
     }
     pub fn session_log_evidence(
         &self,
@@ -50,8 +58,10 @@ impl SqliteStore {
 /// ordinary logs: a forked stub requires a verified, record-free WAL and a lineage
 /// different from recorded history. A new subscriber's first lineage remains
 /// legitimate, as does a fresh lineage after proven deliberate removal.
+/// Evidence is loaded lazily so the filesystem fast path never locks the store's
+/// database connection. Offline callers can reuse their existing read snapshot.
 pub(crate) fn log_state(
-    conn: &Connection,
+    load_evidence: impl FnOnce() -> Result<SessionLogEvidence, EvidenceError>,
     session: &BindIdentity,
     wal: &dyn broca_core::WalStore,
 ) -> Result<SessionLogState, EvidenceError> {
@@ -70,7 +80,7 @@ pub(crate) fn log_state(
     {
         return Ok(SessionLogState::Available);
     }
-    let history = evidence(conn, session)?;
+    let history = load_evidence()?;
     if !history.content {
         return Ok(SessionLogState::Unwritten);
     }

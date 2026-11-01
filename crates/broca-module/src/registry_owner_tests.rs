@@ -1968,3 +1968,44 @@ async fn a_full_dispatch_cache_evicts_one_session_not_all() {
         "the session cached longest ago is the one evicted"
     );
 }
+
+/// Manual wall-time and syscall probe; no latency threshold belongs in CI.
+#[tokio::test]
+#[ignore = "manual check_session_log fast-path measurement"]
+async fn session_log_guard_available_fast_path_measurement() {
+    let fixture = Fixture::new();
+    fixture.append(&[started(&fixture.session, None, None), finished()]);
+    let store = fixture.sqlite();
+    let registry = LineageRegistry::new_with_reader(
+        Arc::new(NeverOpener),
+        fixture.wal.clone(),
+        Some(store.clone()),
+    );
+    registry.set_session_address_inventory(store);
+    broca_wal::migration::rebuild_fence_index(&fixture.root).unwrap();
+    let bytes = fixture
+        .wal
+        .live_wal_bytes(&fixture.session)
+        .unwrap()
+        .unwrap();
+    assert!(bytes > broca_wal::framing::LINEAGE_FRAME_LEN as u64);
+    for _ in 0..20 {
+        registry.check_session_log(&fixture.session).await.unwrap();
+    }
+    const ITERATIONS: usize = 1000;
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    eprintln!(
+        "CHECK_SESSION_LOG_BEGIN root={} iterations={ITERATIONS} wal_bytes={bytes}",
+        fixture.root.display()
+    );
+    let whole = std::time::Instant::now();
+    for _ in 0..ITERATIONS {
+        let start = std::time::Instant::now();
+        registry.check_session_log(&fixture.session).await.unwrap();
+        samples.push(start.elapsed().as_nanos());
+    }
+    let elapsed = whole.elapsed().as_nanos();
+    samples.sort_unstable();
+    eprintln!("CHECK_SESSION_LOG_END iterations={ITERATIONS} total_ns={elapsed} mean_ns={} p50_ns={} p99_ns={}",
+        elapsed / ITERATIONS as u128, samples[ITERATIONS / 2], samples[ITERATIONS * 99 / 100 - 1]);
+}

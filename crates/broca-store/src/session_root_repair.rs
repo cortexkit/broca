@@ -339,7 +339,12 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
         )?;
         match alternatives.as_slice() {
             [] => {
-                if crate::session_log_evidence::log_state(conn, &recorded, &wal)?.missing_history()
+                if crate::session_log_evidence::log_state(
+                    || crate::session_log_evidence::evidence(conn, &recorded),
+                    &recorded,
+                    &wal,
+                )?
+                .missing_history()
                 {
                     return Err("real_log_not_found: no independently recorded root has a matching historical lineage".into());
                 }
@@ -367,8 +372,11 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
     } else {
         let mut forked = Vec::new();
         for (address, identity) in &roots {
-            if crate::session_log_evidence::log_state(conn, identity, &wal)?
-                == crate::session_log_evidence::SessionLogState::ForkedStub
+            if crate::session_log_evidence::log_state(
+                || crate::session_log_evidence::evidence(conn, identity),
+                identity,
+                &wal,
+            )? == crate::session_log_evidence::SessionLogState::ForkedStub
             {
                 forked.push(address);
             }
