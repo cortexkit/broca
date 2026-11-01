@@ -50,14 +50,22 @@ fn native_finish_events(
     use broca_protocol::{AssistantMessage, MessageId, NormalizedEvent, ProviderControl, Usage};
     vec![
         NormalizedEvent::Control(ProviderControl::AssistantMessage {
-            message: AssistantMessage { message_id: MessageId("native-finish".into()), content },
+            message: AssistantMessage {
+                message_id: MessageId("native-finish".into()),
+                content,
+            },
         }),
-        NormalizedEvent::Control(serde_json::from_value(serde_json::json!({
-            "type":"step_finished", "step_id":1, "usage":{},
-            "finish_reason":legacy, "raw_finish_reason":raw,
-        })).unwrap()),
+        NormalizedEvent::Control(
+            serde_json::from_value(serde_json::json!({
+                "type":"step_finished", "step_id":1, "usage":{},
+                "finish_reason":legacy, "raw_finish_reason":raw,
+            }))
+            .unwrap(),
+        ),
         NormalizedEvent::Control(ProviderControl::Finished {
-            usage: Usage::default(), finish_reason: legacy, retries_used: 0,
+            usage: Usage::default(),
+            finish_reason: legacy,
+            retries_used: 0,
         }),
     ]
 }
@@ -70,17 +78,29 @@ async fn finish_reason_reports_provider_limits_without_a_caller_cap_on_every_fam
         (Family::AnthropicMessages, "max_tokens"),
         (Family::OpenAiChat, "length"),
         (Family::OpenAiResponses, "incomplete:max_output_tokens"),
-        (Family::OpenAiResponsesChatgpt, "incomplete:max_output_tokens"),
+        (
+            Family::OpenAiResponsesChatgpt,
+            "incomplete:max_output_tokens",
+        ),
         (Family::Gemini, "MAX_TOKENS"),
         (Family::GoogleCodeAssist, "MAX_TOKENS"),
         (Family::BedrockConverse, "max_tokens"),
     ] {
         let mut rig = Rig::start(&format!("native-limit-{family:?}")).await;
-        *rig.script.media_frozen.lock().unwrap() = Some(broca_provider::families::frozen_config_for_family(family, "fake"));
-        rig.script.normalized_steps.lock().unwrap().push_back(native_finish_events(
-            Some(raw), broca_protocol::FinishReason::Length,
-            vec![ContentBlock::Text { text: "provider-limited reply".into() }],
-        ));
+        let mut frozen = broca_provider::families::frozen_config_for_family(family, "fake");
+        frozen.project_id = Some("fixture-project".into());
+        *rig.script.media_frozen.lock().unwrap() = Some(frozen);
+        rig.script
+            .normalized_steps
+            .lock()
+            .unwrap()
+            .push_back(native_finish_events(
+                Some(raw),
+                broca_protocol::FinishReason::Length,
+                vec![ContentBlock::Text {
+                    text: "provider-limited reply".into(),
+                }],
+            ));
         let sent = rig.send("native-limit", "no caller output cap", None).await;
         let run = result(&sent)["run_id"].as_str().unwrap().to_owned();
         rig.wait_for_finished(1).await;
@@ -89,13 +109,22 @@ async fn finish_reason_reports_provider_limits_without_a_caller_cap_on_every_fam
         let status = call(&mut rig, "run.status", serde_json::json!({"run_id":run})).await;
         let output = result(&output);
         let status = result(&status);
-        assert_eq!(status["final_step_finish_reason"], "length", "legacy field: {family:?}");
+        assert_eq!(
+            status["final_step_finish_reason"], "length",
+            "legacy field: {family:?}"
+        );
         if output["finish"] != "length" || status["finish"] != "length" {
-            missing.push(format!("{family:?}: result={} status={}", output["finish"], status["finish"]));
+            missing.push(format!(
+                "{family:?}: result={} status={}",
+                output["finish"], status["finish"]
+            ));
         }
         rig.finish().await;
     }
-    assert!(missing.is_empty(), "provider length evidence was not served: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "provider length evidence was not served: {missing:?}"
+    );
 }
 
 #[tokio::test]
