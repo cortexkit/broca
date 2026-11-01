@@ -44,14 +44,17 @@ pub enum WalFormat {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WalConfig {
     pub format: WalFormat,
+    pub recovery: crate::recovery::RecoveryPolicy,
 }
 
 impl WalConfig {
     pub const LEGACY: Self = Self {
         format: WalFormat::Legacy,
+        recovery: crate::recovery::RecoveryPolicy::Repair,
     };
     pub const OVERHAUL: Self = Self {
         format: WalFormat::Overhaul,
+        recovery: crate::recovery::RecoveryPolicy::Repair,
     };
 
     pub fn is_overhaul(self) -> bool {

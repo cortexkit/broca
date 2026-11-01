@@ -2267,7 +2267,7 @@ pub(crate) fn text_turn(seq_base: u64, step: u64, text: &str) -> Vec<FramedRecor
     ]
 }
 
-fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
+pub(crate) fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
     let batch_id = BatchId(format!("b{step}"));
     let tool_call_id = ToolCallId(format!("c{step}"));
     vec![

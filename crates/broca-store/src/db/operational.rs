@@ -76,6 +76,7 @@ impl DiagnosticEvidenceReader for OverhaulDb {
                 Ok(rows)
             };
             Ok(Evidence {
+                pending_recovery: Vec::new(),
                 live:read("r.state IN ('active','paused')",false,true)?,
                 errors:read("r.state='error'",true,false)?,
                 interruptions:read("r.state IN ('interrupted','transform_unavailable')",true,false)?,
@@ -97,6 +98,7 @@ pub fn operational_database_name(root: &std::path::Path) -> Result<&'static str,
 
 pub fn open_diagnostic_reader(
     root: &std::path::Path,
+    config: broca_wal::WalConfig,
 ) -> Result<Box<dyn DiagnosticEvidenceReader>, String> {
     if operational_database_name(root)? == "broca.db" {
         OverhaulDb::open_read_only(root)
@@ -104,7 +106,7 @@ pub fn open_diagnostic_reader(
             .map_err(|e| e.to_string())
     } else {
         crate::SqliteStore::open_read_only(root.join("run-index.db"))
-            .map(|db| Box::new(db) as Box<dyn DiagnosticEvidenceReader>)
+            .map(|db| Box::new(db.with_wal_config(config)) as Box<dyn DiagnosticEvidenceReader>)
             .map_err(|e| e.to_string())
     }
 }

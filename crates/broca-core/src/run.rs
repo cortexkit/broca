@@ -1921,6 +1921,22 @@ where
     A: ApprovalPolicy,
     W: WalStore,
 {
+    if let Some(store) = &store {
+        wal_store.bind_recovery_projection(Some(&req.session), store.clone());
+        if !writer.recovery_cut_ids().is_empty()
+            && store
+                .needs_wal_recovery_projection(&req.session, writer.recovery_cut_ids())
+                .map_err(RunError::Wal)?
+        {
+            let head = writer
+                .durable_head()
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let full = wal_store.read_records_range(&req.session, 0, Some(head), None)?;
+            store
+                .reproject_wal_recovery(&req.session, &full)
+                .map_err(RunError::Wal)?;
+        }
+    }
     #[cfg(feature = "test-clock")]
     let test_control = {
         let mut control = control.clone();
@@ -2119,7 +2135,7 @@ where
 {
     require_agent_run_scope_writer(req.scope.as_ref())?;
     let mut offset_prior = None;
-    let snapshot = if let Some(prepared) = offsets {
+    let mut snapshot = if let Some(prepared) = offsets {
         if prior_snapshot_matches_writer_head(writer, &prepared.snapshot)
             && prepared.lineage == writer.lineage_id()
         {
@@ -2195,6 +2211,20 @@ where
     writer.seed_lineage_tags(lineage_tags);
     if offset_prior.is_none() {
         seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
+    }
+    if !writer.recovery_cut_ids().is_empty() {
+        if snapshot.base_watermark != 0 {
+            snapshot = complete_snapshot(wal_store, &req.session)?;
+            offset_prior = None;
+        }
+        if crate::recovery_close_out::complete(writer, &snapshot.tail)
+            .await
+            .map_err(|error| RunError::Wal(error.to_string()))?
+        {
+            snapshot = complete_snapshot(wal_store, &req.session)?;
+            offset_prior = None;
+            seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
+        }
     }
     let episode = snapshot.checkpoint_at_head.last_episode.as_ref();
     let is_resume = episode.is_some();
@@ -2595,6 +2625,9 @@ where
     A: ApprovalPolicy,
     W: WalStore,
 {
+    if let Some(store) = &store {
+        wal_store.bind_recovery_projection(Some(&req.session), store.clone());
+    }
     // PER-RUN writer: spawn it, run the body on it, then `shutdown().await` it BEFORE the
     // caller drops the lease (so a superseded writer can never append after a new run
     // acquires the session). The coordinator uses `run_loop_on_writer` instead with a
@@ -9642,6 +9675,8 @@ async fn run_step<P: Provider>(
 /// gets a `tool_result` without reaching the plane; and a `Dispatch` call gets an intent
 /// followed by a `tool_result`.
 enum CallPlan {
+    /// Recovery retained attribution but removed the intent/result bytes.
+    Recovered(ToolCallId),
     /// Approved (input possibly narrowed) — dispatch through the plane.
     Dispatch(PlannedDispatch),
     /// Refused before dispatch (capability/denial/plane-down). Carries ONLY the
@@ -9684,9 +9719,9 @@ fn call_plan_id(plan: &CallPlan) -> ToolCallId {
         CallPlan::HookTerminal { result, .. } | CallPlan::Synthetic { result, .. } => {
             result.tool_call_id.clone()
         }
-        CallPlan::NoDispatch { tool_call_id, .. } | CallPlan::Stopped(tool_call_id) => {
-            tool_call_id.clone()
-        }
+        CallPlan::NoDispatch { tool_call_id, .. }
+        | CallPlan::Stopped(tool_call_id)
+        | CallPlan::Recovered(tool_call_id) => tool_call_id.clone(),
     }
 }
 
@@ -9774,17 +9809,13 @@ fn held_resume_intents(
             };
             let mut dispatch = PlannedDispatch::from(call.clone());
             dispatch.input = Arc::clone(args);
-            dispatch.call_key = call_key.clone().or_else(|| {
-                writer
-                    .lineage_id()
-                    .map(|lineage| crate::context::call_key(lineage, frame.seq))
-            });
+            dispatch.call_key = call_key.clone().or_else(|| writer.call_key(frame.seq));
             if let Some(key) = call_key {
                 dispatch.approved = frames.iter().find_map(|frame| match &frame.record {
                     WalRecord::ToolCallDeferred { args_jcs, .. }
-                        if writer.lineage_id().is_some_and(|lineage| {
-                            crate::context::call_key(lineage, frame.seq) == *key
-                        }) =>
+                        if writer
+                            .call_key(frame.seq)
+                            .is_some_and(|found| found == *key) =>
                     {
                         Some(args_jcs.clone())
                     }
@@ -9809,6 +9840,11 @@ fn step_attempt_was_args_cut(frames: &[broca_wal::FramedRecord], step_id: StepId
             if *attempted_step == step_id && outcome.as_str() == "tool_args_trailing_garbage"))
 }
 
+// A torn batch start is inferred from the owning run and model step during recovery.
+pub(crate) fn tool_batch_id(run_id: &RunId, step_id: StepId) -> BatchId {
+    BatchId(format!("{}-b{}", run_id.0, step_id.0))
+}
+
 fn tool_args_rejection_records(
     run_id: &RunId,
     step_id: StepId,
@@ -9819,7 +9855,7 @@ fn tool_args_rejection_records(
     if rejected.is_empty() {
         return (Vec::new(), None);
     }
-    let batch_id = BatchId(format!("{}-b{}", run_id.0, step_id.0));
+    let batch_id = tool_batch_id(run_id, step_id);
     let mut records = Vec::new();
     if !batch_already_started {
         records.push(WalRecord::ToolBatchStarted {
@@ -9952,7 +9988,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     out: &mpsc::Sender<OutputEvent>,
     ordered: Option<&RunControl>,
 ) -> Result<BatchOutcome, RunError> {
-    let batch_id = BatchId(format!("{}-b{}", run_id.0, step_id.0));
+    let batch_id = tool_batch_id(run_id, step_id);
     let ctx = BatchCtx {
         media_capture: writer.media_capture(),
         batch_id: batch_id.clone(),
@@ -10082,6 +10118,22 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
             .and_then(|results| results.pop_front())
         {
             plan.push(CallPlan::Already(prior));
+            continue;
+        }
+        if writer.recovery_tombstoned(
+            run_id,
+            &call.tool_call_id,
+            &batch_id,
+            Some(step_id),
+            existing_intents
+                .get(&call.tool_call_id)
+                .and_then(|dispatch| dispatch.call_key.as_deref()),
+        ) || existing_intents
+            .get(&call.tool_call_id)
+            .and_then(|dispatch| dispatch.call_key.as_deref())
+            .is_some_and(|key| writer.recovery_tombstoned_key(key))
+        {
+            plan.push(CallPlan::Recovered(call.tool_call_id.clone()));
             continue;
         }
         if let Some(dispatch) = existing_intents.remove(&call.tool_call_id) {
@@ -10292,9 +10344,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                             call_key: None,
                         })
                         .into_result()?;
-                    c.call_key = writer
-                        .lineage_id()
-                        .map(|lineage| crate::context::call_key(lineage, seq));
+                    c.call_key = writer.call_key(seq);
                 }
                 CallPlan::NoDispatch {
                     tool_call_id,
@@ -10327,7 +10377,10 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                         provider_held: None,
                     });
                 }
-                CallPlan::Synthetic { .. } | CallPlan::Already(_) | CallPlan::Stopped(_) => {}
+                CallPlan::Synthetic { .. }
+                | CallPlan::Already(_)
+                | CallPlan::Stopped(_)
+                | CallPlan::Recovered(_) => {}
             }
         }
         writer.sync().await?;
@@ -10395,6 +10448,19 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                         provider_held: None,
                     });
                 }
+                CallPlan::Recovered(tool_call_id) => {
+                    writer.record(WalRecord::ToolResult {
+                        finished_at_ms: None,
+                        tags: None,
+                        hooks: None,
+                        batch_id: batch_id.clone(),
+                        result: Arc::new(crate::resume::outcome_unknown_result(tool_call_id)),
+                        outcome: DispatchOutcome::Unknown,
+                        reason: Some("wal_recovery_cut".into()),
+                        withdraw_elicitation: None,
+                        provider_held: None,
+                    });
+                }
                 CallPlan::Dispatch(_) | CallPlan::Already(_) => {}
             }
         }
@@ -10412,17 +10478,20 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
 
         let mut resolutions: Vec<CallResolution> = Vec::with_capacity(plan.len());
         for p in plan {
-            resolutions.push(resolve(p, &ctx, tool_plane, cancel, stop).await);
+            let recovered = matches!(p, CallPlan::Recovered(_));
+            let resolution = resolve(p, &ctx, tool_plane, cancel, stop).await;
+            debug_assert!(
+                !resolution.ambiguous || recovered,
+                "a no-dispatch plan may be ambiguous only for a recovered call"
+            );
+            resolutions.push(resolution);
         }
-        debug_assert!(
-            !resolutions.iter().any(|r| r.ambiguous),
-            "a plan with no dispatches must not produce ambiguous results"
-        );
-        // No call of this batch was sent, so no result is ambiguous. A scope drain seen at batch
-        // start still stops the run: every later call in the run would meet the same closed
-        // scope. A call the stop request kept back stops it too: the run was asked to start
-        // nothing further.
-        let interruption = if scope_stopped {
+        // No new call was sent, but a recovery tombstone still represents an
+        // earlier dispatch with a lost outcome. Close that run as interrupted.
+        // Scope drains and stop requests retain their ordinary no-dispatch behavior.
+        let interruption = if resolutions.iter().any(|r| r.ambiguous) {
+            Some(BatchInterruption::Ambiguous)
+        } else if scope_stopped {
             Some(BatchInterruption::ScopeDrained)
         } else if let Some(cause) = gating_stop {
             Some(cause)
@@ -10545,6 +10614,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 .lock()
                 .expect("provider-held close-out")
                 .batch = Some(crate::replay::OpenToolBatch {
+                needs_start: false,
                 batch_id: batch_id.clone(),
                 step_id,
                 calls: unfinished
@@ -11290,6 +11360,15 @@ async fn resolve<T: ToolPlane>(
     stop: Option<&CancellationToken>,
 ) -> CallResolution {
     match plan {
+        CallPlan::Recovered(id) => {
+            let mut resolution = CallResolution::plain(
+                crate::resume::outcome_unknown_result(&id),
+                Some(DispatchOutcome::Unknown),
+            );
+            resolution.ambiguous = true;
+            resolution.reason = Some("wal_recovery_cut".into());
+            resolution
+        }
         CallPlan::Stopped(id) => stopped_resolution(&id),
         // A stop requested after this call's intent was written, but before the call was sent:
         // it is not sent. Calls of the batch already sent are left to finish.
@@ -11692,7 +11771,7 @@ async fn finalize_hard_stop(
     submitted: Option<&ToolCallId>,
     closing: Option<(ClosingNotice<'_>, &[ContentBlock])>,
 ) -> Result<RunSummary, RunError> {
-    let batch_id = BatchId(format!("{}-b{}", resolved_run_id.0, step_id.0));
+    let batch_id = tool_batch_id(resolved_run_id, step_id);
     let call_ids: Vec<ToolCallId> = pending.iter().map(|c| c.tool_call_id.clone()).collect();
     if !batch_already_started {
         writer.record(WalRecord::ToolBatchStarted {
@@ -15224,6 +15303,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                recovery_cuts: Vec::new(),
                 has_model_attempt: None,
                 media: None,
                 head: None,
@@ -16599,12 +16679,9 @@ mod approval_gate {
         let seq = writer.record(prepared.clone()).into_result()?;
         // No route operation can observe this key until the Prepared frame is durable.
         writer.sync().await?;
-        let key = crate::context::call_key(
-            writer
-                .lineage_id()
-                .ok_or_else(|| RunError::Wal("Prepared lineage missing".into()))?,
-            seq,
-        );
+        let key = writer
+            .call_key(seq)
+            .ok_or_else(|| RunError::Wal("Prepared lineage missing".into()))?;
         history.fold(seq, prepared.clone());
         Ok(Slot::Held(Held {
             key,
@@ -16646,9 +16723,7 @@ mod approval_gate {
                         hooks: call.hooks.clone(),
                     })
                     .into_result()?;
-                call.call_key = writer
-                    .lineage_id()
-                    .map(|lineage| crate::context::call_key(lineage, seq));
+                call.call_key = writer.call_key(seq);
             }
             CallPlan::NoDispatch {
                 tool_call_id,
@@ -16735,7 +16810,7 @@ mod approval_gate {
         }
         let ctx = BatchCtx {
             media_capture: writer.media_capture(),
-            batch_id: BatchId(format!("{}-b{}", run_id.0, step.0)),
+            batch_id: tool_batch_id(run_id, step),
             bind: session.clone(),
             run_id: run_id.clone(),
             scope: scope.cloned(),
@@ -16845,6 +16920,31 @@ mod approval_gate {
                 .and_then(|queue| queue.pop_front())
             {
                 Slot::Ready(Some(CallPlan::Already(result)))
+            } else if writer.recovery_tombstoned(
+                run_id,
+                &call.tool_call_id,
+                &ctx.batch_id,
+                Some(step),
+                held.get(&call.tool_call_id)
+                    .map(|prepared| prepared.key.as_str())
+                    .or_else(|| {
+                        resume
+                            .intents
+                            .get(&call.tool_call_id)
+                            .and_then(|dispatch| dispatch.call_key.as_deref())
+                    }),
+            ) || resume
+                .intents
+                .get(&call.tool_call_id)
+                .and_then(|dispatch| dispatch.call_key.as_deref())
+                .is_some_and(|key| writer.recovery_tombstoned_key(key))
+                || held
+                    .get(&call.tool_call_id)
+                    .is_some_and(|prepared| writer.recovery_tombstoned_key(&prepared.key))
+            {
+                // A restored approval cannot authorize repeating an external
+                // effect whose outcome recovery marked unknown.
+                Slot::Ready(Some(CallPlan::Recovered(call.tool_call_id.clone())))
             } else if let Some(dispatch) = resume.intents.remove(&call.tool_call_id) {
                 Slot::Ready(Some(CallPlan::Dispatch(dispatch)))
             } else if let Some(prepared) = held.remove(&call.tool_call_id) {
@@ -17337,6 +17437,7 @@ mod approval_gate {
                     .lock()
                     .expect("provider-held close-out")
                     .batch = Some(crate::replay::OpenToolBatch {
+                    needs_start: false,
                     batch_id: ctx.batch_id.clone(),
                     step_id: step,
                     calls: slots
@@ -17740,6 +17841,14 @@ mod approval_gate {
         let Feedback::Released(held, Some(answer)) = event else {
             return Ok(());
         };
+        if history
+            .projection
+            .calls
+            .get(&held.key)
+            .is_some_and(lost_approval_terminal)
+        {
+            return late_answer(history, writer, &held.ctx(ctx), control, &held.key, answer).await;
+        }
         let Some(projected) = history.projection.calls.get(&held.key) else {
             return Ok(());
         };
@@ -17928,6 +18037,12 @@ mod approval_gate {
             }
         }
     }
+    fn lost_approval_terminal(call: &crate::replay::ProjectedDeferredCall) -> bool {
+        call.late_result
+            .as_deref()
+            .is_some_and(crate::recovery_close_out::is_lost_approval_receipt)
+    }
+
     async fn late_answer(
         history: &mut History,
         writer: &WalHandle,
@@ -17943,7 +18058,8 @@ mod approval_gate {
         }) else {
             return Ok(());
         };
-        if call.late_result.is_some() || !history.projection.late_allowed(call) {
+        let frozen = lost_approval_terminal(call);
+        if !frozen && (call.late_result.is_some() || !history.projection.late_allowed(call)) {
             return Ok(());
         }
         let WalRecord::ToolCallDeferred { ask, .. } = &*call.prepared else {
@@ -17964,7 +18080,11 @@ mod approval_gate {
             Err(error) if error.retryable => return Ok(()),
             Err(error) => return late_refusal(history, writer, key, &error).await,
         };
-        record_late_answer(history, writer, key, authorized_late, late_execution).await
+        record_late_answer(history, writer, key, authorized_late, late_execution).await?;
+        if frozen {
+            report_late(control, ctx, &held, LateOutcome::Unknown).await;
+        }
+        Ok(())
     }
 
     pub(super) async fn record_late_answer(
@@ -18015,6 +18135,22 @@ mod approval_gate {
         }) else {
             return Ok(());
         };
+        if lost_approval_terminal(call) {
+            // Route refusal has no authenticated answer from which to invent a decision.
+            let id = call.elicitation_id.clone().unwrap_or_default();
+            history.record(
+                writer,
+                WalRecord::LateApprovalRecorded {
+                    call_key: key.into(),
+                    elicitation_id: id,
+                    decision: LateDecision::None,
+                    approval_digest: None,
+                    late_execution: None,
+                },
+            );
+            writer.sync().await?;
+            return Ok(());
+        }
         if call.late_result.is_some() || !history.projection.late_allowed(call) {
             return Ok(());
         }
@@ -18045,25 +18181,53 @@ mod approval_gate {
         Ok(())
     }
 
+    fn late_recovery_tombstoned(
+        projection: &crate::replay::DeferredCallProjection,
+        writer: &WalHandle,
+        call: &crate::replay::ProjectedDeferredCall,
+    ) -> bool {
+        let key = broca_wal::recovery::physical_call_key(
+            &projection.lineage_id,
+            call.prepared_seq,
+            call.recovery_generation.as_deref(),
+        );
+        let identity = projection.effect_identity(call);
+        projection.recovery_tombstoned(call)
+            || call
+                .run_id
+                .as_ref()
+                .zip(identity.as_ref())
+                .is_some_and(|(run, identity)| {
+                    identity.batch_id.as_ref().is_some_and(|batch| {
+                        writer.recovery_tombstoned(
+                            run,
+                            &identity.tool_call_id,
+                            batch,
+                            identity.step_id,
+                            Some(&key),
+                        )
+                    })
+                })
+            || writer.recovery_tombstoned_key(&key)
+    }
+
     async fn close_stopped_late(
         history: &mut History,
         writer: &WalHandle,
         bind: &BindIdentity,
         control: &RunControl,
     ) -> Result<(), RunError> {
-        let Some(stopped) = &history.projection.stopped_runs else {
-            return Ok(());
-        };
+        let stopped = history.projection.stopped_runs.as_ref();
         let calls: Vec<_> = history
             .projection
             .calls
             .iter()
             .filter(|(_, call)| {
                 crate::replay::DeferredCallProjection::late_open(call)
-                    && call
-                        .run_id
-                        .as_ref()
-                        .is_some_and(|run| stopped.contains(&run.0))
+                    && (late_recovery_tombstoned(&history.projection, writer, call)
+                        || call.run_id.as_ref().is_some_and(|run| {
+                            stopped.is_some_and(|stopped| stopped.contains(&run.0))
+                        }))
             })
             .map(|(key, call)| (key.clone(), call.clone()))
             .collect();
@@ -18077,7 +18241,9 @@ mod approval_gate {
             else {
                 unreachable!()
             };
-            let sent = projected.late_dispatch_intent.is_some() || history.frames.iter().any(|frame| matches!(&frame.record, WalRecord::ToolDispatchIntent { call_key: Some(anchor), .. } if anchor == &key));
+            let sent = late_recovery_tombstoned(&history.projection, writer, &projected)
+                || projected.late_dispatch_intent.is_some()
+                || history.frames.iter().any(|frame| matches!(&frame.record, WalRecord::ToolDispatchIntent { call_key: Some(anchor), .. } if anchor == &key));
             let outcome = if sent {
                 LateOutcome::Unknown
             } else {
@@ -18158,6 +18324,49 @@ mod approval_gate {
             rebuilt.fold_frames(&history.frames.appended);
             history.projection = rebuilt;
         }
+        // Recovery receipts close the effect before admission can dispatch it.
+        // Report that durable outcome through the existing idempotent approval
+        // channel without manufacturing a second LateResult terminal.
+        if let Some(plane) = &control.elicitation_plane {
+            for call in history.projection.calls.values() {
+                if !matches!(
+                    call.late_result.as_deref(),
+                    Some(WalRecord::RecoveryCallClosed { .. })
+                ) || !matches!(
+                    call.late_approval.as_deref(),
+                    Some(WalRecord::LateApprovalRecorded {
+                        decision: LateDecision::Approved,
+                        ..
+                    })
+                ) {
+                    continue;
+                }
+                if let (
+                    Some(id),
+                    Some(run_id),
+                    WalRecord::ToolCallDeferred {
+                        batch_id, scope, ..
+                    },
+                ) = (&call.elicitation_id, &call.run_id, call.prepared.as_ref())
+                {
+                    let ctx = BatchCtx {
+                        media_capture: writer.media_capture(),
+                        batch_id: batch_id.clone(),
+                        bind: session.clone(),
+                        run_id: run_id.clone(),
+                        scope: Some(scope.clone()),
+                    };
+                    crate::consent::report(
+                        plane.as_ref(),
+                        &ctx,
+                        id,
+                        crate::tool_plane::ApprovalExecution::OutcomeUnknown,
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
         close_stopped_late(history, writer, session, control).await?;
         if control.elicitation_plane.is_none() {
             history.require_installed_plane(control)?;
@@ -18167,10 +18376,10 @@ mod approval_gate {
             .calls
             .iter()
             .filter(|(_, call)| {
-                history.projection.late_allowed(call)
+                (lost_approval_terminal(call) || history.projection.late_allowed(call))
                     && call.decision == Some(DeferredDecision::Expired)
                     && call.late_approval.is_none()
-                    && call.late_result.is_none()
+                    && (lost_approval_terminal(call) || call.late_result.is_none())
             })
             .map(|(key, call)| (key.clone(), call.clone()))
             .collect();
@@ -18319,7 +18528,8 @@ mod approval_gate {
                     matches!(&frame.record,
                 WalRecord::ToolDispatchIntent { call_key: Some(anchor), .. } if anchor == &key)
                 });
-            if dispatch_exists {
+            if dispatch_exists || late_recovery_tombstoned(&history.projection, writer, &projected)
+            {
                 history.record(
                     writer,
                     WalRecord::LateResult {
@@ -18776,7 +18986,7 @@ async fn pause_approval(
 ) -> Result<RunSummary, RunError> {
     let batch_id = match open.first().map(|call| &*call.prepared) {
         Some(WalRecord::ToolCallDeferred { batch_id, .. }) => batch_id.clone(),
-        _ if provider_held => BatchId(format!("{}-b{}", run.0, steps)),
+        _ if provider_held => tool_batch_id(run, StepId(steps)),
         _ => return Err(RunError::Wal("approval pause lacks open calls".into())),
     };
     let ctx = BatchCtx {

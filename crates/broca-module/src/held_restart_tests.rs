@@ -659,9 +659,12 @@ impl broca_core::WalStore for CountingWal {
             // Expose FileWal::durable_publication, the byte end proven by this descriptor's
             // sync, without changing the file store's read-side path or frame format.
             Ok(Box::new(
-                broca_wal::FileWal::open(self.inner.wal_path(key))?
-                    .with_wal_config(self.inner.wal_config())?
-                    .with_feature_floor(floor),
+                broca_wal::FileWal::open_with_recovery(
+                    self.inner.wal_path(key),
+                    self.inner.wal_config(),
+                    floor.clone(),
+                )?
+                .with_feature_floor(floor),
             ))
         } else {
             self.inner.open(key)

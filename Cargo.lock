@@ -311,6 +311,7 @@ name = "broca-core"
 version = "0.3.298"
 dependencies = [
  "async-trait",
+ "broca-crash-harness",
  "broca-diagnostics",
  "broca-owner-only",
  "broca-protocol",
@@ -398,6 +399,7 @@ dependencies = [
  "async-trait",
  "base64",
  "broca-core",
+ "broca-crash-harness",
  "broca-diagnostics",
  "broca-fetch-plan",
  "broca-memory-relief",
@@ -432,6 +434,7 @@ dependencies = [
  "base64",
  "broca-catalog",
  "broca-core",
+ "broca-crash-harness",
  "broca-diagnostics",
  "broca-fetch-plan",
  "broca-heap-profile",

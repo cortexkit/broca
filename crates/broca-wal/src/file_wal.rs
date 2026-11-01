@@ -29,6 +29,19 @@ use broca_protocol::BindIdentity;
 
 pub const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024 * 1024;
 
+static RECOVERY_TAIL_TRUNCATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// File-synced version 4 (overhaul) truncations in this process. Ordinary final tails have
+/// no marker; a real cut can still need marker completion from its manifest.
+pub fn recovery_tail_truncations() -> u64 {
+    RECOVERY_TAIL_TRUNCATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn recovery_truncated() {
+    RECOVERY_TAIL_TRUNCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[path = "human_prompt_count.rs"]
 mod human_prompt_count;
 
@@ -325,6 +338,13 @@ pub enum WalError {
         log: WalFormat,
         offered: WalFormat,
     },
+    /// Recovery already ran under the opening boot configuration. Selecting a
+    /// different overhaul configuration now would bypass that recovery decision.
+    BootConfigurationChange {
+        path: PathBuf,
+        opened: WalConfig,
+        requested: WalConfig,
+    },
 }
 
 impl WalError {
@@ -345,6 +365,7 @@ impl WalError {
             | Self::Entropy(_)
             | Self::FeatureFloor { .. }
             | Self::StateRoot(_)
+            | Self::BootConfigurationChange { .. }
             | Self::FrameFormat { .. }) => Err(other),
         }
     }
@@ -429,6 +450,9 @@ impl std::fmt::Display for WalError {
                 format_name(*log),
                 format_name(*offered)
             ),
+            WalError::BootConfigurationChange { path, opened, requested } => write!(f,
+                "WAL {} was opened with boot configuration {opened:?}; {requested:?} must be selected before opening, not after recovery",
+                path.display()),
         }
     }
 }
@@ -644,7 +668,7 @@ pub struct FileWal {
     /// whose direct child was newly created.
     newly_created_dirs: RefCell<Vec<PathBuf>>,
     /// The frame format this log writes, set by the store that opened it from the boot
-    /// decision. Legacy unless [`FileWal::with_wal_config`] says otherwise.
+    /// decision. Unconfigured opens are legacy-only; a later builder cannot promote them.
     config: WalConfig,
     /// Minted when the log is configured as an overhaul log: the random 128-bit id stamped in
     /// every version 4 frame this open appends, so a frame names the writer that wrote it.
@@ -683,7 +707,7 @@ fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
     fs_ops::create_dir_all(dir)
 }
 
-fn mint_lineage_id() -> Result<WalLineageId, WalError> {
+pub(crate) fn mint_lineage_id() -> Result<WalLineageId, WalError> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(WalError::Entropy)?;
     // UUID-shaped presentation is only a convenient encoding; consumers treat the value as opaque.
@@ -886,7 +910,10 @@ impl FileWal {
     }
     /// Open (creating if absent) the WAL at `path`, recovering `next_seq` from the
     /// last committed record. Creation writes a fresh lineage identity; an existing legacy file
-    /// remains unidentified until its next append. A torn trailing frame (an append that crashed
+    /// remains unidentified until its next append. This unconfigured path is legacy-only and
+    /// never probes recovery sidecars. Overhaul callers supply the boot format and policy through
+    /// `open_with_recovery` or `open_with_manifest_and_recovery` before any recovery.
+    /// A legacy torn trailing frame (an append that crashed
     /// mid-write, never fsynced as complete) is TRUNCATED away on open, so the file ends exactly at
     /// the last valid frame before any new append.
     ///
@@ -902,6 +929,8 @@ impl FileWal {
             String::new(),
             AccessMode::GuardEveryMutation,
             None,
+            None,
+            None,
         )
     }
 
@@ -916,6 +945,8 @@ impl FileWal {
             String::new(),
             AccessMode::GuardEveryMutation,
             Some(sync_probe),
+            None,
+            None,
         )
     }
 
@@ -958,6 +989,72 @@ impl FileWal {
             session_ref,
             AccessMode::GuardEveryMutation,
             None,
+            None,
+            None,
+        )
+    }
+
+    /// Supply the boot decision before recovery can mutate an overhaul log.
+    pub fn open_with_manifest_and_recovery(
+        path: impl Into<PathBuf>,
+        manifest_path: impl Into<PathBuf>,
+        session_addr: impl Into<String>,
+        identity: impl Into<String>,
+        session_ref: String,
+        recovery: (WalConfig, PathBuf),
+    ) -> Result<Self, WalError> {
+        Self::open_inner(
+            path.into(),
+            Some(ManifestAppend {
+                path: manifest_path.into(),
+                session_addr: session_addr.into(),
+                identity: identity.into(),
+            }),
+            session_ref,
+            AccessMode::GuardEveryMutation,
+            None,
+            Some(recovery),
+            None,
+        )
+    }
+
+    pub fn open_with_manifest_and_recovery_hooks(
+        path: impl Into<PathBuf>,
+        manifest_path: impl Into<PathBuf>,
+        session_addr: impl Into<String>,
+        identity: impl Into<String>,
+        session_ref: String,
+        recovery: (WalConfig, PathBuf),
+        hooks: std::sync::Arc<dyn crate::recovery::RecoveryHooks>,
+    ) -> Result<Self, WalError> {
+        Self::open_inner(
+            path.into(),
+            Some(ManifestAppend {
+                path: manifest_path.into(),
+                session_addr: session_addr.into(),
+                identity: identity.into(),
+            }),
+            session_ref,
+            AccessMode::GuardEveryMutation,
+            None,
+            Some(recovery),
+            Some(hooks),
+        )
+    }
+
+    pub fn open_with_recovery(
+        path: impl Into<PathBuf>,
+        config: WalConfig,
+        feature_floor: PathBuf,
+    ) -> Result<Self, WalError> {
+        Self::open_inner(
+            path.into(),
+            None,
+            String::new(),
+            AccessMode::GuardEveryMutation,
+            None,
+            Some((config, feature_floor)),
+            None,
         )
     }
 
@@ -968,6 +1065,8 @@ impl FileWal {
         access: AccessMode,
         #[cfg(test)] sync_probe: Option<SyncProbe>,
         #[cfg(not(test))] _sync_probe: Option<()>,
+        recovery: Option<(WalConfig, PathBuf)>,
+        hooks: Option<std::sync::Arc<dyn crate::recovery::RecoveryHooks>>,
     ) -> Result<Self, WalError> {
         crate::migration::guard(&path, &session_ref, true)?;
         #[cfg(windows)]
@@ -993,32 +1092,53 @@ impl FileWal {
         let max_read_bytes = OPEN_READ_CAP.with(Cell::get);
         #[cfg(not(test))]
         let max_read_bytes = DEFAULT_MAX_READ_BYTES;
-        let recovered = access_counter::writer_open(&path, true, || match File::open(&path) {
-            Ok(file) => {
-                let size = file.metadata().map_err(WalError::Io)?.len();
-                if size > max_read_bytes {
-                    return Err(WalError::TooLarge {
-                        max_bytes: max_read_bytes,
-                        file_size: size,
-                    });
-                }
-                scan_prefix(
-                    std::io::BufReader::new(file),
-                    max_read_bytes,
-                    |_| None::<()>,
-                )
+        let boot_config = recovery
+            .as_ref()
+            .map_or(WalConfig::LEGACY, |(config, _)| *config);
+        let recovered = access_counter::writer_open(&path, true, || {
+            let initial = scan_writer_open(&path, max_read_bytes, boot_config.is_overhaul());
+            if matches!(&initial, Err(error) if !matches!(error,
+                WalError::Corrupt { .. } | WalError::SequenceGap { .. } | WalError::NonMonotonic { .. }))
+            {
+                return initial;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                scan_prefix(std::io::empty(), max_read_bytes, |_| None::<()>)
+            let inspection = match &initial {
+                Ok(open) => crate::recovery::OpenInspection {
+                    file_len: open.file_len,
+                    valid_end: Some(open.scan.valid_end),
+                    lineage: open.scan.lineage_id,
+                    legacy_records: open.scan.legacy_records,
+                    missing: open.missing,
+                },
+                Err(_) => crate::recovery::OpenInspection {
+                    file_len: 0,
+                    valid_end: None,
+                    lineage: None,
+                    legacy_records: false,
+                    missing: false,
+                },
+            };
+            let changed = crate::recovery::before_open_with_hooks(
+                &path,
+                recovery.as_ref().map(|r| r.0),
+                recovery.as_ref().map(|r| r.1.as_path()),
+                &session_ref,
+                max_read_bytes,
+                hooks.as_deref(),
+                Some(&inspection),
+            )?;
+            if changed {
+                scan_writer_open(&path, max_read_bytes, boot_config.is_overhaul())
+            } else {
+                initial
             }
-            Err(error) => Err(WalError::Io(error)),
         })?;
-        let valid_end = recovered.valid_end;
-        let recovered_lineage_id = recovered.lineage_id;
+        let valid_end = recovered.scan.valid_end;
+        let recovered_lineage_id = recovered.scan.lineage_id;
         // Seq is 1-BASED: the first record is seq 1, so a watermark of 0
         // unambiguously means "nothing projected yet" and `tail_after_seq(0)`
         // includes the first record (the cold-start merge case).
-        let next_seq = recovered.last_seq.map(|seq| seq + 1).unwrap_or(1);
+        let next_seq = recovered.scan.last_seq.map(|seq| seq + 1).unwrap_or(1);
         // If the file is longer than the last valid record, a torn tail exists — truncate it
         // so the file ends exactly at the last valid record, BEFORE opening the append
         // handle. The truncation uses a dedicated WRITE handle: an append-mode handle
@@ -1035,6 +1155,16 @@ impl FileWal {
                     .map_err(WalError::Io)?;
                 trunc.set_len(valid_end).map_err(WalError::Io)?;
                 trunc.sync_all().map_err(WalError::Io)?; // durable before appending after it
+                if boot_config.is_overhaul() {
+                    recovery_truncated();
+                }
+            }
+        }
+        // Projection repair must read the final durable file, after either a real
+        // cut or silent ordinary-tail trimming, before any writable handle escapes.
+        if !recovered.cut_ids.is_empty() {
+            if let Some(hooks) = &hooks {
+                hooks.after_repair(&path, &recovered.cut_ids)?;
             }
         }
         let mut create_opts = OpenOptions::new();
@@ -1075,7 +1205,7 @@ impl FileWal {
         } else {
             valid_end
         };
-        Ok(Self {
+        Self {
             path,
             file,
             next_seq,
@@ -1083,7 +1213,7 @@ impl FileWal {
             synced_prefix: Cell::new(None),
             dir_needs_sync: Cell::new(true),
             newly_created_dirs: RefCell::new(newly_created_dirs),
-            config: WalConfig::LEGACY,
+            config: boot_config,
             writer_id: None,
             writer_close_reserve: 0,
             lineage_id,
@@ -1095,7 +1225,8 @@ impl FileWal {
             access,
             #[cfg(test)]
             sync_probe,
-        })
+        }
+        .with_wal_config(boot_config)
     }
 
     /// Name the feature floor this WAL raises before it appends a record that requires a WAL
@@ -1105,19 +1236,28 @@ impl FileWal {
         self
     }
 
-    /// Write this log in `config`'s format, as decided once at boot for its state root. An
-    /// overhaul log mints its random `writer_id` here, so each open stamps its own; it then writes
-    /// only version 4 frames it stamps itself and refuses caller-encoded bytes.
+    /// Validate the writing configuration decided before this handle was opened.
+    /// This never reruns recovery or promotes an unconfigured legacy handle.
     pub fn with_wal_config(mut self, config: WalConfig) -> Result<Self, WalError> {
+        if self.config.format != config.format
+            || (self.config.is_overhaul() && self.config.recovery != config.recovery)
+        {
+            return Err(WalError::BootConfigurationChange {
+                path: self.path.clone(),
+                opened: self.config,
+                requested: config,
+            });
+        }
         self.writer_id = match config.format {
             WalFormat::Legacy => None,
-            WalFormat::Overhaul => {
+            WalFormat::Overhaul if self.writer_id.is_none() => {
                 let mut id = [0u8; 16];
                 getrandom::fill(&mut id).map_err(WalError::Entropy)?;
                 #[cfg(feature = "fs-override")]
                 let id = WRITER_ID_FOR_TEST.with(|slot| slot.get().unwrap_or(id));
                 Some(id)
             }
+            WalFormat::Overhaul => self.writer_id,
         };
         self.config = config;
         Ok(self)
@@ -1232,6 +1372,16 @@ impl FileWal {
         sync: bool,
         source: FrameSource,
     ) -> Result<u64, WalError> {
+        if matches!(
+            record,
+            WalRecord::RecoveryCut { .. } | WalRecord::RecoveryCallClosed { .. }
+        ) && !self.config.is_overhaul()
+        {
+            return Err(WalError::FrameFormat {
+                log: WalFormat::Legacy,
+                offered: WalFormat::Overhaul,
+            });
+        }
         // One validation phase per tenure: the open-time guard cleared the
         // fenced path and reference under the held tenure, so owned appends
         // skip the repeated migration probes while that verdict still covers
@@ -1719,11 +1869,9 @@ impl OwnedWriterWal {
             fenced_path,
             fenced_ref,
         };
-        let wal =
-            FileWal::open_inner(path, manifest, session_ref, access, None).map_err(|error| {
-                OwnedOpenError {
-                    cause: OwnedOpenCause::Wal(error),
-                }
+        let wal = FileWal::open_inner(path, manifest, session_ref, access, None, None, None)
+            .map_err(|error| OwnedOpenError {
+                cause: OwnedOpenCause::Wal(error),
             })?;
         #[cfg(test)]
         OWNED_OPEN_PANIC_AFTER_RECOVERY.with(|flag| {
@@ -1937,6 +2085,52 @@ struct PrefixScan<T> {
     valid_end: u64,
     last_seq: Option<u64>,
     lineage_id: Option<WalLineageId>,
+    legacy_records: bool,
+}
+
+struct WriterOpenScan {
+    scan: PrefixScan<()>,
+    file_len: u64,
+    missing: bool,
+    cut_ids: std::collections::BTreeSet<String>,
+}
+
+fn scan_writer_open(path: &Path, cap: u64, overhaul: bool) -> Result<WriterOpenScan, WalError> {
+    let mut cut_ids = std::collections::BTreeSet::new();
+    let mut observe = |frame: &FramedRecord| {
+        if overhaul {
+            if let WalRecord::RecoveryCut { recovery } = &frame.record {
+                cut_ids.insert(recovery.cut_id.clone());
+            }
+        }
+        None::<()>
+    };
+    let (scan, file_len, missing) = match File::open(path) {
+        Ok(file) => {
+            let file_len = file.metadata().map_err(WalError::Io)?.len();
+            if file_len > cap {
+                return Err(WalError::TooLarge {
+                    max_bytes: cap,
+                    file_size: file_len,
+                });
+            }
+            (
+                scan_prefix(std::io::BufReader::new(file), cap, &mut observe)?,
+                file_len,
+                false,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (scan_prefix(std::io::empty(), cap, &mut observe)?, 0, true)
+        }
+        Err(error) => return Err(WalError::Io(error)),
+    };
+    Ok(WriterOpenScan {
+        scan,
+        file_len,
+        missing,
+        cut_ids,
+    })
 }
 
 fn read_up_to(file: &mut impl Read, bytes: &mut [u8]) -> Result<usize, WalError> {
@@ -1966,6 +2160,7 @@ fn scan_prefix<T>(
         valid_end: 0,
         last_seq: None,
         lineage_id: None,
+        legacy_records: false,
     };
     loop {
         let offset = scan.valid_end;
@@ -2017,6 +2212,7 @@ fn scan_prefix<T>(
         }
         match decode_next_counted(&frame) {
             DecodeStep::Record { framed, consumed } => {
+                scan.legacy_records |= frame[4] != crate::framing::V4_FRAMING_VERSION;
                 validate_contiguous_sequence(scan.last_seq, 1, framed.seq)?;
                 scan.last_seq = Some(framed.seq);
                 scan.valid_end += consumed as u64;
@@ -2610,6 +2806,9 @@ fn validate_contiguous_sequence(
     }
     Ok(())
 }
+
+// Damage may hide the next boundary, so search every possible lineage envelope
+// rather than trusting the damaged frame's declared length.
 
 // A damaged length cannot identify the next boundary. Search for intact frames
 // instead; matching lineage-only metadata after a damaged last record is part
@@ -6132,5 +6331,95 @@ mod windows_acl_tests {
     #[test]
     fn windows_manifest_wal_refused_before_replay() {
         refuses_before_replay(true);
+    }
+}
+
+#[cfg(all(test, unix, feature = "fs-override"))]
+mod legacy_owned_io_tests {
+    use super::*;
+    use std::sync::Arc;
+    mod trace {
+        use crate as wal_api;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../broca-crash-harness/src/io_trace_backend.rs"
+        ));
+    }
+
+    #[test]
+    fn prototype_owned_legacy_open_keeps_master_io() {
+        let root = broca_test_support::scratch_root().join(format!(
+            "prototype-owned-legacy-io-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("wal/log");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            crate::framing::encode(
+                1,
+                1,
+                &WalRecord::StepStarted {
+                    step_id: broca_protocol::StepId(1),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let session = broca_protocol::BindIdentity::new("/legacy-project", "harness", "owned-io");
+        let tenure = crate::writer_tenure::WalLeaseDomain::new(root.join("leases"))
+            .mint_for_test(&session, 1)
+            .unwrap();
+        let fs = Arc::new(trace::IoTraceFs::new(
+            &root,
+            Arc::new(crate::fs_ops::RealFs),
+        ));
+        crate::fs_ops::with_fs_ops(fs.clone(), || {
+            drop(OwnedWriterWal::open(&path, &session, "legacy-owned-ref", tenure).unwrap());
+        });
+        let attempts = fs.attempts();
+        println!("master prototype-owned trace: {attempts:?}");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/legacy-owned-master-io.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(attempts).unwrap(),
+            expected["attempts"],
+            "prototype legacy owned open must keep its independently measured master I/O"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unconfigured_legacy_handle_cannot_be_promoted_after_open() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("legacy-promotion-{}", std::process::id()));
+        let path = root.join("wal/log");
+        let wal = FileWal::open(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let trace = Arc::new(trace::IoTraceFs::new(
+            &root,
+            Arc::new(crate::fs_ops::RealFs),
+        ));
+        let result =
+            crate::fs_ops::with_fs_ops(trace.clone(), || wal.with_wal_config(WalConfig::OVERHAUL));
+        match result {
+            Ok(_) => panic!("an unconfigured legacy handle must not become an overhaul writer"),
+            Err(error) => assert!(
+                error.to_string().contains("boot"),
+                "typed refusal must explain boot configuration: {error}"
+            ),
+        }
+        assert!(
+            trace.attempts().is_empty(),
+            "promotion refusal must not run recovery again"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -3854,6 +3854,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
         tail: Arc::new(Vec::new()),
         checkpoint_at_base: None,
         checkpoint_at_head: AdmissionCheckpointV1 {
+            recovery_cuts: Vec::new(),
             has_model_attempt: None,
             media: None,
             head: None,

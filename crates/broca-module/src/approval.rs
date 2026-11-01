@@ -950,3 +950,57 @@ impl Drop for ActorJob {
         self.jobs.done.notify_waiters();
     }
 }
+
+#[cfg(test)]
+mod recovery_read_tests {
+    use super::*;
+
+    #[test]
+    fn lost_approval_refusal_uses_existing_late_result_error_code_member() {
+        let result: broca_protocol::ToolResult = serde_json::from_value(serde_json::json!({
+            "tool_call_id":"call_0","is_error":true,"output":{"kind":"error",
+                "message":"outcome_unknown: late_approval_evidence_lost",
+                "code":"late_approval_evidence_lost"}
+        }))
+        .unwrap();
+        let view = broca_core::LateApprovalView {
+            call_key: "lineage:4".into(),
+            approval: std::sync::Arc::new(WalRecord::LateApprovalRecorded {
+                call_key: "lineage:4".into(),
+                elicitation_id: "question".into(),
+                decision: broca_wal::LateDecision::Approved,
+                approval_digest: None,
+                late_execution: Some(broca_wal::LateExecution::Execute),
+            }),
+            outcome: Some(broca_wal::LateOutcome::Unknown),
+            result: Some(std::sync::Arc::new(result)),
+        };
+        let (page, next) = late_page(&[view], None, 65_536).unwrap();
+        assert!(next.is_none());
+        let value = serde_json::to_value(page).unwrap();
+        assert_eq!(value[0]["decision"], "approved");
+        assert_eq!(value[0]["outcome"], "unknown");
+        assert_eq!(
+            value[0]["result"]["output"]["code"],
+            "late_approval_evidence_lost"
+        );
+        let keys: std::collections::BTreeSet<_> = value[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "call_key",
+                "decision",
+                "elicitation_id",
+                "outcome",
+                "result"
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+}

@@ -395,11 +395,15 @@ async fn overhaul_relocation_refuses_a_writer_record_plus_an_ordinary_record() {
     let handle = root.spawn();
     handle.record(ordinary()).into_result().unwrap();
     handle.shutdown().await.unwrap();
-    let mut wal = FileWal::open(root.store.wal_path(&root.session))
-        .unwrap()
-        .with_feature_floor(root.store.feature_floor_path())
-        .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-        .unwrap();
+    let mut wal = FileWal::open_with_recovery(
+        root.store.wal_path(&root.session),
+        broca_wal::WalConfig::OVERHAUL,
+        root.store.feature_floor_path(),
+    )
+    .unwrap()
+    .with_feature_floor(root.store.feature_floor_path())
+    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+    .unwrap();
     let destination = root.store.ephemeral_wal_path(&root.session);
     assert!(wal
         .relocate_unstarted(&destination)

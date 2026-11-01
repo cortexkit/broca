@@ -208,6 +208,7 @@ pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
     ACCOUNT_LIMIT_PAUSE_FEATURE,
+    crate::recovery::FEATURE,
     BILL_ATTEMPTS_FEATURE,
     BILL_VAULT_FACTS_FEATURE,
     crate::head_proof::VISIBILITY_LATE_FEATURE,
@@ -1097,6 +1098,33 @@ mod service_tier_queue_tests;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn recovery_completion_requires_the_recovery_reader_feature() {
+        use super::*;
+        let record: WalRecord = serde_json::from_str(
+            r#"{"type":"recovery_call_closed","cut_id":"cut-1","run_id":"removed-r","call_key":"lineage:4","tool_call_id":"call_0","outcome":"unknown","result":{"tool_call_id":"call_0","output":{"kind":"error","message":"outcome_unknown"},"is_error":true}}"#,
+        ).unwrap();
+        let bytes = encode_v4(
+            v4::Metadata {
+                seq: 1,
+                fence: 1,
+                appended_ms: 0,
+                writer_id: [1; 16],
+            },
+            &[FRAME_STAMPS_FEATURE],
+            &record,
+        )
+        .unwrap();
+        assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|feature| *feature != crate::recovery::FEATURE)
+            .collect();
+        assert!(matches!(decode_next_with(&bytes, &older),
+            DecodeStep::NewerWriter { missing, .. } if missing == [crate::recovery::FEATURE]));
+    }
+
+    #[test]
     fn message_times_require_an_understanding_reader() {
         use super::*;
         let old = include_str!("../tests/fixtures/before_message_times.jsonl");
@@ -1526,6 +1554,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recovery_cut_is_a_must_understand_overhaul_record() {
+        let record: WalRecord = serde_json::from_value(serde_json::json!({
+            "type":"recovery_cut", "cut_id":"cut", "sidecar_basename":"log.cut-1",
+            "cut_offset":69, "removed_len":1, "removed_sha256":"digest",
+            "reason":"unproven_corruption", "active_run":null, "runs":[], "unattributed_tool_risk":true
+        })).unwrap();
+        assert_eq!(record.required_features(), &[crate::recovery::FEATURE]);
+        let frame = PreparedV4Frame::prepare(&record)
+            .unwrap()
+            .stamp(v4::Metadata {
+                seq: 1,
+                fence: 1,
+                appended_ms: 1,
+                writer_id: [1; 16],
+            })
+            .unwrap();
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != crate::recovery::FEATURE)
+            .collect();
+        assert!(
+            matches!(decode_next_with(&frame, &older), DecodeStep::NewerWriter { missing, .. }
+            if missing == [crate::recovery::FEATURE])
+        );
+        assert!(
+            matches!(decode_next(&frame), DecodeStep::Record { framed, .. } if framed.record == record)
+        );
+    }
+
     /// The production `KNOWN_FEATURES` table holds exactly the features this build interprets.
     /// A name enters it only with the release that reads its records, so a build never claims
     /// to understand a frame it would misread; the test-only name is never in it.
@@ -1535,6 +1594,7 @@ mod tests {
             KNOWN_FEATURES,
             &[
                 ACCOUNT_LIMIT_PAUSE_FEATURE,
+                crate::recovery::FEATURE,
                 BILL_ATTEMPTS_FEATURE,
                 BILL_VAULT_FACTS_FEATURE,
                 crate::head_proof::VISIBILITY_LATE_FEATURE,

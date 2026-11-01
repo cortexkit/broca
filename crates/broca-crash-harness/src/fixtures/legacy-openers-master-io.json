@@ -1,0 +1,45 @@
+{
+  "source_commit": "ba14a1bce",
+  "surfaces": [
+    [
+      "metadata agent-data/write-fences/ready",
+      "read_dir agent-data/cuts",
+      "open r=true w=false a=false c=false n=false t=false ordinary=false wal/e0d5ab7777b6a843.moved",
+      "open r=true w=false a=false c=false n=false t=false ordinary=false wal/e0d5ab7777b6a843.moving",
+      "metadata wal",
+      "mkdir_all wal",
+      "open r=true w=false a=false c=false n=false t=false ordinary=false wal/e0d5ab7777b6a843.wal",
+      "file_metadata wal/e0d5ab7777b6a843.wal",
+      "read 8192 wal/e0d5ab7777b6a843.wal",
+      "read 8192 wal/e0d5ab7777b6a843.wal",
+      "metadata wal/e0d5ab7777b6a843.wal",
+      "open r=true w=false a=true c=false n=true t=false ordinary=false wal/e0d5ab7777b6a843.wal",
+      "open r=true w=false a=true c=false n=false t=false ordinary=false wal/e0d5ab7777b6a843.wal"
+    ],
+    [
+      "metadata wal/e0d5ab7777b6a843.wal",
+      "metadata wal-ephemeral/e0d5ab7777b6a843.wal",
+      "metadata wal-durable/e0d5ab7777b6a843.wal",
+      "open r=true w=false a=false c=false n=false t=false ordinary=false wal/e0d5ab7777b6a843.wal",
+      "file_metadata wal/e0d5ab7777b6a843.wal",
+      "seek Start(0) wal/e0d5ab7777b6a843.wal",
+      "read 32 wal/e0d5ab7777b6a843.wal",
+      "read 32 wal/e0d5ab7777b6a843.wal",
+      "read 64 wal/e0d5ab7777b6a843.wal",
+      "read 40 wal/e0d5ab7777b6a843.wal"
+    ],
+    [
+      "metadata agent-data/write-fences/ready",
+      "read_dir agent-data/cuts",
+      "open r=true w=false a=false c=false n=false t=false ordinary=false wal/e0d5ab7777b6a843.moved",
+      "open r=true w=false a=false c=false n=false t=false ordinary=false wal/e0d5ab7777b6a843.moving",
+      "metadata wal",
+      "mkdir_all wal",
+      "open r=true w=false a=false c=false n=false t=false ordinary=false wal/e0d5ab7777b6a843.wal",
+      "metadata wal/e0d5ab7777b6a843.wal",
+      "open r=true w=false a=true c=false n=true t=false ordinary=false wal/e0d5ab7777b6a843.wal",
+      "write 69 wal/e0d5ab7777b6a843.wal",
+      "flush wal/e0d5ab7777b6a843.wal"
+    ]
+  ]
+}

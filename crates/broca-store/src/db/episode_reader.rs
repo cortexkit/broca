@@ -457,11 +457,13 @@ mod tests {
                 unreachable!()
             };
             let bind = session.clone();
-            let wal = broca_wal::FileWal::open(root.join("session.wal"))
-                .unwrap()
-                .with_feature_floor(root.join("wal-floor"))
-                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                .unwrap();
+            let wal = broca_wal::FileWal::open_with_recovery(
+                root.join("session.wal"),
+                broca_wal::WalConfig::OVERHAUL,
+                root.join("wal-floor"),
+            )
+            .unwrap()
+            .with_feature_floor(root.join("wal-floor"));
             Self {
                 db: Arc::new(OverhaulDb::open(&root).unwrap()),
                 wal,

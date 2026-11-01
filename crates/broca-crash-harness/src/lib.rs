@@ -43,6 +43,7 @@
 //! ordinary test run.
 
 pub mod invariants;
+pub mod io_trace;
 pub mod power_loss;
 
 #[cfg(all(test, unix))]
@@ -667,3 +668,8 @@ pub fn resume_records(records: &[WalRecord]) -> usize {
         .filter(|record| matches!(record, WalRecord::ResumeStarted { .. }))
         .count()
 }
+#[cfg(all(test, unix))]
+mod v4_recovery_tests;
+
+#[cfg(all(test, unix))]
+mod legacy_io_tests;

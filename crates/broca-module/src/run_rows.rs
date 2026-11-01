@@ -482,11 +482,13 @@ mod tests {
             // so publication can use the durable byte end recorded by its successful sync.
             drop(store.open(key).unwrap());
             Box::new(
-                broca_wal::FileWal::open(store.wal_path(key))
-                    .unwrap()
-                    .with_feature_floor(root.join("wal-floor"))
-                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                    .unwrap(),
+                broca_wal::FileWal::open_with_recovery(
+                    store.wal_path(key),
+                    broca_wal::WalConfig::OVERHAUL,
+                    root.join("wal-floor"),
+                )
+                .unwrap()
+                .with_feature_floor(root.join("wal-floor")),
             )
         }
         fn append(&mut self, record: WalRecord) {

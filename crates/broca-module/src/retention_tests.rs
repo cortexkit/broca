@@ -1,4 +1,7 @@
 use super::*;
+#[cfg(unix)]
+#[path = "retention_recovery_tests.rs"]
+mod recovery_artifacts;
 use broca_core::{ExportIndex, MaterializedStore, RunIndex, RunIndexState};
 use broca_protocol::{RunFinishReason, RunId};
 use broca_wal::Wal;
@@ -188,6 +191,7 @@ async fn archived_expiry_cache_keeps_tombstones_and_newer_lineages_authoritative
             .unwrap();
     }
     let stone = Tombstone {
+        recovery_artifacts: Vec::new(),
         next_tag: None,
         next_notice_seq: None,
         lineage_id: id,
@@ -602,6 +606,11 @@ impl Rig {
     #[cfg(any(unix, windows))]
     fn overhaul() -> Self {
         let mut rig = Self::new();
+        rig.store = Arc::new(
+            SqliteStore::open(rig.root.join("run-index.db"))
+                .unwrap()
+                .with_wal_config(broca_wal::WalConfig::OVERHAUL),
+        );
         fs::write(
             rig.root.join(broca_wal::state_format::MARKER_FILENAME),
             b"broca-state/2\n",
@@ -731,6 +740,7 @@ async fn relocation_incomplete_preflight_never_expires_or_completes_deletion() {
         .write_tombstone(
             &rig.key,
             &Tombstone {
+                recovery_artifacts: Vec::new(),
                 lineage_id: id.clone(),
                 expired_at_ms: 1,
                 seq: 1,
@@ -2052,6 +2062,7 @@ fn sidecar_removal_failure_leaves_completion_retryable() {
         .with_extension("session");
     let temp = side.with_extension("session.tmp");
     let stone = Tombstone {
+        recovery_artifacts: Vec::new(),
         next_tag: None,
         next_notice_seq: None,
         lineage_id: id.clone(),
@@ -2089,6 +2100,7 @@ fn matching_tombstone_precedes_the_clock_and_latest_sequence_wins() {
     let rig = Rig::new();
     let id = rig.seed(30, 100, Some(200));
     let stone = Tombstone {
+        recovery_artifacts: Vec::new(),
         next_tag: None,
         next_notice_seq: None,
         lineage_id: id.clone(),
@@ -2108,6 +2120,7 @@ fn matching_tombstone_precedes_the_clock_and_latest_sequence_wins() {
         .write_tombstone(
             &rig.key,
             &Tombstone {
+                recovery_artifacts: Vec::new(),
                 next_tag: None,
                 next_notice_seq: None,
                 lineage_id: "a".repeat(32),
@@ -2164,6 +2177,7 @@ fn unfinished_deletion_resumes_each_disk_boundary_and_never_moves_a_new_lineage(
         let rig = Rig::new();
         let id = rig.seed(1, 100, Some(200));
         let stone = Tombstone {
+            recovery_artifacts: Vec::new(),
             next_tag: None,
             next_notice_seq: None,
             lineage_id: id.clone(),
@@ -3145,6 +3159,7 @@ async fn expiry_frees_cached_sender_and_ownership_for_the_next_lineage() {
         .write_tombstone(
             &rig.key,
             &Tombstone {
+                recovery_artifacts: Vec::new(),
                 next_tag: None,
                 next_notice_seq: None,
                 lineage_id: id,
@@ -3457,6 +3472,7 @@ fn interrupted_retention_deletion_exports_owed_identity_without_restoring_wal() 
     let _lease = rig.service.lease(&rig.key).unwrap();
     rig.service.rederive(&rig.key).unwrap();
     let stone = Tombstone {
+        recovery_artifacts: Vec::new(),
         next_tag: None,
         next_notice_seq: None,
         lineage_id: lineage.clone(),
@@ -4727,6 +4743,7 @@ fn readable_record_first_legacy_deletion_accepts_live_and_moved_layouts() {
         );
         if moved {
             let stone = Tombstone {
+                recovery_artifacts: Vec::new(),
                 next_tag: None,
                 next_notice_seq: None,
                 lineage_id: id.clone(),
@@ -5664,6 +5681,7 @@ fn deletion_recovery_isolates_persistent_bad_tombstone_and_evicts_good_keys() {
             .write_tombstone(
                 &rig.key,
                 &Tombstone {
+                    recovery_artifacts: Vec::new(),
                     next_tag: None,
                     next_notice_seq: None,
                     lineage_id: id.clone(),

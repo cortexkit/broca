@@ -2337,6 +2337,7 @@ mod tests {
                 completed_at_ms: None,
                 next_tag: None,
                 next_notice_seq: None,
+                recovery_artifacts: Vec::new(),
             })
             .unwrap(),
         )

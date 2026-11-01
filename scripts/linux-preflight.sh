@@ -7,7 +7,7 @@ cd "$root"
 dirty="$(git status --porcelain)" || { echo 'linux-preflight: cannot read snapshot status' >&2; exit 2; }
 [[ -z "$dirty" ]] || { echo 'linux-preflight: snapshot must be committed and clean' >&2; exit 2; }
 : "${CARGO_TARGET_DIR:?motor must supply its persistent target cache}"
-export CARGO_BUILD_JOBS=8 PYTHONDONTWRITEBYTECODE=1
+export CARGO_BUILD_JOBS=16 PYTHONDONTWRITEBYTECODE=1
 rustc --version
 cargo --version
 cargo nextest --version
@@ -19,6 +19,7 @@ printf 'integration selection (fixture families stay in CI/Mac):\n%s\n' "$portab
 features=(
   -F broca-provider/live
   -F broca-provider/test-harness
+  -F broca-provider/portable-power-loss
   -F broca-catalog/live
   -F broca-module-serve/test-clock
 )
@@ -39,7 +40,7 @@ cargo test --locked --workspace --lib --bins --no-fail-fast "${features[@]}" -- 
 if [[ "$list_rc" -ne 0 ]]; then cat "$scratch/unit-list" >&2; exit "$list_rc"; fi
 python3 scripts/preflight-test-report.py unit-list "$scratch/unit-list" "${portable_unit_exclusions[@]}"
 unit_rc=0
-cargo test --locked --workspace --lib --bins --no-fail-fast "${features[@]}" --quiet -- --exact "${unit_skips[@]}" --show-output 2>&1 | tee "$scratch/units" || unit_rc=$?
+cargo test --locked --workspace --lib --bins --no-fail-fast "${features[@]}" --quiet -- --exact "${unit_skips[@]}" --test-threads 16 --show-output 2>&1 | tee "$scratch/units" || unit_rc=$?
 python3 scripts/preflight-test-report.py units "$scratch/units"
 [[ "$unit_rc" -eq 0 ]] || exit "$unit_rc"
 cargo nextest list --locked --workspace "${features[@]}" -E 'kind(test) and not (binary(=live) or binary(=live_e2e))' -T json > "$scratch/full.json"

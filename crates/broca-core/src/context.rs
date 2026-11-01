@@ -746,6 +746,29 @@ pub struct TagLocation {
 
 /// The materialized store read seam. The loop depends only on this trait.
 pub trait MaterializedStore: Send + Sync {
+    /// Invalidate rebuildable views durably before physical WAL recovery cuts.
+    /// Usage export facts are independent authority and must not be changed.
+    fn invalidate_wal_recovery(
+        &self,
+        _session: &BindIdentity,
+        _cut: &broca_wal::recovery::RecoveryCut,
+    ) -> Result<(), String> {
+        Err("materialized store cannot durably invalidate a WAL recovery".into())
+    }
+    fn needs_wal_recovery_projection(
+        &self,
+        _session: &BindIdentity,
+        _cut_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn reproject_wal_recovery(
+        &self,
+        _session: &BindIdentity,
+        _range: &WalRangeRead,
+    ) -> Result<(), String> {
+        Err("materialized store cannot reproject a WAL recovery".into())
+    }
     fn read_retained_head(
         &self,
         _session: &BindIdentity,
@@ -1906,8 +1929,10 @@ pub struct ToolCallDispatch {
 /// An ordinary call's fallback key, from its own `ToolDispatchIntent`.
 ///
 /// Ordinary calls use their own intent: sibling calls share a step record but have
-/// distinct intents. A synced sequence is never reissued, and the log identity
-/// distinguishes replacements at one address. Consent preparation can make a call
+/// distinct intents. This fallback spelling is for unrepaired history. After a
+/// repair the writer records a cut-generation key so reused sequences cannot alias
+/// removed calls. The log identity distinguishes replacements at one address.
+/// Consent preparation can make a call
 /// durable earlier; its key is then recorded on the later intent and preserved by
 /// [`tool_call_key`]. Model ids may repeat without reusing either kind of key.
 /// The spelling is printable ASCII, below the tool-provider role's 256-byte bound.
@@ -2390,6 +2415,7 @@ pub(crate) fn merge_prefix_and_tail(
     tail_episodes.render = tail_state.render_episodes.clone().unwrap_or_default();
     let state = crate::ReplayState {
         account_limit_pause: None,
+        recovered_calls: Vec::new(),
         extent: tail_state.extent,
         tags_await_setup: tail_state.tags_await_setup,
         input_budget: tail_state.input_budget,
