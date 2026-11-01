@@ -4597,9 +4597,10 @@ mod database_attach_tests {
                 op.frames_decoded,
                 op.reads.iter().map(|r| r.length).sum::<u64>(),
             ));
+            drop(reader);
             drop(wal);
             drop(db);
-            let _ = std::fs::remove_dir_all(root);
+            std::fs::remove_dir_all(root).unwrap();
         }
         assert_eq!(measurements[0], measurements[1]);
         eprintln!("bounded attach reads/decodes/bytes: {measurements:?}");
@@ -4728,8 +4729,9 @@ mod database_attach_tests {
         );
         fanout.teardown().await;
         writer.shutdown().await.unwrap();
+        drop(fanout);
         drop(lease);
         drop(db);
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

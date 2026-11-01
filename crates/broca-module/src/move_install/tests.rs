@@ -186,6 +186,8 @@ fn operational_overhaul_activation_recovery_keeps_exclusions_across_the_rename_c
     )
     .unwrap());
     assert!(!root.join("run-index.db").exists());
+    // Windows cannot remove the scratch directory while SQLite still has open files.
+    drop(db);
     std::fs::remove_dir_all(root).unwrap();
 }
 

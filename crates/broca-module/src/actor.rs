@@ -10510,6 +10510,8 @@ mod tests {
         wal: Box<dyn broca_wal::Wal + Send>,
         witness: Arc<std::sync::Mutex<broca_wal::file_wal::DurablePublication>>,
         reader: Arc<dyn broca_core::context::AdmissionReader>,
+        // Fields are dropped in order; remove the directory only after closing its files.
+        _scratch: DatabaseAdmissionScratch,
     }
 
     impl DatabaseAdmissionFixture {
@@ -10545,6 +10547,7 @@ mod tests {
             let source = witness.clone();
             let reader = db.admission_reader(move |_| Ok(source.lock().unwrap().clone()));
             Self {
+                _scratch: DatabaseAdmissionScratch(root.clone()),
                 root,
                 key,
                 db,
@@ -10592,10 +10595,19 @@ mod tests {
         }
     }
 
-    impl Drop for DatabaseAdmissionFixture {
+    struct DatabaseAdmissionScratch(std::path::PathBuf);
+    impl Drop for DatabaseAdmissionScratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn database_admission_fixture_cleanup_closes_database_and_wal() {
+        let fixture = DatabaseAdmissionFixture::new(&database_paused_records(false, 0, false));
+        let root = fixture.root.clone();
+        drop(fixture);
+        assert!(!root.exists(), "fixture left its scratch directory behind");
     }
 
     fn database_paused_records(
