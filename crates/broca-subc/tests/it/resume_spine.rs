@@ -178,6 +178,7 @@ fn request(project_root: &Path) -> RunRequest {
         session: BindIdentity::new(project_root, HARNESS, SESSION),
         model: ModelHandle::new("aft-stub", "stub-model"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

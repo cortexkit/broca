@@ -1819,6 +1819,16 @@ pub trait ServeHandler: Send + Sync {
         Ok(())
     }
 
+    /// Diagnostic ownership observation only; a cold cache is unknown, not a non-owner.
+    /// Implementations must not read storage or open an actor to answer this query.
+    fn cached_session_owner(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        None
+    }
+
     /// Owner-only authorization for cancel/retract, independent of route scope and epoch.
     /// A handler without recorded ownership has no protected session.
     async fn authorize_session_owner(
@@ -2060,6 +2070,21 @@ pub trait ServeHandler: Send + Sync {
                 Some(broca_protocol::ErrorClass::Permanent),
             ))
         }
+    }
+
+    /// Cancel with the daemon-attested caller, never an identity from the request body.
+    /// Handlers without named-sender admission retain owner-only cancellation.
+    async fn cancel_from(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<CancelResponse, ServeError> {
+        self.authorize_session_owner(session, principal, scope)
+            .await?;
+        self.cancel_at(session, run_id, at).await
     }
 
     /// `run.status` / `session.status` — the lineage's current state.
@@ -2394,6 +2419,13 @@ impl crate::LineageRegistry {
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
+    fn cached_session_owner(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        crate::LineageRegistry::cached_session_owner(self, session, principal)
+    }
     async fn run_event_get(
         &self,
         session: &LineageKey,
@@ -2536,9 +2568,8 @@ impl ServeHandler for crate::LineageRegistry {
         scope: &broca_protocol::SendScope,
         submission_id: Option<&str>,
     ) -> Result<(), ServeError> {
-        // Runner 0.7.29 CONTRACT.md:2333-2362 (§9.2) extends only session.retract:
-        // owners keep their exact path; another attested sender may withdraw only its
-        // recorded submission. run.cancel remains owner-only, even for that sender.
+        // Retraction grants access to a submission's recorded sender, independently of
+        // whether the current plan grants that sender permission to stop the running turn.
         match self
             .authorize_session_owner(session, principal, scope)
             .await
@@ -4272,6 +4303,63 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<CancelResponse, ServeError> {
         use crate::actor::CancelOutcome;
         match self.route_cancel_at(session, run_id, at).await? {
+            CancelOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
+            CancelOutcome::Error(error) => Err(ServeError::Open(error, None)),
+            CancelOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
+            CancelOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
+            CancelOutcome::Ack => Ok(CancelResponse::Ack),
+            CancelOutcome::NotActive => Ok(CancelResponse::NotActive),
+            CancelOutcome::Reopen => unreachable!("registry retry consumes Reopen"),
+        }
+    }
+
+    async fn cancel_from(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<CancelResponse, ServeError> {
+        use crate::actor::CancelOutcome;
+        match self
+            .warm_cancel_authority(session, principal, scope, at)
+            .await?
+        {
+            Some(crate::actor::CancelAuthority::Owner) => {
+                return self.cancel_at(session, run_id, at).await
+            }
+            Some(crate::actor::CancelAuthority::Sender) => {}
+            None => {
+                let refusal = match self
+                    .authorize_session_owner(session, principal, scope)
+                    .await
+                {
+                    Ok(()) => return self.cancel_at(session, run_id, at).await,
+                    Err(ServeError::ScopeRefused(refusal)) => refusal,
+                    Err(error) => return Err(error),
+                };
+                let granted = if let (
+                    broca_wal::record::RunCancelAt::Now,
+                    Some(broca_protocol::BindPrincipal::Reserved { module_id }),
+                ) = (at, principal)
+                {
+                    self.interrupt_cancel_granted(session, module_id).await?
+                } else {
+                    false
+                };
+                if !granted {
+                    return Err(ServeError::ScopeRefused(refusal));
+                }
+            }
+        }
+        // Refuse before opening an actor: recovery itself can write. The actor checks the
+        // grant again so a refresh accepted after this read cannot leave stale authority.
+        match self
+            .route_cancel_from(session, run_id, at, principal.cloned(), scope.clone())
+            .await?
+        {
+            CancelOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
             CancelOutcome::Error(error) => Err(ServeError::Open(error, None)),
             CancelOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
             CancelOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
@@ -4400,6 +4488,7 @@ mod held_status_tests {
 
     fn state(index: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            account_limit_pause: None,
             state: index,
             held_calls: Vec::new(),
             budget_detail: None,
@@ -4504,6 +4593,7 @@ mod paused_auth_tests {
                 broca_protocol::PauseReason::AuthRequired,
             ] {
                 let state = broca_core::ReconciledRunState {
+                    account_limit_pause: None,
                     held_calls: Vec::new(),
                     run_usage: Default::default(),
                     budget_detail: None,
@@ -4583,6 +4673,7 @@ mod context_ceiling_tests {
     use super::*;
     fn reconciled(state: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            account_limit_pause: None,
             held_calls: Vec::new(),
             state,
             context_ceiling: None,
@@ -4743,6 +4834,7 @@ mod offset_head_tests {
             run_id: RunId("r1".into()),
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,

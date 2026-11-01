@@ -72,6 +72,11 @@ const MAX_INFLIGHT_ROUTE_REQUESTS: usize = 64;
 const DISPATCH_LANE_SWEEP_MIN: usize = 64;
 const DROP_LOG_KEY_LIMIT: usize = 256;
 
+/// Start reader-census coverage at daemon startup, before accepting any routes.
+pub fn initialize_session_readers() {
+    crate::session_readers::initialize();
+}
+
 // Serve-side drops are inbound daemon frames rejected by broca's route-binding guard below.
 // They are distinct from broca_subc::FRAME_DROPS, which counts frames dropped on the
 // client-side outbound routes.
@@ -392,6 +397,11 @@ fn health_status(details: &[String]) -> subc_protocol::session::HealthStatus {
     }
 }
 
+fn held_withdrawal_health_detail(withdrawals: &serde_json::Value) -> Option<String> {
+    (withdrawals["failed"].as_u64().unwrap_or(0) > 0 || withdrawals.get("error").is_some())
+        .then(|| "provider-held tool.withdraw failures need attention".into())
+}
+
 fn now_epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -532,6 +542,8 @@ struct BindObservation {
     /// The daemon-stamped principal, converted without change. `None` when the bind carried
     /// none, which is what a daemon that predates principal stamping sends.
     principal: Option<broca_protocol::BindPrincipal>,
+    /// Render once per bind so repeated status polls never allocate a census key.
+    reader_principal: Option<Arc<str>>,
     /// The daemon's scope stamp on the bind, or why there is none. Every send over the route
     /// carries it to admission, which decides the owner check and the scope to freeze.
     scope: broca_protocol::SendScope,
@@ -1080,6 +1092,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
     H: ServeHandler + 'static,
 {
+    initialize_session_readers();
     let stall_state = stall::connection_state();
     let (tx, rx) = broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, stall_state.egress.clone());
     let mut writer = tokio::spawn(drain_writer(write_half, rx));
@@ -1843,6 +1856,7 @@ async fn handle_control_request(
             // records who started it. A session may later adopt a scope only if the scope's
             // owner is the principal on every earlier episode, and an episode recorded without
             // one can never satisfy that.
+            let principal_observation = principal.as_ref().map(to_bind_principal);
             let bind = BindObservation {
                 management: matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. }),
                 agent_data: matches!(&target, subc_protocol::RouteTarget::InternalService { service_id, .. }
@@ -1856,7 +1870,10 @@ async fn handle_control_request(
                     RouteRole::LlmRunner
                 },
                 project_id: identity.project_id.clone(),
-                principal: principal.as_ref().map(to_bind_principal),
+                reader_principal: Some(crate::session_readers::principal_label(
+                    principal_observation.as_ref(),
+                )),
+                principal: principal_observation,
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
                 stamped_project: scope
                     .as_ref()
@@ -2049,10 +2066,8 @@ async fn handle_control_request(
                 details
                     .push("late-results-rebuild-required: intake completeness is unknown".into());
             }
-            if held_runtime["withdrawals"]["failed"].as_u64().unwrap_or(0) > 0
-                || held_runtime["withdrawals"].get("error").is_some()
-            {
-                details.push("provider-held tool.withdraw failures need attention".into());
+            if let Some(detail) = held_withdrawal_health_detail(&held_runtime["withdrawals"]) {
+                details.push(detail);
             }
             if retention_unreadable > 0 {
                 details.push(format!("{retention_unreadable} retained logs blocked by unreadability without a current projection"));
@@ -2190,6 +2205,7 @@ async fn handle_control_request(
                 });
             metrics["scoped_role_route_refusals"] =
                 serde_json::json!(broca_subc::scoped_role_route_refusals());
+            metrics["session_readers"] = crate::session_readers::health();
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
                 // status Ok. Fusiform reachability is deliberately absent because health never
@@ -2660,6 +2676,12 @@ where
             }
         }
         count_management_operation(method);
+        if let Some(op) = crate::session_readers::operation(method) {
+            crate::session_readers::record(
+                bind.reader_principal.as_ref(), op,
+                handler.cached_session_owner(&session, bind.principal.as_ref()),
+            );
+        }
         if describe {
             trace_describe("task_started", channel, epoch, corr);
         }
@@ -2726,9 +2748,9 @@ async fn authorize_route_request<H: ServeHandler>(
             .authorize_session_retract(session, bind.principal.as_ref(), &bind.scope, submission_id)
             .await
     } else if method == OP_CANCEL {
-        handler
-            .authorize_session_owner(session, bind.principal.as_ref(), &bind.scope)
-            .await
+        // Cancellation checks the caller together with the current sender grant in the
+        // lineage actor, serialized with refresh, rather than trusting a route-time grant.
+        Ok(())
     } else {
         handler
             .authorize_session(session, bind.principal.as_ref())
@@ -3392,7 +3414,13 @@ where
                 }
             };
             match handler
-                .cancel_at(session, broca_protocol::RunId(params.run_id), at)
+                .cancel_from(
+                    session,
+                    broca_protocol::RunId(params.run_id),
+                    at,
+                    bind.principal.as_ref(),
+                    &bind.scope,
+                )
                 .await
             {
                 Ok(resp) => send_json_response(writer, ver, channel, epoch, corr, &resp).await,
@@ -6127,6 +6155,83 @@ mod tests {
         assert_eq!(logs[0].fields["session"], logs[1].fields["session"]);
     }
 
+    #[tokio::test]
+    async fn scope_gone_withdrawals_do_not_degrade_health_but_other_failures_do() {
+        struct NoRetry;
+        #[async_trait::async_trait]
+        impl broca_module::held_withdrawals::WithdrawTransport for NoRetry {
+            async fn withdraw(
+                &self,
+                _: &broca_core::tool_plane::LateResultRegistration,
+            ) -> (
+                cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+                serde_json::Value,
+            ) {
+                panic!("a terminal refusal must not be retried");
+            }
+        }
+        for (code, failed, scope_gone, expected) in [
+            (
+                subc_protocol::error_codes::SCOPE_NOT_LIVE,
+                0,
+                1,
+                subc_protocol::session::HealthStatus::Ok,
+            ),
+            (
+                subc_protocol::error_codes::SCOPE_ENDED,
+                0,
+                1,
+                subc_protocol::session::HealthStatus::Ok,
+            ),
+            (
+                subc_protocol::error_codes::SCOPE_NOT_CARRIER,
+                1,
+                0,
+                subc_protocol::session::HealthStatus::Degraded,
+            ),
+        ] {
+            let root = broca_test_support::scratch_root().join(format!("withdrawal-health-{code}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let store = Arc::new(
+                broca_module::late_results_store::LateResultsStore::open(
+                    &root.join("late-results.db"),
+                )
+                .unwrap(),
+            );
+            let call = broca_core::tool_plane::LateResultRegistration {
+                lineage: "lineage".into(),
+                call_key: "lineage:4".into(),
+                module: "tools".into(),
+                bind: BrocaBindIdentity::new("/project", "broca", code),
+                scope: None,
+            };
+            store.register_calls(std::slice::from_ref(&call)).unwrap();
+            // Existing outbox rows keep their terminal state; only health accounting changes.
+            store
+                .record_withdrawal(&call, "failed", 1, &serde_json::json!({"code":code}))
+                .unwrap();
+            let service = broca_module::held_withdrawals::HeldWithdrawals::new(
+                store,
+                Arc::new(broca_core::FileWalStore::new(root.join("wal"))),
+                Arc::new(NoRetry),
+            );
+            service.bind_stopping_signal(CancellationToken::new());
+            service.recover().await.unwrap();
+            let withdrawals = service.health();
+            assert_eq!(withdrawals["failed"], failed, "{code}: {withdrawals}");
+            assert_eq!(
+                withdrawals["scope_gone"], scope_gone,
+                "{code}: {withdrawals}"
+            );
+            let details: Vec<_> = held_withdrawal_health_detail(&withdrawals)
+                .into_iter()
+                .collect();
+            assert_eq!(health_status(&details), expected, "{withdrawals}");
+        }
+        let error = serde_json::json!({"failed": 0, "error": "unreadable"});
+        assert!(held_withdrawal_health_detail(&error).is_some());
+    }
+
     #[test]
     fn projection_health_degrades_only_for_sessions_still_behind() {
         let recovered = projection_health_report(1, 0);
@@ -7912,6 +8017,7 @@ mod tests {
             run_id: broca_protocol::RunId("legacy".into()),
             session,
             config: Box::new(broca_wal::RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -8338,6 +8444,7 @@ mod tests {
                     role: RouteRole::LlmRunner,
                     project_id: None,
                     principal: None,
+                    reader_principal: None,
                     scope: broca_protocol::SendScope::Unstamped,
                     stamped_project: None,
                     consumer_format: Default::default(),

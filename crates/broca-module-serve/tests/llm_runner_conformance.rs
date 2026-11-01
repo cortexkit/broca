@@ -3551,6 +3551,13 @@ const REQUIRED_STRUCTURED_OUTPUT_CASES: &[&str] = &[
     "structured_output_sibling_never_dispatched",
 ];
 
+const REQUIRED_INTERRUPT_CANCEL_CASES: &[&str] = &[
+    "run_cancel_by_interrupt_now_cancelled",
+    "run_cancel_by_interrupt_without_grant_refused",
+    "run_cancel_by_interrupt_non_now_refused",
+    "run_cancel_by_interrupt_other_session_refused",
+];
+
 const REQUIRED_RETRACT_OWN_SEND_CASES: &[&str] = &[
     "retract_own_send_sender_retracted",
     "retract_own_send_other_sender_refused",
@@ -3569,6 +3576,7 @@ fn check_named_contract_cases(
         .iter()
         .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
         .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
+        .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
     {
         let case = cases
             .iter()
@@ -3608,6 +3616,7 @@ mod named_contract_case_tests {
                 case.name.starts_with("input_token_cap_")
                     || case.name.starts_with("structured_output_")
                     || case.name.starts_with("retract_own_send_")
+                    || case.name.starts_with("run_cancel_by_interrupt_")
             })
             .map(|case| CaseReport {
                 case: case.name,
@@ -3634,6 +3643,7 @@ mod named_contract_case_tests {
             .iter()
             .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
             .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
+            .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
             .copied()
             .chain(std::iter::once("structured_output_streamed_siblings"))
         {

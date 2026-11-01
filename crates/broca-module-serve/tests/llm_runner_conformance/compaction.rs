@@ -562,6 +562,7 @@ fn settlement_records() -> Vec<broca_wal::FramedRecord> {
         run_id: RunId(id.into()),
         session: BindIdentity::new("/test", "runner", "settle"),
         config: Box::new(broca_wal::RunConfig {
+            account_limit_pause: false,
             model: ModelHandle::new("mock", "m"),
             tools: Arc::new(vec![]),
             tool_choice: Default::default(),

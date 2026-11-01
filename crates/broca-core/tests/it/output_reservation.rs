@@ -206,6 +206,7 @@ fn request(dir: &std::path::Path) -> RunRequest {
         session: broca_protocol::BindIdentity::new(dir, "window", "s1"),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

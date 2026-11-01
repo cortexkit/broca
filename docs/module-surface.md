@@ -352,6 +352,24 @@ request increments after authorization and migration checks, even when its param
 later return an error. Authorization and migration refusals are not counted. The existing
 `session_reads` and `actor_opens` counters remain available with their existing meanings.
 
+`health.check.metrics.session_readers` is a process-wide, in-memory census of authorized
+read attempts, separate from the legacy numeric `metrics.session_reads`. Its `entries` array
+contains `{principal, op, owner, count, last_ms}` for `session.read`, `session.history`,
+`session.head`, `session.subscribe`, `run.status`, `run.result`, `run.tool_calls`, `send.status`
+and `session.media_read`. Authorization and migration refusals are excluded; later parameter
+or handler errors still count. Subscriptions count once when opened, not once per frame.
+The principal is rendered from the daemon's route stamp (`reserved:<module_id>`, `direct`,
+`unverified`, or the existing principal type's other rendering); a bind from an older daemon
+with no stamp is named `unattested`. Request parameters cannot change that attribution.
+`owner` is true for the recorded first sender or scope owner, false for other callers, and
+null when ordinary requests have not yet loaded ownership into the cache. Unknown reads
+retain their own keys rather than being reclassified later. Telemetry never reads storage
+or opens an actor to discover ownership. The key is `(principal, op, owner)` with at most 256
+distinct keys; attempts introducing further keys increment `overflow`, while existing keys
+continue counting. Counts, `overflow` and the epoch-millisecond `last_ms` values reset on
+restart; `since_ms` is the daemon's process-start coverage timestamp. No census is written
+to a log or store.
+
 To see one debug record per served operation, add a `CK_LOG` value to broca's module environment
 in `subc.jsonc`:
 
@@ -1203,7 +1221,7 @@ retain it in `Queued.principal`. Request-body sender claims never grant access. 
 unverified or ambiguous attribution grants no exception to the owner's existing path.
 Answers and durable tombstones are identical to an owner's withdrawal: `retracted`,
 `already_started` or `not_pending`. A delivered steer is `not_pending`. This does not
-extend `run.cancel`, which remains owner-only, or change sessions without a recorded owner.
+extend `run.cancel` by itself, or change sessions without a recorded owner.
 
 Plan-named senders may share a `send_id` without sharing a submission. The first sender
 keeps the legacy run ID; a later delegated sender colliding with another recorded sender
@@ -1248,7 +1266,16 @@ not compare that stamp with an authority or reject an append solely because it i
 
 ## 13. Cancel token + provider watchdog (core change)
 
-`run.cancel` is owner-only. Omitted `at` (or `at: "now"`) retains immediate cancellation:
+`run.cancel` admits the session's owners. Broca also declares `run_cancel_by_interrupt`:
+an attested named sender whose current effective grant has `interrupt: true` may cancel
+with omitted `at` or `at: "now"`, but never `step_boundary`. The latest accepted refresh
+controls this grant even before its execution plan applies; removed senders and callers
+named only in another session are refused `scope_owner_mismatch` without writes. Sender
+cancels use the same `"ack"` / `"not_active"` replies and `cancelled` terminal as owners,
+with no sender field added to either. The accepted sender stop is durable before `"ack"`,
+so recovery finishes the cancellation without dispatching an in-flight call again.
+
+Omitted `at` (or `at: "now"`) retains immediate cancellation:
 the model stream is cancelled and sent tool calls retain the existing at-most-once recovery
 rules. `at: "step_boundary"` finishes the in-flight model step and its entire tool batch,
 records the results, and writes no further `StepStarted` before `RunFinished{Cancelled}`.
@@ -1685,7 +1712,13 @@ for an already-durably-cancelled call. Neither shutdown nor restart creates a wi
 by itself, and a call that completed before its sibling was cancelled is not withdrawn. The
 registry's stop signal suppresses new withdrawal attempts and retries during drain; an earlier
 request may already have reached the provider. Health exposes pending/failed withdrawals and
-their refusal codes.
+their refusal codes. Route refusals `scope_not_live` and `scope_ended` mean withdrawal is
+impossible under the original scope, not that the held call was cancelled or its outcome is
+known. They count in `provider_held.withdrawals.scope_gone`, not `failed`, and do not degrade
+health; `scope_gone_details` retains at most ten diagnostics with the same `code`, `answer`
+and `reason` fields as `failure_details`. All other refusals and errors still count as failures.
+After a cancelled call's terminal is durable, a later result is only receipted and acked as a
+no-op when the module's on-demand feed next drains, not guaranteed to be delivered to the run.
 
 Late-result pullers start before withdrawal recovery, which runs independently and obeys the
 registry's stop signal. Withdrawal recovery snapshots the outbox once, groups rows by session,

@@ -603,6 +603,7 @@ async fn run(args: Args) -> Result<(), String> {
                         let text = std::fs::read_to_string(path)
                             .map_err(|e| format!("read {}: {e}", path.display()))?;
                         prompt.push(Message {
+                            turn_system: false,
                             cache_prefix_blocks: None,
                             origin: None,
                             ordinal: None,
@@ -612,6 +613,7 @@ async fn run(args: Args) -> Result<(), String> {
                         });
                     }
                     prompt.push(Message {
+                        turn_system: false,
                         cache_prefix_blocks: None,
                         origin: None,
                         ordinal: None,

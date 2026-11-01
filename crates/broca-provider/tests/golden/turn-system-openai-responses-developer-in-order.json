@@ -1,0 +1,23 @@
+[
+  {
+    "input": [
+      {
+        "content": "Summarize the notes.",
+        "role": "user",
+        "type": "message"
+      },
+      {
+        "content": [
+          {
+            "text": "Keep the summary concise.",
+            "type": "input_text"
+          }
+        ],
+        "role": "developer"
+      }
+    ],
+    "max_output_tokens": 2048,
+    "model": "gpt-4o",
+    "stream": true
+  }
+]

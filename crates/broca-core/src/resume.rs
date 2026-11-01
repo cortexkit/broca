@@ -1983,6 +1983,7 @@ mod tests {
                 records.push(approval("call", "key-call", DeferredDecision::Approved));
             }
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r".into()),
                 ts_ms: Some(1),
                 reason: PauseReason::Restart,

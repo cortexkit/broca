@@ -28,10 +28,8 @@ impl RunExecutor for PauseBeforeCancel {
         job.writer.sync().await?;
         let _ = job.on_admitted.take().unwrap().send(Ok(job.req.run_id.clone()));
         self.release.notified().await;
-        job.writer.record(WalRecord::RunPaused {
-            run_id: job.req.run_id.clone(), ts_ms: Some(200),
-            reason: broca_protocol::PauseReason::Restart, error: None,
-        });
+        job.writer.record(WalRecord::RunPaused { account_limit: None, run_id: job.req.run_id.clone(), ts_ms: Some(200),
+        reason: broca_protocol::PauseReason::Restart, error: None, });
         job.writer.sync().await?;
         // The next read belongs to the paused cancel finalizer, not the executor.
         self.wal.fail_next_read();

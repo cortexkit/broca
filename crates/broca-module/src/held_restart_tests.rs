@@ -600,7 +600,9 @@ async fn restarted_delivery(restarts: usize, refused: bool, queued: bool, seeded
             "database admission needs no legacy checkpoint store"
         );
     }
-    let _ = std::fs::remove_dir_all(root);
+    drop(store);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -733,6 +735,7 @@ async fn finished_materialized_open_keeps_baseline_read_counts() {
     })
     .await;
     assert!(registry.stop_and_seal().await);
+    drop(registry);
     store
         .project_range(&key, &wal.read_records_range(&key, 0, None, None).unwrap())
         .unwrap();
@@ -762,5 +765,6 @@ async fn finished_materialized_open_keeps_baseline_read_counts() {
         "preserve the baseline range read"
     );
     assert!(registry.stop_and_seal().await);
-    let _ = std::fs::remove_dir_all(root);
+    drop(registry);
+    std::fs::remove_dir_all(root).unwrap();
 }

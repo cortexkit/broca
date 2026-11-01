@@ -34,7 +34,7 @@ fn seed_admission_episode(wal: &FlakyReadWalStore, key: &BindIdentity, now: u64,
     }
     writer.append(1, &record, true).unwrap();
     let end = if restart {
-        WalRecord::RunPaused { run_id: RunId("prior".into()), ts_ms: Some(now),
+        WalRecord::RunPaused { account_limit: None, run_id: RunId("prior".into()), ts_ms: Some(now),
             reason: broca_protocol::PauseReason::Restart, error: None }
     } else {
         WalRecord::RunFinished { interrupt_reason: None, ts_ms: Some(now), reason: RunFinishReason::Completed,

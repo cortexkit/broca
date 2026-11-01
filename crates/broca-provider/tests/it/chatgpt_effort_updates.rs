@@ -47,6 +47,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
         run_id: RunId(format!("run-{effort}")),
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -72,6 +73,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
         }),
         input: role
             .map(|role| Message {
+                turn_system: false,
                 role,
                 content: vec![ContentBlock::Text {
                     text: format!("episode-{effort}"),

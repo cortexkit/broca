@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 pub(crate) fn fixed_request() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -31,6 +32,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             }],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -41,6 +43,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             }],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -54,6 +57,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             })],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -97,6 +101,7 @@ pub(crate) fn fixed_request() -> CallOptions {
 fn repeated_tool_call_id_request() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -110,6 +115,7 @@ fn repeated_tool_call_id_request() -> CallOptions {
             })],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -124,6 +130,7 @@ fn repeated_tool_call_id_request() -> CallOptions {
             })],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -137,6 +144,7 @@ fn repeated_tool_call_id_request() -> CallOptions {
             })],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

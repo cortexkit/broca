@@ -411,6 +411,7 @@ pub async fn run_family_e2e<F: WireFamily + 'static>(
         session: BindIdentity::new(&dir, "runner", &session),
         model: ModelHandle::new("mock", "mock-model"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

@@ -371,6 +371,7 @@ impl Fixture {
             }
             let end = if restart_paused {
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("prior".into()),
                     ts_ms: None,
                     reason: broca_protocol::PauseReason::Restart,
@@ -493,6 +494,7 @@ impl Fixture {
             charge_basis_resolver: None,
             startup_recovery_pending: false,
             prior_snapshot: None,
+            sender_policy_cache: None,
             pending_fifo: Vec::new(),
             send_reply: None,
             skip_materialization_submissions: HashSet::new(),

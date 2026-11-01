@@ -141,6 +141,7 @@ mod gated {
             session: BindIdentity::new(dir, "c6b", "s1"),
             model: ModelHandle::new("anthropic", "claude-opus-4-8"),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -269,6 +270,7 @@ mod gated {
             .open(&request.session)
             .expect("open WAL for resumable seed");
         let config = RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags,
             computed_tags: None,
@@ -765,6 +767,86 @@ mod gated {
             drop(sent);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_system_crash_after_delivery_record_resumes_with_identical_downgraded_bytes() {
+        assert_turn_system_resume(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_system_crash_after_delivery_record_resumes_with_identical_system_bytes() {
+        assert_turn_system_resume(true).await;
+    }
+
+    async fn assert_turn_system_resume(supported: bool) {
+        use broca_core::delivery_order::{system_delivered, OrderedSend};
+        use broca_protocol::{DeliveryMode, DeliveryOrder, SubmissionId};
+        let dir = broca_test_support::scratch_root().join(format!(
+            "broca-turn-system-resume-{supported}-{}",
+            std::process::id()
+        ));
+        broca_test_support::remove_rig_dir(&dir);
+        let mut frozen = anthropic_apikey_frozen_config("claude-opus-4-8");
+        frozen.anthropic_turn_system = supported;
+        let req = request(&dir);
+        seed_resumable_request(&dir, &req, &frozen);
+        let note = OrderedSend {
+            admitted_at_ms: None,
+            submission_id: SubmissionId("template-note".into()),
+            order: DeliveryOrder {
+                modes: vec![DeliveryMode::TurnSystem],
+                dedupe_key: None,
+                expires_at_ms: None,
+                template: None,
+            },
+            principal: None,
+            input: vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "Keep the summary concise.".into(),
+                }],
+            )],
+        };
+        let delivered = system_delivered(&note, &req.run_id);
+        let mut expected_prompt = req.input.clone();
+        if let WalRecord::SendDelivered {
+            input: Some(input), ..
+        } = &delivered
+        {
+            expected_prompt.extend(input.iter().cloned());
+        } else {
+            panic!("delivery must carry its frozen input");
+        }
+        let provider = FrozenProvider::new(frozen.clone());
+        let expected = provider.render_request(&CallOptions::new(expected_prompt));
+        let store = FileWalStore::new(dir.join("wal"));
+        {
+            let mut wal = store.open(&req.session).unwrap();
+            wal.append(1, &delivered, false).unwrap();
+            wal.append(1, &WalRecord::StepStarted { step_id: StepId(1) }, true)
+                .unwrap();
+        }
+        // No model call or response exists after the durable delivery. Reopen through the
+        // production resume path, which must use the delivered input recorded in the WAL.
+        let summary = drive_request(&dir, &provider, req).await.unwrap();
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+        let calls = provider.sent.lock().unwrap();
+        assert_eq!(calls.get(&0).expect("resumed model call"), &expected);
+        let body: serde_json::Value = serde_json::from_slice(&expected).unwrap();
+        assert!(body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| if supported {
+                message["role"] == "system" && message["content"] == "Keep the summary concise."
+            } else {
+                message["role"] == "user"
+                    && message["content"]
+                        == "<context-note>Keep the summary concise.</context-note>"
+            }));
+        let records = FileWal::open(wal_path(&dir)).unwrap().replay().unwrap();
+        assert!(records.iter().any(|record| record.record == delivered));
     }
 
     #[tokio::test(flavor = "multi_thread")]

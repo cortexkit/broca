@@ -253,6 +253,7 @@ impl WalStore for ReadCountingWalStore {
 fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     let mut wal = store.open(&request.session).expect("open WAL for seed");
     let config = RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -322,6 +323,7 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
 
 fn resumable_frozen_config(request: &RunRequest, stop_when: Vec<StopCondition>) -> RunConfig {
     RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,

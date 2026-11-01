@@ -125,6 +125,7 @@ impl RunExecutor for Executor {
 
 fn config() -> RunConfig {
     RunConfig {
+        account_limit_pause: false,
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         generation: Default::default(),
         tool_choice: Default::default(),

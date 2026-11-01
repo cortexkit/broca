@@ -584,6 +584,8 @@ pub fn resolve_frozen(
         renderer_version,
         image_notice_labels: false,
         wire_model_id: model.id.clone(),
+        anthropic_turn_system: provider.wire_family == WireFamilyId::AnthropicMessages
+            && crate::turn_system::catalog_support(provider.wire_family, &provider.id, model),
         // The spec's base_url is the catalog-driven override for OpenAI-compatible
         // (and other host-configurable) providers. Empty = the family default.
         base_url: (!provider.base_url.is_empty()).then(|| provider.base_url.clone()),
@@ -689,6 +691,7 @@ fn frozen_from_family_defaults(
 ) -> FrozenRenderConfig {
     let q = default_quirks(family);
     FrozenRenderConfig {
+        anthropic_turn_system: false,
         family_id: family,
         renderer_version: renderer_version_for(family),
         image_notice_labels: false,

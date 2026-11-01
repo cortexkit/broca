@@ -546,6 +546,7 @@ mod tests {
 
     fn user(text: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],

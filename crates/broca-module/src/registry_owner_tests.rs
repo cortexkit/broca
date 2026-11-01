@@ -812,6 +812,78 @@ fn install_live(
 }
 
 #[tokio::test]
+async fn cached_reader_ownership_is_unknown_when_cold_and_never_reads_storage() {
+    let fixture = Fixture::new();
+    fixture.append(&[
+        started(
+            &fixture.session,
+            Some(reserved("carrier")),
+            Some(scope("core")),
+        ),
+        finished(),
+    ]);
+    let snapshot = snapshot(&fixture);
+    let checkpoint = snapshot.checkpoint.clone().unwrap();
+    let (registry, wal, store) = registry(&fixture, Ok(Some(snapshot)));
+    assert_eq!(
+        registry.cached_session_owner(&fixture.session, Some(&reserved("core"))),
+        None
+    );
+    assert_eq!(store.reads.load(Ordering::Relaxed), 0);
+    assert!(wal.reads.lock().unwrap().is_empty());
+
+    let head = install_live(&registry, &fixture.session, &checkpoint);
+    for (principal, expected) in [
+        (Some(reserved("core")), true),
+        (Some(reserved("carrier")), true),
+        (Some(reserved("observer")), false),
+        (None, false),
+    ] {
+        assert_eq!(
+            registry.cached_session_owner(&fixture.session, principal.as_ref()),
+            Some(expected)
+        );
+    }
+    head.fetch_add(1, Ordering::Release);
+    assert_eq!(
+        registry.cached_session_owner(&fixture.session, Some(&reserved("core"))),
+        None
+    );
+    assert_eq!(store.reads.load(Ordering::Relaxed), 0);
+    assert!(wal.reads.lock().unwrap().is_empty());
+
+    registry
+        .inner
+        .slots
+        .lock()
+        .unwrap()
+        .remove(&fixture.session);
+    registry
+        .inner
+        .live_ownership
+        .lock()
+        .unwrap()
+        .remove(&fixture.session);
+    assert!(
+        decision(&registry, &fixture.session, Some(&reserved("core")))
+            .await
+            .is_ok()
+    );
+    let store_reads = store.reads.load(Ordering::Relaxed);
+    let wal_reads = wal.reads.lock().unwrap().len();
+    assert_eq!(
+        registry.cached_session_owner(&fixture.session, Some(&reserved("core"))),
+        Some(true)
+    );
+    assert_eq!(
+        registry.cached_session_owner(&fixture.session, Some(&reserved("observer"))),
+        Some(false)
+    );
+    assert_eq!(store.reads.load(Ordering::Relaxed), store_reads);
+    assert_eq!(wal.reads.lock().unwrap().len(), wal_reads);
+}
+
+#[tokio::test]
 async fn owner_sources_match_full_wal_without_opening_an_actor() {
     let fixture = Fixture::new();
     fixture.append(&[

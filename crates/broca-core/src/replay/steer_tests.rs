@@ -38,6 +38,7 @@ fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
         run_id: RunId("r1".into()),
         session: BindIdentity::new("/tmp/project", "runner", "session"),
         config: Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

@@ -207,6 +207,7 @@ pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
 /// as [`DecodeStep::NewerWriter`]. `ck-broca --wal-known-features` prints this list so
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
+    ACCOUNT_LIMIT_PAUSE_FEATURE,
     BILL_ATTEMPTS_FEATURE,
     BILL_VAULT_FACTS_FEATURE,
     crate::head_proof::VISIBILITY_LATE_FEATURE,
@@ -226,6 +227,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     CONTEXT_CEILING_FEATURE,
     DEFERRED_CALL_FEATURE,
     DELIVERY_ORDER_FEATURE,
+    TURN_SYSTEM_FEATURE,
     DISPATCH_MODULE_FEATURE,
     FLOW_SCOPE_FEATURE,
     FRAME_STAMPS_FEATURE,
@@ -260,6 +262,9 @@ pub const KNOWN_FEATURES: &[&str] = &[
     TOOL_TIMES_FEATURE,
     MESSAGE_TIMES_FEATURE,
 ];
+
+/// A timed account pause must not be mistaken for a terminal error or an authentication pause.
+pub const ACCOUNT_LIMIT_PAUSE_FEATURE: &str = "account-limit-pause/v1";
 
 /// Physical-send reservation and settlement evidence for billing readers.
 pub const BILL_ATTEMPTS_FEATURE: &str = "bill-attempts/v1";
@@ -479,6 +484,9 @@ pub const DEFERRED_CALL_FEATURE: &str = "deferred-call/v1";
 /// would start a run from a queued send that may never start one, deliver a send that was
 /// replaced or expired, or render a prompt without a send that was delivered into it.
 pub const DELIVERY_ORDER_FEATURE: &str = "delivery-order/v1";
+
+/// Turn-scoped system entries must not be hoisted into legacy global instructions.
+pub const TURN_SYSTEM_FEATURE: &str = "turn-system/v1";
 
 /// A feature name that test builds treat as known, in addition to [`KNOWN_FEATURES`].
 ///
@@ -1526,6 +1534,7 @@ mod tests {
         assert_eq!(
             KNOWN_FEATURES,
             &[
+                ACCOUNT_LIMIT_PAUSE_FEATURE,
                 BILL_ATTEMPTS_FEATURE,
                 BILL_VAULT_FACTS_FEATURE,
                 crate::head_proof::VISIBILITY_LATE_FEATURE,
@@ -1545,6 +1554,7 @@ mod tests {
                 CONTEXT_CEILING_FEATURE,
                 DEFERRED_CALL_FEATURE,
                 DELIVERY_ORDER_FEATURE,
+                TURN_SYSTEM_FEATURE,
                 DISPATCH_MODULE_FEATURE,
                 FLOW_SCOPE_FEATURE,
                 FRAME_STAMPS_FEATURE,
@@ -3178,4 +3188,10 @@ mod view_negotiation_tests {
 }
 
 #[cfg(test)]
+#[path = "framing/account_limit_pause_tests.rs"]
+mod account_limit_pause_tests;
+#[cfg(test)]
 mod vault_facts_tests;
+
+#[cfg(test)]
+mod turn_system_tests;

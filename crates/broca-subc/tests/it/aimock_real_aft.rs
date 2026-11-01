@@ -147,6 +147,7 @@ async fn loop_drives_aimock_through_real_aft() {
         session: BindIdentity::new(&rig.dir, "runner", "spike-1"),
         model: ModelHandle::new(&module_id, &model),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

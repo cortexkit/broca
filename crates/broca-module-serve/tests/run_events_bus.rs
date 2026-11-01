@@ -72,6 +72,7 @@ fn started_at(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(ts_ms),
         config: Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -549,6 +550,7 @@ async fn real_bus_headers_digest_sequence_and_ack_retention() {
         .append(
             1,
             &WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("bus-run".into()),
                 ts_ms: Some(now_ms()),
                 reason: broca_protocol::PauseReason::Restart,

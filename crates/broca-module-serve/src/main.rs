@@ -43,6 +43,7 @@ const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module::diagnostics::initialize();
+    broca_module_serve::serve::initialize_session_readers();
     #[cfg(feature = "heap-profile")]
     broca_heap_profile::start();
     run_runtime(serve_main())?
@@ -5001,6 +5002,7 @@ mod executor {
             frozen.prompt_cache_key = Some("frozen-key".into());
             let mut req = drift_request(std::path::Path::new("/inherit-cache"));
             let config = broca_wal::RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -6141,6 +6143,7 @@ mod executor {
             framed(
                 seq,
                 broca_wal::WalRecord::RunPaused {
+                    account_limit: None,
                     ts_ms: None,
                     run_id: broca_protocol::RunId("run-1".into()),
                     reason: broca_protocol::PauseReason::AuthRequired,
@@ -6190,6 +6193,7 @@ mod executor {
                     session: BindIdentity::new("/tmp/project", "harness", "session"),
                     ts_ms: None,
                     config: Box::new(broca_wal::RunConfig {
+                        account_limit_pause: false,
                         turn_directives_v1: None,
                         render_tags: false,
                         computed_tags: None,

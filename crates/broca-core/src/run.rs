@@ -4954,7 +4954,18 @@ where
                 // from the reconstructed state and fall through to the loop, exactly like
                 // Resume, writing NO new RunStarted (the run is the same one, not a new
                 // episode).
-                if !auth_resolved && reason != PauseReason::Restart {
+                let account_limit_ready = reason == PauseReason::AccountLimit
+                    && prior.account_limit_pause.as_ref().is_some_and(|pause| {
+                        control
+                            .now_ms()
+                            .is_some_and(|now| now >= pause.resume_not_before_ms)
+                    });
+                let may_continue = match reason {
+                    PauseReason::AccountLimit => account_limit_ready,
+                    PauseReason::Restart => true,
+                    _ => auth_resolved,
+                };
+                if !may_continue {
                     let _ = send(
                         out,
                         OutputEvent::Control(ControlUnit::Paused {
@@ -5035,6 +5046,7 @@ where
                 if let Some(auth_selection) = control
                     .auth_selection
                     .as_ref()
+                    .filter(|_| reason != PauseReason::AccountLimit)
                     .filter(|selection| Some(*selection) != frozen_auth_selection)
                 {
                     if let Some(config) = &mut warm_config {
@@ -5046,7 +5058,7 @@ where
                     });
                     refreeze_recorded = true;
                 }
-                if reason == PauseReason::Restart {
+                if matches!(reason, PauseReason::Restart | PauseReason::AccountLimit) {
                     writer.record(resume_continuing);
                     writer.sync().await?;
                 } else if refreeze_recorded {
@@ -5236,6 +5248,7 @@ where
             session: req.session.clone(),
             config: remember_warm_config(
                 RunConfig {
+                    account_limit_pause: false,
                     turn_directives_v1: req.directives.clone(),
                     render_tags,
                     computed_tags,
@@ -7474,6 +7487,7 @@ where
                 // the steered message after it.
                 budget_state = step_budget_state;
                 let mut answer = Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     role: Role::Assistant,
                     content: assembled.content.clone(),
@@ -7584,6 +7598,7 @@ where
             &mut batch.results,
         );
         let mut answer = Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::Assistant,
             content: assembled.content,
@@ -7606,6 +7621,7 @@ where
             None
         };
         let mut results = Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::Tool,
             content: batch
@@ -8167,6 +8183,7 @@ async fn pause_run_impl(
     }
 
     writer.record(WalRecord::RunPaused {
+        account_limit: None,
         ts_ms: control.now_ms(),
         run_id: run_id.clone(),
         reason,
@@ -8849,6 +8866,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     // resume dispatched takes the tag the writer assigned when it appended that result's
     // record (`WalHandle::take_call_tags`).
     let mut answer = Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::Assistant,
         content: pending.assistant.content,
@@ -8866,6 +8884,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         None
     };
     let mut results = Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::Tool,
         content: batch
@@ -13328,6 +13347,7 @@ mod tests {
         let mut prior = crate::replay::replay(&[]).unwrap();
         prior.render_episodes = None;
         prior.run_config = Some(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -15350,6 +15370,7 @@ mod tests {
         }
 
         let config = RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -15411,6 +15432,7 @@ mod tests {
                 ownership: Some(crate::SessionOwnershipV1::default()),
                 at_seq: 8,
                 last_episode: Some(crate::LastEpisodeV1 {
+                    account_limit_pause: None,
                     cancel_at: None,
                     on_restart: None,
                     pause_reason: None,

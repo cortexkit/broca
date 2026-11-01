@@ -128,6 +128,7 @@ mod gated {
 
         let provider = live_provider(frozen, AuthHandle::Bearer(key)).expect("OpenAiChat is wired");
         let opts = CallOptions::new(vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

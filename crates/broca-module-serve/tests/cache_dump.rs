@@ -350,6 +350,7 @@ async fn fixture<F: WireFamily + 'static>(
         session: session.clone(),
         model: ModelHandle::new("test", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

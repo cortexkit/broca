@@ -1,5 +1,23 @@
 use super::*;
 
+#[test]
+fn durable_recovery_keeps_replay_state_off_caller_frames() {
+    fn future_size<'a, W: WalStore + 'static, F: std::future::Future>(
+        _: impl FnOnce(&'a mut LineageActor<W>) -> F,
+    ) -> usize {
+        std::mem::size_of::<F>()
+    }
+    // Recovery also runs inside actor command handling on a worker's small stack.
+    // Its orchestration future must not embed the full replay/admission state.
+    let production = future_size(LineageActor::<FileWalStore>::recover_durable_work);
+    let probe = future_size(LineageActor::<ProbeWal>::recover_durable_work);
+    eprintln!("recovery future bytes: production={production}, probe={probe}");
+    assert!(
+        production <= 4096 && probe <= 4096,
+        "recovery must keep large replay state on the heap: production={production}, probe={probe} bytes"
+    );
+}
+
 struct Running {
     task: tokio::task::JoinHandle<Fixture>,
     tx: mpsc::Sender<LineageCmd>,

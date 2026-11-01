@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 fn msg(role: Role, content: Vec<ContentBlock>) -> Message {
     Message {
+        turn_system: false,
         role,
         content,
         cache_prefix_blocks: None,
@@ -23,6 +24,7 @@ fn msg(role: Role, content: Vec<ContentBlock>) -> Message {
 
 fn assistant_from(model: &str, content: Vec<ContentBlock>) -> Message {
     Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::Assistant,
         content,

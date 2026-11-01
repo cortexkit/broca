@@ -24,6 +24,10 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
+    /// Template text delivered at its conversation position, never global instructions.
+    /// Unsupported routes render it at user authority without changing the stored entry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub turn_system: bool,
     /// Number of leading content blocks that form a caller-declared cacheable prefix.
     ///
     /// This render metadata stays beside the content it describes so queueing and replay retain
@@ -76,6 +80,7 @@ impl Message {
         Self {
             role,
             content,
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -90,6 +95,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content,
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: Some(origin),
             ordinal: None,
