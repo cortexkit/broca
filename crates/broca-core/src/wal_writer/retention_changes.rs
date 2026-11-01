@@ -119,7 +119,9 @@ impl ObservedWal {
                         Ok(Ok(())) => {}
                         Ok(Err(reason)) => return Err(WalError::PublicationObserver(reason)),
                         Err(_) => {
-                            return Err(WalError::PublicationObserver("publication observer panicked after WAL sync"))
+                            return Err(WalError::PublicationObserver(
+                                "publication observer panicked after WAL sync",
+                            ))
                         }
                     }
                 }

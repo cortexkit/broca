@@ -11,9 +11,17 @@ use subc_protocol::ErrorBody;
 
 pub use broca_wire::diagnostics::OP;
 pub const REPLY_LIMIT: usize = 65_536;
-enum RootSource { Unselected(PathBuf), Boot(broca_wal::state_format::OwnedStateRootDecision) }
+enum RootSource {
+    Unselected(PathBuf),
+    Boot(broca_wal::state_format::OwnedStateRootDecision),
+}
 impl RootSource {
-    fn path(&self)->&Path { match self { Self::Unselected(root)=>root,Self::Boot(decision)=>decision.root() } }
+    fn path(&self) -> &Path {
+        match self {
+            Self::Unselected(root) => root,
+            Self::Boot(decision) => decision.root(),
+        }
+    }
 }
 static ROOT: OnceLock<(RootSource, broca_wal::WalConfig)> = OnceLock::new();
 static READER: OnceLock<std::sync::Arc<dyn broca_store::db::DiagnosticEvidenceReader>> =
@@ -26,9 +34,13 @@ pub fn install(root: PathBuf, config: broca_wal::WalConfig) {
 }
 
 /// Retain the boot capability for every request without another marker read.
-pub fn install_decided(decision:broca_wal::state_format::OwnedStateRootDecision,config:broca_wal::WalConfig) {
-    crate::session_address_health::initialize(); live::initialize();
-    let _=ROOT.set((RootSource::Boot(decision),config));
+pub fn install_decided(
+    decision: broca_wal::state_format::OwnedStateRootDecision,
+    config: broca_wal::WalConfig,
+) {
+    crate::session_address_health::initialize();
+    live::initialize();
+    let _ = ROOT.set((RootSource::Boot(decision), config));
 }
 
 /// Boot can inject its selected reader without changing the diagnostic service.
@@ -197,20 +209,34 @@ pub fn serving_reply(
                 "diagnostics.findings run-index source is not configured",
             )
         })?;
-        let root=source.path();
+        let root = source.path();
         if let Some(reader) = READER.get() {
             gather_with_reader(root, reader.as_ref(), catalog_age, since, now, *config)
+        } else if let RootSource::Boot(decision) = source {
+            let decision = decision.borrowed();
+            let database = if decision.legacy().is_some() {
+                "run-index.db"
+            } else {
+                "broca.db"
+            };
+            let store = broca_store::db::open_diagnostic_reader_decided(decision, *config)
+                .map_err(|_| {
+                    ErrorBody::new(
+                        "store_error",
+                        format!("diagnostics.findings cannot read {database}"),
+                    )
+                })?;
+            gather_with_reader(root, store.as_ref(), catalog_age, since, now, *config)
         } else {
-            if let RootSource::Boot(decision)=source {
-                let decision=decision.borrowed();
-                if let Some(capability)=decision.legacy() {
-                    let store=broca_store::SqliteStore::open_boot_legacy_read_only(capability).map_err(|_|ErrorBody::new("store_error","diagnostics.findings cannot read run-index.db"))?.with_wal_config(*config);
-                    return gather_with_reader(root,&store,catalog_age,since,now,*config);
-                }
-                let store=broca_store::db::open_diagnostic_reader_decided(decision,*config).map_err(|_|ErrorBody::new("store_error","diagnostics.findings cannot read broca.db"))?;
-                return gather_with_reader(root,store.as_ref(),catalog_age,since,now,*config);
-            }
-            Err(ErrorBody::new("store_error","diagnostics.findings run-index source is not configured"))
+            let store = broca_store::SqliteStore::open_read_only(root.join("run-index.db"))
+                .map_err(|_| {
+                    ErrorBody::new(
+                        "store_error",
+                        "diagnostics.findings cannot read run-index.db",
+                    )
+                })?
+                .with_wal_config(*config);
+            gather_with_reader(root, &store, catalog_age, since, now, *config)
         }
     })
 }

@@ -37,15 +37,28 @@ pub(super) enum RestartDiscovery {
     Legacy(Arc<broca_store::SqliteStore>),
     Overhaul(Arc<dyn broca_core::RecoveryDiscovery>),
 }
-pub(super) enum RestartDiscoveryError { Legacy(broca_store::StoreError), Overhaul(String) }
+pub(super) enum RestartDiscoveryError {
+    Legacy(broca_store::StoreError),
+    Overhaul(String),
+}
 impl std::fmt::Debug for RestartDiscoveryError {
-    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
-        match self { Self::Legacy(error)=>std::fmt::Debug::fmt(error,f),Self::Overhaul(error)=>std::fmt::Debug::fmt(error,f) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy(error) => std::fmt::Debug::fmt(error, f),
+            Self::Overhaul(error) => std::fmt::Debug::fmt(error, f),
+        }
     }
 }
 impl RestartDiscovery {
-    pub fn candidates(&self)->Result<Vec<(String,BindIdentity)>,RestartDiscoveryError> {
-        match self { Self::Legacy(index)=>index.restart_resume_candidates().map_err(RestartDiscoveryError::Legacy),Self::Overhaul(index)=>index.restart_resume_candidates().map_err(RestartDiscoveryError::Overhaul) }
+    pub fn candidates(&self) -> Result<Vec<(String, BindIdentity)>, RestartDiscoveryError> {
+        match self {
+            Self::Legacy(index) => index
+                .restart_resume_candidates()
+                .map_err(RestartDiscoveryError::Legacy),
+            Self::Overhaul(index) => index
+                .restart_resume_candidates()
+                .map_err(RestartDiscoveryError::Overhaul),
+        }
     }
 }
 
@@ -57,7 +70,8 @@ impl Stores {
         Ok(Self {
             legacy: Some(Arc::new(
                 broca_store::SqliteStore::open_boot_legacy(root)
-                    .map_err(|e| format!("open run index: {e}"))?.with_wal_config(wal_config),
+                    .map_err(|e| format!("open run index: {e}"))?
+                    .with_wal_config(wal_config),
             )),
             overhaul: None,
         })
@@ -72,23 +86,23 @@ impl Stores {
     }
 
     pub fn open_overhaul(root: &Path) -> Result<Self, String> {
-                let db = Arc::new(OverhaulDb::open(root).map_err(|e| e.to_string())?);
-                let publications = Arc::new(Publications {
-                    db: db.clone(),
-                    root: root.to_path_buf(),
-                    slots: Mutex::default(),
-                    gates: Mutex::default(),
-                    blocked: Mutex::default(),
-                });
-                Ok(Self {
-                    legacy: None,
-                    overhaul: Some(Overhaul {
-                        db,
-                        publications,
-                        stop: Arc::default(),
-                        worker: None,
-                    }),
-                })
+        let db = Arc::new(OverhaulDb::open(root).map_err(|e| e.to_string())?);
+        let publications = Arc::new(Publications {
+            db: db.clone(),
+            root: root.to_path_buf(),
+            slots: Mutex::default(),
+            gates: Mutex::default(),
+            blocked: Mutex::default(),
+        });
+        Ok(Self {
+            legacy: None,
+            overhaul: Some(Overhaul {
+                db,
+                publications,
+                stop: Arc::default(),
+                worker: None,
+            }),
+        })
     }
 }
 
@@ -297,7 +311,17 @@ impl Overhaul {
         let one = self.publications.clone();
         Arc::new(
             broca_module::registry::OverhaulRunSource::new(self.db.clone(), wal).with_consistency(
-                Arc::new(move || all.catch_up_all().map(|_| ())),
+                Arc::new(move || {
+                    let failed = all.catch_up_all()?;
+                    if failed.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "run-row publication unavailable for {} session(s)",
+                            failed.len()
+                        ))
+                    }
+                }),
                 Arc::new(move |key| one.witness_locked(key, None)),
                 self.publications.gate_factory(),
             ),
@@ -314,20 +338,21 @@ impl Overhaul {
     pub fn event_store(&self) -> Arc<dyn broca_store::bus_events::RunEventStore> {
         let publications = self.publications.clone();
         let available = self.publications.clone();
+        let failed_sessions = Arc::new(Mutex::new(Vec::new()));
+        let failed_read = failed_sessions.clone();
         Arc::new(
             broca_store::db::OverhaulRunEventStore::new(self.db.clone())
                 .with_before_read(Arc::new(move || {
                     let failed = publications.catch_up_all()?;
-                    if failed.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "run-event publication unavailable for {} session(s)",
-                            failed.len()
-                        ))
-                    }
+                    // Keep publication failures local to their sessions; committed
+                    // outbox bodies remain independent of the live WAL projection.
+                    *failed_sessions.lock().map_err(|e| e.to_string())? = failed;
+                    Ok(())
                 }))
-                .with_session_filter(Arc::new(move |key| available.ensure_available(key).is_ok())),
+                .with_session_filter(Arc::new(move |key| {
+                    failed_read.lock().is_ok_and(|failed| !failed.contains(key))
+                        && available.ensure_available(key).is_ok()
+                })),
         )
     }
     pub fn compaction_receipts(
@@ -512,12 +537,6 @@ struct Recovery {
 impl broca_core::RecoveryDiscovery for Recovery {
     fn active_runs(&self) -> Result<Vec<(String, BindIdentity)>, String> {
         let failed = self.publications.catch_up_all()?;
-        if !failed.is_empty() {
-            return Err(format!(
-                "recovery discovery publication unavailable for {} session(s)",
-                failed.len()
-            ));
-        }
         Ok(self
             .db
             .active_runs()
@@ -530,12 +549,6 @@ impl broca_core::RecoveryDiscovery for Recovery {
     }
     fn restart_resume_candidates(&self) -> Result<Vec<(String, BindIdentity)>, String> {
         let failed = self.publications.catch_up_all()?;
-        if !failed.is_empty() {
-            return Err(format!(
-                "restart discovery publication unavailable for {} session(s)",
-                failed.len()
-            ));
-        }
         Ok(self
             .db
             .restart_resume_candidates()
@@ -548,12 +561,6 @@ impl broca_core::RecoveryDiscovery for Recovery {
     }
     fn withdrawal_candidates(&self) -> Result<Vec<broca_core::WithdrawalRun>, String> {
         let failed = self.publications.catch_up_all()?;
-        if !failed.is_empty() {
-            return Err(format!(
-                "withdrawal discovery publication unavailable for {} session(s)",
-                failed.len()
-            ));
-        }
         Ok(
             broca_core::RecoveryDiscovery::withdrawal_candidates(self.db.as_ref())?
                 .into_iter()
@@ -723,53 +730,189 @@ impl Drop for Overhaul {
 mod tests {
     #[test]
     fn an_invalid_slot_does_not_disable_other_sessions_recovery_or_events() {
-        let root=Root::new("isolated-discovery-failure"); let stores=Stores::open_overhaul(&root.0).unwrap();
-        let overhaul=stores.overhaul.as_ref().unwrap(); let wal_store=wal(&root,overhaul); let events=overhaul.event_store();
-        events.enable_bus_events("test").unwrap(); events.begin_bus_event_period(100).unwrap();
-        let bad=BindIdentity::new("/composition","runner","bad-slot"); let good=BindIdentity::new("/composition","runner","healthy-slot");
-        let mut proofs=Vec::new();
-        for (key,id) in [(&bad,"bad-slot"),(&good,"healthy-slot")] {
-            let mut writer=wal_store.open(key).unwrap(); let mut start=started(key,id); if let WalRecord::RunStarted{ts_ms,..}=&mut start{*ts_ms=Some(101);}
-            writer.append(1,&start,true).unwrap(); let proof=overhaul.publications.witness(key,None).unwrap();
-            overhaul.db.index_run_withdrawals_owed(id,true).unwrap();
-            events.project_new_bus_events(key,&proof.lineage().to_string(),&writer.replay().unwrap(),102).unwrap(); proofs.push(proof);
+        assert_discovery_failure_is_isolated(true);
+    }
+
+    #[test]
+    fn a_failed_catch_up_does_not_disable_other_sessions_recovery_or_events() {
+        assert_discovery_failure_is_isolated(false);
+    }
+
+    fn assert_discovery_failure_is_isolated(invalid_slot: bool) {
+        let root = Root::new(if invalid_slot {
+            "isolated-invalid-slot"
+        } else {
+            "isolated-catch-up-failure"
+        });
+        let stores = Stores::open_overhaul(&root.0).unwrap();
+        let overhaul = stores.overhaul.as_ref().unwrap();
+        let wal_store = wal(&root, overhaul);
+        let events = overhaul.event_store();
+        events.enable_bus_events("test").unwrap();
+        events.begin_bus_event_period(100).unwrap();
+        let bad = BindIdentity::new("/composition", "runner", "bad-slot");
+        let good = BindIdentity::new("/composition", "runner", "healthy-slot");
+        let mut proofs = Vec::new();
+        for (key, id) in [(&bad, "bad-slot"), (&good, "healthy-slot")] {
+            let mut writer = wal_store.open(key).unwrap();
+            let mut start = started(key, id);
+            if let WalRecord::RunStarted { ts_ms, .. } = &mut start {
+                *ts_ms = Some(101);
+            }
+            writer.append(1, &start, true).unwrap();
+            let proof = overhaul.publications.witness(key, None).unwrap();
+            overhaul.db.index_run_withdrawals_owed(id, true).unwrap();
+            events
+                .project_new_bus_events(
+                    key,
+                    &proof.lineage().to_string(),
+                    &writer.replay().unwrap(),
+                    102,
+                )
+                .unwrap();
+            proofs.push(proof);
         }
-        overhaul.publications.slots.lock().unwrap().get(&bad).unwrap().record(&proofs[1]);
-        let recovery=overhaul.recovery_discovery();
-        let active=recovery.active_runs(); let restart=recovery.restart_resume_candidates(); let debt=recovery.withdrawal_candidates();
-        let census=events.bus_event_open_sessions(); let checkpoint=events.bus_event_checkpoint(&good); let position=events.bus_event_position(&good,&proofs[1].lineage().to_string()); let pending=events.pending_bus_event();
-        for rows in [active,restart] { let rows=rows.expect("healthy recovery discovery must continue"); assert!(rows.iter().any(|(_,key)|key==&good)); assert!(rows.iter().all(|(_,key)|key!=&bad)); }
-        let debt=debt.expect("healthy withdrawal discovery must continue"); assert!(debt.iter().any(|row|row.session==good)); assert!(debt.iter().all(|row|row.session!=bad));
-        assert_eq!(census.unwrap(),vec![good.clone()]); assert!(checkpoint.unwrap().is_some()); assert_eq!(position.unwrap(),1);
-        assert_eq!(pending.unwrap().unwrap().headers.get("run_id").map(String::as_str),Some("healthy-slot"));
-        assert!(events.bus_event_checkpoint(&bad).is_err()); assert!(events.bus_event_position(&bad,&proofs[0].lineage().to_string()).is_err());
+        if invalid_slot {
+            overhaul
+                .publications
+                .slots
+                .lock()
+                .unwrap()
+                .get(&bad)
+                .unwrap()
+                .record(&proofs[1]);
+        } else {
+            let mut writer = wal_store.open(&bad).unwrap();
+            writer.append(1, &finished(), true).unwrap();
+            drop(writer);
+            std::fs::remove_file(proofs[0].path()).unwrap();
+            assert!(overhaul.publications.ensure_available(&bad).is_ok());
+            assert!(overhaul.publications.witness(&bad, None).is_err());
+        }
+        let recovery = overhaul.recovery_discovery();
+        let active = recovery.active_runs();
+        let restart = recovery.restart_resume_candidates();
+        let debt = recovery.withdrawal_candidates();
+        let census = events.bus_event_open_sessions();
+        let checkpoint = events.bus_event_checkpoint(&good);
+        let position = events.bus_event_position(&good, &proofs[1].lineage().to_string());
+        let pending = events.pending_bus_event();
+        for rows in [active, restart] {
+            let rows = rows.expect("healthy recovery discovery must continue");
+            assert!(rows.iter().any(|(_, key)| key == &good));
+            assert!(rows.iter().all(|(_, key)| key != &bad));
+        }
+        let debt = debt.expect("healthy withdrawal discovery must continue");
+        assert!(debt.iter().any(|row| row.session == good));
+        assert!(debt.iter().all(|row| row.session != bad));
+        assert_eq!(census.unwrap(), vec![good.clone()]);
+        assert!(checkpoint.unwrap().is_some());
+        assert_eq!(position.unwrap(), 1);
+        // Already committed outbox bodies do not depend on a live publication.
+        // Drain the earlier event as well, rather than losing it or starving the healthy one.
+        let pending = pending.unwrap().unwrap();
+        assert_eq!(
+            pending.headers.get("run_id").map(String::as_str),
+            Some("bad-slot")
+        );
+        events
+            .acknowledge_bus_event(
+                &pending,
+                cortexkit_bus_trait::PublishReceipt::new(1, false),
+                103,
+            )
+            .unwrap();
+        assert_eq!(
+            events
+                .pending_bus_event()
+                .unwrap()
+                .unwrap()
+                .headers
+                .get("run_id")
+                .map(String::as_str),
+            Some("healthy-slot")
+        );
+        assert!(events.bus_event_checkpoint(&bad).is_err());
+        assert!(events
+            .bus_event_position(&bad, &proofs[0].lineage().to_string())
+            .is_err());
     }
 
     #[test]
     fn an_acknowledged_unindexed_run_with_failed_publication_is_not_absent() {
-        let root=Root::new("failed-advisory-refresh"); let stores=Stores::open_overhaul(&root.0).unwrap(); let overhaul=stores.overhaul.as_ref().unwrap(); let wal_store=wal(&root,overhaul);
-        let bad=BindIdentity::new("/composition","runner","unindexed-bad"); let good=BindIdentity::new("/composition","runner","valid-proof");
-        let mut bad_writer=wal_store.open(&bad).unwrap(); bad_writer.append(1,&started(&bad,"acknowledged-bad"),true).unwrap();
-        let good_writer=wal_store.open(&good).unwrap(); good_writer.sync().unwrap();
-        overhaul.publications.slots.lock().unwrap().get(&bad).unwrap().record(&good_writer.durable_publication().unwrap());
-        let opener=broca_module::DefaultOpener::new(Arc::new(broca_core::FileLeaseStore::new(root.0.join("leases"))),wal_store.clone(),Arc::new(RefusesExecution));
-        let registry=broca_module::LineageRegistry::new_with_run_rows(Arc::new(opener),Some(wal_store.clone()),None,Some(overhaul.run_rows(wal_store)));
-        assert!(registry.overhaul_lookup_run("acknowledged-bad").unwrap().is_err(),"failed publication is unknown/unavailable, never a successful absence");
-        assert!(registry.overhaul_restart_resume_candidates().unwrap().is_err());
+        let root = Root::new("failed-advisory-refresh");
+        let stores = Stores::open_overhaul(&root.0).unwrap();
+        let overhaul = stores.overhaul.as_ref().unwrap();
+        let wal_store = wal(&root, overhaul);
+        let bad = BindIdentity::new("/composition", "runner", "unindexed-bad");
+        let good = BindIdentity::new("/composition", "runner", "valid-proof");
+        let mut bad_writer = wal_store.open(&bad).unwrap();
+        bad_writer
+            .append(1, &started(&bad, "acknowledged-bad"), true)
+            .unwrap();
+        let good_writer = wal_store.open(&good).unwrap();
+        good_writer.sync().unwrap();
+        overhaul
+            .publications
+            .slots
+            .lock()
+            .unwrap()
+            .get(&bad)
+            .unwrap()
+            .record(&good_writer.durable_publication().unwrap());
+        let opener = broca_module::DefaultOpener::new(
+            Arc::new(broca_core::FileLeaseStore::new(root.0.join("leases"))),
+            wal_store.clone(),
+            Arc::new(RefusesExecution),
+        );
+        let registry = broca_module::LineageRegistry::new_with_run_rows(
+            Arc::new(opener),
+            Some(wal_store.clone()),
+            None,
+            Some(overhaul.run_rows(wal_store)),
+        );
+        assert!(
+            registry
+                .overhaul_lookup_run("acknowledged-bad")
+                .unwrap()
+                .is_err(),
+            "failed publication is unknown/unavailable, never a successful absence"
+        );
+        assert!(registry
+            .overhaul_restart_resume_candidates()
+            .unwrap()
+            .is_err());
         assert!(registry.overhaul_active_runs(&[]).unwrap().is_err());
     }
 
     #[test]
     fn legacy_restart_warning_preserves_typed_debug_bytes() {
-        let root=Root::with_format("restart-warning",false);
-        let stores=Stores::open_boot_legacy(broca_wal::state_format::decide_state_root(&root.0).unwrap().legacy().unwrap(),broca_wal::WalConfig::LEGACY).unwrap();
-        let store=stores.legacy.unwrap();
-        rusqlite::Connection::open(root.0.join("run-index.db")).unwrap().execute_batch("DROP TABLE run_index").unwrap();
-        let direct=store.restart_resume_candidates(); assert!(direct.is_err());
-        let expected=format!("restart resume: cannot list candidate runs: {:?}",Ok::<_,std::io::Error>(direct));
-        let source=RestartDiscovery::Legacy(store);
-        let actual=format!("restart resume: cannot list candidate runs: {:?}",Ok::<_,std::io::Error>(source.candidates()));
-        assert_eq!(actual.as_bytes(),expected.as_bytes());
+        let root = Root::with_format("restart-warning", false);
+        let stores = Stores::open_boot_legacy(
+            broca_wal::state_format::decide_state_root(&root.0)
+                .unwrap()
+                .legacy()
+                .unwrap(),
+            broca_wal::WalConfig::LEGACY,
+        )
+        .unwrap();
+        let store = stores.legacy.unwrap();
+        rusqlite::Connection::open(root.0.join("run-index.db"))
+            .unwrap()
+            .execute_batch("DROP TABLE run_index")
+            .unwrap();
+        let direct = store.restart_resume_candidates();
+        assert!(direct.is_err());
+        let expected = format!(
+            "restart resume: cannot list candidate runs: {:?}",
+            Ok::<_, std::io::Error>(direct)
+        );
+        let source = RestartDiscovery::Legacy(store);
+        let actual = format!(
+            "restart resume: cannot list candidate runs: {:?}",
+            Ok::<_, std::io::Error>(source.candidates())
+        );
+        assert_eq!(actual.as_bytes(), expected.as_bytes());
     }
 
     #[cfg(feature = "test-clock")]
@@ -918,13 +1061,39 @@ mod tests {
                 "healthy session admission while another session rebuilds",
                 || read_rx.try_recv().map_err(|e| e.to_string()),
             )
-            .unwrap()
         }));
         release_tx.send(()).unwrap();
         rebuilding.join().unwrap();
         drop(guard);
         reading.join().unwrap();
-        assert!(result.is_ok());
+        let snapshot = result
+            .expect("healthy admission must complete while the other session rebuilds")
+            .expect("healthy admission must return a snapshot, not a fast read failure");
+        assert_eq!(snapshot.head_seq, 2);
+        assert_eq!(snapshot.base_watermark, 1);
+        let base = snapshot.checkpoint_at_base.as_ref().unwrap();
+        assert_eq!(base.at_seq, 1);
+        assert_eq!(base.last_episode.as_ref().unwrap().run_id.0, "healthy");
+        assert_eq!(snapshot.checkpoint_at_head.at_seq, 2);
+        assert_eq!(
+            snapshot
+                .checkpoint_at_head
+                .last_episode
+                .as_ref()
+                .unwrap()
+                .run_id
+                .0,
+            "healthy"
+        );
+        assert_eq!(snapshot.tail.len(), 1);
+        assert_eq!(snapshot.tail[0].seq, 2);
+        assert!(matches!(
+            &snapshot.tail[0].record,
+            WalRecord::RunFinished {
+                reason: broca_protocol::RunFinishReason::Completed,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1567,7 +1736,14 @@ mod tests {
     #[tokio::test]
     async fn legacy_real_opener_constructs_no_overhaul_reader_and_keeps_its_read_path() {
         let root = Root::with_format("legacy-real-opener", false);
-        let stores = Stores::open_boot_legacy(broca_wal::state_format::decide_state_root(&root.0).unwrap().legacy().unwrap(),broca_wal::WalConfig::LEGACY).unwrap();
+        let stores = Stores::open_boot_legacy(
+            broca_wal::state_format::decide_state_root(&root.0)
+                .unwrap()
+                .legacy()
+                .unwrap(),
+            broca_wal::WalConfig::LEGACY,
+        )
+        .unwrap();
         assert!(stores.overhaul.is_none());
         let index = stores.legacy.as_ref().unwrap();
         let wal = Arc::new(FileWalStore::with_config(

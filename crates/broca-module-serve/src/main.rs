@@ -1110,15 +1110,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let _restart_resume = {
         let registry = registry.clone();
         let index = match &run_index {
-            Some(index)=>composition::RestartDiscovery::Legacy(index.clone()),
-            None=>composition::RestartDiscovery::Overhaul(recovery.clone()),
+            Some(index) => composition::RestartDiscovery::Legacy(index.clone()),
+            None => composition::RestartDiscovery::Overhaul(recovery.clone()),
         };
         let wal = crash_orphan_wal.clone();
         let describer = scope_describer.clone();
         tokio::spawn(async move {
             describer.wait_registered().await;
-            let candidates =
-                spawn_blocking(JobKind::Recovery, move || index.candidates()).await;
+            let candidates = spawn_blocking(JobKind::Recovery, move || index.candidates()).await;
             match candidates {
                 Ok(Ok(candidates)) => {
                     registry.resume_restart_pauses(wal, candidates).await;

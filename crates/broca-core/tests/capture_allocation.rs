@@ -94,19 +94,53 @@ fn installed_publication_hook_does_not_allocate_at_a_warmed_sync() {
 
 #[test]
 fn rejected_publication_hook_does_not_allocate_on_sync() {
-    use broca_core::{FileWalStore,WalStore};
-    use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
-    let root=broca_test_support::scratch_root().join(format!("publication-reject-allocation-{}",std::process::id()));
-    std::fs::create_dir_all(&root).unwrap(); std::fs::write(root.join("state-format"),"broca-state/2").unwrap();
-    let reject=Arc::new(AtomicBool::new(false)); let flag=reject.clone();
-    let store=FileWalStore::with_config(root.join("wal"),broca_wal::WalConfig::OVERHAUL)
-        .with_publication_observer(Arc::new(move |_,_,_| {
-            let flag=flag.clone(); Arc::new(move |_|if flag.load(Ordering::Relaxed){Err("publication identity mismatch")}else{Ok(())})
+    use broca_core::{FileWalStore, WalStore};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let root = broca_test_support::scratch_root().join(format!(
+        "publication-reject-allocation-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+    let reject = Arc::new(AtomicBool::new(false));
+    let flag = reject.clone();
+    let store = FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL)
+        .with_publication_observer(Arc::new(move |_, _, _| {
+            let flag = flag.clone();
+            Arc::new(move |_| {
+                if flag.load(Ordering::Relaxed) {
+                    Err("publication identity mismatch")
+                } else {
+                    Ok(())
+                }
+            })
         }));
-    let wal=store.open(&broca_protocol::BindIdentity::new("/publication","test","reject")).unwrap();
-    wal.sync().unwrap(); reject.store(true,Ordering::Relaxed);
-    assert_eq!(allocations(||assert!(wal.sync().is_err())),0,"refusing the acknowledgement must not allocate on the sync thread");
-    drop(wal); std::fs::remove_dir_all(root).unwrap();
+    let wal = store
+        .open(&broca_protocol::BindIdentity::new(
+            "/publication",
+            "test",
+            "reject",
+        ))
+        .unwrap();
+    wal.sync().unwrap();
+    reject.store(true, Ordering::Relaxed);
+    let mut result = Ok(());
+    assert_eq!(
+        allocations(|| result = wal.sync()),
+        0,
+        "refusing the acknowledgement must not allocate on the sync thread"
+    );
+    assert!(matches!(
+        result,
+        Err(WalError::PublicationObserver(
+            "publication identity mismatch"
+        ))
+    ));
+    drop(wal);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
