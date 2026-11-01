@@ -2267,6 +2267,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // credential source, as here); its counters are read through a real daemon in
         // account_selection_real_daemon.
         "account_selection",
+        // Refusals ended because their computed reset/retry deadline was already before
+        // broca's pause time. This healthy daemon has seen none; assert zero below.
+        "account_limit_stale_resets",
         "stall_watchdog",
         // Retained sessions whose expiry could not be confirmed because their log is unreadable
         // and the index is not provably current, so deletion keeps them. Present at zero.
@@ -2333,6 +2336,11 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         assert!(entry["op"].is_string());
         assert!(entry["owner"].is_boolean() || entry["owner"].is_null());
     }
+    assert_eq!(
+        metrics["account_limit_stale_resets"],
+        serde_json::json!(0),
+        "the isolated healthy daemon has not ended a refusal for stale account timing"
+    );
     // This in-process adapter has no daemon bootstrap or watchdog file. The real
     // binary enables the witness during boot; a library-only connection says so.
     assert_eq!(

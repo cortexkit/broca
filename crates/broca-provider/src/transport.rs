@@ -3991,6 +3991,7 @@ async fn drive_attempt(
             request.family,
             headers.get("x-amzn-errortype"),
         );
+        let observed_at_ms = clock.now_ms();
         let error = match request.family {
             Some(family) => {
                 let error = classify_chatgpt_upstream_key_rejection(family, code, &text, error);
@@ -4002,7 +4003,7 @@ async fn drive_attempt(
                     code,
                     &headers,
                     &text,
-                    UNIX_EPOCH + Duration::from_millis(clock.now_ms()),
+                    UNIX_EPOCH + Duration::from_millis(observed_at_ms),
                     error,
                 )
             }
@@ -4039,6 +4040,8 @@ async fn drive_attempt(
             || error.is_credit_insufficient();
         if error.is_account_limit_exhausted() {
             trace.account_observation.limit = Some(broca_protocol::AttemptAccountLimit {
+                disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+                observed_at_ms,
                 resets_at_ms: error.resets_at_ms,
                 resets_at_source: error.resets_at_source.clone(),
                 limit_window: error.limit_window.clone(),

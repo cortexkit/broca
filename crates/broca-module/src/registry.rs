@@ -5142,8 +5142,8 @@ impl LineageRegistry {
         (opened, failed)
     }
 
-    /// Resume WAL-confirmed restart pauses after dependency routes are registered. Candidate
-    /// index rows may lag the WAL; only a latest durable restart pause authorizes a resume.
+    /// Rebuild WAL-confirmed restart and timed-account continuations after routes are registered.
+    /// Candidate index rows may lag; only the latest durable pause authorizes continuation.
     pub async fn resume_restart_pauses(
         &self,
         wal_store: Arc<dyn broca_core::WalStore>,
@@ -5185,9 +5185,9 @@ impl LineageRegistry {
             };
             let resume = match &prior.resolution {
                 broca_core::ReplayResolution::AuthRequired { reason, .. } => match reason {
-                    broca_protocol::PauseReason::Restart => true,
+                    broca_protocol::PauseReason::Restart
+                    | broca_protocol::PauseReason::AccountLimit => true,
                     broca_protocol::PauseReason::AuthRequired
-                    | broca_protocol::PauseReason::AccountLimit
                     | broca_protocol::PauseReason::ToolHeld => false,
                 },
                 broca_core::ReplayResolution::ProviderHeld {

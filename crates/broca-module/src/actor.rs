@@ -44,6 +44,10 @@ use tokio_util::sync::CancellationToken;
 use crate::executor::{RunExecutor, RunJob, RunKind};
 use crate::registry::{ActorHandle, CloseToken, LineageKey, RegistryHandle};
 
+mod account_limit_pause;
+#[cfg(all(test, feature = "test-clock"))]
+#[path = "account_limit_pause_tests.rs"]
+mod account_limit_pause_tests;
 #[path = "writer_reclaim.rs"]
 pub mod writer_reclaim;
 
@@ -1489,6 +1493,7 @@ pub struct LineageActor<W: WalStore> {
     /// Startup exhausted its bounded recovery retries without proving the durable queue state.
     /// Mutating admission must recover this state before it can use the in-memory queue view.
     startup_recovery_pending: bool,
+    account_limit_timer: Option<account_limit_pause::TimedPause>,
     /// Idle admission view loaded at actor open or after the previous run's terminal barrier.
     prior_snapshot: Option<PriorWalSnapshot>,
     sender_policy_cache: Option<(u64, broca_core::SessionOwnershipV1)>,
@@ -1857,6 +1862,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             export_index,
             charge_basis_resolver,
             startup_recovery_pending: false,
+            account_limit_timer: None,
             prior_snapshot: None,
             sender_policy_cache: None,
             ceiling_drain_held: false,
@@ -2103,6 +2109,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
             };
             let tick = tokio::time::sleep_until(idle_deadline);
+            let timed_pause = self.account_limit_timer.clone().filter(|_| {
+                matches!(self.state, RunState::Idle)
+                    && self.registry.restart_resume_ready()
+                    && !self.registry.is_stopping()
+            });
+            let account_wake = async {
+                match timed_pause.as_ref() {
+                    Some(pause) => {
+                        tokio::time::sleep(Duration::from_millis(
+                            pause.resume_not_before_ms.saturating_sub(clock.now_ms()),
+                        ))
+                        .await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 biased;
                 _ = seal.cancelled() => {
@@ -2141,6 +2163,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     }
                     if self.close_finished_one_shot().await {
                         return;
+                    }
+                }
+                _ = account_wake => {
+                    if let Some(pause) = timed_pause.clone() {
+                        if let Err(error) = self.wake_account_limit(pause).await {
+                            self.account_limit_timer = None;
+                            self.startup_recovery_pending = true;
+                            tracing::warn!(target: "lifecycle", "account-limit wake deferred to WAL recovery: {error}");
+                        }
                     }
                 }
                 _ = tick => {
@@ -3080,6 +3111,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
         let tail_resolution = tail_prior.resolution;
 
+        if episode_disposition == EpisodeDisposition::Paused
+            && episode_pause_reason == Some(broca_protocol::PauseReason::AccountLimit)
+            && matches!(
+                tail_resolution,
+                broca_core::ReplayResolution::Interrupted { .. }
+            )
+        {
+            self.write_interrupted_seal(None, SealCause::CrashOrphan)
+                .await?;
+            self.refresh_admission_view().await?;
+            return self.drain_queue_one().await;
+        }
+
         // The terminal run index cannot identify a crash that happened before its own update.
         // Reopening the affected lineage closes that earlier WAL-to-index window directly from
         // the authoritative finished episode. Repeated emission is safe by immutable fact_id.
@@ -3194,6 +3238,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 Err(error) => Err(error.to_string()),
             };
+        }
+
+        if episode_disposition == EpisodeDisposition::Paused
+            && episode_pause_reason == Some(broca_protocol::PauseReason::AccountLimit)
+        {
+            return self.arm_account_limit().await;
         }
 
         if episode_disposition == EpisodeDisposition::Paused
@@ -3921,6 +3971,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                             state.pause_reason,
                             Some(
                                 broca_protocol::PauseReason::Restart
+                                    | broca_protocol::PauseReason::AccountLimit
                                     | broca_protocol::PauseReason::ToolHeld
                             )
                         ) =>
@@ -4210,17 +4261,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if !resume_indexed_run {
             match delivery {
                 broca_protocol::Delivery::Queue => {
-                    // A paused session is not idle, although no run is in flight. Admitted as a
-                    // run, a new message would only re-drive the paused episode (which renders
-                    // nothing until its pause is resolved) and its input would be recorded
-                    // nowhere; queued, it would wait behind a run nothing is going to end. So
-                    // it is refused before anything is written, like a steer. The paused run's
-                    // own retry has this run id and is not refused: it resumes the run.
+                    // A paused episode still owns the session. Unrelated input must neither
+                    // re-drive it nor be silently queued behind an authentication or account
+                    // wait. Its own authorized continuation keeps the original run id.
                     if matches!(self.state, RunState::Idle) {
                         match self.paused_run().await {
                             Ok(Some((paused, reason)))
                                 if paused != run_id
-                                    && reason == broca_protocol::PauseReason::AuthRequired =>
+                                    && matches!(
+                                        reason,
+                                        broca_protocol::PauseReason::AuthRequired
+                                            | broca_protocol::PauseReason::AccountLimit
+                                    ) =>
                             {
                                 return SendOutcome::RunPaused {
                                     run_id: paused,
@@ -4278,6 +4330,20 @@ impl<W: WalStore + 'static> LineageActor<W> {
     ) -> SendOutcome {
         if matches!(self.state, RunState::Idle) && !resume_indexed_run {
             match self.paused_run().await {
+                Ok(Some((paused, reason @ broca_protocol::PauseReason::AccountLimit))) => {
+                    return if paused == run_id {
+                        SendOutcome::Paused {
+                            run_id,
+                            reason,
+                            delivered: None,
+                        }
+                    } else {
+                        SendOutcome::RunPaused {
+                            run_id: paused,
+                            reason,
+                        }
+                    };
+                }
                 Ok(Some((
                     paused,
                     reason @ (broca_protocol::PauseReason::Restart
@@ -6217,12 +6283,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
         let expired = order.expired_at(self.ordered_now_ms());
-        // Like a plain queued send, a send that may start a run is refused on a session paused
-        // for re-authentication: it would wait behind a run nothing is going to end.
+        // Like a plain queued send, unrelated ordered work cannot take ownership from a run
+        // paused for authentication or an account reset.
         if order.starts_runs() && matches!(self.state, RunState::Idle) {
             match self.paused_run().await {
                 Ok(Some((paused, reason)))
-                    if reason == broca_protocol::PauseReason::AuthRequired =>
+                    if matches!(
+                        reason,
+                        broca_protocol::PauseReason::AuthRequired
+                            | broca_protocol::PauseReason::AccountLimit
+                    ) =>
                 {
                     return SendOutcome::RunPaused {
                         run_id: paused,
@@ -7902,6 +7972,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let _ = self.sync_retention_index().await;
         let should_emit_usage = index_state.is_terminal();
         self.set_idle();
+        self.account_limit_timer = None;
         // Only a terminal ends a one-shot's business with this session; a pause stays resumable.
         self.close_after_one_shot = skip_materialization && index_state.is_terminal();
         if owed {
@@ -7927,6 +7998,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
         } else {
             match self.refresh_admission_view().await {
                 Ok(()) => {
+                    if summary.paused == Some(broca_protocol::PauseReason::AccountLimit) {
+                        if let Err(error) = self.arm_account_limit().await {
+                            self.startup_recovery_pending = true;
+                            tracing::warn!(target: "lifecycle", "account-limit timer rebuild deferred: {error}");
+                        }
+                    }
                     if let Err(error) = self.drain_queue_one().await {
                         tracing::warn!(target: "admission", "queued-run drain deferred: {error}");
                     }
@@ -8218,6 +8295,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if self.startup_recovery_pending {
             reasons.push("startup_recovery");
         }
+        if self.account_limit_timer.is_some() {
+            reasons.push("account_limit_pause");
+        }
         reasons
     }
 
@@ -8468,6 +8548,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// appends. The registry returns false at its total deadline; process exit then ends those
     /// tasks and threads and leaves the WAL authoritative for the next boot's recovery.
     async fn seal_for_shutdown(&mut self) {
+        self.account_limit_timer = None;
         self.finish_restart_waiters(Err("shutdown interrupted restart admission".into()));
         let seal_deadline = tokio::time::Instant::now() + SHUTDOWN_SEAL_BOUND;
         let active = matches!(self.state, RunState::Active { .. });

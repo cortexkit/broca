@@ -2206,6 +2206,8 @@ async fn handle_control_request(
             metrics["scoped_role_route_refusals"] =
                 serde_json::json!(broca_subc::scoped_role_route_refusals());
             metrics["session_readers"] = crate::session_readers::health();
+            metrics["account_limit_stale_resets"] =
+                serde_json::json!(broca_core::account_limit_stale_resets());
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
                 // status Ok. Fusiform reachability is deliberately absent because health never
@@ -9988,6 +9990,12 @@ mod tests {
         assert!(
             health["metrics"]["scoped_role_route_refusals"].is_object(),
             "health.check includes scoped role-open refusal counts keyed by daemon code"
+        );
+        assert!(
+            health["metrics"]["account_limit_stale_resets"]
+                .as_u64()
+                .is_some(),
+            "health.check always exposes the stale account-reset counter"
         );
         assert_eq!(
             health["metrics"]["retention_repairs_pending"].as_u64(),

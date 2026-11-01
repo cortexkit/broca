@@ -1367,6 +1367,20 @@ keep their existing behavior and omit this diagnostic.
 - **State enum:** `Idle | Active{run_id, step} | Paused{run_id, reason} | Interrupted{run_id} |
   Terminal{run_id, reason} | Error{run_id, detail}`. `run.status(session)` resolves the
   in-process active run first, then WAL inference.
+- **Timed account pauses:** the root `broca.jsonc` switch `account_limit_pause` defaults to
+  false and must be a boolean. An enabled fresh run freezes consent in its WAL config.
+  A source-classified transient account limit pauses only with a present, checked recovery
+  floor in `[paused_at_ms, paused_at_ms + 60 minutes]`. It resumes itself on the same frozen
+  selection, never through a routing account switch. `run.status` reports `state: paused`,
+  `reason: account_limit`, `pause_reason: account_limit`, the original structured error and
+  optional `resume_not_before_ms`. The durable subscribe `paused` control carries the same
+  floor after its barrier; the subscription stays attached for ordinary resume progress.
+  `session.head.last_run_state` remains reason-only, with no new ordinal or deadline member.
+  An idempotent resend returns the pause/current continuation rather than scheduling a second
+  execution. Unrelated sends and steers receive `run_paused`; cancel remains available.
+  Newly stale reset refusals retain the terminal path and increment the always-present lifetime
+  health metric `account_limit_stale_resets`. Readers must understand `account-limit-pause/v1`
+  before the writer is deployed or the switch enabled.
 - **Durable run index** in `run-index.db`: `run_id → {session, lineage, submission_id, state,
   wal_path}` so run-keyed ops survive restart. Resume **reuses the original run_id**
   (today it mints `req.run_id`).
@@ -1391,9 +1405,8 @@ keep their existing behavior and omit this diagnostic.
   contract, not a defect.
 - **`TransformUnavailable` is read, never written:** older WAL records and run-index rows carry
   it, and readers report it (`run.status`, `session.read`, the run index), but this build never
-  ends a run with it. It is terminal, not a pause: a pause is only for a failure with a
-  caller-side resolver contract (`AuthRequired` → the caller re-authenticates, then resumes the
-  SAME run).
+  ends a run with it. It is terminal, not a pause: a pause preserves a resolvable nonterminal
+  cause and the same run rather than sealing the episode.
 - **Active model-step progress:** run-keyed `run.status` can include an optional `step` object
   `{step_id, started_at_ms, attempt, attempt_started_at_ms, last_content_at_ms?,
   max_content_gap_ms?, max_content_gap_ended_at_ms?}`. It is a cheap snapshot of the live actor's
