@@ -363,6 +363,7 @@ async fn run(args: Args) -> Result<i32, String> {
         session: bind,
         model: ModelHandle::new(&provider_tag, &resolved.wire_model),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -640,6 +641,7 @@ mod tests {
 
     fn fixed_opts() -> CallOptions {
         let mut o = CallOptions::new(vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

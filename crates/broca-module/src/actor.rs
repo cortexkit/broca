@@ -12170,6 +12170,7 @@ mod tests {
             session: key.clone(),
             model: broca_protocol::request::ModelHandle::new("fake", "fake"),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,

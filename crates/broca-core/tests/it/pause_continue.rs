@@ -97,6 +97,7 @@ fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -190,6 +191,7 @@ fn tool_req(run_id: &str, session: &BindIdentity, prompt: &str) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -269,6 +271,7 @@ fn seed_resume_without_terminal(
                 context_management: None,
             }),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,

@@ -59,6 +59,7 @@ fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("anthropic", "claude-opus-4-8"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -368,6 +369,7 @@ fn text(run: &str, msg: &str, session: &BindIdentity) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("anthropic", "claude-opus-4-8"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

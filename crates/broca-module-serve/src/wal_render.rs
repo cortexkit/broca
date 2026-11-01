@@ -131,6 +131,7 @@ mod tests {
     fn turn(id: &str, input: serde_json::Value, output: ToolOutput, failed: bool) -> Vec<Message> {
         vec![
             Message {
+                turn_system: false,
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     tool_call_id: ToolCallId(id.into()),
@@ -144,6 +145,7 @@ mod tests {
                 cache_prefix_blocks: None,
             },
             Message {
+                turn_system: false,
                 role: Role::Tool,
                 content: vec![ContentBlock::ToolResult(ToolResult {
                     tool_call_id: ToolCallId(id.into()),

@@ -117,6 +117,10 @@ pub struct FrozenRenderConfig {
     pub renderer_version: u32,
     /// The wire model id (request `model` field, or endpoint path for path-labeled APIs).
     pub wire_model_id: String,
+    /// Provider-published support for system messages inside Anthropic's conversation.
+    /// Absence fails closed; freezing the catalog result keeps resume rendering stable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anthropic_turn_system: bool,
     /// The API base URL, when the provider isn't at the family's default host. This
     /// is what makes the OpenAI-compatible long tail config-only: every
     /// OpenAI-compatible provider is the OpenAI-Chat family pointed at a different

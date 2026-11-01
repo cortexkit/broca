@@ -1957,6 +1957,7 @@ async fn chatgpt_refresh_run_rejecting(
         model_id: "gpt-5".into(),
     },
     input: vec![Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,

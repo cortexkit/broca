@@ -2424,6 +2424,7 @@ pub(crate) fn run_started(
                 context_management: None,
             }),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,

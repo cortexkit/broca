@@ -94,6 +94,7 @@ fn start(run: &str, text: &str) -> WalRecord {
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(run_config()),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -714,6 +715,7 @@ fn demo_request(run: &str, dir: &std::path::Path) -> RunRequest {
         session: BindIdentity::new(dir, "crashcut", "s1"),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -837,6 +839,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                     ..run_config()
                 }),
                 input: vec![Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,
@@ -934,6 +937,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1525,6 +1529,7 @@ fn text_request(run: &str, session: &broca_protocol::BindIdentity, prompt: &str)
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1562,6 +1567,7 @@ fn text_request_with_system(
     req.input.insert(
         0,
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -2443,6 +2449,7 @@ async fn cross_episode_resume_is_exactly_once() {
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -2545,6 +2552,7 @@ async fn cross_episode_resume_is_exactly_once() {
                     ..run_config()
                 }),
                 input: vec![Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,
@@ -2928,6 +2936,7 @@ fn req2(session: &BindIdentity) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -3516,6 +3525,7 @@ async fn a_new_episode_appends_onto_a_lineage_sealed_by_an_interrupt() {
                 session: session.clone(),
                 config: Box::new(run_config()),
                 input: vec![Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,

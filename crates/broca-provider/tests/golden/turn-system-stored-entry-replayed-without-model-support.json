@@ -1,0 +1,41 @@
+[
+  {
+    "max_tokens": 2048,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "Summarize the notes.",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": "<context-note>Keep the summary concise.</context-note>",
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "Here is the summary.",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      }
+    ],
+    "model": "claude-opus-4-8",
+    "stream": true,
+    "system": [
+      {
+        "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "type": "text"
+      }
+    ],
+    "thinking": {
+      "budget_tokens": 1024,
+      "type": "enabled"
+    }
+  }
+]

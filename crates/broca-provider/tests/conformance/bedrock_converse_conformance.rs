@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 fn rich_request() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -31,6 +32,7 @@ fn rich_request() -> CallOptions {
             }],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -39,6 +41,7 @@ fn rich_request() -> CallOptions {
             content: vec![ContentBlock::Text { text: "Hi".into() }],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -104,6 +107,7 @@ fn bedrock_spec() -> (ProviderSpec, ModelSpec) {
         cost: CostSchedule::default(),
         reasoning_options: Default::default(),
         server_side_fallback: None,
+        mid_conversation_system: None,
         input_modalities: Default::default(),
         release_date: None,
         status: None,

@@ -78,6 +78,7 @@ fn start(run: &str, text: &str, max_tokens: u32) -> WalRecord {
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(run_config(max_tokens)),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

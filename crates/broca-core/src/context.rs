@@ -2994,6 +2994,7 @@ mod tests {
                     context_management: None,
                 }),
                 input: vec![Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     role: Role::User,
                     content: vec![ContentBlock::Text { text: "hi".into() }],
@@ -4057,6 +4058,7 @@ mod episode_merge_regression {
             session: BindIdentity::new("/tmp/p", "h", "s"),
             config: Box::new(config(model)),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: text.into() }],

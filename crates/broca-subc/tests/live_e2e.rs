@@ -135,6 +135,7 @@ async fn live_model_reads_a_real_file_through_real_aft() {
         session: BindIdentity::new(&rig.dir, "runner", "fs-live-1"),
         model: ModelHandle::new("anthropic", MODEL),
         input: vec![broca_protocol::content::Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -263,6 +264,7 @@ async fn live_model_drives_a_real_subc_tool_call() {
     session: BindIdentity::new(&rig.dir, "dogfood", "live-1"),
     model: ModelHandle::new("anthropic", MODEL),
     input: vec![broca_protocol::content::Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,
@@ -406,6 +408,7 @@ async fn live_interleaved_thinking_echo_back_survives_multiturn() {
         session: BindIdentity::new(&rig.dir, "dogfood", "think-1"),
         model: ModelHandle::new("anthropic", MODEL),
         input: vec![broca_protocol::content::Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

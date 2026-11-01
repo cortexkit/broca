@@ -188,6 +188,7 @@ mod tests {
     fn history() -> Vec<Message> {
         (0..4)
             .map(|ordinal| Message {
+                turn_system: false,
                 ordinal: Some(ordinal),
                 role: if ordinal % 2 == 0 {
                     Role::Assistant
