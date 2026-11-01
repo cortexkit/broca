@@ -188,3 +188,4 @@ fn writer_id_power_loss_open_close_and_recovery_preserve_marker_or_closed() {
         recovery.assert_all_cuts_covered(&covered);
     }
 }
+crate::require_process_kill!();

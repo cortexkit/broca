@@ -383,3 +383,4 @@ fn v4_recovery_marker_sync_failure_retries_the_visible_marker_barrier() {
         }
     });
 }
+crate::require_process_kill!();

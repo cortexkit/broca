@@ -308,3 +308,4 @@ async fn real_handle_unlink_failure_preserves_durable_close_and_marker_for_recla
     assert!(matches!(records[1].record, WalRecord::WriterClosed { .. }));
     assert!(marker_kept);
 }
+crate::require_process_kill!();

@@ -19,6 +19,7 @@ mod graceful_stop;
 mod hand_written_expectations;
 mod observed_wal_fidelity;
 mod plan_manifest_redrive;
+mod process_kill_guard;
 mod scope_migration;
 mod script_fixtures;
 mod session_address;

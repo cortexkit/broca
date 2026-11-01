@@ -108,6 +108,7 @@ fn other_principal_request() -> RunRequest {
 
 const fn one_edit(name: &'static str, request: fn() -> RunRequest) -> Scenario {
     Scenario {
+        extension: None,
         name,
         request,
         control: default_control,
@@ -136,6 +137,7 @@ fn adopt_request() -> RunRequest {
 }
 
 const ADOPT: Scenario = Scenario {
+    extension: None,
     name: "adopt",
     request: adopt_request,
     control: default_control,
@@ -471,3 +473,5 @@ async fn both_sides_of_the_adopting_run_started(handle: &RunnerHandle) {
         );
     }
 }
+
+broca_crash_harness::require_process_kill!();

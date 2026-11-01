@@ -1815,3 +1815,4 @@ fn power_loss_non_unix_refuses_nonempty_initial_roots() {
     assert!(RecordingFs::new(&root).is_err());
     fs::remove_dir_all(root).unwrap();
 }
+broca_crash_harness::require_process_kill!();

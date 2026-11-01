@@ -546,3 +546,4 @@ fn v4_recovery_leaves_pinned_legacy_bytes_and_tail_policy_unchanged() {
         assert_eq!(std::fs::read(root.log()).unwrap(), fixture);
     }
 }
+crate::require_process_kill!();

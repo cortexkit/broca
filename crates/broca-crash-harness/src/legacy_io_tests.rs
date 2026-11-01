@@ -99,3 +99,4 @@ fn missing_legacy_log_ignores_malformed_recovery_sidecar() {
         "legacy filesystem attempts must equal the independently captured master trace"
     );
 }
+crate::require_process_kill!();
