@@ -74,6 +74,80 @@ fn caller_module_nonce<'a>(
     };
     Ok(Some((module, nonce)))
 }
+
+fn reset_caller_nonce_files(owner_nonce: &Path) -> Result<(), HarnessError> {
+    // Every stand-in is supervised and receives a new launch nonce after restart. A file
+    // left by the previous process must not satisfy the next caller's readiness check.
+    for module in [
+        OWNER_MODULE,
+        SENDER_MODULE,
+        HEAD_SENDER_MODULE,
+        STRANGER_MODULE,
+        "magic-context",
+    ] {
+        let principal = format!("reserved:{module}");
+        let (_, path) = caller_module_nonce(&principal, owner_nonce)?.expect("known caller module");
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(HarnessError::new(format!(
+                    "resetting {module} caller nonce before launch: {error}"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn caller_nonce_reset_discards_every_previous_supervised_launch() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("caller-nonce-reset-{}", std::process::id()));
+    broca_test_support::remove_rig_dir(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let owner_nonce = root.join("owner.nonce");
+    let mut paths = Vec::new();
+    for module in [
+        OWNER_MODULE,
+        SENDER_MODULE,
+        HEAD_SENDER_MODULE,
+        STRANGER_MODULE,
+        "magic-context",
+    ] {
+        let (_, path) = caller_module_nonce(&format!("reserved:{module}"), &owner_nonce)
+            .unwrap()
+            .unwrap();
+        std::fs::write(&path, "previous-supervised-launch").unwrap();
+        paths.push(path);
+    }
+    std::fs::write(root.join("unrelated.nonce"), "keep").unwrap();
+    reset_caller_nonce_files(&owner_nonce).unwrap();
+    for path in paths {
+        assert!(
+            !path.exists(),
+            "a restarted rig could read an old caller identity from {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read(root.join("unrelated.nonce")).unwrap(),
+        b"keep"
+    );
+    reset_caller_nonce_files(&owner_nonce).unwrap();
+    broca_test_support::remove_rig_dir(&root);
+}
+
+#[test]
+fn caller_nonce_reset_fails_before_launch_if_a_publication_cannot_be_removed() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("caller-nonce-reset-error-{}", std::process::id()));
+    broca_test_support::remove_rig_dir(&root);
+    std::fs::create_dir_all(root.join("sender.nonce")).unwrap();
+    let error = reset_caller_nonce_files(&root.join("owner.nonce")).unwrap_err();
+    assert!(error.to_string().contains(SENDER_MODULE), "{error}");
+    broca_test_support::remove_rig_dir(&root);
+}
 const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 /// The system-prompt marker naming the session a model request belongs to.
 const SESSION_MARKER: &str = "conformance-session:";
@@ -1285,7 +1359,7 @@ impl BrocaSubject {
         std::fs::create_dir_all(config_path.parent().unwrap()).map_err(|e| fail(e.to_string()))?;
         std::fs::create_dir_all(&runtime_dir).map_err(|e| fail(e.to_string()))?;
         let owner_nonce = root.join("owner.nonce");
-        let _ = std::fs::remove_file(&owner_nonce);
+        reset_caller_nonce_files(&owner_nonce)?;
         let connection_file = runtime_dir.join("subc-connection.json");
         let _ = std::fs::remove_file(&connection_file);
         let config = json!({
@@ -3675,6 +3749,13 @@ const REQUIRED_STRUCTURED_OUTPUT_CASES: &[&str] = &[
     "structured_output_sibling_never_dispatched",
 ];
 
+const REQUIRED_INTERRUPT_CANCEL_CASES: &[&str] = &[
+    "run_cancel_by_interrupt_now_cancelled",
+    "run_cancel_by_interrupt_without_grant_refused",
+    "run_cancel_by_interrupt_non_now_refused",
+    "run_cancel_by_interrupt_other_session_refused",
+];
+
 const REQUIRED_RETRACT_OWN_SEND_CASES: &[&str] = &[
     "retract_own_send_sender_retracted",
     "retract_own_send_other_sender_refused",
@@ -3693,6 +3774,7 @@ fn check_named_contract_cases(
         .iter()
         .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
         .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
+        .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
     {
         let case = cases
             .iter()
@@ -3732,6 +3814,7 @@ mod named_contract_case_tests {
                 case.name.starts_with("input_token_cap_")
                     || case.name.starts_with("structured_output_")
                     || case.name.starts_with("retract_own_send_")
+                    || case.name.starts_with("run_cancel_by_interrupt_")
             })
             .map(|case| CaseReport {
                 case: case.name,
@@ -3758,6 +3841,7 @@ mod named_contract_case_tests {
             .iter()
             .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
             .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
+            .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
             .copied()
             .chain(std::iter::once("structured_output_streamed_siblings"))
         {

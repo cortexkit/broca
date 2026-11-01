@@ -1845,6 +1845,19 @@ pub trait ServeHandler: Send + Sync {
         Ok(())
     }
 
+    /// Authorize cancellation before migration fences or parameter validation can disclose
+    /// session state. Only an immediate stop may use a named sender's interrupt grant.
+    async fn authorize_session_cancel(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        _immediate: bool,
+    ) -> Result<(), ServeError> {
+        self.authorize_session_owner(session, principal, scope)
+            .await
+    }
+
     /// Retraction defaults to owner-only unless the handler supports recorded senders.
     /// The principal must come from the daemon's bind, never from request parameters.
     async fn authorize_session_retract(
@@ -2075,6 +2088,21 @@ pub trait ServeHandler: Send + Sync {
                 Some(broca_protocol::ErrorClass::Permanent),
             ))
         }
+    }
+
+    /// Cancel with the daemon-attested caller, never an identity from the request body.
+    /// Handlers without named-sender admission retain owner-only cancellation.
+    async fn cancel_from(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<CancelResponse, ServeError> {
+        self.authorize_session_owner(session, principal, scope)
+            .await?;
+        self.cancel_at(session, run_id, at).await
     }
 
     /// `run.status` / `session.status` — the lineage's current state.
@@ -2553,6 +2581,23 @@ impl ServeHandler for crate::LineageRegistry {
             .map_err(ServeError::ScopeRefused)
     }
 
+    async fn authorize_session_cancel(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        immediate: bool,
+    ) -> Result<(), ServeError> {
+        let at = if immediate {
+            broca_wal::record::RunCancelAt::Now
+        } else {
+            broca_wal::record::RunCancelAt::StepBoundary
+        };
+        self.resolve_cancel_authority(session, principal, scope, at)
+            .await
+            .map(|_| ())
+    }
+
     async fn authorize_session_retract(
         &self,
         session: &LineageKey,
@@ -2560,9 +2605,8 @@ impl ServeHandler for crate::LineageRegistry {
         scope: &broca_protocol::SendScope,
         submission_id: Option<&str>,
     ) -> Result<(), ServeError> {
-        // Runner 0.7.29 CONTRACT.md:2333-2362 (§9.2) extends only session.retract:
-        // owners keep their exact path; another attested sender may withdraw only its
-        // recorded submission. run.cancel remains owner-only, even for that sender.
+        // Retraction admits the submission's recorded sender without requiring the
+        // interrupt:true grant that lets a non-owner stop the running turn.
         match self
             .authorize_session_owner(session, principal, scope)
             .await
@@ -4307,6 +4351,41 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<CancelResponse, ServeError> {
         use crate::actor::CancelOutcome;
         match self.route_cancel_at(session, run_id, at).await? {
+            CancelOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
+            CancelOutcome::Error(error) => Err(ServeError::Open(error, None)),
+            CancelOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
+            CancelOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
+            CancelOutcome::Ack => Ok(CancelResponse::Ack),
+            CancelOutcome::NotActive => Ok(CancelResponse::NotActive),
+            CancelOutcome::Reopen => unreachable!("registry retry consumes Reopen"),
+        }
+    }
+
+    async fn cancel_from(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<CancelResponse, ServeError> {
+        use crate::actor::CancelOutcome;
+        match self
+            .resolve_cancel_authority(session, principal, scope, at)
+            .await?
+        {
+            crate::actor::CancelAuthority::Owner => {
+                return self.cancel_at(session, run_id, at).await
+            }
+            crate::actor::CancelAuthority::Sender => {}
+        }
+        // Refuse before opening an actor: recovery itself can write. The actor rechecks
+        // the sender grant against any session.refresh accepted since this read.
+        match self
+            .route_cancel_from(session, run_id, at, principal.cloned(), scope.clone())
+            .await?
+        {
+            CancelOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
             CancelOutcome::Error(error) => Err(ServeError::Open(error, None)),
             CancelOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
             CancelOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
