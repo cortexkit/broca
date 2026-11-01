@@ -1336,8 +1336,8 @@ impl BrocaSubject {
                 &self
                     .backup_classes
                     .as_ref()
-                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled}))
-                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled})),
+                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled,"media":{"enabled":self.media_enabled}}))
+                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled,"media":{"enabled":self.media_enabled}})),
             )
             .unwrap(),
         )

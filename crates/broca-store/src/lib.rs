@@ -54,7 +54,7 @@ pub mod session_refs;
 pub mod session_root_repair;
 pub mod system_one;
 mod wal_recovery;
-pub use fold_identities::fold_identities;
+pub use fold_identities::{fold_identities, require_legacy_operator_root, LegacyOnlyOperator};
 
 pub use system_one::SystemOneStore;
 

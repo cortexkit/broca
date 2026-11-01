@@ -666,6 +666,30 @@ mod tests {
     }
 
     #[test]
+    fn recovery_inferred_batch_matches_the_production_batch_id_generator() {
+        let generated = crate::run::tool_batch_id(&RunId("r".into()), broca_protocol::StepId(1));
+        assert_eq!(generated, broca_protocol::BatchId("r-b1".into()));
+        let mut records = crate::replay::deferred_tests::batch(&["kept-call"]);
+        records.pop();
+        records.push(
+            serde_json::from_value(serde_json::json!({
+                "type":"recovery_cut", "cut_id":"cut-lost-start", "sidecar_basename":"log.cut",
+                "cut_offset":0, "removed_len":1, "removed_sha256":"a".repeat(64),
+                "reason":"published_region_corruption", "active_run":"r",
+                "runs":[{"run_id":"r","calls":[{"tool_call_id":"kept-call"}]}],
+                "unattributed_tool_risk":false
+            }))
+            .unwrap(),
+        );
+        let prior = crate::replay(&records).unwrap();
+        let batch = prior
+            .open_tool_batch
+            .expect("the retained model turn infers its lost start");
+        assert!(batch.needs_start);
+        assert_eq!(batch.batch_id, generated);
+    }
+
+    #[test]
     fn recovery_inferred_batch_cannot_be_replaced_by_another_plan() {
         let mut records = crate::replay::deferred_tests::batch(&["kept-call"]);
         records.pop();

@@ -3740,9 +3740,14 @@ impl WalHandle {
     }
 
     pub(crate) fn bind_media_capture(&mut self, store: &impl WalStore, session: &BindIdentity) {
-        self.media_capture = store
-            .uploads()
-            .map(|uploads| crate::tool_media::ToolMediaCapture::new(uploads, session.clone()));
+        // Tool and person media share the immutable boot decision.
+        self.media_capture = if broca_protocol::attachments_enabled() {
+            store
+                .uploads()
+                .map(|uploads| crate::tool_media::ToolMediaCapture::new(uploads, session.clone()))
+        } else {
+            None
+        };
     }
 
     pub fn check_move(&self) -> Result<(), WalError> {

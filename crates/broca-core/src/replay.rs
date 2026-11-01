@@ -4684,7 +4684,9 @@ pub fn reconcile_run_state<'a>(
                         indeterminate_tool_calls.record_dispatch_terminal(call, true);
                     }
                     let state = found.get_or_insert_with(interrupted_recovery_state);
-                    state.state = RunIndexState::Interrupted;
+                    if matches!(state.state, RunIndexState::Active | RunIndexState::Paused) {
+                        state.state = RunIndexState::Interrupted;
+                    }
                     let known = state.indeterminate_tool_calls.get_or_insert_with(Vec::new);
                     for call in calls {
                         if !known.contains(&call) {
@@ -4700,7 +4702,9 @@ pub fn reconcile_run_state<'a>(
             } if owner.0 == run_id => {
                 indeterminate_tool_calls.record_dispatch_terminal(tool_call_id, true);
                 let state = found.get_or_insert_with(interrupted_recovery_state);
-                state.state = RunIndexState::Interrupted;
+                if matches!(state.state, RunIndexState::Active | RunIndexState::Paused) {
+                    state.state = RunIndexState::Interrupted;
+                }
                 let known = state.indeterminate_tool_calls.get_or_insert_with(Vec::new);
                 if !known.contains(tool_call_id) {
                     known.push(tool_call_id.clone());

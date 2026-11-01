@@ -8545,29 +8545,52 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // both the shutdown seal's five-second limit and the global exit deadline remain
         // enforceable.
         let lineage = writer.lineage_id();
-        let (prior, attempts_already_recorded, projection, closing, held_replies) =
-            spawn_blocking(JobKind::WalRead, move || {
-                let frames = wal_store
-                    .read_records_range(&key, 0, Some(head), None)
-                    .map_err(|e| e.to_string())?;
-                let frames = crate::approval::complete_frames(frames, head)?;
-                let projection = crate::approval::projection_from_frames(lineage, &frames)?;
-                let records: Vec<_> = frames.into_iter().map(|frame| frame.record).collect();
-                let recorded =
-                    sealed_step.map(|step| attempts_recorded_for_latest_step(&records, step));
-                broca_core::replay(&records)
-                    .map(|prior| {
-                        let closing = broca_core::resume::provider_held_closing_reason(
-                            &prior,
-                            records.iter(),
-                        );
-                        let held_replies = broca_core::resume::closing_held_replies(records.iter());
-                        (prior, recorded, projection, closing, held_replies)
-                    })
-                    .map_err(|e| e.to_string())
-            })
-            .await
-            .map_err(|e| e.to_string())??;
+        let overhaul = writer.is_overhaul();
+        let (
+            prior,
+            attempts_already_recorded,
+            projection,
+            closing,
+            held_replies,
+            resumed_in_tenure,
+        ) = spawn_blocking(JobKind::WalRead, move || {
+            let frames = wal_store
+                .read_records_range(&key, 0, Some(head), None)
+                .map_err(|e| e.to_string())?;
+            let frames = crate::approval::complete_frames(frames, head)?;
+            let projection = crate::approval::projection_from_frames(lineage, &frames)?;
+            let records: Vec<_> = frames.into_iter().map(|frame| frame.record).collect();
+            // The opener may already record ResumeStarted after WriterOpened
+            // while completing recovery, before the log reaches the actor.
+            let resumed_in_tenure = overhaul
+                && records
+                    .iter()
+                    .rposition(|record| matches!(record, WalRecord::WriterOpened { .. }))
+                    .is_some_and(|opened| {
+                        records[opened + 1..]
+                            .iter()
+                            .any(|record| matches!(record, WalRecord::ResumeStarted { .. }))
+                    });
+            let recorded =
+                sealed_step.map(|step| attempts_recorded_for_latest_step(&records, step));
+            broca_core::replay(&records)
+                .map(|prior| {
+                    let closing =
+                        broca_core::resume::provider_held_closing_reason(&prior, records.iter());
+                    let held_replies = broca_core::resume::closing_held_replies(records.iter());
+                    (
+                        prior,
+                        recorded,
+                        projection,
+                        closing,
+                        held_replies,
+                        resumed_in_tenure,
+                    )
+                })
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         if prior.run_id.is_none() || prior.run_finished_durable {
             return Ok(false);
         }
@@ -8645,7 +8668,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             broca_core::close_out_open_batch(&prior, deferred_close)
         };
         let resuming = cause == SealCause::CrashOrphan;
-        if resuming {
+        if resuming && !resumed_in_tenure {
             writer.record(broca_core::resume_started_record(&prior, head, Vec::new()));
         }
         if !held_replies.is_empty() {

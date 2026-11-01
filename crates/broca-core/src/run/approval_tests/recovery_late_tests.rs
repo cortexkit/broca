@@ -220,27 +220,32 @@ async fn completed_origin_without_a_late_intent_still_executes_once() {
 
 #[tokio::test]
 async fn recovery_cut_late_intent_never_resends_from_completed_origin() {
-    check_cut_late_intent(false, LateDamage::ReadableGap, false).await;
+    check_cut_late_intent(false, LateDamage::ReadableGap, None).await;
 }
 
 #[tokio::test]
 async fn recovery_cut_late_intent_keeps_its_prepared_owner_after_a_later_episode() {
-    check_cut_late_intent(true, LateDamage::ReadableGap, false).await;
+    check_cut_late_intent(true, LateDamage::ReadableGap, None).await;
 }
 
 #[tokio::test]
 async fn recovery_undecodable_late_intent_never_resends_from_completed_origin() {
-    check_cut_late_intent(false, LateDamage::UndecodableIntent, false).await;
+    check_cut_late_intent(false, LateDamage::UndecodableIntent, None).await;
 }
 
 #[tokio::test]
 async fn recovery_destroyed_late_approval_and_intent_never_resends() {
-    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, false).await;
+    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, None).await;
 }
 
 #[tokio::test]
 async fn recovery_frozen_question_records_a_later_approval_without_execution() {
-    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, true).await;
+    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, Some("approve")).await;
+}
+
+#[tokio::test]
+async fn recovery_frozen_question_records_a_later_decline_without_execution() {
+    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, Some("decline")).await;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -250,12 +255,20 @@ enum LateDamage {
     LostApprovalAndIntent,
 }
 
-async fn check_cut_late_intent(later_episode: bool, damage: LateDamage, later_answer: bool) {
+async fn check_cut_late_intent(
+    later_episode: bool,
+    damage: LateDamage,
+    later_answer: Option<&'static str>,
+) {
     let (mut rig, key) = expired_overhaul().await;
     let lost_approval = damage == LateDamage::LostApprovalAndIntent;
     let undecodable = damage != LateDamage::ReadableGap;
     if lost_approval {
-        *rig.questions.answer.lock().unwrap() = if later_answer { "none" } else { "approve" };
+        *rig.questions.answer.lock().unwrap() = if later_answer.is_some() {
+            "none"
+        } else {
+            "approve"
+        };
     }
     let origin = rig
         .frames()
@@ -455,7 +468,7 @@ async fn check_cut_late_intent(later_episode: bool, damage: LateDamage, later_an
         !full_projection.late_allowed(full_projection.calls.get(&key).unwrap()),
         "Completed origin must not authorize a recovery-tombstoned call"
     );
-    if !later_answer {
+    if later_answer.is_none() {
         assert!(rig
             .questions
             .reports
@@ -464,17 +477,28 @@ async fn check_cut_late_intent(later_episode: bool, damage: LateDamage, later_an
             .iter()
             .any(|(_, outcome)| matches!(outcome, ApprovalExecution::OutcomeUnknown)));
     }
-    if later_answer {
+    if let Some(answer) = later_answer {
         assert!(!rig.frames().iter().any(|frame| matches!(&frame.record,
             WalRecord::LateApprovalRecorded { call_key, .. } if call_key == &key)));
         let old_head = std::fs::read(broca_wal::head_proof::sidecar_path(&path)).ok();
-        *rig.questions.answer.lock().unwrap() = "approve";
+        *rig.questions.answer.lock().unwrap() = answer;
         next_turn(&rig, "late-arrived-after-freeze").await;
         assert!(rig.tools.sent.lock().unwrap().is_empty());
         assert_eq!(unknown(&rig.frames()), 1);
-        assert_eq!(rig.frames().iter().filter(|frame| matches!(&frame.record,
-            WalRecord::LateApprovalRecorded { call_key, decision: broca_wal::LateDecision::Approved, .. }
-            if call_key == &key)).count(), 1);
+        let expected_decision = match answer {
+            "approve" => broca_wal::LateDecision::Approved,
+            "decline" => broca_wal::LateDecision::Declined,
+            _ => unreachable!("the regression only supplies authenticated approval choices"),
+        };
+        assert_eq!(
+            rig.frames()
+                .iter()
+                .filter(|frame| matches!(&frame.record,
+            WalRecord::LateApprovalRecorded { call_key, decision, .. }
+            if call_key == &key && decision == &expected_decision))
+                .count(),
+            1
+        );
         let mut projection =
             crate::replay::DeferredCallProjection::new(rig.writer.lineage_id().unwrap());
         projection.fold_frames(&rig.frames());

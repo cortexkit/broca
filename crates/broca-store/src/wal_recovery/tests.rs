@@ -1216,3 +1216,90 @@ fn sender_policy_repair_legacy_fence_guard_executes_no_sql() {
     }
     clear_authorizer(&store);
 }
+
+#[test]
+fn recovery_completed_receipt_owner_stays_completed_after_reprojection() {
+    for with_receipt in [false, true] {
+        let f = Fixture::with_damage(false);
+        let mut wal =
+            FileWal::open_with_recovery(&f.path, WalConfig::OVERHAUL, f.wals.feature_floor_path())
+                .unwrap()
+                .with_feature_floor(f.wals.feature_floor_path());
+        let damage_at = std::fs::metadata(&f.path).unwrap().len() as usize;
+        let writer_id = wal.writer_id().unwrap();
+        let through = wal.last_seq();
+        wal.append(
+            1,
+            &WalRecord::WriterOpened {
+                writer_id,
+                previous_writer_id: None,
+                recovered_through_seq: through,
+                cause: "reopen".into(),
+            },
+            true,
+        )
+        .unwrap();
+        wal.append(1, &WalRecord::WriterClosed { writer_id }, true)
+            .unwrap();
+        drop(wal);
+        let mut image = std::fs::read(&f.path).unwrap();
+        image[damage_at + 4] = 0;
+        std::fs::write(&f.path, image).unwrap();
+        f.recover().unwrap();
+        assert_eq!(
+            f.store.lookup_run("r").unwrap().unwrap().state,
+            RunIndexState::Completed
+        );
+        let mut cut = f
+            .wals
+            .read_records(&f.session)
+            .unwrap()
+            .into_iter()
+            .find_map(|frame| match frame.record {
+                WalRecord::RecoveryCut { recovery } => Some(recovery),
+                _ => None,
+            })
+            .unwrap();
+        cut.cut_id.push_str("-completed-owner");
+        cut.active_run = Some(broca_protocol::RunId("r".into()));
+        cut.runs = vec![broca_wal::recovery::RecoveryRun {
+            run_id: broca_protocol::RunId("r".into()),
+            calls: Vec::new(),
+        }];
+        let cut_id = cut.cut_id.clone();
+        let mut wal =
+            FileWal::open_with_recovery(&f.path, WalConfig::OVERHAUL, f.wals.feature_floor_path())
+                .unwrap()
+                .with_feature_floor(f.wals.feature_floor_path());
+        wal.append(1, &WalRecord::RecoveryCut { recovery: cut }, true)
+            .unwrap();
+        if with_receipt {
+            let receipt: WalRecord = serde_json::from_value(serde_json::json!({
+                "type":"recovery_call_closed", "cut_id":cut_id, "run_id":"r",
+                "tool_call_id":"late-call", "outcome":"unknown",
+                "result":{"tool_call_id":"late-call", "output":{"kind":"error",
+                    "message":"outcome_unknown"},"is_error":true}
+            }))
+            .unwrap();
+            wal.append(1, &receipt, true).unwrap();
+        }
+        drop(wal);
+        let range =
+            broca_wal::file_wal::read_records_range(&f.path, DEFAULT_MAX_READ_BYTES, 0, None, None)
+                .unwrap();
+        for _ in 0..2 {
+            f.store
+                .reproject_wal_recovery_inner(&f.session, &range)
+                .unwrap();
+            let run = f.store.lookup_run("r").unwrap().unwrap();
+            assert_eq!(
+                run.state,
+                RunIndexState::Completed,
+                "receipt={with_receipt}"
+            );
+            assert_eq!(run.usage.unwrap().input_tokens, Some(30));
+            assert_eq!(run.retries_used, 2);
+            assert!(!f.pending());
+        }
+    }
+}

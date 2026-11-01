@@ -279,6 +279,7 @@ fn arming_notice(days: u64, interval: Duration, poll: Duration) -> String {
 }
 
 fn scheduled_pass(root: &Path, config: WalArchiveConfig) -> io::Result<Option<FoldReport>> {
+    broca_store::require_legacy_operator_root(root, "wal-archive").map_err(io::Error::other)?;
     // RESUME AN UNFINISHED PASS RATHER THAN ASKING FOR A FRESH ONE.
     //
     // A fresh fold refuses while an unfinished journal exists, and that gate is right --
@@ -337,6 +338,20 @@ fn scheduled_pass(root: &Path, config: WalArchiveConfig) -> io::Result<Option<Fo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn archive_helper_refuses_before_fold_identity_or_journal_reads() {
+        crate::bundle::tests::refused_roots("archive", |root| {
+            let error = scheduled_pass(root, WalArchiveConfig { days: Some(14) }).unwrap_err();
+            let refusal = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<broca_store::LegacyOnlyOperator>()
+                .unwrap();
+            assert_eq!(refusal.operator, "wal-archive");
+            assert_eq!(refusal.root, root);
+        });
+    }
+
     pub(super) struct TempRoot(PathBuf);
     impl TempRoot {
         pub(super) fn new() -> io::Result<Self> {

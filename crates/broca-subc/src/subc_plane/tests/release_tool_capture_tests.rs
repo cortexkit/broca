@@ -6,7 +6,8 @@ use broca_wal::{DispatchOutcome, WalRecord};
 use serde_json::json;
 
 #[tokio::test]
-async fn unavailable_capture_records_image_notice_and_writes_no_media() {
+async fn capture_off_image_result_records_notice_and_writes_no_media() {
+    assert!(!broca_protocol::attachments_enabled());
     let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
     assert_eq!(data.len(), 92);
     for is_error in [false, true] {
@@ -23,7 +24,7 @@ async fn unavailable_capture_records_image_notice_and_writes_no_media() {
             WalHandle::open_and_spawn_observed(store.clone(), ctx.bind.clone(), lease, None)
                 .await
                 .unwrap();
-        ctx.media_capture = None;
+        ctx.media_capture = writer.media_capture();
         let raw = json!({"content":[
             {"type":"text","text":"before"},
             {"type":"image","mimeType":"image/png","data":data},
@@ -86,7 +87,7 @@ async fn unavailable_capture_records_image_notice_and_writes_no_media() {
         assert!(!wal_bytes
             .windows(b"media-content/v1".len())
             .any(|window| window == b"media-content/v1"));
-        assert!(ctx.media_capture.is_none());
+        assert!(writer.media_capture().is_none());
         writer.shutdown().await.unwrap();
         drop(lease);
     }

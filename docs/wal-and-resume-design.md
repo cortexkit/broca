@@ -54,9 +54,19 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   explicit policy below.
 - **Overhaul recovery policy is explicit.** `broca.jsonc` accepts
   `"wal_recovery": "repair"` (default) or `"refuse"`; an unknown value refuses
-  boot by name. This setting affects only version 4 logs. Legacy bytes and
-  recovery behavior are unchanged, including the existing ambiguity between a
+  boot. Validation applies to every root format: a bad value also refuses boot
+  on a legacy root, even though the
+  recovery policy affects only version 4 logs. Legacy bytes and recovery
+  behavior are unchanged, including the existing ambiguity between a
   damaged final append and corruption of a synced final frame.
+
+  `refuse` delegates entirely to the ordinary decoder before reading head proofs,
+  cut manifests or other recovery evidence, or invoking callbacks that invalidate
+  and rebuild the affected session's materialized transcript and index. Even a
+  malformed matching sidecar cannot change that decoder's outcome. It does not
+  finish an interrupted repair: a durable pending-recovery marker keeps the
+  affected session's materialized transcript and index views unavailable until
+  a writable open with `repair` finishes the interrupted repair.
 
   Recovery is enabled only by the state format decided at boot and supplied to
   the opener. Unconfigured `FileWal::open` and the low-level
@@ -83,7 +93,8 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   append. The existing final-tail discard rule therefore cannot provide a
   stronger guarantee against post-sync storage corruption.
 
-  A previously repaired log still pays a recurring verification cost. For a
+  Under `repair`, a previously repaired log still pays a recurring verification
+  cost. For a
   clean, unchanged writable `FileWal` open with completed same-lineage manifests
   and no projection hooks, recovery performs two complete WAL read/decode passes,
   one retained-prefix SHA-256 pass per applicable manifest, one parent-directory
@@ -136,7 +147,8 @@ digest := SHA-256 (or BLAKE3) over (header-fields ‖ payload)
   lineage's inventory; lineage-namespaced filenames prevent name reuse. The
   existing check that defers retention for overhaul roots remains in place;
   this cleanup does not enable destructive background retention on those roots.
-  A pending manifest is finished on the next writable open, even when the log
+  A pending manifest is finished on the next repair-mode writable open, even
+  when the log
   already looks clean after a failed or interrupted truncate. A successful
   `RecoveryCut` append is synced before writable open completes. Retrying a
   matching completed cut does not create duplicate recovery records. Later

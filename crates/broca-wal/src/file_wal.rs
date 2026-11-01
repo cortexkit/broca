@@ -1372,7 +1372,11 @@ impl FileWal {
         sync: bool,
         source: FrameSource,
     ) -> Result<u64, WalError> {
-        if matches!(record, WalRecord::RecoveryCut { .. }) && !self.config.is_overhaul() {
+        if matches!(
+            record,
+            WalRecord::RecoveryCut { .. } | WalRecord::RecoveryCallClosed { .. }
+        ) && !self.config.is_overhaul()
+        {
             return Err(WalError::FrameFormat {
                 log: WalFormat::Legacy,
                 offered: WalFormat::Overhaul,

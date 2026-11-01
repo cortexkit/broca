@@ -704,6 +704,14 @@ async fn check_recovery_seal(model_step_cut: bool) {
     assert!(records
         .iter()
         .any(|record| matches!(record, WalRecord::RecoveryCut { .. })));
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ResumeStarted { .. }))
+            .count(),
+        1,
+        "one startup sweep must publish exactly one ResumeStarted"
+    );
     assert!(records.iter().any(
         |record| matches!(record, WalRecord::ResumeStarted { indeterminate, .. }
         if indeterminate == &vec![ToolCallId(CALL.into())])

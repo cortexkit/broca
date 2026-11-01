@@ -4052,7 +4052,8 @@ where
             }),
         )
     };
-    let defer_media_tags = provider.defer_media_tags(render_tags);
+    let defer_media_tags =
+        broca_protocol::attachments_enabled() && provider.defer_media_tags(render_tags);
     writer.retain_live_tags(render_tags && computed_tags.is_none());
     let context_limit = if is_resume && !append_episode {
         prior
@@ -9820,6 +9821,11 @@ fn step_attempt_was_args_cut(frames: &[broca_wal::FramedRecord], step_id: StepId
             if *attempted_step == step_id && outcome.as_str() == "tool_args_trailing_garbage"))
 }
 
+// A torn batch start is inferred from the owning run and model step during recovery.
+pub(crate) fn tool_batch_id(run_id: &RunId, step_id: StepId) -> BatchId {
+    BatchId(format!("{}-b{}", run_id.0, step_id.0))
+}
+
 fn tool_args_rejection_records(
     run_id: &RunId,
     step_id: StepId,
@@ -9830,7 +9836,7 @@ fn tool_args_rejection_records(
     if rejected.is_empty() {
         return (Vec::new(), None);
     }
-    let batch_id = BatchId(format!("{}-b{}", run_id.0, step_id.0));
+    let batch_id = tool_batch_id(run_id, step_id);
     let mut records = Vec::new();
     if !batch_already_started {
         records.push(WalRecord::ToolBatchStarted {
@@ -9963,7 +9969,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     out: &mpsc::Sender<OutputEvent>,
     ordered: Option<&RunControl>,
 ) -> Result<BatchOutcome, RunError> {
-    let batch_id = BatchId(format!("{}-b{}", run_id.0, step_id.0));
+    let batch_id = tool_batch_id(run_id, step_id);
     let ctx = BatchCtx {
         media_capture: writer.media_capture(),
         batch_id: batch_id.clone(),
@@ -11746,7 +11752,7 @@ async fn finalize_hard_stop(
     submitted: Option<&ToolCallId>,
     closing: Option<(ClosingNotice<'_>, &[ContentBlock])>,
 ) -> Result<RunSummary, RunError> {
-    let batch_id = BatchId(format!("{}-b{}", resolved_run_id.0, step_id.0));
+    let batch_id = tool_batch_id(resolved_run_id, step_id);
     let call_ids: Vec<ToolCallId> = pending.iter().map(|c| c.tool_call_id.clone()).collect();
     if !batch_already_started {
         writer.record(WalRecord::ToolBatchStarted {
@@ -16782,7 +16788,7 @@ mod approval_gate {
         }
         let ctx = BatchCtx {
             media_capture: writer.media_capture(),
-            batch_id: BatchId(format!("{}-b{}", run_id.0, step.0)),
+            batch_id: tool_batch_id(run_id, step),
             bind: session.clone(),
             run_id: run_id.clone(),
             scope: scope.cloned(),
@@ -18108,6 +18114,7 @@ mod approval_gate {
             return Ok(());
         };
         if lost_approval_terminal(call) {
+            // Route refusal has no authenticated answer from which to invent a decision.
             let id = call.elicitation_id.clone().unwrap_or_default();
             history.record(
                 writer,
@@ -18957,7 +18964,7 @@ async fn pause_approval(
 ) -> Result<RunSummary, RunError> {
     let batch_id = match open.first().map(|call| &*call.prepared) {
         Some(WalRecord::ToolCallDeferred { batch_id, .. }) => batch_id.clone(),
-        _ if provider_held => BatchId(format!("{}-b{}", run.0, steps)),
+        _ if provider_held => tool_batch_id(run, StepId(steps)),
         _ => return Err(RunError::Wal("approval pause lacks open calls".into())),
     };
     let ctx = BatchCtx {

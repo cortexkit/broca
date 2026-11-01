@@ -210,6 +210,7 @@ mod tests {
 
     #[test]
     fn image_classifier_returns_decoded_bytes_awaiting_capture() {
+        assert!(broca_protocol::attachments_enabled());
         let hex = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
         let png: Vec<u8> = hex
             .as_bytes()

@@ -556,3 +556,70 @@ fn a_damaged_header_crc_is_preserved_even_when_intact_records_follow() {
         }
     }
 }
+
+#[test]
+fn a_legacy_log_refuses_recovery_call_closed_without_changing_bytes() {
+    let scratch = Scratch::new("legacy-recovery-receipt");
+    let mut wal = FileWal::open(scratch.log()).unwrap();
+    let before = std::fs::read(scratch.log()).unwrap();
+    let record: WalRecord = serde_json::from_str(
+        r#"{"type":"recovery_call_closed","cut_id":"cut","run_id":"completed-owner","tool_call_id":"late-call","outcome":"unknown","result":{"tool_call_id":"late-call","output":{"kind":"error","message":"outcome_unknown"},"is_error":true}}"#,
+    ).unwrap();
+    assert!(matches!(
+        wal.append(1, &record, true),
+        Err(WalError::FrameFormat {
+            log: WalFormat::Legacy,
+            offered: WalFormat::Overhaul
+        })
+    ));
+    assert_eq!(std::fs::read(scratch.log()).unwrap(), before);
+}
+
+#[test]
+fn refuse_ignores_malformed_recovery_manifests_and_matches_decoder() {
+    let original = {
+        let scratch = Scratch::new("refuse-original");
+        let mut wal = scratch.overhaul();
+        for step in 1..=3 {
+            wal.append(1, &plain(step), true).unwrap();
+        }
+        std::fs::read(scratch.log()).unwrap()
+    };
+    let mut corrupt = original.clone();
+    corrupt[LINEAGE_FRAME_LEN + 4] = 0;
+    for image in [
+        original.clone(),
+        original[..original.len() - 1].to_vec(),
+        corrupt,
+    ] {
+        let scratch = Scratch::new("refuse-malformed-manifest");
+        std::fs::create_dir_all(scratch.log().parent().unwrap()).unwrap();
+        std::fs::write(scratch.log(), &image).unwrap();
+        let manifest = scratch
+            .log()
+            .with_file_name("session.wal.cut-malformed.json");
+        std::fs::write(&manifest, b"{not-json").unwrap();
+        let expected = recover_prefix(&image, 0, None, None);
+        let mut config = WalConfig::OVERHAUL;
+        config.recovery = crate::recovery::RecoveryPolicy::Refuse;
+        let actual = FileWal::open_with_recovery(scratch.log(), config, scratch.floor());
+        match expected {
+            Ok(prefix) => {
+                drop(actual.expect("Refuse must ignore malformed recovery artifacts"));
+                assert_eq!(
+                    std::fs::read(scratch.log()).unwrap(),
+                    image[..prefix.valid_end as usize]
+                );
+            }
+            Err(expected) => {
+                let actual = actual
+                    .err()
+                    .expect("the ordinary decoder refused this image");
+                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                assert_eq!(std::fs::read(scratch.log()).unwrap(), image);
+            }
+        }
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"{not-json");
+        assert!(!crate::head_proof::sidecar_path(&scratch.log()).exists());
+    }
+}

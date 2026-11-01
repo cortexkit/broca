@@ -359,7 +359,11 @@ fn restore_run_rows(
         let mut state = if present.contains(run) {
             broca_core::reconcile_run_state(
                 records.iter().filter_map(|f| {
-                    (!matches!(f.record, WalRecord::RecoveryCut { .. })).then_some(&f.record)
+                    (!matches!(
+                        f.record,
+                        WalRecord::RecoveryCut { .. } | WalRecord::RecoveryCallClosed { .. }
+                    ))
+                    .then_some(&f.record)
                 }),
                 run,
             )
@@ -370,11 +374,16 @@ fn restore_run_rows(
             // A cut ends unfinished work, but cannot rewrite an explicit terminal
             // that survived before the cut.
             if matches!(state.state, RunIndexState::Active | RunIndexState::Paused)
-                && records.iter().any(|frame| {
-                    matches!(&frame.record,
-                    WalRecord::RecoveryCut { recovery }
-                    if recovery.runs.iter().any(|owner| owner.run_id.0 == *run)
-                    || recovery.active_run.as_ref().is_some_and(|owner| owner.0 == *run))
+                && records.iter().any(|frame| match &frame.record {
+                    WalRecord::RecoveryCut { recovery } => {
+                        recovery.runs.iter().any(|owner| owner.run_id.0 == *run)
+                            || recovery
+                                .active_run
+                                .as_ref()
+                                .is_some_and(|owner| owner.0 == *run)
+                    }
+                    WalRecord::RecoveryCallClosed { run_id, .. } => run_id.0 == *run,
+                    _ => false,
                 })
             {
                 state.state = RunIndexState::Interrupted;

@@ -1115,10 +1115,10 @@ pub(crate) fn before_open_with_hooks(
     inspection: Option<&OpenInspection>,
 ) -> Result<bool, WalError> {
     let overhaul = config.is_some_and(|config| config.is_overhaul());
-    if !overhaul {
+    // Refuse uses only the ordinary decoder, even when recovery artifacts exist.
+    if !overhaul || config.is_some_and(|config| config.recovery == RecoveryPolicy::Refuse) {
         return Ok(false);
     }
-    let refuse = config.is_some_and(|config| config.recovery == RecoveryPolicy::Refuse);
     let mut stored_manifests = manifests(log, cap)?;
     if inspection.is_some_and(|inspection| inspection.missing) && !stored_manifests.is_empty() {
         return Err(WalError::Io(std::io::Error::other(format!(
@@ -1130,19 +1130,6 @@ pub(crate) fn before_open_with_hooks(
         stored_manifests.retain(|manifest| manifest.lineage_id == lineage.as_bytes());
     }
     if stored_manifests.is_empty() {
-        if refuse {
-            if inspection.is_none() {
-                let bytes = match read_capped(log, cap) {
-                    Ok(bytes) => bytes,
-                    Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                        Vec::new()
-                    }
-                    Err(error) => return Err(error),
-                };
-                crate::file_wal::recover_prefix(&bytes, 0, None, None)?;
-            }
-            return Ok(false);
-        }
         if let Some(inspection) = inspection {
             if inspection.legacy_records {
                 return Err(WalError::FrameFormat {
@@ -1186,7 +1173,7 @@ pub(crate) fn before_open_with_hooks(
             log.display()
         ))));
     }
-    let mut scan = prefix(&bytes, !refuse)?;
+    let mut scan = prefix(&bytes, true)?;
     let session_name = if session.is_empty() {
         log.display().to_string()
     } else {
@@ -1279,20 +1266,6 @@ pub(crate) fn before_open_with_hooks(
             }
         }
     }
-    if config.unwrap_or(crate::WalConfig::OVERHAUL).recovery == RecoveryPolicy::Refuse
-        && retry.is_none()
-    {
-        // Preserve the original decoder's typed errors and final-tail behavior.
-        // Refuse never invents a recovery cut for newly discovered damage.
-        crate::file_wal::recover_prefix(&bytes, 0, None, None)?;
-        if pending.is_empty() {
-            return Ok(false);
-        }
-        return Err(WalError::Io(std::io::Error::other(format!(
-            "wal_recovery=refuse: WAL {} no longer matches its pending recovery marker prefix",
-            log.display()
-        ))));
-    }
     let inferred_floor = log
         .parent()
         .and_then(Path::parent)
@@ -1305,7 +1278,7 @@ pub(crate) fn before_open_with_hooks(
     let marker = if let Some(marker) = retry {
         // A partial marker may contain complete earlier records in the same
         // recovery batch. Rewind the batch, not just the first undecodable byte.
-        scan = prefix(&bytes[..marker.offset as usize], !refuse)?;
+        scan = prefix(&bytes[..marker.offset as usize], true)?;
         marker
     } else {
         let active_run = scan.calls.active.clone();
@@ -1605,7 +1578,7 @@ mod tests {
         std::fs::remove_file(&log).unwrap();
         let mut refuse = crate::WalConfig::OVERHAUL;
         refuse.recovery = RecoveryPolicy::Refuse;
-        assert!(before_open(&log, Some(refuse), Some(&floor), "session", 1_000_000).is_err());
+        before_open(&log, Some(refuse), Some(&floor), "session", 1_000_000).unwrap();
         assert!(!log.exists());
         assert!(before_open(
             &log,

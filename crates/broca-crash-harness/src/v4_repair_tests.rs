@@ -105,7 +105,7 @@ fn v4_recovery_torn_marker_reuses_the_original_cut_and_exact_bytes() {
 
 #[cfg(feature = "writer-id-faults")]
 #[test]
-fn v4_recovery_refuse_finishes_manifest_directory_failure_before_truncation() {
+fn v4_recovery_repair_finishes_manifest_directory_failure_before_truncation() {
     let (state, _) = damaged_image();
     let root = Scratch::new();
     state.install(&root.0).unwrap();
@@ -123,7 +123,7 @@ fn v4_recovery_refuse_finishes_manifest_directory_failure_before_truncation() {
             .remove(0);
         let start = recording.operation_kinds().len();
         let wal = root
-            .open_policy(broca_wal::recovery::RecoveryPolicy::Refuse)
+            .open_policy(broca_wal::recovery::RecoveryPolicy::Repair)
             .unwrap();
         let ops = recording.operation_kinds();
         let resize = ops[start..]
@@ -167,7 +167,7 @@ fn v4_recovery_refuse_finishes_manifest_directory_failure_before_truncation() {
 }
 
 #[test]
-fn v4_recovery_refuse_finishes_only_bound_marker_bytes_and_requires_evidence() {
+fn v4_recovery_repair_finishes_only_bound_marker_bytes_and_requires_evidence() {
     let (state, _) = damaged_image();
     let root = Scratch::new();
     state.install(&root.0).unwrap();
@@ -179,7 +179,7 @@ fn v4_recovery_refuse_finishes_only_bound_marker_bytes_and_requires_evidence() {
     let start = manifest.recovery.cut_offset as usize;
     std::fs::write(root.log(), &complete[..start + HEADER_LEN]).unwrap();
     drop(
-        root.open_policy(broca_wal::recovery::RecoveryPolicy::Refuse)
+        root.open_policy(broca_wal::recovery::RecoveryPolicy::Repair)
             .unwrap(),
     );
     assert_eq!(std::fs::read(root.log()).unwrap(), complete);
