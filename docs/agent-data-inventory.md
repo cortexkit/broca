@@ -20,6 +20,26 @@ roots. A refused bind or an
 interrupted first send can therefore leave an identity-only candidate without a WAL.
 Candidates still do not prove that content exists or is locally owned.
 
+An identity reservation alone remains a new session, including after an interrupted
+first bind. Subscribe-before-send may create its first lineage, preserving the
+subscriber's cursor origin. Historical content is different: any run-index row,
+materialized projection/meta row, covered log census entry, or deletion
+ledger/tombstone for the exact key is content evidence. When that evidence exists
+but neither a live log nor an archive member is available, reads and actor-opening
+operations refuse `session_log_missing` (`detail.class: "permanent"`) unless removal
+is proven deliberate. The same refusal applies to a verified lineage-only log
+whose lineage differs from unexpired historical run or projection evidence.
+File length is only a probe prefilter, never the lineage proof; ordinary
+content-bearing logs take no additional content read. The refusal names the session and
+`store-maintenance repair-session-root`; it never guesses an address from the
+route's current folder. Expired reads keep `expired`; move fences keep
+`session_moving` and `session_moved`. A send after completed expiry can still
+start a fresh lineage.
+`health.check.metrics.session_address_refusals.session_log_missing` counts served
+refusals, `diagnostics.findings` reports an error naming the session, and a WARN is
+limited to one per minute. An older deletion cannot excuse a missing newer,
+unexpired run or a different materialized lineage.
+
 Before a `RunStarted` append, ordinary and preencoded writers (including
 provider-free imports) attempt to commit the candidate. The connection mutex and
 SQLite write lock share a bounded wait budget matching the store's five-second

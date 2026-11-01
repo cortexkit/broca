@@ -222,6 +222,10 @@ pub enum OpenError {
         session_ref: String,
         reason: String,
     },
+    SessionLogMissing {
+        session: String,
+        harness: String,
+    },
     /// The session's WAL holds a complete frame that requires WAL features this build does not
     /// know (`missing`): a newer broca wrote it. Kept apart from [`OpenError::Open`] because the
     /// remedy differs: retrying cannot help, only placing a build that knows the features can.
@@ -360,6 +364,8 @@ impl std::fmt::Display for OpenError {
             OpenError::RetentionInvalid(_) => write!(f, "invalid retention"),
             OpenError::SessionClassInvalid(message) => f.write_str(message),
             OpenError::LeaseHeld(s) => write!(f, "session '{s}' held by a live writer"),
+            OpenError::SessionLogMissing { session, harness } => write!(f,
+                "session_log_missing: session {session:?} in harness {harness:?} has history but no log; stop broca and inspect store-maintenance repair-session-root STATE_ROOT --harness {harness:?} --session {session:?}"),
             OpenError::Open(s)
             | OpenError::Classified { reason: s, .. }
             | OpenError::HistoryUnreachable { reason: s, .. }
@@ -2421,6 +2427,7 @@ impl LineageRegistry {
         status: bool,
     ) -> Result<ActorHandle, OpenError> {
         self.check_move(key, true)?;
+        self.check_session_log(key).await?;
         let mut close_retries = 0;
         loop {
             if self.inner.stopping.is_cancelled() {
@@ -4985,6 +4992,7 @@ impl LineageRegistry {
                             sweep.not_live += 1;
                         }
                         OpenError::Expired { .. }
+                        | OpenError::SessionLogMissing { .. }
                         | OpenError::RetentionInvalid(_)
                         | OpenError::SessionClassInvalid(_) => sweep.open_failed += 1,
                         OpenError::LeaseHeld(_) => sweep.lease_held += 1,
@@ -5013,6 +5021,13 @@ impl LineageRegistry {
 }
 
 impl RegistryHandle {
+    pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
+        LineageRegistry {
+            inner: self.inner.clone(),
+        }
+        .check_session_log(key)
+        .await
+    }
     pub(crate) fn note_session_ownership(
         &self,
         key: &LineageKey,
@@ -6908,12 +6923,13 @@ impl LineageRegistry {
     ) -> Result<(), OpenError> {
         self.check_move(key, false)?;
         let Some(service) = self.inner.retention.get().cloned() else {
-            return Ok(());
+            return self.check_session_log(key).await;
         };
         let head = match self.inner.slots.lock().unwrap().get(key) {
             Some(Entry::Open { handle, .. }) => Some(handle.durable_head.load(Ordering::Acquire)),
             _ => None,
         };
+        let checked_key = key.clone();
         let key = key.clone();
         let run = run.map(str::to_owned);
         let store = self
@@ -6944,6 +6960,36 @@ impl LineageRegistry {
         .map_err(OpenError::from_retention)?;
         if let Some(expired_at_ms) = expired {
             return Err(OpenError::Expired { expired_at_ms });
+        }
+        self.check_session_log(&checked_key).await
+    }
+
+    /// Identity-only reservations may still create their first subscriber lineage.
+    /// Historical content evidence, unlike a reservation, forbids replacing an
+    /// unexplained missing log. Both read admission and writer activation use this
+    /// check, including a second writer check under the acquired session lease.
+    pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
+        let (Some(inventory), Some(reader)) = (
+            self.inner.session_address_inventory.get().cloned(),
+            self.inner.reader.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let wal = reader.wal_store.clone();
+        let session = key.clone();
+        let missing = spawn_blocking(JobKind::StoreRead, move || {
+            let state = inventory
+                .session_log_state(&session, wal.as_ref())
+                .map_err(OpenError::Open)?;
+            Ok::<_, OpenError>(state.missing_history())
+        })
+        .await
+        .map_err(|error| OpenError::Open(error.to_string()))??;
+        if missing {
+            return Err(OpenError::SessionLogMissing {
+                session: key.session.clone(),
+                harness: key.harness.clone(),
+            });
         }
         Ok(())
     }

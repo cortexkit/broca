@@ -4526,6 +4526,7 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::SessionHeld(_) => "session_held".into(),
         ServeError::Open(_, _) => "open_failed".into(),
         ServeError::HistoryUnreachable { .. } => broca_wire::HISTORY_UNREACHABLE.into(),
+        ServeError::SessionLogMissing { .. } => "session_log_missing".into(),
         ServeError::ReplyTooLarge(_) => broca_wire::REPLY_TOO_LARGE.into(),
         ServeError::RetainedSessionTooLarge { .. } => "retained_session_too_large".into(),
         ServeError::SessionTooLarge { .. } => "session_too_large".into(),
@@ -4647,6 +4648,13 @@ async fn send_serve_error(
         return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
     }
     let code = match err {
+        ServeError::SessionLogMissing { session, harness } => {
+            crate::session_address_health::record_missing(session, harness);
+            let body = ErrorBody::new("session_log_missing", err.to_string()).with_detail(
+                serde_json::json!({"class":"permanent", "session":session, "harness":harness}),
+            );
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
         ServeError::Upload(error) => {
             let body = upload_error_body(error, false);
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
@@ -6624,6 +6632,43 @@ mod tests {
         let error: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(error.code, "transient");
         assert!(error.message.contains("credentials service unreachable"));
+    }
+
+    #[tokio::test]
+    async fn session_log_missing_is_named_permanent_and_counted() {
+        let before = crate::session_address_health::health()["session_log_missing"]
+            .as_u64()
+            .unwrap();
+        let (tx, mut rx) = broca_diagnostics::channel(1, Arc::default());
+        send_serve_error(
+            &tx,
+            PROTOCOL_VERSION,
+            7,
+            3,
+            11,
+            &ServeError::SessionLogMissing {
+                session: "cktui-missing".into(),
+                harness: "broca".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let frame = rx.recv().await.unwrap();
+        assert_eq!(frame.header.ty, FrameType::Error);
+        let error: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(error["code"], "session_log_missing");
+        assert_eq!(error["detail"]["class"], "permanent");
+        assert!(error["message"].as_str().unwrap().contains("cktui-missing"));
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("store-maintenance repair-session-root"));
+        assert!(
+            crate::session_address_health::health()["session_log_missing"]
+                .as_u64()
+                .unwrap()
+                > before
+        );
     }
 
     #[tokio::test]

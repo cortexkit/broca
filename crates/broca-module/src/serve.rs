@@ -1521,6 +1521,10 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
 /// failures describe lease or store problems; `SendIdReuse` is a typed request rejection.
 #[derive(Debug, Clone)]
 pub enum ServeError {
+    SessionLogMissing {
+        session: String,
+        harness: String,
+    },
     Upload(broca_core::media_uploads::UploadError),
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     UnknownSend,
@@ -1644,6 +1648,9 @@ pub enum ServeError {
 impl From<OpenError> for ServeError {
     fn from(e: OpenError) -> Self {
         match e {
+            OpenError::SessionLogMissing { session, harness } => {
+                Self::SessionLogMissing { session, harness }
+            }
             OpenError::SessionMoving { cut_id } => Self::SessionMoving { cut_id },
             OpenError::SessionMoved { holder } => Self::SessionMoved { holder },
             OpenError::Expired { expired_at_ms } => ServeError::Expired { expired_at_ms },
@@ -1673,6 +1680,7 @@ impl From<OpenError> for ServeError {
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServeError::SessionLogMissing { session, harness } => OpenError::SessionLogMissing { session: session.clone(), harness: harness.clone() }.fmt(f),
             Self::Upload(error) => error.fmt(f),
             ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
             ServeError::SessionMoving { cut_id } => write!(f, "session is moving under cut {cut_id}"),
