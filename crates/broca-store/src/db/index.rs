@@ -165,8 +165,13 @@ pub(super) fn index_in_tx(
     if outdated && !force {
         broca_core::replay::SeedFallback::new("withdrawal projection version outdated");
     }
+    let compaction_outdated = checkpoint.is_some() && !super::outbox::projection_current(tx, &key)?;
+    if compaction_outdated && !force {
+        broca_core::replay::SeedFallback::new("compaction resolution locators incomplete");
+    }
     let rebuilt = force
         || outdated
+        || compaction_outdated
         || checkpoint
             .as_ref()
             .is_some_and(|cp| !matches_checkpoint(cp, log.bytes, &lineage_id));
@@ -299,6 +304,7 @@ pub(super) fn apply_frame(
     frame: &IndexedFrame,
 ) -> Result<(), DbError> {
     let delta = seed.observe(&frame.framed, frame.off, frame.end)?;
+    super::outbox::observe(tx, key, frame)?;
     if matches!(
         frame.framed.record,
         broca_wal::WalRecord::CompactionMessage { .. }
@@ -532,6 +538,25 @@ mod tests {
     }
     fn r_rows(db: &OverhaulDb) -> Vec<(String, Vec<Vec<Value>>)> {
         rows(db, schema::REBUILDABLE_TABLES)
+    }
+
+    fn seed_authoritative_table(tx: &Transaction<'_>, table: &str) -> Result<(), DbError> {
+        match table {
+            "compaction_view_receipt" => {
+                tx.execute("INSERT INTO compaction_view_receipt VALUES('row','lineage','1','0','digest',1)", [])?;
+            }
+            "bus_event_outbox" => {
+                tx.execute("INSERT INTO bus_event_outbox VALUES('row','run',1,'subject','epoch','session',X'000102FF',1,NULL,0)", [])?;
+            }
+            "compaction_notice_outbox" => {
+                tx.execute("INSERT INTO compaction_notice_outbox VALUES('row','session','subject','{}','digest',1,NULL)", [])?;
+            }
+            _ => {
+                // Tables not explicitly handled above must also survive an index rebuild byte-for-byte.
+                tx.execute_batch(&format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, payload BLOB NOT NULL); INSERT INTO {table} VALUES ('row',X'000102FF');"))?;
+            }
+        }
+        Ok(())
     }
     fn qualified_boundaries(db: &OverhaulDb) -> Vec<u64> {
         db.read_snapshot(|tx| {
@@ -1369,6 +1394,147 @@ mod tests {
             })
             .unwrap();
         assert!(!scratch._scratch.0.join("run-index.db").exists());
+    }
+
+    #[test]
+    fn raw_head_uses_latest_accepted_senders_without_origin_reads() {
+        use broca_wal::Wal;
+        let (_, base, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let base = modern_raw_records(base);
+        let bind = bind(&encode_records(&base));
+        let scratch = database();
+        let path = scratch._scratch.0.join("sender-head.wal");
+        let mut wal = broca_wal::FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(scratch._scratch.0.join("wal-floor"));
+        for record in &base {
+            wal.append(1, record, true).unwrap();
+        }
+        publish_writer(&scratch.db, &bind, &wal);
+        for (generation, sender) in [(1, "occipital"), (2, "replacement")] {
+            let manifest = serde_json::from_value(serde_json::json!({
+                "plan":serde_json::json!({"senders":[{"module":sender,"idle_start":true}]}).to_string(),
+                "plan_identity":sender,"composition_digest":"composition","fetches":[],"tools":[],
+                "system_text":"PRIVATE-REFRESH-TEXT","system_digest":"system","join_version":1,"role_versions":{}
+            })).unwrap();
+            wal.append(
+                1,
+                &WalRecord::SessionRefreshAccepted {
+                    generation,
+                    policy: "on_prefix_rebuild".into(),
+                    manifest: Box::new(manifest),
+                    run_in_progress: false,
+                    applies_from_next_run: false,
+                },
+                true,
+            )
+            .unwrap();
+            publish_writer(&scratch.db, &bind, &wal);
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let actual = counter
+                .operation("raw sender head")
+                .run(|| raw_read(&scratch.db, &bind, &wal, Some(0), 100));
+            let frames = wal.replay().unwrap();
+            let expected = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+                .unwrap()
+                .head
+                .unwrap();
+            assert_eq!(actual.head, expected);
+            let operations = counter.snapshot();
+            assert!(
+                operations[0].seed_fallbacks.is_empty(),
+                "{:?}",
+                operations[0]
+            );
+            assert!(operations[0]
+                .reads
+                .iter()
+                .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        }
+        let mut later = base;
+        if let WalRecord::RunStarted { run_id, .. } = &mut later[0] {
+            run_id.0 = "after-refresh".into();
+        }
+        for record in &later {
+            wal.append(1, record, true).unwrap();
+        }
+        publish_writer(&scratch.db, &bind, &wal);
+        let publication = wal.durable_publication().unwrap();
+        let head = publication.sequence();
+        let db = std::sync::Arc::new(scratch.db);
+        let publishing_db = db.clone();
+        let publishing_bind = bind.clone();
+        let reader = db.admission_reader(move |_| {
+            publishing_db
+                .publish(&publishing_bind, "s-test", LogLocation::Live, &publication)
+                .map_err(|error| error.to_string())?;
+            Ok(publication.clone())
+        });
+        db.transaction(false, |tx| {
+            let (encoded, tail): (String, String) =
+                tx.query_row("SELECT admission_seed,tail_seed FROM session", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+            let mut old: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            old["state"]["scalars"]["ownership"]
+                .as_object_mut()
+                .unwrap()
+                .remove("sender_admission");
+            old["state"]
+                .as_object_mut()
+                .unwrap()
+                .remove("latest_refresh");
+            let mut tail: serde_json::Value = serde_json::from_str(&tail).unwrap();
+            tail["admission"] = old.clone();
+            tx.execute(
+                "UPDATE session SET admission_seed=?1,tail_seed=?2",
+                rusqlite::params![old.to_string(), tail.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let owner = counter
+            .operation("execution without sender repair")
+            .run(|| reader.prior_snapshot(&bind, head))
+            .unwrap();
+        assert!(owner.base_watermark > 0);
+        assert!(!owner
+            .checkpoint_at_head
+            .ownership
+            .unwrap()
+            .sender_admission_complete());
+        assert!(counter.snapshot()[0]
+            .reads
+            .iter()
+            .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        for n in 0..2 {
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let sender = counter
+                .operation("lazy sender seed repair")
+                .run(|| reader.sender_snapshot(&bind, head))
+                .unwrap();
+            assert_eq!(
+                sender
+                    .checkpoint_at_head
+                    .ownership
+                    .unwrap()
+                    .effective_senders()[0]
+                    .module,
+                "replacement"
+            );
+            let origin_reads = counter.snapshot()[0]
+                .reads
+                .iter()
+                .filter(|read| read.class == broca_wal::access_counter::ReadClass::Origin)
+                .count();
+            // The first repair fetches the file prefix once; publishing the repaired seed
+            // also accounts for replaying those bytes from memory. Neither recurs later.
+            assert_eq!(origin_reads, if n == 0 { 2 } else { 0 });
+        }
     }
 
     #[test]
@@ -2453,13 +2619,16 @@ mod tests {
             "compaction_notice_outbox",
             "classify_claim",
         ];
-        scratch.db.authoritative_transaction(|tx| {
-            tx.execute("INSERT INTO log_reader VALUES ('reader',1,'declared')", [])?;
-            for table in &authoritative_tables[1..] {
-                tx.execute_batch(&format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, payload BLOB NOT NULL); INSERT INTO {table} VALUES ('row',X'000102FF');"))?;
-            }
-            Ok(())
-        }).unwrap();
+        scratch
+            .db
+            .authoritative_transaction(|tx| {
+                tx.execute("INSERT INTO log_reader VALUES ('reader',1,'declared')", [])?;
+                for table in &authoritative_tables[1..] {
+                    seed_authoritative_table(tx, table)?;
+                }
+                Ok(())
+            })
+            .unwrap();
         scratch
             .db
             .index(&publication(&other_bind, &other_bytes))
@@ -4219,15 +4388,15 @@ mod tests {
             "compaction_notice_outbox",
             "classify_claim",
         ];
-        db.db.authoritative_transaction(|tx| {
-            tx.execute("INSERT INTO log_reader VALUES ('reader',1,'declared')", [])?;
-            // Future owners define these state-machine schemas. Unknown tables
-            // must survive rebuild just as the already-owned log_reader does.
-            for table in &tables[1..] {
-                tx.execute_batch(&format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, payload BLOB NOT NULL); INSERT INTO {table} VALUES ('row',X'000102FF');"))?;
-            }
-            Ok(())
-        }).unwrap();
+        db.db
+            .authoritative_transaction(|tx| {
+                tx.execute("INSERT INTO log_reader VALUES ('reader',1,'declared')", [])?;
+                for table in &tables[1..] {
+                    seed_authoritative_table(tx, table)?;
+                }
+                Ok(())
+            })
+            .unwrap();
         let before = rows(&db.db, &tables);
         let bytes = corpus().remove(0);
         let bind = bind(&bytes);

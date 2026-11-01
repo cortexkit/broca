@@ -69,6 +69,7 @@ impl crate::HookPlane for Hooks {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         hook: HookCall,
     ) -> Result<HookAnswer, crate::HookUnavailable> {
         if let Subject::PreTool { input, .. } = &hook.subject {
@@ -1010,6 +1011,7 @@ impl Rig {
         restart: bool,
     ) -> BatchOutcome {
         let runtime = HookRuntime {
+            scope: None,
             plan: &self.plan,
             plane: self.control.hook_plane.as_ref().unwrap(),
             bind: &self.bind,

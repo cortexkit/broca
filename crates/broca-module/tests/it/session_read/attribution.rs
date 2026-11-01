@@ -200,6 +200,13 @@ impl MaterializedStore for HeldProjection {
     }
 }
 impl Persister for HeldProjection {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        self.inner.repair_sender_policy(session, range)
+    }
     fn project(
         &self,
         key: &BindIdentity,

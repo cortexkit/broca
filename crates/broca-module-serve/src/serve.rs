@@ -2188,6 +2188,8 @@ async fn handle_control_request(
             // this process serves no model-tool route.
             "llm_tools_consent": routes.llm_tools.as_ref().map(|tools| tools.consent_health()),
                 });
+            metrics["scoped_role_route_refusals"] =
+                serde_json::json!(broca_subc::scoped_role_route_refusals());
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
                 // status Ok. Fusiform reachability is deliberately absent because health never
@@ -9629,6 +9631,10 @@ mod tests {
             (FrameType::Response, 0, 2)
         );
         let health: serde_json::Value = serde_json::from_slice(&health.body).unwrap();
+        assert!(
+            health["metrics"]["scoped_role_route_refusals"].is_object(),
+            "health.check includes scoped role-open refusal counts keyed by daemon code"
+        );
         assert_eq!(
             health["metrics"]["retention_repairs_pending"].as_u64(),
             Some(0),

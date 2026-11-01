@@ -629,6 +629,7 @@ impl CompactionPlane for ScriptedCompaction {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         assert_eq!(provider, PROVIDER);
@@ -654,6 +655,7 @@ impl CompactionPlane for ScriptedCompaction {
         &self,
         provider: &str,
         _bind: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, CompactionUnavailable> {
         assert_eq!(provider, PROVIDER);
@@ -672,6 +674,7 @@ impl CompactionPlane for ScriptedCompaction {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: broca_core::compaction_provider::ride::RideRequest,
     ) -> Result<broca_core::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
         if let Some(marker) = &self.block_ride {

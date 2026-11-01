@@ -547,7 +547,7 @@ fn recovery_crash_after_invalidation_reopens_without_stale_projection() {
     assert_eq!(std::fs::read(&f.path).unwrap(), f.damaged);
     assert!(matches!(
         f.store
-            .try_commit_projection(&SqliteStore::key(&f.session), stale)
+            .try_commit_projection(&SqliteStore::key(&f.session), stale, false)
             .unwrap(),
         ProjectionCommit::Conflict
     ));
@@ -1020,4 +1020,199 @@ fn recovery_crash_before_manifest_never_exposes_stale_summaries() {
         committed, prepared,
         "retry must reproduce the pre-manifest recovery identity"
     );
+}
+
+struct StopBeforeRecoveryProjection {
+    store: Arc<SqliteStore>,
+    session: BindIdentity,
+}
+
+impl RecoveryHooks for StopBeforeRecoveryProjection {
+    fn before_cut(&self, cut: &RecoveryCut) -> Result<(), WalError> {
+        self.store
+            .invalidate_wal_recovery_inner(&self.session, cut)
+            .unwrap();
+        Ok(())
+    }
+
+    fn after_repair(&self, _: &Path, _: &BTreeSet<String>) -> Result<(), WalError> {
+        Err(WalError::Io(std::io::Error::other(
+            "stop before publishing recovery projection",
+        )))
+    }
+}
+
+fn pending_sender_repair_fixture() -> (Fixture, WalRangeRead) {
+    let f = Fixture::new();
+    let hooks = Arc::new(StopBeforeRecoveryProjection {
+        store: f.store.clone(),
+        session: f.session.clone(),
+    });
+    let error = FileWal::open_with_manifest_and_recovery_hooks(
+        &f.path,
+        f.wals.manifest_path(),
+        session_addr(&f.session),
+        String::new(),
+        broca_core::wal_writer::agent_session_ref(&f.session),
+        (WalConfig::OVERHAUL, f.wals.feature_floor_path()),
+        hooks,
+    )
+    .err()
+    .expect("the projection publication must be interrupted");
+    assert!(
+        error
+            .to_string()
+            .contains("stop before publishing recovery projection"),
+        "{error}"
+    );
+    assert!(f.pending());
+    let range =
+        broca_wal::file_wal::read_records_range(&f.path, DEFAULT_MAX_READ_BYTES, 0, None, None)
+            .unwrap();
+    let WalRangeRecords::Complete(records) = range.records() else {
+        panic!("the repaired WAL must be complete before projection publication")
+    };
+    assert!(records
+        .iter()
+        .any(|frame| matches!(frame.record, WalRecord::RecoveryCut { .. })));
+    (f, range)
+}
+
+fn sender_repair_at_write(
+    f: &Fixture,
+    range: &WalRangeRead,
+    locked: bool,
+) -> Result<u64, StoreError> {
+    let key = SqliteStore::key(&f.session);
+    let WalRangeRecords::Complete(records) = range.records() else {
+        panic!("complete sender repair range")
+    };
+    if locked {
+        f.store
+            .project_records_locked(&key, records, Some(range), true)
+    } else {
+        let mut snapshot = f.store.projection_snapshot(&key)?;
+        snapshot.attribution_complete = false;
+        let plan = SqliteStore::prepare_projection(snapshot, records, Some(range))?;
+        f.store
+            .try_commit_projection(&key, plan, true)
+            .map(|commit| match commit {
+                ProjectionCommit::Applied(watermark) => watermark,
+                ProjectionCommit::Conflict => panic!("fixture has no competing projector"),
+            })
+    }
+}
+
+fn sender_repair_refuses_pending_at_write(locked: bool) {
+    let (f, range) = pending_sender_repair_fixture();
+    let before = f.tables(REBUILDABLE);
+    let changes_before: i64 = f
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap();
+    let events = authorize(&f.store, None);
+    let result = sender_repair_at_write(&f, &range, locked);
+    clear_authorizer(&f.store);
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|action| action.starts_with("Insert")
+                || action.starts_with("Update")
+                || action.starts_with("Delete")),
+        "sender-policy repair must not attempt a projection write during pending recovery"
+    );
+    let changes_after: i64 = f
+        .store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(changes_after, changes_before);
+    assert_eq!(f.tables(REBUILDABLE), before);
+    assert!(f.pending());
+    let error = result.expect_err("only owned recovery may finish a pending projection");
+    assert_eq!(
+        error.to_string(),
+        broca_core::StorePageReadError::AttributionStale.to_string()
+    );
+    let events = authorize(&f.store, None);
+    let error = broca_core::Persister::repair_sender_policy(f.store.as_ref(), &f.session, &range)
+        .expect_err("the sender repair entry point must also refuse pending recovery");
+    clear_authorizer(&f.store);
+    assert_eq!(
+        error,
+        broca_core::StorePageReadError::AttributionStale.to_string()
+    );
+    assert!(!events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|action| action.starts_with("Insert")
+            || action.starts_with("Update")
+            || action.starts_with("Delete")));
+    assert_eq!(f.tables(REBUILDABLE), before);
+    assert!(f.pending());
+
+    f.recover().unwrap();
+    f.assert_rebuilt();
+    sender_repair_at_write(&f, &range, locked).unwrap();
+    broca_core::Persister::repair_sender_policy(f.store.as_ref(), &f.session, &range).unwrap();
+    f.assert_rebuilt();
+}
+
+#[test]
+fn sender_policy_repair_optimistic_transaction_refuses_pending_recovery() {
+    sender_repair_refuses_pending_at_write(false);
+
+    let f = Fixture::new();
+    let key = SqliteStore::key(&f.session);
+    let mut snapshot = f.store.projection_snapshot(&key).unwrap();
+    snapshot.attribution_complete = false;
+    let plan = SqliteStore::prepare_projection(snapshot, &f.before, None).unwrap();
+    stop_after_invalidation(&f);
+    let before = f.tables(REBUILDABLE);
+    let events = authorize(&f.store, None);
+    let result = f.store.try_commit_projection(&key, plan, true);
+    clear_authorizer(&f.store);
+    assert!(matches!(result, Err(StoreError::AttributionStale)));
+    assert!(!events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|action| action.starts_with("Insert")
+            || action.starts_with("Update")
+            || action.starts_with("Delete")));
+    assert_eq!(f.tables(REBUILDABLE), before);
+    assert!(f.pending());
+}
+
+#[test]
+fn sender_policy_repair_locked_transaction_refuses_pending_recovery() {
+    sender_repair_refuses_pending_at_write(true);
+}
+
+#[test]
+fn sender_policy_repair_legacy_fence_guard_executes_no_sql() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let key = SqliteStore::key(&session("legacy-sender-repair"));
+    let events = authorize(&store, None);
+    {
+        let mut conn = store.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        let before = events.lock().unwrap().len();
+        store.check_sender_repair_fence(&tx, &key, true).unwrap();
+        assert_eq!(
+            events.lock().unwrap().len(),
+            before,
+            "the legacy sender-repair guard must execute no SQL"
+        );
+        tx.commit().unwrap();
+    }
+    clear_authorizer(&store);
 }

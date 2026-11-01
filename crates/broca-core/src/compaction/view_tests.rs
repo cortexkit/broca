@@ -629,6 +629,7 @@ async fn mismatched_views_are_never_applied() {
         let control = crate::RunControl::default();
         let bind = bind();
         let runtime = Runtime {
+            scope: None,
             provider: "provider",
             bind: &bind,
             plane: None,
@@ -780,6 +781,7 @@ async fn apply_over(
     let control = crate::RunControl::default();
     let bind = bind();
     let runtime = Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: None,
@@ -1101,6 +1103,7 @@ async fn a_recorded_notice_is_durable_before_it_returns() {
     let control = crate::RunControl::default();
     let bind = bind();
     let runtime = Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: None,

@@ -1,0 +1,42 @@
+[
+  [
+    "bus_event_age",
+    "CREATE INDEX bus_event_age ON bus_event_outbox(at_ms)"
+  ],
+  [
+    "bus_event_live_runs",
+    "CREATE INDEX bus_event_live_runs ON run_index(state_changed_ms)\n            WHERE state IN ('active','paused')"
+  ],
+  [
+    "bus_event_open",
+    "CREATE TABLE bus_event_open (\n            session TEXT PRIMARY KEY, identity TEXT NOT NULL\n         )"
+  ],
+  [
+    "bus_event_outbox",
+    "CREATE TABLE bus_event_outbox (\n            event_key TEXT PRIMARY KEY, run_id TEXT NOT NULL, seq INTEGER NOT NULL,\n            subject TEXT NOT NULL, epoch TEXT NOT NULL, session TEXT NOT NULL,\n            body BLOB NOT NULL, at_ms INTEGER NOT NULL, published_ms INTEGER,\n            best_effort INTEGER NOT NULL DEFAULT 0,\n            UNIQUE(epoch, run_id, seq, subject)\n         )"
+  ],
+  [
+    "bus_event_pending",
+    "CREATE INDEX bus_event_pending ON bus_event_outbox(published_ms, at_ms)"
+  ],
+  [
+    "bus_event_period",
+    "CREATE TABLE bus_event_period (\n            id INTEGER PRIMARY KEY CHECK (id = 1), started_ms INTEGER NOT NULL\n         )"
+  ],
+  [
+    "bus_event_projection",
+    "CREATE TABLE bus_event_projection (\n            session TEXT PRIMARY KEY, epoch TEXT NOT NULL, seq INTEGER NOT NULL,\n            state_json TEXT NOT NULL\n         )"
+  ],
+  [
+    "bus_event_unpublished",
+    "CREATE INDEX bus_event_unpublished ON bus_event_outbox(best_effort)\n            WHERE published_ms IS NULL AND best_effort=0"
+  ],
+  [
+    "compaction_notice_outbox",
+    "CREATE TABLE compaction_notice_outbox (\n            message_id TEXT PRIMARY KEY, session TEXT NOT NULL, subject TEXT NOT NULL,\n            headers TEXT NOT NULL, digest TEXT NOT NULL, at_ms INTEGER NOT NULL,\n            published_ms INTEGER\n         )"
+  ],
+  [
+    "compaction_notice_unpublished",
+    "CREATE INDEX compaction_notice_unpublished\n            ON compaction_notice_outbox(at_ms) WHERE published_ms IS NULL"
+  ]
+]

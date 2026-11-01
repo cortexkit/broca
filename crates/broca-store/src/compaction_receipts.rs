@@ -40,6 +40,46 @@ pub struct ReplacedReceipt {
     pub view_version: String,
 }
 
+/// Receipts are committed before bus delivery acknowledgement and survive inbox loss.
+/// Resolution facts come from the session log, independently of receipt persistence.
+pub trait CompactionReceiptStore: broca_core::SessionRefResolver {
+    fn receive_compaction_view(&self, receipt: &ViewReceipt) -> Result<ReceiptWrite, StoreError>;
+    fn compaction_receipts(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<ViewReceipt>, StoreError>;
+    fn clear_compaction_receipt(&self, receipt: &ViewReceipt) -> Result<(), StoreError>;
+    fn current_compaction_facts(
+        &self,
+        wal: &dyn broca_core::WalStore,
+        session: &broca_protocol::BindIdentity,
+    ) -> Result<crate::compaction_facts::CompactionFacts, String>;
+}
+
+impl CompactionReceiptStore for SqliteStore {
+    fn receive_compaction_view(&self, receipt: &ViewReceipt) -> Result<ReceiptWrite, StoreError> {
+        self.receive_compaction_view(receipt)
+    }
+    fn compaction_receipts(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<ViewReceipt>, StoreError> {
+        self.compaction_receipts(after, limit)
+    }
+    fn clear_compaction_receipt(&self, receipt: &ViewReceipt) -> Result<(), StoreError> {
+        self.clear_compaction_receipt(receipt)
+    }
+    fn current_compaction_facts(
+        &self,
+        wal: &dyn broca_core::WalStore,
+        session: &broca_protocol::BindIdentity,
+    ) -> Result<crate::compaction_facts::CompactionFacts, String> {
+        self.current_compaction_facts(wal, session)
+    }
+}
+
 impl SqliteStore {
     /// Commit before acknowledging the bus delivery. Decimal strings preserve all u64 versions.
     pub fn receive_compaction_view(
@@ -48,41 +88,12 @@ impl SqliteStore {
     ) -> Result<ReceiptWrite, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let held = tx.query_row(
-            "SELECT lineage_id,view_version FROM compaction_view_receipt WHERE session_ref=?1",
-            [&receipt.ready.session_ref],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        );
-        let replaced = match held {
-            Ok((lineage, version))
-                if lineage == receipt.lineage_id
-                    && version
-                        .parse::<u64>()
-                        .ok()
-                        .is_some_and(|v| v >= receipt.ready.view_version) =>
-            {
-                return Ok(ReceiptWrite::Held)
-            }
-            Ok((lineage_id, view_version)) => Some(ReplacedReceipt {
-                lineage_id,
-                view_version,
-            }),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(error) => return Err(error.into()),
-        };
-        tx.execute(
-            "INSERT OR REPLACE INTO compaction_view_receipt VALUES(?1,?2,?3,?4,?5,?6)",
-            params![
-                receipt.ready.session_ref,
-                receipt.lineage_id,
-                receipt.ready.view_version.to_string(),
-                receipt.ready.covers_through.to_string(),
-                receipt.ready.digest,
-                receipt.received_at_ms
-            ],
-        )?;
+        let result = receive(&tx, receipt)?;
+        if result == ReceiptWrite::Held {
+            return Ok(result);
+        }
         tx.commit()?;
-        Ok(ReceiptWrite::Recorded { replaced })
+        Ok(result)
     }
 
     /// Page startup recovery so a large receipt table cannot create an unbounded database read.
@@ -91,43 +102,132 @@ impl SqliteStore {
         after: &str,
         limit: usize,
     ) -> Result<Vec<ViewReceipt>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let mut query = conn.prepare_cached("SELECT session_ref,lineage_id,view_version,covers_through,digest,received_at_ms FROM compaction_view_receipt WHERE session_ref>?1 ORDER BY session_ref LIMIT ?2")?;
-        let rows = query.query_map(params![after, limit.min(256) as u64], |r| {
-            let parse = |column| -> Result<u64, rusqlite::Error> {
-                let value: String = r.get(column)?;
-                value.parse().map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        column,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })
-            };
-            Ok(ViewReceipt {
-                ready: ViewReady::new(
-                    r.get::<_, String>(0)?,
-                    parse(2)?,
-                    parse(3)?,
-                    r.get::<_, String>(4)?,
-                ),
-                lineage_id: r.get(1)?,
-                received_at_ms: r.get(5)?,
-            })
-        })?;
-        rows.collect::<Result<_, _>>().map_err(Into::into)
+        list(&self.conn.lock().unwrap(), after, limit)
     }
 
     /// Compare-and-delete cannot erase a newer receipt arriving during WAL projection.
     pub fn clear_compaction_receipt(&self, receipt: &ViewReceipt) -> Result<(), StoreError> {
-        self.conn.lock().unwrap().execute("DELETE FROM compaction_view_receipt WHERE session_ref=?1 AND lineage_id=?2 AND view_version=?3 AND digest=?4", params![receipt.ready.session_ref, receipt.lineage_id, receipt.ready.view_version.to_string(), receipt.ready.digest])?;
-        Ok(())
+        clear(&self.conn.lock().unwrap(), receipt)
     }
+}
+
+pub(crate) fn receive(
+    conn: &Connection,
+    receipt: &ViewReceipt,
+) -> Result<ReceiptWrite, StoreError> {
+    let held = conn.query_row(
+        "SELECT lineage_id,view_version FROM compaction_view_receipt WHERE session_ref=?1",
+        [&receipt.ready.session_ref],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    );
+    let replaced = match held {
+        Ok((lineage, version))
+            if lineage == receipt.lineage_id
+                && version
+                    .parse::<u64>()
+                    .ok()
+                    .is_some_and(|v| v >= receipt.ready.view_version) =>
+        {
+            return Ok(ReceiptWrite::Held)
+        }
+        Ok((lineage_id, view_version)) => Some(ReplacedReceipt {
+            lineage_id,
+            view_version,
+        }),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => return Err(error.into()),
+    };
+    conn.execute(
+        "INSERT OR REPLACE INTO compaction_view_receipt VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            receipt.ready.session_ref,
+            receipt.lineage_id,
+            receipt.ready.view_version.to_string(),
+            receipt.ready.covers_through.to_string(),
+            receipt.ready.digest,
+            receipt.received_at_ms
+        ],
+    )?;
+    Ok(ReceiptWrite::Recorded { replaced })
+}
+
+pub(crate) fn list(
+    conn: &Connection,
+    after: &str,
+    limit: usize,
+) -> Result<Vec<ViewReceipt>, StoreError> {
+    let mut query = conn.prepare_cached("SELECT session_ref,lineage_id,view_version,covers_through,digest,received_at_ms FROM compaction_view_receipt WHERE session_ref>?1 ORDER BY session_ref LIMIT ?2")?;
+    let rows = query.query_map(params![after, limit.min(256) as u64], |r| {
+        let parse = |column| -> Result<u64, rusqlite::Error> {
+            let value: String = r.get(column)?;
+            value.parse().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        };
+        Ok(ViewReceipt {
+            ready: ViewReady::new(
+                r.get::<_, String>(0)?,
+                parse(2)?,
+                parse(3)?,
+                r.get::<_, String>(4)?,
+            ),
+            lineage_id: r.get(1)?,
+            received_at_ms: r.get(5)?,
+        })
+    })?;
+    rows.collect::<Result<_, _>>().map_err(Into::into)
+}
+
+pub(crate) fn clear(conn: &Connection, receipt: &ViewReceipt) -> Result<(), StoreError> {
+    conn.execute("DELETE FROM compaction_view_receipt WHERE session_ref=?1 AND lineage_id=?2 AND view_version=?3 AND digest=?4", params![receipt.ready.session_ref, receipt.lineage_id, receipt.ready.view_version.to_string(), receipt.ready.digest])?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_held_receipt_completes_with_rollback() {
+        thread_local! {
+            static COMPLETIONS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn trace(sql: &str) {
+            if sql == "COMMIT" || sql == "ROLLBACK" {
+                COMPLETIONS.with(|events| events.borrow_mut().push(sql.into()));
+            }
+        }
+        let store = SqliteStore::open_in_memory().unwrap();
+        let receipt = ViewReceipt {
+            ready: ViewReady::new("a".repeat(32), 2, 3, "b".repeat(64)),
+            lineage_id: "lineage".into(),
+            received_at_ms: 123,
+        };
+        store.conn.lock().unwrap().trace(Some(trace));
+        store.receive_compaction_view(&receipt).unwrap();
+        assert_eq!(
+            COMPLETIONS.with(|events| events.replace(Vec::new())),
+            ["COMMIT"]
+        );
+        for version in [2, 1] {
+            let mut held = receipt.clone();
+            held.ready.view_version = version;
+            assert_eq!(
+                store.receive_compaction_view(&held).unwrap(),
+                ReceiptWrite::Held
+            );
+            assert_eq!(
+                COMPLETIONS.with(|events| events.replace(Vec::new())),
+                ["ROLLBACK"]
+            );
+        }
+        store.conn.lock().unwrap().trace(None);
+    }
+
     #[test]
     fn receipts_are_durable_newest_only_and_compare_deleted() {
         let path = broca_test_support::scratch_root().join("compaction-receipts.db");

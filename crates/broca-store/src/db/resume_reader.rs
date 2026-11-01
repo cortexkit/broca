@@ -80,7 +80,7 @@ fn snapshot(
         .optional()
         .map_err(sql)?;
     let (encoded, lineage, indexed) = row.ok_or_else(|| bad("resume session index missing"))?;
-    let stored = ProjectionContinuation::decode(&encoded)?;
+    let stored = ProjectionContinuation::decode_for_execution(&encoded)?;
     let boundary = stored.boundary();
     let indexed_boundary = tx.query_row(
         "SELECT lineage_id,seq,frame_off,frame_end,frame_identity,qualified FROM projection_boundary WHERE sid=?1 AND seq=?2",

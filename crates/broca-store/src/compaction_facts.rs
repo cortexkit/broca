@@ -132,6 +132,44 @@ impl SqliteStore {
             && !crate::wal_recovery::read_fence(tx, key)?.is_some_and(|fence| fence.pending))
     }
 
+    pub fn current_compaction_facts(
+        &self,
+        wal: &dyn broca_core::WalStore,
+        session: &BindIdentity,
+    ) -> Result<CompactionFacts, String> {
+        let epoch = self
+            .compaction_projection_epoch(session)
+            .map_err(|e| e.to_string())?;
+        let facts = self.compaction_facts(session).map_err(|e| e.to_string())?;
+        let identity = wal.file_identity(session).map_err(|e| e.to_string())?;
+        let bytes = wal.live_wal_bytes(session).map_err(|e| e.to_string())?;
+        if let Some(facts) = facts.filter(|f| f.current_file(identity, bytes)) {
+            if self
+                .compaction_projection_epoch(session)
+                .map_err(|e| e.to_string())?
+                != epoch
+            {
+                return Err("compaction facts changed during recovery".into());
+            }
+            return Ok(facts);
+        }
+        // A bounded suffix keeps projection lag from turning receipt intake into a full read.
+        let range = wal
+            .read_records_tail_bounded(session, FACTS_TAIL_BYTES)
+            .map_err(|e| e.to_string())?
+            .ok_or("compaction facts projection is behind the bounded WAL suffix")?;
+        let flushed = wal.flush_for_read(session).map_err(|e| e.to_string())?;
+        if range
+            .next_anchor
+            .is_some_and(|a| Some(a.file_id) != flushed)
+        {
+            return Err("compaction WAL changed during its durability proof".into());
+        }
+        self.project_compaction_facts_at_epoch(session, &range, &epoch)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "compaction facts projection cannot cover the bounded WAL suffix".into())
+    }
+
     /// Older databases can seed the new facts row from their existing admission checkpoint.
     /// An uncaptured compaction checkpoint is unknown, never evidence of absent Setup.
     pub fn compaction_facts(
@@ -392,6 +430,8 @@ impl SqliteStore {
         Ok(Some(facts))
     }
 }
+
+pub const FACTS_TAIL_BYTES: u64 = 256 * 1024;
 
 #[cfg(test)]
 mod tests {

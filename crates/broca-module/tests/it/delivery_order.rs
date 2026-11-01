@@ -934,6 +934,439 @@ fn reserved(module: &str) -> Option<BindPrincipal> {
     })
 }
 
+async fn refresh_senders(
+    rig: &Rig,
+    key: &broca_protocol::BindIdentity,
+    generation: u64,
+    policy: &str,
+    plan: broca_module::actor::SendPlan,
+) {
+    let mut manifest = (*plan.manifest.unwrap()).clone();
+    let mut value: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+    value["tool_items"] = serde_json::json!([]);
+    value["system_text_items"] = serde_json::json!([]);
+    value["step_transform_items"] = serde_json::json!([]);
+    value["composition"] = serde_json::json!({"providers":[],"step_transform_items":[]});
+    value["composition_digest"] = serde_json::json!(
+        cortexkit_role_tool_provider::catalog::composition_digest(&value["composition"]).unwrap()
+    );
+    manifest.plan_identity = broca_fetch_plan::plan_identity(&value).unwrap();
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap();
+    let reply = rig
+        .registry
+        .route_session_refresh(key, generation, policy.into(), Box::new(manifest))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            reply,
+            broca_module::actor::SessionRefreshOutcome::Accepted { .. }
+        ),
+        "{reply:?}"
+    );
+}
+
+fn owner_template_plan(
+    text: &str,
+) -> (
+    broca_module::actor::SendPlan,
+    cortexkit_role_llm_runner::delivery_order::TemplateUse,
+) {
+    use cortexkit_role_llm_runner::delivery_order::{template_digest, Template, TemplateUse};
+    let template = Template::new("notice", text, Default::default());
+    let use_ = TemplateUse::new("notice", template_digest(&template), Default::default());
+    let mut plan = plan_naming("owner", true);
+    let manifest = std::sync::Arc::make_mut(plan.manifest.as_mut().unwrap());
+    let mut value: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+    value["senders"][0]["templates"] = serde_json::json!([template]);
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap();
+    (plan, use_)
+}
+
+fn prefield_sender_session(
+    fail_repair: bool,
+    refreshed: bool,
+) -> (
+    Rig,
+    broca_protocol::BindIdentity,
+    cortexkit_role_llm_runner::delivery_order::TemplateUse,
+) {
+    use broca_core::{Persister, WalStore};
+    let mut rig = Rig::new("prefield-sender", FakeExecutor::auto(), LONG_TTL);
+    let key = rig.key("prefield");
+    let (mut old_plan, _) = owner_template_plan("OLD OWNER TEMPLATE");
+    let old_manifest = std::sync::Arc::make_mut(old_plan.manifest.as_mut().unwrap());
+    let mut old_value: serde_json::Value =
+        serde_json::from_str(old_manifest.plan.as_json_text()).unwrap();
+    old_value["senders"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"module":"occipital","idle_start":true}));
+    old_manifest.plan = broca_wal::OpaqueJson::from_json_text(old_value.to_string()).unwrap();
+    let (next_plan, latest_template) = owner_template_plan("LATEST OWNER TEMPLATE");
+    let started: WalRecord = serde_json::from_value(serde_json::json!({
+        "type":"run_started", "run_id":"seed", "session":key,
+        "principal":reserved("owner"), "manifest":old_plan.manifest.unwrap(),
+        "config":{"model":{"provider_module_id":"fake","model_id":"fake"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},
+        "input":[], "origin":{"kind":"fresh"}
+    })).unwrap();
+    let step: WalRecord = serde_json::from_value(serde_json::json!({
+        "type":"model_step_finished", "step_id":1,
+        "assistant_message":{"message_id":"seed-message","content":[{"type":"text","text":"seed"}]},
+        "usage":{},"retries_used":0
+    }))
+    .unwrap();
+    let finished: WalRecord = serde_json::from_value(
+        serde_json::json!({"type":"run_finished","reason":"completed","usage":{},"retries_used":0}),
+    )
+    .unwrap();
+    let wal_store = std::sync::Arc::new(broca_core::FileWalStore::new(rig.dir.join("wal")));
+    let mut wal = wal_store.open(&key).unwrap();
+    wal.append(1, &started, true).unwrap();
+    if refreshed {
+        wal.append(
+            1,
+            &WalRecord::SessionRefreshAccepted {
+                generation: 1,
+                policy: "on_prefix_rebuild".into(),
+                manifest: Box::new((*next_plan.manifest.unwrap()).clone()),
+                run_in_progress: true,
+                applies_from_next_run: false,
+            },
+            true,
+        )
+        .unwrap();
+    }
+    wal.append(1, &step, true).unwrap();
+    wal.append(
+        1,
+        &WalRecord::TurnFinished {
+            step_id: broca_protocol::StepId(1),
+        },
+        true,
+    )
+    .unwrap();
+    wal.append(1, &finished, true).unwrap();
+    let safe_head = wal.replay().unwrap().last().unwrap().seq;
+    drop(wal);
+    let range = wal_store
+        .read_records_range(&key, 0, Some(safe_head), None)
+        .unwrap();
+    Persister::project_range(rig.run_index.as_ref(), &key, &range).unwrap();
+    let conn = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+    let encoded: String = conn
+        .query_row("SELECT admission_checkpoint_json FROM meta", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut checkpoint: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    checkpoint["checkpoint"]["ownership"]
+        .as_object_mut()
+        .unwrap()
+        .remove("sender_admission");
+    conn.execute(
+        "UPDATE meta SET admission_checkpoint_json=?1",
+        [checkpoint.to_string()],
+    )
+    .unwrap();
+    if fail_repair {
+        conn.execute_batch("CREATE TRIGGER fail_sender_repair BEFORE UPDATE ON meta BEGIN SELECT RAISE(FAIL, 'sender policy repair unavailable'); END;").unwrap();
+    }
+    let opener = std::sync::Arc::new(
+        broca_module::DefaultOpener::new(
+            std::sync::Arc::new(broca_core::FileLeaseStore::new(rig.dir.join("leases"))),
+            wal_store.clone(),
+            rig.exec.clone(),
+        )
+        .with_idle_ttl(LONG_TTL)
+        .with_run_index(rig.run_index.clone())
+        .with_materialized_store(rig.run_index.clone()),
+    );
+    rig.registry = broca_module::LineageRegistry::new_with_reader(
+        opener,
+        wal_store,
+        Some(rig.run_index.clone()),
+    );
+    (rig, key, latest_template)
+}
+
+#[tokio::test]
+async fn sender_policy_repair_failure_does_not_block_ordinary_owner() {
+    let (rig, key, template) = prefield_sender_session(true, true);
+    let mut owner = send(&key, "ordinary-owner", None);
+    owner.request.principal = reserved("owner");
+    assert!(matches!(
+        rig.registry.send(owner).await.unwrap(),
+        SendResponse::Active { .. }
+    ));
+    wait_idle(&rig, &key).await;
+    for (module, template) in [("occipital", None), ("owner", Some(template))] {
+        let mut delivery = order(&[DeliveryMode::IdleStart], None);
+        delivery.template = template;
+        let mut next = send(&key, &format!("needs-policy-{module}"), Some(delivery));
+        next.request.principal = reserved(module);
+        let before = records(&rig, &key).len();
+        match rig.registry.send(next).await {
+            Err(ServeError::Transient(message)) => {
+                assert!(message.contains(module), "{message}");
+                assert!(
+                    message.contains("sender policy repair unavailable"),
+                    "{message}"
+                );
+            }
+            other => panic!("unknown sender policy must fail retryably: {other:?}"),
+        }
+        assert_eq!(records(&rig, &key).len(), before);
+    }
+    let mut owner = send(&key, "ordinary-owner-after-failure", None);
+    owner.request.principal = reserved("owner");
+    assert!(matches!(
+        rig.registry.send(owner).await.unwrap(),
+        SendResponse::Active { .. }
+    ));
+    wait_idle(&rig, &key).await;
+}
+
+#[tokio::test]
+async fn no_refresh_prefield_policy_admits_named_sender_without_reprojection() {
+    let (rig, key, _) = prefield_sender_session(true, false);
+    let mut next = send(
+        &key,
+        "implicit-baseline-sender",
+        Some(order(&[DeliveryMode::Steer], None)),
+    );
+    next.request.principal = reserved("occipital");
+    assert!(matches!(
+        rig.registry.send(next).await.unwrap(),
+        SendResponse::Pending { .. }
+    ));
+}
+
+#[tokio::test]
+async fn owner_template_repairs_prefield_policy_once_and_uses_latest_text() {
+    let (rig, key, template) = prefield_sender_session(false, true);
+    for n in 0..2 {
+        let mut delivery = order(&[DeliveryMode::IdleStart], None);
+        delivery.template = Some(template.clone());
+        let mut next = send(&key, &format!("owner-template-{n}"), Some(delivery));
+        next.request.principal = reserved("owner");
+        assert!(matches!(
+            rig.registry.send(next).await.unwrap(),
+            SendResponse::Active { .. }
+        ));
+        wait_idle(&rig, &key).await;
+        if n == 0 {
+            rusqlite::Connection::open(rig.dir.join("store.db")).unwrap().execute_batch("CREATE TRIGGER reject_second_repair BEFORE UPDATE ON meta BEGIN SELECT RAISE(FAIL, 'sender policy repaired twice'); END;").unwrap();
+        }
+    }
+    let runs = records(&rig, &key)
+        .into_iter()
+        .filter_map(|record| match record {
+            WalRecord::RunStarted { run_id, input, .. }
+                if run_id.0.starts_with("owner-template-") =>
+            {
+                Some(serde_json::to_string(&input).unwrap())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 2);
+    assert!(
+        runs.iter()
+            .all(|text| text.contains("LATEST OWNER TEMPLATE")
+                && !text.contains("OLD OWNER TEMPLATE"))
+    );
+}
+
+#[tokio::test]
+async fn latest_accepted_senders_start_idle_immediately_and_after_restart() {
+    let mut rig = Rig::new("refresh-sender-idle", FakeExecutor::auto(), LONG_TTL);
+    let key = session_naming_ck_mc(&rig, "refresh-idle", false).await;
+    for (generation, policy) in [
+        (1, "on_prefix_rebuild"),
+        (2, "on_system_rebuild"),
+        (3, "on_history_rebuild"),
+        (4, "immediately"),
+    ] {
+        refresh_senders(
+            &rig,
+            &key,
+            generation,
+            policy,
+            plan_naming("occipital", true),
+        )
+        .await;
+        if generation == 1 {
+            restart_registry(&mut rig).await;
+        }
+        let page = rig
+            .registry
+            .route_read_page(&key, Some(0), Some(100), false)
+            .await
+            .unwrap();
+        assert!(page
+            .head_facts
+            .sender(
+                reserved("occipital").as_ref(),
+                &broca_protocol::SendScope::Internal,
+                &[DeliveryMode::IdleStart]
+            )
+            .is_some());
+        let mut start = send(
+            &key,
+            &format!("refreshed-{generation}"),
+            Some(order(&[DeliveryMode::IdleStart], None)),
+        );
+        start.request.principal = reserved("occipital");
+        let reply = rig.registry.send(start).await.unwrap();
+        assert!(matches!(reply, SendResponse::Active { .. }), "{reply:?}");
+        wait_idle(&rig, &key).await;
+        assert_eq!(
+            rig.exec.seen.lock().unwrap().last().unwrap().principal,
+            reserved("owner")
+        );
+    }
+}
+
+#[tokio::test]
+async fn latest_accepted_senders_replace_pending_grants_and_preserve_admitted_queue() {
+    let (exec, gate) = FakeExecutor::gated_with_step_boundary();
+    let rig = Rig::new("refresh-sender-replace", exec, LONG_TTL);
+    let key = rig.key("replace");
+    let mut first = send(&key, "owner-first", None);
+    first.request.principal = reserved("owner");
+    first.plan = Some(plan_naming("ck-mc", false));
+    rig.registry.send(first).await.unwrap();
+    gate.release().await;
+    wait_idle(&rig, &key).await;
+    refresh_senders(
+        &rig,
+        &key,
+        1,
+        "on_prefix_rebuild",
+        plan_naming("occipital", true),
+    )
+    .await;
+    let mut queued = send(
+        &key,
+        "accepted-before-removal",
+        Some(order(&[DeliveryMode::Steer], None)),
+    );
+    queued.request.principal = reserved("occipital");
+    assert!(matches!(
+        rig.registry.send(queued).await.unwrap(),
+        SendResponse::Pending { .. }
+    ));
+    refresh_senders(
+        &rig,
+        &key,
+        2,
+        "on_prefix_rebuild",
+        plan_naming("replacement", true),
+    )
+    .await;
+    let before = records(&rig, &key).len();
+    for ordered in [false, true] {
+        let mut next = send(
+            &key,
+            &format!("removed-{ordered}"),
+            ordered.then(|| order(&[DeliveryMode::IdleStart], None)),
+        );
+        next.request.principal = reserved("occipital");
+        assert!(rig.registry.send(next).await.is_err());
+    }
+    assert_eq!(records(&rig, &key).len(), before);
+    let page = rig
+        .registry
+        .route_read_page(&key, Some(0), Some(100), false)
+        .await
+        .unwrap();
+    assert!(page
+        .head_facts
+        .sender(
+            reserved("occipital").as_ref(),
+            &broca_protocol::SendScope::Internal,
+            &[DeliveryMode::IdleStart]
+        )
+        .is_none());
+    let mut start = send(&key, "replacement-start", None);
+    start.request.principal = reserved("replacement");
+    assert!(matches!(
+        rig.registry.send(start).await.unwrap(),
+        SendResponse::Active { .. }
+    ));
+    gate.release().await;
+    wait_idle(&rig, &key).await;
+    assert!(records(&rig, &key).iter().any(|record| matches!(record, WalRecord::SendDelivered { submission_id, .. } if submission_id.0 == "sub-accepted-before-removal")));
+}
+
+#[tokio::test]
+async fn latest_accepted_senders_without_idle_start_join_running_and_use_new_templates() {
+    let (exec, gate) = FakeExecutor::gated_with_step_boundary();
+    let rig = Rig::new("refresh-sender-join", exec, LONG_TTL);
+    let key = rig.key("join");
+    let mut first = send(&key, "owner-first", None);
+    first.request.principal = reserved("owner");
+    first.plan = Some(plan_naming("old", false));
+    rig.registry.send(first).await.unwrap();
+    gate.release().await;
+    wait_idle(&rig, &key).await;
+    let (plan, template) = template_fixture();
+    refresh_senders(&rig, &key, 1, "on_prefix_rebuild", plan).await;
+    for ordered in [false, true] {
+        let mut start = send(
+            &key,
+            &format!("no-grant-{ordered}"),
+            ordered.then(|| order(&[DeliveryMode::IdleStart], None)),
+        );
+        start.request.principal = reserved("ck-mc");
+        assert!(matches!(
+            rig.registry.send(start).await,
+            Err(ServeError::InvalidParams { .. })
+        ));
+    }
+    let mut owner = send(&key, "owner-running", None);
+    owner.request.principal = reserved("owner");
+    rig.registry.send(owner).await.unwrap();
+    let mut delivery = order(&[DeliveryMode::Steer], None);
+    delivery.template = Some(template);
+    let mut join = send(&key, "new-template", Some(delivery));
+    join.request.principal = reserved("ck-mc");
+    let reply = rig.registry.send(join).await.unwrap();
+    assert!(matches!(reply, SendResponse::Pending { .. }), "{reply:?}");
+    gate.release().await;
+    wait_idle(&rig, &key).await;
+    assert!(records(&rig, &key).iter().any(|record| matches!(record, WalRecord::Queued { request, .. } if serde_json::to_string(&request.input).unwrap().contains("Context is 82% full."))));
+}
+
+#[tokio::test]
+async fn latest_accepted_senders_control_string_interrupt_grants() {
+    let rig = Rig::new("refresh-sender-interrupt", FakeExecutor::auto(), LONG_TTL);
+    let key = session_naming_ck_mc(&rig, "interrupt", false).await;
+    for (generation, granted) in [(1, true), (2, false)] {
+        refresh_senders(
+            &rig,
+            &key,
+            generation,
+            "on_prefix_rebuild",
+            plan_naming_with_interrupt("occipital", true, granted),
+        )
+        .await;
+        let mut next = send(&key, &format!("interrupt-{generation}"), None);
+        next.delivery = broca_protocol::Delivery::Interrupt;
+        next.request.principal = reserved("occipital");
+        let before = records(&rig, &key).len();
+        let reply = rig.registry.send(next).await;
+        if granted {
+            assert!(matches!(reply.unwrap(), SendResponse::Active { .. }));
+            wait_idle(&rig, &key).await;
+        } else {
+            assert!(matches!(reply, Err(ServeError::InvalidParams { .. })));
+            assert_eq!(records(&rig, &key).len(), before);
+        }
+    }
+}
+
 fn template_fixture() -> (
     broca_module::actor::SendPlan,
     cortexkit_role_llm_runner::delivery_order::TemplateUse,

@@ -153,7 +153,7 @@ impl DatabaseEpisodeReader {
             return Ok(None);
         };
         let encoded = encoded.ok_or_else(|| bad("historical episode continuation missing"))?;
-        let stored = ProjectionContinuation::decode(&encoded)
+        let stored = ProjectionContinuation::decode_for_execution(&encoded)
             .map_err(|_| bad("historical episode continuation unsupported"))?;
         let seed = EpisodeSeed::from_continuation(&stored);
         let matches: bool = tx.query_row("SELECT lineage_id IS ?3 AND frame_off=?4 AND frame_end=?5 AND frame_identity=?6 AND qualified=1 FROM projection_boundary WHERE sid=?1 AND seq=?2", params![key,seq,seed.boundary.lineage_id,seed.boundary.frame_off,seed.boundary.frame_end,seed.boundary.frame_identity], |r| r.get(0))?;
@@ -217,7 +217,8 @@ impl DatabaseEpisodeReader {
         {
             return Err(bad("episode cursor identity mismatch"));
         }
-        let continuation = ProjectionContinuation::decode(&tail).map_err(DbError::SeedFallback)?;
+        let continuation =
+            ProjectionContinuation::decode_for_execution(&tail).map_err(DbError::SeedFallback)?;
         let seed = EpisodeSeed::from_continuation(&continuation);
         let frames = self.read_range(seed.boundary.frame_end, end)?;
         broca_core::replay::replay_seeded_at_validated_boundary(

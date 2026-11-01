@@ -28,6 +28,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         input: Vec<broca_protocol::Message>,
         delivery: broca_protocol::Delivery,
         manifest: Option<Arc<broca_wal::PlanManifest>>,
+        scope: Option<&broca_protocol::SessionScope>,
     ) -> Result<PreparedInput, SendOutcome> {
         let mut prepared = PreparedInput {
             input,
@@ -49,7 +50,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .expect("writer live while preparing input"),
         );
         let bind = self.key.clone();
+        // A first send has not recorded its scope yet; its admission supplies that scope.
+        // Steering messages and queued inputs use the scope the session already froze.
+        let frozen_scope = match scope {
+            Some(scope) => Some(scope.clone()),
+            None => {
+                self.load_ownership()
+                    .await
+                    .map_err(SendOutcome::Transient)?
+                    .scope
+            }
+        };
         let runtime = HookRuntime {
+            scope: frozen_scope.as_ref(),
             plan: &plan,
             plane: &plane,
             bind: &bind,

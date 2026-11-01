@@ -6,6 +6,11 @@ use broca_core::head::{HeadProjection, RetainedHeadCheckpoint};
 use broca_protocol::BindIdentity;
 use broca_wal::FramedRecord;
 use rusqlite::{params, OptionalExtension};
+use sha2::Digest;
+
+fn sender_admission_identity(at_seq: u64, json: &str) -> String {
+    format!("v1:{at_seq}:{:x}", sha2::Sha256::digest(json.as_bytes()))
+}
 
 pub(crate) fn init(conn: &rusqlite::Connection) -> Result<(), StoreError> {
     conn.execute_batch(
@@ -14,7 +19,39 @@ pub(crate) fn init(conn: &rusqlite::Connection) -> Result<(), StoreError> {
         facts_json TEXT NOT NULL
     );",
     )?;
+    let has_version = conn
+        .prepare("PRAGMA table_info(retained_head)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "sender_admission_identity");
+    if !has_version {
+        // Older retained-only heads have no admission checkpoint to reveal a refresh they
+        // ignored. Invalidate those caches once, without changing unrefreshed head JSON.
+        conn.execute_batch("ALTER TABLE retained_head ADD COLUMN sender_admission_identity TEXT;")?;
+    }
     Ok(())
+}
+
+pub(crate) fn sender_admission_current(
+    conn: &rusqlite::Connection,
+    session: &str,
+    facts: &HeadProjection,
+) -> Result<bool, rusqlite::Error> {
+    let checkpoint: Option<String> = conn
+        .query_row(
+            "SELECT admission_checkpoint_json FROM meta WHERE session=?1",
+            [session],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let changed = checkpoint
+        .as_deref()
+        .and_then(broca_core::decode_admission_checkpoint)
+        .and_then(|checkpoint| checkpoint.ownership)
+        .is_some_and(|ownership| ownership.session_change_recorded);
+    Ok(facts.sender_admission_current(changed))
 }
 
 impl SqliteStore {
@@ -99,15 +136,28 @@ fn read(
     session: &str,
     lineage_id: &str,
 ) -> Result<Option<RetainedHeadCheckpoint>, StoreError> {
-    let row: Option<(u64, String)> = conn
+    let row: Option<(u64, String, String)> = conn
         .query_row(
-            "SELECT at_seq,facts_json FROM retained_head WHERE lineage_id=?1 AND session=?2",
+            "SELECT at_seq,facts_json,sender_admission_identity FROM retained_head WHERE lineage_id=?1 AND session=?2 AND sender_admission_identity IS NOT NULL",
             params![lineage_id, session],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    row.map(|(at_seq, json)| {
+    row.map(|(at_seq, json, identity)| {
+        // An older writer can update facts_json without knowing the sender-policy fold.
+        // Bind the version to those bytes and their watermark so even an ignored refresh
+        // that advances only at_seq cannot leave a valid-looking stamp after rollback.
+        if identity != sender_admission_identity(at_seq, &json) {
+            return Err(StoreError::InconsistentSnapshot(
+                "retained sender admission identity is stale",
+            ));
+        }
         let facts: HeadProjection = serde_json::from_str(&json)?;
+        if !sender_admission_current(conn, session, &facts)? {
+            return Err(StoreError::InconsistentSnapshot(
+                "retained sender admission requires a complete WAL",
+            ));
+        }
         if facts
             .usage
             .as_ref()
@@ -155,9 +205,10 @@ pub(super) fn write(
             return Ok(());
         }
     }
-    tx.execute("INSERT INTO retained_head(lineage_id,session,at_seq,facts_json) VALUES(?1,?2,?3,?4)
-        ON CONFLICT(lineage_id) DO UPDATE SET at_seq=excluded.at_seq,facts_json=excluded.facts_json",
-        params![lineage_id,session,broca_core::projection_plan::u64_to_i64(at_seq)?,serde_json::to_string(facts)?])?;
+    let json = serde_json::to_string(facts)?;
+    tx.execute("INSERT INTO retained_head(lineage_id,session,at_seq,facts_json,sender_admission_identity) VALUES(?1,?2,?3,?4,?5)
+        ON CONFLICT(lineage_id) DO UPDATE SET at_seq=excluded.at_seq,facts_json=excluded.facts_json,sender_admission_identity=excluded.sender_admission_identity",
+        params![lineage_id,session,broca_core::projection_plan::u64_to_i64(at_seq)?,json,sender_admission_identity(at_seq, &json)])?;
     Ok(())
 }
 
@@ -201,6 +252,106 @@ mod tests {
         }
         records.extend(text_turn(2, 1, "SECRET_ASSISTANT"));
         records
+    }
+
+    #[test]
+    fn old_retained_sender_cache_rebuilds_without_materialized_metadata() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = session("retained-sender-upgrade");
+        let mut frames = records(&session);
+        store
+            .project_retained_head_inner(&session, "lineage", &frames)
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE retained_head SET at_seq=at_seq+1", [])
+            .unwrap();
+        assert!(store.read_retained_head_inner(&session, "lineage").is_err());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE retained_head SET sender_admission_identity=NULL",
+                [],
+            )
+            .unwrap();
+        let broca_wal::WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } = &frames[0].record
+        else {
+            unreachable!()
+        };
+        let mut manifest = manifest.clone();
+        manifest.plan = broca_wal::OpaqueJson::from_json_text(
+            r#"{"senders":[{"module":"occipital","idle_start":true}]}"#,
+        )
+        .unwrap();
+        frames.push(FramedRecord {
+            seq: frames.last().unwrap().seq + 1,
+            fence: 1,
+            record: broca_wal::WalRecord::SessionRefreshAccepted {
+                generation: 1,
+                policy: "on_prefix_rebuild".into(),
+                manifest,
+                run_in_progress: true,
+                applies_from_next_run: false,
+            },
+        });
+        assert!(store
+            .read_retained_head_inner(&session, "lineage")
+            .unwrap()
+            .is_none());
+        store
+            .project_retained_head_inner(&session, "lineage", &frames)
+            .unwrap();
+        let actual = store
+            .read_retained_head_inner(&session, "lineage")
+            .unwrap()
+            .unwrap();
+        let expected = broca_core::AdmissionCheckpointV1::from_frames(&frames)
+            .unwrap()
+            .head
+            .unwrap();
+        assert_eq!(actual.facts, expected);
+        assert!(actual
+            .facts
+            .sender(
+                Some(&broca_protocol::BindPrincipal::Reserved {
+                    module_id: "occipital".into()
+                }),
+                &broca_protocol::SendScope::Internal,
+                &[broca_protocol::DeliveryMode::IdleStart]
+            )
+            .is_some());
+        let mut downgraded = HeadProjection::default();
+        for frame in &frames[..frames.len() - 1] {
+            downgraded.observe(&frame.record);
+        }
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE retained_head SET facts_json=?1",
+                [serde_json::to_string(&downgraded).unwrap()],
+            )
+            .unwrap();
+        assert!(store.read_retained_head_inner(&session, "lineage").is_err());
+        store
+            .project_retained_head_inner(&session, "lineage", &frames)
+            .unwrap();
+        assert_eq!(
+            store
+                .read_retained_head_inner(&session, "lineage")
+                .unwrap()
+                .unwrap()
+                .facts,
+            expected
+        );
     }
 
     #[test]

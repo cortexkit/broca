@@ -5,10 +5,7 @@ use broca_core::CompactionViews;
 use broca_diagnostics::{spawn_blocking, JobKind};
 use broca_module::LineageRegistry;
 use broca_store::compaction_facts::CompactionFacts;
-use broca_store::{
-    compaction_receipts::{ReceiptWrite, ViewReceipt},
-    SqliteStore,
-};
+use broca_store::compaction_receipts::{CompactionReceiptStore, ReceiptWrite, ViewReceipt};
 use cortexkit_bus_trait::{Message, StreamCursor};
 use std::{
     sync::{
@@ -55,7 +52,7 @@ pub fn health() -> serde_json::Value {
 }
 
 pub struct Service {
-    store: Arc<SqliteStore>,
+    store: Arc<dyn CompactionReceiptStore>,
     registry: LineageRegistry,
     wal: Arc<dyn broca_core::WalStore>,
     inbox: Arc<broca_core::ViewReadyInbox>,
@@ -65,7 +62,7 @@ pub struct Service {
 }
 impl Service {
     pub fn new(
-        store: Arc<SqliteStore>,
+        store: Arc<dyn CompactionReceiptStore>,
         registry: LineageRegistry,
         wal: Arc<dyn broca_core::WalStore>,
         inbox: Arc<broca_core::ViewReadyInbox>,
@@ -204,7 +201,7 @@ impl Service {
         let store = self.store.clone();
         let reference = reference.to_owned();
         let refs = spawn_blocking(JobKind::StoreRead, move || {
-            store.session_refs(std::iter::once(reference.as_str()))
+            store.resolve_refs(&[reference.as_str()])
         })
         .await
         .map_err(|e| e.to_string())?
@@ -220,7 +217,7 @@ impl Service {
         let store = self.store.clone();
         let wal = self.wal.clone();
         let facts = spawn_blocking(JobKind::StoreRead, move || {
-            current_facts(&store, wal.as_ref(), &lookup_session)
+            current_facts(store.as_ref(), wal.as_ref(), &lookup_session)
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -444,46 +441,12 @@ async fn receipt_barrier(point: &str) -> Result<(), String> {
     Ok(())
 }
 
-const FACTS_TAIL_BYTES: u64 = 256 * 1024;
-
 fn current_facts(
-    store: &SqliteStore,
+    store: &dyn CompactionReceiptStore,
     wal: &dyn broca_core::WalStore,
     session: &broca_protocol::BindIdentity,
 ) -> Result<CompactionFacts, String> {
-    let epoch = store
-        .compaction_projection_epoch(session)
-        .map_err(|e| e.to_string())?;
-    let facts = store.compaction_facts(session).map_err(|e| e.to_string())?;
-    let identity = wal.file_identity(session).map_err(|e| e.to_string())?;
-    let bytes = wal.live_wal_bytes(session).map_err(|e| e.to_string())?;
-    if let Some(facts) = facts.filter(|f| f.current_file(identity, bytes)) {
-        if store
-            .compaction_projection_epoch(session)
-            .map_err(|e| e.to_string())?
-            != epoch
-        {
-            return Err("compaction facts changed during recovery".into());
-        }
-        return Ok(facts);
-    }
-    // Projection lag must stay cheap even when a message frame is larger than the
-    // suffix budget. Unknown suffixes retry later; they never widen to a full read.
-    let range = wal
-        .read_records_tail_bounded(session, FACTS_TAIL_BYTES)
-        .map_err(|e| e.to_string())?
-        .ok_or("compaction facts projection is behind the bounded WAL suffix")?;
-    let flushed = wal.flush_for_read(session).map_err(|e| e.to_string())?;
-    if range
-        .next_anchor
-        .is_some_and(|a| Some(a.file_id) != flushed)
-    {
-        return Err("compaction WAL changed during its durability proof".into());
-    }
-    store
-        .project_compaction_facts_at_epoch(session, &range, &epoch)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "compaction facts projection cannot cover the bounded WAL suffix".into())
+    store.current_compaction_facts(wal, session)
 }
 
 pub async fn apply_idle(
@@ -501,8 +464,13 @@ pub async fn apply_idle(
             "compaction view decided at the idle boundary");
         Ok(false)
     };
-    let Some((config, run_id)) = records.iter().rev().find_map(|record| match record {
-        broca_wal::WalRecord::RunStarted { config, run_id, .. } => Some((config.as_ref(), run_id)),
+    let Some((config, run_id, scope)) = records.iter().rev().find_map(|record| match record {
+        broca_wal::WalRecord::RunStarted {
+            config,
+            run_id,
+            scope,
+            ..
+        } => Some((config.as_ref(), run_id, scope.as_ref())),
         _ => None,
     }) else {
         return deferred("no_run");
@@ -524,6 +492,7 @@ pub async fn apply_idle(
         .ok_or("compaction wire renderer absent")?;
     broca_core::compaction::apply_idle_view(
         session,
+        scope,
         writer,
         plane,
         views,
@@ -544,6 +513,8 @@ pub async fn apply_idle(
     .map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
+use broca_store::{compaction_facts::FACTS_TAIL_BYTES, SqliteStore};
 #[cfg(test)]
 #[path = "compaction_bus/tests.rs"]
 mod tests;

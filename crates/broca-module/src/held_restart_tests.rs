@@ -2,8 +2,7 @@
 
 use super::tests::text_req;
 use super::*;
-use crate::held_slots::{HeldSlots, SlotDelivery};
-use crate::late_results_puller::HeldDelivery;
+use crate::held_slots::{HeldRunResumer, HeldSlots};
 use crate::opener::DefaultOpener;
 use crate::registry::LineageRegistry;
 use async_trait::async_trait;
@@ -18,7 +17,6 @@ use broca_protocol::{BindIdentity, RunFinishReason};
 use broca_protocol::{
     FinishReason, MessageId, NormalizedEvent, ProviderControl, ToolCallId, ToolOutput, ToolResult,
 };
-use cortexkit_role_tool_provider::late_results::LateEntry;
 use std::sync::atomic::AtomicUsize;
 
 struct HoldingPlane {
@@ -165,6 +163,14 @@ struct ObservedAdmissionReader {
 }
 
 impl broca_core::context::AdmissionReader for ObservedAdmissionReader {
+    fn sender_snapshot(
+        &self,
+        session: &BindIdentity,
+        safe_head: u64,
+    ) -> Result<broca_core::run::PriorWalSnapshot, String> {
+        self.inner.sender_snapshot(session, safe_head)
+    }
+
     fn prior_snapshot(
         &self,
         session: &BindIdentity,
@@ -471,38 +477,32 @@ async fn restarted_delivery(restarts: usize, refused: bool, queued: bool, seeded
             }
         }
         if generation == restarts {
-            let delivery = SlotDelivery::new(
-                slots,
-                Arc::new(registry.clone()),
-                Arc::new(|id, _| {
-                    Some(ToolResult {
-                        tool_call_id: id.clone(),
-                        output: ToolOutput::Text {
-                            text: "remote_unavailable".into(),
-                        },
-                        is_error: true,
-                    })
-                }),
-            )
-            .with_timeout(Duration::from_millis(250));
-            let entry = LateEntry::new(
-                "result",
-                "reserved:broca",
-                "ref",
-                1,
-                "reserved:broca",
-                &registration.as_ref().unwrap().call_key,
-                "late",
-                1,
+            let registration = registration.as_ref().unwrap();
+            let terminal_synced = slots.deposit(
+                &registration.bind,
+                &ToolCallId("a".into()),
+                &registration.call_key,
+                ToolResult {
+                    tool_call_id: ToolCallId("a".into()),
+                    output: ToolOutput::Text {
+                        text: "remote_unavailable".into(),
+                    },
+                    is_error: true,
+                },
             );
-            delivery
-                .deliver(
-                    registration.as_ref().unwrap(),
-                    &ToolCallId("a".into()),
-                    &entry,
-                )
+            registry
+                .resume_for_late_result(&registration.bind)
                 .await
-                .expect("the run must sync the held terminal after restart");
+                .unwrap();
+            // Restart recovery checks durability, not the puller's retry latency. Await the
+            // batch's sync acknowledgement under the shared hang guard even on a busy disk.
+            broca_test_support::wait_for(
+                "held terminal synced after restart",
+                terminal_synced,
+                || format!("WAL={:?}", wal.read_records(&key).unwrap()),
+            )
+            .await
+            .expect("the run must sync the held terminal after restart");
             broca_test_support::wait_until("finished resumed run", || async {
                 wal.read_records(&key)
                     .unwrap()
