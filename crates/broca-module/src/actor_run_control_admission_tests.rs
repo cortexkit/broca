@@ -160,6 +160,23 @@ async fn exercise_control(control: Control, media_on: bool) {
         "the same-key retry must not deliver again"
     );
     assert_eq!(original, [(broca_protocol::RunFinishReason::Completed, None)], "{control:?}: restart must not terminate the worker because its accepted control advanced the head");
+    match control {
+        Control::Queue => {
+            assert_eq!(requests.len(), 2, "resume before starting the queued turn");
+            assert!(!String::from_utf8_lossy(&requests[0]).contains(CONTROL_TEXT));
+            assert_eq!(
+                String::from_utf8_lossy(&requests[1])
+                    .matches(CONTROL_TEXT)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                finishes(&records, "nudge-run"),
+                [(broca_protocol::RunFinishReason::Completed, None)]
+            );
+        }
+        Control::Steer => assert_eq!(requests.len(), 1, "steer the resumed turn"),
+    }
     assert_eq!(
         deliveries, 1,
         "{control:?}: the accepted control must be delivered exactly once without caller retry"
@@ -263,4 +280,14 @@ async fn crash_after_accepted_steer_restarts_with_one_replayed_delivery() {
         );
     }
     restarted.close().await;
+}
+
+#[tokio::test]
+async fn queued_worker_control_during_restart_admission_is_delivered_once() {
+    exercise_control(Control::Queue, true).await;
+}
+
+#[tokio::test]
+async fn steered_worker_control_during_restart_admission_is_delivered_once() {
+    exercise_control(Control::Steer, true).await;
 }

@@ -3443,6 +3443,21 @@ pub struct WalHandle {
 }
 
 impl WalHandle {
+    /// Check a cached media seed's head without rebuilding its already-captured placement.
+    pub(crate) fn validate_media_seed_head(&self, at_seq: u64) -> Result<(), String> {
+        let _enqueue = self.lock_enqueue();
+        self.check_media_seed_head(at_seq)
+    }
+
+    fn check_media_seed_head(&self, at_seq: u64) -> Result<(), String> {
+        if self.durable_head.load(Ordering::Acquire) != at_seq
+            || at_seq.checked_add(1) != Some(self.next_seq.load(Ordering::Acquire))
+        {
+            return Err("media seed head changed before executor initialization".into());
+        }
+        Ok(())
+    }
+
     /// A media-free prefix has no captures or aging history to restore. Its already-seeded
     /// placement is sufficient to start tracking the first later capture without rereading it.
     pub fn empty_media_checkpoint(
@@ -3450,11 +3465,7 @@ impl WalHandle {
         at_seq: u64,
     ) -> Result<crate::media_request::MediaCheckpoint, String> {
         let _enqueue = self.lock_enqueue();
-        if self.durable_head.load(Ordering::Acquire) != at_seq
-            || self.next_seq.load(Ordering::Acquire) != at_seq + 1
-        {
-            return Err("media seed head changed before executor initialization".into());
-        }
+        self.check_media_seed_head(at_seq)?;
         let placement = self
             .display_placement
             .lock()

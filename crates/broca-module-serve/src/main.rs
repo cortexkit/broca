@@ -4460,31 +4460,18 @@ mod executor {
                 let wal = Arc::clone(&self.wal_store);
                 let session = job.req.session.clone();
                 let head = job.writer.durable_head();
-                // File identity and length are metadata reads, not a WAL decode. Capture them
-                // before this executor appends so the first media tail can be strictly anchored.
-                let initial_anchor = self
-                    .wal_store
-                    .file_identity(&session)
-                    .ok()
-                    .flatten()
-                    .zip(self.wal_store.live_wal_bytes(&session).ok().flatten())
-                    .map(|(file_id, byte_end)| broca_wal::WalByteAnchor {
-                        file_id,
-                        byte_end,
-                        seq: prior_snapshot.head_seq,
-                    });
-                let anchor = std::sync::Mutex::new(initial_anchor);
-                let checkpoint = match &prior_snapshot.checkpoint_at_head.media {
-                    Some(broca_core::media_request::DurableMediaSeed::Ready(seed)) => {
-                        Ok((**seed).clone())
-                    }
-                    Some(broca_core::media_request::DurableMediaSeed::Unreadable(_)) => {
-                        Err("media_seed_undecodable after admission replay".into())
-                    }
-                    None => job.writer.empty_media_checkpoint(prior_snapshot.head_seq),
-                };
-                let checkpoint = match checkpoint {
-                    Ok(checkpoint) => checkpoint,
+                let initialized = broca_core::media_request::initialize_media_checkpoint(
+                    &job.writer,
+                    Arc::clone(&self.wal_store),
+                    &session,
+                    prior_snapshot,
+                )
+                .await;
+                let broca_core::media_request::InitializedMedia {
+                    checkpoint,
+                    anchor: initial_anchor,
+                } = match initialized {
+                    Ok(initialized) => initialized,
                     Err(error) => {
                         let error = RunError::Wal(error);
                         if let Some(ack) = job.on_admitted {
@@ -4493,6 +4480,7 @@ mod executor {
                         return Err(error);
                     }
                 };
+                let anchor = std::sync::Mutex::new(initial_anchor);
                 let frozen: broca_provider::wire::FrozenRenderConfig =
                     serde_json::from_value(resolved.provider.render_config_blob())
                         .expect("resolved provider has a frozen config");

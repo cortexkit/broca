@@ -106,9 +106,13 @@ pub(super) async fn execute_probe(
         "production installs media rendering for these tools"
     );
     if executor.media_probe.load(Ordering::SeqCst) == 1 {
-        if let Err(error) = job
-            .writer
-            .empty_media_checkpoint(job.prior_snapshot.head_seq)
+        if let Err(error) = broca_core::media_request::initialize_media_checkpoint(
+            &job.writer,
+            executor.wal_store.clone(),
+            &job.req.session,
+            &job.prior_snapshot,
+        )
+        .await
         {
             let error = RunError::Wal(error);
             if let Some(ack) = job.on_admitted {
