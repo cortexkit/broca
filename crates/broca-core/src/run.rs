@@ -4953,7 +4953,10 @@ where
                     });
                     refreeze_recorded = true;
                 }
-                if matches!(reason, PauseReason::Restart | PauseReason::AccountLimit) {
+                if matches!(
+                    reason,
+                    PauseReason::Restart | PauseReason::AccountLimit | PauseReason::AuthRequired
+                ) {
                     writer.record(resume_continuing);
                     writer.sync().await?;
                 } else if refreeze_recorded {
