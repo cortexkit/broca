@@ -1,6 +1,7 @@
 //! Differential coverage of the installed legacy and format-2 service compositions.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -126,6 +127,117 @@ struct Script {
     reports: Mutex<Vec<Value>>,
     tail_entered: Notify,
     tail_release: Notify,
+    observed: Mutex<Observed>,
+}
+
+#[derive(Default)]
+struct Observed {
+    waiting: String,
+    run_state: Option<Value>,
+    last_event: Option<Value>,
+}
+
+struct Trace {
+    label: &'static str,
+    root: PathBuf,
+    state: PathBuf,
+    script: Arc<Script>,
+}
+
+#[derive(Default)]
+struct WalObservation {
+    last: Option<(u64, String)>,
+    run_state: Option<Value>,
+    completed_tools: BTreeSet<String>,
+    incomplete: bool,
+}
+
+fn observe_wal(state: &Path) -> WalObservation {
+    let mut observation = WalObservation::default();
+    let Ok(entries) = std::fs::read_dir(state.join("wal")) else {
+        return observation;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "wal") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let mut at = 0;
+        while at < bytes.len() {
+            match decode_next(&bytes[at..]) {
+                DecodeStep::Lineage { consumed, .. } => at += consumed,
+                DecodeStep::Record { framed, consumed } => {
+                    at += consumed;
+                    if let broca_wal::WalRecord::ToolResult { result, .. } = &framed.record {
+                        observation
+                            .completed_tools
+                            .insert(result.tool_call_id.0.clone());
+                    }
+                    let Ok(record) = serde_json::to_value(&framed.record) else {
+                        continue;
+                    };
+                    let kind = record["type"].as_str().unwrap_or("unknown");
+                    observation.last = Some((framed.seq, kind.to_owned()));
+                    let state = match kind {
+                        "run_started" => Some("active"),
+                        "run_paused" => Some("paused"),
+                        "run_finished" => Some("finished"),
+                        _ => None,
+                    };
+                    if let Some(state) = state {
+                        observation.run_state = Some(
+                            json!({"run_id":record["run_id"],"state":state,"reason":record["reason"]}),
+                        );
+                    }
+                }
+                _ => {
+                    observation.incomplete = true;
+                    break;
+                }
+            }
+        }
+    }
+    observation
+}
+
+impl Trace {
+    fn waiting(&self, what: impl Into<String>) {
+        self.script.observed.lock().unwrap().waiting = what.into();
+    }
+
+    fn event(&self, event: &Value) {
+        self.script.observed.lock().unwrap().last_event = Some(event.clone());
+    }
+
+    fn snapshot(&self) -> String {
+        let wal = observe_wal(&self.state);
+        let observed = self.script.observed.lock().unwrap();
+        let last = wal
+            .last
+            .map_or_else(|| "none".into(), |(seq, kind)| format!("{kind}@{seq}"));
+        format!("root={} scratch={} waiting={} last_record={} incomplete_tail={} run_state={} wal_run_state={} last_event={} provider_requests={} dispatched_calls={} reports={}",
+            self.label, self.root.display(), observed.waiting, last, wal.incomplete,
+            observed.run_state.as_ref().unwrap_or(&Value::Null), wal.run_state.as_ref().unwrap_or(&Value::Null),
+            observed.last_event.as_ref().unwrap_or(&Value::Null), self.script.requests.lock().unwrap().len(),
+            self.script.dispatches.lock().unwrap().len(), self.script.reports.lock().unwrap().len())
+    }
+
+    fn complete(&self, phase: &str) {
+        eprintln!("differential phase complete: {phase}; {}", self.snapshot());
+    }
+
+    async fn phase<T>(&self, phase: &str, work: impl Future<Output = T>) -> T {
+        self.waiting(phase);
+        let label = format!("differential {}: {phase}", self.label);
+        let result = broca_test_support::event_timeout(&label, work, || self.snapshot())
+            .await
+            .unwrap_or_else(|_| panic!("{label} timed out; {}", self.snapshot()));
+        self.complete(phase);
+        result
+    }
 }
 
 async fn provider(script: Arc<Script>) -> (String, tokio::task::JoinHandle<()>) {
@@ -167,6 +279,7 @@ async fn provider(script: Arc<Script>) -> (String, tokio::task::JoinHandle<()>) 
                     requests.push(bytes[start..start + length].to_vec());
                     turn
                 };
+                script.observed.lock().unwrap().last_event = Some(json!({"provider_request":turn}));
                 if turn == 4 {
                     script.tail_entered.notify_one();
                     script.tail_release.notified().await;
@@ -223,6 +336,9 @@ impl subc_client_rs::ModuleHandler for Tools {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["name"], "work");
         self.script.dispatches.lock().unwrap().push(value);
+        let dispatched = self.script.dispatches.lock().unwrap().len();
+        self.script.observed.lock().unwrap().last_event =
+            Some(json!({"tool_dispatches":dispatched}));
         if let Some(root) = &self.overhaul {
             no_legacy_index(root);
         }
@@ -320,13 +436,24 @@ struct Rig {
     daemon: Option<broca_test_support::RigChild>,
     modules: Vec<tokio::task::JoinHandle<()>>,
     replies: Vec<Value>,
+    trace: Arc<Trace>,
+    daemon_logs: Vec<PathBuf>,
+    completed: bool,
 }
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        self.stop();
+        let keep = !self.completed || std::thread::panicking();
+        if keep {
+            eprintln!("differential failure artifacts: root={} scratch={} state={} daemon_logs={:?} broca_logs={}",
+                self.trace.label, self.root.display(), self.state.display(), self.daemon_logs,
+                self.root.join("data-home/cortexkit/broca/logs").display());
+        }
+        self.cleanup();
         self.provider.abort();
-        broca_test_support::remove_rig_dir(&self.root);
+        if !keep {
+            broca_test_support::remove_rig_dir(&self.root);
+        }
     }
 }
 
@@ -384,7 +511,13 @@ impl Rig {
                     "XDG_DATA_HOME":root.join("data-home")
                 }}
         }}).to_string()).unwrap();
-        let mut rig = Self {
+        let trace = Arc::new(Trace {
+            label: if overhaul { "format-2" } else { "legacy" },
+            root: root.clone(),
+            state: state.clone(),
+            script: script.clone(),
+        });
+        Self {
             root,
             state,
             overhaul,
@@ -393,9 +526,10 @@ impl Rig {
             daemon: None,
             modules: vec![],
             replies: vec![],
-        };
-        rig.start().await;
-        rig
+            trace,
+            daemon_logs: vec![],
+            completed: false,
+        }
     }
 
     fn check(&self) {
@@ -424,8 +558,14 @@ impl Rig {
             broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN"),
             broca_test_support::scratch_root(),
         );
+        let name = format!("daemon-{}", self.daemon_logs.len() / 2);
+        self.daemon_logs.extend([
+            self.root.join(format!("{name}.stdout.log")),
+            self.root.join(format!("{name}.stderr.log")),
+        ]);
+        self.trace.waiting(format!("spawn {name}"));
         let child = broca_test_support::retry_executable_file_busy(|| {
-            broca_test_support::tokio_rig_command(&binary, &self.root, "daemon")?
+            broca_test_support::tokio_rig_command(&binary, &self.root, &name)?
                 .env("XDG_CONFIG_HOME", self.root.join("config"))
                 .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
                 .env("XDG_DATA_HOME", self.root.join("data-home"))
@@ -439,17 +579,20 @@ impl Rig {
                 .spawn()
         })
         .unwrap();
-        self.daemon = Some(broca_test_support::RigChild::new(
-            child, &self.root, "daemon",
-        ));
-        broca_test_support::wait_until("daemon connection file", || async {
-            self.check();
-            self.file()
-                .exists()
-                .then_some(())
-                .ok_or_else(|| "no connection file".into())
-        })
+        self.daemon = Some(broca_test_support::RigChild::new(child, &self.root, &name));
+        self.trace.waiting("daemon connection file");
+        broca_test_support::wait_until(
+            &format!("{} daemon connection file", self.trace.label),
+            || async {
+                self.check();
+                self.file()
+                    .exists()
+                    .then_some(())
+                    .ok_or_else(|| self.trace.snapshot())
+            },
+        )
         .await;
+        self.trace.waiting("register claustrum");
         self.modules.push(
             register(
                 &self.file(),
@@ -468,6 +611,7 @@ impl Rig {
             )
             .await,
         );
+        self.trace.waiting("register prefrontal-routing");
         self.modules.push(
             register(
                 &self.file(),
@@ -496,6 +640,7 @@ impl Rig {
                 sub_supervises: false,
             }])
             .build();
+        self.trace.waiting("register tool provider");
         self.modules.push(
             register(
                 &self.file(),
@@ -510,10 +655,12 @@ impl Rig {
         self.check();
     }
 
-    fn stop(&mut self) {
+    async fn stop(&mut self) {
         self.check();
         if let Some(mut child) = self.daemon.take() {
-            broca_test_support::kill_and_reap_tree(&mut child);
+            tokio::task::spawn_blocking(move || broca_test_support::kill_and_reap_tree(&mut child))
+                .await
+                .unwrap();
         }
         for task in self.modules.drain(..) {
             task.abort();
@@ -521,7 +668,17 @@ impl Rig {
         self.check();
     }
 
+    fn cleanup(&mut self) {
+        if let Some(mut child) = self.daemon.take() {
+            broca_test_support::kill_and_reap_tree(&mut child);
+        }
+        for task in self.modules.drain(..) {
+            task.abort();
+        }
+    }
+
     async fn connect(&self) -> (SubcConnection, RouteHandle) {
+        self.trace.waiting("connect to daemon");
         let connection = SubcConnection::connect(&self.file()).await.unwrap();
         let route = connection
             .route_open_management("broca", &self.identity())
@@ -539,6 +696,7 @@ impl Rig {
         params: Value,
     ) -> Result<Value, Value> {
         self.check();
+        self.trace.waiting(format!("request {method}"));
         let reply = connection
             .route_request_terminal(
                 route,
@@ -548,7 +706,13 @@ impl Rig {
             .unwrap();
         self.check();
         match reply {
-            Ok(bytes) => Ok(serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone()),
+            Ok(bytes) => {
+                let result = serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone();
+                if matches!(method, "session.send" | "run.status" | "run.result") {
+                    self.script.observed.lock().unwrap().run_state = Some(result.clone());
+                }
+                Ok(result)
+            }
             Err(bytes) => Err(serde_json::from_slice(&bytes).unwrap()),
         }
     }
@@ -560,17 +724,20 @@ impl Rig {
         run: &str,
         wanted: &str,
     ) -> Value {
-        broca_test_support::wait_until(wanted, || async {
-            let value = self
-                .request(connection, route, "run.status", json!({"run_id":run}))
-                .await
-                .unwrap();
-            if value["state"] == wanted {
-                Ok(value)
-            } else {
-                Err(value.to_string())
-            }
-        })
+        broca_test_support::wait_until(
+            &format!("{} run state {wanted}", self.trace.label),
+            || async {
+                let value = self
+                    .request(connection, route, "run.status", json!({"run_id":run}))
+                    .await
+                    .unwrap();
+                if value["state"] == wanted {
+                    Ok(value)
+                } else {
+                    Err(self.trace.snapshot())
+                }
+            },
+        )
         .await
     }
 
@@ -972,86 +1139,102 @@ async fn pages(
     route: &RouteHandle,
     run: &str,
 ) -> String {
+    let trace = rig.trace.clone();
     for (method, params) in [
         ("session.head", json!({})),
         ("run.status", json!({"run_id":run})),
         ("run.result", json!({"run_id":run})),
     ] {
-        let reply = rig
-            .request(connection, route, method, params)
+        let reply = trace
+            .phase(method, rig.request(connection, route, method, params))
             .await
             .unwrap();
         rig.replies.push(json!({"method":method,"reply":reply}));
     }
-    let full = rig
-        .request(
-            connection,
-            route,
-            "session.read",
-            json!({"include_tools":true}),
+    let full = trace
+        .phase(
+            "full session.read",
+            rig.request(
+                connection,
+                route,
+                "session.read",
+                json!({"include_tools":true}),
+            ),
         )
         .await
         .unwrap();
     assert!(full["messages"].as_array().unwrap().len() >= 6);
-    let mut ordinal = 0;
-    let mut collected = vec![];
-    loop {
-        let page = rig
-            .request(
-                connection,
-                route,
-                "session.read",
-                json!({"from_ordinal":ordinal,
+    let collected = trace
+        .phase("paged session.read", async {
+            let mut ordinal = 0;
+            let mut collected = vec![];
+            loop {
+                let page = rig
+                    .request(
+                        connection,
+                        route,
+                        "session.read",
+                        json!({"from_ordinal":ordinal,
             "limit":2,"lineage_id":full["lineage_id"],"include_tools":true}),
-            )
-            .await
-            .unwrap();
-        collected.extend(page["messages"].as_array().unwrap().iter().cloned());
-        rig.replies
-            .push(json!({"method":"session.read.page","reply":page}));
-        let Some(next) = page["next_from_ordinal"].as_u64() else {
-            break;
-        };
-        assert!(next > ordinal);
-        ordinal = next;
-    }
+                    )
+                    .await
+                    .unwrap();
+                collected.extend(page["messages"].as_array().unwrap().iter().cloned());
+                rig.replies
+                    .push(json!({"method":"session.read.page","reply":page}));
+                let Some(next) = page["next_from_ordinal"].as_u64() else {
+                    break;
+                };
+                assert!(next > ordinal);
+                ordinal = next;
+            }
+            collected
+        })
+        .await;
     assert_eq!(collected, full["messages"].as_array().unwrap().clone());
     rig.replies
         .push(json!({"method":"session.read.full","reply":full}));
     for form in ["raw", "display"] {
-        let mut params = json!({"limit":2});
-        if form == "display" {
-            params["form"] = json!(form);
-        }
-        let mut cursors = BTreeSet::new();
-        let mut seen = BTreeSet::new();
-        loop {
-            let page = rig
-                .request(connection, route, "session.history", params.clone())
-                .await
-                .unwrap();
-            for message in page["messages"].as_array().unwrap() {
-                assert!(seen.insert(message["mid"].to_string()), "history overlap");
-            }
-            rig.replies
-                .push(json!({"method":format!("session.history.{form}"),"reply":page}));
-            let Some(next) = page["older"].as_str() else {
-                break;
-            };
-            assert!(
-                cursors.insert(next.to_owned()),
-                "history continuation did not advance"
-            );
-            params["cursor"] = json!(next);
-        }
-        assert_eq!(seen.len(), collected.len(), "history has holes");
+        trace
+            .phase(&format!("session.history {form}"), async {
+                let mut params = json!({"limit":2});
+                if form == "display" {
+                    params["form"] = json!(form);
+                }
+                let mut cursors = BTreeSet::new();
+                let mut seen = BTreeSet::new();
+                loop {
+                    let page = rig
+                        .request(connection, route, "session.history", params.clone())
+                        .await
+                        .unwrap();
+                    for message in page["messages"].as_array().unwrap() {
+                        assert!(seen.insert(message["mid"].to_string()), "history overlap");
+                    }
+                    rig.replies
+                        .push(json!({"method":format!("session.history.{form}"),"reply":page}));
+                    let Some(next) = page["older"].as_str() else {
+                        break;
+                    };
+                    assert!(
+                        cursors.insert(next.to_owned()),
+                        "history continuation did not advance"
+                    );
+                    params["cursor"] = json!(next);
+                }
+                assert_eq!(seen.len(), collected.len(), "history has holes");
+            })
+            .await;
     }
-    let first = rig
-        .request(
-            connection,
-            route,
-            "run.tool_calls",
-            json!({"run_id":run,"limit":1}),
+    let first = trace
+        .phase(
+            "run.tool_calls first page",
+            rig.request(
+                connection,
+                route,
+                "run.tool_calls",
+                json!({"run_id":run,"limit":1}),
+            ),
         )
         .await
         .unwrap();
@@ -1061,12 +1244,15 @@ async fn pages(
         .as_str()
         .expect("nonempty run.tool_calls continuation")
         .to_owned();
-    let second = rig
-        .request(
-            connection,
-            route,
-            "run.tool_calls",
-            json!({"run_id":run,"limit":1,"after":next}),
+    let second = trace
+        .phase(
+            "run.tool_calls continuation",
+            rig.request(
+                connection,
+                route,
+                "run.tool_calls",
+                json!({"run_id":run,"limit":1,"after":next}),
+            ),
         )
         .await
         .unwrap();
@@ -1104,69 +1290,88 @@ async fn live_tail(
     handoff: Value,
     resumed_run: &str,
 ) {
-    let subscription = connection
-        .route_open_management("broca", &rig.identity())
-        .await
-        .unwrap();
-    let mut stream = connection
-        .subscribe(
-            &subscription,
-            serde_json::to_vec(&json!({
-                "method":"session.subscribe","params":{"from":handoff}
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    // Receiving the historical terminal proves attachment is installed before new work
-    // starts, so the next run cannot accidentally be covered by replay alone.
-    let mut events = vec![];
-    loop {
-        let bytes = stream
-            .next()
-            .await
-            .unwrap()
-            .expect("historical attachment reaches the resumed terminal");
-        let event: Value = serde_json::from_slice(&bytes).unwrap();
-        let done = terminal(&event, resumed_run);
-        events.push(event);
-        rig.check();
-        if done {
-            break;
-        }
-    }
-    let sent = rig
-        .request(connection, route, "session.send", rig.send(true))
-        .await
-        .unwrap();
-    let run = sent["run_id"].as_str().unwrap().to_owned();
-    rig.replies
-        .push(json!({"method":"session.send.tail","reply":sent}));
-    rig.script.tail_entered.notified().await;
-    rig.check();
-    if rig.overhaul {
-        inspect_database(&rig.state);
-    }
-    rig.script.tail_release.notify_one();
-    loop {
-        let bytes = stream
-            .next()
-            .await
-            .unwrap()
-            .expect("live subscription stays open");
-        let event: Value = serde_json::from_slice(&bytes).unwrap();
-        let done = terminal(&event, &run);
-        events.push(event);
-        rig.check();
-        if done {
-            break;
-        }
-    }
-    drop(stream);
-    connection.route_close(&subscription).await.unwrap();
-    let status = rig.state(connection, route, &run, "completed").await;
-    rig.replies
-        .push(json!({"method":"run.status.tail","reply":status}));
+    let trace = rig.trace.clone();
+    let (subscription, mut stream, mut events) = trace
+        .phase("live attach: historical handoff", async {
+            let subscription = connection
+                .route_open_management("broca", &rig.identity())
+                .await
+                .unwrap();
+            let mut stream = connection
+                .subscribe(
+                    &subscription,
+                    serde_json::to_vec(&json!({
+                        "method":"session.subscribe","params":{"from":handoff}
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Receiving the historical terminal proves attachment is installed before new work
+            // starts, so the next run cannot accidentally be covered by replay alone.
+            let mut events = vec![];
+            loop {
+                trace.waiting(format!("historical terminal for {resumed_run}"));
+                let bytes = stream
+                    .next()
+                    .await
+                    .unwrap()
+                    .expect("historical attachment reaches the resumed terminal");
+                let event: Value = serde_json::from_slice(&bytes).unwrap();
+                trace.event(&event);
+                let done = terminal(&event, resumed_run);
+                events.push(event);
+                rig.check();
+                if done {
+                    break;
+                }
+            }
+            (subscription, stream, events)
+        })
+        .await;
+    let run = trace
+        .phase("live attach: held tail admission", async {
+            let sent = rig
+                .request(connection, route, "session.send", rig.send(true))
+                .await
+                .unwrap();
+            let run = sent["run_id"].as_str().unwrap().to_owned();
+            rig.replies
+                .push(json!({"method":"session.send.tail","reply":sent}));
+            rig.script.tail_entered.notified().await;
+            rig.check();
+            if rig.overhaul {
+                inspect_database(&rig.state);
+            }
+            rig.script.tail_release.notify_one();
+            run
+        })
+        .await;
+    trace
+        .phase("live attach: live terminal", async {
+            loop {
+                trace.waiting(format!("live terminal for {run}"));
+                let bytes = stream
+                    .next()
+                    .await
+                    .unwrap()
+                    .expect("live subscription stays open");
+                let event: Value = serde_json::from_slice(&bytes).unwrap();
+                trace.event(&event);
+                let done = terminal(&event, &run);
+                events.push(event);
+                rig.check();
+                if done {
+                    break;
+                }
+            }
+            drop(stream);
+            connection.route_close(&subscription).await.unwrap();
+            let status = rig.state(connection, route, &run, "completed").await;
+            rig.replies
+                .push(json!({"method":"run.status.tail","reply":status}));
+        })
+        .await;
     let controls: Vec<_> = events.iter().filter(|v| v["kind"] == "control").collect();
     assert!(!controls.is_empty());
     let positions: Vec<_> = controls.iter().map(|v| cursor(&v["cursor"])).collect();
@@ -1192,38 +1397,45 @@ async fn live_tail(
 
     // Read the same durable interval after the live tail has finished. Matching the entire
     // control interval checks holes as well as duplicates at the replay/live handoff.
-    let replay_route = connection
-        .route_open_management("broca", &rig.identity())
-        .await
-        .unwrap();
-    let mut replay = connection
-        .subscribe(
-            &replay_route,
-            serde_json::to_vec(&json!({
-                "method":"session.subscribe","params":{"from":handoff}
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    let mut replayed = vec![];
-    loop {
-        let bytes = replay
-            .next()
-            .await
-            .unwrap()
-            .expect("replay reaches the tail terminal");
-        let event: Value = serde_json::from_slice(&bytes).unwrap();
-        let done = terminal(&event, &run);
-        if event["kind"] == "control" {
-            replayed.push(event);
-        }
-        if done {
-            break;
-        }
-    }
-    drop(replay);
-    connection.route_close(&replay_route).await.unwrap();
+    let replayed = trace
+        .phase("live attach: durable replay", async {
+            let replay_route = connection
+                .route_open_management("broca", &rig.identity())
+                .await
+                .unwrap();
+            let mut replay = connection
+                .subscribe(
+                    &replay_route,
+                    serde_json::to_vec(&json!({
+                        "method":"session.subscribe","params":{"from":handoff}
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut replayed = vec![];
+            loop {
+                trace.waiting(format!("durable replay terminal for {run}"));
+                let bytes = replay
+                    .next()
+                    .await
+                    .unwrap()
+                    .expect("replay reaches the tail terminal");
+                let event: Value = serde_json::from_slice(&bytes).unwrap();
+                trace.event(&event);
+                let done = terminal(&event, &run);
+                if event["kind"] == "control" {
+                    replayed.push(event);
+                }
+                if done {
+                    break;
+                }
+            }
+            drop(replay);
+            connection.route_close(&replay_route).await.unwrap();
+            replayed
+        })
+        .await;
     assert_eq!(
         positions,
         replayed
@@ -1237,8 +1449,11 @@ async fn live_tail(
     }
     rig.replies
         .push(json!({"method":"session.subscribe.handoff","handoff":handoff,"events":events}));
-    let history = rig
-        .request(connection, route, "session.history", json!({"limit":100}))
+    let history = trace
+        .phase(
+            "session.history after live tail",
+            rig.request(connection, route, "session.history", json!({"limit":100})),
+        )
         .await
         .unwrap();
     rig.replies
@@ -1251,15 +1466,44 @@ async fn differential() {
     let mut runs = vec![];
     let mut handoffs = vec![];
     for rig in [&mut legacy, &mut overhaul] {
-        let (connection, route) = rig.connect().await;
-        let sent = rig
-            .request(&connection, &route, "session.send", rig.send(false))
+        let trace = rig.trace.clone();
+        let (connection, route) = trace
+            .phase("start", async {
+                rig.start().await;
+                rig.connect().await
+            })
+            .await;
+        let sent = trace
+            .phase(
+                "first send",
+                rig.request(&connection, &route, "session.send", rig.send(false)),
+            )
             .await
             .unwrap();
         let run = sent["run_id"].as_str().unwrap().to_owned();
         rig.replies
             .push(json!({"method":"session.send.first","reply":sent}));
-        let paused = rig.state(&connection, &route, &run, "paused").await;
+        for call in ["call-0", "call-1"] {
+            trace
+                .phase(
+                    &format!("tool call {call}"),
+                    broca_test_support::wait_until(
+                        &format!("{} tool result {call}", trace.label),
+                        || async {
+                            rig.check();
+                            if observe_wal(&rig.state).completed_tools.contains(call) {
+                                Ok(())
+                            } else {
+                                Err(trace.snapshot())
+                            }
+                        },
+                    ),
+                )
+                .await;
+        }
+        let paused = trace
+            .phase("auth pause", rig.state(&connection, &route, &run, "paused"))
+            .await;
         assert_eq!(paused["reason"], "auth_required");
         rig.replies
             .push(json!({"method":"run.status.paused","reply":paused}));
@@ -1268,18 +1512,28 @@ async fn differential() {
             2,
             "two real dispatched calls"
         );
-        broca_test_support::wait_until("pre-restart durable attempt reports", || async {
-            rig.check();
-            let reports = rig.script.reports.lock().unwrap();
-            if reports.iter().filter(|v| v["kind"] == "attempt").count() == 3 {
-                Ok(())
-            } else {
-                Err(format!("reports={reports:?}"))
-            }
-        })
-        .await;
-        let head = rig
-            .request(&connection, &route, "session.head", json!({}))
+        trace
+            .phase(
+                "pre-restart accounting reports",
+                broca_test_support::wait_until(
+                    &format!("{} pre-restart durable attempt reports", trace.label),
+                    || async {
+                        rig.check();
+                        let reports = rig.script.reports.lock().unwrap();
+                        if reports.iter().filter(|v| v["kind"] == "attempt").count() == 3 {
+                            Ok(())
+                        } else {
+                            Err(format!("reports={reports:?}"))
+                        }
+                    },
+                ),
+            )
+            .await;
+        let head = trace
+            .phase(
+                "paused head",
+                rig.request(&connection, &route, "session.head", json!({})),
+            )
             .await
             .unwrap();
         handoffs.push(head["head"].clone());
@@ -1288,32 +1542,49 @@ async fn differential() {
         if rig.overhaul {
             inspect_database(&rig.state);
         }
-        connection.route_close(&route).await.unwrap();
-        drop(connection);
-        rig.stop();
-        rig.start().await;
+        trace
+            .phase("restart", async {
+                trace.waiting("close pre-restart route");
+                connection.route_close(&route).await.unwrap();
+                drop(connection);
+                trace.waiting("stop pre-restart daemon tree");
+                rig.stop().await;
+                rig.start().await;
+            })
+            .await;
         runs.push(run);
     }
-    let (lc, lr) = legacy.connect().await;
-    let (oc, or) = overhaul.connect().await;
+    let (lc, lr) = legacy
+        .trace
+        .phase("reconnect after restart", legacy.connect())
+        .await;
+    let (oc, or) = overhaul
+        .trace
+        .phase("reconnect after restart", overhaul.connect())
+        .await;
     let mut tokens = vec![];
     for (i, (rig, connection, route)) in [(&mut legacy, &lc, &lr), (&mut overhaul, &oc, &or)]
         .into_iter()
         .enumerate()
     {
-        let resumed = rig
-            .request(connection, route, "session.send", rig.send(false))
-            .await
-            .unwrap();
-        assert_eq!(resumed["run_id"], runs[i], "restart resumes the same run");
-        rig.replies
-            .push(json!({"method":"session.send.resume","reply":resumed}));
-        rig.state(connection, route, &runs[i], "completed").await;
-        assert_eq!(
-            rig.script.dispatches.lock().unwrap().len(),
-            2,
-            "resume must not redispatch"
-        );
+        let trace = rig.trace.clone();
+        trace
+            .phase("resume", async {
+                let resumed = rig
+                    .request(connection, route, "session.send", rig.send(false))
+                    .await
+                    .unwrap();
+                assert_eq!(resumed["run_id"], runs[i], "restart resumes the same run");
+                rig.replies
+                    .push(json!({"method":"session.send.resume","reply":resumed}));
+                rig.state(connection, route, &runs[i], "completed").await;
+                assert_eq!(
+                    rig.script.dispatches.lock().unwrap().len(),
+                    2,
+                    "resume must not redispatch"
+                );
+            })
+            .await;
         tokens.push(pages(rig, connection, route, &runs[i]).await);
         if rig.overhaul {
             inspect_database(&rig.state);
@@ -1323,48 +1594,61 @@ async fn differential() {
         .into_iter()
         .enumerate()
     {
-        let other = 1 - i;
-        let foreign = rig
-            .request(
-                connection,
-                route,
-                "run.tool_calls",
-                json!({"run_id":runs[i],"after":tokens[other]}),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(foreign["error"]["code"], "invalid_params");
-        let mut tampered: Value = serde_json::from_str(&tokens[i]).unwrap();
-        tampered["ordinal"] = json!(tampered["ordinal"].as_u64().unwrap() + 1);
-        let refusal = rig
-            .request(
-                connection,
-                route,
-                "run.tool_calls",
-                json!({"run_id":runs[i],"after":tampered.to_string()}),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(refusal["error"]["code"], "invalid_params");
+        let trace = rig.trace.clone();
+        trace
+            .phase("run.tool_calls rejection checks", async {
+                let other = 1 - i;
+                let foreign = rig
+                    .request(
+                        connection,
+                        route,
+                        "run.tool_calls",
+                        json!({"run_id":runs[i],"after":tokens[other]}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(foreign["error"]["code"], "invalid_params");
+                let mut tampered: Value = serde_json::from_str(&tokens[i]).unwrap();
+                tampered["ordinal"] = json!(tampered["ordinal"].as_u64().unwrap() + 1);
+                let refusal = rig
+                    .request(
+                        connection,
+                        route,
+                        "run.tool_calls",
+                        json!({"run_id":runs[i],"after":tampered.to_string()}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(refusal["error"]["code"], "invalid_params");
+            })
+            .await;
     }
     live_tail(&mut legacy, &lc, &lr, handoffs[0].clone(), &runs[0]).await;
     live_tail(&mut overhaul, &oc, &or, handoffs[1].clone(), &runs[1]).await;
     for rig in [&legacy, &overhaul] {
-        broca_test_support::wait_until("routing reports for both completed runs", || async {
-            rig.check();
-            let reports = rig.script.reports.lock().unwrap();
-            if reports
-                .iter()
-                .filter(|v| v["kind"] == "run_finished")
-                .count()
-                == 2
-            {
-                Ok(())
-            } else {
-                Err(format!("reports={reports:?}"))
-            }
-        })
-        .await;
+        let trace = rig.trace.clone();
+        trace
+            .phase(
+                "final accounting reports",
+                broca_test_support::wait_until(
+                    &format!("{} routing reports for both completed runs", trace.label),
+                    || async {
+                        rig.check();
+                        let reports = rig.script.reports.lock().unwrap();
+                        if reports
+                            .iter()
+                            .filter(|v| v["kind"] == "run_finished")
+                            .count()
+                            == 2
+                        {
+                            Ok(())
+                        } else {
+                            Err(format!("reports={reports:?}"))
+                        }
+                    },
+                ),
+            )
+            .await;
     }
     let left = Sources::read(&legacy);
     let right = Sources::read(&overhaul);
@@ -1415,21 +1699,112 @@ async fn differential() {
     inspect_database(&overhaul.state);
     legacy.check();
     overhaul.check();
-    lc.route_close(&lr).await.unwrap();
-    oc.route_close(&or).await.unwrap();
+    legacy.trace.complete("source and byte correspondence");
+    overhaul.trace.complete("source and byte correspondence");
+    legacy
+        .trace
+        .phase("close final route", lc.route_close(&lr))
+        .await
+        .unwrap();
+    overhaul
+        .trace
+        .phase("close final route", oc.route_close(&or))
+        .await
+        .unwrap();
+    legacy.completed = true;
+    overhaul.completed = true;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_daemon_legacy_and_overhaul_are_field_scoped_differential() {
     assert!(broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN").is_file(),
         "the real-daemon differential requires SUBC_CORE_BIN; it must not pass as a dependency skip");
-    broca_test_support::event_timeout(
-        "legacy/overhaul real-daemon differential",
-        differential(),
-        || "inspect the differential daemon logs".into(),
+    differential().await;
+}
+
+fn diagnostic_rig(tag: &str, overhaul: bool) -> Rig {
+    let root = broca_test_support::scratch_root().join(tag);
+    let state = root.join("state");
+    std::fs::create_dir_all(state.join("wal")).unwrap();
+    let script = Arc::new(Script::default());
+    let trace = Arc::new(Trace {
+        label: if overhaul { "format-2" } else { "legacy" },
+        root: root.clone(),
+        state: state.clone(),
+        script: script.clone(),
+    });
+    let log = root.join("daemon-0.stderr.log");
+    std::fs::write(&log, "retained daemon output").unwrap();
+    Rig {
+        root,
+        state,
+        overhaul,
+        script,
+        trace,
+        daemon: None,
+        provider: tokio::spawn(std::future::pending()),
+        modules: vec![],
+        replies: vec![],
+        daemon_logs: vec![log],
+        completed: false,
+    }
+}
+
+#[tokio::test]
+async fn differential_failure_preserves_both_roots_and_daemon_logs() {
+    let legacy = diagnostic_rig("differential-failed-legacy", false);
+    let overhaul = diagnostic_rig("differential-failed-format-2", true);
+    let roots = [legacy.root.clone(), overhaul.root.clone()];
+    drop(legacy);
+    drop(overhaul);
+    for root in roots {
+        assert_eq!(
+            std::fs::read_to_string(root.join("daemon-0.stderr.log")).unwrap(),
+            "retained daemon output"
+        );
+        assert!(root.join("state/wal").is_dir());
+        broca_test_support::remove_rig_dir(root);
+    }
+    let mut success = diagnostic_rig("differential-succeeded", false);
+    let root = success.root.clone();
+    success.completed = true;
+    drop(success);
+    assert!(!root.exists(), "successful rigs must still clean up");
+}
+
+#[tokio::test]
+async fn differential_phase_diagnostic_names_root_and_observed_state() {
+    let mut rig = diagnostic_rig("differential-observed", true);
+    let mut bytes = broca_wal::framing::encode(
+        7,
+        1,
+        &broca_wal::WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
     )
-    .await
     .unwrap();
+    bytes.extend_from_slice(b"torn suffix");
+    std::fs::write(rig.state.join("wal/observed.wal"), bytes).unwrap();
+    rig.script.observed.lock().unwrap().run_state = Some(json!({"state":"paused"}));
+    rig.trace.event(&json!({"unit":{"type":"run_paused"}}));
+    rig.trace.waiting("auth pause");
+    let diagnostic = rig.trace.snapshot();
+    for expected in [
+        "root=format-2",
+        "waiting=auth pause",
+        "last_record=step_started@7",
+        "incomplete_tail=true",
+        "run_state={\"state\":\"paused\"}",
+        "run_paused",
+    ] {
+        assert!(
+            diagnostic.contains(expected),
+            "missing {expected}: {diagnostic}"
+        );
+    }
+    assert!(diagnostic.contains(&rig.root.display().to_string()));
+    assert_eq!(rig.trace.phase("helper completion", async { 42 }).await, 42);
+    rig.completed = true;
 }
 
 #[test]
