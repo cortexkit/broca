@@ -98,6 +98,7 @@ async fn run_with_selection(
         session: session.clone(),
         model: ModelHandle::new(provider_id, "gpt-4.1"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

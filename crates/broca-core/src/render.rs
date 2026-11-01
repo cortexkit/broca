@@ -54,6 +54,7 @@ mod tests {
 
     fn opts() -> CallOptions {
         let mut o = CallOptions::new(vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::User,
             content: vec![broca_protocol::content::ContentBlock::Text { text: "hi".into() }],

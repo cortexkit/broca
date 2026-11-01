@@ -18,6 +18,7 @@ const MODEL_Y: &str = "gemini-3.5-flash-high";
 pub(crate) fn fixed_request() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -28,6 +29,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             }],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -38,6 +40,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             }],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -51,6 +54,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             })],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -98,6 +102,7 @@ pub(crate) fn fixed_request() -> CallOptions {
 fn json_tool_result_request(value: Value) -> CallOptions {
     CallOptions::new(vec![
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -111,6 +116,7 @@ fn json_tool_result_request(value: Value) -> CallOptions {
             })],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -140,6 +146,7 @@ fn function_response(rendered: &[u8]) -> Value {
 fn two_tool_turn_request(first_id: &str, second_id: &str) -> CallOptions {
     CallOptions::new(vec![
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -153,6 +160,7 @@ fn two_tool_turn_request(first_id: &str, second_id: &str) -> CallOptions {
             })],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -167,6 +175,7 @@ fn two_tool_turn_request(first_id: &str, second_id: &str) -> CallOptions {
             })],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -180,6 +189,7 @@ fn two_tool_turn_request(first_id: &str, second_id: &str) -> CallOptions {
             })],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -387,6 +397,7 @@ fn signed_reasoning_request(origin: Option<ModelHandle>, target_model: &str) -> 
             }],
         ),
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::Assistant,
             content: vec![

@@ -2295,6 +2295,11 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if self.carries_turn_system() {
+            with_feature(base, crate::framing::TURN_SYSTEM_FEATURE)
+        } else {
+            base
+        };
         if matches!(
             self,
             Self::ToolDispatchIntent {
@@ -2650,6 +2655,40 @@ impl WalRecord {
             } => blocks(&assistant_message.content),
             Self::Queued { request, .. } => messages(&request.input),
             Self::Steered { input, .. } => messages(input),
+            Self::CompactionMessage { replacement, .. } => messages(replacement),
+            _ => false,
+        }
+    }
+
+    fn carries_turn_system(&self) -> bool {
+        let messages = |input: &[Message]| input.iter().any(|message| message.turn_system);
+        let hooks_carry = |hooks: &Option<Box<Hooks>>| {
+            hooks.as_ref().is_some_and(|hooks| {
+                hooks
+                    .original
+                    .iter()
+                    .chain(hooks.final_value.iter())
+                    .any(|value| {
+                        value.as_array().is_some_and(|messages| {
+                            messages.iter().any(|message| {
+                                message
+                                    .get("turn_system")
+                                    .and_then(serde_json::Value::as_bool)
+                                    == Some(true)
+                            })
+                        })
+                    })
+            })
+        };
+        match self {
+            Self::RunStarted { input, hooks, .. } | Self::Steered { input, hooks, .. } => {
+                messages(input) || hooks_carry(hooks)
+            }
+            Self::Queued { request, hooks, .. } => messages(&request.input) || hooks_carry(hooks),
+            Self::SendDelivered { input, mode, .. } => {
+                *mode == broca_protocol::DeliveryMode::TurnSystem
+                    || input.as_deref().is_some_and(|input| messages(input))
+            }
             Self::CompactionMessage { replacement, .. } => messages(replacement),
             _ => false,
         }
@@ -4233,6 +4272,7 @@ mod schema_tests {
 
     fn user_msg(text: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],

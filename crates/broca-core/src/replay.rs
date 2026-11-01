@@ -2757,6 +2757,7 @@ fn replay_seeded_with_compaction<'a>(
                     });
                     prompt.push(tagged(
                         Message {
+                            turn_system: false,
                             cache_prefix_blocks: None,
                             role: Role::Assistant,
                             content: assistant_message
@@ -2817,6 +2818,7 @@ fn replay_seeded_with_compaction<'a>(
                     ep.first_step_message.get_or_insert(prompt.len());
                     prompt.push(tagged(
                         Message {
+                            turn_system: false,
                             cache_prefix_blocks: None,
                             role: Role::Assistant,
                             content: assistant_message.content.clone(),
@@ -3488,6 +3490,7 @@ fn replay_seeded_with_compaction<'a>(
             .map(|(assistant, step_record)| {
                 let mut message = tagged(
                     Message {
+                        turn_system: false,
                         cache_prefix_blocks: None,
                         role: Role::Assistant,
                         content: assistant.content.clone(),
@@ -4295,6 +4298,7 @@ fn commit_tool_turn(
 ) {
     prompt.push(tagged(
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::Assistant,
             content: assistant.content.clone(),
@@ -4311,6 +4315,7 @@ fn commit_tool_turn(
         .filter_map(|(position, _)| batch.result_for(position).map(ContentBlock::ToolResult))
         .collect();
     prompt.push(Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::Tool,
         content,

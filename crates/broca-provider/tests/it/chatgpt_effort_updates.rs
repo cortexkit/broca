@@ -72,6 +72,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
         }),
         input: role
             .map(|role| Message {
+                turn_system: false,
                 role,
                 content: vec![ContentBlock::Text {
                     text: format!("episode-{effort}"),

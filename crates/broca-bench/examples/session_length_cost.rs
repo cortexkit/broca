@@ -1005,6 +1005,7 @@ fn compaction_control(views: &Arc<Views>) -> RunControl {
 
 fn text_message(role: Role, text: String) -> Message {
     Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,

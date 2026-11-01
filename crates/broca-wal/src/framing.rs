@@ -226,6 +226,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     CONTEXT_CEILING_FEATURE,
     DEFERRED_CALL_FEATURE,
     DELIVERY_ORDER_FEATURE,
+    TURN_SYSTEM_FEATURE,
     DISPATCH_MODULE_FEATURE,
     FLOW_SCOPE_FEATURE,
     FRAME_STAMPS_FEATURE,
@@ -479,6 +480,9 @@ pub const DEFERRED_CALL_FEATURE: &str = "deferred-call/v1";
 /// would start a run from a queued send that may never start one, deliver a send that was
 /// replaced or expired, or render a prompt without a send that was delivered into it.
 pub const DELIVERY_ORDER_FEATURE: &str = "delivery-order/v1";
+
+/// Turn-scoped system entries must not be hoisted into legacy global instructions.
+pub const TURN_SYSTEM_FEATURE: &str = "turn-system/v1";
 
 /// A feature name that test builds treat as known, in addition to [`KNOWN_FEATURES`].
 ///
@@ -1545,6 +1549,7 @@ mod tests {
                 CONTEXT_CEILING_FEATURE,
                 DEFERRED_CALL_FEATURE,
                 DELIVERY_ORDER_FEATURE,
+                TURN_SYSTEM_FEATURE,
                 DISPATCH_MODULE_FEATURE,
                 FLOW_SCOPE_FEATURE,
                 FRAME_STAMPS_FEATURE,
@@ -3179,3 +3184,6 @@ mod view_negotiation_tests {
 
 #[cfg(test)]
 mod vault_facts_tests;
+
+#[cfg(test)]
+mod turn_system_tests;

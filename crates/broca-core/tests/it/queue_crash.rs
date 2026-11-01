@@ -18,6 +18,7 @@ use broca_wal::{RunConfig, RunOrigin, WalRecord};
 
 fn msg(text: &str) -> Message {
     Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::User,
         content: vec![ContentBlock::Text { text: text.into() }],

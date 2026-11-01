@@ -52,6 +52,7 @@ fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
             session: session.clone(),
             config: Box::new(min_config()),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -323,6 +324,7 @@ fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
         session: key.clone(),
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

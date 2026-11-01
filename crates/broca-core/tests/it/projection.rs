@@ -87,6 +87,7 @@ fn started(run: &str) -> WalRecord {
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(run_config()),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1054,6 +1055,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
         principal: None,
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

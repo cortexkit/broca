@@ -111,6 +111,7 @@ fn request(session: BindIdentity, frozen: &broca_wal::PlanManifest) -> RunReques
         session,
         model: ModelHandle::new("test", "test"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

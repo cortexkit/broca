@@ -17,6 +17,7 @@ use std::{sync::Arc, time::Duration};
 
 fn message(role: Role, text: String) -> Message {
     Message {
+        turn_system: false,
         role,
         content: vec![ContentBlock::Text { text }],
         origin: None,

@@ -7335,6 +7335,7 @@ where
                 // the steered message after it.
                 budget_state = step_budget_state;
                 let mut answer = Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     role: Role::Assistant,
                     content: assembled.content.clone(),
@@ -7445,6 +7446,7 @@ where
             &mut batch.results,
         );
         let mut answer = Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::Assistant,
             content: assembled.content,
@@ -7467,6 +7469,7 @@ where
             None
         };
         let mut results = Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::Tool,
             content: batch
@@ -8710,6 +8713,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     // resume dispatched takes the tag the writer assigned when it appended that result's
     // record (`WalHandle::take_call_tags`).
     let mut answer = Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::Assistant,
         content: pending.assistant.content,
@@ -8727,6 +8731,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         None
     };
     let mut results = Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::Tool,
         content: batch

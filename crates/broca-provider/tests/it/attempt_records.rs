@@ -284,6 +284,7 @@ mod gated {
             session: BindIdentity::new(dir.join("proj"), "attempts", "s1"),
             model: ModelHandle::new("anthropic", "m"),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
