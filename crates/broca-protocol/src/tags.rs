@@ -244,6 +244,9 @@ pub struct TagRendering {
     /// Plain assistant `text` blocks show their tag. Never thinking, encrypted reasoning,
     /// tool calls or a text block carrying provider state.
     pub assistant_text: bool,
+    /// Frozen admission opt-in for image labels on multipart notice text. Older runs
+    /// treated those text parts literally, including transcripts supplied by import.
+    pub image_notice_labels: bool,
 }
 
 impl TagRendering {
@@ -252,16 +255,22 @@ impl TagRendering {
     pub fn for_family(family_id: Option<&str>) -> Self {
         Self {
             assistant_text: family_id == Some(ANTHROPIC_MESSAGES_FAMILY),
+            image_notice_labels: false,
         }
     }
 
     /// The rendering for a run whose provider froze `frozen_render_config`.
     pub fn for_render_config(frozen_render_config: &serde_json::Value) -> Self {
-        Self::for_family(
+        let mut rendering = Self::for_family(
             frozen_render_config
                 .get("family_id")
                 .and_then(serde_json::Value::as_str),
-        )
+        );
+        rendering.image_notice_labels = frozen_render_config
+            .get("image_notice_labels")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        rendering
     }
 }
 
@@ -298,7 +307,13 @@ fn render_message_tags(message: &mut Message, rendering: TagRendering) {
     // model's text cleaned, an image-only result as its label. The stored-ledger rules below
     // stay exactly as they were for every message written under them.
     if let Some(computed) = tags.computed {
-        render_computed(message, &tags, computed, true);
+        render_computed(
+            message,
+            &tags,
+            computed,
+            true,
+            rendering.image_notice_labels,
+        );
         return;
     }
     let role = message.role;
@@ -400,20 +415,39 @@ pub fn part_kind(role: Role, block: &ContentBlock, clean: bool) -> Option<PartKi
                 text_kind(message, PartKind::ToolResultText)
             }
             ToolOutput::Json { .. } => return None,
-            ToolOutput::Parts { parts } => parts_numbering(parts).0,
+            ToolOutput::Parts { parts } => parts_numbering(parts, false).0,
         },
     })
 }
 
 // Map storage once for the shared contract's classification and placement rules. Numbering
 // and rendering must see the same blocks, including empty text and every media reference.
-fn parts_numbering(parts: &[crate::ToolOutputPart]) -> (PartKind, Option<usize>) {
+fn parts_numbering(
+    parts: &[crate::ToolOutputPart],
+    notice_labels: bool,
+) -> (PartKind, Option<usize>) {
     use cortexkit_role_llm_runner::tags::{
         numbered_block_index, tool_result_kind, ToolResultBlock,
     };
+    // A capture failure is text in storage. Use the shared image-only rule only when
+    // the entire result has image notices or images; mixed original text keeps its old bytes.
+    let image_only = notice_labels
+        && parts.iter().all(|part| match part {
+            crate::ToolOutputPart::Media { media } => media.kind == crate::MediaKind::Image,
+            crate::ToolOutputPart::Text { text } => {
+                text.is_empty()
+                    || crate::content::is_image_only_notice(text)
+                    || text
+                        .split('\n')
+                        .all(crate::content::is_generated_image_notice)
+            }
+        });
     let blocks: Vec<_> = parts
         .iter()
         .map(|part| match part {
+            crate::ToolOutputPart::Text { text } if image_only && !text.is_empty() => {
+                ToolResultBlock::Image
+            }
             crate::ToolOutputPart::Text { text } => ToolResultBlock::Text(text),
             crate::ToolOutputPart::Media { media } => match media.kind {
                 crate::MediaKind::Image => ToolResultBlock::Image,
@@ -525,7 +559,13 @@ pub fn exposed_part_text(message: &Message, index: usize) -> Option<String> {
 /// Show a computed message's numbers, cleaned text and image labels in place, the way a run
 /// that renders tags sends it (`render` true), or only its cleaned text (`render` false, a run
 /// that renders no tags but resends replies an earlier tag-rendering run wrote).
-fn render_computed(message: &mut Message, tags: &PartTags, computed: ComputedTags, render: bool) {
+fn render_computed(
+    message: &mut Message,
+    tags: &PartTags,
+    computed: ComputedTags,
+    render: bool,
+    notice_labels: bool,
+) {
     let role = message.role;
     for (block, number) in message.content.iter_mut().zip(tags.parts.iter()) {
         let number = number.filter(|_| render);
@@ -569,7 +609,7 @@ fn render_computed(message: &mut Message, tags: &PartTags, computed: ComputedTag
                     }
                     ToolOutput::Json { .. } => {}
                     ToolOutput::Parts { parts } => {
-                        let (kind, index) = parts_numbering(parts);
+                        let (kind, index) = parts_numbering(parts, notice_labels);
                         if let Some(index) = index {
                             if let crate::ToolOutputPart::Text { text } = &mut parts[index] {
                                 *text = cortexkit_role_llm_runner::tags::render_counted_text(
@@ -614,7 +654,7 @@ pub fn clean_computed_into(messages: &mut [Message]) {
         };
         message.tags.rendered = true;
         if computed.clean {
-            render_computed(message, &tags, computed, false);
+            render_computed(message, &tags, computed, false, false);
         }
     }
 }
@@ -636,6 +676,50 @@ pub fn part_key(ordinal: u64, index: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_frozen_imported_notice_parts_keep_their_text_bytes() {
+        let notices = [
+            "[image/png not shown to the model: this runner does not pass tool images to models yet]",
+            "[media not shown: kind=image mime=image/png bytes=69 sha256=b1ff9c8ea3a7 reason=store_failed]",
+        ];
+        let mut message: Message = serde_json::from_value(serde_json::json!({
+            "role":"tool", "content":[{"type":"tool_result", "tool_call_id":"photo",
+                "output":{"kind":"parts", "parts":notices.map(|text| serde_json::json!({"kind":"text", "text":text}))}}]
+        })).unwrap();
+        number_message(
+            &mut message,
+            ComputedRules {
+                render: true,
+                clean: false,
+            },
+            &mut 6,
+        )
+        .unwrap();
+        let recorded = serde_json::json!({"family_id":"anthropic_messages", "renderer_version":2});
+        let restored: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&recorded).unwrap()).unwrap();
+        render_tags_into(
+            std::slice::from_mut(&mut message),
+            TagRendering::for_render_config(&restored),
+        );
+        let ContentBlock::ToolResult(result) = &message.content[0] else {
+            panic!("imported tool result")
+        };
+        assert_eq!(
+            result.output,
+            ToolOutput::Parts {
+                parts: vec![
+                    crate::ToolOutputPart::Text {
+                        text: format!("§7§ {}", notices[0])
+                    },
+                    crate::ToolOutputPart::Text {
+                        text: notices[1].into()
+                    },
+                ]
+            }
+        );
+    }
+
     #[test]
     fn resolve_non_text_content_preserves_the_stored_encoding() {
         let block = super::ContentBlock::Reasoning {

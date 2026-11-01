@@ -101,8 +101,6 @@ pub mod run_events;
 #[cfg(all(feature = "test-attachments", not(debug_assertions)))]
 compile_error!("test-attachments is a non-shipping feature");
 
-static MEDIA_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
 static SERVICE_TIER_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Fix service-tier admission and discovery before serving requests. Restart to change it.
@@ -126,29 +124,5 @@ pub fn frozen_service_tier(render: &serde_json::Value) -> &'static str {
         Some("priority" | "fast") => "fast",
         _ if render.get("speed").and_then(serde_json::Value::as_str) == Some("fast") => "fast",
         _ => "standard",
-    }
-}
-
-/// Fix media admission for the process before opening stores or serving requests.
-/// Changing the operator setting requires a restart, not a per-request decision.
-pub fn configure_media(enabled: bool) -> Result<(), &'static str> {
-    MEDIA_ENABLED
-        .set(enabled)
-        .map_err(|_| "media.enabled was already configured; restart broca to change it")
-}
-
-/// The boot decision, or the non-shipping opt-in used by attachment test rigs.
-pub fn attachments_enabled() -> bool {
-    if let Some(enabled) = MEDIA_ENABLED.get() {
-        return *enabled;
-    }
-    #[cfg(all(feature = "test-attachments", debug_assertions))]
-    {
-        std::hint::black_box("broca-nonshipping-attachments-v1");
-        true
-    }
-    #[cfg(not(all(feature = "test-attachments", debug_assertions)))]
-    {
-        false
     }
 }

@@ -99,6 +99,9 @@ pub enum ControlUnit {
     Paused {
         run_id: RunId,
         reason: PauseReason,
+        /// The durable same-selection send floor for a timed account pause.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_not_before_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<SharedProviderError>,
     },
@@ -556,6 +559,7 @@ mod tests {
     #[test]
     fn control_pause_serializes_provider_unavailable_as_shared_transient() {
         let paused_wire = serde_json::to_value(ControlUnit::Paused {
+            resume_not_before_ms: None,
             run_id: RunId("run-1".into()),
             reason: PauseReason::AuthRequired,
             error: Some(unavailable_error().into()),

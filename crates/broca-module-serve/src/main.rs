@@ -143,8 +143,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(ServeIoError)?;
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
-    let media = broca_module_serve::config::MediaConfig::load_default().map_err(ServeIoError)?;
-    broca_protocol::configure_media(media.enabled).map_err(|error| ServeIoError(error.into()))?;
+    broca_module_serve::config::warn_obsolete_media_default().map_err(ServeIoError)?;
     let service_tier =
         broca_module_serve::config::ServiceTierConfig::load_default().map_err(ServeIoError)?;
     broca_protocol::configure_service_tier(service_tier.enabled)
@@ -243,6 +242,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // The operator switches for content-filter fallback, both layers under one key. A malformed
     // block refuses boot by name, like the sections above; without one, both stay off.
     let anthropic_fallbacks = broca_module_serve::config::AnthropicFallbackConfig::load_default()
+        .map_err(ServeIoError)?;
+    let account_limit_pause = broca_module_serve::config::AccountLimitPauseConfig::load_default()
         .map_err(ServeIoError)?;
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
@@ -504,6 +505,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Both content-filter fallback switches, read above with the other early config so the
     // refusal mapping can take its own switch from the same block.
     executor_impl = executor_impl.with_anthropic_fallbacks(anthropic_fallbacks);
+    executor_impl = executor_impl.with_account_limit_pause(account_limit_pause.enabled);
     let charge_basis_table = Arc::new(ChargeBasisTable::load_default_path().map_err(ServeIoError)?);
     if let Some(notice) = charge_basis_table.ignored_version_notice() {
         tracing::warn!(target: "billing", "{notice}");
@@ -3075,6 +3077,7 @@ mod executor {
         /// The operator switches and refusal-resend model mapping for Anthropic OAuth runs.
         /// Consulted only at admission; a resume keeps its recorded policy. Both switches default off.
         anthropic_fallbacks: broca_module_serve::config::AnthropicFallbackConfig,
+        account_limit_pause: bool,
         /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
         /// its WAL could not be read), so the WAL is read for it at most once per session.
         cc_suffix_memo: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
@@ -3188,6 +3191,7 @@ mod executor {
                 routing: None,
                 claude_code_install_id: None,
                 anthropic_fallbacks: Default::default(),
+                account_limit_pause: false,
                 cc_suffix_memo: Default::default(),
                 cc_suffix_wal_bytes: Default::default(),
                 cc_prompt_memo: Default::default(),
@@ -3332,6 +3336,11 @@ mod executor {
             config: broca_module_serve::config::AnthropicFallbackConfig,
         ) -> Self {
             self.anthropic_fallbacks = config;
+            self
+        }
+
+        pub fn with_account_limit_pause(mut self, enabled: bool) -> Self {
+            self.account_limit_pause = enabled;
             self
         }
 
@@ -4481,7 +4490,7 @@ mod executor {
                 None
             };
             let resolve_options = broca_catalog::live::ResolveOptions {
-                media: fresh_episode && broca_protocol::attachments_enabled(),
+                media: fresh_episode,
                 media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
                 claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,
@@ -4665,11 +4674,7 @@ mod executor {
                 }
             }
 
-            let uploads = if broca_protocol::attachments_enabled() {
-                self.wal_store.uploads()
-            } else {
-                None
-            };
+            let uploads = self.wal_store.uploads();
             if let Some(uploads) = uploads.filter(|_| {
                 resolved.provider.supports_media_renderer()
                     && (job.has_media_input()
@@ -4689,31 +4694,18 @@ mod executor {
                 let wal = Arc::clone(&self.wal_store);
                 let session = job.req.session.clone();
                 let head = job.writer.durable_head();
-                // File identity and length are metadata reads, not a WAL decode. Capture them
-                // before this executor appends so the first media tail can be strictly anchored.
-                let initial_anchor = self
-                    .wal_store
-                    .file_identity(&session)
-                    .ok()
-                    .flatten()
-                    .zip(self.wal_store.live_wal_bytes(&session).ok().flatten())
-                    .map(|(file_id, byte_end)| broca_wal::WalByteAnchor {
-                        file_id,
-                        byte_end,
-                        seq: prior_snapshot.head_seq,
-                    });
-                let anchor = std::sync::Mutex::new(initial_anchor);
-                let checkpoint = match &prior_snapshot.checkpoint_at_head.media {
-                    Some(broca_core::media_request::DurableMediaSeed::Ready(seed)) => {
-                        Ok((**seed).clone())
-                    }
-                    Some(broca_core::media_request::DurableMediaSeed::Unreadable(_)) => {
-                        Err("media_seed_undecodable after admission replay".into())
-                    }
-                    None => job.writer.empty_media_checkpoint(prior_snapshot.head_seq),
-                };
-                let checkpoint = match checkpoint {
-                    Ok(checkpoint) => checkpoint,
+                let initialized = broca_core::media_request::initialize_media_checkpoint(
+                    &job.writer,
+                    Arc::clone(&self.wal_store),
+                    &session,
+                    prior_snapshot,
+                )
+                .await;
+                let broca_core::media_request::InitializedMedia {
+                    checkpoint,
+                    anchor: initial_anchor,
+                } = match initialized {
+                    Ok(initialized) => initialized,
                     Err(error) => {
                         let error = RunError::Wal(error);
                         if let Some(ack) = job.on_admitted {
@@ -4722,6 +4714,7 @@ mod executor {
                         return Err(error);
                     }
                 };
+                let anchor = std::sync::Mutex::new(initial_anchor);
                 let frozen: broca_provider::wire::FrozenRenderConfig =
                     serde_json::from_value(resolved.provider.render_config_blob())
                         .expect("resolved provider has a frozen config");
@@ -4844,6 +4837,7 @@ mod executor {
             // method-qualified vault credential id.
             let mut control = job.control;
             control.compaction_signals = self.compaction_signals;
+            control.account_limit_pause = self.account_limit_pause;
             control.hook_plane = self.hook_plane();
             // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
             // the durable WAL projector. The actor's live-output task discards those same units,
@@ -5100,6 +5094,8 @@ mod executor {
             )
             .unwrap();
             let mut wrong = broca_core::PriorWalSnapshot {
+                lineage_id: None,
+                anchor: None,
                 base_watermark: 0,
                 head_seq: witness.sequence(),
                 checkpoint_at_base: None,
@@ -6625,6 +6621,14 @@ mod executor {
                     true,
                 ),
                 (
+                    "account-limit pause",
+                    run_outcome(
+                        RunFinishReason::Interrupted,
+                        Some(PauseReason::AccountLimit),
+                    ),
+                    false,
+                ),
+                (
                     "terminal error",
                     run_outcome(RunFinishReason::Error, None),
                     true,
@@ -6656,8 +6660,7 @@ mod executor {
                 ),
             ];
 
-            // PauseReason currently has no non-auth variant. TransformUnavailable is the
-            // other resumable outcome and is represented by a finish reason with paused=None.
+            // An account-limit pause does not authorize a vault auth-failure report.
             for (name, outcome, expected) in cases {
                 assert_eq!(should_check_wire_auth(&outcome), expected, "{name}");
             }

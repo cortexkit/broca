@@ -332,6 +332,9 @@ fn check_recovery_finding(remove_raw: bool) {
     assert!(!serde_json::to_string(&reply)
         .unwrap()
         .contains("private removed content"));
+    // Close the store before deleting its folder: Windows refuses to delete an open file
+    // (OS error 32).
+    drop(index);
     std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
@@ -418,10 +421,12 @@ fn legacy_diagnostics_never_reads_recovery_manifests() {
     );
     let owner = principal();
     let head = scope(owner.clone(), ScopeKind::Head, false, true);
-    let recording =
-        std::sync::Arc::new(broca_crash_harness::power_loss::RecordingFs::new(&root).unwrap());
+    // The trace only needs to observe attempted file operations, so it wraps the real file
+    // system. The power-loss recorder would also work on Unix, but it refuses a non-empty root
+    // on Windows, where std cannot establish hard-link identity.
     let trace = std::sync::Arc::new(broca_crash_harness::io_trace::IoTraceFs::new(
-        &root, recording,
+        &root,
+        std::sync::Arc::new(broca_wal::fs_ops::RealFs),
     ));
     let reply = broca_wal::fs_ops::with_fs_ops(trace.clone(), || {
         serving_reply(json!({}), Some(&owner), &head, Ok(100), NOW)

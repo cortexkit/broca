@@ -853,8 +853,79 @@ pub fn is_image_only_notice(text: &str) -> bool {
         })
 }
 
+pub(crate) fn is_generated_image_notice(line: &str) -> bool {
+    let Some(fields) = line
+        .strip_prefix("[media not shown: kind=image mime=")
+        .and_then(|fields| fields.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let Some((fields, reason)) = fields.rsplit_once(" reason=") else {
+        return false;
+    };
+    let Some((fields, digest)) = fields.rsplit_once(" sha256=") else {
+        return false;
+    };
+    let Some((mime, bytes)) = fields.rsplit_once(" bytes=") else {
+        return false;
+    };
+    !mime.is_empty()
+        && !mime.contains(['[', ']', '\n'])
+        && bytes.parse::<u64>().is_ok()
+        && digest.len() == 12
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && MediaMarkerReason::deserialize(serde::de::value::StrDeserializer::<
+            serde::de::value::Error,
+        >::new(reason))
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generated_image_notices_are_image_only_but_real_text_and_other_kinds_are_not() {
+        use super::*;
+        let image = MediaRef {
+            kind: MediaKind::Image,
+            mime: "image/png; name=locator".into(),
+            byte_size: 2,
+            sha256: "a".repeat(64),
+            width: Some(1),
+            height: Some(1),
+        };
+        for reason in [
+            MediaMarkerReason::Mime,
+            MediaMarkerReason::Undecodable,
+            MediaMarkerReason::StoreFailed,
+        ] {
+            let line = media_not_shown_marker(&image, reason);
+            assert!(is_generated_image_notice(&line), "{line}");
+            assert!(!is_image_only_notice(&line));
+            assert!(!is_generated_image_notice(&format!(
+                "{line}\nactual tool text"
+            )));
+            assert!(!is_generated_image_notice(&format!("{line}\n")));
+        }
+        let document = MediaRef {
+            kind: MediaKind::Document,
+            mime: "application/pdf".into(),
+            width: None,
+            height: None,
+            ..image
+        };
+        assert!(!is_generated_image_notice(&media_not_shown_marker(
+            &document,
+            MediaMarkerReason::StoreFailed
+        )));
+        for malformed in [
+            "[media not shown: kind=image mime=image/png bytes=two sha256=aaaaaaaaaaaa reason=mime]",
+            "[media not shown: kind=image mime=image/png bytes=2 sha256=bad reason=mime]",
+            "[media not shown: kind=image mime=image/png bytes=2 sha256=aaaaaaaaaaaa reason=unknown]",
+        ] {
+            assert!(!is_generated_image_notice(malformed), "{malformed}");
+        }
+    }
+
     #[test]
     fn image_only_notices_are_recognised_and_mixed_content_is_not() {
         use super::{dropped_media_notice, is_image_only_notice};

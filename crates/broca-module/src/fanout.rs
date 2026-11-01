@@ -678,8 +678,7 @@ impl<W: WalStore + 'static> Fanout<W> {
         source_enabled: bool,
     ) -> (Self, broca_core::RecordObserver) {
         let approvals = Arc::new(crate::approval_state::ApprovalState::default());
-        let media_head = broca_protocol::attachments_enabled()
-            .then(|| Arc::new(crate::registry::media_head::Live::default()));
+        let media_head = Some(Arc::new(crate::registry::media_head::Live::default()));
         let source_warm = source_enabled.then(crate::source_warm::Events::default);
         let ring = LazyRing::new(RING_CAPACITY);
         let display_ring = DisplaySender::new(DISPLAY_RING_CAPACITY);

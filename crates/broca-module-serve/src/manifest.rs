@@ -355,13 +355,11 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             ),
         },
     ];
-    if broca_protocol::attachments_enabled() {
-        operations.push(ManagementOperation {
-            name: cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
-            kind: ManagementOperationKind::Query,
-            description: Some("Read bounded media bytes referenced by the bound session.".into()),
-        });
-    }
+    operations.push(ManagementOperation {
+        name: cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
+        kind: ManagementOperationKind::Query,
+        description: Some("Read bounded media bytes referenced by the bound session.".into()),
+    });
     operations
 }
 

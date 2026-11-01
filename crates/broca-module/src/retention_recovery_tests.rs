@@ -2,14 +2,14 @@ use super::*;
 
 const PRIVATE_CUT: &str = "private-retention-cut-content";
 
-fn seed_cut_artifacts(rig: &Rig) -> (String, Vec<String>) {
+fn seed_cut_artifacts<I>(rig: &Rig<I>) -> (String, Vec<String>) {
     let id = rig.seed(1, 100, Some(200));
     let _lease = rig.service.lease(&rig.key).unwrap();
     let names = add_cut_artifacts(rig, &id);
     (id, names)
 }
 
-fn add_cut_artifacts(rig: &Rig, id: &str) -> Vec<String> {
+fn add_cut_artifacts<I>(rig: &Rig<I>, id: &str) -> Vec<String> {
     let path = rig.service.wal.ephemeral_wal_path(&rig.key);
     let mut wal = rig
         .service
@@ -101,7 +101,7 @@ fn leased_completion_removes_raw_manifest_and_orphan_cut_content() {
         .is_some());
 }
 
-fn prepare_stone(rig: &Rig, id: String, names: &[String]) -> Tombstone {
+fn prepare_stone<I>(rig: &Rig<I>, id: String, names: &[String]) -> Tombstone {
     let captured = rig
         .service
         .capture_recovery_artifacts(&rig.service.wal.ephemeral_wal_path(&rig.key))
@@ -193,14 +193,12 @@ fn retention_completion_child() {
         root.join("wal"),
         broca_wal::WalConfig::OVERHAUL,
     ));
-    let store = Arc::new(
-        SqliteStore::open(root.join("run-index.db"))
-            .unwrap()
-            .with_wal_config(broca_wal::WalConfig::OVERHAUL),
-    );
+    let store = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+    for name in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
+        assert!(!root.join(name).exists());
+    }
     let leases = Arc::new(broca_core::FileLeaseStore::new(root.join("leases")));
-    let resolver = Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1));
-    let service = RetentionService::new(wal, store.clone(), leases, store, resolver).unwrap();
+    let service = RetentionService::without_usage_export(wal, store, leases).unwrap();
     let _lease = service.lease(&key).unwrap();
     let stone = service.tombstones(&key).unwrap().pop().unwrap();
     let mut step = 0;

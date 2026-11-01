@@ -1386,6 +1386,10 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             held_calls: state.held_calls,
         },
         State::Paused => RunStatusResponse::Paused {
+            resume_not_before_ms: state
+                .account_limit_pause
+                .as_ref()
+                .map(|pause| pause.resume_not_before_ms),
             auth_selection,
             pause_reason: state
                 .pause_reason
@@ -1393,6 +1397,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
                     matches!(
                         reason,
                         broca_protocol::PauseReason::Restart
+                            | broca_protocol::PauseReason::AccountLimit
                             | broca_protocol::PauseReason::ToolHeld
                     )
                 })
@@ -2512,9 +2517,7 @@ impl ServeHandler for crate::LineageRegistry {
                 Some(broca_protocol::ErrorClass::Permanent),
             )
         })?;
-        if broca_protocol::attachments_enabled()
-            && req.media == cortexkit_role_llm_runner::read::MediaMode::Inline
-        {
+        if req.media == cortexkit_role_llm_runner::read::MediaMode::Inline {
             page.render_inline_media();
         }
         let subject = model_group_reply_too_large_subject(&page);
@@ -3270,11 +3273,7 @@ impl ServeHandler for crate::LineageRegistry {
             .await?;
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Blocks {
             for entry in &mut response.messages {
-                if broca_protocol::attachments_enabled() {
-                    entry.show_media_blocks_with_identity();
-                } else {
-                    entry.show_media_blocks();
-                }
+                entry.show_media_blocks_with_identity();
             }
         }
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
@@ -3355,23 +3354,19 @@ impl ServeHandler for crate::LineageRegistry {
                 .find_map(|framed| broca_core::record_time_ms(&framed.record))
                 .unwrap_or(0),
         };
-        let media_facts = if broca_protocol::attachments_enabled() {
-            Some(
-                self.media_facts_for_head(
-                    session,
-                    crate::registry::media_head::Request {
-                        lineage: lineage_id,
-                        at_seq,
-                        run_id: page.lineage_state.last_run_id.as_ref(),
-                        state: page.lineage_state.state.as_str(),
-                        model: head_facts.model.as_ref(),
-                    },
-                )
-                .await?,
+        let media_facts = Some(
+            self.media_facts_for_head(
+                session,
+                crate::registry::media_head::Request {
+                    lineage: lineage_id,
+                    at_seq,
+                    run_id: page.lineage_state.last_run_id.as_ref(),
+                    state: page.lineage_state.state.as_str(),
+                    model: head_facts.model.as_ref(),
+                },
             )
-        } else {
-            None
-        };
+            .await?,
+        );
         let interrupted_reason = if page.lineage_state.state.as_str() == "interrupted" {
             if let Some(facts) = &media_facts {
                 facts.interrupt_reason.clone()
