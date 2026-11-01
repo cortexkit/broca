@@ -229,7 +229,7 @@ rebuilds or rewrites the live key itself.
 
 The flat-session-key projection tables checked for cleanup are `meta`, `message`,
 `message_tag`, `episode_span`, `retention_lineage`, `retained_head`,
-`compaction_facts`, `bus_event_projection` and `bus_event_open`. Preview lists
+`compaction_facts`, `display_fact`, `display_fact_seed`, `bus_event_projection` and `bus_event_open`. Preview lists
 every existing table with a `session` column and its exact stale-key row count;
 `remove` identifies the known projections. An unrecognized table with stale-key
 rows refuses rather than risking authoritative data. Tables using JSON identities

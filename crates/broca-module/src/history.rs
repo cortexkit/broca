@@ -297,6 +297,17 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
                         .iter()
                         .find(|fact| fact.tool_call_id == call.tool_call_id.0)
                         .and_then(|fact| fact.call_key.clone());
+                    if let Some(time) = entry
+                        .tool_times
+                        .iter()
+                        .find(|time| time.tool_call_id == call.tool_call_id.0)
+                    {
+                        part.call_key = time.call_key.clone();
+                        part.schema_pin = time.schema_pin.clone();
+                        part.started_at = time.started_at;
+                        part.finished_at = time.finished_at;
+                        part.unanswered = time.unanswered.clone();
+                    }
                     DisplayPart::ToolCall(part)
                 }
                 ContentBlock::ToolResult(result) => {
@@ -454,6 +465,7 @@ pub async fn read<H: ServeHandler + ?Sized>(
         let mut read = SessionReadRequest::new(session.clone(), Some(from), Some(stop - from));
         read.lineage_id = Some(lineage.clone());
         read.include_rich_ui = request.form() == HistoryForm::Display;
+        read.include_display_facts = request.form() == HistoryForm::Display;
         read.max_bytes = Some(broca_wire::READ_MAXIMUM_MAX_BYTES);
         // Display needs stored payloads; raw history honors the caller's descriptor choice.
         read.media = if request.form() == HistoryForm::Display {
@@ -515,6 +527,13 @@ pub async fn read<H: ServeHandler + ?Sized>(
             }
             if let Some(metadata) = metadata.get(&entry.ordinal) {
                 for call in row.tool_calls_mut() {
+                    if entry
+                        .tool_times
+                        .iter()
+                        .any(|time| time.tool_call_id == call.tool_call_id)
+                    {
+                        continue;
+                    }
                     call.schema_pin = metadata.tool_pins.get(&call.tool_call_id).and_then(|pin| {
                         cortexkit_role_tool_provider::call::SchemaPin::new(
                             &call.name,

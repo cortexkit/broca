@@ -71,6 +71,8 @@ const PROJECTION_TABLES: &[&str] = &[
     "bus_event_open",
     "bus_event_projection",
     "compaction_facts",
+    "display_fact",
+    "display_fact_seed",
     "episode_span",
     "message",
     "message_tag",

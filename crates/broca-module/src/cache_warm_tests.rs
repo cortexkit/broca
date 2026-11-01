@@ -895,6 +895,7 @@ impl Fixture {
                 limit: Some(100),
                 include_tools: false,
                 include_rich_ui: false,
+                include_display_facts: false,
                 after_mid: None,
                 lineage_id: None,
                 max_bytes: None,

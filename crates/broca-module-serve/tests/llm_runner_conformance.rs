@@ -2306,6 +2306,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::RenderedModelInput,
             Capability::DeliveryOrder,
             Capability::SenderSuccession,
+            Capability::ReadDisplayFacts,
             Capability::Compaction,
             Capability::ModelView,
             Capability::ClientMessageId,
@@ -3759,6 +3760,9 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "sender_succession_predecessor_status",
         "sender_succession_undeclared_refused",
         "delivery_deadline_retry_keeps_original_expiry",
+        "read_display_facts_default_absent",
+        "read_display_facts_opt_in_envelope",
+        "read_display_facts_undeclared_refused",
     ] {
         let case = report
             .cases
@@ -3770,6 +3774,30 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
                 case.outcome,
                 CaseOutcome::Passed | CaseOutcome::Inapplicable { .. }
             ),
+            "{}",
+            report.render()
+        );
+    }
+    for name in [
+        "message_checkpoint_numbering_starts_at_message_count",
+        "message_checkpoint_head_matches_certified_cut",
+        "message_checkpoint_anchors_after_folded_message",
+        "message_checkpoint_native_marker_carries_both_counters",
+        "message_checkpoint_missing_counter_is_not_zero",
+        "message_checkpoint_uncounted_rows_never_served",
+        "message_checkpoint_head_during_setup_uses_marker",
+        "message_checkpoint_read_during_adoption_setup",
+    ] {
+        let case = report
+            .cases
+            .iter()
+            .find(|case| case.case == name)
+            .expect(name);
+        assert_eq!(
+            case.outcome,
+            CaseOutcome::Inapplicable {
+                reason: "runner does not declare message_checkpoint".into()
+            },
             "{}",
             report.render()
         );

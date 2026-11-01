@@ -746,6 +746,31 @@ pub struct TagLocation {
 
 /// The materialized store read seam. The loop depends only on this trait.
 pub trait MaterializedStore: Send + Sync {
+    /// Display facts are an opt-in, per-lineage cache. A missing seed requires one lazy
+    /// backfill for this session only; default transcript reads never call this seam.
+    fn read_display_facts_cache(
+        &self,
+        _session: &BindIdentity,
+        _lineage: &str,
+        _at_seq: u64,
+        _ordinals: &[u64],
+    ) -> Result<Option<crate::display_facts::DisplayFactsCache>, String> {
+        Ok(None)
+    }
+
+    /// Publish fact versions and their complete continuation in one transaction. An expected
+    /// sequence mismatch means another reader won, not permission to overwrite its seed.
+    fn publish_display_facts(
+        &self,
+        _session: &BindIdentity,
+        _lineage: &str,
+        _expected_seq: Option<u64>,
+        _seed: &crate::display_facts::DisplayFactsSeed,
+        _versions: &[crate::display_facts::DisplayFactVersion],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     fn read_retained_head(
         &self,
         _session: &BindIdentity,

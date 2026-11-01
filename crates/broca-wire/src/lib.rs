@@ -940,6 +940,9 @@ pub struct ReadParams {
     /// Expose the frozen teaching stamp on assistant entries only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_rich_ui: bool,
+    /// Opt in to stored client identity and per-call timing beside each message, never in it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_display_facts: bool,
     /// Read strictly after the message with this `mid`, taken from an earlier page of the
     /// lineage `lineage_id` names. Refused `unknown_mid` when that lineage has no such message,
     /// never answered with the newest page instead. Requires `lineage_id`, and cannot be combined
@@ -1093,6 +1096,10 @@ fn serialize_read_message<S: serde::Serializer>(
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_times: Vec<cortexkit_role_llm_runner::read::ToolTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rich_ui: Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written_at: Option<u64>,
@@ -1175,6 +1182,10 @@ impl Serialize for SessionReadMessage {
             part_digests: &'a Option<Vec<cortexkit_role_llm_runner::read::descriptors::PartDigest>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             rich_ui: &'a Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            client_message_id: &'a Option<String>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            tool_times: &'a [cortexkit_role_llm_runner::read::ToolTime],
         }
         Wire {
             written_at: self.written_at,
@@ -1188,6 +1199,8 @@ impl Serialize for SessionReadMessage {
             digest: &self.digest,
             part_digests: &self.part_digests,
             rich_ui: &self.rich_ui,
+            client_message_id: &self.client_message_id,
+            tool_times: &self.tool_times,
         }
         .serialize(serializer)
     }
@@ -1413,6 +1426,8 @@ pub fn describe_resolved_part(
         message.content.get(index).cloned().into_iter().collect(),
     );
     let mut entry = SessionReadMessage {
+        client_message_id: None,
+        tool_times: Vec::new(),
         rich_ui: None,
         written_at: None,
         ordinal,
@@ -5978,6 +5993,8 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            client_message_id: None,
+            tool_times: Vec::new(),
             rich_ui: None,
             written_at: None,
             delivered_as: None,
@@ -6373,6 +6390,8 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            client_message_id: None,
+            tool_times: Vec::new(),
             rich_ui: None,
             written_at: None,
             delivered_as: None,

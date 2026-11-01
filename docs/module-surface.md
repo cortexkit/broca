@@ -1444,6 +1444,30 @@ Each item carries both `ordinal` and `mid: "m<ordinal>"`; `mid` is the MC-coordi
 spelling used by consumers. Chunking is required for large transcripts because subc has a
 per-frame cap and closes a full egress queue.
 
+**Display facts (opt-in).** Broca declares `read_display_facts`. On transcript reads,
+`include_display_facts: true` adds a stored `client_message_id` to its user entry and
+`tool_times` to an assistant entry carrying calls, beside `mid`, never inside `message`.
+Calls remain in message order. `started_at` is the recorded dispatch time;
+`finished_at` is that call's recorded answer time, not the batch's closing time.
+`unanswered` names a recorded closure without an answer (`interrupted`, `cancelled`,
+`denied` or `not_executed`). Missing facts stay absent. Display-history tool parts
+expose the same times and closure reasons. Default transcript reads keep their bytes
+and do not load or build the display cache; raw history does not request these facts.
+Because broca also declares `call_identity`, each call's opt-in timing item copies its
+projected `call_key` and `schema_pin` when known. The key identifies the durable call;
+the pin encodes the tool name, schema digest and semantics version frozen at dispatch.
+Both read envelopes and display rows
+use the same stored strings, not a current tool catalog. A prepared call declined before
+dispatch keeps its key but has no dispatch schema pin.
+
+The first opt-in read lazily backfills only its own session's rebuildable display
+projection. Fact versions and a versioned continuation (the last processed log sequence
+plus pending-message and tool-batch state) commit atomically, so a failed
+backfill remains incomplete and retries on demand. Later reads select only their page's
+rows and fold the bounded WAL suffix since that continuation. No boot-time sweep visits
+historical sessions. Retention expiry removes the cache and prevents a racing reader
+from repopulating an expired lineage.
+
 **Rich UI teaching stamp.** Broca declares `rich_ui_stamp`. A teaching provider's fetched
 `system_text.rich_ui` value (`{dialect, catalog_digest}`) is frozen at admission, never read
 from caller-supplied metadata or fetched again for later runs. Conflicting stamps refuse

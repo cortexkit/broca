@@ -42,6 +42,130 @@ async fn one_tool_turn(tag: &str) -> (Rig, String) {
     (rig, run_id)
 }
 
+#[tokio::test]
+async fn display_facts_opt_in_preserves_default_and_matches_stored_times() {
+    let mut rig = Rig::start("read-display-facts").await;
+    *rig.script.schema_pin.lock().unwrap() = Some(broca_wal::DispatchSchemaPin {
+        schema_digest: "a".repeat(64),
+        semantics: 7,
+    });
+    rig.script
+        .push(&[Step::Call("facts-call"), Step::Text("answer")]);
+    let active = rig
+        .send_with(
+            "facts-turn",
+            "hi",
+            None,
+            serde_json::json!({"client_message_id":"phone_facts_1"}),
+        )
+        .await;
+    let run = result(&active)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let default = call(&mut rig, "session.read", serde_json::json!({})).await;
+    let plain = result(&default);
+    let lineage = plain["lineage_id"].as_str().unwrap();
+    let mut baseline = normalized(&default.body, &run, lineage);
+    for entry in plain["messages"].as_array().unwrap() {
+        if let Some(at) = entry["written_at"].as_u64() {
+            baseline = baseline.replace(
+                &format!("\"written_at\":{at},"),
+                "\"written_at\":\"@RECORDED_TIME@\",",
+            );
+        }
+        assert!(entry.get("client_message_id").is_none());
+        assert!(entry.get("tool_times").is_none());
+    }
+    if std::env::var_os("BROCA_CAPTURE_DISPLAY_BASELINE").is_some() {
+        std::fs::write(
+            golden_path("session_read.default_display_facts_baseline.json"),
+            &baseline,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        baseline,
+        pinned("session_read.default_display_facts_baseline.json")
+    );
+    let decorated = call(
+        &mut rig,
+        "session.read",
+        serde_json::json!({"include_display_facts":true}),
+    )
+    .await;
+    let facts = result(&decorated);
+    assert_eq!(facts["messages"][0]["client_message_id"], "phone_facts_1");
+    let mut stripped = facts.clone();
+    for entry in stripped["messages"].as_array_mut().unwrap() {
+        let entry = entry.as_object_mut().unwrap();
+        entry.remove("client_message_id");
+        entry.remove("tool_times");
+    }
+    assert_eq!(plain, stripped);
+    let records = rig.records();
+    let started = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::ToolDispatchIntent {
+                tool_call_id,
+                dispatched_at_ms,
+                ..
+            } if tool_call_id.0 == "facts-call" => *dispatched_at_ms,
+            _ => None,
+        })
+        .unwrap();
+    let finished = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::ToolResult {
+                result,
+                finished_at_ms,
+                ..
+            } if result.tool_call_id.0 == "facts-call" => *finished_at_ms,
+            _ => None,
+        })
+        .unwrap();
+    let times = &facts["messages"][1]["tool_times"];
+    assert_eq!(times.as_array().unwrap().len(), 1);
+    assert_eq!(times[0]["tool_call_id"], "facts-call");
+    assert_eq!(times[0]["started_at"], started);
+    assert_eq!(times[0]["finished_at"], finished);
+    let history = call(
+        &mut rig,
+        "session.history",
+        serde_json::json!({"form":"display"}),
+    )
+    .await;
+    let history_page = result(&history);
+    let tool = &history_page["messages"][1]["row"]["parts"][0];
+    assert_eq!(tool["started_at"], started);
+    assert_eq!(tool["finished_at"], finished);
+    assert!(tool.get("unanswered").is_none());
+    assert!(tool["call_key"].is_string());
+    assert!(tool["schema_pin"].is_string());
+    assert_eq!(times[0]["call_key"], tool["call_key"]);
+    assert_eq!(times[0]["schema_pin"], tool["schema_pin"]);
+    if let Some(path) = std::env::var_os("BROCA_DISPLAY_FACTS_SAMPLES") {
+        use sha2::{Digest, Sha256};
+        let path = std::path::PathBuf::from(path);
+        std::fs::create_dir_all(&path).unwrap();
+        let mut sums = String::new();
+        for (name, bytes) in [
+            ("default-read.json", default.body.as_slice()),
+            ("opt-in-read.json", decorated.body.as_slice()),
+            ("history.json", history.body.as_slice()),
+        ] {
+            std::fs::write(path.join(name), bytes).unwrap();
+            sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(bytes)));
+        }
+        let row = serde_json::to_vec(&history_page["messages"][1]).unwrap();
+        std::fs::write(path.join("history-row.json"), &row).unwrap();
+        sums.push_str(&format!("{:x}  history-row.json\n", Sha256::digest(&row)));
+        std::fs::write(path.join("SHA256SUMS"), sums).unwrap();
+    }
+    rig.finish().await;
+}
+
 /// A `session.read` and a `session.subscribe` from the start, each with no params, of a session
 /// whose one run called a tool. Existing member and cursor/unit bytes remain pinned separately
 /// from the default read-entry times, dispatch attribution, live metadata and message boundaries.

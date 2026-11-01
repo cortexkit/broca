@@ -28,6 +28,8 @@ use broca_wal::{DispatchOutcome, FileWal, RunConfig, Wal, WalRecord};
 use tokio::sync::{mpsc, Mutex};
 #[path = "session_read/attribution.rs"]
 mod attribution;
+#[path = "session_read/display_facts.rs"]
+mod display_facts;
 #[path = "session_read/media.rs"]
 mod media;
 #[path = "session_read/run_usage.rs"]
@@ -1757,6 +1759,7 @@ fn read_request(
         limit,
         include_tools: false,
         include_rich_ui: false,
+        include_display_facts: false,
         after_mid: None,
         lineage_id: None,
         max_bytes: None,

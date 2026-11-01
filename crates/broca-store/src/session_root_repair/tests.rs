@@ -617,6 +617,8 @@ fn orphaned_projection_repair_preserves_all_24_run_transcript() {
             "bus_event_open",
             "bus_event_projection",
             "compaction_facts",
+            "display_fact",
+            "display_fact_seed",
             "episode_span",
             "message",
             "message_tag",
@@ -740,6 +742,16 @@ fn orphaned_projection_cleanup_includes_all_flat_key_projection_tables() {
     tx.execute("INSERT INTO message_tag VALUES(?1,1,0,0)", [&key])
         .unwrap();
     for session in [&key, &live] {
+        tx.execute(
+            "INSERT INTO display_fact_seed VALUES(?1,?2,'{}')",
+            params![session, lineage],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO display_fact VALUES(?1,?2,0,1,'{}')",
+            params![session, lineage],
+        )
+        .unwrap();
         tx.execute(
             "INSERT INTO compaction_facts VALUES(?1,?2,'{}')",
             params![session, lineage],

@@ -37,6 +37,7 @@ pub struct SessionReadRequest {
     /// Also return the tool list frozen on the latest episode's `RunStarted`.
     pub include_tools: bool,
     pub include_rich_ui: bool,
+    pub include_display_facts: bool,
     /// Read strictly after the message with this `mid`, taken from an earlier page of the
     /// lineage `lineage_id`. The serve adapter refuses a request that sets it without
     /// `lineage_id`, or together with `from_ordinal`.
@@ -60,6 +61,7 @@ impl SessionReadRequest {
             limit,
             include_tools: false,
             include_rich_ui: false,
+            include_display_facts: false,
             after_mid: None,
             lineage_id: None,
             max_bytes: None,
@@ -520,6 +522,8 @@ fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                client_message_id: None,
+                tool_times: Vec::new(),
                 rich_ui: None,
                 written_at: message.written_at,
                 delivered_as: message
@@ -3117,6 +3121,7 @@ impl ServeHandler for crate::LineageRegistry {
             None => req.from_ordinal,
         };
         let crate::registry::RouteReadPage {
+            at_seq,
             mut page,
             tools,
             dispatches,
@@ -3195,6 +3200,45 @@ impl ServeHandler for crate::LineageRegistry {
         }
         let prompt_len = page.prompt_len;
         let mut response = session_read_response(page, tools);
+        if req.include_display_facts {
+            if let Some(lineage) = &response.lineage_id {
+                let facts = self
+                    .display_facts_for_page(
+                        &req.session,
+                        lineage,
+                        at_seq,
+                        response
+                            .messages
+                            .iter()
+                            .map(|entry| entry.ordinal)
+                            .collect(),
+                    )
+                    .await?;
+                for entry in &mut response.messages {
+                    if let Some(facts) = facts.get(&entry.ordinal) {
+                        if entry.message.role == broca_protocol::Role::User {
+                            entry.client_message_id = facts.client_message_id.clone();
+                        }
+                        entry.tool_times = facts.tool_times.clone();
+                    }
+                    if entry.tool_times.is_empty() {
+                        entry.tool_times = entry
+                            .message
+                            .content
+                            .iter()
+                            .filter_map(|block| match block {
+                                broca_protocol::ContentBlock::ToolCall(call) => {
+                                    Some(cortexkit_role_llm_runner::read::ToolTime::new(
+                                        &call.tool_call_id.0,
+                                    ))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                    }
+                }
+            }
+        }
         if req.include_rich_ui {
             let mut stamps = std::collections::BTreeMap::new();
             for entry in &mut response.messages {

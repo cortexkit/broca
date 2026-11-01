@@ -380,6 +380,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::HOST_HISTORY,
         cortexkit_role_llm_runner::capabilities::HISTORY_DISPLAY,
         cortexkit_role_llm_runner::capabilities::RICH_UI_STAMP,
+        cortexkit_role_llm_runner::capabilities::READ_DISPLAY_FACTS,
         cortexkit_role_llm_runner::capabilities::CALL_IDENTITY,
         cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
@@ -418,7 +419,7 @@ pub fn broca_role_describe_with_writers(
         // idle session starts. `turn_system` has no renderer and is deliberately not advertised.
         DELIVERY_ORDER_GROUP,
         cortexkit_role_llm_runner::capabilities::SENDER_SUCCESSION,
-        // A send's client_message_id lives beside its body and is exposed only on display rows.
+        // Client identity belongs to the display envelope, never to a model-visible message.
         cortexkit_role_llm_runner::capabilities::CLIENT_MESSAGE_ID,
     ]
     .map(String::from)
@@ -1217,7 +1218,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "40543943437aab194b6807a49bd12235173f5ab4e937eafce583b796db57370a",
+            "b224282fbdcdd15bb539b51c71e92c400f56b3f6070ed4a09efdbc894dbc5dd1",
         );
     }
 
@@ -1395,7 +1396,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "54252d781e0ee90e18eb1d4837aa55ec0fe065ae888b956fc90c7b87cc5e39e8";
+        "3d92e8c1b698275853950cd88f7fbd5fb511c27955957854cc60e8955bb059da";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

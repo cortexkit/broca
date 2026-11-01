@@ -390,6 +390,12 @@ impl SqliteStore {
             ));
         }
         if lineage.expired_at_ms.is_some() {
+            for table in ["display_fact", "display_fact_seed"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE lineage=?1 AND session=?2"),
+                    params![lineage.lineage_id, Self::key(&lineage.session)],
+                )?;
+            }
             tx.execute(
                 "DELETE FROM retained_head WHERE lineage_id=?1 AND session=?2",
                 params![lineage.lineage_id, Self::key(&lineage.session)],

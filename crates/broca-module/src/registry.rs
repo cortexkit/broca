@@ -11,6 +11,7 @@
 //! See `docs/lineage-actor-coordinator.md` §1.
 
 use broca_diagnostics::JobKind;
+mod display_facts;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
