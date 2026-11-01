@@ -759,6 +759,7 @@ pub enum CutLockMode {
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 
 struct Inner {
+    run_event_reader: std::sync::OnceLock<Arc<RunEventLookup>>,
     session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
     episode_source: std::sync::OnceLock<Arc<EpisodeReadSource>>,
     session_inventory_readiness: std::sync::OnceLock<Arc<dyn SessionInventoryReadiness>>,
@@ -1107,6 +1108,8 @@ struct ReadSources {
 type EpisodePublication = dyn Fn(&LineageKey, Option<u64>) -> Result<broca_wal::file_wal::DurablePublication, String>
     + Send
     + Sync;
+pub type RunEventLookup =
+    dyn Fn(&str) -> Result<Option<(LineageKey, Vec<u8>)>, String> + Send + Sync;
 
 /// Opt-in database composition. The callback supplies the writer's durable publication
 /// at the sequence requested for an attach, or the latest publication for a page.
@@ -1114,7 +1117,7 @@ type EpisodePublication = dyn Fn(&LineageKey, Option<u64>) -> Result<broca_wal::
 pub struct EpisodeReadSource {
     db: Arc<broca_store::db::OverhaulDb>,
     publication: Arc<EpisodePublication>,
-    gate: Option<Arc<Mutex<()>>>,
+    gate: Option<Arc<broca_store::db::SessionGateFactory>>,
     access: Option<broca_wal::access_counter::WalAccessCounter>,
 }
 
@@ -1129,6 +1132,10 @@ impl EpisodeReadSource {
     }
 
     pub fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
+        self.gate = Some(Arc::new(move |_| gate.clone()));
+        self
+    }
+    pub fn with_session_gates(mut self, gate: Arc<broca_store::db::SessionGateFactory>) -> Self {
         self.gate = Some(gate);
         self
     }
@@ -1165,8 +1172,8 @@ impl EpisodeReadSource {
         head: Option<u64>,
         read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
     ) -> Result<T, String> {
-        let _guard = self
-            .gate
+        let gate = self.gate.as_ref().map(|factory| factory(key));
+        let _guard = gate
             .as_ref()
             .map(|gate| gate.lock().map_err(|e| e.to_string()))
             .transpose()?;
@@ -1199,7 +1206,7 @@ pub(crate) struct RawPageTestBundle {
 pub struct RawPageSource {
     db: Arc<broca_store::db::OverhaulDb>,
     publication: Arc<EpisodePublication>,
-    gate: Option<Arc<Mutex<()>>>,
+    gate: Option<Arc<broca_store::db::SessionGateFactory>>,
 }
 
 impl RawPageSource {
@@ -1212,6 +1219,10 @@ impl RawPageSource {
     }
 
     pub fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
+        self.gate = Some(Arc::new(move |_| gate.clone()));
+        self
+    }
+    pub fn with_session_gates(mut self, gate: Arc<broca_store::db::SessionGateFactory>) -> Self {
         self.gate = Some(gate);
         self
     }
@@ -1223,8 +1234,8 @@ impl RawPageSource {
         limit: Option<u64>,
         tools: bool,
     ) -> Result<Box<RouteReadPage>, OpenError> {
-        let _guard = self
-            .gate
+        let gate = self.gate.as_ref().map(|factory| factory(key));
+        let _guard = gate
             .as_ref()
             .map(|gate| gate.lock().map_err(|e| OpenError::Open(e.to_string())))
             .transpose()?;
@@ -1264,8 +1275,8 @@ impl RawPageSource {
         key: &LineageKey,
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
-        let _guard = self
-            .gate
+        let gate = self.gate.as_ref().map(|factory| factory(key));
+        let _guard = gate
             .as_ref()
             .map(|gate| gate.lock().map_err(|e| OpenError::Open(e.to_string())))
             .transpose()?;
@@ -1327,6 +1338,12 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    pub fn set_run_event_reader(&self, reader: Arc<RunEventLookup>) {
+        assert!(
+            self.inner.run_event_reader.set(reader).is_ok(),
+            "run-event reader already installed"
+        );
+    }
     /// Supply the durable identity inventory before accepting routed session binds.
     pub fn set_session_address_inventory(&self, inventory: Arc<broca_store::SqliteStore>) {
         self.set_session_address_resolver(inventory);
@@ -1514,14 +1531,26 @@ impl LineageRegistry {
         session: &LineageKey,
         event_key: &str,
     ) -> Result<broca_wire::RunEventGetResponse, crate::serve::ServeError> {
-        let Some(store) = self.inner.reader.as_ref().and_then(|r| r.store.clone()) else {
+        let native = self.inner.run_event_reader.get().cloned();
+        let store = self.inner.reader.as_ref().and_then(|r| r.store.clone());
+        if native.is_none() && store.is_none() {
             return Ok(broca_wire::RunEventGetResponse::Absent);
-        };
+        }
+        if native.is_some() {
+            self.check_move(session, false)
+                .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?;
+        }
         let event_key = event_key.to_owned();
         let key = event_key.clone();
-        let row = spawn_blocking(broca_diagnostics::JobKind::StoreRead, move || {
-            store.read_run_event(&key)
-        })
+        let row = spawn_blocking(
+            broca_diagnostics::JobKind::StoreRead,
+            move || match native {
+                Some(reader) => reader(&key),
+                None => store
+                    .ok_or_else(|| "run-event reader unavailable".to_string())?
+                    .read_run_event(&key),
+            },
+        )
         .await
         .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?
         .map_err(|e| crate::serve::ServeError::Open(e, None))?;
@@ -1726,6 +1755,7 @@ impl LineageRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                run_event_reader: std::sync::OnceLock::new(),
                 session_address_inventory: std::sync::OnceLock::new(),
                 episode_source: std::sync::OnceLock::new(),
                 session_inventory_readiness: std::sync::OnceLock::new(),

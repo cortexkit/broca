@@ -37,7 +37,7 @@ impl OverhaulDb {
             let row: Option<(String, Option<String>, u64)> = tx.query_row(
                 "SELECT admission_seed,lineage_id,indexed_seq FROM session WHERE sid=?1",
                 [super::index::sid(bind)?],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_,Option<u64>>(2)?.unwrap_or(0))),
             ).optional()?;
             let Some((encoded, lineage, head)) = row else {
                 return Err(DbError::SeedFallback(SeedFallback::new("admission session index missing")));

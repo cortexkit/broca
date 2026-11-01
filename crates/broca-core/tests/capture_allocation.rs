@@ -55,6 +55,79 @@ fn allocations(operation: impl FnOnce()) -> usize {
     ALLOCATIONS.with(|count| count.replace(None).unwrap())
 }
 
+#[test]
+fn installed_publication_hook_does_not_allocate_at_a_warmed_sync() {
+    use broca_core::{FileWalStore, WalStore};
+    use std::sync::Arc;
+    let root = broca_test_support::scratch_root()
+        .join(format!("publication-allocation-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+    let store = FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL)
+        .with_publication_observer(Arc::new(|_, path, lineage| {
+            let slot = broca_wal::file_wal::PublicationSlot::new(vec![path.to_path_buf()], lineage);
+            Arc::new(move |publication| {
+                slot.record_borrowed(publication);
+                if slot.is_invalid() {
+                    Err("publication identity mismatch")
+                } else {
+                    Ok(())
+                }
+            })
+        }));
+    let wal = store
+        .open(&broca_protocol::BindIdentity::new(
+            "/publication",
+            "test",
+            "sync",
+        ))
+        .unwrap();
+    wal.sync().unwrap();
+    assert_eq!(
+        allocations(|| wal.sync().unwrap()),
+        0,
+        "the installed hook must not clone a path on the sync thread"
+    );
+    drop(wal);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn panicking_publication_hook_fails_sync_without_unwinding() {
+    use broca_core::{FileWalStore, WalStore};
+    use std::sync::Arc;
+    let root = broca_test_support::scratch_root()
+        .join(format!("publication-hook-panic-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+    let bus_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bus = bus_calls.clone();
+    let store = FileWalStore::with_config(root.join("wal"), broca_wal::WalConfig::OVERHAUL)
+        .with_durable_observer(Arc::new(move |_, _, _| {
+            bus.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }))
+        .with_publication_observer(Arc::new(|_, _, _| Arc::new(|_| panic!("observer fault"))));
+    let wal = store
+        .open(&broca_protocol::BindIdentity::new(
+            "/publication",
+            "test",
+            "panic",
+        ))
+        .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wal.sync()));
+    assert!(
+        matches!(outcome, Ok(Err(_))),
+        "observer failure must be an unavailable session, not an unwinding writer"
+    );
+    assert_eq!(
+        bus_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "index failure must not suppress the independent bus subscriber"
+    );
+    drop(wal);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[derive(Default)]
 struct MemoryWal(u64);
 

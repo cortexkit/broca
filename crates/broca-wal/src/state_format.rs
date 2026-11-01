@@ -46,6 +46,37 @@ pub struct WalConfig {
     pub format: WalFormat,
 }
 
+/// A root decision made once at boot. Tokens borrow this checked root rather
+/// than re-reading a marker at each store open.
+pub struct StateRootDecision<'a> {
+    root: &'a Path,
+    config: WalConfig,
+}
+
+pub struct LegacyStateRoot<'a> {
+    root: &'a Path,
+}
+impl LegacyStateRoot<'_> {
+    pub fn root(&self) -> &Path {
+        self.root
+    }
+}
+impl<'a> StateRootDecision<'a> {
+    pub fn config(&self) -> WalConfig {
+        self.config
+    }
+    pub fn legacy(&self) -> Option<LegacyStateRoot<'a>> {
+        (!self.config.is_overhaul()).then_some(LegacyStateRoot { root: self.root })
+    }
+}
+
+pub fn decide_state_root(root: &Path) -> Result<StateRootDecision<'_>, StateRootError> {
+    Ok(StateRootDecision {
+        root,
+        config: classify_state_root(root)?,
+    })
+}
+
 impl WalConfig {
     pub const LEGACY: Self = Self {
         format: WalFormat::Legacy,

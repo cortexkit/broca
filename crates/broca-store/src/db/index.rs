@@ -927,9 +927,10 @@ mod tests {
             assert_eq!(
                 scratch
                     .db
-                    .read_snapshot(|tx| Ok(
-                        tx.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?
-                    ))
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
                 2
             );

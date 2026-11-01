@@ -26,10 +26,24 @@ pub(super) struct Publications {
     db: Arc<OverhaulDb>,
     root: PathBuf,
     slots: Mutex<HashMap<BindIdentity, Arc<PublicationSlot>>>,
-    pub gate: Arc<Mutex<()>>,
+    gates: Mutex<SessionGates>,
+    blocked: Mutex<HashMap<String, String>>,
 }
 
+type SessionGates = HashMap<BindIdentity, std::sync::Weak<Mutex<()>>>;
+
 impl Stores {
+    pub fn open_boot_legacy(
+        root: broca_wal::state_format::LegacyStateRoot<'_>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            legacy: Some(Arc::new(
+                broca_store::SqliteStore::open_boot_legacy(root)
+                    .map_err(|e| format!("open run index: {e}"))?,
+            )),
+            overhaul: None,
+        })
+    }
     /// Legacy store construction stays at its original startup point, after the
     /// held-call runtime has opened. A failed earlier boot must not create its DB.
     pub fn deferred_legacy() -> Self {
@@ -54,7 +68,8 @@ impl Stores {
                     db: db.clone(),
                     root: root.to_path_buf(),
                     slots: Mutex::default(),
-                    gate: Arc::default(),
+                    gates: Mutex::default(),
+                    blocked: Mutex::default(),
                 });
                 Ok(Self {
                     legacy: None,
@@ -71,26 +86,101 @@ impl Stores {
 }
 
 impl Publications {
+    pub fn catch_up_all(&self) -> Result<Vec<BindIdentity>, String> {
+        let sessions: Vec<_> = self
+            .slots
+            .lock()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .filter(|(key, _)| {
+                !self
+                    .blocked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&broca_core::session_addr(key))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut failed = Vec::new();
+        for session in sessions {
+            if self.witness(&session, None).is_err() {
+                failed.push(session);
+            }
+        }
+        Ok(failed)
+    }
+    pub fn gate_for(&self, session: &BindIdentity) -> Arc<Mutex<()>> {
+        let mut gates = self.gates.lock().unwrap_or_else(|e| e.into_inner());
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(session).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(session.clone(), Arc::downgrade(&gate));
+        gate
+    }
+
+    pub fn gate_factory(self: &Arc<Self>) -> Arc<broca_store::db::SessionGateFactory> {
+        let this = self.clone();
+        Arc::new(move |session| this.gate_for(session))
+    }
+
+    pub fn ensure_available(&self, session: &BindIdentity) -> Result<(), String> {
+        if let Some(error) = self
+            .blocked
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(&broca_core::session_addr(session))
+        {
+            return Err(error.clone());
+        }
+        if self
+            .slots
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(session)
+            .is_some_and(|slot| slot.is_invalid())
+        {
+            return Err(format!(
+                "session {} has an invalid publication identity",
+                broca_core::session_addr(session)
+            ));
+        }
+        Ok(())
+    }
     pub fn observer(self: &Arc<Self>) -> Arc<broca_core::wal_writer::PublicationObserverFactory> {
         let this = self.clone();
         Arc::new(move |session, path, lineage| {
             // Registration happens during writer open, not on its sync path.
-            let name = path.file_name().expect("a WAL has a file name");
-            let paths = vec![
-                path.to_path_buf(),
-                this.root.join("wal").join(name),
-                this.root.join("wal-durable").join(name),
-                this.root.join("wal-ephemeral").join(name),
-            ];
-            let slot = Arc::new(PublicationSlot::new(paths, lineage));
-            let mut slots = this.slots.lock().unwrap();
-            if let Some(previous) = slots.get(session).and_then(|slot| slot.snapshot()) {
-                if previous.lineage() == lineage {
-                    slot.record(&previous);
+            let mut paths = vec![path.to_path_buf()];
+            if let Some(name) = path.file_name() {
+                for dir in ["wal", "wal-durable", "wal-ephemeral"] {
+                    paths.push(this.root.join(dir).join(name));
                 }
             }
-            slots.insert(session.clone(), slot.clone());
-            Arc::new(move |publication| slot.record(publication))
+            let slot = Arc::new(PublicationSlot::new(paths, lineage));
+            // Open is under the existing writer exclusion. Retain an acknowledged
+            // prefix until this descriptor publishes its first successful sync.
+            let previous = this.slots.lock().unwrap().get(session).cloned();
+            if let Some(previous) = previous.and_then(|slot| slot.snapshot()) {
+                if std::fs::metadata(path)
+                    .is_ok_and(|metadata| previous.byte_end() <= metadata.len())
+                {
+                    slot.seed_previous(&previous);
+                }
+            }
+            this.slots
+                .lock()
+                .unwrap()
+                .insert(session.clone(), slot.clone());
+            Arc::new(move |publication| {
+                slot.record_borrowed(publication);
+                if slot.is_invalid() {
+                    Err("publication identity mismatch")
+                } else {
+                    Ok(())
+                }
+            })
         })
     }
 
@@ -108,6 +198,37 @@ impl Publications {
         session: &BindIdentity,
         publication: &DurablePublication,
     ) -> Result<(), String> {
+        self.publish_bound(session, publication, false)
+    }
+
+    fn publish_bound(
+        &self,
+        session: &BindIdentity,
+        publication: &DurablePublication,
+        historical: bool,
+    ) -> Result<(), String> {
+        let current = self.db.read_snapshot(|tx| {
+            use rusqlite::OptionalExtension;
+            Ok(tx.query_row("SELECT indexed_seq,indexed_end,lineage_id FROM session WHERE project_root=?1 AND harness=?2 AND session_key=?3",rusqlite::params![session.project_root.to_string_lossy(),session.harness,session.session],|r| Ok((r.get::<_,Option<u64>>(0)?.unwrap_or(0),r.get::<_,u64>(1)?,r.get::<_,Option<String>>(2)?))).optional()?)
+        }).map_err(|e| e.to_string())?;
+        if current
+            == Some((
+                publication.sequence(),
+                publication.byte_end(),
+                Some(publication.lineage().to_string()),
+            ))
+        {
+            return Ok(());
+        }
+        if historical
+            && current.as_ref().is_some_and(|(seq, end, lineage)| {
+                *seq >= publication.sequence()
+                    && *end >= publication.byte_end()
+                    && lineage.as_deref() == Some(publication.lineage().to_string().as_str())
+            })
+        {
+            return Ok(());
+        }
         self.db
             .publish(
                 session,
@@ -126,7 +247,8 @@ impl Publications {
         session: &BindIdentity,
         head: Option<u64>,
     ) -> Result<DurablePublication, String> {
-        let _guard = self.gate.lock().map_err(|e| e.to_string())?;
+        let gate = self.gate_for(session);
+        let _guard = gate.lock().map_err(|e| e.to_string())?;
         self.witness_locked(session, head)
     }
 
@@ -135,6 +257,7 @@ impl Publications {
         session: &BindIdentity,
         head: Option<u64>,
     ) -> Result<DurablePublication, String> {
+        self.ensure_available(session)?;
         let publication = self
             .slots
             .lock()
@@ -159,6 +282,56 @@ impl Publications {
 }
 
 impl Overhaul {
+    pub fn run_rows(
+        &self,
+        wal: Arc<FileWalStore>,
+    ) -> Arc<broca_module::registry::OverhaulRunSource> {
+        let all = self.publications.clone();
+        let one = self.publications.clone();
+        Arc::new(
+            broca_module::registry::OverhaulRunSource::new(self.db.clone(), wal).with_consistency(
+                Arc::new(move || all.catch_up_all().map(|_| ())),
+                Arc::new(move |key| one.witness_locked(key, None)),
+                self.publications.gate_factory(),
+            ),
+        )
+    }
+
+    pub fn recovery_discovery(&self) -> Arc<dyn broca_core::RecoveryDiscovery> {
+        Arc::new(Recovery {
+            db: self.db.clone(),
+            publications: self.publications.clone(),
+        })
+    }
+
+    pub fn event_store(&self) -> Arc<dyn broca_store::bus_events::RunEventStore> {
+        let publications = self.publications.clone();
+        let available = self.publications.clone();
+        Arc::new(
+            broca_store::db::OverhaulRunEventStore::new(self.db.clone())
+                .with_before_read(Arc::new(move || {
+                    let failed = publications.catch_up_all()?;
+                    if failed.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "run-event publication unavailable for {} session(s)",
+                            failed.len()
+                        ))
+                    }
+                }))
+                .with_session_filter(Arc::new(move |key| available.ensure_available(key).is_ok())),
+        )
+    }
+    pub fn compaction_receipts(
+        &self,
+    ) -> Arc<dyn broca_store::compaction_receipts::CompactionReceiptStore> {
+        let publications = self.publications.clone();
+        self.db.compaction_receipt_store_serialized(
+            move |session| publications.witness_locked(session, None),
+            self.publications.gate_factory(),
+        )
+    }
     pub fn inventory(&self) -> Arc<dyn SessionInventory> {
         Arc::new(Inventory {
             db: self.db.clone(),
@@ -172,7 +345,7 @@ impl Overhaul {
             inner: self
                 .db
                 .admission_reader(move |session| publications.witness_locked(session, None)),
-            gate: self.publications.gate.clone(),
+            publications: self.publications.clone(),
         })
     }
 
@@ -185,40 +358,101 @@ impl Overhaul {
 impl Publications {
     /// Reconcile every live WAL before constructing any service or recovery reader.
     pub fn reconcile(&self, wal: &FileWalStore) -> Result<(), String> {
+        self.blocked.lock().map_err(|e| e.to_string())?.clear();
         let reader = broca_core::ReadOnlyWalReader::new(&self.root);
-        for address in reader.addresses().map_err(|e| e.to_string())? {
-            let mut session = self.db.read_snapshot(|tx| {
+        let mut addresses = reader.addresses().unwrap_or_else(|error| {
+            broca_wal::access_counter::seed_fallback("boot archive inventory unavailable");
+            tracing::warn!(target:"publication", "archive inventory unavailable at boot: {error}");
+            Default::default()
+        });
+        for dir in ["wal", "wal-durable", "wal-ephemeral"] {
+            if let Ok(entries) = std::fs::read_dir(self.root.join(dir)) {
+                for entry in entries.flatten() {
+                    if let Some(address) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.strip_suffix(".wal"))
+                    {
+                        addresses.insert(address.to_string());
+                    }
+                }
+            }
+        }
+        for address in addresses {
+            let result: Result<(), (&'static str, String)> = (|| {
+                let path = ["wal", "wal-durable", "wal-ephemeral"]
+                    .into_iter()
+                    .map(|dir| self.root.join(dir).join(format!("{address}.wal")))
+                    .find(|path| path.is_file())
+                    .ok_or_else(|| {
+                        (
+                            "boot archived WAL unavailable",
+                            "archive recovery is not enabled".to_string(),
+                        )
+                    })?;
+                let _checked_header = broca_wal::file_wal::WalRecovery::open(
+                    &path,
+                    broca_wal::DEFAULT_MAX_READ_BYTES,
+                )
+                .map_err(|error| {
+                    let reason = if matches!(error, broca_wal::WalError::TooLarge { .. }) {
+                        "boot WAL over byte ceiling"
+                    } else {
+                        "boot lineage header unavailable"
+                    };
+                    (reason, error.to_string())
+                })?;
+                let mut session = self.db.read_snapshot(|tx| {
                 use rusqlite::OptionalExtension;
                 Ok(tx.query_row("SELECT project_root,harness,session_key FROM session_identity WHERE address=?1", [&address], |r| {
                     Ok(BindIdentity::new(r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?))
                 }).optional()?)
-            }).map_err(|e| e.to_string())?;
-            if session.is_none() {
-                broca_wal::access_counter::seed_fallback("boot identity inventory missing");
-                let (records, _) = reader.records(&address).map_err(|e| e.to_string())?;
-                session = records.iter().find_map(|frame| match &frame.record {
-                    broca_wal::WalRecord::RunStarted { session, .. } => Some(session.clone()),
-                    _ => None,
-                });
-            }
-            let session = session
-                .ok_or_else(|| format!("WAL {address} has no recoverable session identity"))?;
-            let path = wal
-                .resolve_live_path(&session)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| {
-                    format!("format-2 WAL {address} is archived; archive recovery is not enabled")
+            }).map_err(|e| ("boot session index unavailable",e.to_string()))?;
+                if session.is_none() {
+                    broca_wal::access_counter::seed_fallback("boot identity inventory missing");
+                    let (records, _) = reader
+                        .records(&address)
+                        .map_err(|e| ("boot identity unavailable", e.to_string()))?;
+                    session = records.iter().find_map(|frame| match &frame.record {
+                        broca_wal::WalRecord::RunStarted { session, .. } => Some(session.clone()),
+                        _ => None,
+                    });
+                }
+                let session = session.ok_or_else(|| {
+                    (
+                        "boot identity unavailable",
+                        format!("WAL {address} has no recoverable session identity"),
+                    )
                 })?;
-            let result = self
-                .db
-                .catch_up_session(&broca_store::db::ReconcileSession {
-                    bind: &session,
-                    session_ref: &broca_core::agent_session_ref(&session),
-                    location: LogLocation::Live,
-                    path: &path,
-                })
-                .map_err(|e| e.to_string())?;
-            self.remember(session, &result.publication);
+                if broca_core::session_addr(&session) != address {
+                    return Err((
+                        "boot identity unavailable",
+                        "WAL address and identity differ".into(),
+                    ));
+                }
+                wal.check_move(&session, false)
+                    .map_err(|e| ("boot session placement unavailable", e.to_string()))?;
+                let result = self
+                    .db
+                    .catch_up_session(&broca_store::db::ReconcileSession {
+                        bind: &session,
+                        session_ref: &broca_core::agent_session_ref(&session),
+                        location: LogLocation::Live,
+                        path: &path,
+                    })
+                    .map_err(|e| ("boot WAL session unavailable", e.to_string()))?;
+                self.remember(session, &result.publication);
+                Ok(())
+            })();
+            if let Err((reason, error)) = result {
+                broca_wal::access_counter::seed_fallback(reason);
+                let message = format!("WAL {address} unavailable at boot ({reason}): {error}");
+                self.blocked
+                    .lock()
+                    .map_err(|e| e.to_string())?
+                    .insert(address, message.clone());
+                tracing::warn!(target:"publication", "{message}; other sessions remain available");
+            }
         }
         Ok(())
     }
@@ -237,7 +471,9 @@ impl Overhaul {
                     slots.keys().cloned().collect::<Vec<_>>()
                 };
                 for session in sessions {
-                    let _guard = publications.gate.lock().unwrap();
+                    if publications.ensure_available(&session).is_err() { continue; }
+                    let gate = publications.gate_for(&session);
+                    let _guard = gate.lock().unwrap();
                     // Re-read under the operation gate; a service may already
                     // have published a newer proof while this worker was waiting.
                     let Some(current) = publications.slots.lock().unwrap().get(&session).cloned() else { continue; };
@@ -260,6 +496,67 @@ impl Overhaul {
 struct Inventory {
     db: Arc<OverhaulDb>,
     publications: Arc<Publications>,
+}
+
+struct Recovery {
+    db: Arc<OverhaulDb>,
+    publications: Arc<Publications>,
+}
+impl broca_core::RecoveryDiscovery for Recovery {
+    fn active_runs(&self) -> Result<Vec<(String, BindIdentity)>, String> {
+        let failed = self.publications.catch_up_all()?;
+        if !failed.is_empty() {
+            return Err(format!(
+                "recovery discovery publication unavailable for {} session(s)",
+                failed.len()
+            ));
+        }
+        Ok(self
+            .db
+            .active_runs()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|(_, key)| {
+                !failed.contains(key) && self.publications.ensure_available(key).is_ok()
+            })
+            .collect())
+    }
+    fn restart_resume_candidates(&self) -> Result<Vec<(String, BindIdentity)>, String> {
+        let failed = self.publications.catch_up_all()?;
+        if !failed.is_empty() {
+            return Err(format!(
+                "restart discovery publication unavailable for {} session(s)",
+                failed.len()
+            ));
+        }
+        Ok(self
+            .db
+            .restart_resume_candidates()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|(_, key)| {
+                !failed.contains(key) && self.publications.ensure_available(key).is_ok()
+            })
+            .collect())
+    }
+    fn withdrawal_candidates(&self) -> Result<Vec<broca_core::WithdrawalRun>, String> {
+        let failed = self.publications.catch_up_all()?;
+        if !failed.is_empty() {
+            return Err(format!(
+                "withdrawal discovery publication unavailable for {} session(s)",
+                failed.len()
+            ));
+        }
+        Ok(
+            broca_core::RecoveryDiscovery::withdrawal_candidates(self.db.as_ref())?
+                .into_iter()
+                .filter(|row| {
+                    !failed.contains(&row.session)
+                        && self.publications.ensure_available(&row.session).is_ok()
+                })
+                .collect(),
+        )
+    }
 }
 
 impl SessionRefIndex for Inventory {
@@ -288,7 +585,8 @@ impl SessionInventory for Inventory {
     fn forget_projection(&self, session: &BindIdentity) -> Result<(), String> {
         // Move/delete callers have already stopped this session's writer. Remove
         // its proof under the publication gate so the worker cannot recreate rows.
-        let _guard = self.publications.gate.lock().map_err(|e| e.to_string())?;
+        let gate = self.publications.gate_for(session);
+        let _guard = gate.lock().map_err(|e| e.to_string())?;
         self.db.forget_projection(session)?;
         self.publications
             .slots
@@ -301,7 +599,77 @@ impl SessionInventory for Inventory {
 
 struct Admission {
     inner: Arc<dyn broca_core::context::AdmissionReader>,
-    gate: Arc<Mutex<()>>,
+    publications: Arc<Publications>,
+}
+
+struct Resume {
+    db: Arc<OverhaulDb>,
+    publications: Arc<Publications>,
+    session: BindIdentity,
+    reader: Mutex<Option<Arc<dyn broca_core::resume::OffsetResumeReader>>>,
+}
+
+impl Publications {
+    pub fn resume_reader(
+        self: &Arc<Self>,
+        session: &BindIdentity,
+    ) -> Result<Arc<dyn broca_core::resume::OffsetResumeReader>, String> {
+        self.ensure_available(session)?;
+        Ok(Arc::new(Resume {
+            db: self.db.clone(),
+            publications: self.clone(),
+            session: session.clone(),
+            reader: Mutex::new(None),
+        }))
+    }
+}
+
+impl broca_core::resume::OffsetResumeReader for Resume {
+    fn snapshot(
+        &self,
+        head: u64,
+    ) -> Result<broca_core::resume::OffsetResumeSnapshot, broca_core::replay::SeedFallback> {
+        let gate = self.publications.gate_for(&self.session);
+        let _guard = gate.lock().map_err(|_| {
+            broca_core::replay::SeedFallback::new("resume session gate unavailable")
+        })?;
+        let proof = self
+            .publications
+            .witness_locked(&self.session, Some(head))
+            .map_err(|_| broca_core::replay::SeedFallback::new("resume publication unavailable"))?;
+        self.publications
+            .publish_bound(&self.session, &proof, true)
+            .map_err(|_| {
+                broca_core::replay::SeedFallback::new("resume publication catch-up unavailable")
+            })?;
+        let reader = self.db.resume_reader(self.session.clone(), proof);
+        let result = reader.snapshot(head);
+        *self
+            .reader
+            .lock()
+            .map_err(|_| broca_core::replay::SeedFallback::new("resume reader unavailable"))? =
+            Some(reader);
+        result
+    }
+    fn read_at(&self, off: u64, len: u64) -> std::io::Result<Vec<u8>> {
+        let gate = self.publications.gate_for(&self.session);
+        let _guard = gate
+            .lock()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.reader
+            .lock()
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("resume snapshot must precede range reads"))?
+            .read_at(off, len)
+    }
+    fn reconstructed(&self, fallback: Option<broca_core::replay::SeedFallback>) {
+        if let Ok(reader) = self.reader.lock() {
+            if let Some(reader) = reader.as_ref() {
+                reader.reconstructed(fallback);
+            }
+        }
+    }
 }
 
 impl broca_core::context::AdmissionReader for Admission {
@@ -310,7 +678,8 @@ impl broca_core::context::AdmissionReader for Admission {
         session: &BindIdentity,
         head: u64,
     ) -> Result<broca_core::run::PriorWalSnapshot, String> {
-        let _guard = self.gate.lock().map_err(|e| e.to_string())?;
+        let gate = self.publications.gate_for(session);
+        let _guard = gate.lock().map_err(|e| e.to_string())?;
         self.inner.prior_snapshot(session, head)
     }
     fn sender_snapshot(
@@ -318,7 +687,8 @@ impl broca_core::context::AdmissionReader for Admission {
         session: &BindIdentity,
         head: u64,
     ) -> Result<broca_core::run::PriorWalSnapshot, String> {
-        let _guard = self.gate.lock().map_err(|e| e.to_string())?;
+        let gate = self.publications.gate_for(session);
+        let _guard = gate.lock().map_err(|e| e.to_string())?;
         self.inner.sender_snapshot(session, head)
     }
     fn paused_episode(
@@ -326,7 +696,8 @@ impl broca_core::context::AdmissionReader for Admission {
         session: &BindIdentity,
         head: u64,
     ) -> Result<Option<broca_core::admission::LastEpisodeV1>, String> {
-        let _guard = self.gate.lock().map_err(|e| e.to_string())?;
+        let gate = self.publications.gate_for(session);
+        let _guard = gate.lock().map_err(|e| e.to_string())?;
         self.inner.paused_episode(session, head)
     }
 }
@@ -343,9 +714,465 @@ impl Drop for Overhaul {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-clock")]
+    fn assert_resume_or_receipt_io_holds_session_gate(resume: bool) {
+        use broca_wal::fs_ops::{self, FsOps};
+        use std::sync::atomic::AtomicUsize;
+        struct CheckIo {
+            gate: Arc<Mutex<()>>,
+            reads: Arc<AtomicUsize>,
+        }
+        impl FsOps for CheckIo {
+            fn open(
+                &self,
+                p: &Path,
+                o: &fs_ops::OpenOptions,
+            ) -> std::io::Result<Box<dyn fs_ops::FileOps>> {
+                if p.extension().is_some_and(|ext| ext == "wal") {
+                    self.reads.fetch_add(1, Ordering::Relaxed);
+                    assert!(
+                        self.gate.try_lock().is_err(),
+                        "WAL source read escaped its session publication gate"
+                    );
+                }
+                fs_ops::RealFs.open(p, o)
+            }
+            fn metadata(&self, p: &Path) -> std::io::Result<std::fs::Metadata> {
+                fs_ops::RealFs.metadata(p)
+            }
+            fn create_dir_all(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.create_dir_all(p)
+            }
+            fn rename(&self, a: &Path, b: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.rename(a, b)
+            }
+            fn remove_file(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.remove_file(p)
+            }
+            fn sync_dir(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.sync_dir(p)
+            }
+            fn create_dir(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.create_dir(p)
+            }
+            fn hard_link(&self, a: &Path, b: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.hard_link(a, b)
+            }
+            fn canonicalize(&self, p: &Path) -> std::io::Result<PathBuf> {
+                fs_ops::RealFs.canonicalize(p)
+            }
+            fn read_dir(&self, p: &Path) -> std::io::Result<fs_ops::ReadDir> {
+                fs_ops::RealFs.read_dir(p)
+            }
+            fn validate_if_exists(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.validate_if_exists(p)
+            }
+        }
+        let root = Root::new(if resume {
+            "resume-gate"
+        } else {
+            "receipt-gate"
+        });
+        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let overhaul = stores.overhaul.as_ref().unwrap();
+        let wal_store = wal(&root, overhaul);
+        let bind = BindIdentity::new("/composition", "runner", "read-gate");
+        let mut writer = wal_store.open(&bind).unwrap();
+        writer.append(1, &started(&bind, "gate"), false).unwrap();
+        writer.append(1, &finished(), true).unwrap();
+        let proof = overhaul.publications.witness(&bind, None).unwrap();
+        let gate = overhaul.publications.gate_for(&bind);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = overhaul.publications.resume_reader(&bind).unwrap();
+        let receipts = overhaul.compaction_receipts();
+        fs_ops::with_fs_ops(
+            Arc::new(CheckIo {
+                gate,
+                reads: reads.clone(),
+            }),
+            || {
+                if resume {
+                    let _ = reader.snapshot(proof.sequence());
+                    assert_eq!(reader.read_at(0, 69).unwrap().len(), 69);
+                } else {
+                    receipts
+                        .current_compaction_facts(wal_store.as_ref(), &bind)
+                        .unwrap();
+                }
+            },
+        );
+        assert!(
+            reads.load(Ordering::Relaxed) > 0,
+            "the test must reach a WAL source read"
+        );
+    }
+
+    #[cfg(feature = "test-clock")]
+    #[test]
+    fn resume_snapshot_and_ranges_remain_inside_the_session_gate() {
+        assert_resume_or_receipt_io_holds_session_gate(true);
+    }
+    #[cfg(feature = "test-clock")]
+    #[test]
+    fn compaction_receipt_source_remains_inside_the_session_gate() {
+        assert_resume_or_receipt_io_holds_session_gate(false);
+    }
+
+    #[test]
+    fn another_sessions_admission_does_not_wait_for_a_rebuild() {
+        let root = Root::new("independent-session");
+        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let overhaul = stores.overhaul.as_ref().unwrap();
+        let wal_store = wal(&root, overhaul);
+        let a = BindIdentity::new("/composition", "runner", "slow");
+        let b = BindIdentity::new("/composition", "runner", "healthy");
+        let mut writer = wal_store.open(&b).unwrap();
+        writer.append(1, &started(&b, "healthy"), false).unwrap();
+        writer.append(1, &finished(), true).unwrap();
+        let proof = overhaul.publications.witness(&b, None).unwrap();
+        let gate = overhaul.publications.gate_for(&a);
+        let guard = gate.lock().unwrap();
+        assert!(
+            overhaul.publications.gate_for(&b).try_lock().is_ok(),
+            "unrelated sessions must have independent publication gates"
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let db = overhaul.db.clone();
+        let rebuilding = std::thread::spawn(move || {
+            db.authoritative_transaction(|_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap()
+        });
+        started_rx.recv().unwrap();
+        let reader = overhaul.admission_reader();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reading = std::thread::spawn(move || {
+            read_tx
+                .send(reader.prior_snapshot(&b, proof.sequence()))
+                .unwrap()
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            broca_test_support::wait_until_sync(
+                "healthy session admission while another session rebuilds",
+                || read_rx.try_recv().map_err(|e| e.to_string()),
+            )
+            .unwrap()
+        }));
+        release_tx.send(()).unwrap();
+        rebuilding.join().unwrap();
+        drop(guard);
+        reading.join().unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn bad_boot_sessions_do_not_refuse_healthy_sessions() {
+        let root = Root::new("partial-boot");
+        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let overhaul = stores.overhaul.as_ref().unwrap();
+        let wal_store = wal(&root, overhaul);
+        let healthy = BindIdentity::new("/composition", "runner", "healthy");
+        {
+            let mut writer = wal_store.open(&healthy).unwrap();
+            writer
+                .append(1, &started(&healthy, "healthy"), false)
+                .unwrap();
+            writer.append(1, &finished(), true).unwrap();
+        }
+        overhaul.publications.witness(&healthy, None).unwrap();
+        let broken = BindIdentity::new("/composition", "runner", "torn");
+        let path = wal_store.wal_path(&broken);
+        std::fs::write(&path, b"torn lineage").unwrap();
+        let identityless = BindIdentity::new("/composition", "runner", "identityless");
+        let file = broca_wal::FileWal::open(wal_store.wal_path(&identityless)).unwrap();
+        file.sync().unwrap();
+        drop(file);
+        let huge = BindIdentity::new("/composition", "runner", "oversized");
+        std::fs::File::create(wal_store.wal_path(&huge))
+            .unwrap()
+            .set_len(broca_wal::DEFAULT_MAX_READ_BYTES + 1)
+            .unwrap();
+        let archived = BindIdentity::new("/composition", "runner", "archived");
+        {
+            let writer = wal_store.open(&archived).unwrap();
+            writer.sync().unwrap();
+        }
+        let archived_path = wal_store.resolve_live_path(&archived).unwrap().unwrap();
+        let archive_dir = root.0.join("wal-archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let archive_path = archive_dir.join("fold-1.ark");
+        let mut archive = broca_wal::archive::ArchiveWriter::create(&archive_path)
+            .unwrap()
+            .without_feature_floor();
+        archive
+            .append(
+                &broca_core::session_addr(&archived),
+                &std::fs::read(&archived_path).unwrap(),
+            )
+            .unwrap();
+        archive.seal().unwrap();
+        std::fs::remove_file(archived_path).unwrap();
+        let archive_before = std::fs::read(&archive_path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        assert!(counter
+            .operation("partial boot")
+            .run(|| overhaul.reconcile(&wal_store))
+            .is_ok());
+        assert!(overhaul.publications.witness(&healthy, None).is_ok());
+        for session in [&broken, &identityless, &huge, &archived] {
+            assert!(overhaul.publications.witness(session, None).is_err());
+        }
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(std::fs::read(archive_path).unwrap(), archive_before);
+        assert!(wal_store.open(&broken).is_err());
+        for reason in [
+            "boot lineage header unavailable",
+            "boot identity unavailable",
+            "boot WAL over byte ceiling",
+            "boot archived WAL unavailable",
+        ] {
+            assert!(counter.snapshot()[0].seed_fallbacks.contains(&reason));
+        }
+    }
+
+    #[test]
+    fn acknowledged_run_discovery_catches_up_before_the_publisher_drains() {
+        let root = Root::new("fresh-discovery");
+        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let overhaul = stores.overhaul.as_ref().unwrap();
+        let wal_store = wal(&root, overhaul);
+        let bind = BindIdentity::new("/composition", "runner", "discovery");
+        let mut writer = wal_store.open(&bind).unwrap();
+        writer.append(1, &started(&bind, "fresh"), true).unwrap();
+        let discovery = overhaul.recovery_discovery();
+        assert!(
+            discovery
+                .active_runs()
+                .unwrap()
+                .iter()
+                .any(|(run, _)| run == "fresh"),
+            "acknowledged RunStarted must be discoverable before a publisher tick"
+        );
+        assert!(discovery
+            .restart_resume_candidates()
+            .unwrap()
+            .iter()
+            .any(|(run, _)| run == "fresh"));
+    }
+
+    #[test]
+    fn reopening_a_writer_keeps_the_previously_acknowledged_discovery_head() {
+        let root = Root::new("reopen-discovery-head");
+        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let overhaul = stores.overhaul.as_ref().unwrap();
+        let wal_store = wal(&root, overhaul);
+        let bind = BindIdentity::new("/composition", "runner", "reopened");
+        {
+            let mut writer = wal_store.open(&bind).unwrap();
+            writer
+                .append(1, &started(&bind, "ack-before-reopen"), true)
+                .unwrap();
+        }
+        assert!(overhaul
+            .db
+            .lookup_run("ack-before-reopen")
+            .unwrap()
+            .is_none());
+        let _reopened = wal_store.open(&bind).unwrap();
+        assert!(
+            overhaul
+                .recovery_discovery()
+                .active_runs()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == "ack-before-reopen"),
+            "opening a descriptor must not erase the previous durable head before its first sync"
+        );
+    }
+
+    #[test]
+    fn run_lookup_and_rows_use_the_acknowledged_prefix_before_a_publisher_tick() {
+        let root = Root::new("fresh-run-row");
+        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let overhaul = stores.overhaul.as_ref().unwrap();
+        let wal_store = wal(&root, overhaul);
+        let bind = BindIdentity::new("/composition", "runner", "run-row");
+        let mut writer = wal_store.open(&bind).unwrap();
+        let opener = broca_module::DefaultOpener::new(
+            Arc::new(broca_core::FileLeaseStore::new(root.0.join("leases"))),
+            wal_store.clone(),
+            Arc::new(RefusesExecution),
+        );
+        let source = overhaul.run_rows(wal_store.clone());
+        let registry = broca_module::LineageRegistry::new_with_run_rows(
+            Arc::new(opener),
+            Some(wal_store),
+            None,
+            Some(source),
+        );
+        writer
+            .append(1, &started(&bind, "row-fresh"), true)
+            .unwrap();
+        let row = registry
+            .overhaul_lookup_run("row-fresh")
+            .unwrap()
+            .unwrap()
+            .expect("acknowledged run must be indexed before lookup");
+        assert_eq!(row.state, broca_core::RunIndexState::Active);
+        writer.append(1, &finished(), false).unwrap();
+        assert!(
+            registry
+                .overhaul_active_runs(&[])
+                .unwrap()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id.0 == "row-fresh"),
+            "an unsynced terminal must not enter the run-row view"
+        );
+        writer.sync().unwrap();
+        assert_eq!(
+            registry
+                .overhaul_lookup_run("row-fresh")
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .state,
+            broca_core::RunIndexState::Completed
+        );
+        assert!(registry
+            .overhaul_active_runs(&[])
+            .unwrap()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn run_event_discovery_catches_acknowledged_runs_before_a_publisher_tick() {
+        let root = Root::new("fresh-run-event");
+        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let overhaul = stores.overhaul.as_ref().unwrap();
+        let wal_store = wal(&root, overhaul);
+        let bind = BindIdentity::new("/composition", "runner", "run-event");
+        let events = overhaul.event_store();
+        events.enable_bus_events("test").unwrap();
+        events.begin_bus_event_period(100).unwrap();
+        let mut writer = wal_store.open(&bind).unwrap();
+        let mut start = started(&bind, "bus-fresh");
+        if let WalRecord::RunStarted { ts_ms, .. } = &mut start {
+            *ts_ms = Some(101);
+        }
+        writer.append(1, &start, true).unwrap();
+        assert!(overhaul.db.lookup_run("bus-fresh").unwrap().is_none());
+        assert!(
+            events.bus_event_open_sessions().unwrap().contains(&bind),
+            "run events must discover the acknowledged WAL before the worker drains"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_retained_event_get_does_not_require_a_legacy_materializer() {
+        let root = Root::new("native-event-get");
+        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let overhaul = stores.overhaul.as_ref().unwrap();
+        let wal_store = wal(&root, overhaul);
+        let bind = BindIdentity::new("/composition", "runner", "event-get");
+        let events = overhaul.event_store();
+        events.enable_bus_events("test").unwrap();
+        events.begin_bus_event_period(100).unwrap();
+        let mut writer = wal_store.open(&bind).unwrap();
+        let mut start = started(&bind, "retained-event");
+        if let WalRecord::RunStarted { ts_ms, .. } = &mut start {
+            *ts_ms = Some(101);
+        }
+        writer.append(1, &start, true).unwrap();
+        let proof = writer.durable_publication().unwrap();
+        events
+            .project_new_bus_events(
+                &bind,
+                &proof.lineage().to_string(),
+                &writer.replay().unwrap(),
+                102,
+            )
+            .unwrap();
+        let retained = events
+            .pending_bus_event()
+            .unwrap()
+            .expect("the event was retained before bus publication");
+        let opener = broca_module::DefaultOpener::new(
+            Arc::new(broca_core::FileLeaseStore::new(root.0.join("leases"))),
+            wal_store.clone(),
+            Arc::new(RefusesExecution),
+        );
+        let registry =
+            broca_module::LineageRegistry::new_with_reader(Arc::new(opener), wal_store, None);
+        let reader = events.clone();
+        registry.set_run_event_reader(Arc::new(move |key| {
+            reader.get_bus_event(key).map_err(|e| e.to_string())
+        }));
+        let value = registry
+            .route_run_event(&bind, &retained.event_key)
+            .await
+            .unwrap();
+        assert!(
+            matches!(value,broca_wire::RunEventGetResponse::Found{jcs,..} if jcs.as_bytes()==retained.body)
+        );
+        assert!(matches!(
+            registry
+                .route_run_event(
+                    &BindIdentity::new("/composition", "runner", "other"),
+                    &retained.event_key
+                )
+                .await
+                .unwrap(),
+            broca_wire::RunEventGetResponse::Absent
+        ));
+        no_legacy_files(&root);
+    }
+
+    #[test]
+    fn mismatched_publication_fails_only_its_session_without_poisoning_registration() {
+        let root = Root::new("publication-mismatch");
+        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let overhaul = stores.overhaul.as_ref().unwrap();
+        let wal_store = wal(&root, overhaul);
+        let bind = BindIdentity::new("/composition", "runner", "mismatch");
+        let writer = wal_store.open(&bind).unwrap();
+        writer.sync().unwrap();
+        let previous = writer.durable_publication().unwrap();
+        let factory = overhaul.publications.observer();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            factory(
+                &bind,
+                &root.0.join("wal/different-address.wal"),
+                previous.lineage(),
+            )
+        }));
+        assert!(
+            result.is_ok(),
+            "registration must never panic while holding the session map"
+        );
+        assert!(result.unwrap()(previous.borrowed()).is_err());
+        assert!(
+            overhaul.publications.witness(&bind, None).is_err(),
+            "the mismatched session must be unavailable"
+        );
+        assert!(overhaul.publications.slots.lock().is_ok());
+        let other = BindIdentity::new("/composition", "runner", "healthy");
+        let healthy = wal_store.open(&other).unwrap();
+        healthy.sync().unwrap();
+        assert!(overhaul.publications.witness(&other, None).is_ok());
+        drop(healthy);
+        drop(writer);
+    }
+
     use super::*;
     use broca_core::WalStore;
-    use broca_wal::{RunConfig, WalRecord};
+    use broca_wal::{RunConfig, Wal, WalRecord};
 
     struct Root(PathBuf);
     impl Root {
@@ -438,8 +1265,12 @@ mod tests {
     }
 
     fn wal(root: &Root, overhaul: &Overhaul) -> Arc<FileWalStore> {
+        let publications = overhaul.publications.clone();
         let wal = Arc::new(
             FileWalStore::with_config(root.0.join("wal"), broca_wal::WalConfig::OVERHAUL)
+                .with_session_guard(Arc::new(move |session| {
+                    publications.ensure_available(session)
+                }))
                 .with_publication_observer(overhaul.publications.observer()),
         );
         wal.set_session_ref_index(overhaul.db.clone());
@@ -560,7 +1391,7 @@ mod tests {
                 overhaul.db.clone(),
                 Arc::new(move |session, head| source.witness_locked(session, head)),
             )
-            .with_gate(overhaul.publications.gate.clone())
+            .with_session_gates(overhaul.publications.gate_factory())
             .with_access_counter(access.clone()),
         );
         let opener = super::super::opener_for_state_root(
@@ -594,7 +1425,7 @@ mod tests {
                 overhaul.db.clone(),
                 Arc::new(move |session, head| source.witness_locked(session, head)),
             )
-            .with_gate(overhaul.publications.gate.clone()),
+            .with_session_gates(overhaul.publications.gate_factory()),
         ));
         let outcome = broca_test_support::wait_for(
             "owned opener admission",
@@ -633,9 +1464,9 @@ mod tests {
         let measured = access.snapshot();
         for (kind, expected_reads, expected_decodes) in [
             ("admission prior", 11, 17),
-            ("raw page", 12, 15),
-            ("model page", 12, 21),
-            ("model attach", 6, 11),
+            ("raw page", 8, 11),
+            ("model page", 8, 17),
+            ("model attach", 2, 7),
         ] {
             let reads: Vec<_> = measured
                 .iter()
@@ -750,7 +1581,7 @@ mod tests {
                 overhaul.db.clone(),
                 Arc::new(move |session, head| publications.witness_locked(session, head)),
             )
-            .with_gate(overhaul.publications.gate.clone()),
+            .with_session_gates(overhaul.publications.gate_factory()),
         );
         let opener = super::super::opener_for_state_root(
             Arc::new(broca_core::FileLeaseStore::new(root.0.join("leases"))),

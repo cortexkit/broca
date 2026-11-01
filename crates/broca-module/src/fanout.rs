@@ -678,7 +678,8 @@ impl<W: WalStore + 'static> Fanout<W> {
         source_enabled: bool,
     ) -> (Self, broca_core::RecordObserver) {
         let approvals = Arc::new(crate::approval_state::ApprovalState::default());
-        let media_head = Some(Arc::new(crate::registry::media_head::Live::default()));
+        let media_head = broca_protocol::attachments_enabled()
+            .then(|| Arc::new(crate::registry::media_head::Live::default()));
         let source_warm = source_enabled.then(crate::source_warm::Events::default);
         let ring = LazyRing::new(RING_CAPACITY);
         let display_ring = DisplaySender::new(DISPLAY_RING_CAPACITY);
@@ -4293,6 +4294,142 @@ mod episode_attach_tests {
 
 #[cfg(test)]
 mod database_attach_tests {
+    #[test]
+    fn header_only_database_pages_and_attach_stay_empty() {
+        let root = root();
+        let bind = BindIdentity::new("/db", "runner", "empty");
+        let (_store, wal) = wal(&root, &bind);
+        wal.sync().unwrap();
+        let proof = wal.durable_publication().unwrap();
+        assert_eq!(proof.sequence(), 0);
+        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        db.publish(
+            &bind,
+            &broca_core::agent_session_ref(&bind),
+            broca_store::db::LogLocation::Live,
+            &proof,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let reader = db.episode_reader(bind.clone(), proof.clone()).unwrap();
+            let model = reader.read_model_page(&Default::default()).unwrap();
+            assert!(model.page.messages.is_empty());
+            assert!(model.fallback.is_none());
+            let raw = db
+                .read_raw_page(
+                    &bind,
+                    &broca_core::agent_session_ref(&bind),
+                    broca_store::db::LogLocation::Live,
+                    &proof,
+                    Default::default(),
+                )
+                .unwrap();
+            assert!(raw.page.messages.is_empty());
+            assert_eq!(raw.at_seq, 0);
+            assert!(raw.index_validated);
+            let source = proof.clone();
+            let admission = db.admission_reader(move |_| Ok(source.clone()));
+            assert!(admission
+                .prior_snapshot(&bind, 0)
+                .unwrap()
+                .checkpoint_at_head
+                .last_episode
+                .is_none());
+            let source = proof.clone();
+            let receipts = db.compaction_receipt_store(move |_| Ok(source.clone()));
+            receipts
+                .current_compaction_facts(_store.as_ref(), &bind)
+                .unwrap();
+            let replay =
+                replay_for_database_attach(&reader, AttachFrom::Cursor(FromCursor::Start)).unwrap();
+            assert!(replay.units.is_empty());
+            assert_eq!(reader.sequence(), 0);
+        }
+        drop(wal);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscribe_at_zero_then_first_append_delivers_each_live_cursor_once() {
+        let root = root();
+        let bind = BindIdentity::new("/db", "runner", "zero-handoff");
+        let (store, mut wal) = wal(&root, &bind);
+        wal.sync().unwrap();
+        let initial = wal.durable_publication().unwrap();
+        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        db.publish(
+            &bind,
+            &broca_core::agent_session_ref(&bind),
+            broca_store::db::LogLocation::Live,
+            &initial,
+        )
+        .unwrap();
+        let latest = Arc::new(std::sync::Mutex::new(initial));
+        let source = latest.clone();
+        let (fanout, _observer) = Fanout::new(store, bind.clone());
+        let mut fanout =
+            fanout.with_episode_source(Arc::new(crate::registry::EpisodeReadSource::new(
+                db.clone(),
+                Arc::new(move |_, head| {
+                    let proof = source.lock().unwrap().clone();
+                    proof
+                        .prefix_at(head.unwrap_or(proof.sequence()), 0)
+                        .map_err(|e| e.to_string())
+                }),
+            )));
+        let (slot, rx, detached) = fanout.prepare_attach();
+        let h = 0;
+        for record in records(0) {
+            wal.append(1, &record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        *latest.lock().unwrap() = wal.durable_publication().unwrap();
+        let expected = project_control(&wal.replay().unwrap());
+        assert!(!expected.is_empty());
+        for event in &expected {
+            fanout.ring.send(Arc::new(event.clone())).unwrap();
+        }
+        let (sink, mut deliveries) = mpsc::channel(128);
+        fanout.spawn_subscriber(
+            slot,
+            AttachFrom::Cursor(FromCursor::Start),
+            h,
+            rx,
+            detached,
+            sink,
+            None,
+        );
+        let reset = broca_test_support::wait_for(
+            "display reset for empty attach",
+            deliveries.recv(),
+            || "empty attach did not reset display".into(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(reset,Delivery::Display(event) if matches!(event.as_ref(),broca_protocol::DisplayEvent::DisplayReset))
+        );
+        for event in expected {
+            let delivery = broca_test_support::wait_for(
+                "first live cursor after empty attach",
+                deliveries.recv(),
+                || "empty attach did not hand off".into(),
+            )
+            .await
+            .unwrap();
+            match delivery {
+                Delivery::Control(actual) => assert_eq!(actual.0, event.0),
+                other => panic!("unexpected delivery: {other:?}"),
+            }
+        }
+        assert!(deliveries.try_recv().is_err());
+        fanout.teardown().await;
+        drop(wal);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use broca_core::{FileWalStore, WalHandle};
     use broca_wal::WalRecord;

@@ -402,9 +402,13 @@ pub(crate) fn prepare(root: &Path, overhaul_opt_in: bool) -> Result<StateFormat,
 /// the root [`prepare`] just decided. The WAL's own classifier reads the marker again and also
 /// refuses an overhaul root whose `wal/` is a symbolic link or resolves outside the root; boot
 /// stops on any refusal, and on a classification that disagrees with `format`.
-pub(crate) fn wal_config(root: &Path, format: StateFormat) -> Result<broca_wal::WalConfig, String> {
-    let config = broca_wal::classify_state_root(root)
+pub(crate) fn wal_decision(
+    root: &Path,
+    format: StateFormat,
+) -> Result<broca_wal::state_format::StateRootDecision<'_>, String> {
+    let decision = broca_wal::state_format::decide_state_root(root)
         .map_err(|error| format!("refusing to serve: {error}. See {RUNBOOK}."))?;
+    let config = decision.config();
     if config.is_overhaul() != (format == StateFormat::Overhaul) {
         return Err(format!(
             "refusing to serve: the state root {} was decided as {format:?} but its log format \
@@ -413,7 +417,12 @@ pub(crate) fn wal_config(root: &Path, format: StateFormat) -> Result<broca_wal::
             config.format
         ));
     }
-    Ok(config)
+    Ok(decision)
+}
+
+#[cfg(test)]
+pub(crate) fn wal_config(root: &Path, format: StateFormat) -> Result<broca_wal::WalConfig, String> {
+    wal_decision(root, format).map(|decision| decision.config())
 }
 
 /// Today's background work that deletes or exports state.

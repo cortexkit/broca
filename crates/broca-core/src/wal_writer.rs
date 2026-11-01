@@ -385,6 +385,7 @@ pub struct FileWalStore {
     retention_changes: Arc<retention_changes::Changes>,
     durable_observer: Option<Arc<DurableWalObserver>>,
     publication_observer: Option<Arc<PublicationObserverFactory>>,
+    session_guard: Option<Arc<SessionGuard>>,
     #[cfg(any(test, feature = "test-clock"))]
     range_reads: AtomicU64,
 }
@@ -396,9 +397,14 @@ pub type DurableWalObserver =
 
 /// Installed at open, away from barriers. Its returned callback must perform no
 /// I/O or blocking work; it only records the writer's descriptor-bound proof.
+/// An observer error refuses the acknowledgement after sync; recovery retains
+/// the durable WAL bytes rather than treating an unavailable index as current.
 pub type PublicationObserverFactory =
     dyn Fn(&BindIdentity, &Path, broca_wal::WalLineageId) -> Arc<PublicationObserver> + Send + Sync;
-pub type PublicationObserver = dyn Fn(&broca_wal::file_wal::DurablePublication) + Send + Sync;
+pub type PublicationObserver = dyn Fn(broca_wal::file_wal::DurablePublicationRef<'_>) -> Result<(), &'static str>
+    + Send
+    + Sync;
+pub type SessionGuard = dyn Fn(&BindIdentity) -> Result<(), String> + Send + Sync;
 
 /// THREE STATES, NOT TWO, and collapsing any pair of them has now caused a defect each.
 ///
@@ -594,6 +600,9 @@ impl FileWalStore {
     }
 
     pub fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {
+        if let Some(guard) = &self.session_guard {
+            guard(session).map_err(|error| WalError::Io(io::Error::other(error)))?;
+        }
         // A cut file may name the session by its folder-based v1 reference (recorded before
         // the v2 switch) or by its v2 reference. Check both in one pass, so a pending release
         // under either reference outranks a moved tombstone for writes.
@@ -818,6 +827,7 @@ impl FileWalStore {
             retention_changes: Arc::default(),
             durable_observer: None,
             publication_observer: None,
+            session_guard: None,
             #[cfg(any(test, feature = "test-clock"))]
             range_reads: AtomicU64::new(0),
         }
@@ -848,6 +858,10 @@ impl FileWalStore {
 
     pub fn with_publication_observer(mut self, factory: Arc<PublicationObserverFactory>) -> Self {
         self.publication_observer = Some(factory);
+        self
+    }
+    pub fn with_session_guard(mut self, guard: Arc<SessionGuard>) -> Self {
+        self.session_guard = Some(guard);
         self
     }
 
@@ -3535,9 +3549,14 @@ impl WalHandle {
     }
 
     pub(crate) fn bind_media_capture(&mut self, store: &impl WalStore, session: &BindIdentity) {
-        self.media_capture = store
-            .uploads()
-            .map(|uploads| crate::tool_media::ToolMediaCapture::new(uploads, session.clone()));
+        // Tool and person media share the immutable boot decision.
+        self.media_capture = if broca_protocol::attachments_enabled() {
+            store
+                .uploads()
+                .map(|uploads| crate::tool_media::ToolMediaCapture::new(uploads, session.clone()))
+        } else {
+            None
+        };
     }
 
     pub fn check_move(&self) -> Result<(), WalError> {

@@ -142,7 +142,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(ServeIoError)?;
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
-    broca_module_serve::config::warn_obsolete_media_default().map_err(ServeIoError)?;
+    let media = broca_module_serve::config::MediaConfig::load_default().map_err(ServeIoError)?;
+    broca_protocol::configure_media(media.enabled).map_err(|error| ServeIoError(error.into()))?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
         .map_err(ServeIoError)?;
     let bus_event_config =
@@ -196,7 +197,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // version 4 frames on a `broca-state/2` root, today's frames everywhere else. A marker that
     // cannot be read, or an overhaul root whose `wal/` is a symbolic link or resolves outside the
     // root, refuses boot instead.
-    let wal_config = state_format::wal_config(&state_root, state_format).map_err(ServeIoError)?;
+    let wal_decision =
+        state_format::wal_decision(&state_root, state_format).map_err(ServeIoError)?;
+    let wal_config = wal_decision.config();
     let _stall_watchdog = broca_module_serve::stall::start(&state_root)?;
     // An optional provider base_url override (the mock/openai-compatible path; e.g. aimock).
     // When unset, the run's model id is resolved through the catalog.
@@ -327,10 +330,18 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         wal_store = wal_store.with_durable_observer(bus_hints.observer());
     }
     if let Some(overhaul) = &stores.overhaul {
+        let publications = overhaul.publications.clone();
+        wal_store = wal_store.with_session_guard(Arc::new(move |session| {
+            publications.ensure_available(session)
+        }));
         wal_store = wal_store.with_publication_observer(overhaul.publications.observer());
         wal_store.set_session_ref_index(overhaul.db.clone());
     }
     let wal_store = Arc::new(wal_store);
+    // The state-root lock is held. Reap temporary names before WAL recovery.
+    broca_module::actor::writer_reclaim::reap_temporary_markers_at_boot(wal_store.clone())
+        .await
+        .map_err(ServeIoError)?;
     if let Some(overhaul) = &mut stores.overhaul {
         let wal = wal_store.clone();
         let publications = overhaul.publications.clone();
@@ -346,10 +357,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         overhaul.start().map_err(ServeIoError)?;
         start_media_sweep(&state_root);
     }
-    // The state-root lock is already held, and no session writer has started yet.
-    broca_module::actor::writer_reclaim::reap_temporary_markers_at_boot(wal_store.clone())
-        .await
-        .map_err(ServeIoError)?;
     let crash_orphan_wal = wal_store.clone();
 
     // The provider-held runtime: the slots a held call waits in, and the intake that pulls each
@@ -388,7 +395,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let scope_describer = Arc::new(broca_subc::ModuleScopeDescriber::new());
     plane.set_scope_describer(scope_describer.clone());
     if state_format == state_format::StateFormat::Legacy {
-        stores = composition::Stores::open(state_format, &state_root).map_err(ServeIoError)?;
+        stores = composition::Stores::open_boot_legacy(
+            wal_decision.legacy().expect("legacy boot decision"),
+        )
+        .map_err(ServeIoError)?;
         wal_store.set_session_ref_index(stores.legacy.as_ref().unwrap().clone());
     }
     let run_index = stores.legacy.clone();
@@ -451,16 +461,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         executor::LiveLoopExecutor::new(wal_store.clone(), legacy.clone(), plane, provider_base_url)
     } else {
         let overhaul = stores.overhaul.as_ref().expect("one boot-selected bundle");
-        let db = overhaul.db.clone();
         let publications = overhaul.publications.clone();
         executor::LiveLoopExecutor::new_overhaul(
             wal_store.clone(),
             plane,
             provider_base_url,
-            Arc::new(move |session| {
-                let witness = publications.witness(session, None)?;
-                Ok(db.resume_reader(session.clone(), witness))
-            }),
+            Arc::new(move |session| publications.resume_reader(session)),
         )
     };
     let mut executor_impl = executor_impl
@@ -758,7 +764,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 overhaul.db.clone(),
                 Arc::new(move |session, head| publications.witness_locked(session, head)),
             )
-            .with_gate(overhaul.publications.gate.clone()),
+            .with_session_gates(overhaul.publications.gate_factory()),
         )
     });
     if let Some(overhaul) = &stores.overhaul {
@@ -771,12 +777,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ttl) = idle_ttl {
         opener_builder = opener_builder.with_idle_ttl(ttl);
     }
-    let run_rows = stores.overhaul.as_ref().map(|overhaul| {
-        Arc::new(broca_module::registry::OverhaulRunSource::new(
-            overhaul.db.clone(),
-            crash_orphan_wal.clone(),
-        ))
-    });
+    let run_rows = stores
+        .overhaul
+        .as_ref()
+        .map(|overhaul| overhaul.run_rows(crash_orphan_wal.clone()));
     let mut registry = LineageRegistry::new_with_run_rows(
         Arc::new(opener_builder),
         Some(wal_reader),
@@ -792,7 +796,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                     overhaul.db.clone(),
                     Arc::new(move |session, head| publications.witness_locked(session, head)),
                 )
-                .with_gate(overhaul.publications.gate.clone()),
+                .with_session_gates(overhaul.publications.gate_factory()),
             ));
         registry.set_session_address_resolver(overhaul.db.clone());
     } else {
@@ -979,10 +983,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 legacy.clone()
             } else {
                 let overhaul = stores.overhaul.as_ref().unwrap();
-                let publications = overhaul.publications.clone();
-                overhaul
-                    .db
-                    .compaction_receipt_store(move |session| publications.witness(session, None))
+                overhaul.compaction_receipts()
             };
         let service = broca_module_serve::compaction_bus::Service::new(
             receipts,
@@ -1001,10 +1002,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(legacy) = &run_index {
             legacy.clone()
         } else {
-            Arc::new(broca_store::db::OverhaulRunEventStore::new(
-                stores.overhaul.as_ref().unwrap().db.clone(),
-            ))
+            stores.overhaul.as_ref().unwrap().event_store()
         };
+    if stores.overhaul.is_some() {
+        let reader = event_store.clone();
+        registry.set_run_event_reader(Arc::new(move |key| {
+            reader.get_bus_event(key).map_err(|e| e.to_string())
+        }));
+    }
     let _bus_events = broca_module_serve::bus_events::Service {
         config: bus_event_config,
         store: event_store,
@@ -1026,7 +1031,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let recovery: Arc<dyn broca_core::RecoveryDiscovery> = if let Some(legacy) = &run_index {
         legacy.clone()
     } else {
-        stores.overhaul.as_ref().unwrap().db.clone()
+        stores.overhaul.as_ref().unwrap().recovery_discovery()
     };
     let crash_orphans = mark_crash_orphans(
         &registry,
@@ -4400,7 +4405,7 @@ mod executor {
                 None
             };
             let resolve_options = broca_catalog::live::ResolveOptions {
-                media: fresh_episode,
+                media: fresh_episode && broca_protocol::attachments_enabled(),
                 media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
                 claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,
@@ -4584,7 +4589,11 @@ mod executor {
                 }
             }
 
-            let uploads = self.wal_store.uploads();
+            let uploads = if broca_protocol::attachments_enabled() {
+                self.wal_store.uploads()
+            } else {
+                None
+            };
             if let Some(uploads) = uploads.filter(|_| {
                 resolved.provider.supports_media_renderer()
                     && (job.has_media_input()
