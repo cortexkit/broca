@@ -426,6 +426,7 @@ impl Fixture {
             ended_submissions: Default::default(),
             delivered_submissions: Default::default(),
             restart_admitting: false,
+            deferred_restart_settings: Default::default(),
             restart_waiters: Vec::new(),
             restart_recovery_owns_waiters: false,
             resuming_for_late_result: false,

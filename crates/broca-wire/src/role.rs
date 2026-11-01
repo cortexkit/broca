@@ -484,12 +484,24 @@ pub fn broca_role_describe_with_writers(
             .push(cortexkit_role_llm_runner::capabilities::SERVICE_TIER.into());
         describe = describe.with_service_tiers(service_tiers());
     }
-    RoleDescribeResponse {
+    let mut response = RoleDescribeResponse {
         role: describe,
         session_class: SessionClassCapability {
             backup_classes: vec!["head".into()],
         },
-    }
+    };
+    response
+        .role
+        .capabilities
+        .push(cortexkit_role_llm_runner::capabilities::ATTACHMENTS.into());
+    response.role.majors[0].ops.extend([
+        "session.upload_begin".into(),
+        "session.upload_append".into(),
+        "session.upload_status".into(),
+        "session.upload_commit".into(),
+        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
+    ]);
+    response
 }
 
 /// Family support is an upper bound; admission also requires that model's priced mode.
@@ -514,25 +526,6 @@ fn service_tiers() -> cortexkit_role_llm_runner::service_tier::ServiceTiers {
     .into_iter()
     .map(|(wire, levels)| (wire.into(), Support::new(levels, Served::Reported)))
     .collect()
-}
-
-impl RoleDescribeResponse {
-    /// Advertise the whole attachments group only after boot enables its serving paths.
-    pub fn with_media(mut self, enabled: bool) -> Self {
-        if enabled {
-            self.role
-                .capabilities
-                .push(cortexkit_role_llm_runner::capabilities::ATTACHMENTS.into());
-            self.role.majors[0].ops.extend([
-                "session.upload_begin".into(),
-                "session.upload_append".into(),
-                "session.upload_status".into(),
-                "session.upload_commit".into(),
-                cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
-            ]);
-        }
-        self
-    }
 }
 
 pub use cortexkit_role_llm_runner::tags::{
@@ -1254,7 +1247,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "1efe20e412a7ac83461b20fb03edaf780e70d2fdadeab39b433d7f852ebe2d52",
+            "1310517fd6b3fe529e7ba833c0acaa7a3711ce3252930b9deb44ea2161ba940b",
         );
     }
 
@@ -1432,7 +1425,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "3f8102ee15158c368c0ca547886c4e777dc25e8e7190e0334d9f355914fddde0";
+        "ae729a7b9a1ca0de45a0b1b087f6caa98167e98c05a2eac903753deaeb794c21";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

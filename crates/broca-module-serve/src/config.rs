@@ -226,77 +226,55 @@ mod compaction_signals_config_tests {
     }
 }
 
-/// Boot-only media opt-in. Unknown settings refuse rather than silently disabling capture.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct MediaConfig {
-    pub enabled: bool,
+/// Read the retired media key only to tell operators it no longer affects admission.
+pub fn warn_obsolete_media_default() -> Result<(), String> {
+    if let crate::config_home::ConfigHome::Resolved { path, .. } =
+        crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+    {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                if has_obsolete_media(&text)
+                    .map_err(|error| format!("{}: {error}", path.display()))?
+                {
+                    tracing::warn!(target: "config", "broca.jsonc key 'media' is obsolete and ignored; media input follows the frozen model's capabilities");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("read config {}: {error}", path.display())),
+        }
+    }
+    Ok(())
 }
 
-impl MediaConfig {
-    pub fn load_default() -> Result<Self, String> {
-        use crate::config_home::ConfigHome;
-        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
-        {
-            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    Self::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-                Err(error) => Err(format!("read media from {}: {error}", path.display())),
-            },
-            ConfigHome::Unresolvable => Ok(Self::default()),
-        }
-    }
-
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let text = crate::cache_routing::strip_trailing_commas(
-            &crate::cache_routing::strip_jsonc_comments(text),
-        );
-        let file: serde_json::Value =
-            serde_json::from_str(&text).map_err(|error| format!("parse media: {error}"))?;
-        match file.get("media") {
-            None => Ok(Self::default()),
-            Some(value) if !value.is_object() => Err("media must be an object".into()),
-            Some(value) => serde_json::from_value(value.clone())
-                .map_err(|error| format!("parse media: {error}")),
-        }
-    }
+fn has_obsolete_media(text: &str) -> Result<bool, String> {
+    let text = crate::cache_routing::strip_trailing_commas(
+        &crate::cache_routing::strip_jsonc_comments(text),
+    );
+    let file: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&text).map_err(|error| format!("parse broca config: {error}"))?;
+    Ok(file.contains_key("media"))
 }
 
 #[cfg(test)]
-mod media_config_tests {
-    use super::MediaConfig;
+mod obsolete_media_tests {
+    use super::has_obsolete_media;
 
     #[test]
-    fn media_defaults_off_and_requires_an_explicit_boolean() {
-        for text in ["{}", r#"{"media":{}}"#, r#"{"media":{"enabled":false}}"#] {
-            assert_eq!(MediaConfig::parse(text).unwrap(), MediaConfig::default());
-        }
-        assert!(
-            MediaConfig::parse(r#"{"media":{"enabled":true,},}"#)
-                .unwrap()
-                .enabled
-        );
-    }
-
-    #[test]
-    fn malformed_media_is_named_including_unknown_settings() {
+    fn obsolete_media_is_accepted_without_parsing_its_value() {
+        assert!(!has_obsolete_media("{}").unwrap());
         for text in [
+            r#"{"media":{"enabled":false}}"#,
+            r#"{"media":{"enabled":true,},}"#,
+            r#"{"media":{"enabeld":true}}"#,
+            r#"{"media":{"enabled":"yes"}}"#,
             r#"{"media":null}"#,
-            r#"{"media":true}"#,
             r#"{"media":[]}"#,
-            r#"{"media":{"enabled":"true"}}"#,
-            r#"{"media":{"enabled":null}}"#,
         ] {
-            let error = MediaConfig::parse(text).unwrap_err();
-            assert!(error.contains("media"), "{error}");
+            assert!(has_obsolete_media(text).unwrap());
+            // Other boot loaders must not reject the retired top-level key either.
+            crate::account_routing::AccountSelectionConfig::parse(text).unwrap();
+            crate::vault_config::VaultCredentialIds::parse(text).unwrap();
         }
-        let error = MediaConfig::parse(r#"{"media":{"enabeld":true}}"#).unwrap_err();
-        assert!(
-            error.contains("media") && error.contains("enabeld"),
-            "{error}"
-        );
     }
 }
 

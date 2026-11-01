@@ -277,7 +277,7 @@ fn assemble_judged(
                                             computed.clean = false;
                                         }
                                         probe.tags = broca_protocol::tags::TagSlot::new(Some(std::sync::Arc::new(tags)));
-                                        broca_protocol::tags::render_tags_into(std::slice::from_mut(&mut probe), broca_protocol::tags::TagRendering { assistant_text: true });
+                                        broca_protocol::tags::render_tags_into(std::slice::from_mut(&mut probe), broca_protocol::tags::TagRendering { assistant_text: true, ..Default::default() });
                                         part = probe.content.remove(0);
                                 }
                                 edited.content.push(part);

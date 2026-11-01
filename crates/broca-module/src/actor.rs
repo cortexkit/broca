@@ -1580,6 +1580,7 @@ pub struct LineageActor<W: WalStore> {
     /// kept current with `retracted_submissions`. A keyed retry must carry the same order.
     ordered_submissions: HashMap<broca_protocol::SubmissionId, broca_protocol::DeliveryOrder>,
     restart_admitting: bool,
+    deferred_restart_settings: std::collections::VecDeque<LineageCmd>,
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
     /// Set while startup restart recovery drives the admission, because that branch answers
     /// parked `restart_waiters` itself once it knows the episode's outcome.
@@ -1887,6 +1888,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             delivered_submissions: HashMap::new(),
             ordered_submissions: HashMap::new(),
             restart_admitting: false,
+            deferred_restart_settings: Default::default(),
             restart_waiters: Vec::new(),
             restart_recovery_owns_waiters: false,
             resuming_for_late_result: false,
@@ -2212,10 +2214,110 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .await
     }
 
-    /// Dispatch ONE command. Shared by the live `recv` arm and the pre-close drain.
-    /// Returns true when an active run ended without a durable terminal and this actor generation
-    /// must exit so the next generation recovers from the WAL before serving more work.
+    fn discard_stale_admission_view(&mut self) {
+        if self.prior_snapshot.as_ref().is_some_and(|snapshot| {
+            self.writer.as_ref().is_none_or(|writer| {
+                writer.next_record_seq() != snapshot.head_seq.saturating_add(1)
+            })
+        }) {
+            self.prior_snapshot = None;
+        }
+    }
+
+    /// Dispatch one command through the live receive arm or the pre-close drain.
+    /// Return true when an undurable run exit requires a new actor generation to recover the WAL.
     async fn handle_cmd(&mut self, cmd: LineageCmd) -> bool {
+        // Idle commands and delegated warm/recovery work can advance the writer without
+        // starting an episode. Keep a cached admission view only while its head still matches.
+        self.discard_stale_admission_view();
+        // The executor already owns its resume snapshot while dependencies are unresolved.
+        // Postpone session-change metadata writes, without changing run-control handling.
+        if self.restart_admitting && Self::defer_restart_command(&cmd) {
+            if let Some(error) = self.observe_writer_poison() {
+                return self.reply_writer_poisoned(cmd, error);
+            }
+            // Bound only settings, never the normal command lane: cancellation, steering
+            // and status must remain available while dependency admission is suspended.
+            if self.deferred_restart_settings.len() >= self.rx.max_capacity() {
+                match cmd {
+                    LineageCmd::SessionRefresh { reply, .. } => {
+                        let _ = reply.send(SessionRefreshOutcome::Error(
+                            "session.refresh deferred settings are full; retry after admission"
+                                .into(),
+                        ));
+                    }
+                    LineageCmd::SessionRefreshPolicy { reply, .. } => {
+                        let _ = reply.send(SessionRefreshPolicyOutcome::Error("session.refresh_policy deferred settings are full; retry after admission".into()));
+                    }
+                    LineageCmd::SessionFlushPrefix { reply, .. } => {
+                        let _ = reply.send(SessionFlushPrefixOutcome::Error("session.flush_prefix deferred settings are full; retry after admission".into()));
+                    }
+                    _ => unreachable!("only settings are deferred"),
+                }
+            } else {
+                self.deferred_restart_settings.push_back(cmd);
+            }
+            return false;
+        }
+        if !self.restart_admitting {
+            Box::pin(self.apply_deferred_restart_settings()).await;
+        }
+        let exit = self.handle_cmd_inner(cmd).await;
+        self.discard_stale_admission_view();
+        exit
+    }
+
+    fn defer_restart_command(cmd: &LineageCmd) -> bool {
+        matches!(
+            cmd,
+            LineageCmd::SessionRefresh { .. }
+                | LineageCmd::SessionRefreshPolicy { .. }
+                | LineageCmd::SessionFlushPrefix { .. }
+        )
+    }
+
+    async fn apply_deferred_restart_settings(&mut self) {
+        while let Some(cmd) = self.deferred_restart_settings.pop_front() {
+            self.discard_stale_admission_view();
+            if let Some(error) = self.observe_writer_poison() {
+                self.reply_writer_poisoned(cmd, error);
+            } else if self.writer.is_none() {
+                Self::reply_retired(cmd);
+            } else {
+                // These commands were received before teardown/expiry was selected. Use
+                // their ordinary typed handlers without re-entering lifecycle dispatch.
+                match cmd {
+                    LineageCmd::SessionRefresh {
+                        generation,
+                        policy,
+                        manifest,
+                        reply,
+                    } => {
+                        let _ =
+                            reply.send(self.on_session_refresh(generation, policy, manifest).await);
+                    }
+                    LineageCmd::SessionRefreshPolicy {
+                        generation,
+                        policy,
+                        send_id,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            self.on_session_refresh_policy(generation, policy, send_id)
+                                .await,
+                        );
+                    }
+                    LineageCmd::SessionFlushPrefix { send_id, reply } => {
+                        let _ = reply.send(self.on_session_flush_prefix(send_id).await);
+                    }
+                    _ => unreachable!("only settings are deferred"),
+                }
+            }
+            self.discard_stale_admission_view();
+        }
+    }
+
+    async fn handle_cmd_inner(&mut self, cmd: LineageCmd) -> bool {
         if let LineageCmd::CutLock { reply, mode } = cmd {
             let busy = if matches!(self.state, RunState::Active { .. }) {
                 Some("run_active".into())
@@ -2536,6 +2638,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 } else {
                     Ok(false)
                 };
+                // Applying or refusing a view can append a notice too. The next send must
+                // not depend on a separate queue-wake command to observe those durable records.
+                self.discard_stale_admission_view();
                 // An applied compaction view is a real frozen-prefix rebuild for a pending
                 // `on_prefix_rebuild` change: the next run applies it. A new run alone is not.
                 if matches!(result, Ok(true)) {
@@ -2856,7 +2961,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(error) => Err(format!("session move check failed: {error}")),
             };
         }
-        self.recover_durable_work_inner().await?;
+        // Recovery can be polled beneath command/admission handling on a worker's
+        // small stack. Keep its large replay/admission future off those caller frames.
+        Box::pin(self.recover_durable_work_inner()).await?;
         if self.registry.has_recovery_debt(&self.key) {
             // A readable replay alone cannot discharge a failed fsync. Prove the recovered
             // session durable before clearing only its debt; keep the historical failure event.
@@ -4887,6 +4994,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             request_identity_digest: request_identity_digest.clone(),
             tools_were_omitted,
         };
+        // A command can queue/cancel work and start its successor in the same actor turn.
+        self.discard_stale_admission_view();
         if self.prior_snapshot.is_none() {
             if let Err(error) = self.refresh_admission_view().await {
                 return Err(StartRunFailure::Infrastructure(error));
@@ -5283,6 +5392,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // nothing new, so it usually leaves before the seal has to cut it.
             stop_requested: Some(self.registry.stopping_signal()),
             steer: Some(Arc::clone(&steer)),
+            live_steer_after_seq: Some(prior_snapshot.head_seq),
             manifest: manifest.clone(),
             manifest_system_override: self.session_change.applied_generation > 0
                 || (!resuming && self.pending_for_model(&req.model).is_some()),
@@ -5472,6 +5582,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Ok(Err(error)) => Err(StartRunFailure::Admission(error)),
                     Err(_) => Err(StartRunFailure::Infrastructure("run ended before admission".into())),
                 },
+                // Only the separate settings FIFO is bounded; run control stays responsive.
                 Some(command) = self.rx.recv(), if restart_resuming => {
                     // Commands are served while a restart-paused episode waits for its
                     // dependencies, so this one runs inside the suspended admission. Its exit
@@ -5492,6 +5603,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         };
         self.restart_admitting = false;
+        if admission.is_err() && !matches!(&admission, Err(StartRunFailure::Shutdown)) {
+            if let Some(RunState::Active { handle, .. }) = pending_active.take() {
+                handle.abort();
+                let _ = handle.await;
+            } else {
+                self.stop_active_run().await;
+                self.set_idle();
+            }
+        }
+        // The suspended admission owns this FIFO. Apply it before returning to any caller
+        // that can admit a queued successor, including refusal and shutdown recovery. A
+        // refused task has already stopped, so typed settings replies do not call it active.
+        Box::pin(self.apply_deferred_restart_settings()).await;
         // `ResumeRestart` requests that arrived during this admission were parked because it
         // was already resuming the episode. Every path into restart admission must answer them
         // once it ends (a cancel or interrupt finalizer, a queued drain, a cancel recovery),
@@ -5513,16 +5637,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // Shutdown leaves the restart task in self.state so seal_for_shutdown
             // can stop and join it before durably recording the episode's end.
             Err(StartRunFailure::Shutdown) => return Err(StartRunFailure::Shutdown),
-            Err(error) => {
-                if let Some(RunState::Active { handle, .. }) = pending_active.take() {
-                    handle.abort();
-                    let _ = handle.await;
-                } else {
-                    self.stop_active_run().await;
-                    self.set_idle();
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
 
         if admits_the_session {
@@ -7843,6 +7958,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     }
 
     async fn drain_queue_one_inline(&mut self) -> Result<(), String> {
+        Box::pin(self.apply_deferred_restart_settings()).await;
         if self.registry.is_stopping() {
             return Ok(());
         }
@@ -8990,6 +9106,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// rest of its teardown is done and drops it where it would drop an actor-held lease,
     /// so both tenure kinds release at the same point of the close.
     async fn shutdown_writer(&mut self) -> WriterClosed {
+        Box::pin(self.apply_deferred_restart_settings()).await;
         if let Some(task) = self.source_warm_task.take() {
             task.stop().await;
         }
@@ -9532,6 +9649,38 @@ impl<W: WalStore + 'static> LineageActor<W> {
         )
         .await
         .map_err(|error| format!("admission snapshot task failed: {error}"))??;
+        let writer = self
+            .writer
+            .as_ref()
+            .expect("writer live while loading admission");
+        if snapshot.lineage_id.is_none() {
+            snapshot.lineage_id = writer.lineage_id().map(|lineage| lineage.to_string());
+        }
+        if snapshot.anchor.is_none()
+            && matches!(
+                &snapshot.checkpoint_at_head.media,
+                Some(broca_core::media_request::DurableMediaSeed::Ready(_))
+            )
+        {
+            let anchor = self
+                .wal_store
+                .file_identity(&self.key)
+                .ok()
+                .flatten()
+                .zip(self.wal_store.live_wal_bytes(&self.key).ok().flatten())
+                .map(|(file_id, byte_end)| broca_wal::WalByteAnchor {
+                    file_id,
+                    byte_end,
+                    seq: safe_head,
+                });
+            // A complete read carries no byte offset. Metadata can supply one only
+            // while no append has advanced its selected cut; never relabel a newer EOF.
+            if writer.next_record_seq() == safe_head.saturating_add(1)
+                && writer.durable_head().load(Ordering::Acquire) == safe_head
+            {
+                snapshot.anchor = anchor;
+            }
+        }
         // Run reconstruction never reads the durable pending queue. Move its allocation into the
         // actor's queue state before sharing the slim checkpoint with executor/core clones.
         let mut pending_fifo = snapshot.take_pending_fifo();
@@ -14747,7 +14896,8 @@ mod tests {
             std::mem::size_of::<Fut>()
         }
         type Actor = LineageActor<FileWalStore>;
-        let recovery = future_size(Actor::recover_durable_work);
+        // Recovery orchestration also heap-owns replay now, so its small future is
+        // no longer a useful relative benchmark for the other control entries.
         for (name, size) in [
             (
                 "recover_startup_admission_view",
@@ -14757,9 +14907,8 @@ mod tests {
             ("start_run", future_size_6(Actor::start_run)),
         ] {
             assert!(
-                size * 4 < recovery,
-                "{name} is carried inline in its callers: {size} bytes, recovery itself is \
-                 {recovery} bytes"
+                size <= 4096,
+                "{name} carries {size} bytes in its callers; keep replay/admission state on the heap"
             );
         }
     }

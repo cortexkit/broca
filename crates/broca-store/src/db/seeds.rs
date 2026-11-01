@@ -163,6 +163,8 @@ fn full_admission(
     let checkpoint_at_head =
         broca_core::AdmissionCheckpointV1::from_frames(&frames).map_err(|e| e.to_string())?;
     Ok(broca_core::run::PriorWalSnapshot {
+        lineage_id: None,
+        anchor: None,
         base_watermark: 0,
         head_seq: head,
         tail: std::sync::Arc::new(frames),
@@ -248,7 +250,7 @@ impl DatabaseAdmissionReader {
                     let tail = admission_tail(read_at, &seed, safe_head, end)?;
                     Ok((seed, tail))
                 });
-                match seeded {
+                let mut snapshot = match seeded {
                     Ok((seed, tail)) => broca_core::run::load_prior_wal_snapshot_from_seed(
                         read_at,
                         &seed,
@@ -265,7 +267,9 @@ impl DatabaseAdmissionReader {
                         count_admission_error(&error);
                         full_admission(read_at, safe_head, end, lineage)
                     }
-                }
+                }?;
+                snapshot.lineage_id = Some(lineage.to_owned());
+                Ok(snapshot)
             },
         )
     }
