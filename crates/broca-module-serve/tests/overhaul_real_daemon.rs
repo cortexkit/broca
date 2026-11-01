@@ -123,11 +123,23 @@ fn inspect_database(root: &Path) {
 #[derive(Default)]
 struct Script {
     requests: Mutex<Vec<Vec<u8>>>,
+    reservations: Mutex<Vec<Result<Option<ReservationReceipt>, String>>>,
     dispatches: Mutex<Vec<Value>>,
     reports: Mutex<Vec<Value>>,
     tail_entered: Notify,
     tail_release: Notify,
     observed: Mutex<Observed>,
+}
+
+#[derive(Clone, Debug)]
+struct ReservationReceipt {
+    lineage: String,
+    attempt_id: String,
+    seq: u64,
+    end: u64,
+    durable_seq: u64,
+    durable_end: u64,
+    reservation: Value,
 }
 
 #[derive(Default)]
@@ -240,13 +252,17 @@ impl Trace {
     }
 }
 
-async fn provider(script: Arc<Script>) -> (String, tokio::task::JoinHandle<()>) {
+async fn provider(
+    script: Arc<Script>,
+    billing_root: Option<PathBuf>,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
             let script = script.clone();
+            let billing_root = billing_root.clone();
             tokio::spawn(async move {
                 let mut bytes = Vec::new();
                 let (start, length) = loop {
@@ -279,6 +295,13 @@ async fn provider(script: Arc<Script>) -> (String, tokio::task::JoinHandle<()>) 
                     requests.push(bytes[start..start + length].to_vec());
                     turn
                 };
+                let receipt = match &billing_root {
+                    Some(root) => {
+                        capture_reservation(root, turn, &bytes[start..start + length]).map(Some)
+                    }
+                    None => Ok(None),
+                };
+                script.reservations.lock().unwrap().push(receipt);
                 script.observed.lock().unwrap().last_event = Some(json!({"provider_request":turn}));
                 if turn == 4 {
                     script.tail_entered.notify_one();
@@ -481,7 +504,7 @@ impl Rig {
             std::fs::create_dir_all(dir).unwrap();
         }
         let script = Arc::new(Script::default());
-        let (url, provider) = provider(script.clone()).await;
+        let (url, provider) = provider(script.clone(), overhaul.then(|| state.clone())).await;
         // Both roots render the same synthetic Chat transport, independently of live catalogs.
         std::fs::write(state.join("catalog/fusiform-lkg.json"), json!({
             "catalog_version":1,"resolved_at_ms":1,"source":"fixture","models":{
@@ -535,6 +558,13 @@ impl Rig {
     fn check(&self) {
         if self.overhaul {
             no_legacy_index(&self.state);
+        }
+        for receipt in self.script.reservations.lock().unwrap().iter() {
+            assert!(
+                receipt.is_ok(),
+                "{} physical-attempt reservation: {receipt:?}",
+                self.trace.label
+            );
         }
     }
 
@@ -767,6 +797,261 @@ struct Sources {
     overhaul: bool,
 }
 
+fn source_wal_path(state: &Path) -> Result<PathBuf, String> {
+    fn logs(dir: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
+        for entry in std::fs::read_dir(dir).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            if path.is_dir() {
+                logs(&path, found)?;
+            } else if path.extension().is_some_and(|extension| extension == "wal") {
+                found.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut paths = vec![];
+    logs(state, &mut paths)?;
+    if paths.len() != 1 {
+        return Err(format!("expected one lineage WAL: {paths:?}"));
+    }
+    Ok(paths.remove(0))
+}
+
+fn capture_reservation(
+    state: &Path,
+    attempt: usize,
+    body: &[u8],
+) -> Result<ReservationReceipt, String> {
+    use broca_wal::head_proof::{sidecar_path, PublishedLog};
+    let path = source_wal_path(state)?;
+    let sidecar = std::fs::read(sidecar_path(&path))
+        .map_err(|error| format!("reservation head proof: {error}"))?;
+    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+    let published = PublishedLog::open(&bytes, &sidecar)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "reservation has no valid synced-prefix proof".to_owned())?;
+    let end = usize::try_from(published.head().durable_end).map_err(|error| error.to_string())?;
+    // Check the writer's synced-prefix proof when HTTP arrives, before sending the response.
+    let (lineage, records) = decode_sources(&bytes[..end]);
+    let reservations: Vec<_> = records
+        .iter()
+        .filter(|source| source.record["type"] == "attempt_reserved")
+        .collect();
+    if reservations.len() != attempt + 1 {
+        return Err(format!(
+            "physical attempt {} has {} durable reservations",
+            attempt + 1,
+            reservations.len()
+        ));
+    }
+    let reserved = reservations[attempt];
+    let id = reserved.record["attempt_id"]
+        .as_str()
+        .ok_or("reservation has no attempt_id")?;
+    let reservation = &reserved.record["reservation"];
+    if reservation["request_body_bytes"].as_u64() != Some(body.len() as u64)
+        || reservation["compressed"] != false
+    {
+        return Err(format!("reservation {id} does not describe this HTTP body"));
+    }
+    if records.iter().any(|source| {
+        source.record["attempt_id"] == id && source.record["type"] != "attempt_reserved"
+    }) {
+        return Err(format!(
+            "attempt {id} settled before its HTTP request was answered"
+        ));
+    }
+    Ok(ReservationReceipt {
+        lineage,
+        attempt_id: id.to_owned(),
+        seq: reserved.seq,
+        end: reserved.end,
+        durable_seq: published.head().durable_seq,
+        durable_end: published.head().durable_end,
+        reservation: reservation.clone(),
+    })
+}
+
+fn assert_billing_attempts(
+    lineage: &str,
+    overhaul: bool,
+    records: &[Source],
+    requests: &[Vec<u8>],
+    receipts: &[Result<Option<ReservationReceipt>, String>],
+) {
+    use sha2::{Digest, Sha256};
+    let attempts: Vec<_> = records
+        .iter()
+        .filter(|source| source.record["type"] == "model_attempt_finished")
+        .collect();
+    assert_eq!(
+        attempts.len(),
+        requests.len(),
+        "one terminal per physical model attempt"
+    );
+    assert_eq!(
+        receipts.len(),
+        requests.len(),
+        "one observation per physical HTTP request"
+    );
+    for (terminal, body) in attempts.iter().zip(requests) {
+        assert_eq!(terminal.record["request_body_len"], body.len() as u64);
+        assert_eq!(
+            terminal.record["request_body_sha256"],
+            format!("{:x}", Sha256::digest(body))
+        );
+    }
+    if !overhaul {
+        assert!(
+            !records.iter().any(|source| billing_only(&source.record)),
+            "legacy WAL has billing-only records"
+        );
+        assert!(receipts.iter().all(|receipt| matches!(receipt, Ok(None))));
+        for terminal in attempts {
+            for field in ["attempt_id", "reservation", "envelope"] {
+                assert!(
+                    terminal.record[field].is_null(),
+                    "legacy terminal gained {field}"
+                );
+            }
+        }
+        return;
+    }
+    let reservations: Vec<_> = records
+        .iter()
+        .filter(|source| source.record["type"] == "attempt_reserved")
+        .collect();
+    assert_eq!(
+        reservations.len(),
+        requests.len(),
+        "one billing reservation per physical attempt"
+    );
+    let mut by_id = BTreeMap::new();
+    let mut current_run = Value::Null;
+    for source in records {
+        if source.record["type"] == "run_started" {
+            current_run = source.record["run_id"].clone();
+        }
+        if source.record["type"] == "attempt_reserved" {
+            let id = source.record["attempt_id"].as_str().unwrap();
+            assert_eq!(id.len(), 32);
+            assert!(id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+            assert!(
+                by_id.insert(id, source).is_none(),
+                "duplicate reservation {id}"
+            );
+            assert!(current_run.is_string());
+            assert_eq!(source.record["reservation"]["run_id"], current_run);
+        }
+    }
+    let mut terminals = BTreeMap::new();
+    for (((reserved, terminal), body), receipt) in reservations
+        .iter()
+        .zip(&attempts)
+        .zip(requests)
+        .zip(receipts)
+    {
+        let receipt = receipt
+            .as_ref()
+            .expect("valid reservation proof")
+            .as_ref()
+            .expect("format-2 reservation receipt");
+        let id = reserved.record["attempt_id"].as_str().unwrap();
+        let reservation = &reserved.record["reservation"];
+        assert_eq!(receipt.lineage, lineage);
+        assert_eq!(
+            receipt.attempt_id, id,
+            "reservation order must match HTTP arrival order"
+        );
+        assert_eq!(receipt.seq, reserved.seq);
+        assert_eq!(receipt.end, reserved.end);
+        assert_eq!(receipt.reservation, *reservation);
+        assert!(
+            receipt.durable_seq >= reserved.seq && receipt.durable_end >= reserved.end,
+            "reservation must already be published durable when HTTP arrives"
+        );
+        assert!(
+            receipt.durable_seq < terminal.seq && reserved.seq < terminal.seq,
+            "reservation durability must precede its terminal"
+        );
+        assert_eq!(terminal.record["attempt_id"], id);
+        assert_eq!(terminal.record["reservation"], *reservation);
+        for field in ["step_id", "attempt"] {
+            assert!(reservation[field].is_u64());
+            assert_eq!(terminal.record[field], reservation[field]);
+        }
+        assert_eq!(reservation["request_body_bytes"], body.len() as u64);
+        assert_eq!(reservation["provider"], "xai");
+        assert_eq!(reservation["endpoint_host"], "127.0.0.1");
+        assert_eq!(
+            reservation["model_sent"],
+            serde_json::from_slice::<Value>(body).unwrap()["model"]
+        );
+        assert_eq!(reservation["send_index"], 1);
+        assert_eq!(reservation["warm"], false);
+        assert_eq!(reservation["compressed"], false);
+        let envelope = &terminal.record["envelope"];
+        assert!(envelope.is_object());
+        assert_eq!(envelope["sent"], true);
+        assert_eq!(envelope["http_status"], terminal.record["http_status"]);
+        assert_eq!(
+            envelope["response_bytes"],
+            terminal.record["response_body_len"]
+        );
+        assert_eq!(envelope["sent_at_ms"], terminal.record["sent_at_ms"]);
+        assert_eq!(envelope["finished_at_ms"], terminal.record["ts_ms"]);
+        assert!(
+            terminals.insert(id, terminal.seq).is_none(),
+            "duplicate attempt terminal {id}"
+        );
+    }
+    let mut corrections = BTreeSet::new();
+    for source in records.iter().filter(|source| {
+        billing_only(&source.record) && source.record["type"] != "attempt_reserved"
+    }) {
+        let id = source.record["attempt_id"].as_str().unwrap();
+        let reserved = by_id
+            .get(id)
+            .expect("settlement must name a reserved attempt");
+        assert!(reserved.seq < source.seq);
+        assert_eq!(source.record["reservation"], reserved.record["reservation"]);
+        match source.record["type"].as_str().unwrap() {
+            "attempt_finished" | "attempt_released" => {
+                assert!(source.record["envelope"].is_object());
+                if source.record["type"] == "attempt_released" {
+                    assert_eq!(source.record["envelope"]["sent"], false);
+                }
+                assert!(
+                    terminals.insert(id, source.seq).is_none(),
+                    "attempt has two terminals: {id}"
+                );
+            }
+            "attempt_corrected" => {
+                assert!(
+                    *terminals
+                        .get(id)
+                        .expect("correction must follow a terminal")
+                        < source.seq
+                );
+                assert!(source.record["envelope"].is_object());
+                assert!(corrections.insert(source.record["correction_id"].as_str().unwrap()));
+            }
+            _ => unreachable!(),
+        }
+    }
+    // This clean HTTP fixture has no abandoned sends, recovery settlements or corrections.
+    assert_eq!(
+        records
+            .iter()
+            .filter(|source| billing_only(&source.record))
+            .count(),
+        reservations.len(),
+        "unexpected billing kind: inspect it before excluding it from correspondence"
+    );
+}
+
 fn decode_sources(bytes: &[u8]) -> (String, Vec<Source>) {
     let mut at = 0;
     let mut records = vec![];
@@ -868,24 +1153,19 @@ impl Sources {
     }
 
     fn read(rig: &Rig) -> Self {
-        fn logs(dir: &Path, found: &mut Vec<PathBuf>) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    logs(&path, found);
-                } else if path.extension().is_some_and(|e| e == "wal") {
-                    found.push(path);
-                }
-            }
-        }
-        let mut paths = vec![];
-        logs(&rig.state, &mut paths);
-        assert_eq!(paths.len(), 1, "one lineage WAL: {paths:?}");
-        let bytes = std::fs::read(&paths[0]).unwrap();
+        let path = source_wal_path(&rig.state).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
         let (lineage, records) = decode_sources(&bytes);
+        assert_billing_attempts(
+            &lineage,
+            rig.overhaul,
+            &records,
+            &rig.script.requests.lock().unwrap(),
+            &rig.script.reservations.lock().unwrap(),
+        );
         let logical = records
             .iter()
-            .filter(|s| !lifecycle(&s.record))
+            .filter(|s| comparable_source(&s.record))
             .enumerate()
             .map(|(i, s)| (s.seq, i + 1))
             .collect();
@@ -894,14 +1174,9 @@ impl Sources {
             .filter(|s| s.record["type"] == "run_started")
             .map(|s| s.record["run_id"].as_str().unwrap().to_owned())
             .collect();
-        let range = broca_wal::read_records_range(
-            &paths[0],
-            broca_wal::DEFAULT_MAX_READ_BYTES,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
+        let range =
+            broca_wal::read_records_range(&path, broca_wal::DEFAULT_MAX_READ_BYTES, 0, None, None)
+                .unwrap();
         let file_id = range
             .anchor_at(records.last().unwrap().seq)
             .unwrap()
@@ -953,6 +1228,19 @@ fn lifecycle(record: &Value) -> bool {
         record["type"].as_str(),
         Some("writer_opened" | "writer_closed")
     )
+}
+
+fn billing_only(record: &Value) -> bool {
+    // Format-2 physical-send bookkeeping has no legacy counterpart and is checked separately.
+    // ModelAttemptFinished remains comparable because both formats write that terminal.
+    matches!(
+        record["type"].as_str(),
+        Some("attempt_reserved" | "attempt_released" | "attempt_finished" | "attempt_corrected")
+    )
+}
+
+fn comparable_source(record: &Value) -> bool {
+    !lifecycle(record) && !billing_only(record)
 }
 
 fn fields(value: &Value, expected: &[&str]) {
@@ -1170,12 +1458,12 @@ fn correspondence(left: &Sources, right: &Sources) {
     let left_records: Vec<_> = left
         .records
         .iter()
-        .filter(|s| !lifecycle(&s.record))
+        .filter(|s| comparable_source(&s.record))
         .collect();
     let right_records: Vec<_> = right
         .records
         .iter()
-        .filter(|s| !lifecycle(&s.record))
+        .filter(|s| comparable_source(&s.record))
         .collect();
     assert_eq!(
         left_records.len(),
@@ -2082,6 +2370,310 @@ fn differential_source_oracle_preserves_optional_initial_incarnation() {
         records[1].end as usize,
         header.len() * 3 + first.len() + second.len()
     );
+}
+
+#[test]
+fn differential_billing_records_are_checked_but_not_corresponded() {
+    let legacy = billing_fixture(false);
+    let overhaul = billing_fixture(true);
+    for fixture in [&legacy, &overhaul] {
+        assert_billing_attempts(
+            &fixture.sources.lineage,
+            fixture.sources.overhaul,
+            &fixture.sources.records,
+            &fixture.requests,
+            &fixture.receipts,
+        );
+    }
+    correspondence(&legacy.sources, &overhaul.sources);
+    assert_eq!(legacy.sources.position(2), overhaul.sources.position(4));
+    assert!(!overhaul.sources.logical.contains_key(&3));
+}
+
+struct BillingFixture {
+    sources: Sources,
+    requests: Vec<Vec<u8>>,
+    receipts: Vec<Result<Option<ReservationReceipt>, String>>,
+}
+
+fn billing_fixture(overhaul: bool) -> BillingFixture {
+    use sha2::{Digest, Sha256};
+    let body = br#"{"model":"differential-model"}"#.to_vec();
+    let id = "a".repeat(32);
+    let lineage = format!("lineage-{overhaul}");
+    let reservation = json!({"run_id":"run-a","step_id":1,"attempt":0,"send_index":1,
+        "warm":false,"reserved_at_ms":1,"provider":"xai","endpoint_host":"127.0.0.1",
+        "model_sent":"differential-model","credential":{"credential_ref":"apikey:xai","account_ref":"acct-fixture"},
+        "session":{"project_root":"/project","harness":"differential","session":"session","session_ref":"ref"},
+        "run":{},"request_body_bytes":body.len(),"compressed":false});
+    let mut terminal = json!({"type":"model_attempt_finished","step_id":1,"attempt":0,
+        "request_body_len":body.len(),"request_body_sha256":format!("{:x}", Sha256::digest(&body)),
+        "http_status":200,"response_body_len":3,"sent_at_ms":2,"ts_ms":3});
+    let mut bodies = vec![];
+    if overhaul {
+        bodies.push(json!({"type":"writer_opened"}));
+    }
+    bodies.push(json!({"type":"run_started","run_id":"run-a"}));
+    let receipt = if overhaul {
+        bodies.push(json!({"type":"attempt_reserved","attempt_id":id,"reservation":reservation}));
+        terminal["attempt_id"] = json!(id);
+        terminal["reservation"] = reservation.clone();
+        terminal["envelope"] = json!({"sent":true,"http_status":200,"response_bytes":3,"sent_at_ms":2,"finished_at_ms":3});
+        Some(ReservationReceipt {
+            lineage: lineage.clone(),
+            attempt_id: id,
+            seq: 3,
+            end: 300,
+            durable_seq: 3,
+            durable_end: 300,
+            reservation,
+        })
+    } else {
+        None
+    };
+    bodies.extend([terminal, json!({"type":"run_finished","run_id":"run-a"})]);
+    let records: Vec<_> = bodies
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| Source {
+            seq: index as u64 + 1,
+            end: (index as u64 + 1) * 100,
+            record,
+        })
+        .collect();
+    let logical = records
+        .iter()
+        .filter(|source| comparable_source(&source.record))
+        .enumerate()
+        .map(|(index, source)| (source.seq, index + 1))
+        .collect();
+    BillingFixture {
+        sources: Sources {
+            lineage,
+            records,
+            logical,
+            root: "/state".into(),
+            runs: vec!["run-a".into()],
+            file_id: 7,
+            projected: BTreeSet::new(),
+            overhaul,
+        },
+        requests: vec![body],
+        receipts: vec![Ok(receipt)],
+    }
+}
+
+#[test]
+fn differential_billing_ledger_rejects_unmatched_or_undurable_attempts() {
+    for kind in [
+        "attempt_reserved",
+        "attempt_released",
+        "attempt_finished",
+        "attempt_corrected",
+    ] {
+        assert!(billing_only(&json!({"type":kind})));
+    }
+    for kind in [
+        "model_attempt_finished",
+        "cache_warmed",
+        "run_started",
+        "attempt_future",
+    ] {
+        assert!(!billing_only(&json!({"type":kind})), "must not hide {kind}");
+    }
+    for fault in [
+        "missing reservation",
+        "wrong lineage",
+        "wrong order",
+        "unpublished sequence",
+        "unpublished bytes",
+        "late proof",
+        "wrong terminal id",
+        "changed reservation",
+        "wrong envelope",
+        "orphan settlement",
+        "duplicate settlement",
+        "unexpected correction",
+    ] {
+        let mut fixture = billing_fixture(true);
+        match fault {
+            "missing reservation" => {
+                fixture.sources.records.remove(2);
+            }
+            "wrong lineage" => {
+                fixture.receipts[0]
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .lineage = "foreign".into()
+            }
+            "wrong order" => {
+                fixture.receipts[0]
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .attempt_id = "b".repeat(32)
+            }
+            "unpublished sequence" => {
+                fixture.receipts[0]
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .durable_seq = 2
+            }
+            "unpublished bytes" => {
+                fixture.receipts[0]
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .durable_end = 299
+            }
+            "late proof" => {
+                fixture.receipts[0]
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .durable_seq = 4
+            }
+            "wrong terminal id" => {
+                fixture.sources.records[3].record["attempt_id"] = json!("b".repeat(32))
+            }
+            "changed reservation" => {
+                fixture.sources.records[3].record["reservation"]["step_id"] = json!(2)
+            }
+            "wrong envelope" => {
+                fixture.sources.records[3].record["envelope"]["http_status"] = json!(401)
+            }
+            "orphan settlement" | "duplicate settlement" | "unexpected correction" => {
+                let mut record = fixture.sources.records[3].record.clone();
+                record["type"] = json!(if fault == "unexpected correction" {
+                    "attempt_corrected"
+                } else {
+                    "attempt_finished"
+                });
+                record["correction_id"] = json!("c".repeat(32));
+                if fault == "orphan settlement" {
+                    record["attempt_id"] = json!("b".repeat(32));
+                }
+                fixture.sources.records.push(Source {
+                    seq: 6,
+                    end: 600,
+                    record,
+                });
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            std::panic::catch_unwind(|| assert_billing_attempts(
+                &fixture.sources.lineage,
+                true,
+                &fixture.sources.records,
+                &fixture.requests,
+                &fixture.receipts
+            ))
+            .is_err(),
+            "accepted {fault}"
+        );
+    }
+    let mut legacy = billing_fixture(false);
+    let mut overhaul = billing_fixture(true);
+    legacy.sources.records.push(Source {
+        seq: 4,
+        end: 400,
+        record: overhaul.sources.records[2].record.clone(),
+    });
+    assert!(std::panic::catch_unwind(|| assert_billing_attempts(
+        &legacy.sources.lineage,
+        false,
+        &legacy.sources.records,
+        &legacy.requests,
+        &legacy.receipts
+    ))
+    .is_err());
+    let legacy = billing_fixture(false);
+    overhaul.sources.records.push(Source {
+        seq: 6,
+        end: 600,
+        record: json!({"type":"attempt_future"}),
+    });
+    assert!(
+        std::panic::catch_unwind(|| correspondence(&legacy.sources, &overhaul.sources)).is_err()
+    );
+}
+
+#[tokio::test]
+async fn differential_billing_receipt_requires_a_published_reservation() {
+    use broca_wal::head_proof::{PublicationStatus, Publisher, SyncedPrefix};
+    use broca_wal::{FileWal, Wal, WalConfig, WalRecord};
+    let mut rig = diagnostic_rig("differential-reservation-proof", true);
+    std::fs::write(rig.state.join("state-format"), b"broca-state/2\n").unwrap();
+    let path = rig.state.join("wal/source.wal");
+    let floor = rig.state.join(broca_wal::floor::FEATURE_FLOOR_FILENAME);
+    let mut wal = FileWal::open_with_recovery(&path, WalConfig::OVERHAUL, floor.clone())
+        .unwrap()
+        .with_feature_floor(floor)
+        .with_wal_config(WalConfig::OVERHAUL)
+        .unwrap();
+    wal.append(
+        1,
+        &WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
+        true,
+    )
+    .unwrap();
+    let mut publisher = Publisher::from_synced(SyncedPrefix::sync(&wal).unwrap()).unwrap();
+    assert_eq!(
+        publisher
+            .publish(broca_wal::framing::appended_ms_now)
+            .unwrap(),
+        PublicationStatus::Published
+    );
+    let fixture = billing_fixture(true);
+    let reserved: WalRecord =
+        serde_json::from_value(fixture.sources.records[2].record.clone()).unwrap();
+    let seq = wal.append(1, &reserved, true).unwrap();
+    assert!(
+        capture_reservation(&rig.state, 0, &fixture.requests[0]).is_err(),
+        "a stale proof must not cover a later reservation"
+    );
+    publisher.sync(&wal).unwrap();
+    assert_eq!(
+        publisher
+            .publish(broca_wal::framing::appended_ms_now)
+            .unwrap(),
+        PublicationStatus::Published
+    );
+    let receipt = capture_reservation(&rig.state, 0, &fixture.requests[0]).unwrap();
+    assert_eq!(receipt.seq, seq);
+    assert_eq!(receipt.attempt_id, "a".repeat(32));
+    assert!(receipt.durable_seq >= seq && receipt.durable_end >= receipt.end);
+    assert!(capture_reservation(&rig.state, 1, &fixture.requests[0]).is_err());
+    assert!(capture_reservation(&rig.state, 0, b"different body").is_err());
+    let settled: WalRecord = serde_json::from_value(
+        json!({"type":"attempt_finished", "attempt_id":"a".repeat(32),
+        "reservation":fixture.sources.records[2].record["reservation"],
+        "envelope":{"sent":"unknown","outcome":"unknown","response_bytes":0}}),
+    )
+    .unwrap();
+    wal.append(1, &settled, true).unwrap();
+    publisher.sync(&wal).unwrap();
+    assert_eq!(
+        publisher
+            .publish(broca_wal::framing::appended_ms_now)
+            .unwrap(),
+        PublicationStatus::Published
+    );
+    assert!(
+        capture_reservation(&rig.state, 0, &fixture.requests[0]).is_err(),
+        "an already-settled attempt cannot authorize this send"
+    );
+    rig.completed = true;
 }
 
 #[test]
