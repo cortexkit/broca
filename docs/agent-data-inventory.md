@@ -319,11 +319,15 @@ key rows, changes log bytes or extracts an archive. All other run metadata is
 retained. A present stale meta lineage must match the verified surviving log's
 lineage; a known different lineage refuses even if transcript bytes happen to
 match. Legacy NULL meta lineage means unknown, not different: cleanup requires
-every stale `message` row to have a live-key row at the same `ord` with
-byte-identical stored `json`, and stale `meta.last_run_id` must occur in a verified
-live-log `run_started`. Missing or differing rows refuse with
-`null_lineage_prefix_mismatch`; a missing or unrepresented last run ID refuses
-with `null_lineage_last_run_missing`.
+every stale `message` row to match the verified surviving log's projection at the
+same `ord`, using the store's canonical serialized `json` bytes. No live-key cache
+is required. If live-key message rows exist, every stale row must additionally
+have a byte-identical live-key row at that ordinal; matching caches cannot excuse
+a difference from the log. A missing or differing log-derived message refuses
+with `null_lineage_log_prefix_mismatch`; a missing or differing live-key row
+refuses with `null_lineage_prefix_mismatch`. Stale `meta.last_run_id` must occur
+in a verified live-log `run_started`, or repair refuses with
+`null_lineage_last_run_missing`.
 
 Preview reports `stale_projection_evidence.kind` as `lineage_match` or
 `null_lineage_prefix_match`, with `compared_message_rows`. The known-lineage proof

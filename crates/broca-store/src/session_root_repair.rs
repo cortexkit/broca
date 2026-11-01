@@ -632,6 +632,28 @@ fn plan_projection_cleanup(
     let wal = broca_core::FileWalStore::new(root.join("wal"));
     let range = wal.read_records_range(live, 0, None, None)?;
     result.live_log_lineage = range.lineage_id.map(|id| id.to_string());
+    let rebuild = || -> Result<crate::ProjectionPlan> {
+        let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+            return Err(
+                "live projection proof requires the complete verified surviving log".into(),
+            );
+        };
+        // Use the store's own replay and serialization, without committing a
+        // cache: the WAL can prove a prefix even if the live key was never read.
+        Ok(SqliteStore::prepare_projection(
+            broca_core::projection_plan::ProjectionSnapshot {
+                attribution_complete: true,
+                seed: None,
+                watermark: 0,
+                lineage_id: None,
+                next_ord: 0,
+                previous_control_head: None,
+            },
+            records,
+            Some(&range),
+        )?)
+    };
+    let mut rebuilt = None;
     if let Some(meta) = &result.stale_meta {
         result.stale_projection_evidence = Some(match &meta.lineage_id {
             Some(lineage) => {
@@ -650,6 +672,7 @@ fn plan_projection_cleanup(
                 &SqliteStore::key(live),
                 meta,
                 verified_records,
+                rebuilt.insert(rebuild()?),
             )?,
         });
     }
@@ -667,27 +690,8 @@ fn plan_projection_cleanup(
             return Err(format!("stale projection table {table} has a different or unverified lineage; refusing cleanup").into());
         }
     }
-    if !result.live_meta_present {
-        let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
-            return Err(
-                "live key has no meta row and the complete log needed to rebuild it is unavailable"
-                    .into(),
-            );
-        };
-        // Prepare from an empty snapshot without committing it: prove rebuilding
-        // succeeds, but leave every live-key row untouched during maintenance.
-        SqliteStore::prepare_projection(
-            broca_core::projection_plan::ProjectionSnapshot {
-                attribution_complete: true,
-                seed: None,
-                watermark: 0,
-                lineage_id: None,
-                next_ord: 0,
-                previous_control_head: None,
-            },
-            records,
-            Some(&range),
-        )?;
+    if !result.live_meta_present && rebuilt.is_none() {
+        rebuild()?;
     }
     Ok(())
 }
@@ -698,13 +702,17 @@ fn null_lineage_prefix_evidence(
     live_key: &str,
     meta: &ProjectionMeta,
     verified_records: &[broca_wal::FramedRecord],
+    projection: &crate::ProjectionPlan,
 ) -> Result<ProjectionEvidence> {
     // Compare stored bytes, not parsed JSON: normalization would hide a differing
     // row and falsely certify a projection from another history as a live prefix.
+    // A live message cache remains an additional fence when present, but an
+    // absent cache cannot disprove the history in the verified log.
     let mismatch = conn
         .query_row(
             "SELECT s.ord FROM message s LEFT JOIN message l ON l.session=?2 AND l.ord=s.ord
-         WHERE s.session=?1 AND (l.ord IS NULL OR CAST(s.json AS BLOB) IS NOT CAST(l.json AS BLOB))
+         WHERE s.session=?1 AND EXISTS(SELECT 1 FROM message WHERE session=?2)
+           AND (l.ord IS NULL OR CAST(s.json AS BLOB) IS NOT CAST(l.json AS BLOB))
          ORDER BY s.ord LIMIT 1",
             params![stale_key, live_key],
             |row| row.get::<_, i64>(0),
@@ -713,16 +721,30 @@ fn null_lineage_prefix_evidence(
     if let Some(ordinal) = mismatch {
         return Err(format!("null_lineage_prefix_mismatch: stale message ord {ordinal} has no byte-identical live-key row; refusing orphaned projection cleanup").into());
     }
+    let mut query =
+        conn.prepare("SELECT ord,CAST(json AS BLOB) FROM message WHERE session=?1 ORDER BY ord")?;
+    let mut rows = query.query([stale_key])?;
+    let mut compared_message_rows = 0;
+    while let Some(row) = rows.next()? {
+        let ordinal: i64 = row.get(0)?;
+        let bytes: Vec<u8> = row.get(1)?;
+        let expected = match projection {
+            crate::ProjectionPlan::Write(prepared) => ordinal
+                .checked_sub(prepared.next_ord)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .and_then(|index| prepared.message_json.get(index)),
+            _ => None,
+        };
+        if expected.map(|json| json.as_bytes()) != Some(bytes.as_slice()) {
+            return Err(format!("null_lineage_log_prefix_mismatch: stale message ord {ordinal} has no byte-identical message in the verified log projection; refusing orphaned projection cleanup").into());
+        }
+        compared_message_rows += 1;
+    }
     if !meta.last_run_id.as_deref().is_some_and(|last_run| verified_records.iter().any(|frame| {
         matches!(&frame.record, broca_wal::WalRecord::RunStarted { run_id, .. } if run_id.0 == last_run)
     })) {
         return Err(format!("null_lineage_last_run_missing: stale meta.last_run_id {:?} is not a run_started ID in the verified surviving log; refusing orphaned projection cleanup", meta.last_run_id).into());
     }
-    let compared_message_rows = conn.query_row(
-        "SELECT count(*) FROM message WHERE session=?1",
-        [stale_key],
-        |row| row.get(0),
-    )?;
     Ok(ProjectionEvidence {
         kind: ProjectionEvidenceKind::NullLineagePrefixMatch,
         compared_message_rows,

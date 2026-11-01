@@ -1,6 +1,9 @@
 use super::*;
 use broca_core::SessionRefIndex;
 
+#[path = "legacy_projection_tests.rs"]
+mod projections;
+
 struct LegacyFork {
     root: PathBuf,
     store: SqliteStore,
