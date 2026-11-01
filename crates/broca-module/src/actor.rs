@@ -1747,10 +1747,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         run_index: Option<Arc<dyn broca_core::RunIndex>>,
         admission_reader: Arc<dyn broca_core::context::AdmissionReader>,
     ) -> ActorHandle {
-        Self::spawn_holding(
+        Self::spawn_with_readers(
             key,
             gen,
-            ActorTenure::Lease(lease),
+            Some(lease),
             writer,
             executor,
             wal_store,
@@ -1762,6 +1762,43 @@ impl<W: WalStore + 'static> LineageActor<W> {
             None,
             None,
             Some(admission_reader),
+        )
+    }
+
+    /// Attach format-selected readers after the existing writer recovery path.
+    /// A missing lease means the writer already owns the session tenure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_readers(
+        key: LineageKey,
+        gen: u64,
+        lease: Option<Box<dyn LeaseHandle>>,
+        writer: Arc<WalHandle>,
+        executor: Arc<dyn RunExecutor>,
+        wal_store: Arc<W>,
+        registry: RegistryHandle,
+        idle_ttl: Duration,
+        fanout: crate::fanout::Fanout<W>,
+        run_index: Option<Arc<dyn broca_core::RunIndex>>,
+        materialized_store: Option<Arc<dyn broca_core::SessionStore>>,
+        export_index: Option<Arc<dyn broca_core::ExportIndex>>,
+        charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
+        admission_reader: Option<Arc<dyn broca_core::context::AdmissionReader>>,
+    ) -> ActorHandle {
+        Self::spawn_holding(
+            key,
+            gen,
+            lease.map_or(ActorTenure::InWriter, ActorTenure::Lease),
+            writer,
+            executor,
+            wal_store,
+            registry,
+            idle_ttl,
+            fanout,
+            run_index,
+            materialized_store,
+            export_index,
+            charge_basis_resolver,
+            admission_reader,
         )
     }
 

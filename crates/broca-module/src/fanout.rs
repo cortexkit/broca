@@ -1249,8 +1249,9 @@ async fn subscriber_task<W: WalStore + 'static>(
                 spawn_blocking(
                     JobKind::WalRead,
                     broca_wal::access_counter::inherit(move || {
-                        let reader = source.reader(&session, Some(h))?;
-                        replay_for_database_attach(&reader, from)
+                        source.with_reader(&session, Some(h), |reader| {
+                            replay_for_database_attach(&reader, from)
+                        })
                     }),
                 )
                 .await,

@@ -384,6 +384,7 @@ pub struct FileWalStore {
     move_reads: AtomicU64,
     retention_changes: Arc<retention_changes::Changes>,
     durable_observer: Option<Arc<DurableWalObserver>>,
+    publication_observer: Option<Arc<PublicationObserverFactory>>,
     #[cfg(any(test, feature = "test-clock"))]
     range_reads: AtomicU64,
 }
@@ -392,6 +393,12 @@ pub struct FileWalStore {
 /// The callback must retain only the session identity and durable head, not record bodies.
 pub type DurableWalObserver =
     dyn Fn(&BindIdentity, u64, Option<broca_wal::WalLineageId>) + Send + Sync;
+
+/// Installed at open, away from barriers. Its returned callback must perform no
+/// I/O or blocking work; it only records the writer's descriptor-bound proof.
+pub type PublicationObserverFactory =
+    dyn Fn(&BindIdentity, &Path, broca_wal::WalLineageId) -> Arc<PublicationObserver> + Send + Sync;
+pub type PublicationObserver = dyn Fn(&broca_wal::file_wal::DurablePublication) + Send + Sync;
 
 /// THREE STATES, NOT TWO, and collapsing any pair of them has now caused a defect each.
 ///
@@ -810,6 +817,7 @@ impl FileWalStore {
             move_reads: AtomicU64::new(0),
             retention_changes: Arc::default(),
             durable_observer: None,
+            publication_observer: None,
             #[cfg(any(test, feature = "test-clock"))]
             range_reads: AtomicU64::new(0),
         }
@@ -835,6 +843,11 @@ impl FileWalStore {
 
     pub fn with_durable_observer(mut self, observer: Arc<DurableWalObserver>) -> Self {
         self.durable_observer = Some(observer);
+        self
+    }
+
+    pub fn with_publication_observer(mut self, factory: Arc<PublicationObserverFactory>) -> Self {
+        self.publication_observer = Some(factory);
         self
     }
 
@@ -1204,6 +1217,10 @@ impl FileWalStore {
             ),
         );
         let retained = Arc::new(AtomicBool::new(retained));
+        let publication_observer = self
+            .publication_observer
+            .as_ref()
+            .and_then(|factory| Some(factory(session, wal.log_path()?, wal.lineage_id()?)));
         Ok((
             Box::new(retention_changes::ObservedWal {
                 inner: wal,
@@ -1212,6 +1229,7 @@ impl FileWalStore {
                 retained: retained.clone(),
                 session: session.clone(),
                 durable_observer: self.durable_observer.clone(),
+                publication_observer,
             }),
             retained,
         ))

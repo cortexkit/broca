@@ -27,13 +27,13 @@ pub struct ReconcileOutcome {
     /// Bytes after the last complete frame. Recovery never truncates the WAL;
     /// the next writer open owns removal of this unpublished suffix.
     pub ignored_suffix_bytes: u64,
+    pub publication: broca_wal::file_wal::DurablePublication,
 }
 
 impl OverhaulDb {
     /// Reconcile the caller's complete WAL inventory before enabling service
     /// reads or restart/orphan handling. Each session commits independently, so
     /// an interrupted boot can safely repeat the inventory from the beginning.
-    /// This capability is deliberately not registered by the daemon yet.
     pub fn reconcile_boot<'a>(
         &self,
         sessions: impl IntoIterator<Item = ReconcileSession<'a>>,
@@ -131,7 +131,13 @@ impl OverhaulDb {
             let recovered = broca_wal::file_wal::recover_prefix(&bytes, start, seq, Some(lineage))
                 .map_err(DbError::Wal)?;
             let end = recovered.valid_end;
-            file.borrow().sync_all()?;
+            let publication = broca_wal::file_wal::DurablePublication::sync_recovered(
+                &file.borrow(),
+                session.path,
+                lineage,
+                recovered.last_seq.unwrap_or(0),
+                end,
+            )?;
             let lineage = lineage.to_string();
             let checked = CheckedEnd {
                 lineage: &lineage,
@@ -154,6 +160,7 @@ impl OverhaulDb {
             Ok(ReconcileOutcome {
                 index,
                 ignored_suffix_bytes: size - end,
+                publication,
             })
         })
     }

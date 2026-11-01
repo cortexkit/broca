@@ -604,6 +604,112 @@ pub struct DurablePublication {
 }
 
 impl DurablePublication {
+    /// Sync the descriptor whose complete prefix boot recovery has validated.
+    /// The supplied end excludes any torn suffix; readers still validate its lineage and frames.
+    pub fn sync_recovered(
+        file: &File,
+        path: &Path,
+        lineage: WalLineageId,
+        seq: u64,
+        end: u64,
+    ) -> std::io::Result<Self> {
+        if end > file.metadata()?.len() {
+            return Err(std::io::Error::other(
+                "recovered publication exceeds the WAL descriptor",
+            ));
+        }
+        file.sync_all()?;
+        Ok(Self::new(path.to_path_buf(), lineage, seq, end))
+    }
+
+    fn new(path: PathBuf, lineage: WalLineageId, seq: u64, end: u64) -> Self {
+        Self {
+            path,
+            lineage,
+            seq,
+            end,
+        }
+    }
+
+    /// Bound an existing proof to an earlier frame, starting at an indexed frame
+    /// offset. No writer is opened and no new durability claim is made.
+    pub fn prefix_at(&self, sequence: u64, offset: u64) -> std::io::Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
+        if sequence > self.seq || offset >= self.end {
+            return Err(std::io::Error::other(
+                "publication prefix is outside its durable proof",
+            ));
+        }
+        if sequence == self.seq {
+            return Ok(self.clone());
+        }
+        let mut file = fs_ops::OpenOptions::new().read(true).open(&self.path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut file =
+            crate::access_counter::AccessReader::new(file.take(self.end - offset), offset);
+        let mut consumed = 0usize;
+        while (consumed as u64) < self.end - offset {
+            let mut header = [0u8; crate::framing::HEADER_LEN];
+            file.read_exact(&mut header)?;
+            let payload = u32::from_le_bytes(header[..4].try_into().unwrap());
+            let header_len = if header[4] == crate::framing::V4_FRAMING_VERSION {
+                crate::framing::v4_header_len(&header).ok_or_else(|| {
+                    std::io::Error::other("invalid publication prefix frame header")
+                })?
+            } else {
+                header.len()
+            };
+            let size = header_len
+                .checked_add(payload as usize)
+                .ok_or_else(|| std::io::Error::other("publication prefix frame overflows"))?;
+            if payload > crate::framing::MAX_PAYLOAD_LEN
+                || size as u64 > self.end - offset - consumed as u64
+            {
+                return Err(std::io::Error::other(
+                    "publication prefix frame exceeds its durable proof",
+                ));
+            }
+            let mut frame = vec![0u8; size];
+            frame[..header.len()].copy_from_slice(&header);
+            file.read_exact(&mut frame[header.len()..])?;
+            match crate::access_counter::decode_next(&frame) {
+                crate::framing::DecodeStep::Record {
+                    framed: record,
+                    consumed: len,
+                } => {
+                    consumed += len;
+                    if record.seq == sequence {
+                        let gap_len = crate::framing::LINEAGE_FRAME_LEN;
+                        if (consumed + gap_len) as u64 <= self.end - offset {
+                            let mut gap = vec![0u8; gap_len];
+                            file.read_exact(&mut gap)?;
+                            if matches!(crate::access_counter::decode_next(&gap), crate::framing::DecodeStep::Lineage { lineage_id, .. } if lineage_id == self.lineage)
+                            {
+                                consumed += gap_len;
+                            }
+                        }
+                        return Ok(Self::new(
+                            self.path.clone(),
+                            self.lineage,
+                            sequence,
+                            offset + consumed as u64,
+                        ));
+                    }
+                    if record.seq > sequence {
+                        break;
+                    }
+                }
+                crate::framing::DecodeStep::Lineage { consumed: len, .. } => {
+                    consumed += len;
+                }
+                _ => break,
+            }
+        }
+        Err(std::io::Error::other(
+            "attach barrier frame is absent from the proven prefix",
+        ))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -615,6 +721,71 @@ impl DurablePublication {
     }
     pub fn byte_end(&self) -> u64 {
         self.end
+    }
+}
+
+/// A single writer's latest proof. Recording uses only atomic stores, so a slow
+/// indexer never blocks a WAL barrier. Snapshots may retry while the writer stores.
+pub struct PublicationSlot {
+    paths: Vec<PathBuf>,
+    lineage: WalLineageId,
+    version: std::sync::atomic::AtomicU64,
+    seq: std::sync::atomic::AtomicU64,
+    end: std::sync::atomic::AtomicU64,
+    path_index: std::sync::atomic::AtomicUsize,
+}
+
+impl PublicationSlot {
+    pub fn new(paths: Vec<PathBuf>, lineage: WalLineageId) -> Self {
+        Self {
+            paths,
+            lineage,
+            version: std::sync::atomic::AtomicU64::new(0),
+            seq: std::sync::atomic::AtomicU64::new(0),
+            end: std::sync::atomic::AtomicU64::new(0),
+            path_index: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Called by the one writer that owns this slot, never concurrently.
+    pub fn record(&self, publication: &DurablePublication) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let path_index = self
+            .paths
+            .iter()
+            .position(|path| path == publication.path())
+            .expect("publication path belongs to the writer's placement domain");
+        assert_eq!(publication.lineage(), self.lineage);
+        self.version.fetch_add(1, SeqCst);
+        self.seq.store(publication.sequence(), SeqCst);
+        self.end.store(publication.byte_end(), SeqCst);
+        self.path_index.store(path_index, SeqCst);
+        self.version.fetch_add(1, SeqCst);
+    }
+
+    pub fn snapshot(&self) -> Option<DurablePublication> {
+        use std::sync::atomic::Ordering::SeqCst;
+        loop {
+            let before = self.version.load(SeqCst);
+            if before == 0 {
+                return None;
+            }
+            if !before.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+            let seq = self.seq.load(SeqCst);
+            let end = self.end.load(SeqCst);
+            let path_index = self.path_index.load(SeqCst);
+            if before == self.version.load(SeqCst) {
+                return Some(DurablePublication::new(
+                    self.paths[path_index].clone(),
+                    self.lineage,
+                    seq,
+                    end,
+                ));
+            }
+        }
     }
 }
 
@@ -1446,12 +1617,12 @@ impl FileWal {
 impl Wal for FileWal {
     fn durable_publication(&self) -> Option<DurablePublication> {
         let (seq, end) = self.synced_prefix.get()?;
-        Some(DurablePublication {
-            path: self.path.clone(),
-            lineage: self.lineage_id?,
+        Some(DurablePublication::new(
+            self.path.clone(),
+            self.lineage_id?,
             seq,
             end,
-        })
+        ))
     }
     fn log_path(&self) -> Option<&Path> {
         Some(&self.path)

@@ -22,6 +22,7 @@ use crate::registry::{ActorHandle, LineageKey, LineageOpener, OpenError, Registr
 
 /// Opens a lineage with a real lease + session WAL writer + the configured executor.
 pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
+    readers: Option<Arc<ActorReadSources>>,
     projection_fences: std::sync::Mutex<
         std::collections::HashMap<LineageKey, std::sync::Weak<tokio::sync::Mutex<()>>>,
     >,
@@ -44,6 +45,13 @@ pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
     /// directory; an opener built from an arbitrary `LeaseStore` cannot prove its root
     /// and therefore accepts none.
     lease_root: Option<PathBuf>,
+}
+
+/// Boot-selected read capabilities. Recovery still opens the writer and syncs
+/// the recovered WAL prefix once, before attaching readers to its actor and fanout.
+pub struct ActorReadSources {
+    pub admission: Arc<dyn broca_core::context::AdmissionReader>,
+    pub episodes: Arc<crate::registry::EpisodeReadSource>,
 }
 
 /// [`DefaultOpener::with_lease_domain`] refused a domain that does not acquire in the
@@ -123,6 +131,7 @@ impl<W: WalStore> DefaultOpener<FileLeaseStore, W> {
 impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
     pub fn new(lease_store: Arc<L>, wal_store: Arc<W>, executor: Arc<dyn RunExecutor>) -> Self {
         Self {
+            readers: None,
             projection_fences: Default::default(),
             lease_store,
             wal_store,
@@ -135,6 +144,11 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
             lease_domain: None,
             lease_root: None,
         }
+    }
+
+    pub fn with_readers(mut self, readers: Arc<ActorReadSources>) -> Self {
+        self.readers = Some(readers);
+        self
     }
 
     /// Open actors under owned writer tenures minted by `domain`. The domain must name
@@ -512,6 +526,11 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             key.clone(),
             self.executor.source_warm_enabled(),
         );
+        let fanout = if let Some(readers) = &self.readers {
+            fanout.with_episode_source(readers.episodes.clone())
+        } else {
+            fanout
+        };
 
         // 3. Open + recover + prove the SESSION WAL away from the async runtime, then spawn its
         //    writer with the fan-out observer. The lease moves through that blocking operation so
@@ -554,6 +573,25 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             }
         }
         let writer = Arc::new(writer);
+
+        if let Some(readers) = &self.readers {
+            return Ok(LineageActor::spawn_with_readers(
+                key.clone(),
+                gen,
+                lease,
+                writer,
+                self.executor.clone(),
+                self.wal_store.clone(),
+                registry,
+                self.idle_ttl,
+                fanout,
+                self.run_index.clone(),
+                self.materialized_store.clone(),
+                self.export_index.clone(),
+                self.charge_basis_resolver.clone(),
+                Some(readers.admission.clone()),
+            ));
+        }
 
         // 4. Start the actor, which owns the writer + fan-out (and a bare lease, if any)
         //    until close.

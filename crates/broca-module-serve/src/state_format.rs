@@ -105,6 +105,8 @@ pub(crate) enum StateFormatError {
     UnknownMarker { root: PathBuf, found: String },
     /// A legacy root on a build that no longer runs the legacy format.
     LegacyAfterCut { root: PathBuf },
+    /// A development root still holds the legacy index.
+    PreFinalIndex { path: PathBuf },
     /// The root could not be read or the marker could not be written.
     Io {
         action: &'static str,
@@ -130,6 +132,12 @@ impl fmt::Display for StateFormatError {
                  build no longer runs. Follow {RUNBOOK} to move it aside and start on an empty \
                  root.",
                 root.display()
+            ),
+            Self::PreFinalIndex { path } => write!(
+                f,
+                "refusing to serve: {} is on a format-2 root created by a pre-G development \
+                 build; recreate the root. The legacy index is not read or deleted.",
+                path.display()
             ),
             Self::Io {
                 action,
@@ -251,6 +259,15 @@ pub(crate) fn inspect_root(
         let bytes = fs
             .read(&marker)
             .map_err(io_error("read the state-format marker", &marker))?;
+        if names_overhaul(&bytes) {
+            for file in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
+                if names.iter().any(|name| name == file) {
+                    return Err(StateFormatError::PreFinalIndex {
+                        path: root.join(file),
+                    });
+                }
+            }
+        }
         return Ok(RootContents::Marked(bytes));
     }
     // The state-root lock file holds no state, and `ck-broca` creates it before this check runs
@@ -477,6 +494,27 @@ impl StateFormat {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pre_final_overhaul_root_is_refused_without_touching_legacy_index() {
+        let scratch = Scratch::new("pre-final-index");
+        let root = scratch.root();
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, bytes) in [
+            ("state-format", "broca-state/2\n"),
+            ("run-index.db", "not even a SQLite database"),
+            ("run-index.db-wal", "uncheckpointed legacy bytes"),
+            ("run-index.db-shm", "legacy shared memory"),
+        ] {
+            std::fs::write(root.join(name), bytes).unwrap();
+        }
+        let before = tree(&root);
+        let error = prepare(&root, false).unwrap_err().to_string();
+        assert!(error.contains("run-index.db"), "{error}");
+        assert!(error.contains("pre-G development build"), "{error}");
+        assert!(error.contains("recreate the root"), "{error}");
+        assert_eq!(tree(&root), before);
+    }
+
     use super::*;
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1145,8 +1183,7 @@ mod tests {
                 assert_eq!(tree(&root), before, "a refused root is not touched");
             }
         }
-        // The overhaul marker with or without its trailing newline runs, whatever else the root
-        // holds.
+        // A fresh root accepts the overhaul marker with or without its trailing newline.
         for marker in [&b"broca-state/2"[..], b"broca-state/2\n"] {
             let scratch = Scratch::new("known");
             let root = scratch.root();

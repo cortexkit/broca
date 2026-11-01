@@ -53,6 +53,9 @@ take it (`crates/broca-module-serve/src/state_root_lock.rs`).
 The WAL is the source of truth. Everything in `run-index.db` is derived from it, although
 not all of it can be regenerated (section 4 says which parts cannot).
 
+Format-2 roots created before the final wiring release must be recreated; these development
+roots are identified by a `run-index.db` file beside `state-format`.
+
 
 broca creates the WAL directory, WAL files and archive containers owner-only (`0700`
 directories, `0600` files), and restricts `run-index.db` and its `-wal`/`-shm` sidecars to

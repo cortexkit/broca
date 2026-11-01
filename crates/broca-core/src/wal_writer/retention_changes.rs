@@ -51,6 +51,7 @@ pub(super) struct ObservedWal {
     pub retained: Arc<AtomicBool>,
     pub session: BindIdentity,
     pub durable_observer: Option<Arc<DurableWalObserver>>,
+    pub publication_observer: Option<Arc<super::PublicationObserver>>,
 }
 
 impl Drop for ObservedWal {
@@ -109,6 +110,11 @@ impl Drop for ReleaseHintLease {
 
 impl ObservedWal {
     fn durable(&self) {
+        if let Some(observer) = &self.publication_observer {
+            if let Some(publication) = self.inner.durable_publication() {
+                observer(&publication);
+            }
+        }
         if let Some(observer) = &self.durable_observer {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 observer(
@@ -318,6 +324,7 @@ mod tests {
                 changes: Arc::default(),
                 retained: Arc::default(),
                 session: BindIdentity::new("/", "test", "s"),
+                publication_observer: None,
                 durable_observer: Some(Arc::new(move |_, seq, _| {
                     output
                         .lock()
@@ -328,6 +335,41 @@ mod tests {
             assert_eq!(wal.sync().is_err(), fail);
         }
         assert_eq!(*observed.lock().unwrap(), vec![(7, true)]);
+    }
+
+    #[test]
+    fn absent_publication_hook_does_not_request_a_proof() {
+        struct NoProofWal;
+        impl Wal for NoProofWal {
+            fn append(&mut self, _: u64, _: &WalRecord, _: bool) -> Result<u64, WalError> {
+                unreachable!()
+            }
+            fn sync(&self) -> Result<(), WalError> {
+                Ok(())
+            }
+            fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+                unreachable!()
+            }
+            fn tail_after_seq(&self, _: u64) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+                unreachable!()
+            }
+            fn last_seq(&self) -> u64 {
+                0
+            }
+            fn durable_publication(&self) -> Option<broca_wal::file_wal::DurablePublication> {
+                panic!("an unconfigured barrier must not construct or clone a proof")
+            }
+        }
+        let wal = ObservedWal {
+            inner: Box::new(NoProofWal),
+            address: Arc::from("legacy"),
+            changes: Arc::default(),
+            retained: Arc::default(),
+            session: BindIdentity::new("/", "test", "legacy"),
+            durable_observer: None,
+            publication_observer: None,
+        };
+        wal.sync().unwrap();
     }
 
     #[test]

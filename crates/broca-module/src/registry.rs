@@ -759,11 +759,10 @@ pub enum CutLockMode {
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 
 struct Inner {
-    session_address_inventory: std::sync::OnceLock<Arc<broca_store::SqliteStore>>,
+    session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
     episode_source: std::sync::OnceLock<Arc<EpisodeReadSource>>,
     session_inventory_readiness: std::sync::OnceLock<Arc<dyn SessionInventoryReadiness>>,
-    #[cfg(test)]
-    raw_pages: std::sync::OnceLock<Arc<RawPageTestBundle>>,
+    raw_pages: std::sync::OnceLock<Arc<RawPageSource>>,
     tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
     actor_idle_holds: Mutex<HashMap<LineageKey, (u64, Vec<&'static str>)>>,
     /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
@@ -1115,11 +1114,63 @@ type EpisodePublication = dyn Fn(&LineageKey, Option<u64>) -> Result<broca_wal::
 pub struct EpisodeReadSource {
     db: Arc<broca_store::db::OverhaulDb>,
     publication: Arc<EpisodePublication>,
+    gate: Option<Arc<Mutex<()>>>,
+    access: Option<broca_wal::access_counter::WalAccessCounter>,
 }
 
 impl EpisodeReadSource {
     pub fn new(db: Arc<broca_store::db::OverhaulDb>, publication: Arc<EpisodePublication>) -> Self {
-        Self { db, publication }
+        Self {
+            db,
+            publication,
+            gate: None,
+            access: None,
+        }
+    }
+
+    pub fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    pub fn with_access_counter(
+        mut self,
+        access: broca_wal::access_counter::WalAccessCounter,
+    ) -> Self {
+        self.access = Some(access);
+        self
+    }
+
+    pub(crate) fn with_reader<T>(
+        &self,
+        key: &LineageKey,
+        head: Option<u64>,
+        read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if let Some(access) = &self.access {
+            return access
+                .operation(if head.is_some() {
+                    "model attach"
+                } else {
+                    "model page"
+                })
+                .run(|| self.with_reader_inner(key, head, read));
+        }
+        self.with_reader_inner(key, head, read)
+    }
+
+    fn with_reader_inner<T>(
+        &self,
+        key: &LineageKey,
+        head: Option<u64>,
+        read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _guard = self
+            .gate
+            .as_ref()
+            .map(|gate| gate.lock().map_err(|e| e.to_string()))
+            .transpose()?;
+        read(self.reader(key, head)?)
     }
 
     pub(crate) fn reader(
@@ -1144,8 +1195,27 @@ pub(crate) struct RawPageTestBundle {
     pub publications: Mutex<HashMap<LineageKey, broca_wal::file_wal::DurablePublication>>,
 }
 
-#[cfg(test)]
-impl RawPageTestBundle {
+/// WAL-backed raw reads installed only by the boot-selected overhaul bundle.
+pub struct RawPageSource {
+    db: Arc<broca_store::db::OverhaulDb>,
+    publication: Arc<EpisodePublication>,
+    gate: Option<Arc<Mutex<()>>>,
+}
+
+impl RawPageSource {
+    pub fn new(db: Arc<broca_store::db::OverhaulDb>, publication: Arc<EpisodePublication>) -> Self {
+        Self {
+            db,
+            publication,
+            gate: None,
+        }
+    }
+
+    pub fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
     fn page(
         &self,
         key: &LineageKey,
@@ -1153,17 +1223,19 @@ impl RawPageTestBundle {
         limit: Option<u64>,
         tools: bool,
     ) -> Result<Box<RouteReadPage>, OpenError> {
-        let publications = self.publications.lock().unwrap();
-        let publication = publications
-            .get(key)
-            .ok_or_else(|| OpenError::Open("raw page publication not supplied".into()))?;
+        let _guard = self
+            .gate
+            .as_ref()
+            .map(|gate| gate.lock().map_err(|e| OpenError::Open(e.to_string())))
+            .transpose()?;
+        let publication = (self.publication)(key, None).map_err(OpenError::Open)?;
         let raw = self
             .db
             .read_raw_page(
                 key,
                 &broca_core::agent_session_ref(key),
                 broca_store::db::LogLocation::Live,
-                publication,
+                &publication,
                 broca_store::db::RawPageRequest {
                     from_ordinal: from,
                     limit,
@@ -1192,16 +1264,18 @@ impl RawPageTestBundle {
         key: &LineageKey,
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
-        let publications = self.publications.lock().unwrap();
-        let publication = publications
-            .get(key)
-            .ok_or_else(|| OpenError::Open("raw tag publication not supplied".into()))?;
+        let _guard = self
+            .gate
+            .as_ref()
+            .map(|gate| gate.lock().map_err(|e| OpenError::Open(e.to_string())))
+            .transpose()?;
+        let publication = (self.publication)(key, None).map_err(OpenError::Open)?;
         self.db
             .read_raw_tag_location(
                 key,
                 &broca_core::agent_session_ref(key),
                 broca_store::db::LogLocation::Live,
-                publication,
+                &publication,
                 tag,
             )
             .map(Some)
@@ -1255,6 +1329,13 @@ pub struct RegistryHandle {
 impl LineageRegistry {
     /// Supply the durable identity inventory before accepting routed session binds.
     pub fn set_session_address_inventory(&self, inventory: Arc<broca_store::SqliteStore>) {
+        self.set_session_address_resolver(inventory);
+    }
+
+    pub fn set_session_address_resolver(
+        &self,
+        inventory: Arc<dyn broca_store::SessionAddressResolver>,
+    ) {
         assert!(
             self.inner.session_address_inventory.set(inventory).is_ok(),
             "session address inventory already configured"
@@ -1330,14 +1411,29 @@ impl LineageRegistry {
         }
     }
 
-    /// Install database episode reads explicitly; boot-time store selection is unchanged.
+    /// Install the episode reader selected by the boot-time state format.
     pub fn with_episode_source(self, source: Arc<EpisodeReadSource>) -> Self {
         assert!(self.inner.episode_source.set(source).is_ok());
         self
     }
     #[cfg(test)]
     pub(crate) fn with_raw_pages_for_test(self, bundle: Arc<RawPageTestBundle>) -> Self {
-        assert!(self.inner.raw_pages.set(bundle).is_ok());
+        self.with_raw_page_source(Arc::new(RawPageSource::new(
+            bundle.db.clone(),
+            Arc::new(move |key, _| {
+                bundle
+                    .publications
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| "raw page publication not supplied".into())
+            }),
+        )))
+    }
+
+    pub fn with_raw_page_source(self, source: Arc<RawPageSource>) -> Self {
+        assert!(self.inner.raw_pages.set(source).is_ok());
         self
     }
     pub(crate) fn upload_store(&self) -> Option<broca_core::media_uploads::Uploads> {
@@ -1633,7 +1729,6 @@ impl LineageRegistry {
                 session_address_inventory: std::sync::OnceLock::new(),
                 episode_source: std::sync::OnceLock::new(),
                 session_inventory_readiness: std::sync::OnceLock::new(),
-                #[cfg(test)]
                 raw_pages: std::sync::OnceLock::new(),
                 tool_route_health: std::sync::OnceLock::new(),
                 actor_idle_holds: Mutex::new(HashMap::new()),
@@ -3700,9 +3795,15 @@ impl LineageRegistry {
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
         self.check_expired(key, None).await?;
-        #[cfg(test)]
         if let Some(bundle) = self.inner.raw_pages.get() {
-            return bundle.tag_location(key, tag);
+            let bundle = bundle.clone();
+            let key = key.clone();
+            return spawn_blocking(
+                JobKind::StoreRead,
+                broca_wal::access_counter::inherit(move || bundle.tag_location(&key, tag)),
+            )
+            .await
+            .map_err(|error| OpenError::Open(error.to_string()))?;
         }
         let Some(store) = self
             .inner
@@ -3795,25 +3896,31 @@ impl LineageRegistry {
             let source = source.clone();
             let key = key.clone();
             let request = request.clone();
-            return spawn_blocking(JobKind::StoreRead, move || {
-                source
-                    .reader(&key, None)?
-                    .read_model_page(&request)
-                    .map(|page| RoutedPage::Model(page.page))
-                    .map_err(|error| error.to_string())
-            })
+            return spawn_blocking(
+                JobKind::StoreRead,
+                broca_wal::access_counter::inherit(move || {
+                    source.with_reader(&key, None, |reader| {
+                        reader
+                            .read_model_page(&request)
+                            .map(|page| RoutedPage::Model(page.page))
+                            .map_err(|error| error.to_string())
+                    })
+                }),
+            )
             .await
             .map_err(|error| OpenError::Open(error.to_string()))?
             .map_err(OpenError::Open);
         }
-        #[cfg(test)]
         if model.is_none() {
             if let Some(bundle) = self.inner.raw_pages.get() {
                 let bundle = bundle.clone();
                 let key = key.clone();
-                return spawn_blocking(JobKind::StoreRead, move || {
-                    bundle.page(&key, from_ordinal, limit, include_tools)
-                })
+                return spawn_blocking(
+                    JobKind::StoreRead,
+                    broca_wal::access_counter::inherit(move || {
+                        bundle.page(&key, from_ordinal, limit, include_tools)
+                    }),
+                )
                 .await
                 .map_err(|e| OpenError::Open(e.to_string()))?
                 .map(RoutedPage::Raw);

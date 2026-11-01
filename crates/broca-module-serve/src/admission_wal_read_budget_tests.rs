@@ -101,7 +101,7 @@ async fn assert_media_free_sparse_resume_legacy_render_and_decode(with_tools: bo
         lengths: Default::default(),
         uploads: Default::default(),
     });
-    let materialized = stand_in.session_store.clone();
+    let materialized = stand_in.session_store.clone().unwrap();
     let executor = LiveLoopExecutor::new(
         store.clone(),
         materialized.clone(),
@@ -270,7 +270,7 @@ async fn fresh_episode_admission_does_not_add_a_full_wal_read() {
     });
     let executor = Arc::new(LiveLoopExecutor::new(
         store.clone(),
-        stand_in.session_store.clone(),
+        stand_in.session_store.clone().unwrap(),
         stand_in.plane.clone(),
         Some("http://127.0.0.1:9".into()),
     ));
