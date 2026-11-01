@@ -4315,25 +4315,36 @@ impl ServeHandler for crate::LineageRegistry {
         scope: &broca_protocol::SendScope,
     ) -> Result<CancelResponse, ServeError> {
         use crate::actor::CancelOutcome;
-        let refusal = match self
-            .authorize_session_owner(session, principal, scope)
-            .await
+        match self
+            .warm_cancel_authority(session, principal, scope, at)
+            .await?
         {
-            Ok(()) => return self.cancel_at(session, run_id, at).await,
-            Err(ServeError::ScopeRefused(refusal)) => refusal,
-            Err(error) => return Err(error),
-        };
-        let granted = if let (
-            broca_wal::record::RunCancelAt::Now,
-            Some(broca_protocol::BindPrincipal::Reserved { module_id }),
-        ) = (at, principal)
-        {
-            self.interrupt_cancel_granted(session, module_id).await?
-        } else {
-            false
-        };
-        if !granted {
-            return Err(ServeError::ScopeRefused(refusal));
+            Some(crate::actor::CancelAuthority::Owner) => {
+                return self.cancel_at(session, run_id, at).await
+            }
+            Some(crate::actor::CancelAuthority::Sender) => {}
+            None => {
+                let refusal = match self
+                    .authorize_session_owner(session, principal, scope)
+                    .await
+                {
+                    Ok(()) => return self.cancel_at(session, run_id, at).await,
+                    Err(ServeError::ScopeRefused(refusal)) => refusal,
+                    Err(error) => return Err(error),
+                };
+                let granted = if let (
+                    broca_wal::record::RunCancelAt::Now,
+                    Some(broca_protocol::BindPrincipal::Reserved { module_id }),
+                ) = (at, principal)
+                {
+                    self.interrupt_cancel_granted(session, module_id).await?
+                } else {
+                    false
+                };
+                if !granted {
+                    return Err(ServeError::ScopeRefused(refusal));
+                }
+            }
         }
         // Refuse before opening an actor: recovery itself can write. The actor checks the
         // grant again so a refresh accepted after this read cannot leave stale authority.
