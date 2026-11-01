@@ -510,17 +510,6 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   With the service-tier writer enabled, `service_tier` follows the fixed-run rules below
   instead of inheriting from an ended run.
 
-- Ordered delivery advertises `tool_result`, `turn_system`, `steer` and `idle_start` globally.
-  A `turn_system` delivery requires a validated plan template and a legal position on the
-  frozen provider route. Responses renders a `developer` input item in conversation order,
-  never top-level `instructions`. Anthropic requires the provider's explicit
-  `capability.mid_conversation_system` catalog fact and renders a persistent `system` message
-  after a user turn or tool result, at the end of the request; it adds neither `clear_at` nor
-  a beta header. An absent fact is unsupported, not an admission failure. Gemini and other
-  unsupported routes skip to the next listed mode, or keep the send pending if none is
-  possible. A stored system entry switched to an unsupported route renders as user text
-  without changing the stored role, text or delivery mode.
-
 Broca does not send `service_tier` to account routing; a tier chosen by a router reaches broca
 only through the caller's send. Broca does not report `service_tier_applied` or
 `service_tier_served` to account routing.
@@ -1278,7 +1267,7 @@ retain it in `Queued.principal`. Request-body sender claims never grant access. 
 unverified or ambiguous attribution grants no exception to the owner's existing path.
 Answers and durable tombstones are identical to an owner's withdrawal: `retracted`,
 `already_started` or `not_pending`. A delivered steer is `not_pending`. This does not
-extend `run.cancel` by itself, or change sessions without a recorded owner.
+extend `run.cancel`, which remains owner-only, or change sessions without a recorded owner.
 
 Plan-named senders may share a `send_id` without sharing a submission. The first sender
 keeps the legacy run ID; a later delegated sender colliding with another recorded sender
@@ -1323,16 +1312,7 @@ not compare that stamp with an authority or reject an append solely because it i
 
 ## 13. Cancel token + provider watchdog (core change)
 
-`run.cancel` admits the session's owners. Broca also declares `run_cancel_by_interrupt`:
-an attested named sender whose current effective grant has `interrupt: true` may cancel
-with omitted `at` or `at: "now"`, but never `step_boundary`. The latest accepted refresh
-controls this grant even before its execution plan applies; removed senders and callers
-named only in another session are refused `scope_owner_mismatch` without writes. Sender
-cancels use the same `"ack"` / `"not_active"` replies and `cancelled` terminal as owners,
-with no sender field added to either. The accepted sender stop is durable before `"ack"`,
-so recovery finishes the cancellation without dispatching an in-flight call again.
-
-Omitted `at` (or `at: "now"`) retains immediate cancellation:
+`run.cancel` is owner-only. Omitted `at` (or `at: "now"`) retains immediate cancellation:
 the model stream is cancelled and sent tool calls retain the existing at-most-once recovery
 rules. `at: "step_boundary"` finishes the in-flight model step and its entire tool batch,
 records the results, and writes no further `StepStarted` before `RunFinished{Cancelled}`.

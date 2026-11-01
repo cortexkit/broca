@@ -7,7 +7,8 @@
 //! - `tool_result`: when a tool batch of the running turn has just finished with a text or error
 //!   result to carry the send's text, and the send's input is text only. Decided as the batch
 //!   commits, so the delivery record sits before the turn's `TurnFinished`.
-//! - `turn_system`: rendered template text at a confirmed provider route and legal position.
+//! - `turn_system`: never possible in this build ([`TURN_SYSTEM_TEMPLATE_UNIMPLEMENTED`]); the
+//!   list falls through to its next mode.
 //! - `steer`: at every step boundary of a running turn.
 //! - `idle_start`: when the session is idle; the actor drains the send into a new run.
 //!
@@ -26,8 +27,6 @@ use std::sync::Arc;
 pub struct Boundary {
     /// A tool batch has just finished with a result that can carry text.
     pub tool_result: bool,
-    /// The route accepts a turn-scoped system entry at this position.
-    pub turn_system: bool,
     /// A turn is running and will render another step.
     pub running: bool,
     /// The session is idle and may start a run.
@@ -39,7 +38,6 @@ impl Boundary {
     pub fn tool_batch(carrier: bool) -> Self {
         Self {
             tool_result: carrier,
-            turn_system: false,
             running: true,
             idle: false,
         }
@@ -48,7 +46,6 @@ impl Boundary {
     /// A step boundary of a running turn.
     pub const STEP: Self = Self {
         tool_result: false,
-        turn_system: false,
         running: true,
         idle: false,
     };
@@ -56,7 +53,6 @@ impl Boundary {
     /// An idle session.
     pub const IDLE: Self = Self {
         tool_result: false,
-        turn_system: false,
         running: false,
         idle: true,
     };
@@ -71,7 +67,7 @@ pub fn choose_mode(
 ) -> Option<DeliveryMode> {
     order.modes.iter().copied().find(|mode| match mode {
         DeliveryMode::ToolResult => boundary.tool_result && has_text,
-        DeliveryMode::TurnSystem => boundary.turn_system && has_text && order.template.is_some(),
+        DeliveryMode::TurnSystem => false,
         DeliveryMode::Steer => boundary.running,
         DeliveryMode::IdleStart => boundary.idle,
         _ => false,

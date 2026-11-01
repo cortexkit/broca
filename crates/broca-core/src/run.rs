@@ -5765,12 +5765,6 @@ where
         guidance_episodes.active_step(episode_history_start as u64);
     }
     drop(episode_step_spans);
-    if let Some(inbox) = &control.steer {
-        let tool_position = Message::new(Role::Tool, Vec::new());
-        inbox.set_system_after_tool_result(
-            provider.turn_system_possible(Some(&tool_position), false),
-        );
-    }
     let mut opts = Arc::new(CallOptions {
         ephemeral_session: retention_lineage()?,
         render_episodes: Arc::new(render_episodes.into()),
@@ -5964,18 +5958,13 @@ where
         // The inbox's lock makes "which steers are before this StepStarted" the same question
         // for the WAL and for this prompt (see `crate::steer`).
         // Queued sends with an ordered `delivery` list are decided under the same lock: one whose
-        // first possible mode is `steer` or `turn_system` joins this step after the steered
-        // messages, and one that expired ends. Records precede `StepStarted`, exactly where
-        // replay places them.
+        // first possible mode is `steer` joins this step after the steered messages, and one that
+        // expired ends. Their records precede `StepStarted`, exactly where replay places them.
         let mut steered = match &control.steer {
-            Some(inbox) => match inbox.try_take_at_step_with_system(
+            Some(inbox) => match inbox.try_take_at_step_ordered_for(
                 &resolved_run_id,
                 control.now_ms().unwrap_or(0),
                 step_id,
-                steer_backlog.last().or_else(|| opts.prompt.last()),
-                &|preceding, followed_by_user| {
-                    provider.turn_system_possible(preceding, followed_by_user)
-                },
                 |records| {
                     let assigned = records
                         .into_iter()
@@ -6598,12 +6587,6 @@ where
                 );
             }
             provider.set_step_route(step_route);
-            if let Some(inbox) = &control.steer {
-                let tool_position = Message::new(Role::Tool, Vec::new());
-                inbox.set_system_after_tool_result(
-                    provider.turn_system_possible(Some(&tool_position), false),
-                );
-            }
         }
         let mut refusal_prior_retries = 0u32;
         let mut first_attempt = next_attempt;
@@ -6913,12 +6896,6 @@ where
                     step_route = crate::refusal_fallback::StepRoute::Fallback;
                     route_reason = broca_wal::StepRouteReason::Refusal;
                     provider.set_step_route(step_route);
-                    if let Some(inbox) = &control.steer {
-                        let tool_position = Message::new(Role::Tool, Vec::new());
-                        inbox.set_system_after_tool_result(
-                            provider.turn_system_possible(Some(&tool_position), false),
-                        );
-                    }
                     first_attempt = step_attempts.load(std::sync::atomic::Ordering::Relaxed);
                     *thinking_dropped.lock().unwrap() = None;
                     continue;

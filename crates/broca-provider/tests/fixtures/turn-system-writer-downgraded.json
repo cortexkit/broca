@@ -1,1 +1,0 @@
-{"max_tokens":2048,"messages":[{"content":[{"text":"Summarize the notes.","type":"text"}],"role":"user"},{"content":"<context-note>Keep the summary concise.</context-note>","role":"user"}],"model":"claude-opus-4-8","stream":true,"system":[]}

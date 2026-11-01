@@ -25,7 +25,6 @@ struct State {
     protected: Vec<Message>,
     next_protected: Vec<Message>,
     protected_step: Option<broca_protocol::StepId>,
-    system_after_tool_result: bool,
     closed: bool,
     /// Queued sends with an ordered `delivery` list, in queue order, that this turn may still
     /// deliver (see `crate::delivery_order`). The actor adds them and the run takes them, both
@@ -58,10 +57,6 @@ pub struct SteerInbox {
 }
 
 impl SteerInbox {
-    /// Freeze the next request route's support before committing its tool-result boundary.
-    pub fn set_system_after_tool_result(&self, possible: bool) {
-        self.lock().system_after_tool_result = possible;
-    }
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -353,7 +348,7 @@ impl SteerInbox {
             Vec<broca_wal::WalRecord>,
         ) -> Vec<Option<Vec<broca_protocol::tags::MessageTags>>>,
     ) -> Option<Vec<Message>> {
-        self.take_ordered(run_id, now_ms, None, None, &|_, _| false, record)
+        self.take_ordered(run_id, now_ms, None, record)
     }
 
     pub fn try_take_at_step_ordered_for(
@@ -365,29 +360,7 @@ impl SteerInbox {
             Vec<broca_wal::WalRecord>,
         ) -> Vec<Option<Vec<broca_protocol::tags::MessageTags>>>,
     ) -> Option<Vec<Message>> {
-        self.take_ordered(run_id, now_ms, Some(step), None, &|_, _| false, record)
-    }
-
-    /// Decide system authority against the frozen route and the actual staged position.
-    pub fn try_take_at_step_with_system(
-        &self,
-        run_id: &broca_protocol::RunId,
-        now_ms: u64,
-        step: broca_protocol::StepId,
-        preceding: Option<&Message>,
-        system_possible: &dyn Fn(Option<&Message>, bool) -> bool,
-        record: impl FnOnce(
-            Vec<broca_wal::WalRecord>,
-        ) -> Vec<Option<Vec<broca_protocol::tags::MessageTags>>>,
-    ) -> Option<Vec<Message>> {
-        self.take_ordered(
-            run_id,
-            now_ms,
-            Some(step),
-            preceding,
-            system_possible,
-            record,
-        )
+        self.take_ordered(run_id, now_ms, Some(step), record)
     }
 
     fn take_ordered(
@@ -395,72 +368,41 @@ impl SteerInbox {
         run_id: &broca_protocol::RunId,
         now_ms: u64,
         step: Option<broca_protocol::StepId>,
-        preceding: Option<&Message>,
-        system_possible: &dyn Fn(Option<&Message>, bool) -> bool,
         record: impl FnOnce(
             Vec<broca_wal::WalRecord>,
         ) -> Vec<Option<Vec<broca_protocol::tags::MessageTags>>>,
     ) -> Option<Vec<Message>> {
-        use crate::delivery_order::{choose_mode, ended, steered, system_delivered, Boundary};
+        use crate::delivery_order::{choose_mode, ended, steered, Boundary};
         let mut state = self.lock();
         if self.boundary_cancel.is_cancelled() {
             return None;
         }
         let mut taken = std::mem::take(&mut state.pending);
         let mut records = Vec::new();
-        // Each ordered delivery's record position and the messages it delivers, in order.
+        // Each steer delivery's record position and the messages it delivers, in order.
         let mut delivered = Vec::new();
         let mut kept = Vec::new();
-        let ordered = std::mem::take(&mut state.ordered);
-        let last_user = ordered.iter().rposition(|later| {
-            !later.order.expired_at(now_ms)
-                && later
-                    .order
-                    .modes
-                    .contains(&broca_protocol::DeliveryMode::Steer)
-        });
-        for (index, send) in ordered.iter().enumerate() {
+        for send in std::mem::take(&mut state.ordered) {
             if send.order.expired_at(now_ms) {
                 records.push(ended(
                     &send.submission_id,
                     broca_wal::record::SendEndReason::Expired,
                 ));
-                state.consumed.push(send.submission_id.clone());
+                state.consumed.push(send.submission_id);
                 continue;
             }
             let has_text = crate::delivery_order::appended_text(&send.input).is_some();
-            let followed_by_user = last_user.is_some_and(|last| last > index);
-            let boundary = Boundary {
-                turn_system: system_possible(taken.last().or(preceding), followed_by_user),
-                ..Boundary::STEP
-            };
-            match choose_mode(&send.order, boundary, has_text) {
-                Some(broca_protocol::DeliveryMode::TurnSystem) => {
-                    let record = system_delivered(send, run_id);
-                    if let broca_wal::WalRecord::SendDelivered {
-                        input: Some(input), ..
-                    } = &record
-                    {
-                        taken.extend(input.iter().cloned());
-                        delivered.push((records.len(), input.as_ref().clone()));
-                    }
-                    records.push(record);
-                    state.consumed.push(send.submission_id.clone());
-                }
-                Some(broca_protocol::DeliveryMode::Steer) => {
-                    records.push(steered(send, run_id));
-                    taken.extend(send.input.iter().cloned());
-                    delivered.push((records.len() - 1, send.input.clone()));
-                    state.consumed.push(send.submission_id.clone());
-                }
-                _ => kept.push(send.clone()),
+            if choose_mode(&send.order, Boundary::STEP, has_text)
+                == Some(broca_protocol::DeliveryMode::Steer)
+            {
+                records.push(steered(&send, run_id));
+                delivered.push((records.len() - 1, send.input.clone()));
+                state.consumed.push(send.submission_id);
+            } else {
+                kept.push(send);
             }
         }
         state.ordered = kept;
-        // `taken` above tracks prospective placement for authority checks. Attach durable tags
-        // once, below, to the original steers followed by each recorded delivery.
-        let ordered_count: usize = delivered.iter().map(|(_, messages)| messages.len()).sum();
-        taken.truncate(taken.len() - ordered_count);
         let assigned = record(records);
         for (position, mut messages) in delivered {
             if let Some(Some(tags)) = assigned.get(position) {
@@ -501,10 +443,7 @@ impl SteerInbox {
             return Vec::new();
         }
         let carrier = carrier(results).cloned();
-        let boundary = Boundary {
-            turn_system: state.system_after_tool_result,
-            ..Boundary::tool_batch(carrier.is_some())
-        };
+        let boundary = Boundary::tool_batch(carrier.is_some());
         let mut records = Vec::new();
         let mut appends = Vec::new();
         let mut kept = Vec::new();
