@@ -1819,6 +1819,16 @@ pub trait ServeHandler: Send + Sync {
         Ok(())
     }
 
+    /// Diagnostic ownership observation only; a cold cache is unknown, not a non-owner.
+    /// Implementations must not read storage or open an actor to answer this query.
+    fn cached_session_owner(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        None
+    }
+
     /// Owner-only authorization for cancel/retract, independent of route scope and epoch.
     /// A handler without recorded ownership has no protected session.
     async fn authorize_session_owner(
@@ -2394,6 +2404,13 @@ impl crate::LineageRegistry {
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
+    fn cached_session_owner(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        crate::LineageRegistry::cached_session_owner(self, session, principal)
+    }
     async fn run_event_get(
         &self,
         session: &LineageKey,
