@@ -1658,6 +1658,7 @@ fn registration_candidates(
 
 #[cfg(test)]
 mod tests {
+    include!("late_results_puller/abandoned_call_tests.rs");
     use super::*;
     use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall};
     use broca_protocol::{BatchId, MessageId, RunId, StepId};

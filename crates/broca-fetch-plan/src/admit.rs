@@ -713,6 +713,36 @@ fn unanswered(error: FetchError) -> Unanswered {
     }
 }
 
+async fn catalog_with_optional_keepalive(
+    fetcher: &dyn Fetcher,
+    provider: &str,
+    request: &CatalogRequest,
+    deadline: Instant,
+) -> Result<(Value, bool), FetchMiss> {
+    use crate::keepalive_discovery::{observe, Outcome};
+    let started = std::time::Instant::now();
+    let promise = fetcher.call_keepalive_supported(provider);
+    let catalog = within_deadline(deadline, || fetcher.catalog(provider, request));
+    tokio::pin!(promise, catalog);
+    tokio::select! {
+        biased;
+        promise = &mut promise => {
+            let (supported, outcome) = match promise {
+                Ok(supported) => (supported, Outcome::Finished),
+                Err(_) => (false, Outcome::Failed),
+            };
+            observe(provider, outcome, started.elapsed());
+            catalog.await.map(|answer| (answer, supported)).map_err(FetchMiss::from_error)
+        }
+        answer = &mut catalog => {
+            // Discovery is optional. Never extend a successful required fetch's wait, or
+            // spend its remaining admission budget retrying a failed liveness lookup.
+            observe(provider, Outcome::Unfinished, started.elapsed());
+            answer.map(|answer| (answer, false)).map_err(FetchMiss::from_error)
+        }
+    }
+}
+
 /// A provider's decoded catalog answer.
 #[derive(Debug, Clone)]
 struct Fetched {
@@ -1171,16 +1201,7 @@ pub async fn admit(
             deadline
         };
         async move {
-            let call_keepalive = within_deadline(fetch_deadline, || {
-                fetcher.call_keepalive_supported(fetch.provider)
-            })
-            .await
-            .map_err(FetchMiss::from_error)?;
-            let answer =
-                within_deadline(fetch_deadline, || fetcher.catalog(fetch.provider, &request))
-                    .await
-                    .map_err(FetchMiss::from_error)?;
-            Ok((answer, call_keepalive))
+            catalog_with_optional_keepalive(fetcher, fetch.provider, &request, fetch_deadline).await
         }
     }));
     let declarations = futures::future::join_all(plan.step_items.iter().map(|step| {

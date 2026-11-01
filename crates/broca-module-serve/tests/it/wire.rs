@@ -1947,6 +1947,8 @@ async fn isolated_health_probe(test: &str) -> bool {
     false
 }
 
+mod keepalive_health;
+
 /// A channel-0 health.check returns registry counts and dependency states from memory.
 #[tokio::test]
 async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
@@ -2039,6 +2041,8 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     let stale_drops_before = initial_metrics["serve_frames_dropped_stale_epoch"]
         .as_u64()
         .expect("initial health.check includes the stale-epoch counter");
+    let discovery_before = initial_metrics["tool_keepalive_discovery"].clone();
+    keepalive_health::record_failed_lookup().await;
 
     let session = BindIdentity::new("broca-unscoped-v1", "runner", "s1");
     let bind = ModuleControlRequest::RouteBind {
@@ -2161,6 +2165,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         "frames_dropped_stale_epoch",
         "frames_dropped_unmatched_terminal",
         "reverse_requests_refused",
+        "tool_keepalive_discovery",
         // The preceding stale-epoch field belongs to broca-subc's client-side outbound routes;
         // these two are the serve loop's process-side inbound frame drops.
         "serve_frames_dropped_unbound_channel",
@@ -2235,6 +2240,20 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     .into_iter()
     .collect();
     let actual: std::collections::BTreeSet<&str> = metrics.keys().map(String::as_str).collect();
+    let discovery = &metrics["tool_keepalive_discovery"];
+    assert_eq!(
+        discovery["probes"].as_u64().unwrap(),
+        discovery_before["probes"].as_u64().unwrap() + 1
+    );
+    assert_eq!(
+        discovery["lookup_failed"].as_u64().unwrap(),
+        discovery_before["lookup_failed"].as_u64().unwrap() + 1
+    );
+    assert_eq!(
+        discovery["lookup_unfinished"],
+        discovery_before["lookup_unfinished"]
+    );
+    assert_eq!(*discovery, broca_fetch_plan::keepalive_discovery_health());
     assert_eq!(
         actual, expected,
         "health.check metric keys drifted from what this test pins. A NEW key here is not a \

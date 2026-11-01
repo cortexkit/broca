@@ -2196,6 +2196,7 @@ async fn handle_control_request(
             // this process serves no model-tool route.
             "llm_tools_consent": routes.llm_tools.as_ref().map(|tools| tools.consent_health()),
                 });
+            metrics["tool_keepalive_discovery"] = broca_fetch_plan::keepalive_discovery_health();
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
                 // status Ok. Fusiform reachability is deliberately absent because health never

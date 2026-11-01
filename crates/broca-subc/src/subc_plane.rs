@@ -446,7 +446,7 @@ trait ToolPlaneConnection: Send + Sync {
         &self,
         _route: &RouteHandle,
         _call: &ToolCall,
-        _deadline: Duration,
+        _deadline: crate::connection::ToolReplyDeadline,
         _preset: Option<&str>,
         _args: &ApprovedArgs,
         _schema_pin: Option<&str>,
@@ -464,7 +464,7 @@ trait ToolPlaneConnection: Send + Sync {
         &self,
         route: &RouteHandle,
         call: &ToolCall,
-        deadline: Duration,
+        deadline: crate::connection::ToolReplyDeadline,
         preset: Option<&str>,
         _call_key: Option<&str>,
         schema_pin: Option<&str>,
@@ -485,7 +485,7 @@ trait ToolPlaneConnection: Send + Sync {
             &call.tool_name,
             &call.input,
             Some(&call.tool_call_id.0),
-            deadline,
+            deadline.duration,
             preset,
         )
         .await
@@ -539,7 +539,7 @@ impl ToolPlaneConnection for SubcConnection {
         &self,
         route: &RouteHandle,
         call: &ToolCall,
-        deadline: Duration,
+        deadline: crate::connection::ToolReplyDeadline,
         preset: Option<&str>,
         call_key: Option<&str>,
         schema_pin: Option<&str>,
@@ -558,7 +558,8 @@ impl ToolPlaneConnection for SubcConnection {
             &call.tool_name,
             &args,
             Some(&call.tool_call_id.0),
-            deadline,
+            deadline.duration,
+            deadline.declared,
             preset,
             call_key,
             schema_pin,
@@ -586,7 +587,7 @@ impl ToolPlaneConnection for SubcConnection {
         &self,
         route: &RouteHandle,
         call: &ToolCall,
-        deadline: Duration,
+        deadline: crate::connection::ToolReplyDeadline,
         preset: Option<&str>,
         args: &ApprovedArgs,
         schema_pin: Option<&str>,
@@ -596,7 +597,8 @@ impl ToolPlaneConnection for SubcConnection {
             &call.tool_name,
             &args.bytes,
             Some(&call.tool_call_id.0),
-            deadline,
+            deadline.duration,
+            deadline.declared,
             preset,
             Some(&args.key),
             schema_pin,
@@ -882,6 +884,10 @@ impl SubcToolPlane {
                 .ok()
             });
         let late_results = self.frozen_contract(ctx, module).late_results;
+        let deadline = crate::connection::ToolReplyDeadline {
+            duration: deadline,
+            declared: self.declared_reply(ctx, module, call).is_some(),
+        };
         let plain_key = key.filter(|_| {
             self.held_reply_declared() && late_results && self.conn.consumer_module_id().is_some()
         });
@@ -1094,19 +1100,28 @@ impl SubcToolPlane {
         }
     }
 
-    fn reply_deadline(&self, ctx: &BatchCtx, module_id: &str, call: &ToolCall) -> Duration {
+    fn declared_reply(
+        &self,
+        ctx: &BatchCtx,
+        module_id: &str,
+        call: &ToolCall,
+    ) -> Option<cortexkit_role_tool_provider::catalog::Reply> {
         let manifests = self.batch_presets.lock().unwrap();
         // A deadline the frozen fetch plan's provider declared wins; otherwise the one the caller
         // declared on the tool when it sent it. Both go through the role's deadline arithmetic,
         // which never lowers the runner's fallback and is never lowered by it.
-        let reply = manifests
+        manifests
             .get(&Self::batch_route_key(ctx))
             .and_then(|manifest| {
                 manifest
                     .provider_reply(module_id, &call.tool_name)
                     .cloned()
                     .or_else(|| manifest.declared_reply(&call.tool_name))
-            });
+            })
+    }
+
+    fn reply_deadline(&self, ctx: &BatchCtx, module_id: &str, call: &ToolCall) -> Duration {
+        let reply = self.declared_reply(ctx, module_id, call);
         let keepalive = self.frozen_contract(ctx, module_id).call_keepalive;
         if reply.is_some() || keepalive {
             return Duration::from_millis(
@@ -4517,7 +4532,7 @@ mod tests {
             &self,
             route: &RouteHandle,
             call: &ToolCall,
-            deadline: Duration,
+            deadline: crate::connection::ToolReplyDeadline,
             preset: Option<&str>,
             args: &ApprovedArgs,
             _schema_pin: Option<&str>,
@@ -4533,7 +4548,7 @@ mod tests {
                 &call.tool_name,
                 &arguments,
                 Some(&call.tool_call_id.0),
-                deadline,
+                deadline.duration,
                 preset,
             )
             .await
@@ -7219,7 +7234,7 @@ mod tests {
             &self,
             route: &RouteHandle,
             call: &ToolCall,
-            deadline: Duration,
+            deadline: crate::connection::ToolReplyDeadline,
             preset: Option<&str>,
             call_key: Option<&str>,
             schema_pin: Option<&str>,
@@ -8443,7 +8458,10 @@ mod approval_digest_contract_tests {
                 &conn,
                 &route,
                 &call,
-                Duration::from_secs(1),
+                crate::connection::ToolReplyDeadline {
+                    duration: Duration::from_secs(1),
+                    declared: false
+                },
                 Some("head"),
                 &args,
                 None
@@ -8551,6 +8569,7 @@ mod approved_queue_contract_tests {
                     args,
                     Some("approved"),
                     Duration::from_millis(20),
+                    false,
                     None,
                     Some("call-key"),
                     None,

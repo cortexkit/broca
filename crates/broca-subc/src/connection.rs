@@ -298,6 +298,31 @@ pub struct RouteHandle {
     pub(crate) call_keepalive: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ToolReplyDeadline {
+    pub duration: Duration,
+    pub declared: bool,
+}
+
+struct ToolReplyWait {
+    duration: Duration,
+    enqueued_at: time::Instant,
+    absolute: bool,
+    silence: Option<Duration>,
+}
+
+impl ToolReplyWait {
+    fn enqueued(duration: Duration, declared_reply: bool, keepalive: bool) -> Self {
+        Self {
+            duration,
+            enqueued_at: time::Instant::now(),
+            absolute: declared_reply || keepalive,
+            silence: keepalive
+                .then(|| Duration::from_millis(cortexkit_role_tool_provider::KEEPALIVE_SILENCE_MS)),
+        }
+    }
+}
+
 impl RouteHandle {
     pub(crate) fn generation(&self) -> u64 {
         self.conn.0
@@ -2064,8 +2089,9 @@ impl SubcConnection {
     }
 
     /// [`Self::tool_call`] with the terminal-reply deadline chosen by the caller. The tool plane
-    /// passes the frozen per-call deadline. Legacy routes bound silence between frames;
-    /// negotiated keepalive routes bound total time independently of their silence timer.
+    /// supplies no frozen reply metadata. Non-negotiated routes therefore use the legacy
+    /// silence bound; negotiated routes also have an absolute budget. Agent dispatch uses
+    /// the guarded path so a declared `reply` deadline is absolute regardless of negotiation.
     pub async fn tool_call_with_deadline(
         &self,
         route: &RouteHandle,
@@ -2138,6 +2164,7 @@ impl SubcConnection {
         args_jcs: &str,
         tool_call_id: Option<&str>,
         deadline: Duration,
+        declared_reply: bool,
         preset: Option<&str>,
         call_key: Option<&str>,
         schema_pin: Option<&str>,
@@ -2167,12 +2194,14 @@ impl SubcConnection {
             )
             .map_err(|error| ConnError::Transport(error.to_string()))?;
             self.enqueue_approved(&runtime, frame, signals).await?;
+            // Route-open, bind and writer-capacity waits consume no provider reply budget.
+            let wait = ToolReplyWait::enqueued(deadline, declared_reply, route.call_keepalive);
             log_tool_dispatch(route.channel, corr, name);
-            Ok::<_, ApprovedSetupError>((runtime, registration, rx, corr))
+            Ok::<_, ApprovedSetupError>((runtime, registration, rx, corr, wait))
         };
-        let (runtime, _registration, mut rx, corr) =
+        let (runtime, _registration, mut rx, corr, wait) =
             before_push.await.map_err(ApprovedCallError::BeforePush)?;
-        self.receive_tool_call(runtime, route, corr, &mut rx, deadline, Some(signals))
+        self.receive_tool_call(runtime, route, corr, &mut rx, wait, Some(signals))
             .await
             .map_err(ApprovedCallError::AfterPush)
     }
@@ -2228,8 +2257,9 @@ impl SubcConnection {
         )
         .map_err(|error| ConnError::Transport(error.to_string()))?;
         self.send(&runtime, frame).await?;
+        let wait = ToolReplyWait::enqueued(deadline, false, route.call_keepalive);
         log_tool_dispatch(route.channel, corr, operation);
-        self.receive_tool_call(runtime, route, corr, &mut rx, deadline, None)
+        self.receive_tool_call(runtime, route, corr, &mut rx, wait, None)
             .await
     }
 
@@ -2239,7 +2269,7 @@ impl SubcConnection {
         route: &RouteHandle,
         corr: u64,
         rx: &mut mpsc::UnboundedReceiver<Frame>,
-        deadline: Duration,
+        wait: ToolReplyWait,
         signals: Option<&broca_core::tool_plane::DispatchSignals>,
     ) -> ConnResult<serde_json::Value> {
         // Arm abandonment only after enqueue. A request canceled while reserving
@@ -2256,10 +2286,10 @@ impl SubcConnection {
                 }
             } => Err(ConnError::Transport("tool call abandoned: run cancelled or stopped".into())),
             terminal = async {
-                if route.call_keepalive {
-                    self.await_tool_terminal_with_keepalive(&runtime, rx, deadline).await
+                if wait.absolute {
+                    self.await_tool_terminal_absolute(&runtime, rx, wait).await
                 } else {
-                    self.await_terminal_deadline(&runtime, rx, deadline).await
+                    self.await_terminal_deadline(&runtime, rx, wait.duration).await
                 }
             } => terminal,
         };
@@ -2277,25 +2307,25 @@ impl SubcConnection {
         }
     }
 
-    async fn await_tool_terminal_with_keepalive(
+    async fn await_tool_terminal_absolute(
         &self,
         runtime: &Arc<ConnectionRuntime>,
         rx: &mut mpsc::UnboundedReceiver<Frame>,
-        deadline: Duration,
+        wait: ToolReplyWait,
     ) -> ConnResult<Frame> {
-        let reply_at = time::Instant::now() + deadline;
-        let silence = Duration::from_millis(cortexkit_role_tool_provider::KEEPALIVE_SILENCE_MS);
-        let mut silent_at = time::Instant::now() + silence;
+        let deadline = wait.duration;
+        let reply_at = wait.enqueued_at + deadline;
+        let mut silent_at = wait.silence.map(|silence| wait.enqueued_at + silence);
         loop {
             let received = tokio::select! {
                 // An already queued PUSH must not win over an expired reply deadline.
                 biased;
-                _ = time::sleep_until(reply_at.min(silent_at)) => {
+                _ = time::sleep_until(silent_at.map_or(reply_at, |silent| reply_at.min(silent))) => {
                     self.spawn_liveness_probe(runtime);
-                    let reason = if reply_at <= silent_at {
-                        format!("timed out after {deadline:?}")
+                    let reason = if silent_at.is_some_and(|silent| silent < reply_at) {
+                        format!("tool call silent for {:?}", wait.silence.expect("silence timer configured"))
                     } else {
-                        format!("tool call silent for {silence:?}")
+                        format!("timed out after {deadline:?}")
                     };
                     return Err(ConnError::Transport(reason));
                 }
@@ -2304,7 +2334,7 @@ impl SubcConnection {
             match received {
                 Some(frame) => match frame.header.ty {
                     FrameType::Push => {
-                        silent_at = time::Instant::now() + silence;
+                        silent_at = wait.silence.map(|silence| time::Instant::now() + silence);
                         // Keepalives are transport liveness, never display, history or model
                         // content. Ordinary progress is drained here as on legacy routes.
                         if cortexkit_role_tool_provider::is_keepalive(&frame.body) {
@@ -4727,6 +4757,7 @@ mod tests {
                                 "{}",
                                 None,
                                 Duration::from_secs(10),
+                                false,
                                 None,
                                 None,
                                 None,
@@ -4922,6 +4953,7 @@ mod tests {
             arguments,
             Some("call"),
             Duration::from_secs(1),
+            false,
             None,
             Some("lineage:7"),
             Some(&pin),
@@ -6032,6 +6064,7 @@ mod tests {
             r#"{"secret":"argument content"}"#,
             Some("provider-call"),
             Duration::from_secs(1),
+            false,
             None,
             None,
             None,

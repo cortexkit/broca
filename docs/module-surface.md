@@ -1573,13 +1573,29 @@ after 90 seconds without a PUSH or terminal frame. Any PUSH resets only that sil
 `{"kind":"keepalive"}` bodies are never displayed, stored as tool output, or sent to the model.
 A tool without `reply` gets the contract's 24-hour ceiling instead of the runner fallback.
 A declared `reply` keeps its existing deadline calculation, never shorter than the runner's
-fallback. PUSH frames cannot extend that terminal deadline. Non-negotiated calls keep their
-previous per-frame wait, normally 120 seconds. Whenever broca abandons an outstanding tool request,
+fallback. It is an absolute terminal deadline on every route, negotiated or not, and PUSH
+frames cannot extend it. The budget starts only after the request enters the writer queue;
+route-open, bind, module-restart and writer-capacity waits do not consume it. Broca does not
+stamp a deadline into the tool request body. Only non-negotiated tools without a declared
+`reply` keep the previous per-frame wait, normally 120 seconds, including the existing
+`aft` provider's shell/watch argument-derived fallback (defined in
+[`tool_deadline.rs`](../crates/broca-subc/src/tool_deadline.rs)). Whenever broca abandons an outstanding tool request,
 including run cancellation and shutdown, its existing abandonment guard sends a best-effort
 CANCEL without waiting for the provider. Late frames find no waiter and cannot produce another
 result; an ambiguous call is never re-sent. A provider-held call (described under
 [Provider-held calls](#provider-held-calls) below) has already ended its original REQUEST with
 an interim held reply. Cancelling its continuing work still uses `tool.withdraw`, not CANCEL.
+
+The manifest promise is read from one admission-local daemon `catalog.list` snapshot, shared
+with the existing presetless system-text capability read when present. `tool.catalog` does
+not publish manifest `provides`, so otherwise one additional control request is needed.
+Optional discovery runs alongside the required provider fetch and is never awaited after
+that fetch finishes. A failed lookup, or one still unfinished when the required reply arrives,
+freezes no promise instead of refusing the send. A warning is limited to once per minute;
+`health.check.metrics.tool_keepalive_discovery` separately counts `lookup_failed` and
+`lookup_unfinished`. Its `probes` and wall-clock `wait_us_total`/`wait_us_max` include cache
+hits and are not production daemon RTT measurements. Required system-text capability checks
+retain their previous fail-closed and retry behavior.
 
 Fence keyed `(session, tool_call_id)` **with eviction** on batch/run terminal; **per-route
 window** resolved from the specific provider at route-open (not memoized once); **route
