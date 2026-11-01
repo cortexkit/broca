@@ -99,6 +99,8 @@ pub(crate) fn log_state(
 /// or its already-represented lineage metadata. Once that evidence exists, a missing log must not be replaced by subscribe
 /// or any other actor-opening operation. Old removal evidence cannot excuse the
 /// loss of a newer, unexpired run or a different materialized lineage.
+/// An unexpired run with unknown lineage needs its run ID in a verified
+/// pending-deletion log before it can share that older removal proof.
 pub(crate) fn evidence(
     conn: &Connection,
     session: &BindIdentity,
@@ -177,15 +179,21 @@ pub(crate) fn evidence(
             |row| row.get::<_, bool>(0),
         )?;
     }
-    let ledger: bool = conn.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM retention_deletion WHERE {run_match})"),
+    let mut deletion_lineages = std::collections::HashSet::new();
+    let mut ledger_query = conn.prepare(&format!(
+        "SELECT lineage_id FROM retention_deletion WHERE {run_match}"
+    ))?;
+    for id in ledger_query.query_map(
         params![
             session.project_root.to_string_lossy(),
             session.harness,
             session.session
         ],
-        |row| row.get(0),
-    )?;
+        |row| row.get::<_, String>(0),
+    )? {
+        deletion_lineages.insert(id?);
+    }
+    let ledger = !deletion_lineages.is_empty();
     content |= ledger;
     let mut removed = ledger || (runs && !unexpired);
     let mut stones = std::collections::HashSet::new();
@@ -230,8 +238,11 @@ pub(crate) fn evidence(
     removed |= !stones.is_empty();
     let mut unremoved_run = false;
     if unexpired && removed {
+        let retired_lineages: std::collections::HashSet<String> =
+            deletion_lineages.union(&stones).cloned().collect();
+        let mut proven_retired_runs = None;
         let mut query = conn.prepare(&format!(
-            "SELECT lineage_id FROM run_index WHERE {run_match} AND expired_at_ms IS NULL"
+            "SELECT run_id,lineage_id FROM run_index WHERE {run_match} AND expired_at_ms IS NULL"
         ))?;
         let mut rows = query.query(params![
             session.project_root.to_string_lossy(),
@@ -239,9 +250,18 @@ pub(crate) fn evidence(
             session.session
         ])?;
         while let Some(row) = rows.next()? {
-            if let Some(id) = row.get::<_, Option<String>>(0)? {
-                let deleted: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM retention_deletion WHERE lineage_id=?1 AND session=?2)", params![id, serde_json::to_string(session)?], |row| row.get(0))?;
-                unremoved_run |= !stones.contains(&id) && !deleted;
+            if let Some(id) = row.get::<_, Option<String>>(1)? {
+                unremoved_run |= !retired_lineages.contains(&id);
+            } else {
+                // An older expiry cannot excuse a newer run whose lineage has
+                // not been projected yet. A verified deleting log must name it.
+                if proven_retired_runs.is_none() {
+                    proven_retired_runs = Some(deleting_run_ids(conn, session, &retired_lineages)?);
+                }
+                unremoved_run |= !proven_retired_runs
+                    .as_ref()
+                    .unwrap()
+                    .contains(&row.get::<_, String>(0)?);
             }
         }
     }
@@ -254,7 +274,7 @@ pub(crate) fn evidence(
         .optional()?;
     if let Some(lineage) = meta {
         let covered = match lineage {
-            Some(id) => stones.contains(&id) || conn.query_row("SELECT EXISTS(SELECT 1 FROM retention_deletion WHERE lineage_id=?1 AND session=?2)", params![id, serde_json::to_string(session)?], |row| row.get::<_, bool>(0))?,
+            Some(id) => stones.contains(&id) || deletion_lineages.contains(&id),
             None => false,
         };
         removed &= covered;
@@ -266,6 +286,46 @@ pub(crate) fn evidence(
     })
 }
 
+fn deleting_run_ids(
+    conn: &Connection,
+    session: &BindIdentity,
+    lineages: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<String>, EvidenceError> {
+    let mut runs = std::collections::HashSet::new();
+    let Some(root) = conn.path().and_then(|path| Path::new(path).parent()) else {
+        return Ok(runs);
+    };
+    let wal = broca_core::FileWalStore::new(root.join("wal"));
+    for lineage in lineages {
+        // Ledger text becomes a filename component; the verified header below
+        // must also match its canonical lineage spelling before it proves a run.
+        if lineage.len() != 36
+            || !lineage
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        {
+            continue;
+        }
+        let path = wal.ephemeral_root().join(format!(
+            "{}.{lineage}.deleting",
+            broca_core::session_addr(session)
+        ));
+        let range = broca_wal::read_records_range(path, wal.max_read_bytes(), 0, None, None)?;
+        if range.lineage_id.map(|id| id.to_string()).as_deref() != Some(lineage.as_str()) {
+            continue;
+        }
+        let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+            continue;
+        };
+        for frame in records {
+            if let broca_wal::WalRecord::RunStarted { run_id, .. } = &frame.record {
+                runs.insert(run_id.0.clone());
+            }
+        }
+    }
+    Ok(runs)
+}
+
 fn table_exists(conn: &Connection, table: &str) -> Result<bool, EvidenceError> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
@@ -273,3 +333,6 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, EvidenceError> {
         |row| row.get(0),
     )?)
 }
+
+#[cfg(test)]
+mod tests;

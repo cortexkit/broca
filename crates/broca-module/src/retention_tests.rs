@@ -6017,3 +6017,48 @@ async fn expired_history_allows_a_fresh_subscriber_lineage() {
     );
     assert!(registry.route_read(&rig.key, None, Some(20)).await.is_ok());
 }
+
+#[tokio::test]
+async fn older_expiry_cannot_mask_an_unidentified_new_run_missing_log() {
+    let rig = Rig::new();
+    rig.seed(1, 1000, Some(1000));
+    let lease = rig.service.lease(&rig.key).unwrap();
+    rig.service.delete_expired(&rig.key, 2001).unwrap().unwrap();
+    drop(lease);
+    broca_core::RunIndex::index_run_active(
+        rig.store.as_ref(),
+        &broca_core::RunIndexRow {
+            run_id: "new-after-expiry".into(),
+            session: rig.key.clone(),
+            submission_id: None,
+            request_identity_digest: None,
+            state: broca_core::RunIndexState::Active,
+            usage: None,
+            final_step_finish_reason: None,
+            retries_used: 0,
+            title: None,
+            withdrawals_owed: false,
+        },
+    )
+    .unwrap();
+    let registry = rig.registry(None);
+    registry.set_session_address_inventory(rig.store.clone());
+    assert!(matches!(
+        registry.check_session_log(&rig.key).await,
+        Err(crate::registry::OpenError::SessionLogMissing { .. })
+    ));
+    assert!(matches!(
+        registry.check_expired(&rig.key, Some("r1")).await,
+        Err(crate::registry::OpenError::Expired {
+            expired_at_ms: 2000
+        })
+    ));
+    let read = registry.route_read(&rig.key, None, Some(20)).await;
+    assert!(
+        matches!(
+            &read,
+            Err(crate::registry::OpenError::SessionLogMissing { .. })
+        ),
+        "{read:?}"
+    );
+}

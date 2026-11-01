@@ -98,6 +98,27 @@ pub struct SessionRootRepair {
     pub live_log_lineage: Option<String>,
     pub live_meta_present: bool,
     pub remove_retention_discovery_rows: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_surviving_ref: Option<RefAddition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub move_stub_aside: Option<StubAside>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RefAddition {
+    pub session_ref: String,
+    pub alias: String,
+    pub address: String,
+    pub identity: BindIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StubAside {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub lineage_id: String,
+    pub created_at_ns: String,
+    pub real_last_write_at_ns: String,
 }
 
 impl SqliteStore {
@@ -157,9 +178,25 @@ impl SqliteStore {
         if actual.stale_identity.is_none() {
             return Ok(());
         }
+        if let Some(aside) = &actual.move_stub_aside {
+            let parent = aside.to.parent().ok_or("repair_aside_parent_missing")?;
+            broca_owner_only::create_dir_all(parent)?;
+            if aside.to.try_exists()? {
+                return Err("repair_aside_exists: refusing to overwrite preserved bytes".into());
+            }
+            // Preserve the stub before committing metadata. After a crash the
+            // stale reference still has history but no log, so serving refuses
+            // to create a replacement. A fresh preview can finish the remapping.
+            std::fs::rename(&aside.from, &aside.to)?;
+            broca_wal::migration::sync_dir(parent)?;
+            broca_wal::migration::sync_dir(aside.from.parent().ok_or("stub_parent_missing")?)?;
+        }
         // Suppress the legacy-write trigger only while updating identities whose
         // surviving candidate is already present in this same transaction.
         tx.execute("INSERT INTO agent_data_writer VALUES(1)", [])?;
+        if let Some(add) = &actual.add_surviving_ref {
+            session_refs::insert(&tx, &add.address, &add.identity)?;
+        }
         for run in &actual.repoint_runs {
             tx.execute(
                 "UPDATE run_index SET session=?1 WHERE run_id=?2 AND session=?3 AND state=?4",
@@ -284,38 +321,84 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
         live_log_lineage: None,
         live_meta_present: false,
         remove_retention_discovery_rows: 0,
+        add_surviving_ref: None,
+        move_stub_aside: None,
     };
-    if roots.len() == 1 {
-        return Ok(result);
-    }
     let reader = ReadOnlyWalReader::new(root);
     let addresses = reader.addresses()?;
+    let wal = broca_core::FileWalStore::new(root.join("wal"));
+    let mut proposed_live = None;
+    if roots.len() == 1 {
+        let recorded = roots.first_key_value().unwrap().1.clone();
+        let alternatives = crate::session_ref_audit::alternate_logs(
+            conn,
+            root,
+            &recorded,
+            &addresses,
+            &crate::session_ref_audit::known_roots(conn)?,
+        )?;
+        match alternatives.as_slice() {
+            [] => {
+                if crate::session_log_evidence::log_state(conn, &recorded, &wal)?.missing_history()
+                {
+                    return Err("real_log_not_found: no independently recorded root has a matching historical lineage".into());
+                }
+                return Ok(result);
+            }
+            [candidate] => {
+                proposed_live = Some(candidate.address.clone());
+                roots.insert(candidate.address.clone(), candidate.identity.clone());
+            }
+            _ => {
+                return Err(
+                    "real_log_ambiguous: more than one alternate log matches history".into(),
+                )
+            }
+        }
+    }
     let present: Vec<_> = roots
         .keys()
         .filter(|address| addresses.contains(*address))
         .collect();
-    if present.len() != 1 {
-        return Err(format!(
-            "session-root repair requires exactly one address with a log, found {}",
-            present.len()
-        )
-        .into());
-    }
-    let live_address = present[0];
+    let live_address = if let Some(address) = proposed_live {
+        address
+    } else if present.len() == 1 {
+        (*present[0]).clone()
+    } else {
+        let mut forked = Vec::new();
+        for (address, identity) in &roots {
+            if crate::session_log_evidence::log_state(conn, identity, &wal)?
+                == crate::session_log_evidence::SessionLogState::ForkedStub
+            {
+                forked.push(address);
+            }
+        }
+        if present.len() != 2 || forked.len() != 1 {
+            return Err(format!("competing_logs: session-root repair requires exactly one address with a log, found {}", present.len()).into());
+        }
+        roots
+            .keys()
+            .find(|address| *address != forked[0])
+            .unwrap()
+            .clone()
+    };
     let (stale_address, stale) = roots
         .iter()
-        .find(|(address, _)| *address != live_address)
+        .find(|(address, _)| address.as_str() != live_address.as_str())
         .unwrap();
-    let live = &roots[live_address];
+    let live = &roots[&live_address];
     check_fences(conn, root, stale_address, stale)?;
-    check_fences(conn, root, live_address, live)?;
+    check_fences(conn, root, &live_address, live)?;
+    if addresses.contains(stale_address) {
+        result.move_stub_aside = Some(prove_stub_aside(root, stale, live)?);
+    }
     let foreign: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM agent_data_session_ref WHERE address=?1 AND (harness<>?2 OR session<>?3))",
         params![stale_address,harness,session], |row| row.get(0))?;
     if foreign {
         return Err("stale address has an unrelated v1 ref".into());
     }
-    let (records, _) = reader.records(live_address)?;
+    let (records, _) = reader.records(&live_address)?;
     let mut current = None;
     let mut episodes = BTreeMap::new();
     for frame in &records {
@@ -409,6 +492,21 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
     result.surviving_address = live_address.clone();
     result.stale_identity = Some(stale.clone());
     result.stale_address = Some(stale_address.clone());
+    if !references
+        .iter()
+        .any(|reference| reference.identity == *live)
+    {
+        result.add_surviving_ref = Some(RefAddition {
+            session_ref: broca_core::wal_writer::legacy_session_ref(
+                &live.harness,
+                &live.project_root.to_string_lossy(),
+                &live.session,
+            ),
+            alias: agent_session_ref(live),
+            address: live_address.clone(),
+            identity: live.clone(),
+        });
+    }
     result.remove_v1_refs = references
         .into_iter()
         .filter(|reference| reference.identity == *stale)
@@ -446,7 +544,7 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
             .as_ref()
             .is_some_and(|lineage| Some(lineage) != result.live_log_lineage.as_ref())
         {
-            return Err(format!("run {} row lineage_id {:?} differs from surviving log lineage {:?}; cannot re-point exactly",
+            return Err(format!("real_log_lineage_mismatch: run {} row lineage_id {:?} differs from surviving log lineage {:?}; cannot re-point exactly",
                 run.run_id, run.row_lineage_id, result.live_log_lineage).into());
         }
     }
@@ -670,6 +768,73 @@ fn check_fences(
         }
     }
     Ok(())
+}
+
+fn prove_stub_aside(root: &Path, stale: &BindIdentity, live: &BindIdentity) -> Result<StubAside> {
+    let wal = broca_core::FileWalStore::new(root.join("wal"));
+    let path = wal.resolve_live_path(stale)?.ok_or("stub_not_live")?;
+    let range = wal.read_records_range(stale, 0, None, None)?;
+    let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+        return Err("stub_not_lineage_only: incomplete log".into());
+    };
+    let meta = std::fs::metadata(&path)?;
+    if !records.is_empty() || meta.len() != broca_wal::framing::LINEAGE_FRAME_LEN as u64 {
+        return Err(
+            "stub_not_lineage_only: extra records or bytes must never be moved aside".into(),
+        );
+    }
+    let lineage = range.lineage_id.ok_or("stub_lineage_unproven")?.to_string();
+    let real = wal
+        .resolve_live_path(live)?
+        .ok_or("real_log_not_live_for_stub: last-write proof requires a live real log")?;
+    let real_lineage = wal
+        .read_records_range(live, 0, None, None)?
+        .lineage_id
+        .ok_or("real_log_lineage_unproven")?
+        .to_string();
+    if lineage == real_lineage {
+        return Err("stub_lineage_not_forked: refusing a matching lineage".into());
+    }
+    // Modification time alone cannot prove when the stub was created.
+    let created = meta
+        .created()
+        .map_err(|error| format!("stub_creation_time_unavailable: {error}"))?;
+    // A copy that preserved write time but reset creation time cannot prove
+    // the source stub's age. Refuse that inconsistent timestamp evidence.
+    if created > meta.modified()? {
+        return Err("stub_creation_time_unreliable: creation follows the stub's last write; preserve original timestamps".into());
+    }
+    let written = std::fs::metadata(real)?
+        .modified()
+        .map_err(|error| format!("real_log_last_write_unavailable: {error}"))?;
+    if created <= written {
+        return Err(
+            "stub_not_newer_than_real_log: creation must follow the real log's last write".into(),
+        );
+    }
+    let to = path
+        .parent()
+        .ok_or("stub_parent_missing")?
+        .join("repair-aside")
+        .join(format!("{}.{lineage}.wal", session_addr(stale)));
+    if to.try_exists()? {
+        return Err("repair_aside_exists: refusing to overwrite preserved bytes".into());
+    }
+    Ok(StubAside {
+        from: path,
+        to,
+        lineage_id: lineage,
+        created_at_ns: created
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("stub_time_invalid: {error}"))?
+            .as_nanos()
+            .to_string(),
+        real_last_write_at_ns: written
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("real_log_time_invalid: {error}"))?
+            .as_nanos()
+            .to_string(),
+    })
 }
 
 #[cfg(test)]

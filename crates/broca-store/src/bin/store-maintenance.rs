@@ -550,8 +550,11 @@ fn repair_session_root(args: &[String]) -> ExitCode {
         stale meta lineage_id, watermark_seq, last_run_id and the evidence used.\n\
         --write requires broca AND its supervisor STOPPED for the entire operation.\n\
         Live or unknown writer liveness refuses before SQLite opens; both session leases\n\
-        also exclude standalone writers. No log bytes are changed. Only a two-root pair\n\
-        with one log (live or archived), no deletion or move fences, and terminal stale\n\
+        also exclude standalone writers. No log bytes are changed. A two-root pair\n\
+        with one log (live or archived), or one wrong-root ref with a proven real log,\n\
+        can be repaired. A forked lineage-only stub must be newer than the real log's\n\
+        last write; it is moved into repair-aside beside the logs, never deleted.\n\
+        Repairs require no deletion or move fences, and terminal stale\n\
         run rows matched by run ID and durable terminal state can be repaired. Embedded\n\
         triples may predate re-keys. Orphaned projections are deleted,\n\
         never merged; known stale lineage must match the log. NULL lineage requires\n\

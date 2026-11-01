@@ -30,6 +30,8 @@ use tokio::sync::{mpsc, Mutex};
 mod attribution;
 #[path = "session_read/media.rs"]
 mod media;
+#[path = "session_read/root_repair.rs"]
+mod root_repair;
 #[path = "session_read/run_usage.rs"]
 mod run_usage;
 #[path = "session_read/tags.rs"]
@@ -1829,6 +1831,7 @@ async fn assert_historical_session_ops_refuse(forked_stub: bool) {
         "subscribe",
         "warm",
         "send",
+        "scoped_bind",
     ] {
         let (rig, resolved, real, real_bytes) = stale_inventory_fixture().await;
         if forked_stub {
@@ -1864,6 +1867,29 @@ async fn assert_historical_session_ops_refuse(forked_stub: bool) {
         let stub = rig.wal_store.wal_path(&resolved);
         let before = std::fs::read(&stub).ok();
         let result = match op {
+            "scoped_bind" => {
+                let stamp = broca_protocol::BindScope {
+                    scope: broca_protocol::SessionScope {
+                        owner: broca_protocol::BindPrincipal::Reserved {
+                            module_id: "core".into(),
+                        },
+                        scope_ref: "work".into(),
+                        scope_epoch: 1,
+                        flow_id: None,
+                        sender: None,
+                        agent_id: None,
+                        run_id: None,
+                    },
+                    owner_authorized: true,
+                    kind: broca_protocol::ScopeKind::Head,
+                    parent: None,
+                    parent_state: None,
+                };
+                rig.registry
+                    .bind_adoption_refusal(&resolved, None, &stamp)
+                    .await
+                    .map(|_| ())
+            }
             "read" => rig
                 .registry
                 .read(read_request(&resolved, None, Some(20)))
@@ -1907,10 +1933,12 @@ async fn assert_historical_session_ops_refuse(forked_stub: bool) {
             }
             _ => unreachable!(),
         };
-        if !result
-            .as_ref()
-            .is_err_and(|error| error.to_string().contains("repair-session-root"))
-        {
+        if !result.as_ref().is_err_and(|error| {
+            matches!(
+                error,
+                broca_module::serve::ServeError::SessionLogMissing { .. }
+            ) && error.to_string().contains("repair-session-root")
+        }) {
             failures.push(format!("{op}: {result:?}"));
         }
         if std::fs::read(&stub).ok() != before {

@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[path = "one_wrong_root_tests.rs"]
+mod one_wrong_root;
+
 struct Fixture {
     root: PathBuf,
     store: SqliteStore,

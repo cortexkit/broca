@@ -2992,6 +2992,9 @@ impl ServeHandler for crate::LineageRegistry {
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::BindScope,
     ) -> Result<Option<broca_core::AdoptionRefusal>, ServeError> {
+        // A missing log must not look unwritten to adoption, or become an
+        // opaque, transient ownership-read failure instead of a named refusal.
+        self.check_session_log(session).await?;
         let ownership = match self.bind_ownership(session).await {
             crate::registry::BindOwnership::Known(ownership) => ownership,
             crate::registry::BindOwnership::NoHistorySource => return Ok(None),

@@ -35,10 +35,19 @@ content-bearing logs take no additional content read. The refusal names the sess
 route's current folder. Expired reads keep `expired`; move fences keep
 `session_moving` and `session_moved`. A send after completed expiry can still
 start a fresh lineage.
+Status polling for large sessions or runs left active by a crash may still recover
+an existing log's torn tail or append the missing terminal for an abandoned run.
+That recovery policy is unchanged. The guard prevents opening a writer that
+could create a replacement log when historical content is missing.
 `health.check.metrics.session_address_refusals.session_log_missing` counts served
 refusals, `diagnostics.findings` reports an error naming the session, and a WARN is
 limited to one per minute. An older deletion cannot excuse a missing newer,
 unexpired run or a different materialized lineage.
+If an unexpired run's lineage is still unknown, a verified pending-deletion log
+must contain its run ID before the run can count as deliberately removed. An
+older tombstone alone cannot excuse losing a newer, not-yet-projected run.
+Session-wide expiry hints are checked against that shared history decision;
+queries explicitly naming an already-expired run keep their `expired` answer.
 
 Before a `RunStarted` append, ordinary and preencoded writers (including
 provider-free imports) attempt to commit the candidate. The connection mutex and
@@ -224,8 +233,42 @@ both canonical session leases to exclude standalone writers; these leases do not
 replace the stopped-supervisor requirement. Preview uses a read-only connection,
 without schema initialization or leases.
 
-Repair requires a complete inventory, exactly two roots, and exactly one address
-with a WAL across all live trees and sealed archive trees. It refuses deletion
+Repair requires a complete inventory and either two recorded project roots for
+the same `(harness, session)` with one surviving log, or one wrong-root reference
+with a root recorded in another inventory entry or run row whose log matches
+historical lineage evidence. The `audit-session-refs` helper checks these recorded
+root candidates and verifies their logs' lineages; it never takes a root from the
+repair request's current folder. A lineage-only fork at
+the stale address is permitted only with all of these additional proofs:
+
+- its verified log has a lineage frame and no records or other bytes;
+- its lineage differs from the verified real log, whose lineage must match any
+  recorded run lineage and the existing projection evidence;
+- the filesystem proves the stub was **created after** the real live log's last
+  write. Modification time alone is not creation proof. Unavailable creation time
+  refuses as `stub_creation_time_unavailable`; an archived real log cannot supply
+  this live last-write proof and refuses as `real_log_not_live_for_stub`.
+
+Copies used for chronology proof must preserve original creation and modification
+times. A creation time later than the stub's own last-write time refuses as
+`stub_creation_time_unreliable` (for example, a copy that reset creation time but
+preserved write time). If a copy reset both timestamps, its copy times are not
+evidence of production chronology; use a timestamp-preserving copy or the stopped
+original store for that proof.
+
+Preview names the root-dependent v1 session reference for the full bind triple
+and the root-independent v2 alias for the `(harness, session)` pair to add. It also
+names the exact stub source, aside destination, lineage and timestamp proof.
+Apply moves the stub, without
+changing its bytes, into `repair-aside/` inside its live log directory, never
+deleting it or overwriting an existing aside file. This preservation happens
+before the SQLite commit: if application fails after the move, keep the aside
+and make a fresh preview to finish remapping. A successful repeat is a no-op.
+Missing-file repairs need no stub move. Competing content-bearing logs,
+`stub_not_lineage_only`, `stub_not_newer_than_real_log` and
+`real_log_lineage_mismatch` refuse rather than merge or discard content.
+
+It refuses deletion
 ledgers/tombstones, expired lineage records, move/cut fences, unreadable sources,
 and competing logs.
 Each stale run must be terminal and match an episode by run ID in the surviving

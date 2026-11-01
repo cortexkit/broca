@@ -6930,6 +6930,7 @@ impl LineageRegistry {
             _ => None,
         };
         let checked_key = key.clone();
+        let run_scoped = run.is_some();
         let key = key.clone();
         let run = run.map(str::to_owned);
         let store = self
@@ -6959,6 +6960,11 @@ impl LineageRegistry {
         .map_err(|e| OpenError::Open(e.to_string()))?
         .map_err(OpenError::from_retention)?;
         if let Some(expired_at_ms) = expired {
+            // A session-wide expiry hint must not hide missing history from a
+            // newer run. An explicitly named expired run keeps its own answer.
+            if !run_scoped {
+                self.check_session_log(&checked_key).await?;
+            }
             return Err(OpenError::Expired { expired_at_ms });
         }
         self.check_session_log(&checked_key).await
@@ -6968,6 +6974,8 @@ impl LineageRegistry {
     /// Historical content evidence, unlike a reservation, forbids replacing an
     /// unexplained missing log. Both read admission and writer activation use this
     /// check, including a second writer check under the acquired session lease.
+    /// `session.status` may still recover an existing log's torn tail or append an
+    /// orphan's terminal; it must never mint a replacement for missing history.
     pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
         let (Some(inventory), Some(reader)) = (
             self.inner.session_address_inventory.get().cloned(),
