@@ -26,6 +26,7 @@ pub mod registry;
 pub mod retention;
 pub mod retention_withdrawals;
 mod send_fate;
+mod sender_admission;
 pub mod serve;
 pub mod session_class;
 mod uploads;
