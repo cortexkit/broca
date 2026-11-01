@@ -236,6 +236,22 @@ impl broca_fetch_plan::PlanAdmitter for SubcPlanAdmitter {
 
 #[async_trait]
 impl Fetcher for SubcPlanFetcher {
+    async fn call_keepalive_supported(&self, provider: &str) -> Result<bool, FetchError> {
+        let entries = self
+            .conn
+            .catalog_list()
+            .await
+            .map_err(|error| FetchError::Lost(error.to_string()))?;
+        Ok(entries
+            .iter()
+            .find(|entry| entry.module_id == provider)
+            .and_then(|entry| entry.capabilities.as_ref())
+            .is_some_and(|caps| {
+                caps.provides.iter().any(|capability| {
+                    capability == cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY
+                })
+            }))
+    }
     async fn system_text_default_supported(&self, provider: &str) -> Result<bool, FetchError> {
         let entries = self
             .conn
@@ -421,6 +437,49 @@ mod preset_tests {
 mod default_text_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn keepalive_promise_comes_only_from_the_matching_provider_manifest() {
+        for (module, provides, expected) in [
+            (
+                "provider",
+                vec![cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY],
+                true,
+            ),
+            ("provider", vec![], false),
+            (
+                "other",
+                vec![cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY],
+                false,
+            ),
+        ] {
+            let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+            let fetcher = SubcPlanFetcher::new(
+                Arc::new(conn),
+                BindIdentity::new("/project", "runner", "catalog"),
+                None,
+            );
+            let read = fetcher.call_keepalive_supported("provider");
+            let reply = async {
+                let request = daemon.next_request().await;
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["op"], "catalog.list");
+                let mut entry =
+                    serde_json::to_value(subc_control::CatalogEntry::new(module, vec![], vec![]))
+                        .unwrap();
+                entry["capabilities"] = json!({"provides":provides});
+                let response = subc_control::ClientControlResponse::CatalogList {
+                    generation: 1,
+                    modules: vec![serde_json::from_value(entry).unwrap()],
+                    subc_ops: vec![],
+                };
+                assert!(daemon.reply(&request, serde_json::to_vec(&response).unwrap()));
+            };
+            let (supported, ()) = tokio::join!(read, reply);
+            assert_eq!(supported.unwrap(), expected);
+            assert!(daemon.take_written_for_test().is_empty());
+        }
+    }
 
     #[tokio::test]
     async fn system_text_default_uses_matching_daemon_catalog_declaration() {

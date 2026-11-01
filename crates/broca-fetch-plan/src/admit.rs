@@ -411,6 +411,11 @@ impl FetchError {
 /// them.
 #[async_trait]
 pub trait Fetcher: Send + Sync {
+    /// The provider's manifest promise, read from the daemon catalog at admission.
+    /// Older fetchers cannot negotiate keepalives and freeze no promise.
+    async fn call_keepalive_supported(&self, _provider: &str) -> Result<bool, FetchError> {
+        Ok(false)
+    }
     /// A declaration from the provider's daemon catalog entry, never guessed from
     /// a version or learned by forwarding a request an older provider cannot read.
     async fn system_text_default_supported(&self, _provider: &str) -> Result<bool, FetchError> {
@@ -868,6 +873,7 @@ fn freeze_reply(reply: &cortexkit_role_tool_provider::catalog::Reply) -> broca_w
 /// display never depend on a provider's later catalog.
 fn frozen_provider_declarations(
     answer: &cortexkit_role_tool_provider::catalog::CatalogAnswer,
+    call_keepalive: bool,
 ) -> Option<FrozenProviderDeclarations> {
     let result_formats: BTreeMap<String, FrozenResultFormat> = answer
         .tools
@@ -882,6 +888,7 @@ fn frozen_provider_declarations(
         })
         .collect();
     let declarations = FrozenProviderDeclarations {
+        call_keepalive: call_keepalive.then_some(true),
         schema_pins: (!answer.tools.is_empty()).then(|| {
             answer
                 .tools
@@ -1164,9 +1171,16 @@ pub async fn admit(
             deadline
         };
         async move {
-            within_deadline(fetch_deadline, || fetcher.catalog(fetch.provider, &request))
-                .await
-                .map_err(FetchMiss::from_error)
+            let call_keepalive = within_deadline(fetch_deadline, || {
+                fetcher.call_keepalive_supported(fetch.provider)
+            })
+            .await
+            .map_err(FetchMiss::from_error)?;
+            let answer =
+                within_deadline(fetch_deadline, || fetcher.catalog(fetch.provider, &request))
+                    .await
+                    .map_err(FetchMiss::from_error)?;
+            Ok((answer, call_keepalive))
         }
     }));
     let declarations = futures::future::join_all(plan.step_items.iter().map(|step| {
@@ -1211,16 +1225,20 @@ pub async fn admit(
     };
     let (catalogs, declarations, compaction) = futures::join!(catalogs, declarations, compaction);
     let mut raw_answers = BTreeMap::new();
+    let mut keepalive_promises = BTreeSet::new();
     let mut outcomes: BTreeMap<&str, Result<Fetched, FetchMiss>> = BTreeMap::new();
     let mut absent_tools = BTreeSet::new();
     for (fetch, outcome) in catalog_fetches.iter().zip(&catalogs) {
         let mut decoded = match outcome {
-            Ok(answer) => decode_answer(answer.clone(), fetch.text_item.is_some())
+            Ok((answer, _)) => decode_answer(answer.clone(), fetch.text_item.is_some())
                 .and_then(|fetched| check_opted_in_slots(fetched, fetch.tool_item)),
             Err(_) => continue,
         };
-        if let Ok(answer) = outcome {
+        if let Ok((answer, keepalive)) = outcome {
             raw_answers.insert(fetch.provider, answer.clone());
+            if *keepalive {
+                keepalive_promises.insert(fetch.provider);
+            }
         }
         if fetch.tool_item.is_some_and(|item| item.optional)
             && decoded
@@ -1595,7 +1613,10 @@ pub async fn admit(
                             })
                             .collect(),
                     ),
-                    declarations_frozen: frozen_provider_declarations(&fetched.answer),
+                    declarations_frozen: frozen_provider_declarations(
+                        &fetched.answer,
+                        keepalive_promises.contains(provider),
+                    ),
                 },
                 Err(missed) => FetchOutcome::Absent {
                     reason: missed.unanswered.absence(),
@@ -1693,6 +1714,7 @@ pub fn baseline_facts(manifest: &PlanManifest) -> BaselineFacts {
 
 #[cfg(test)]
 mod tests {
+    include!("call_keepalive_tests.rs");
     use std::sync::Mutex;
 
     use super::*;
@@ -2027,7 +2049,7 @@ mod tests {
                 "name":"work", "input_schema":{"type":"object"}, "schema_digest":digest, "semantics":7, "capabilities":[]
             }]
         })).unwrap();
-        let frozen = frozen_provider_declarations(&answer).unwrap();
+        let frozen = frozen_provider_declarations(&answer, false).unwrap();
         answer.tools[0].schema_digest = "0".repeat(64);
         answer.tools[0].semantics = 99;
         let round_trip: FrozenProviderDeclarations =

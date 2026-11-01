@@ -295,6 +295,7 @@ pub struct RouteHandle {
     conn: ConnToken,
     pub(crate) reads_tool_result: bool,
     pub(crate) reads_held_reply: bool,
+    pub(crate) call_keepalive: bool,
 }
 
 impl RouteHandle {
@@ -308,6 +309,7 @@ impl RouteHandle {
             conn,
             reads_tool_result: false,
             reads_held_reply: false,
+            call_keepalive: false,
         }
     }
 
@@ -1367,8 +1369,9 @@ impl SubcConnection {
         scope: Option<&subc_protocol::scope::ScopeSelector>,
         tool_result_v1: bool,
         provider_held_installed: bool,
+        call_keepalive: bool,
     ) -> ConnResult<RouteHandle> {
-        let capabilities = if provider_held_installed {
+        let mut capabilities = if provider_held_installed {
             Some(vec![
                 cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
                 cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
@@ -1377,6 +1380,11 @@ impl SubcConnection {
             tool_result_v1
                 .then(|| vec![cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into()])
         };
+        if call_keepalive {
+            capabilities
+                .get_or_insert_with(Vec::new)
+                .push(cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY.into());
+        }
         self.route_open_target_with_capabilities(
             RouteTarget::ToolProvider {
                 module_id: module_id.into(),
@@ -1729,6 +1737,10 @@ impl SubcConnection {
         let reads_tool_result = cortexkit_role_tool_provider::consumer_reads_tool_result_v1(
             consumer_capabilities.as_deref(),
         );
+        let call_keepalive = consumer_capabilities.as_ref().is_some_and(|caps| {
+            caps.iter()
+                .any(|cap| cap == cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY)
+        });
         let req = ClientControlRequest::RouteOpen {
             identity,
             target,
@@ -1758,6 +1770,7 @@ impl SubcConnection {
                         let mut handle = RouteHandle::new(route_channel, route_epoch, conn);
                         handle.reads_tool_result = reads_tool_result;
                         handle.reads_held_reply = reads_held_reply;
+                        handle.call_keepalive = call_keepalive;
                         Ok(handle)
                     }
                     Ok(other) => Err(ConnError::Protocol(format!(
@@ -2051,8 +2064,8 @@ impl SubcConnection {
     }
 
     /// [`Self::tool_call`] with the terminal-reply deadline chosen by the caller. The tool plane
-    /// passes the per-call value from [`crate::tool_deadline::tool_reply_deadline`]; like every
-    /// deadline here it bounds silence between frames, resetting on interim Push frames.
+    /// passes the frozen per-call deadline. Legacy routes bound silence between frames;
+    /// negotiated keepalive routes bound total time independently of their silence timer.
     pub async fn tool_call_with_deadline(
         &self,
         route: &RouteHandle,
@@ -2159,7 +2172,7 @@ impl SubcConnection {
         };
         let (runtime, _registration, mut rx, corr) =
             before_push.await.map_err(ApprovedCallError::BeforePush)?;
-        self.receive_tool_call(runtime, route, corr, &mut rx, deadline)
+        self.receive_tool_call(runtime, route, corr, &mut rx, deadline, Some(signals))
             .await
             .map_err(ApprovedCallError::AfterPush)
     }
@@ -2216,7 +2229,7 @@ impl SubcConnection {
         .map_err(|error| ConnError::Transport(error.to_string()))?;
         self.send(&runtime, frame).await?;
         log_tool_dispatch(route.channel, corr, operation);
-        self.receive_tool_call(runtime, route, corr, &mut rx, deadline)
+        self.receive_tool_call(runtime, route, corr, &mut rx, deadline, None)
             .await
     }
 
@@ -2227,11 +2240,29 @@ impl SubcConnection {
         corr: u64,
         rx: &mut mpsc::UnboundedReceiver<Frame>,
         deadline: Duration,
+        signals: Option<&broca_core::tool_plane::DispatchSignals>,
     ) -> ConnResult<serde_json::Value> {
         // Arm abandonment only after enqueue. A request canceled while reserving
         // writer capacity has no provider work to cancel.
         let mut abandon = CancelOnAbandon::arm(&runtime, route, corr);
-        let terminal = self.await_terminal_deadline(&runtime, rx, deadline).await;
+        let terminal = tokio::select! {
+            // Arm abandonment before polling the signals: cancellation may already have
+            // arrived just after enqueue, before the reply wait was first polled.
+            biased;
+            _ = async {
+                match signals {
+                    Some(signals) => signals.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => Err(ConnError::Transport("tool call abandoned: run cancelled or stopped".into())),
+            terminal = async {
+                if route.call_keepalive {
+                    self.await_tool_terminal_with_keepalive(&runtime, rx, deadline).await
+                } else {
+                    self.await_terminal_deadline(&runtime, rx, deadline).await
+                }
+            } => terminal,
+        };
         if terminal.is_ok() {
             abandon.disarm();
         }
@@ -2243,6 +2274,55 @@ impl SubcConnection {
             ty => Err(ConnError::Protocol(format!(
                 "unexpected tool-call frame {ty:?}"
             ))),
+        }
+    }
+
+    async fn await_tool_terminal_with_keepalive(
+        &self,
+        runtime: &Arc<ConnectionRuntime>,
+        rx: &mut mpsc::UnboundedReceiver<Frame>,
+        deadline: Duration,
+    ) -> ConnResult<Frame> {
+        let reply_at = time::Instant::now() + deadline;
+        let silence = Duration::from_millis(cortexkit_role_tool_provider::KEEPALIVE_SILENCE_MS);
+        let mut silent_at = time::Instant::now() + silence;
+        loop {
+            let received = tokio::select! {
+                // An already queued PUSH must not win over an expired reply deadline.
+                biased;
+                _ = time::sleep_until(reply_at.min(silent_at)) => {
+                    self.spawn_liveness_probe(runtime);
+                    let reason = if reply_at <= silent_at {
+                        format!("timed out after {deadline:?}")
+                    } else {
+                        format!("tool call silent for {silence:?}")
+                    };
+                    return Err(ConnError::Transport(reason));
+                }
+                received = rx.recv() => received,
+            };
+            match received {
+                Some(frame) => match frame.header.ty {
+                    FrameType::Push => {
+                        silent_at = time::Instant::now() + silence;
+                        // Keepalives are transport liveness, never display, history or model
+                        // content. Ordinary progress is drained here as on legacy routes.
+                        if cortexkit_role_tool_provider::is_keepalive(&frame.body) {
+                            continue;
+                        }
+                    }
+                    FrameType::Goodbye => {
+                        return Err(ConnError::Transport(ROUTE_GONE_MESSAGE.into()))
+                    }
+                    FrameType::Response | FrameType::Error => return Ok(frame),
+                    ty => {
+                        return Err(ConnError::Protocol(format!(
+                            "frame {ty:?} arrived where a Response or Error terminal was expected"
+                        )))
+                    }
+                },
+                None => return Err(ConnError::Transport("connection closed mid-call".into())),
+            }
         }
     }
 
@@ -4519,6 +4599,9 @@ impl SubcConnection {
 
 #[cfg(test)]
 impl InProcessModuleEnd {
+    pub(crate) fn push(&self, request: &Frame, body: Vec<u8>) -> bool {
+        self.terminal(request, FrameType::Push, body)
+    }
     pub(crate) fn fill_pending_for_test(&self) {
         for corr in 0..MAX_PENDING_REQUESTS as u64 {
             let (sender, _rx) = mpsc::unbounded_channel();
@@ -4584,9 +4667,31 @@ impl InProcessModuleEnd {
             request.header.epoch,
             request.header.corr,
         );
-        let sender = match self.pending.lock().unwrap().get(&key) {
-            Some(PendingEntry::Live { sender, .. }) => sender.clone(),
-            _ => return false,
+        let sender = {
+            let mut pending = self.pending.lock().unwrap();
+            // The real reader removes terminal route.open entries before waking their waiter.
+            // Otherwise dropping the registration keeps an entry for a possible late route
+            // bind, even though this test provider has already answered.
+            if request.header.channel == 0
+                && matches!(ty, FrameType::Response | FrameType::Error)
+                && matches!(
+                    pending.get(&key),
+                    Some(PendingEntry::Live {
+                        route_open: true,
+                        ..
+                    })
+                )
+            {
+                match pending.remove(&key) {
+                    Some(PendingEntry::Live { sender, .. }) => sender,
+                    _ => unreachable!("the route.open entry was inspected under the same lock"),
+                }
+            } else {
+                match pending.get(&key) {
+                    Some(PendingEntry::Live { sender, .. }) => sender.clone(),
+                    _ => return false,
+                }
+            }
         };
         let response = Frame::build(
             ty,
@@ -4605,6 +4710,7 @@ impl InProcessModuleEnd {
 mod tests {
     include!("connection/project_identity_tests.rs");
     include!("connection/route_close_followup_tests.rs");
+    include!("connection/call_keepalive_tests.rs");
     #[tokio::test]
     async fn a_registered_call_waiting_for_egress_cannot_use_a_closing_route() {
         for guarded in [false, true] {
@@ -4714,7 +4820,7 @@ mod tests {
                 session: "session".into(),
             };
             let open = conn.route_open_dispatch_single_attempt(
-                "provider", &identity, None, result_v1, installed,
+                "provider", &identity, None, result_v1, installed, false,
             );
             tokio::pin!(open);
             let request = tokio::select! {

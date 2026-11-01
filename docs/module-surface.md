@@ -1566,6 +1566,21 @@ Record changes:
 
 ## 19. SubcToolPlane hardening
 
+**Call keepalives.** Dispatch declares `call-keepalive/v1` only when the admitted provider's
+manifest listed that promise. The frozen plan carries the promise across resume; an older
+manifest without it retains legacy waits and unchanged bind bytes. Negotiated calls are hung
+after 90 seconds without a PUSH or terminal frame. Any PUSH resets only that silence timer;
+`{"kind":"keepalive"}` bodies are never displayed, stored as tool output, or sent to the model.
+A tool without `reply` gets the contract's 24-hour ceiling instead of the runner fallback.
+A declared `reply` keeps its existing deadline calculation, never shorter than the runner's
+fallback. PUSH frames cannot extend that terminal deadline. Non-negotiated calls keep their
+previous per-frame wait, normally 120 seconds. Whenever broca abandons an outstanding tool request,
+including run cancellation and shutdown, its existing abandonment guard sends a best-effort
+CANCEL without waiting for the provider. Late frames find no waiter and cannot produce another
+result; an ambiguous call is never re-sent. A provider-held call (described under
+[Provider-held calls](#provider-held-calls) below) has already ended its original REQUEST with
+an interim held reply. Cancelling its continuing work still uses `tool.withdraw`, not CANCEL.
+
 Fence keyed `(session, tool_call_id)` **with eviction** on batch/run terminal; **per-route
 window** resolved from the specific provider at route-open (not memoized once); **route
 eviction** (TTL/LRU + GOODBYE on idle) against `u16` channel exhaustion; **route
@@ -1692,6 +1707,8 @@ through exactly the cursor the provider returned. An entry whose call already ha
 no registration names is acked as a no-op. A durable intent with no terminal or held record is
 pending only while its dispatching run is open; an unreadable WAL remains blocked. An answer
 for an indeterminate call in a sealed run never changes that call or enters a later run.
+A `not_started` entry with `reason: "scope_ended"` is the same never-run error result,
+not a request to dispatch the call again.
 Entries are deduplicated on
 `(provider, custodian, call_key, event_id)`, and `cursor_incarnation_changed` re-reads from the
 start. The ack advances only over a settled prefix. An unsettled entry pins the ack: no ack may

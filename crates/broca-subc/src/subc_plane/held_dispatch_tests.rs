@@ -88,12 +88,14 @@ impl ToolPlaneConnection for Rig {
         _: Option<&ScopeSelector>,
         tool_result_v1: bool,
         installed: bool,
+        call_keepalive: bool,
     ) -> Result<RouteHandle, ConnError> {
         self.opened_declaring.lock().unwrap().push(installed);
         self.opened_result.lock().unwrap().push(tool_result_v1);
         let mut route = RouteHandle::synthetic(7);
         route.reads_tool_result = (tool_result_v1 || installed) && self.declared_route;
         route.reads_held_reply = installed && self.declared_route;
+        route.call_keepalive = call_keepalive;
         Ok(route)
     }
     async fn route_close(&self, _: &RouteHandle) -> Result<(), ConnError> {
@@ -226,6 +228,7 @@ fn manifest_declaring(opt_in: bool, late_results: bool) -> ToolManifest {
 
 fn manifest_format(format: Option<&str>, late_results: bool) -> ToolManifest {
     let declarations = FrozenProviderDeclarations {
+        call_keepalive: None,
         result_formats: format.map(|format| {
             std::collections::BTreeMap::from([(
                 "tool".to_owned(),

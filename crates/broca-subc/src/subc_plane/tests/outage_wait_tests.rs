@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 
 const UNAVAILABLE: &str = "target_unavailable — module_id 'aft' is unavailable";
 
-fn tool_step() -> Vec<NormalizedEvent> {
+pub(super) fn tool_step() -> Vec<NormalizedEvent> {
     vec![
         NormalizedEvent::Control(ProviderControl::AssistantMessage {
             message: AssistantMessage {
@@ -39,7 +39,7 @@ fn tool_step() -> Vec<NormalizedEvent> {
     ]
 }
 
-fn text_step(text: &str) -> Vec<NormalizedEvent> {
+pub(super) fn text_step(text: &str) -> Vec<NormalizedEvent> {
     vec![
         NormalizedEvent::Control(ProviderControl::AssistantMessage {
             message: AssistantMessage {
@@ -55,7 +55,7 @@ fn text_step(text: &str) -> Vec<NormalizedEvent> {
     ]
 }
 
-fn request(tag: &str, root: &std::path::Path) -> RunRequest {
+pub(super) fn request(tag: &str, root: &std::path::Path) -> RunRequest {
     let tool = Tool {
         name: "read".into(),
         description: "read".into(),

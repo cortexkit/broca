@@ -417,6 +417,7 @@ trait ToolPlaneConnection: Send + Sync {
         scope: Option<&ScopeSelector>,
         _tool_result_v1: bool,
         _provider_held_installed: bool,
+        _call_keepalive: bool,
     ) -> Result<RouteHandle, ConnError> {
         self.route_open(module_id, identity, scope).await
     }
@@ -521,6 +522,7 @@ impl ToolPlaneConnection for SubcConnection {
         scope: Option<&ScopeSelector>,
         tool_result_v1: bool,
         provider_held_installed: bool,
+        call_keepalive: bool,
     ) -> Result<RouteHandle, ConnError> {
         self.route_open_dispatch_single_attempt(
             module_id,
@@ -528,6 +530,7 @@ impl ToolPlaneConnection for SubcConnection {
             scope,
             tool_result_v1,
             provider_held_installed,
+            call_keepalive,
         )
         .await
     }
@@ -768,12 +771,13 @@ impl Drop for SubcToolPlane {
     }
 }
 
-/// What the batch's frozen plan declared about one provider: whether it serves the `content/v1`
-/// result body, and whether it may settle a call after its reply. Read from the session's
+/// What the batch's frozen plan declared about one provider: result formats, keepalives,
+/// and whether it may settle a call after its reply. Read from the session's
 /// admitted plan alone, never from a live catalog or caller-declared tools, so a provider whose
 /// catalog changed after admission cannot change how a resumed run reads a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrozenContract {
+    pub call_keepalive: bool,
     pub content_v1: bool,
     pub tool_result_v1: bool,
     pub late_results: bool,
@@ -812,6 +816,9 @@ impl SubcToolPlane {
         };
         let declarations = manifest.provider_declarations(module);
         FrozenContract {
+            call_keepalive: declarations
+                .and_then(|declarations| declarations.call_keepalive)
+                .unwrap_or(false),
             late_results: declarations
                 .and_then(|declarations| declarations.late_results)
                 .unwrap_or(false),
@@ -1100,12 +1107,14 @@ impl SubcToolPlane {
                     .cloned()
                     .or_else(|| manifest.declared_reply(&call.tool_name))
             });
-        if let Some(reply) = reply {
+        let keepalive = self.frozen_contract(ctx, module_id).call_keepalive;
+        if reply.is_some() || keepalive {
             return Duration::from_millis(
-                cortexkit_role_tool_provider::catalog::reply_deadline_ms(
-                    Some(&reply),
+                cortexkit_role_tool_provider::catalog::reply_deadline_ms_with_keepalive(
+                    reply.as_ref(),
                     &call.input,
                     self.reply_fallback_ms(),
+                    keepalive,
                 ),
             );
         }
@@ -1568,6 +1577,7 @@ impl SubcToolPlane {
                 guard,
                 patience,
                 self.frozen_contract(ctx, module_id).tool_result_v1,
+                self.frozen_contract(ctx, module_id).call_keepalive,
             )
             .await
             .map_err(|error| map_tool_open_refusal(error, module_id))
@@ -2153,7 +2163,8 @@ impl SubcToolPlane {
         module_id: &str,
         guard: &ToolOpenGuard,
     ) -> Result<(RouteHandle, Arc<Semaphore>), ToolPlaneError> {
-        if !self.frozen_contract(ctx, module_id).tool_result_v1 {
+        let contract = self.frozen_contract(ctx, module_id);
+        if !contract.tool_result_v1 && !contract.call_keepalive {
             return self
                 .ensure_route(&ctx.bind, ctx.scope.as_ref(), module_id, guard)
                 .await;
@@ -2167,7 +2178,8 @@ impl SubcToolPlane {
             guard.deadline,
             guard,
             TOOL_DISPATCH_PATIENCE,
-            true,
+            contract.tool_result_v1,
+            contract.call_keepalive,
         )
         .await
         .map_err(|error| map_tool_open_refusal(error, module_id))
@@ -2188,6 +2200,7 @@ impl SubcToolPlane {
         guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
         tool_result_v1: bool,
+        call_keepalive: bool,
     ) -> Result<(RouteHandle, Option<ScopeStamp>), RouteEnsureError> {
         // One computed deadline keeps the caller budget authoritative while retaining a short
         // per-iteration cap. Using either bound alone would either overshoot a short warm timeout
@@ -2231,6 +2244,7 @@ impl SubcToolPlane {
                     selector.as_ref(),
                     tool_result_v1,
                     self.held_reply_declared(),
+                    call_keepalive,
                 )
             };
             return match outage {
@@ -2322,6 +2336,7 @@ impl SubcToolPlane {
                     Some(&selector),
                     tool_result_v1,
                     self.held_reply_declared(),
+                    call_keepalive,
                 )
             };
             let opened = match outage {
@@ -2420,6 +2435,7 @@ impl SubcToolPlane {
             guard,
             patience,
             false,
+            false,
         )
         .await
     }
@@ -2435,6 +2451,7 @@ impl SubcToolPlane {
         guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
         tool_result_v1: bool,
+        call_keepalive: bool,
     ) -> Result<(RouteHandle, Arc<Semaphore>), RouteEnsureError> {
         let key = Self::route_key(bind, scope, module_id);
         if lifecycle.is_cancelled() {
@@ -2460,7 +2477,9 @@ impl SubcToolPlane {
         let obsolete = {
             let mut routes = self.routes.lock().unwrap();
             if let Some(r) = routes.get_mut(&key) {
-                if r.handle.reads_tool_result == (tool_result_v1 || self.held_reply_declared()) {
+                if r.handle.reads_tool_result == (tool_result_v1 || self.held_reply_declared())
+                    && r.handle.call_keepalive == call_keepalive
+                {
                     r.last_used = Instant::now();
                     return Ok((r.handle, Arc::clone(&r.sem)));
                 }
@@ -2488,6 +2507,7 @@ impl SubcToolPlane {
                 guard,
                 patience,
                 tool_result_v1,
+                call_keepalive,
             )
             .await?;
         let sem = Arc::new(Semaphore::new(window));
@@ -3213,6 +3233,7 @@ impl SubcToolPlane {
                 guard,
                 TOOL_DISPATCH_PATIENCE,
                 self.frozen_contract(ctx, &module_id).tool_result_v1,
+                self.frozen_contract(ctx, &module_id).call_keepalive,
             )
             .await
             .map_err(|error| map_tool_open_refusal(error, &module_id))
@@ -3467,6 +3488,7 @@ impl SubcToolPlane {
                     Some(&selector),
                     self.frozen_contract(ctx, &module).tool_result_v1,
                     self.held_reply_declared(),
+                    self.frozen_contract(ctx, &module).call_keepalive,
                 )
             },
         )
@@ -4137,6 +4159,7 @@ fn legacy_non_text_tool_content_placeholder(block: &serde_json::Value) -> String
 mod tests {
     include!("subc_plane/direct_carrier_tests.rs");
     include!("subc_plane/route_close_followup_tests.rs");
+    include!("subc_plane/call_keepalive_tests.rs");
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
@@ -7192,6 +7215,43 @@ mod tests {
 
     #[async_trait]
     impl ToolPlaneConnection for InProcessWireConnection {
+        async fn tool_call_staged(
+            &self,
+            route: &RouteHandle,
+            call: &ToolCall,
+            deadline: Duration,
+            preset: Option<&str>,
+            call_key: Option<&str>,
+            schema_pin: Option<&str>,
+            signals: &broca_core::tool_plane::DispatchSignals,
+        ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+            <SubcConnection as ToolPlaneConnection>::tool_call_staged(
+                &self.conn, route, call, deadline, preset, call_key, schema_pin, signals,
+            )
+            .await
+        }
+
+        async fn route_open_dispatch(
+            &self,
+            module_id: &str,
+            identity: &BindIdentity,
+            scope: Option<&ScopeSelector>,
+            tool_result_v1: bool,
+            provider_held_installed: bool,
+            call_keepalive: bool,
+        ) -> Result<RouteHandle, ConnError> {
+            self.conn
+                .route_open_dispatch_single_attempt(
+                    module_id,
+                    identity,
+                    scope,
+                    tool_result_v1,
+                    provider_held_installed,
+                    call_keepalive,
+                )
+                .await
+        }
+
         async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
             Ok(Vec::new())
         }
@@ -7264,7 +7324,8 @@ mod tests {
         };
         let ctx = batch_ctx("batch-slow");
         let fake_module = tokio::spawn(async move {
-            let request = module.next_request().await;
+            let (request, keepalive) = call_keepalive::bound_request(&mut module).await;
+            assert!(!keepalive);
             sleep(reply_after).await;
             module.reply(
                 &request,
