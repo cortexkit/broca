@@ -207,6 +207,7 @@ pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
 /// as [`DecodeStep::NewerWriter`]. `ck-broca --wal-known-features` prints this list so
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
+    ACCOUNT_LIMIT_PAUSE_FEATURE,
     BILL_ATTEMPTS_FEATURE,
     BILL_VAULT_FACTS_FEATURE,
     crate::head_proof::VISIBILITY_LATE_FEATURE,
@@ -260,6 +261,9 @@ pub const KNOWN_FEATURES: &[&str] = &[
     TOOL_TIMES_FEATURE,
     MESSAGE_TIMES_FEATURE,
 ];
+
+/// A timed account pause must not be mistaken for a terminal error or an authentication pause.
+pub const ACCOUNT_LIMIT_PAUSE_FEATURE: &str = "account-limit-pause/v1";
 
 /// Physical-send reservation and settlement evidence for billing readers.
 pub const BILL_ATTEMPTS_FEATURE: &str = "bill-attempts/v1";
@@ -1526,6 +1530,7 @@ mod tests {
         assert_eq!(
             KNOWN_FEATURES,
             &[
+                ACCOUNT_LIMIT_PAUSE_FEATURE,
                 BILL_ATTEMPTS_FEATURE,
                 BILL_VAULT_FACTS_FEATURE,
                 crate::head_proof::VISIBILITY_LATE_FEATURE,
@@ -3177,5 +3182,8 @@ mod view_negotiation_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "framing/account_limit_pause_tests.rs"]
+mod account_limit_pause_tests;
 #[cfg(test)]
 mod vault_facts_tests;

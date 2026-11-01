@@ -31,8 +31,8 @@ pub use framing::PreparedV4Frame;
 #[cfg(any(test, feature = "test-known-feature"))]
 pub use framing::{forget_feature_for_test, ForgottenFeature};
 pub use framing::{
-    FrameError, FramedRecord, WalLineageId, ARCHIVE_INDEX_V2_FEATURE, COMPACTION_FEATURE,
-    COMPACTION_VIEW_FEATURE, COMPACTION_WAIT_FEATURE, DEFERRED_CALL_FEATURE,
+    FrameError, FramedRecord, WalLineageId, ACCOUNT_LIMIT_PAUSE_FEATURE, ARCHIVE_INDEX_V2_FEATURE,
+    COMPACTION_FEATURE, COMPACTION_VIEW_FEATURE, COMPACTION_WAIT_FEATURE, DEFERRED_CALL_FEATURE,
     DISPATCH_MODULE_FEATURE, FRAME_STAMPS_FEATURE, FRAMING_VERSION, GATED_FRAMING_VERSION,
     HEADER_LEN, KNOWN_FEATURES, MAX_PAYLOAD_LEN, MESSAGE_TIMES_FEATURE, PLAN_MANIFEST_FEATURE,
     PLAN_REFERENCE_SLOTS_FEATURE, PROVIDER_DECLARATIONS_FEATURE, PROVIDER_FALLBACK_BLOCK_FEATURE,
@@ -41,21 +41,22 @@ pub use framing::{
     STEP_TRANSFORMS_FEATURE, TOOL_REPLY_FEATURE, TOOL_TIMES_FEATURE,
 };
 pub use record::{
-    compaction_replacement_sha256, AccountDecision, ApprovalDecision, AuthSelection,
-    AwaitingApprovalEntry, CompactionCursor, CompactionDisposition, CompactionMessageKind,
-    CompactionRange, CompactionStabilityRank, CompactionStrip, CompactionViewChoice,
-    CompactionWait, CompactionWaitExit, ComputedTagRules, ConversationKeySource, DeferredAsk,
-    DeferredDecision, DeferredExecutor, DispatchOutcome, DispatchSchemaPin, FetchOutcome,
-    FrozenDeclaration, FrozenHoldArgument, FrozenProviderDeclarations, FrozenReferenceSlot,
-    FrozenReply, FrozenResultFormat, HookOp, Hooks, LateDecision, LateExecution, LateOutcome,
-    NoDispatchReason, OnExpiry, OpaqueJson, PlanManifest, ProviderFetch, ProviderHeld,
-    QueuedAdmissionFailure, RefusalFallbackPhase, RefusalFallbackSchedule, RejectedCompaction,
-    ResumeRedo, ResumeReplayed, RunConfig, RunOrigin, SeedOriginKind, SetupTagCheckpoint,
-    SetupViewDue, StepFallback, StepRoute, StepRouteReason, UsageIteration, VaultReadOp,
-    VaultRequest, WalRecord, WithdrawElicitation, WithdrawalAnswer, ACCOUNT_DECISION_AUTH_REQUIRED,
-    ACCOUNT_DECISION_CANDIDATES_UNKNOWN, ACCOUNT_DECISION_DISABLED, ACCOUNT_DECISION_LEGACY_STATIC,
-    ACCOUNT_DECISION_PINNED, ACCOUNT_DECISION_ROUTED, ACCOUNT_DECISION_SINGLE_CANDIDATE,
-    ACCOUNT_DECISION_UNREACHABLE, ACCOUNT_DECISION_UNSUPPORTED, MAX_REPLACEMENT_BYTES,
+    compaction_replacement_sha256, AccountDecision, AccountLimitPause, ApprovalDecision,
+    AuthSelection, AwaitingApprovalEntry, CompactionCursor, CompactionDisposition,
+    CompactionMessageKind, CompactionRange, CompactionStabilityRank, CompactionStrip,
+    CompactionViewChoice, CompactionWait, CompactionWaitExit, ComputedTagRules,
+    ConversationKeySource, DeferredAsk, DeferredDecision, DeferredExecutor, DispatchOutcome,
+    DispatchSchemaPin, FetchOutcome, FrozenDeclaration, FrozenHoldArgument,
+    FrozenProviderDeclarations, FrozenReferenceSlot, FrozenReply, FrozenResultFormat, HookOp,
+    Hooks, LateDecision, LateExecution, LateOutcome, NoDispatchReason, OnExpiry, OpaqueJson,
+    PlanManifest, ProviderFetch, ProviderHeld, QueuedAdmissionFailure, RefusalFallbackPhase,
+    RefusalFallbackSchedule, RejectedCompaction, ResumeRedo, ResumeReplayed, RunConfig, RunOrigin,
+    SeedOriginKind, SetupTagCheckpoint, SetupViewDue, StepFallback, StepRoute, StepRouteReason,
+    UsageIteration, VaultReadOp, VaultRequest, WalRecord, WithdrawElicitation, WithdrawalAnswer,
+    ACCOUNT_DECISION_AUTH_REQUIRED, ACCOUNT_DECISION_CANDIDATES_UNKNOWN, ACCOUNT_DECISION_DISABLED,
+    ACCOUNT_DECISION_LEGACY_STATIC, ACCOUNT_DECISION_PINNED, ACCOUNT_DECISION_ROUTED,
+    ACCOUNT_DECISION_SINGLE_CANDIDATE, ACCOUNT_DECISION_UNREACHABLE, ACCOUNT_DECISION_UNSUPPORTED,
+    MAX_REPLACEMENT_BYTES,
 };
 pub use state_format::{classify_state_root, StateRootError, WalConfig, WalFormat};
 // `PauseReason` is shared caller/WAL vocabulary; it lives in `broca-protocol` (like

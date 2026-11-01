@@ -32,6 +32,7 @@ pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
         run_id: RunId(run.into()),
         session: BindIdentity::new("/retention-test", "runner", "session"),
         config: Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

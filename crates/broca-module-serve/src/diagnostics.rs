@@ -703,6 +703,7 @@ mod operational_port_tests {
             }
             let last = if paused {
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: broca_protocol::RunId(id.into()),
                     reason: broca_protocol::PauseReason::AuthRequired,
                     error: None,

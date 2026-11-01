@@ -45,6 +45,7 @@ use tokio::sync::mpsc;
 
 fn run_config() -> RunConfig {
     RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -393,6 +394,7 @@ fn paused_episode_with_open_intent_fails_closed_to_interrupted() {
         batch_started("b1", 1, &["t1"]),
         intent("b1", "t1"),
         WalRecord::RunPaused {
+            account_limit: None,
             ts_ms: None,
             run_id: RunId("r".into()),
             reason: broca_protocol::PauseReason::AuthRequired,
@@ -1282,6 +1284,7 @@ async fn a_record_type_from_a_newer_build_changes_nothing_replay_reads() {
 /// A provider attempt record as the live loop writes it.
 fn attempt_record(step_id: StepId, attempt: u32, outcome: AttemptOutcome) -> WalRecord {
     WalRecord::ModelAttemptFinished {
+        account_limit_disposition: None,
         attempt_id: None,
         reservation: None,
         envelope: None,
@@ -3079,6 +3082,7 @@ async fn recreated_retry_reports_omitted_vs_explicit_tools_difference() {
 #[test]
 fn post_pause_step_boundary_clears_auth_classification_at_every_cut() {
     let paused = WalRecord::RunPaused {
+        account_limit: None,
         ts_ms: None,
         run_id: RunId("r".into()),
         reason: broca_protocol::PauseReason::AuthRequired,

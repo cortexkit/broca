@@ -1276,6 +1276,7 @@ where
     let pause_tail = [framed(
         4,
         WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r".into()),
             ts_ms: None,
             reason: PauseReason::AuthRequired,
@@ -2398,6 +2399,7 @@ pub(crate) fn run_started(
             run_id: RunId(run_id.into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,

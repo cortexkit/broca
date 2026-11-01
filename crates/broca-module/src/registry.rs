@@ -4863,6 +4863,7 @@ impl LineageRegistry {
                 broca_core::ReplayResolution::AuthRequired { reason, .. } => match reason {
                     broca_protocol::PauseReason::Restart => true,
                     broca_protocol::PauseReason::AuthRequired
+                    | broca_protocol::PauseReason::AccountLimit
                     | broca_protocol::PauseReason::ToolHeld => false,
                 },
                 broca_core::ReplayResolution::ProviderHeld {
@@ -6462,6 +6463,7 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -7088,6 +7090,7 @@ mod offset_page_tests {
 
     fn run_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

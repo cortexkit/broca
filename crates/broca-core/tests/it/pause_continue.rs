@@ -24,6 +24,61 @@ use broca_wal::{FileWal, RunConfig, Wal, WalRecord};
 use serde_json::json;
 use tokio::sync::mpsc;
 
+#[tokio::test]
+async fn legacy_restart_pause_keeps_its_existing_auth_refreeze_behavior() {
+    let root = broca_test_support::scratch_root().join("restart-auth-refreeze-compatibility");
+    std::fs::create_dir_all(&root).unwrap();
+    let session = BindIdentity::new(root.join("project"), "h", "restart");
+    let wal = FileWalStore::new(root.join("wal"));
+    let leases = FileLeaseStore::new(root.join("leases"));
+    let old = serde_json::from_value(json!({"credential_id":"oauth:stub:old"})).unwrap();
+    seed_resume_without_terminal(&wal, &session, Some(old));
+    WalStore::open(&wal, &session)
+        .unwrap()
+        .append(
+            1,
+            &WalRecord::RunPaused {
+                account_limit: None,
+                run_id: RunId("r-orig".into()),
+                ts_ms: None,
+                reason: PauseReason::Restart,
+                error: None,
+            },
+            true,
+        )
+        .unwrap();
+    let new = serde_json::from_value(json!({"credential_id":"oauth:stub:new"})).unwrap();
+    let provider = StubProvider::new(vec![text_reply("done", "done")]);
+    let plane = StubToolPlane::new().with_tool("edit", |_| {
+        StubReply::Output(ToolOutput::Text {
+            text: "edited".into(),
+        })
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let summary = broca_core::run_loop_with_control(
+        tool_req("r-orig", &session, "hello"),
+        &provider,
+        &plane,
+        &leases,
+        &AllowAll,
+        &wal,
+        None,
+        broca_core::RunControl {
+            auth_selection: Some(new),
+            ..Default::default()
+        },
+        &tx,
+    )
+    .await
+    .unwrap();
+    drop(tx);
+    collector.await.unwrap();
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert!(records_of(&wal, &session).iter().any(|record| matches!(record,
+        WalRecord::RunAuthRefrozen { auth_selection, .. } if auth_selection.credential_id == "oauth:stub:new")));
+}
+
 fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
         input_written_at_ms: None,
@@ -189,6 +244,7 @@ fn seed_resume_without_terminal(
             session: session.clone(),
             ts_ms: None,
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,

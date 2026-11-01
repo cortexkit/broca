@@ -217,6 +217,7 @@ async fn usage_zero_steps_omits_all_token_totals() {
         &[
             started(&key, "usage-run", "hello"),
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("usage-run".into()),
                 reason: PauseReason::AuthRequired,
                 error: None,

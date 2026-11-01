@@ -231,6 +231,7 @@ impl FakeExecutor {
                     let _ = ack.send(Ok(job.req.run_id.clone()));
                 }
                 job.writer.record(broca_wal::WalRecord::RunPaused {
+                    account_limit: None,
                     ts_ms: None,
                     run_id: job.req.run_id.clone(),
                     reason: PauseReason::AuthRequired,
@@ -256,6 +257,7 @@ impl FakeExecutor {
                     let _ = rx.recv().await;
                 }
                 job.writer.record(broca_wal::WalRecord::RunPaused {
+                    account_limit: None,
                     ts_ms: None,
                     run_id: job.req.run_id.clone(),
                     reason: PauseReason::AuthRequired,
@@ -419,6 +421,7 @@ impl FakeExecutor {
             run_id: job.req.run_id.clone(),
             session: job.req.session.clone(),
             config: Box::new(broca_wal::RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: job.req.directives.clone(),
                 tools: job.req.tools.clone().into(),
                 tools_were_omitted: job.control.tools_were_omitted,
@@ -515,6 +518,7 @@ impl RunExecutor for FakeExecutor {
 
 fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,

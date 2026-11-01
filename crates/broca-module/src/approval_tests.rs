@@ -259,6 +259,7 @@ impl Rig {
         }
         if paused {
             self.append(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::Restart,

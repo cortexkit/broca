@@ -8015,6 +8015,7 @@ mod tests {
             run_id: broca_protocol::RunId("legacy".into()),
             session,
             config: Box::new(broca_wal::RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
