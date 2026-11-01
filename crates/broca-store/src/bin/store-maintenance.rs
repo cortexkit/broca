@@ -88,6 +88,12 @@ fn dispatch(args: &[String]) -> Result<ExitCode, broca_store::LegacyOnlyOperator
 fn run(args: &[String]) -> ExitCode {
     if args
         .get(1)
+        .is_some_and(|operation| operation == "prepare-session-log-indexes")
+    {
+        return prepare_session_log_indexes(&args[2..]);
+    }
+    if args
+        .get(1)
         .is_some_and(|operation| operation == "repair-session-root")
     {
         return repair_session_root(&args[2..]);
@@ -96,6 +102,13 @@ fn run(args: &[String]) -> ExitCode {
         print_usage();
         return ExitCode::from(2);
     };
+    if operation == "audit-session-refs" {
+        if args.len() != 3 {
+            eprintln!("usage: store-maintenance audit-session-refs STATE_ROOT (read-only)");
+            return ExitCode::from(2);
+        }
+        return audit_session_refs(std::path::Path::new(state_root));
+    }
     if operation == "wal-fold" {
         return wal_fold(&PathBuf::from(state_root), &args[3..]);
     }
@@ -295,6 +308,101 @@ fn run(args: &[String]) -> ExitCode {
     }
 }
 
+fn audit_session_refs(root: &std::path::Path) -> ExitCode {
+    use std::io::Write;
+    if let Some(refusal) = state_root_refusal(
+        "audit-session-refs",
+        root,
+        root.join("run-index.db").is_file(),
+        root.join("wal").is_dir(),
+    ) {
+        eprintln!("{refusal}");
+        return ExitCode::from(2);
+    }
+    let result = (|| -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let store = SqliteStore::open_read_only(root.join("run-index.db"))?;
+        let mut output = std::io::stdout().lock();
+        let count = store.audit_session_refs(|finding| {
+            serde_json::to_writer(&mut output, finding)?;
+            writeln!(output)?;
+            Ok(())
+        })?;
+        writeln!(output, "{}", serde_json::json!({"findings": count}))?;
+        Ok(count)
+    })();
+    match result {
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::from(1),
+        Err(error) => {
+            eprintln!("store-maintenance: audit-session-refs refused: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn prepare_session_log_indexes(args: &[String]) -> ExitCode {
+    const HELP: &str = "usage: store-maintenance prepare-session-log-indexes STATE_ROOT [--write]\nPreview by default: lists each evidence index, whether it exists, and its DDL.\n--write requires broca AND its supervisor STOPPED, as for repair-session-root.\nOnly additive indexes are created; session rows and log bytes are unchanged.";
+    if args.is_empty() || args == ["--help"] {
+        eprintln!("{HELP}");
+        return if args.is_empty() {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
+    if !(args.len() == 1 || args.len() == 2 && args[1] == "--write") {
+        eprintln!("{HELP}");
+        return ExitCode::from(2);
+    }
+    let root = PathBuf::from(&args[0]);
+    if let Some(refusal) = state_root_refusal(
+        "prepare-session-log-indexes",
+        &root,
+        root.join("run-index.db").is_file(),
+        true,
+    ) {
+        eprintln!("{refusal}");
+        return ExitCode::from(2);
+    }
+    let write = args.len() == 2;
+    if write {
+        if let Err(code) = require_stopped_writer(&root, &writer_liveness(&root)) {
+            return code;
+        }
+    }
+    let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = SqliteStore::open_read_only(root.join("run-index.db"))?;
+        let indexes = store.preview_session_log_indexes()?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"mode": if write { "write" } else { "preview" }, "indexes": indexes})
+            )?
+        );
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        drop(store);
+        if write
+            && indexes
+                .iter()
+                .any(|index| index.applicable && !index.exists)
+        {
+            let store =
+                SqliteStore::open_existing_for_session_root_repair(&root.join("run-index.db"))?;
+            store.prepare_session_log_indexes()?;
+            println!("session-log evidence indexes prepared; rows and logs unchanged");
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("store-maintenance: prepare-session-log-indexes refused: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// Exit 1 when any row declined, so a partial repair cannot read as a complete one.
 ///
 /// NOTE ON THE STEADY STATE, measured after both repairs ran against production: the
@@ -323,6 +431,8 @@ fn print_usage() {
                  store-maintenance wal-manifest <state-root> [--write]\n\
                  store-maintenance media-sweep <state-root> [--write]\n\
                  store-maintenance repair-session-root <state-root> --harness H --session S [--write]\n\
+                 store-maintenance audit-session-refs <state-root> (read-only; JSONL; exit 1 for findings)\n\
+                 store-maintenance prepare-session-log-indexes <state-root> [--write]\n\
                  store-maintenance wal-fold <state-root> [--write] [--resume fold-<unix-ms>.journal] [--abandon|--unfold]"
     );
 }
@@ -530,8 +640,11 @@ fn repair_session_root(args: &[String]) -> ExitCode {
         stale meta lineage_id, watermark_seq, last_run_id and the evidence used.\n\
         --write requires broca AND its supervisor STOPPED for the entire operation.\n\
         Live or unknown writer liveness refuses before SQLite opens; both session leases\n\
-        also exclude standalone writers. No log bytes are changed. Only a two-root pair\n\
-        with one log (live or archived), no deletion or move fences, and terminal stale\n\
+        also exclude standalone writers. No log bytes are changed. A two-root pair\n\
+        with one log (live or archived), or one wrong-root ref with a proven real log,\n\
+        can be repaired. A forked lineage-only stub must be newer than the real log's\n\
+        last write; it is moved into repair-aside beside the logs, never deleted.\n\
+        Repairs require no deletion or move fences, and terminal stale\n\
         run rows matched by run ID and durable terminal state can be repaired. Embedded\n\
         triples may predate re-keys. Orphaned projections are deleted,\n\
         never merged; known stale lineage must match the log. NULL lineage requires\n\

@@ -94,6 +94,33 @@ fn legacy_findings_request_does_not_read_a_marker_after_boot() {
 }
 
 #[test]
+fn diagnostics_missing_session_log_names_the_session_as_an_error() {
+    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    let mut evidence = healthy(&store, NOW - 1000);
+    evidence.rings.insert(
+        "session_log_missing".into(),
+        Ok(Snapshot {
+            since_ms: NOW - 1000,
+            truncated: false,
+            events: vec![Event {
+                at_ms: NOW - 1,
+                module: "broca/cktui-missing".into(),
+                code: "session_log_missing".into(),
+            }],
+        }),
+    );
+    let reply = report(evidence, NOW, 1000);
+    let finding = reply
+        .findings
+        .iter()
+        .find(|finding| finding.check == "session_log_missing")
+        .unwrap();
+    assert_eq!(finding.severity, Severity::Error);
+    assert!(finding.summary.contains("cktui-missing"));
+    assert!(finding.hint.contains("repair-session-root"));
+}
+
+#[test]
 fn diagnostics_address_unavailability_is_an_error_from_the_first_refusal_per_reason() {
     let store = broca_store::SqliteStore::open_in_memory().unwrap();
     let mut evidence = healthy(&store, NOW - 1000);

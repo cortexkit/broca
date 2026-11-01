@@ -564,6 +564,10 @@ struct Rig<I = SqliteStore> {
     leases: Arc<broca_core::FileLeaseStore>,
 }
 
+#[cfg(any(unix, windows))]
+#[path = "retention_log_guard_tests.rs"]
+mod log_guard;
+
 #[test]
 fn retention_deletion_drops_media_manifest_after_wal_unlink_and_leaves_collection_to_sweep() {
     let rig = Rig::new();
@@ -5984,4 +5988,144 @@ async fn default_raw_writer_placement_also_enqueues_retention() {
         .lookup_live_retention_lineage(&rig.key)
         .unwrap()
         .is_some());
+}
+
+#[tokio::test]
+async fn missing_expired_log_keeps_expired_answer_with_history_guard() {
+    let rig = Rig::new();
+    rig.seed(1, 1000, Some(1000));
+    let lease = rig.service.lease(&rig.key).unwrap();
+    rig.service.delete_expired(&rig.key, 2001).unwrap().unwrap();
+    drop(lease);
+    let registry = rig.registry(None);
+    registry.set_session_address_inventory(rig.store.clone());
+    let evidence = rig.store.session_log_evidence(&rig.key).unwrap();
+    assert!(evidence.content && evidence.removed);
+    assert!(matches!(
+        registry.route_read(&rig.key, None, Some(20)).await,
+        Err(crate::registry::OpenError::Expired { .. })
+    ));
+    let (sink, _received) = tokio::sync::mpsc::channel(16);
+    assert!(matches!(
+        registry
+            .route_subscribe(&rig.key, crate::fanout::FromCursor::Start, sink)
+            .await,
+        Err(crate::registry::OpenError::Expired { .. })
+    ));
+    assert!(!rig.service.wal.wal_path(&rig.key).exists());
+    assert!(!rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+}
+
+#[tokio::test]
+async fn interrupted_expiry_removal_remains_recoverable_with_history_guard() {
+    let rig = Rig::new();
+    let id = rig.seed(1, 100, Some(200));
+    let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let read = rig.service.read_path(&path).unwrap();
+    let (row, runs) = derive(
+        &rig.key,
+        id.clone(),
+        frames(&read),
+        fs::metadata(&path).unwrap().len(),
+        None,
+    )
+    .unwrap();
+    rig.service.index.upsert(&row, &runs).unwrap();
+    rig.service
+        .write_tombstone(
+            &rig.key,
+            &Tombstone {
+                lineage_id: id.clone(),
+                expired_at_ms: 1200,
+                seq: 1,
+                completed_at_ms: None,
+                next_tag: None,
+                next_notice_seq: None,
+                recovery_artifacts: Vec::new(),
+            },
+        )
+        .unwrap();
+    fs::rename(&path, rig.service.deleting(&rig.key, &id)).unwrap();
+    assert!(rig.store.session_log_evidence(&rig.key).unwrap().removed);
+    let registry = rig.registry(None);
+    registry.set_session_address_inventory(rig.store.clone());
+    assert!(registry.check_session_log(&rig.key).await.is_ok());
+    assert!(matches!(
+        registry.route_read(&rig.key, None, Some(20)).await,
+        Err(crate::registry::OpenError::Expired { .. })
+    ));
+}
+
+#[tokio::test]
+async fn expired_history_allows_a_fresh_subscriber_lineage() {
+    let rig = Rig::new();
+    let old = rig.seed(1, 100, Some(200));
+    let lease = rig.service.lease(&rig.key).unwrap();
+    rig.service.delete_expired(&rig.key, 1200).unwrap().unwrap();
+    drop(lease);
+    let wal = rig
+        .service
+        .wal
+        .open_with_retention(&rig.key, Some(RETAINED_SECONDS))
+        .unwrap();
+    let fresh = wal.lineage_id().unwrap().to_string();
+    assert_ne!(old, fresh);
+    drop(wal);
+    let registry = rig.registry(None);
+    registry.set_session_address_inventory(rig.store.clone());
+    assert!(registry.check_session_log(&rig.key).await.is_ok());
+    let page = registry.route_read(&rig.key, None, Some(20)).await.unwrap();
+    assert_eq!(page.lineage_id.unwrap().to_string(), fresh);
+    assert!(page.messages.is_empty());
+    let now = rig.service.clock.now_ms();
+    assert_eq!(
+        rig.seed_run("fresh", RETAINED_SECONDS, now, Some(now)),
+        fresh
+    );
+    assert!(registry.route_read(&rig.key, None, Some(20)).await.is_ok());
+}
+
+#[tokio::test]
+async fn older_expiry_cannot_mask_an_unidentified_new_run_missing_log() {
+    let rig = Rig::new();
+    rig.seed(1, 1000, Some(1000));
+    let lease = rig.service.lease(&rig.key).unwrap();
+    rig.service.delete_expired(&rig.key, 2001).unwrap().unwrap();
+    drop(lease);
+    broca_core::RunIndex::index_run_active(
+        rig.store.as_ref(),
+        &broca_core::RunIndexRow {
+            run_id: "new-after-expiry".into(),
+            session: rig.key.clone(),
+            submission_id: None,
+            request_identity_digest: None,
+            state: broca_core::RunIndexState::Active,
+            usage: None,
+            final_step_finish_reason: None,
+            retries_used: 0,
+            title: None,
+            withdrawals_owed: false,
+        },
+    )
+    .unwrap();
+    let registry = rig.registry(None);
+    registry.set_session_address_inventory(rig.store.clone());
+    assert!(matches!(
+        registry.check_session_log(&rig.key).await,
+        Err(crate::registry::OpenError::SessionLogMissing { .. })
+    ));
+    assert!(matches!(
+        registry.check_expired(&rig.key, Some("r1")).await,
+        Err(crate::registry::OpenError::Expired {
+            expired_at_ms: 2000
+        })
+    ));
+    let read = registry.route_read(&rig.key, None, Some(20)).await;
+    assert!(
+        matches!(
+            &read,
+            Err(crate::registry::OpenError::SessionLogMissing { .. })
+        ),
+        "{read:?}"
+    );
 }

@@ -101,9 +101,40 @@ impl State {
 }
 
 static STATE: LazyLock<State> = LazyLock::new(|| State::new(broca_module::diagnostics::now_ms()));
+static MISSING: LazyLock<Ring> = LazyLock::new(|| Ring::new(broca_module::diagnostics::now_ms()));
+static MISSING_COUNT: AtomicU64 = AtomicU64::new(0);
+static MISSING_WARN: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub(crate) fn record_missing(session: &str, harness: &str) {
+    MISSING_COUNT.fetch_add(1, Ordering::Relaxed);
+    MISSING.record(Event {
+        at_ms: broca_module::diagnostics::now_ms(),
+        module: format!("{harness:?}/{session:?}"),
+        code: "session_log_missing".into(),
+    });
+    let now = Instant::now();
+    let mut last = MISSING_WARN.lock().unwrap();
+    if missing_warning_due(&mut last, now) {
+        tracing::warn!(target: "session_address", code = "session_log_missing", session = ?session, harness = ?harness,
+            "session history has no log; inspect store-maintenance repair-session-root on the stopped store");
+    }
+}
+
+fn missing_warning_due(last: &mut Option<Instant>, now: Instant) -> bool {
+    if last.is_some_and(|previous| now.saturating_duration_since(previous) < WARN_INTERVAL) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+pub(crate) fn missing_snapshot(since: i64, now: i64) -> Result<Snapshot, String> {
+    MISSING.snapshot(since, now)
+}
 
 pub(crate) fn initialize() {
     LazyLock::force(&STATE);
+    LazyLock::force(&MISSING);
 }
 
 pub(crate) fn record_refusal(error: &SessionAddressError) {
@@ -134,6 +165,7 @@ fn record_into(state: &State, error: &SessionAddressError, at_ms: i64, now: Inst
 
 pub(crate) fn health() -> Value {
     let mut health = STATE.health();
+    health["session_log_missing"] = json!(MISSING_COUNT.load(Ordering::Relaxed));
     health["repairs"] = json!({
         "started": STATE.repair_counts[0].load(Ordering::Relaxed),
         "completed": STATE.repair_counts[1].load(Ordering::Relaxed),
@@ -157,6 +189,18 @@ pub(crate) fn snapshot(since: i64, now: i64) -> Result<Snapshot, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_log_warnings_are_limited_without_limiting_refusal_evidence() {
+        let mut last = None;
+        let now = Instant::now();
+        assert!(missing_warning_due(&mut last, now));
+        assert!(!missing_warning_due(
+            &mut last,
+            now + Duration::from_secs(1)
+        ));
+        assert!(missing_warning_due(&mut last, now + WARN_INTERVAL));
+    }
 
     #[test]
     fn unavailable_warnings_are_one_line_and_rate_limited_per_reason() {
