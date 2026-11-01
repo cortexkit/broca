@@ -1671,7 +1671,7 @@ async fn differential() {
                     )
                     .await
                     .unwrap_err();
-                assert_eq!(foreign["error"]["code"], "invalid_params");
+                assert_eq!(foreign["code"], "invalid_params", "{foreign}");
                 let mut tampered: Value = serde_json::from_str(&tokens[i]).unwrap();
                 tampered["ordinal"] = json!(tampered["ordinal"].as_u64().unwrap() + 1);
                 let refusal = rig
@@ -1683,7 +1683,7 @@ async fn differential() {
                     )
                     .await
                     .unwrap_err();
-                assert_eq!(refusal["error"]["code"], "invalid_params");
+                assert_eq!(refusal["code"], "invalid_params", "{refusal}");
             })
             .await;
     }
