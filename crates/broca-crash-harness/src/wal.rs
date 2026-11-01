@@ -356,6 +356,16 @@ impl WalStore for ObservedWalStore {
         )
     }
 
+    fn read_media_seed_suffix(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: u64,
+        anchor: Option<&broca_wal::WalByteAnchor>,
+    ) -> Result<broca_wal::WalRangeRead, WalError> {
+        WalStore::read_media_seed_suffix(&self.inner, session, after_seq, through_seq, anchor)
+    }
+
     fn read_records_range_from_valid_anchor(
         &self,
         session: &BindIdentity,
@@ -411,6 +421,9 @@ struct ObservedWal {
 impl Wal for ObservedWal {
     fn durable_publication(&self) -> Option<broca_wal::file_wal::DurablePublication> {
         self.inner.durable_publication()
+    }
+    fn borrowed_publication(&self) -> Option<broca_wal::file_wal::DurablePublicationRef<'_>> {
+        self.inner.borrowed_publication()
     }
     fn log_path(&self) -> Option<&std::path::Path> {
         self.inner.log_path()

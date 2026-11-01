@@ -309,6 +309,9 @@ pub use cortexkit_anthropic_policy::RATELIMIT_UNIFIED_HEADER_PREFIX;
 /// refusal the transport classified (see `ProviderError::resets_at_ms` and its siblings).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptAccountLimit {
+    pub disposition: AccountLimitDisposition,
+    /// Source receipt time used to anchor a relative retry hint, not the later pause time.
+    pub observed_at_ms: u64,
     pub resets_at_ms: Option<u64>,
     pub resets_at_source: Option<String>,
     pub limit_window: Option<String>,
@@ -320,6 +323,13 @@ pub struct AttemptAccountLimit {
 pub struct AccountLimitDisposition {
     pub kind: AccountLimitKind,
     pub scope: AccountLimitScope,
+}
+
+impl AccountLimitDisposition {
+    pub const ACCOUNT: Self = Self {
+        kind: AccountLimitKind::AccountLimit,
+        scope: AccountLimitScope::Account,
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

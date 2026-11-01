@@ -2206,6 +2206,8 @@ async fn handle_control_request(
             metrics["scoped_role_route_refusals"] =
                 serde_json::json!(broca_subc::scoped_role_route_refusals());
             metrics["session_readers"] = crate::session_readers::health();
+            metrics["account_limit_stale_resets"] =
+                serde_json::json!(broca_core::account_limit_stale_resets());
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
                 // status Ok. Fusiform reachability is deliberately absent because health never
@@ -2669,8 +2671,7 @@ where
         );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
         let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
-            || (broca_protocol::attachments_enabled()
-                && method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ);
+            || method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ;
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -2792,9 +2793,7 @@ where
         }
     }
     match req.method.as_str() {
-        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ
-            if broca_protocol::attachments_enabled() =>
-        {
+        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ => {
             match handler.media_read(session, req.params).await {
                 Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
                 Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
@@ -3671,8 +3670,7 @@ where
                 handler.compaction_supported(),
                 crate::RETENTION_WRITER_ENABLED,
                 handler.hook_plane_available(),
-            )
-            .with_media(broca_protocol::attachments_enabled());
+            );
             describe.session_class.backup_classes = handler.backup_classes();
             trace_describe("response_ready", channel, epoch, corr);
             let sent = send_json_response(writer, ver, channel, epoch, corr, &describe).await;
@@ -9832,6 +9830,12 @@ mod tests {
         assert!(
             health["metrics"]["scoped_role_route_refusals"].is_object(),
             "health.check includes scoped role-open refusal counts keyed by daemon code"
+        );
+        assert!(
+            health["metrics"]["account_limit_stale_resets"]
+                .as_u64()
+                .is_some(),
+            "health.check always exposes the stale account-reset counter"
         );
         assert_eq!(
             health["metrics"]["retention_repairs_pending"].as_u64(),

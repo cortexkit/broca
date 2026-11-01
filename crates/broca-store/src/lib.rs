@@ -58,6 +58,174 @@ pub mod system_one;
 mod wal_recovery;
 pub use fold_identities::{fold_identities, require_legacy_operator_root, LegacyOnlyOperator};
 
+/// Reserve a logical session's storage address and verify its history through
+/// the format-selected inventory.
+pub trait SessionAddressResolver: Send + Sync {
+    fn resolve_session_address(
+        &self,
+        bind: &BindIdentity,
+        workdir: Option<&Path>,
+    ) -> Result<BindIdentity, session_address::SessionAddressError>;
+
+    /// Check history without opening a writer. Evidence failures must remain
+    /// errors; an unreadable inventory cannot certify a new or available log.
+    fn session_log_state(
+        &self,
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<session_log_evidence::SessionLogState, String>;
+}
+
+impl SessionAddressResolver for SqliteStore {
+    fn session_log_state(
+        &self,
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<session_log_evidence::SessionLogState, String> {
+        SqliteStore::session_log_state(self, session, wal)
+    }
+
+    fn resolve_session_address(
+        &self,
+        bind: &BindIdentity,
+        workdir: Option<&Path>,
+    ) -> Result<BindIdentity, session_address::SessionAddressError> {
+        SqliteStore::resolve_session_address(self, bind, workdir)
+    }
+}
+
+impl SessionAddressResolver for db::OverhaulDb {
+    fn session_log_state(
+        &self,
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<session_log_evidence::SessionLogState, String> {
+        db::OverhaulDb::session_log_state(self, session, wal)
+    }
+
+    fn resolve_session_address(
+        &self,
+        bind: &BindIdentity,
+        workdir: Option<&Path>,
+    ) -> Result<BindIdentity, session_address::SessionAddressError> {
+        use session_address::{InventoryUnavailable, SessionAddressError};
+        let known = self
+            .read_snapshot(|tx| known_overhaul_address(tx, bind))
+            .map_err(SessionAddressError::store_error)??;
+        if let Some(identity) = known {
+            return Ok(identity);
+        }
+        let mut gap_during_reservation = false;
+        let mut reserved_root = None;
+        let result = self
+            .authoritative_transaction(|tx| {
+                match known_overhaul_address(tx, bind)? {
+                    Ok(Some(identity)) => return Ok(Ok(identity)),
+                    Err(error) => return Ok(Err(error)),
+                    Ok(None) => {}
+                }
+                let root = tx.path().and_then(|path| Path::new(path).parent());
+                if session_refs::projection_gap(root)
+                    .map_err(|e| db::DbError::Invalid(e.to_string()))?
+                {
+                    return Ok(Err(SessionAddressError::Unavailable(
+                        InventoryUnavailable::GapMarker,
+                    )));
+                }
+                let complete: bool = tx.query_row(
+                    "SELECT complete FROM inventory_status WHERE id=1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if !complete {
+                    return Ok(Err(SessionAddressError::Unavailable(
+                        InventoryUnavailable::IncompleteInventory,
+                    )));
+                }
+                let identity = BindIdentity::new(
+                    workdir.unwrap_or(&bind.project_root),
+                    &bind.harness,
+                    &bind.session,
+                );
+                if let Err(error) = identity.validate_keyable() {
+                    return Ok(Err(SessionAddressError::Invalid(error)));
+                }
+                tx.execute(
+                    "INSERT INTO session_identity VALUES(?1,?2,?3,?4,?5,?6)",
+                    rusqlite::params![
+                        broca_core::session_addr(&identity),
+                        identity.project_root.to_string_lossy(),
+                        identity.harness,
+                        identity.session,
+                        broca_core::wal_writer::legacy_session_ref(
+                            &identity.harness,
+                            &identity.project_root.to_string_lossy(),
+                            &identity.session
+                        ),
+                        broca_core::agent_session_ref(&identity),
+                    ],
+                )?;
+                if session_refs::projection_gap(root)
+                    .map_err(|e| db::DbError::Invalid(e.to_string()))?
+                {
+                    gap_during_reservation = true;
+                    return Err(db::DbError::Invalid(
+                        "session inventory gap during address reservation".into(),
+                    ));
+                }
+                reserved_root = root.map(Path::to_path_buf);
+                Ok(Ok(identity))
+            })
+            .map_err(|error| {
+                if gap_during_reservation {
+                    SessionAddressError::Unavailable(InventoryUnavailable::GapMarker)
+                } else {
+                    SessionAddressError::store_error(error)
+                }
+            })?;
+        if reserved_root.is_some()
+            && session_refs::projection_gap(reserved_root.as_deref())
+                .map_err(SessionAddressError::store_error)?
+        {
+            return Err(SessionAddressError::Unavailable(
+                InventoryUnavailable::GapMarker,
+            ));
+        }
+        result
+    }
+}
+
+fn known_overhaul_address(
+    conn: &Connection,
+    bind: &BindIdentity,
+) -> Result<Result<Option<BindIdentity>, session_address::SessionAddressError>, db::DbError> {
+    use session_address::SessionAddressError;
+    let mut stmt = conn.prepare("SELECT DISTINCT project_root FROM session_identity WHERE session_ref=?1 AND harness=?2 AND session_key=?3 LIMIT 2")?;
+    let roots = stmt
+        .query_map(
+            rusqlite::params![
+                broca_core::agent_session_ref(bind),
+                bind.harness,
+                bind.session
+            ],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if roots.len() > 1 {
+        return Ok(Err(SessionAddressError::Ambiguous));
+    }
+    Ok(roots
+        .first()
+        .map(|root| {
+            let identity = BindIdentity::new(root, &bind.harness, &bind.session);
+            identity
+                .validate_keyable()
+                .map(|()| identity)
+                .map_err(SessionAddressError::Invalid)
+        })
+        .transpose())
+}
+
 pub use system_one::SystemOneStore;
 
 /// Auditable outcome of one explicit legacy page-usage backfill.
@@ -198,6 +366,7 @@ pub enum StoreError {
     AttributionStale,
     InconsistentSnapshot(&'static str),
     BusEvent(String),
+    LegacyOnly(LegacyOnlyOperator),
 }
 
 impl std::fmt::Display for StoreError {
@@ -215,6 +384,7 @@ impl std::fmt::Display for StoreError {
                 std::fmt::Display::fmt(&broca_core::StorePageReadError::AttributionStale, f)
             }
             StoreError::BusEvent(e) => write!(f, "run event: {e}"),
+            StoreError::LegacyOnly(e) => write!(f, "{e}"),
             StoreError::InconsistentSnapshot(message) => {
                 write!(f, "inconsistent snapshot: {message}")
             }
@@ -557,6 +727,19 @@ impl SqliteStore {
     /// Open an existing projection for inspection without creating a database or running migrations.
     /// Read-only SQLite connections still read committed WAL frames not yet checkpointed into the database.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        require_legacy_operator_root(path.parent().unwrap_or(Path::new(".")), "SqliteStore")
+            .map_err(StoreError::LegacyOnly)?;
+        Self::open_read_only_decided(path)
+    }
+
+    pub fn open_boot_legacy_read_only(
+        root: broca_wal::state_format::LegacyStateRoot<'_>,
+    ) -> Result<Self, StoreError> {
+        Self::open_read_only_decided(&root.root().join("run-index.db"))
+    }
+
+    fn open_read_only_decided(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let (source_instance_id, source_epoch, high_water) = conn.query_row(
@@ -588,6 +771,19 @@ impl SqliteStore {
     /// file nobody thinks to look at.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
+        require_legacy_operator_root(path.parent().unwrap_or(Path::new(".")), "SqliteStore")
+            .map_err(StoreError::LegacyOnly)?;
+        Self::open_decided(path)
+    }
+
+    /// Boot has already classified this exact root; operator opens remain guarded.
+    pub fn open_boot_legacy(
+        root: broca_wal::state_format::LegacyStateRoot<'_>,
+    ) -> Result<Self, StoreError> {
+        Self::open_decided(&root.root().join("run-index.db"))
+    }
+
+    fn open_decided(path: &Path) -> Result<Self, StoreError> {
         #[cfg(windows)]
         prepare_private_sqlite(path).map_err(|source| StoreError::PrivateAccess {
             path: path.to_path_buf(),
@@ -3646,6 +3842,187 @@ fn stored_prefix_messages_carry_row_ordinals_and_refuse_gaps() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn boot_selected_legacy_opens_do_not_read_the_marker_again() {
+        use broca_wal::fs_ops::{self, FsOps};
+        use std::{
+            path::{Path, PathBuf},
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+        };
+        struct CountMarker {
+            marker: PathBuf,
+            reads: Arc<AtomicUsize>,
+        }
+        impl FsOps for CountMarker {
+            fn open(
+                &self,
+                path: &Path,
+                options: &fs_ops::OpenOptions,
+            ) -> std::io::Result<Box<dyn fs_ops::FileOps>> {
+                if path == self.marker {
+                    self.reads.fetch_add(1, Ordering::Relaxed);
+                    return Err(std::io::Error::other("marker unavailable after boot"));
+                }
+                fs_ops::RealFs.open(path, options)
+            }
+            fn metadata(&self, p: &Path) -> std::io::Result<std::fs::Metadata> {
+                fs_ops::RealFs.metadata(p)
+            }
+            fn create_dir_all(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.create_dir_all(p)
+            }
+            fn rename(&self, a: &Path, b: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.rename(a, b)
+            }
+            fn remove_file(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.remove_file(p)
+            }
+            fn sync_dir(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.sync_dir(p)
+            }
+            fn create_dir(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.create_dir(p)
+            }
+            fn hard_link(&self, a: &Path, b: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.hard_link(a, b)
+            }
+            fn canonicalize(&self, p: &Path) -> std::io::Result<PathBuf> {
+                fs_ops::RealFs.canonicalize(p)
+            }
+            fn read_dir(&self, p: &Path) -> std::io::Result<fs_ops::ReadDir> {
+                fs_ops::RealFs.read_dir(p)
+            }
+            fn validate_if_exists(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.validate_if_exists(p)
+            }
+        }
+        let root = broca_test_support::scratch_root()
+            .join(format!("boot-open-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("run-index.db");
+        drop(super::SqliteStore::open(&path).unwrap());
+        let decision = broca_wal::state_format::decide_state_root(&root).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        fs_ops::with_fs_ops(
+            Arc::new(CountMarker {
+                marker: root.join("state-format"),
+                reads: reads.clone(),
+            }),
+            || {
+                drop(super::SqliteStore::open_boot_legacy(decision.legacy().unwrap()).unwrap());
+                drop(
+                    super::SqliteStore::open_boot_legacy_read_only(decision.legacy().unwrap())
+                        .unwrap(),
+                );
+                assert_eq!(reads.load(Ordering::Relaxed), 0);
+                assert!(super::SqliteStore::open(&path).is_err());
+                assert!(super::SqliteStore::open_read_only(&path).is_err());
+                assert_eq!(reads.load(Ordering::Relaxed), 2);
+            },
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overhaul_known_address_does_not_compete_with_a_held_writer() {
+        use super::SessionAddressResolver;
+        let root = broca_test_support::scratch_root()
+            .join(format!("known-address-reader-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        let db = super::db::OverhaulDb::open(&root).unwrap();
+        db.reconcile_inventory().unwrap();
+        let bind = broca_protocol::BindIdentity::new("/route", "runner", "known");
+        let expected = db
+            .resolve_session_address(&bind, Some(std::path::Path::new("/first")))
+            .unwrap();
+        let writer = rusqlite::Connection::open(root.join("broca.db")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            db.resolve_session_address(&bind, Some(std::path::Path::new("/later")))
+                .unwrap(),
+            expected
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+        drop(writer);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overhaul_address_reservations_keep_first_workdir_and_refuse_ambiguous_pairs() {
+        use super::SessionAddressResolver;
+        use broca_core::SessionRefIndex;
+        let root = broca_test_support::scratch_root()
+            .join(format!("overhaul-address-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        let db = super::db::OverhaulDb::open(&root).unwrap();
+        let bind = broca_protocol::BindIdentity::new("/route", "runner", "seat");
+        assert!(matches!(
+            db.resolve_session_address(&bind, None),
+            Err(super::session_address::SessionAddressError::Unavailable(_))
+        ));
+        db.reconcile_inventory().unwrap();
+        let first = db
+            .resolve_session_address(&bind, Some(std::path::Path::new("/first")))
+            .unwrap();
+        assert_eq!(first.project_root, std::path::Path::new("/first"));
+        assert_eq!(
+            db.resolve_session_address(&bind, Some(std::path::Path::new("/later")))
+                .unwrap(),
+            first
+        );
+        let other = broca_protocol::BindIdentity::new("/other", "runner", "seat");
+        db.record_session(&broca_core::session_addr(&other), &other)
+            .unwrap();
+        assert!(matches!(
+            db.resolve_session_address(&bind, None),
+            Err(super::session_address::SessionAddressError::Ambiguous)
+        ));
+        for file in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
+            assert!(!root.join(file).exists());
+        }
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_store_refuses_overhaul_destinations_without_touching_files() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("legacy-store-overhaul-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        let path = root.join("run-index.db");
+        assert!(matches!(
+            super::SqliteStore::open(&path),
+            Err(super::StoreError::LegacyOnly(_))
+        ));
+        assert!(!path.exists());
+        let files = ["run-index.db", "run-index.db-wal", "run-index.db-shm"];
+        for name in files {
+            std::fs::write(root.join(name), format!("untouched {name}")).unwrap();
+        }
+        assert!(matches!(
+            super::SqliteStore::open(&path),
+            Err(super::StoreError::LegacyOnly(_))
+        ));
+        assert!(matches!(
+            super::SqliteStore::open_read_only(&path),
+            Err(super::StoreError::LegacyOnly(_))
+        ));
+        for name in files {
+            assert_eq!(
+                std::fs::read(root.join(name)).unwrap(),
+                format!("untouched {name}").as_bytes()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     struct RepairReadProbe<'a> {
         store: &'a SqliteStore,
         wal: &'a broca_core::FileWalStore,

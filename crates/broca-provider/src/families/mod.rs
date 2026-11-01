@@ -582,6 +582,7 @@ pub fn resolve_frozen(
     Ok(FrozenRenderConfig {
         family_id: provider.wire_family,
         renderer_version,
+        image_notice_labels: false,
         wire_model_id: model.id.clone(),
         anthropic_turn_system: provider.wire_family == WireFamilyId::AnthropicMessages
             && crate::turn_system::catalog_support(provider.wire_family, &provider.id, model),
@@ -693,6 +694,7 @@ fn frozen_from_family_defaults(
         anthropic_turn_system: false,
         family_id: family,
         renderer_version: renderer_version_for(family),
+        image_notice_labels: false,
         wire_model_id: wire_model_id.into(),
         base_url: None,
         max_output_tokens: DEFAULT_HELPER_MAX_OUTPUT_TOKENS,

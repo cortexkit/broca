@@ -256,6 +256,15 @@ mod gated {
         request: &RunRequest,
         frozen: &FrozenRenderConfig,
     ) {
+        seed_resumable_request_with_tags(dir, request, frozen, false);
+    }
+
+    fn seed_resumable_request_with_tags(
+        dir: &std::path::Path,
+        request: &RunRequest,
+        frozen: &FrozenRenderConfig,
+        render_tags: bool,
+    ) {
         let wal_store = FileWalStore::new(dir.join("wal"));
         let mut wal = wal_store
             .open(&request.session)
@@ -263,7 +272,7 @@ mod gated {
         let config = RunConfig {
             account_limit_pause: false,
             turn_directives_v1: None,
-            render_tags: false,
+            render_tags,
             computed_tags: None,
             model: request.model.clone(),
             tools: request.tools.clone().into(),
@@ -1667,6 +1676,116 @@ mod gated {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[tokio::test]
+    async fn recorded_media_off_run_resumes_with_identical_tool_markers_and_bytes() {
+        const MARKER: &str = "[image/png not shown to the model: this runner does not pass tool images to models yet]";
+        let dir = broca_test_support::scratch_root()
+            .join(format!("media-off-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let admitted = anthropic_frozen_config("claude-opus-4-8");
+        assert!(admitted.media.is_none());
+        let mut req = request(&dir);
+        req.input = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"look"}]},
+            {"role":"assistant","content":[{"type":"tool_call","tool_call_id":"photo","tool_name":"read","input":{}}]},
+            {"role":"tool","content":[{"type":"tool_result","tool_call_id":"photo","output":{"kind":"text","text":MARKER},"is_error":false}]}
+        ])).unwrap();
+        seed_resumable_request(&dir, &req, &admitted);
+        let wal = FileWalStore::new(dir.join("wal"));
+        let prior = read_prior_run_config(&wal, &req.session).unwrap().unwrap();
+        let rebuilt: FrozenRenderConfig =
+            serde_json::from_value(prior.frozen_render_config).unwrap();
+        assert!(rebuilt.media.is_none());
+        let expected = AnthropicMessages.render(&admitted, &CallOptions::new(req.input.clone()));
+        let resumed = FrozenProvider::new(rebuilt);
+        drive_request(&dir, &resumed, req).await.unwrap();
+        let sent = resumed.sent.lock().unwrap();
+        assert_eq!(sent[&0], expected);
+        assert!(String::from_utf8_lossy(&sent[&0]).contains(MARKER));
+        assert!(!String::from_utf8_lossy(&sent[&0]).contains("\"type\":\"image\""));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn imported_multipart_notices_resume_with_legacy_frozen_request_bytes() {
+        use broca_core::{run_import, ImportOrigin, ImportRequest, WalHandle};
+        let dir = broca_test_support::scratch_root()
+            .join(format!("imported-notice-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let req = request(&dir);
+        let imported: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"look"}]},
+            {"role":"assistant","content":[{"type":"tool_call","tool_call_id":"photo","tool_name":"read","input":{}}]},
+            {"role":"tool","content":[{"type":"tool_result","tool_call_id":"photo","output":{"kind":"parts","parts":[
+                {"kind":"text","text":"[image/png not shown to the model: this runner does not pass tool images to models yet]"},
+                {"kind":"text","text":"[media not shown: kind=image mime=image/png bytes=69 sha256=b1ff9c8ea3a7 reason=store_failed]"}
+            ]}}]}
+        ])).unwrap();
+        let wal = FileWalStore::new(dir.join("wal"));
+        let writer = WalHandle::spawn(wal.open(&req.session).unwrap(), 1).unwrap();
+        run_import(
+            ImportRequest {
+                session: req.session.clone(),
+                run_id: RunId("import".into()),
+                project_id: None,
+                principal: None,
+                messages: imported.clone(),
+                origin: ImportOrigin {
+                    source_ref: "fixture:notice-resume".into(),
+                },
+            },
+            &writer,
+            &wal,
+        )
+        .await
+        .unwrap();
+        writer.shutdown().await.unwrap();
+        let admitted = anthropic_frozen_config("claude-opus-4-8");
+        seed_resumable_request_with_tags(&dir, &req, &admitted, true);
+        let prior = read_prior_run_config(&wal, &req.session).unwrap().unwrap();
+        let rebuilt: FrozenRenderConfig =
+            serde_json::from_value(prior.frozen_render_config).unwrap();
+        let mut expected_prompt = imported;
+        expected_prompt.extend(req.input.clone());
+        let expected = AnthropicMessages.render(&admitted, &CallOptions::new(expected_prompt));
+        let provider = FrozenProvider::new(rebuilt);
+        drive_request(&dir, &provider, req).await.unwrap();
+        assert_eq!(provider.sent.lock().unwrap()[&0], expected);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recorded_media_profile_resumes_with_identical_profile_and_request_bytes() {
+        use broca_provider::{
+            media_profile::select_media_profile,
+            spec::{InputModalities, WireFamilyId},
+        };
+        let dir = broca_test_support::scratch_root()
+            .join(format!("media-profile-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut admitted = anthropic_frozen_config("claude-opus-4-8");
+        admitted.media = Some(select_media_profile(
+            WireFamilyId::AnthropicMessages,
+            Some(broca_provider::media_profile::MediaQuirk::Anthropic),
+            &admitted.wire_model_id,
+            InputModalities::from_value(&serde_json::json!(["text", "image", "pdf"])),
+            Some(128000),
+        ));
+        let expected = seed_crashed_run(&dir, &admitted).await;
+        let wal = FileWalStore::new(dir.join("wal"));
+        let prior = read_prior_run_config(&wal, &request(&dir).session)
+            .unwrap()
+            .unwrap();
+        let rebuilt: FrozenRenderConfig =
+            serde_json::from_value(prior.frozen_render_config).unwrap();
+        assert_eq!(rebuilt.media, admitted.media);
+        assert!(rebuilt.media.is_some());
+        let resumed = FrozenProvider::new(rebuilt);
+        assert_eq!(run_once(&dir, &resumed).await, RunFinishReason::Completed);
+        assert_eq!(resumed.sent.lock().unwrap()[&0], expected);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// First-party Anthropic's no-request default, exactly as `resolve_cache_policy` in

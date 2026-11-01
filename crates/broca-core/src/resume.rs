@@ -285,6 +285,8 @@ pub fn reconstruct_from_offsets(
     Ok(OffsetResumeState {
         prior: state,
         snapshot: crate::run::PriorWalSnapshot {
+            lineage_id: None,
+            anchor: None,
             base_watermark: seed.watermark_seq,
             head_seq: safe_head,
             checkpoint_at_base: Some(seed.admission_checkpoint),

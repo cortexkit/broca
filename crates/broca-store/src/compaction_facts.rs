@@ -137,6 +137,11 @@ impl SqliteStore {
         wal: &dyn broca_core::WalStore,
         session: &BindIdentity,
     ) -> Result<CompactionFacts, String> {
+        if wal.wal_config().is_overhaul() {
+            return Err(
+                "legacy compaction-facts writer refuses an overhaul WAL destination".into(),
+            );
+        }
         let epoch = self
             .compaction_projection_epoch(session)
             .map_err(|e| e.to_string())?;
@@ -435,6 +440,22 @@ pub const FACTS_TAIL_BYTES: u64 = 256 * 1024;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_compaction_writer_refuses_overhaul_before_wal_access() {
+        let store = crate::SqliteStore::open_in_memory().unwrap();
+        let wal = broca_core::FileWalStore::with_config(
+            "unused-overhaul-root/wal",
+            broca_wal::WalConfig::OVERHAUL,
+        );
+        let error = store
+            .current_compaction_facts(&wal, &broca_protocol::BindIdentity::new("/", "test", "s"))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "legacy compaction-facts writer refuses an overhaul WAL destination"
+        );
+    }
+
     use super::*;
     use broca_core::compaction_provider::{
         lineage::MessageRef,

@@ -7,6 +7,7 @@ use std::path::Path;
 type EvidenceError = Box<dyn std::error::Error + Send + Sync>;
 
 pub mod indexes;
+mod overhaul;
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionLogEvidence {

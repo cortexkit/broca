@@ -54,6 +54,8 @@ pub mod wal;
 mod writer_id_tests;
 
 #[cfg(test)]
+mod account_limit_pause;
+#[cfg(test)]
 mod compaction;
 
 #[cfg(test)]

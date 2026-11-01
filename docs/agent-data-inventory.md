@@ -37,6 +37,18 @@ content-bearing logs take no additional content read. The refusal names the sess
 route's current folder. Expired reads keep `expired`; move fences keep
 `session_moving` and `session_moved`. A send after completed expiry can still
 start a fresh lineage.
+
+The format-selected `SessionAddressResolver` must implement this log-state check;
+there is no default that can silently bypass it. Both stores use one shared
+filesystem-first classifier. A content-bearing live log returns before any
+inventory database access. Legacy SqliteStore evidence is unchanged. On format-2
+roots, OverhaulDb loads its own indexed session/run observations and independent
+retention, removal and imported-run evidence from `broca.db`; its identity-only
+`session_identity` rows remain reservations, not content. SQL or schema failures,
+or content hints without a usable run/lineage proof, return errors rather than
+certifying an available or new session. Older removal proof cannot excuse a
+different current lineage or unidentified imported history.
+
 Status polling for large sessions or runs left active by a crash may still recover
 an existing log's torn tail or append the missing terminal for an abandoned run.
 That recovery policy is unchanged. The guard prevents opening a writer that

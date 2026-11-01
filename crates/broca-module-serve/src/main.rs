@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use broca_core::{FileLeaseStore, FileWalStore, RunIndex};
+use broca_core::{FileLeaseStore, FileWalStore};
 use broca_module::{DefaultOpener, LineageRegistry};
 use broca_module_serve::{
     spawn_catalog_poll, CatalogPoller, ChargeBasisTable, ConsumerRoutes, ServeEnd, ServeIoError,
@@ -22,6 +22,7 @@ use subc_protocol::SUBC_MODULE_ID_ENV;
 use subc_transport::{authenticate_client, connection_file};
 use tokio::net::TcpStream;
 
+mod composition;
 mod state_format;
 use state_format::BackgroundTask;
 
@@ -142,8 +143,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(ServeIoError)?;
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
-    let media = broca_module_serve::config::MediaConfig::load_default().map_err(ServeIoError)?;
-    broca_protocol::configure_media(media.enabled).map_err(|error| ServeIoError(error.into()))?;
+    broca_module_serve::config::warn_obsolete_media_default().map_err(ServeIoError)?;
     let service_tier =
         broca_module_serve::config::ServiceTierConfig::load_default().map_err(ServeIoError)?;
     broca_protocol::configure_service_tier(service_tier.enabled)
@@ -202,8 +202,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // version 4 frames on a `broca-state/2` root, today's frames everywhere else. A marker that
     // cannot be read, or an overhaul root whose `wal/` is a symbolic link or resolves outside the
     // root, refuses boot instead.
-    let mut wal_config =
-        state_format::wal_config(&state_root, state_format).map_err(ServeIoError)?;
+    let wal_decision =
+        state_format::wal_decision(&state_root, state_format).map_err(ServeIoError)?;
+    let mut wal_config = wal_decision.config();
     wal_config.recovery = wal_recovery;
     let _stall_watchdog = broca_module_serve::stall::start(&state_root)?;
     // An optional provider base_url override (the mock/openai-compatible path; e.g. aimock).
@@ -241,6 +242,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // The operator switches for content-filter fallback, both layers under one key. A malformed
     // block refuses boot by name, like the sections above; without one, both stay off.
     let anthropic_fallbacks = broca_module_serve::config::AnthropicFallbackConfig::load_default()
+        .map_err(ServeIoError)?;
+    let account_limit_pause = broca_module_serve::config::AccountLimitPauseConfig::load_default()
         .map_err(ServeIoError)?;
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
@@ -304,8 +307,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the state root up front so the SQLite run index can open its file (the file
     // stores create their own subdirs lazily, but SqliteStore::open needs the dir to exist).
     create_state_directories(&state_root)?;
-    if let Err(error) = broca_core::media_store::spawn_startup_sweep(state_root.clone()) {
-        tracing::warn!(target: "media", "could not start media maintenance; continuing to serve: {error}");
+    if state_format == state_format::StateFormat::Legacy {
+        start_media_sweep(&state_root);
     }
     // The catalog only guides external backup capture; a filesystem refusal must not take
     // session service offline.
@@ -323,16 +326,45 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .flatten();
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
     let bus_hints = Arc::new(broca_module_serve::bus_events::Hints::default());
+    let mut stores = match state_format {
+        state_format::StateFormat::Legacy => composition::Stores::deferred_legacy(),
+        state_format::StateFormat::Overhaul => {
+            composition::Stores::open_overhaul(&state_root).map_err(ServeIoError)?
+        }
+    };
     let mut wal_store = FileWalStore::with_config(state_root.join("wal"), wal_config)
         .with_backup_classes(backup_classes.0);
     if bus_event_config.enabled {
         wal_store = wal_store.with_durable_observer(bus_hints.observer());
     }
+    if let Some(overhaul) = &stores.overhaul {
+        let publications = overhaul.publications.clone();
+        wal_store = wal_store.with_session_guard(Arc::new(move |session| {
+            publications.ensure_available(session)
+        }));
+        wal_store = wal_store.with_publication_observer(overhaul.publications.observer());
+        wal_store.set_session_ref_index(overhaul.db.clone());
+    }
     let wal_store = Arc::new(wal_store);
-    // The state-root lock is already held, and no session writer has started yet.
+    // The state-root lock is held. Reap temporary names before WAL recovery.
     broca_module::actor::writer_reclaim::reap_temporary_markers_at_boot(wal_store.clone())
         .await
         .map_err(ServeIoError)?;
+    if let Some(overhaul) = &mut stores.overhaul {
+        let wal = wal_store.clone();
+        let publications = overhaul.publications.clone();
+        // All writers are stopped under the root lock. No recovery or service
+        // reader is constructed until the index has caught up from every live WAL.
+        spawn_blocking(
+            JobKind::Recovery,
+            broca_wal::access_counter::inherit(move || publications.reconcile(&wal)),
+        )
+        .await
+        .map_err(|error| ServeIoError(format!("join boot index reconciliation: {error}")))?
+        .map_err(ServeIoError)?;
+        overhaul.start().map_err(ServeIoError)?;
+        start_media_sweep(&state_root);
+    }
     let crash_orphan_wal = wal_store.clone();
 
     // The provider-held runtime: the slots a held call waits in, and the intake that pulls each
@@ -370,20 +402,24 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // serve loop below attaches the describer once that connection has registered.
     let scope_describer = Arc::new(broca_subc::ModuleScopeDescriber::new());
     plane.set_scope_describer(scope_describer.clone());
-    let run_index = Arc::new(
-        broca_store::SqliteStore::open(state_root.join("run-index.db"))
-            .map_err(|e| ServeIoError(format!("open run index: {e}")))?
-            .with_wal_config(wal_config),
-    );
-    wal_store.set_session_ref_index(run_index.clone());
-    broca_core::WalStore::bind_recovery_projection(wal_store.as_ref(), None, run_index.clone());
+    if state_format == state_format::StateFormat::Legacy {
+        stores = composition::Stores::open_boot_legacy(
+            wal_decision.legacy().expect("legacy boot decision"),
+            wal_config,
+        )
+        .map_err(ServeIoError)?;
+        let index = stores.legacy.as_ref().unwrap().clone();
+        wal_store.set_session_ref_index(index.clone());
+        broca_core::WalStore::bind_recovery_projection(wal_store.as_ref(), None, index);
+    }
+    let run_index = stores.legacy.clone();
     // Older builds kept spend caps in `caps.db` beside this file. Spend caps were removed, so the
     // file is no longer opened; it is left on disk untouched rather than deleted.
 
     // Load the last-known-good before any admission is possible. The fetch leg gets its own
     // consumer connection, but construction performs no fusiform route.open; only the detached
     // poll below can dial that sibling module.
-    broca_module_serve::diagnostics::install(state_root.clone(), wal_config);
+    broca_module_serve::diagnostics::install_decided(wal_decision.into_owned(), wal_config);
     let catalog_cache = Arc::new(broca_catalog::CatalogCache::open(
         state_root.join("catalog/fusiform-lkg.json"),
     ));
@@ -432,12 +468,19 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| ServeIoError(format!("fetch-plan consumer connect: {e}")))?,
     );
     let tool_route_health_plane = Arc::clone(&plane);
-    let mut executor_impl = executor::LiveLoopExecutor::new(
-        wal_store.clone(),
-        run_index.clone(),
-        plane,
-        provider_base_url,
-    )
+    let executor_impl = if let Some(legacy) = &run_index {
+        executor::LiveLoopExecutor::new(wal_store.clone(), legacy.clone(), plane, provider_base_url)
+    } else {
+        let overhaul = stores.overhaul.as_ref().expect("one boot-selected bundle");
+        let publications = overhaul.publications.clone();
+        executor::LiveLoopExecutor::new_overhaul(
+            wal_store.clone(),
+            plane,
+            provider_base_url,
+            Arc::new(move |session| publications.resume_reader(session)),
+        )
+    };
+    let mut executor_impl = executor_impl
     .with_provider_held_lifecycle(held_runtime.slots.clone())
     .with_hook_plane(Arc::new(broca_subc::SubcHookPlane::new(plan_conn.clone())))
     .with_elicitation_plane(Arc::new(broca_subc::consent::ScopedConsentPlane::new(
@@ -462,6 +505,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Both content-filter fallback switches, read above with the other early config so the
     // refusal mapping can take its own switch from the same block.
     executor_impl = executor_impl.with_anthropic_fallbacks(anthropic_fallbacks);
+    executor_impl = executor_impl.with_account_limit_pause(account_limit_pause.enabled);
     let charge_basis_table = Arc::new(ChargeBasisTable::load_default_path().map_err(ServeIoError)?);
     if let Some(notice) = charge_basis_table.ignored_version_notice() {
         tracing::warn!(target: "billing", "{notice}");
@@ -480,6 +524,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let catch_up_resolver = charge_basis_table.clone();
     let _export_catch_up = state_format.start(BackgroundTask::UsageExport, || {
         spawn_blocking(JobKind::Recovery, move || {
+            let Some(catch_up_index) = catch_up_index else { return; };
             let started = std::time::Instant::now();
             match broca_core::catch_up_usage_exports(
                 catch_up_index.as_ref(),
@@ -686,15 +731,25 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     executor_impl = executor_impl.with_compaction_signals(compaction_signals.enabled);
     let vault_auditor = executor_impl.vault_auditor();
     let wal_reader: Arc<dyn broca_core::WalStore> = wal_store.clone();
-    let store_reader: Arc<dyn broca_core::MaterializedStore> = run_index.clone();
+    let store_reader = run_index
+        .clone()
+        .map(|store| store as Arc<dyn broca_core::MaterializedStore>);
     let retention = Arc::new(
-        broca_module::retention::RetentionService::new(
-            wal_store.clone(),
-            run_index.clone(),
-            lease_store.clone(),
-            run_index.clone(),
-            charge_basis_table.clone(),
-        )
+        if let Some(legacy) = &run_index {
+            broca_module::retention::RetentionService::new(
+                wal_store.clone(),
+                legacy.clone(),
+                lease_store.clone(),
+                legacy.clone(),
+                charge_basis_table.clone(),
+            )
+        } else {
+            broca_module::retention::RetentionService::without_usage_export(
+                wal_store.clone(),
+                stores.overhaul.as_ref().unwrap().db.clone(),
+                lease_store.clone(),
+            )
+        }
         .map_err(|error| ServeIoError(format!("retention clock: {error}")))?,
     );
     if bus_event_config.enabled {
@@ -707,25 +762,59 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let move_wal = wal_store.clone();
     let mut opener_builder =
         opener_for_state_root(lease_store, wal_store, executor, state_format, &state_root)?
-            .with_run_index(run_index.clone())
-            .with_materialized_store(run_index.clone())
             .with_charge_basis_resolver(charge_basis_table.clone());
-    // Each finished run's usage-export fact. An overhaul root exports nothing.
-    if state_format.runs(BackgroundTask::UsageExport) {
-        opener_builder = opener_builder.with_export_index(run_index.clone());
+    if let Some(legacy) = &run_index {
+        opener_builder = opener_builder
+            .with_run_index(legacy.clone())
+            .with_materialized_store(legacy.clone())
+            .with_export_index(legacy.clone());
+    }
+    let episode_source = stores.overhaul.as_ref().map(|overhaul| {
+        let publications = overhaul.publications.clone();
+        Arc::new(
+            broca_module::registry::EpisodeReadSource::new(
+                overhaul.db.clone(),
+                Arc::new(move |session, head| publications.witness_locked(session, head)),
+            )
+            .with_session_gates(overhaul.publications.gate_factory()),
+        )
+    });
+    if let Some(overhaul) = &stores.overhaul {
+        opener_builder =
+            opener_builder.with_readers(Arc::new(broca_module::opener::ActorReadSources {
+                admission: overhaul.admission_reader(),
+                episodes: episode_source.as_ref().unwrap().clone(),
+            }));
     }
     if let Some(ttl) = idle_ttl {
         opener_builder = opener_builder.with_idle_ttl(ttl);
     }
-    let run_rows =
-        run_row_source_for_state_root(state_format, &state_root, crash_orphan_wal.clone())?;
-    let registry = Arc::new(LineageRegistry::new_with_run_rows(
+    let run_rows = stores
+        .overhaul
+        .as_ref()
+        .map(|overhaul| overhaul.run_rows(crash_orphan_wal.clone()));
+    let mut registry = LineageRegistry::new_with_run_rows(
         Arc::new(opener_builder),
         Some(wal_reader),
-        Some(store_reader),
+        store_reader,
         run_rows,
-    ));
-    registry.set_session_address_inventory(run_index.clone());
+    );
+    if let Some(overhaul) = &stores.overhaul {
+        let publications = overhaul.publications.clone();
+        registry = registry
+            .with_episode_source(episode_source.unwrap())
+            .with_raw_page_source(Arc::new(
+                broca_module::registry::RawPageSource::new(
+                    overhaul.db.clone(),
+                    Arc::new(move |session, head| publications.witness_locked(session, head)),
+                )
+                .with_session_gates(overhaul.publications.gate_factory()),
+            ));
+        registry.set_session_address_resolver(overhaul.db.clone());
+    } else {
+        registry.set_session_address_inventory(run_index.as_ref().unwrap().clone());
+    }
+    let registry = Arc::new(registry);
     held_runtime.bind_stopping_signal(registry.stopping_signal());
     registry.set_tool_route_health(Arc::new(move |open| {
         tool_route_health_plane.tool_routes_health(open)
@@ -788,7 +877,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         };
         // System One's export bridge into the usage export. An overhaul root exports nothing.
         let service = Arc::new(if state_format.runs(BackgroundTask::UsageExport) {
-            service.with_export(run_index.clone(), charge_basis_table)
+            service.with_export(run_index.as_ref().unwrap().clone(), charge_basis_table)
         } else {
             service
         });
@@ -853,16 +942,29 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     llm_tools
         .recover_consent()
         .map_err(|error| ServeIoError(format!("recover consent cards: {error}")))?;
-    let agent_data = Arc::new(broca_module_serve::agent_data::AgentDataService::new(
-        state_root.clone(),
-        registry.as_ref().clone(),
-        move_wal,
-        run_index.clone(),
-        Arc::new(broca_subc::session_door::SessionDoorClient::new(
-            plan_conn.clone(),
-            broca_protocol::BindIdentity::new(state_root.clone(), "broca", "agent-data"),
-        )),
+    let door = Arc::new(broca_subc::session_door::SessionDoorClient::new(
+        plan_conn.clone(),
+        broca_protocol::BindIdentity::new(state_root.clone(), "broca", "agent-data"),
     ));
+    let agent_data = Arc::new(if let Some(legacy) = &run_index {
+        broca_module_serve::agent_data::AgentDataService::new(
+            state_root.clone(),
+            registry.as_ref().clone(),
+            move_wal,
+            legacy.clone(),
+            door,
+        )
+    } else {
+        let db = stores.overhaul.as_ref().unwrap().db.clone();
+        broca_module_serve::agent_data::AgentDataService::with_ports(
+            state_root.clone(),
+            registry.as_ref().clone(),
+            move_wal,
+            stores.overhaul.as_ref().unwrap().inventory(),
+            db,
+            door,
+        )
+    });
     agent_data
         .reconcile_boot()
         .await
@@ -888,8 +990,15 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             broca_module_serve::bus_events_nats::CredentialHolder::new(plan_conn.clone()),
         ));
     let _compaction_bus = if bus_event_config.enabled {
+        let receipts: Arc<dyn broca_store::compaction_receipts::CompactionReceiptStore> =
+            if let Some(legacy) = &run_index {
+                legacy.clone()
+            } else {
+                let overhaul = stores.overhaul.as_ref().unwrap();
+                overhaul.compaction_receipts()
+            };
         let service = broca_module_serve::compaction_bus::Service::new(
-            run_index.clone(),
+            receipts,
             registry.as_ref().clone(),
             crash_orphan_wal.clone(),
             compaction_inbox,
@@ -901,9 +1010,21 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let event_store: Arc<dyn broca_store::bus_events::RunEventStore> =
+        if let Some(legacy) = &run_index {
+            legacy.clone()
+        } else {
+            stores.overhaul.as_ref().unwrap().event_store()
+        };
+    if stores.overhaul.is_some() {
+        let reader = event_store.clone();
+        registry.set_run_event_reader(Arc::new(move |key| {
+            reader.get_bus_event(key).map_err(|e| e.to_string())
+        }));
+    }
     let _bus_events = broca_module_serve::bus_events::Service {
         config: bus_event_config,
-        store: run_index.clone(),
+        store: event_store,
         wal: crash_orphan_wal.clone(),
         registry: registry.as_ref().clone(),
         connector: Some(bus_connector),
@@ -919,9 +1040,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     registry.set_cache_declarer(Arc::new(
         broca_module_serve::cache_warm::ProviderCacheDeclarer,
     ));
+    let recovery: Arc<dyn broca_core::RecoveryDiscovery> = if let Some(legacy) = &run_index {
+        legacy.clone()
+    } else {
+        stores.overhaul.as_ref().unwrap().recovery_discovery()
+    };
     let crash_orphans = mark_crash_orphans(
         &registry,
-        Arc::clone(&run_index),
+        recovery.clone(),
         Arc::clone(&crash_orphan_wal),
         process_started,
     )
@@ -985,13 +1111,15 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let _restart_resume = {
         let registry = registry.clone();
-        let index = run_index.clone();
+        let index = match &run_index {
+            Some(index) => composition::RestartDiscovery::Legacy(index.clone()),
+            None => composition::RestartDiscovery::Overhaul(recovery.clone()),
+        };
         let wal = crash_orphan_wal.clone();
         let describer = scope_describer.clone();
         tokio::spawn(async move {
             describer.wait_registered().await;
-            let candidates =
-                spawn_blocking(JobKind::Recovery, move || index.restart_resume_candidates()).await;
+            let candidates = spawn_blocking(JobKind::Recovery, move || index.candidates()).await;
             match candidates {
                 Ok(Ok(candidates)) => {
                     registry.resume_restart_pauses(wal, candidates).await;
@@ -1034,7 +1162,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // question identifiers, without reopening the deleted conversation.
     let _withdrawal_debt = {
         let registry = registry.clone();
-        let index = run_index.clone();
+        let index = recovery.clone();
         let describer = scope_describer.clone();
         tokio::spawn(async move {
             let stopping = registry.stopping_signal();
@@ -1046,7 +1174,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             let candidates = tokio::select! {
                 biased;
                 _ = stopping.cancelled() => return,
-                rows = spawn_blocking(JobKind::Recovery, move || index.runs_with_withdrawals_owed()) => rows,
+                rows = spawn_blocking(JobKind::Recovery, move || index.withdrawal_candidates()) => rows,
             };
             let candidates = match candidates {
                 Ok(Ok(rows)) => rows,
@@ -1253,6 +1381,7 @@ fn opener_for_state_root(
     }
 }
 
+#[cfg(test)]
 fn run_row_source_for_state_root(
     format: state_format::StateFormat,
     root: &Path,
@@ -1288,7 +1417,11 @@ mod overhaul_opener_tests {
         .unwrap()
         .is_none());
         assert!(!root.join("broca.db").exists());
-        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        state_format::prepare(&root, true).unwrap();
+        let wal = Arc::new(FileWalStore::with_config(
+            root.join("wal"),
+            broca_wal::WalConfig::OVERHAUL,
+        ));
         assert!(
             run_row_source_for_state_root(state_format::StateFormat::Overhaul, &root, wal)
                 .unwrap()
@@ -1313,7 +1446,7 @@ mod overhaul_opener_tests {
         }
         let root = broca_test_support::scratch_root()
             .join(format!("overhaul-owned-opener-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        state_format::prepare(&root, true).unwrap();
         let wal = Arc::new(FileWalStore::with_config(
             root.join("wal"),
             broca_wal::WalConfig::OVERHAUL,
@@ -1368,30 +1501,19 @@ mod overhaul_opener_tests {
 /// as they are and ordinary recovery handles them when the session is next opened.
 async fn mark_crash_orphans(
     registry: &LineageRegistry,
-    run_index: Arc<broca_store::SqliteStore>,
+    run_index: Arc<dyn broca_core::RecoveryDiscovery>,
     wal_store: Arc<FileWalStore>,
     process_started: std::time::SystemTime,
 ) -> broca_module::registry::CrashOrphanSweep {
-    let row_registry = registry.clone();
     let candidates = spawn_blocking(JobKind::Recovery, move || {
-        let legacy = run_index
+        run_index
             .active_runs()
             .map(|rows| {
                 rows.into_iter()
                     .map(|(id, key)| (broca_protocol::RunId(id), key))
                     .collect::<Vec<_>>()
             })
-            .map_err(|error| error.to_string());
-        if let Some(rows) = row_registry.overhaul_active_runs(legacy.as_deref().unwrap_or_default())
-        {
-            match rows {
-                Ok(rows) => return Ok(rows),
-                Err(error) => tracing::warn!(
-                    "run-row orphan discovery fell back to the legacy index: {error}"
-                ),
-            }
-        }
-        legacy
+            .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())
@@ -2911,9 +3033,8 @@ mod executor {
     pub struct LiveLoopExecutor<W = FileWalStore> {
         wal_store: Arc<W>,
         offset_resume: Option<Arc<ResumeReaderFactory>>,
-        /// The SQLite session store is both the durable run index and the materialized
-        /// transcript prefix store used by resume and `session.read`.
-        session_store: Arc<broca_store::SqliteStore>,
+        /// The format-selected session store used by resume.
+        session_store: Option<Arc<broca_store::SqliteStore>>,
         /// The SHARED tool plane (one consumer connection, per-session routes). Shared so
         /// every session's tool dispatch rides one outbound subc connection.
         plane: Arc<SubcToolPlane>,
@@ -2956,6 +3077,7 @@ mod executor {
         /// The operator switches and refusal-resend model mapping for Anthropic OAuth runs.
         /// Consulted only at admission; a resume keeps its recorded policy. Both switches default off.
         anthropic_fallbacks: broca_module_serve::config::AnthropicFallbackConfig,
+        account_limit_pause: bool,
         /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
         /// its WAL could not be read), so the WAL is read for it at most once per session.
         cc_suffix_memo: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
@@ -3008,11 +3130,42 @@ mod executor {
             )
         }
 
-        /// Construct an opt-in session-local resume composition. Boot still calls `new`.
+        /// Construct a session-local resume composition for the selected state format.
         /// The factory runs after the writer syncs; its reader must serve that durable head.
         pub fn new_with_offset_resume_readers(
             wal_store: Arc<W>,
             session_store: Arc<broca_store::SqliteStore>,
+            plane: Arc<SubcToolPlane>,
+            provider_base_url: Option<String>,
+            offset_resume: Option<Arc<ResumeReaderFactory>>,
+        ) -> Self {
+            Self::build(
+                wal_store,
+                Some(session_store),
+                plane,
+                provider_base_url,
+                offset_resume,
+            )
+        }
+
+        pub fn new_overhaul(
+            wal_store: Arc<W>,
+            plane: Arc<SubcToolPlane>,
+            provider_base_url: Option<String>,
+            offset_resume: Arc<ResumeReaderFactory>,
+        ) -> Self {
+            Self::build(
+                wal_store,
+                None,
+                plane,
+                provider_base_url,
+                Some(offset_resume),
+            )
+        }
+
+        fn build(
+            wal_store: Arc<W>,
+            session_store: Option<Arc<broca_store::SqliteStore>>,
             plane: Arc<SubcToolPlane>,
             provider_base_url: Option<String>,
             offset_resume: Option<Arc<ResumeReaderFactory>>,
@@ -3038,6 +3191,7 @@ mod executor {
                 routing: None,
                 claude_code_install_id: None,
                 anthropic_fallbacks: Default::default(),
+                account_limit_pause: false,
                 cc_suffix_memo: Default::default(),
                 cc_suffix_wal_bytes: Default::default(),
                 cc_prompt_memo: Default::default(),
@@ -3182,6 +3336,11 @@ mod executor {
             config: broca_module_serve::config::AnthropicFallbackConfig,
         ) -> Self {
             self.anthropic_fallbacks = config;
+            self
+        }
+
+        pub fn with_account_limit_pause(mut self, enabled: bool) -> Self {
+            self.account_limit_pause = enabled;
             self
         }
 
@@ -4331,7 +4490,7 @@ mod executor {
                 None
             };
             let resolve_options = broca_catalog::live::ResolveOptions {
-                media: fresh_episode && broca_protocol::attachments_enabled(),
+                media: fresh_episode,
                 media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
                 claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,
@@ -4515,11 +4674,7 @@ mod executor {
                 }
             }
 
-            let uploads = if broca_protocol::attachments_enabled() {
-                self.wal_store.uploads()
-            } else {
-                None
-            };
+            let uploads = self.wal_store.uploads();
             if let Some(uploads) = uploads.filter(|_| {
                 resolved.provider.supports_media_renderer()
                     && (job.has_media_input()
@@ -4539,31 +4694,18 @@ mod executor {
                 let wal = Arc::clone(&self.wal_store);
                 let session = job.req.session.clone();
                 let head = job.writer.durable_head();
-                // File identity and length are metadata reads, not a WAL decode. Capture them
-                // before this executor appends so the first media tail can be strictly anchored.
-                let initial_anchor = self
-                    .wal_store
-                    .file_identity(&session)
-                    .ok()
-                    .flatten()
-                    .zip(self.wal_store.live_wal_bytes(&session).ok().flatten())
-                    .map(|(file_id, byte_end)| broca_wal::WalByteAnchor {
-                        file_id,
-                        byte_end,
-                        seq: prior_snapshot.head_seq,
-                    });
-                let anchor = std::sync::Mutex::new(initial_anchor);
-                let checkpoint = match &prior_snapshot.checkpoint_at_head.media {
-                    Some(broca_core::media_request::DurableMediaSeed::Ready(seed)) => {
-                        Ok((**seed).clone())
-                    }
-                    Some(broca_core::media_request::DurableMediaSeed::Unreadable(_)) => {
-                        Err("media_seed_undecodable after admission replay".into())
-                    }
-                    None => job.writer.empty_media_checkpoint(prior_snapshot.head_seq),
-                };
-                let checkpoint = match checkpoint {
-                    Ok(checkpoint) => checkpoint,
+                let initialized = broca_core::media_request::initialize_media_checkpoint(
+                    &job.writer,
+                    Arc::clone(&self.wal_store),
+                    &session,
+                    prior_snapshot,
+                )
+                .await;
+                let broca_core::media_request::InitializedMedia {
+                    checkpoint,
+                    anchor: initial_anchor,
+                } = match initialized {
+                    Ok(initialized) => initialized,
                     Err(error) => {
                         let error = RunError::Wal(error);
                         if let Some(ack) = job.on_admitted {
@@ -4572,6 +4714,7 @@ mod executor {
                         return Err(error);
                     }
                 };
+                let anchor = std::sync::Mutex::new(initial_anchor);
                 let frozen: broca_provider::wire::FrozenRenderConfig =
                     serde_json::from_value(resolved.provider.render_config_blob())
                         .expect("resolved provider has a frozen config");
@@ -4673,10 +4816,10 @@ mod executor {
                 });
             }
 
-            let materialized_store =
-                job.materialized_store(
-                    self.session_store.clone() as Arc<dyn broca_core::SessionStore>
-                );
+            let materialized_store = self
+                .session_store
+                .clone()
+                .and_then(|store| job.materialized_store(store));
             let frozen_context_limit = context_limit_for_episode(
                 fresh_episode,
                 job.req.context_limit,
@@ -4694,6 +4837,7 @@ mod executor {
             // method-qualified vault credential id.
             let mut control = job.control;
             control.compaction_signals = self.compaction_signals;
+            control.account_limit_pause = self.account_limit_pause;
             control.hook_plane = self.hook_plane();
             // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
             // the durable WAL projector. The actor's live-output task discards those same units,
@@ -4905,7 +5049,7 @@ mod executor {
             use broca_core::LeaseStore;
             let root = fresh_vault_root("database-offset-admission");
             std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
-            let (stand_in, server) = stand_in_executor(&root).await;
+            let (plane, server) = stand_in_plane(&root).await;
             let http = resume_http_fixture().await;
             let store = Arc::new(FileWalStore::with_config(
                 root.join("wal"),
@@ -4950,6 +5094,8 @@ mod executor {
             )
             .unwrap();
             let mut wrong = broca_core::PriorWalSnapshot {
+                lineage_id: None,
+                anchor: None,
                 base_watermark: 0,
                 head_seq: witness.sequence(),
                 checkpoint_at_base: None,
@@ -4998,12 +5144,11 @@ mod executor {
             let reader_publications = publication_rx.clone();
             let sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed_sessions = sessions.clone();
-            let executor = LiveLoopExecutor::new_with_offset_resume_readers(
+            let executor = LiveLoopExecutor::new_overhaul(
                 store.clone(),
-                stand_in.session_store.clone(),
-                stand_in.plane.clone(),
+                plane,
                 Some(http.url.clone()),
-                Some(Arc::new(move |session| {
+                Arc::new(move |session| {
                     observed_sessions.lock().unwrap().push(session.clone());
                     Ok(db_reader.resume_reader(
                         session.clone(),
@@ -5012,7 +5157,7 @@ mod executor {
                             .clone()
                             .ok_or("publication absent")?,
                     ))
-                })),
+                }),
             );
             let (_, _, expected) =
                 broca_module_serve::wal_render::render_step(&records, &config, &req.run_id.0, 1)
@@ -5042,16 +5187,21 @@ mod executor {
             assert_eq!(summary.reason, RunFinishReason::Completed);
             assert_eq!(*sessions.lock().unwrap(), vec![bind.clone()]);
             assert_eq!(http.requests.lock().unwrap()[0].body, expected);
-            let legacy_prefix = broca_core::MaterializedStore::read_prefix_with_watermark(
-                stand_in.session_store.as_ref(),
-                &bind,
-            )
-            .unwrap();
-            assert!(legacy_prefix.prefix.is_empty());
-            assert_eq!(
-                legacy_prefix.watermark_seq, 0,
-                "offset execution must not persist hydrated messages"
+            assert!(
+                executor.session_store.is_none(),
+                "offset execution has no content materializer"
             );
+            for file in [
+                "store.db",
+                "run-index.db",
+                "run-index.db-wal",
+                "run-index.db-shm",
+            ] {
+                assert!(
+                    !root.join(file).exists(),
+                    "offset execution must not create {file}"
+                );
+            }
             let terminal = publication_rx.borrow().clone().unwrap();
             assert_eq!(
                 terminal.sequence(),
@@ -6471,6 +6621,14 @@ mod executor {
                     true,
                 ),
                 (
+                    "account-limit pause",
+                    run_outcome(
+                        RunFinishReason::Interrupted,
+                        Some(PauseReason::AccountLimit),
+                    ),
+                    false,
+                ),
+                (
                     "terminal error",
                     run_outcome(RunFinishReason::Error, None),
                     true,
@@ -6502,8 +6660,7 @@ mod executor {
                 ),
             ];
 
-            // PauseReason currently has no non-auth variant. TransformUnavailable is the
-            // other resumable outcome and is represented by a finish reason with paused=None.
+            // An account-limit pause does not authorize a vault auth-failure report.
             for (name, outcome, expected) in cases {
                 assert_eq!(should_check_wire_auth(&outcome), expected, "{name}");
             }
@@ -6654,6 +6811,12 @@ mod executor {
                 assert_eq!(wire_auth_status(&err_with_status(s)), None, "status {s:?}");
             }
         }
+    }
+}
+
+fn start_media_sweep(state_root: &Path) {
+    if let Err(error) = broca_core::media_store::spawn_startup_sweep(state_root.to_path_buf()) {
+        tracing::warn!(target: "media", "could not start media maintenance; continuing to serve: {error}");
     }
 }
 

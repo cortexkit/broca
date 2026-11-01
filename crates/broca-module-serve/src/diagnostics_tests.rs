@@ -5,6 +5,94 @@ use std::cell::Cell;
 
 const NOW: i64 = 200_000_000;
 
+#[cfg(feature = "test-clock")]
+#[test]
+fn legacy_findings_request_does_not_read_a_marker_after_boot() {
+    use broca_wal::fs_ops::{self, FsOps};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct MarkerProbe {
+        marker: PathBuf,
+        reads: Arc<AtomicUsize>,
+    }
+    impl FsOps for MarkerProbe {
+        fn open(
+            &self,
+            p: &Path,
+            o: &fs_ops::OpenOptions,
+        ) -> std::io::Result<Box<dyn fs_ops::FileOps>> {
+            if p == self.marker {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                return Err(std::io::Error::other("marker unavailable after boot"));
+            }
+            fs_ops::RealFs.open(p, o)
+        }
+        fn metadata(&self, p: &Path) -> std::io::Result<std::fs::Metadata> {
+            fs_ops::RealFs.metadata(p)
+        }
+        fn create_dir_all(&self, p: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.create_dir_all(p)
+        }
+        fn rename(&self, a: &Path, b: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.rename(a, b)
+        }
+        fn remove_file(&self, p: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.remove_file(p)
+        }
+        fn sync_dir(&self, p: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.sync_dir(p)
+        }
+        fn create_dir(&self, p: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.create_dir(p)
+        }
+        fn hard_link(&self, a: &Path, b: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.hard_link(a, b)
+        }
+        fn canonicalize(&self, p: &Path) -> std::io::Result<PathBuf> {
+            fs_ops::RealFs.canonicalize(p)
+        }
+        fn read_dir(&self, p: &Path) -> std::io::Result<fs_ops::ReadDir> {
+            fs_ops::RealFs.read_dir(p)
+        }
+        fn validate_if_exists(&self, p: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.validate_if_exists(p)
+        }
+    }
+    let root = broca_test_support::scratch_root()
+        .join(format!("diagnostic-legacy-marker-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    drop(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
+    install_decided(
+        broca_wal::state_format::decide_state_root(&root)
+            .unwrap()
+            .into_owned(),
+        broca_wal::WalConfig::LEGACY,
+    );
+    std::fs::create_dir(root.join("state-format")).unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let owner = principal();
+    let head = scope(owner.clone(), ScopeKind::Head, false, true);
+    let reply = fs_ops::with_fs_ops(
+        Arc::new(MarkerProbe {
+            marker: root.join("state-format"),
+            reads: reads.clone(),
+        }),
+        || serving_reply(json!({}), Some(&owner), &head, Ok(100), NOW),
+    );
+    assert!(
+        reply.is_ok(),
+        "a later marker failure cannot change the boot-selected legacy diagnostics: {reply:?}"
+    );
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "diagnostics.findings must not classify the legacy root again"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn diagnostics_missing_session_log_names_the_session_as_an_error() {
     let store = broca_store::SqliteStore::open_in_memory().unwrap();
@@ -352,6 +440,14 @@ fn legacy_diagnostics_never_reads_recovery_manifests() {
     drop(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
     let path = root.join("wal/log.cut-1.json");
     std::fs::write(&path, b"malformed sidecar on a legacy root").unwrap();
+    install_decided(
+        broca_wal::state_format::decide_state_root(&root)
+            .unwrap()
+            .into_owned(),
+        broca_wal::WalConfig::LEGACY,
+    );
+    let owner = principal();
+    let head = scope(owner.clone(), ScopeKind::Head, false, true);
     // The trace only needs to observe attempted file operations, so it wraps the real file
     // system. The power-loss recorder would also work on Unix, but it refuses a non-empty root
     // on Windows, where std cannot establish hard-link identity.
@@ -359,11 +455,10 @@ fn legacy_diagnostics_never_reads_recovery_manifests() {
         &root,
         std::sync::Arc::new(broca_wal::fs_ops::RealFs),
     ));
-    let evidence = broca_wal::fs_ops::with_fs_ops(trace.clone(), || {
-        gather(&root, Ok(100), 0, NOW, broca_wal::WalConfig::LEGACY)
+    let reply = broca_wal::fs_ops::with_fs_ops(trace.clone(), || {
+        serving_reply(json!({}), Some(&owner), &head, Ok(100), NOW)
     })
     .unwrap();
-    let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
     assert!(
         !reply
             .findings
@@ -373,7 +468,7 @@ fn legacy_diagnostics_never_reads_recovery_manifests() {
     );
     assert!(
         trace.attempts().is_empty(),
-        "master diagnostics performs no seam-visible WAL I/O"
+        "boot-selected legacy diagnostics performs no seam-visible WAL I/O"
     );
     assert_eq!(
         std::fs::read(path).unwrap(),

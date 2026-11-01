@@ -47,6 +47,62 @@ pub struct WalConfig {
     pub recovery: crate::recovery::RecoveryPolicy,
 }
 
+/// A root decision made once at boot. Tokens borrow this checked root rather
+/// than re-reading a marker at each store open.
+pub struct StateRootDecision<'a> {
+    root: &'a Path,
+    config: WalConfig,
+}
+
+pub struct OwnedStateRootDecision {
+    root: std::path::PathBuf,
+    config: WalConfig,
+}
+impl OwnedStateRootDecision {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn borrowed(&self) -> StateRootDecision<'_> {
+        StateRootDecision {
+            root: &self.root,
+            config: self.config,
+        }
+    }
+}
+
+pub struct LegacyStateRoot<'a> {
+    root: &'a Path,
+}
+impl LegacyStateRoot<'_> {
+    pub fn root(&self) -> &Path {
+        self.root
+    }
+}
+impl<'a> StateRootDecision<'a> {
+    pub fn root(&self) -> &Path {
+        self.root
+    }
+    pub fn into_owned(self) -> OwnedStateRootDecision {
+        OwnedStateRootDecision {
+            root: self.root.to_path_buf(),
+            config: self.config,
+        }
+    }
+    pub fn config(&self) -> WalConfig {
+        self.config
+    }
+    pub fn legacy(&self) -> Option<LegacyStateRoot<'a>> {
+        (!self.config.is_overhaul()).then_some(LegacyStateRoot { root: self.root })
+    }
+}
+
+pub fn decide_state_root(root: &Path) -> Result<StateRootDecision<'_>, StateRootError> {
+    Ok(StateRootDecision {
+        root,
+        config: classify_state_root(root)?,
+    })
+}
+
 impl WalConfig {
     pub const LEGACY: Self = Self {
         format: WalFormat::Legacy,

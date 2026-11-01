@@ -220,7 +220,7 @@ impl OverhaulDb {
                     [&key],
                     |r| {
                         Ok((
-                            r.get::<_, u64>(0)?,
+                            r.get::<_, Option<u64>>(0)?.unwrap_or(0),
                             r.get::<_, u64>(1)?,
                             r.get::<_, String>(2)?,
                         ))
@@ -228,12 +228,13 @@ impl OverhaulDb {
                 )
                 .optional()?)
         })?;
-        let stale_fold = cursor.as_ref().is_some_and(|(_, _, locator)| {
-            serde_json::from_str::<serde_json::Value>(locator)
-                .ok()
-                .and_then(|value| value.get(1)?.get("head_fold")?.get("version")?.as_u64())
-                != Some(1)
-        });
+        let stale_fold = publication.sequence() != 0
+            && cursor.as_ref().is_some_and(|(_, _, locator)| {
+                serde_json::from_str::<serde_json::Value>(locator)
+                    .ok()
+                    .and_then(|value| value.get(1)?.get("head_fold")?.get("version")?.as_u64())
+                    != Some(1)
+            });
         if stale_fold {
             self.raw_fallback_notice(
                 &key,
@@ -258,6 +259,13 @@ impl OverhaulDb {
                 .read_to_end(&mut bytes)?;
             Ok(bytes)
         };
+        if publication.sequence() == 0 {
+            let page = full_page(&read, publication, from, limit, include_tools, true)?;
+            if page.page.lineage_id != Some(publication.lineage()) {
+                return Err(invalid("empty raw page lineage mismatch"));
+            }
+            return Ok(page);
+        }
         let result = self.read_snapshot(|tx| {
             page(
                 tx,

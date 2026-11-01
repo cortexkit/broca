@@ -13,6 +13,7 @@ use broca_protocol::BindIdentity;
 use broca_wal::file_wal::DurablePublication;
 use broca_wal::{access_counter, FramedRecord, WalRecord};
 use cortexkit_bus_trait::PublishReceipt;
+use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -80,13 +81,49 @@ pub(super) fn observe(
 pub struct OverhaulRunEventStore {
     db: Arc<OverhaulDb>,
     state: State,
+    before_read: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
+    session_filter: Option<Arc<SessionFilter>>,
 }
+
+type SessionFilter = dyn Fn(&BindIdentity) -> bool + Send + Sync;
 
 impl OverhaulRunEventStore {
     pub fn new(db: Arc<OverhaulDb>) -> Self {
         Self {
             db,
             state: State::default(),
+            before_read: None,
+            session_filter: None,
+        }
+    }
+    pub fn with_before_read(
+        mut self,
+        read: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        self.before_read = Some(read);
+        self
+    }
+    fn refresh(&self) -> Result<(), StoreError> {
+        self.before_read
+            .as_ref()
+            .map_or(Ok(()), |read| read().map_err(StoreError::BusEvent))
+    }
+    pub fn with_session_filter(mut self, filter: Arc<SessionFilter>) -> Self {
+        self.session_filter = Some(filter);
+        self
+    }
+    fn check_session(&self, key: &BindIdentity) -> Result<(), StoreError> {
+        if self
+            .session_filter
+            .as_ref()
+            .is_some_and(|filter| !filter(key))
+        {
+            Err(StoreError::BusEvent(format!(
+                "run-event session {} unavailable",
+                broca_core::session_addr(key)
+            )))
+        } else {
+            Ok(())
         }
     }
     fn events(&self) -> EventStore<'_> {
@@ -110,6 +147,7 @@ type PublicationSource = dyn Fn(&BindIdentity) -> Result<DurablePublication, Str
 struct DatabaseCompactionReceiptStore {
     db: Arc<OverhaulDb>,
     publication: Box<PublicationSource>,
+    gates: Option<Arc<super::SessionGateFactory>>,
 }
 
 impl OverhaulDb {
@@ -124,6 +162,22 @@ impl OverhaulDb {
         Arc::new(DatabaseCompactionReceiptStore {
             db: self.clone(),
             publication: Box::new(publication),
+            gates: None,
+        })
+    }
+
+    pub fn compaction_receipt_store_serialized(
+        self: &Arc<Self>,
+        publication: impl Fn(&BindIdentity) -> Result<DurablePublication, String>
+            + Send
+            + Sync
+            + 'static,
+        gates: Arc<super::SessionGateFactory>,
+    ) -> Arc<dyn CompactionReceiptStore> {
+        Arc::new(DatabaseCompactionReceiptStore {
+            db: self.clone(),
+            publication: Box::new(publication),
+            gates: Some(gates),
         })
     }
 }
@@ -166,6 +220,11 @@ impl CompactionReceiptStore for DatabaseCompactionReceiptStore {
         _wal: &dyn broca_core::WalStore,
         session: &BindIdentity,
     ) -> Result<CompactionFacts, String> {
+        let gate = self.gates.as_ref().map(|factory| factory(session));
+        let _guard = gate
+            .as_ref()
+            .map(|gate| gate.lock().map_err(|e| e.to_string()))
+            .transpose()?;
         let publication = (self.publication)(session)?;
         self.db
             .compaction_resolution(session, publication)
@@ -190,7 +249,12 @@ impl bus_events::RunEventStore for OverhaulRunEventStore {
         self.events().end_bus_event_period()
     }
     fn bus_event_open_sessions(&self) -> Result<Vec<BindIdentity>, StoreError> {
-        self.events().bus_event_open_sessions()
+        self.refresh()?;
+        let mut sessions = self.events().bus_event_open_sessions()?;
+        if let Some(filter) = &self.session_filter {
+            sessions.retain(|key| filter(key));
+        }
+        Ok(sessions)
     }
     fn bus_event_period_started_ms(&self) -> u64 {
         self.events().bus_event_period_started_ms()
@@ -199,9 +263,13 @@ impl bus_events::RunEventStore for OverhaulRunEventStore {
         &self,
         session: &BindIdentity,
     ) -> Result<Option<(String, u64)>, StoreError> {
+        self.refresh()?;
+        self.check_session(session)?;
         self.events().bus_event_checkpoint(session)
     }
     fn bus_event_position(&self, session: &BindIdentity, epoch: &str) -> Result<u64, StoreError> {
+        self.refresh()?;
+        self.check_session(session)?;
         self.events().bus_event_position(session, epoch)
     }
     fn project_new_bus_events(
@@ -228,9 +296,28 @@ impl bus_events::RunEventStore for OverhaulRunEventStore {
         &self,
         event_key: &str,
     ) -> Result<Option<(BindIdentity, Vec<u8>)>, StoreError> {
-        self.events().get_bus_event(event_key)
+        // Retained event bodies are immutable and committed before bus emission;
+        // their point lookup needs no WAL/index catch-up or writer connection.
+        self.db
+            .read_snapshot(|tx| {
+                let row: Option<(String, Vec<u8>)> = tx
+                    .query_row(
+                        "SELECT session,body FROM bus_event_outbox WHERE event_key=?1",
+                        [event_key],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                row.map(|(owner, body)| {
+                    serde_json::from_str(&owner)
+                        .map(|owner| (owner, body))
+                        .map_err(|e| DbError::Invalid(e.to_string()))
+                })
+                .transpose()
+            })
+            .map_err(store_error)
     }
     fn pending_bus_event(&self) -> Result<Option<Publication>, StoreError> {
+        self.refresh()?;
         self.events().pending_bus_event()
     }
     fn acknowledge_bus_event(
@@ -278,7 +365,7 @@ impl OverhaulDb {
             if !projection_current(tx, &key)? {
                 return Err(bad("compaction resolution locators incomplete"));
             }
-            let indexed: (String, u64, u64) = tx.query_row("SELECT lineage_id,indexed_seq,indexed_end FROM session WHERE sid=?1", [&key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let indexed: (String, u64, u64) = tx.query_row("SELECT lineage_id,indexed_seq,indexed_end FROM session WHERE sid=?1", [&key], |r| Ok((r.get(0)?, r.get::<_,Option<u64>>(1)?.unwrap_or(0), r.get(2)?)))?;
             if indexed != (lineage.clone(), reader.sequence(), reader.byte_end()) {
                 return Err(bad("compaction resolution publication mismatch"));
             }
@@ -445,11 +532,19 @@ mod tests {
             .unwrap()
     }
     fn full(db: &OverhaulDb) {
-        assert_eq!(scalar(db, "PRAGMA synchronous"), 2);
+        assert_eq!(writer_synchronous(db), 2);
+    }
+    fn writer_synchronous(db: &OverhaulDb) -> u64 {
+        // Snapshot readers have separate connections; durability is a writer setting.
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap()
     }
     fn normal(db: &OverhaulDb) {
         db.transaction(false, |_| Ok(())).unwrap();
-        assert_eq!(scalar(db, "PRAGMA synchronous"), 1);
+        assert_eq!(writer_synchronous(db), 1);
     }
     fn receipt(version: u64, lineage: &str) -> ViewReceipt {
         ViewReceipt {
@@ -906,7 +1001,7 @@ mod tests {
         for record in &records[1..] {
             append(&db, &mut wal, record);
         }
-        assert_eq!(scalar(&db, "PRAGMA synchronous"), 1);
+        assert_eq!(writer_synchronous(&db), 1);
         assert_eq!(scalar(&db, "SELECT count(*) FROM bus_event_outbox"), 0);
         assert_eq!(scalar(&db, "SELECT count(*) FROM bus_event_period"), 0);
         let facts = db

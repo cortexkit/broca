@@ -294,8 +294,7 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Disabled media admission refuses uploads by name before decoding a send. Neither
-/// runtime mode permits a client to supply stored media references inline.
+/// A client supplies uploads, never stored media references inline.
 pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String> {
     if let Some(content) = params.get("content").filter(|value| !value.is_null()) {
         // A content part is an upload reference and nothing else. A `media` block, or a tool
@@ -311,18 +310,9 @@ pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String>
                  upload references"
             ));
         }
-        let parts: Vec<cortexkit_role_llm_runner::attachments::ContentPart> =
+        let _: Vec<cortexkit_role_llm_runner::attachments::ContentPart> =
             serde_json::from_value(content.clone())
                 .map_err(|error| format!("invalid content: {error}"))?;
-        if broca_protocol::attachments_enabled() {
-            return Ok(());
-        }
-        if let Some(part) = parts.first() {
-            return Err(format!(
-                "upload {} cannot be sent: attachment admission is unavailable",
-                part.upload_id()
-            ));
-        }
     }
     Ok(())
 }
@@ -1951,6 +1941,9 @@ pub enum RunStatusResponse {
     Paused {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_selection: Option<String>,
+        /// Absolute send floor from the durable account-limit pause, absent on other pauses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_not_before_ms: Option<u64>,
         /// Explicit restart-pause discriminator; authentication-pause replies omit this field to preserve their existing wire shape.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pause_reason: Option<broca_protocol::OpenPauseReason>,
@@ -4859,6 +4852,7 @@ mod tests {
         assert_eq!(
             decoded,
             RunStatusResponse::Paused {
+                resume_not_before_ms: None,
                 held_calls: Vec::new(),
                 auth_selection: None,
                 title: None,
@@ -5439,6 +5433,7 @@ mod restart_wire_tests {
     fn restart_pause_status_and_invalid_policy_match_goldens() {
         scope_refusal_golden::assert_golden(
             RunStatusResponse::Paused {
+                resume_not_before_ms: None,
                 held_calls: Vec::new(),
                 auth_selection: None,
                 title: None,

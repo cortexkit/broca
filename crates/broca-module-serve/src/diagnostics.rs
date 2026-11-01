@@ -11,14 +11,36 @@ use subc_protocol::ErrorBody;
 
 pub use broca_wire::diagnostics::OP;
 pub const REPLY_LIMIT: usize = 65_536;
-static ROOT: OnceLock<(PathBuf, broca_wal::WalConfig)> = OnceLock::new();
+enum RootSource {
+    Unselected(PathBuf),
+    Boot(broca_wal::state_format::OwnedStateRootDecision),
+}
+impl RootSource {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Unselected(root) => root,
+            Self::Boot(decision) => decision.root(),
+        }
+    }
+}
+static ROOT: OnceLock<(RootSource, broca_wal::WalConfig)> = OnceLock::new();
 static READER: OnceLock<std::sync::Arc<dyn broca_store::db::DiagnosticEvidenceReader>> =
     OnceLock::new();
 
 pub fn install(root: PathBuf, config: broca_wal::WalConfig) {
     crate::session_address_health::initialize();
     live::initialize();
-    let _ = ROOT.set((root, config));
+    let _ = ROOT.set((RootSource::Unselected(root), config));
+}
+
+/// Retain the boot capability for every request without another marker read.
+pub fn install_decided(
+    decision: broca_wal::state_format::OwnedStateRootDecision,
+    config: broca_wal::WalConfig,
+) {
+    crate::session_address_health::initialize();
+    live::initialize();
+    let _ = ROOT.set((RootSource::Boot(decision), config));
 }
 
 /// Boot can inject its selected reader without changing the diagnostic service.
@@ -185,17 +207,31 @@ pub fn serving_reply(
     now: i64,
 ) -> Result<Reply, ErrorBody> {
     answer(params, principal, scope, now, |since| {
-        let (root, config) = ROOT.get().ok_or_else(|| {
+        let (source, config) = ROOT.get().ok_or_else(|| {
             ErrorBody::new(
                 "store_error",
                 "diagnostics.findings run-index source is not configured",
             )
         })?;
+        let root = source.path();
         if let Some(reader) = READER.get() {
             gather_with_reader(root, reader.as_ref(), catalog_age, since, now, *config)
+        } else if let RootSource::Boot(decision) = source {
+            let decision = decision.borrowed();
+            let database = if decision.legacy().is_some() {
+                "run-index.db"
+            } else {
+                "broca.db"
+            };
+            let store = broca_store::db::open_diagnostic_reader_decided(decision, *config)
+                .map_err(|_| {
+                    ErrorBody::new(
+                        "store_error",
+                        format!("diagnostics.findings cannot read {database}"),
+                    )
+                })?;
+            gather_with_reader(root, store.as_ref(), catalog_age, since, now, *config)
         } else {
-            // The legacy installer keeps its selected database until boot
-            // explicitly supplies a different diagnostic reader.
             let store = broca_store::SqliteStore::open_read_only(root.join("run-index.db"))
                 .map_err(|_| {
                     ErrorBody::new(

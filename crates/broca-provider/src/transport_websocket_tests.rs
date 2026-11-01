@@ -3164,6 +3164,7 @@ async fn trailing_tool_whitespace_closes_websocket_and_next_step_uses_a_new_sock
 /// rejection is transient rather than a failure of the token broca sent.
 #[test]
 fn wrapped_chatgpt_refusals_keep_their_classes() {
+    let before = now_millis();
     let usage = serde_json::json!({"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1790021043,"eligible_promo":null,"resets_in_seconds":441721}});
     let mut trace = AttemptTrace::default();
     let failure = responses_websocket::wrapped_error(usage.to_string().as_bytes(), &mut trace)
@@ -3174,9 +3175,18 @@ fn wrapped_chatgpt_refusals_keep_their_classes() {
     assert_eq!(failure.error.resets_at_source.as_deref(), Some("body"));
     assert!(failure.retry_forbidden);
     assert_eq!(trace.http_status, Some(429));
+    let observed_at_ms = trace
+        .account_observation
+        .limit
+        .as_ref()
+        .unwrap()
+        .observed_at_ms;
+    assert!((before..=now_millis()).contains(&observed_at_ms));
     assert_eq!(
         trace.account_observation.limit,
         Some(broca_protocol::AttemptAccountLimit {
+            disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+            observed_at_ms,
             resets_at_ms: Some(1_790_021_043_000),
             resets_at_source: Some("body".into()),
             limit_window: None,

@@ -332,6 +332,18 @@ pub trait WalStore: Send + Sync {
         self.read_records_range(session, after_seq, through_seq, anchor)
     }
 
+    /// Extend an already verified media seed. The read budget may be spent on the
+    /// suffix rather than on rereading its captured historical prefix.
+    fn read_media_seed_suffix(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: u64,
+        anchor: Option<&WalByteAnchor>,
+    ) -> Result<WalRangeRead, WalError> {
+        self.read_records_range(session, after_seq, Some(through_seq), anchor)
+    }
+
     /// Read a suffix only when `anchor` is valid. Live-file implementations avoid scanning
     /// from byte zero; immutable archive members must first verify their whole digest.
     /// Implementations that cannot prove the byte offset return `None`, which lets callers use
@@ -396,6 +408,8 @@ pub struct FileWalStore {
     move_reads: AtomicU64,
     retention_changes: Arc<retention_changes::Changes>,
     durable_observer: Option<Arc<DurableWalObserver>>,
+    publication_observer: Option<Arc<PublicationObserverFactory>>,
+    session_guard: Option<Arc<SessionGuard>>,
     #[cfg(any(test, feature = "test-clock"))]
     range_reads: AtomicU64,
 }
@@ -492,6 +506,17 @@ impl broca_wal::recovery::RecoveryHooks for ProjectionRecovery {
 /// The callback must retain only the session identity and durable head, not record bodies.
 pub type DurableWalObserver =
     dyn Fn(&BindIdentity, u64, Option<broca_wal::WalLineageId>) + Send + Sync;
+
+/// Installed at open, away from barriers. Its returned callback must perform no
+/// I/O or blocking work; it only records the writer's descriptor-bound proof.
+/// An observer error refuses the acknowledgement after sync; recovery retains
+/// the durable WAL bytes rather than treating an unavailable index as current.
+pub type PublicationObserverFactory =
+    dyn Fn(&BindIdentity, &Path, broca_wal::WalLineageId) -> Arc<PublicationObserver> + Send + Sync;
+pub type PublicationObserver = dyn Fn(broca_wal::file_wal::DurablePublicationRef<'_>) -> Result<(), &'static str>
+    + Send
+    + Sync;
+pub type SessionGuard = dyn Fn(&BindIdentity) -> Result<(), String> + Send + Sync;
 
 /// THREE STATES, NOT TWO, and collapsing any pair of them has now caused a defect each.
 ///
@@ -687,6 +712,9 @@ impl FileWalStore {
     }
 
     pub fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {
+        if let Some(guard) = &self.session_guard {
+            guard(session).map_err(|error| WalError::Io(io::Error::other(error)))?;
+        }
         // A cut file may name the session by its folder-based v1 reference (recorded before
         // the v2 switch) or by its v2 reference. Check both in one pass, so a pending release
         // under either reference outranks a moved tombstone for writes.
@@ -911,6 +939,8 @@ impl FileWalStore {
             move_reads: AtomicU64::new(0),
             retention_changes: Arc::default(),
             durable_observer: None,
+            publication_observer: None,
+            session_guard: None,
             #[cfg(any(test, feature = "test-clock"))]
             range_reads: AtomicU64::new(0),
         }
@@ -936,6 +966,15 @@ impl FileWalStore {
 
     pub fn with_durable_observer(mut self, observer: Arc<DurableWalObserver>) -> Self {
         self.durable_observer = Some(observer);
+        self
+    }
+
+    pub fn with_publication_observer(mut self, factory: Arc<PublicationObserverFactory>) -> Self {
+        self.publication_observer = Some(factory);
+        self
+    }
+    pub fn with_session_guard(mut self, guard: Arc<SessionGuard>) -> Self {
+        self.session_guard = Some(guard);
         self
     }
 
@@ -1317,6 +1356,10 @@ impl FileWalStore {
             ),
         );
         let retained = Arc::new(AtomicBool::new(retained));
+        let publication_observer = self
+            .publication_observer
+            .as_ref()
+            .and_then(|factory| Some(factory(session, wal.log_path()?, wal.lineage_id()?)));
         Ok((
             Box::new(retention_changes::ObservedWal {
                 inner: wal,
@@ -1325,6 +1368,7 @@ impl FileWalStore {
                 retained: retained.clone(),
                 session: session.clone(),
                 durable_observer: self.durable_observer.clone(),
+                publication_observer,
             }),
             retained,
         ))
@@ -2207,6 +2251,37 @@ impl WalStore for FileWalStore {
             }?);
         }
         Ok(())
+    }
+    fn read_media_seed_suffix(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: u64,
+        anchor: Option<&WalByteAnchor>,
+    ) -> Result<WalRangeRead, WalError> {
+        self.check_move(session, false)?;
+        if let Some(anchor) = anchor {
+            if self.archived_member(session)?.member.is_none() {
+                let limit = anchor
+                    .byte_end
+                    .checked_add(self.max_read_bytes)
+                    .ok_or_else(|| {
+                        WalError::Io(io::Error::other("media suffix read budget overflow"))
+                    })?;
+                if let Some(range) = broca_wal::read_records_range_from_valid_anchor(
+                    self.read_path(session)?,
+                    limit,
+                    after_seq,
+                    Some(through_seq),
+                    anchor,
+                )? {
+                    return Ok(range);
+                }
+            }
+        }
+        // Archive members keep their digest verification; a moved/folded live file
+        // must prove the requested suffix again instead of trusting an old inode offset.
+        self.read_records_range(session, after_seq, Some(through_seq), anchor)
     }
     fn writer_marker_root(&self) -> Option<PathBuf> {
         self.config
@@ -3678,6 +3753,22 @@ impl WalHandle {
             generation,
         ))
     }
+
+    /// Check a cached media seed's head without rebuilding its already-captured placement.
+    pub(crate) fn validate_media_seed_head(&self, at_seq: u64) -> Result<(), String> {
+        let _enqueue = self.lock_enqueue();
+        self.check_media_seed_head(at_seq)
+    }
+
+    fn check_media_seed_head(&self, at_seq: u64) -> Result<(), String> {
+        if self.durable_head.load(Ordering::Acquire) != at_seq
+            || at_seq.checked_add(1) != Some(self.next_seq.load(Ordering::Acquire))
+        {
+            return Err("media seed head changed before executor initialization".into());
+        }
+        Ok(())
+    }
+
     /// A media-free prefix has no captures or aging history to restore. Its already-seeded
     /// placement is sufficient to start tracking the first later capture without rereading it.
     pub fn empty_media_checkpoint(
@@ -3685,11 +3776,7 @@ impl WalHandle {
         at_seq: u64,
     ) -> Result<crate::media_request::MediaCheckpoint, String> {
         let _enqueue = self.lock_enqueue();
-        if self.durable_head.load(Ordering::Acquire) != at_seq
-            || self.next_seq.load(Ordering::Acquire) != at_seq + 1
-        {
-            return Err("media seed head changed before executor initialization".into());
-        }
+        self.check_media_seed_head(at_seq)?;
         let placement = self
             .display_placement
             .lock()
@@ -3740,14 +3827,9 @@ impl WalHandle {
     }
 
     pub(crate) fn bind_media_capture(&mut self, store: &impl WalStore, session: &BindIdentity) {
-        // Tool and person media share the immutable boot decision.
-        self.media_capture = if broca_protocol::attachments_enabled() {
-            store
-                .uploads()
-                .map(|uploads| crate::tool_media::ToolMediaCapture::new(uploads, session.clone()))
-        } else {
-            None
-        };
+        self.media_capture = store
+            .uploads()
+            .map(|uploads| crate::tool_media::ToolMediaCapture::new(uploads, session.clone()));
     }
 
     pub fn check_move(&self) -> Result<(), WalError> {

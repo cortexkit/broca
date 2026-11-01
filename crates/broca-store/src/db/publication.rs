@@ -33,9 +33,31 @@ pub(super) struct PreparedCursor {
     rebuilt: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct RebuildRequest {
+    pub reason: &'static str,
+    pub force: bool,
+}
+
 impl PreparedCursor {
+    pub fn recovery_cursor(&self) -> Option<broca_wal::file_wal::RecoveryCursor> {
+        self.cp.as_ref()?.recovery_cursor()
+    }
     pub fn start(&self) -> (u64, Option<u64>) {
         self.cp.as_ref().map_or((0, None), |cp| (cp.end, cp.seq))
+    }
+}
+
+impl RowCursor {
+    fn recovery_cursor(&self) -> Option<broca_wal::file_wal::RecoveryCursor> {
+        Some(match self.seq {
+            None => broca_wal::file_wal::RecoveryCursor::Empty,
+            Some(_) => broca_wal::file_wal::RecoveryCursor::Frame {
+                off: self.off,
+                end: self.end,
+                identity: self.identity.as_ref()?.as_slice().try_into().ok()?,
+            },
+        })
     }
 }
 
@@ -267,7 +289,7 @@ fn publish_in_tx(
         end: publication.byte_end(),
         seq: publication.sequence(),
     };
-    let prepared = prepare_cursor(tx, &key, &lineage, checked.end, read, None, false)?;
+    let prepared = prepare_cursor(tx, &key, &lineage, checked.end, read, None, None)?;
     publish_checked_in_tx(tx, bind, session_ref, location, &checked, read, prepared)
 }
 
@@ -277,9 +299,11 @@ pub(super) fn prepare_cursor(
     lineage: &str,
     end: u64,
     read: &ReadAt<'_>,
-    rebuild_reason: Option<&'static str>,
-    force: bool,
+    recovery: Option<&broca_wal::file_wal::WalRecovery>,
+    rebuild: Option<RebuildRequest>,
 ) -> Result<PreparedCursor, DbError> {
+    let force = rebuild.is_some_and(|request| request.force);
+    let rebuild_reason = rebuild.map(|request| request.reason);
     let cp = tx.query_row("SELECT indexed_seq,indexed_off,indexed_end,indexed_identity,lineage_id,locator_seed,lineage_off FROM session WHERE sid=?1", [key], |r| Ok(RowCursor {
         seq: r.get(0)?, off: r.get(1)?, end: r.get(2)?, identity: r.get(3)?, lineage: r.get(4)?, locator: r.get(5)?, lineage_off: r.get(6)?,
     })).optional()?;
@@ -288,7 +312,27 @@ pub(super) fn prepare_cursor(
     let outdated = cp.is_some() && !super::recovery::projection_current(tx, key)?;
     let compaction_outdated = cp.is_some() && !super::outbox::projection_current(tx, key)?;
     if let Some(cp) = &cp {
-        if !force && !outdated && !compaction_outdated && valid_cursor(cp, lineage, end, read)? {
+        let valid = if force || outdated || compaction_outdated {
+            false
+        } else if let Some(recovery) = recovery {
+            if cp.lineage.as_deref() != Some(lineage)
+                || cp.end > end
+                || cp.off > cp.end
+                || (cp.seq.is_none()
+                    && (cp.end != LINEAGE_FRAME_LEN as u64 || cp.identity.is_some()))
+            {
+                false
+            } else if let Some(raw) = cp.recovery_cursor() {
+                recovery
+                    .authenticate_cursor(&raw, cp.seq)
+                    .map_err(DbError::Wal)?
+            } else {
+                false
+            }
+        } else {
+            valid_cursor(cp, lineage, end, read)?
+        };
+        if valid {
             seed = load_locator(tx, key, &cp.locator, read)?;
         }
         rebuilt = seed.is_none();

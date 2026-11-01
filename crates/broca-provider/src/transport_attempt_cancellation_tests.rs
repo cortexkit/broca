@@ -37,6 +37,9 @@ impl Wal for ReservationBarrierWal {
     fn durable_publication(&self) -> Option<broca_wal::file_wal::DurablePublication> {
         self.inner.durable_publication()
     }
+    fn borrowed_publication(&self) -> Option<broca_wal::file_wal::DurablePublicationRef<'_>> {
+        self.inner.borrowed_publication()
+    }
     fn log_path(&self) -> Option<&std::path::Path> {
         self.inner.log_path()
     }

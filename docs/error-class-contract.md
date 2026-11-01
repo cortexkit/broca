@@ -53,6 +53,18 @@ action", which makes the quota split derivable per provider code.
 **Ordering rule:** code/body discrimination runs before generic status defaults.
 A quota-429 is indistinguishable only after provider-code discrimination.
 
+### Timed account-limit recovery
+
+The root `account_limit_pause` opt-in does not add a fifth error class. The transport's
+positive account-wall classification produces `kind: account_limit, scope: account` beside
+its existing transient error. Opted-in runs persist that disposition with the failed attempt;
+replay never infers it from HTTP status, Retry-After alone, message text or producer detail.
+Only a present, valid recovery floor in the inclusive interval from the pause through
+60 minutes later can produce a durable account pause. Untimed walls, distant/weekly resets,
+generic 429s, payment exhaustion, authentication and context overflow keep their earlier paths.
+Newly stale floors end the run and increment `health.check.metrics.account_limit_stale_resets`;
+a committed floor that expires during downtime is instead revalidated for immediate wake.
+
 
 ### Producer-side status/code refinements
 

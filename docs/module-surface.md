@@ -1358,6 +1358,20 @@ keep their existing behavior and omit this diagnostic.
 - **State enum:** `Idle | Active{run_id, step} | Paused{run_id, reason} | Interrupted{run_id} |
   Terminal{run_id, reason} | Error{run_id, detail}`. `run.status(session)` resolves the
   in-process active run first, then WAL inference.
+- **Timed account pauses:** the root `broca.jsonc` switch `account_limit_pause` defaults to
+  false and must be a boolean. An enabled fresh run freezes consent in its WAL config.
+  A source-classified transient account limit pauses only with a present, checked recovery
+  floor in `[paused_at_ms, paused_at_ms + 60 minutes]`. It resumes itself on the same frozen
+  selection, never through a routing account switch. `run.status` reports `state: paused`,
+  `reason: account_limit`, `pause_reason: account_limit`, the original structured error and
+  optional `resume_not_before_ms`. The durable subscribe `paused` control carries the same
+  floor after its barrier; the subscription stays attached for ordinary resume progress.
+  `session.head.last_run_state` remains reason-only, with no new ordinal or deadline member.
+  An idempotent resend returns the pause/current continuation rather than scheduling a second
+  execution. Unrelated sends and steers receive `run_paused`; cancel remains available.
+  Newly stale reset refusals retain the terminal path and increment the always-present lifetime
+  health metric `account_limit_stale_resets`. Readers must understand `account-limit-pause/v1`
+  before the writer is deployed or the switch enabled.
 - **Durable run index** in `run-index.db`: `run_id → {session, lineage, submission_id, state,
   wal_path}` so run-keyed ops survive restart. Resume **reuses the original run_id**
   (today it mints `req.run_id`).
@@ -1382,9 +1396,8 @@ keep their existing behavior and omit this diagnostic.
   contract, not a defect.
 - **`TransformUnavailable` is read, never written:** older WAL records and run-index rows carry
   it, and readers report it (`run.status`, `session.read`, the run index), but this build never
-  ends a run with it. It is terminal, not a pause: a pause is only for a failure with a
-  caller-side resolver contract (`AuthRequired` → the caller re-authenticates, then resumes the
-  SAME run).
+  ends a run with it. It is terminal, not a pause: a pause preserves a resolvable nonterminal
+  cause and the same run rather than sealing the episode.
 - **Active model-step progress:** run-keyed `run.status` can include an optional `step` object
   `{step_id, started_at_ms, attempt, attempt_started_at_ms, last_content_at_ms?,
   max_content_gap_ms?, max_content_gap_ended_at_ms?}`. It is a cheap snapshot of the live actor's
@@ -1605,29 +1618,29 @@ refusal is counted in `health.check` as `reverse_requests_refused`.
 
 **Tool result formats and provider-held calls.** The daemon's dispatch routes declare
 `consumer_capabilities: ["tool-result/v1", "held-reply/v1"]` in every build. Typed result
-decoding still requires the result-format opt-in in the provider's frozen catalog. Text and errors use the same
-stored bytes as legacy replies. With media disabled, builds append the existing
-"not shown to the model" notice for each omitted image. With media enabled, dispatch captures
-images and PDFs through the session's media-capture handle. Role discovery and management routes do not
+decoding still requires the result-format opt-in in the provider's frozen catalog. Negotiating
+`tool-result/v1` does not change the stored text or error payload bytes. Dispatch captures images
+and PDFs through the session's
+media-capture handle. The frozen model's media profile decides which captures reach a model
+request; unsupported kinds remain text markers. Role discovery and management routes do not
 negotiate tool results.
 
-### Runtime media opt-in
+### Model-based media input
 
-In `broca.jsonc`, `"media": {"enabled": true}` enables media for the process.
-The section is optional and `enabled` defaults to `false`. Only a boolean is accepted;
-unknown keys inside `media` refuse boot by name. The decision is read once before stores
-are opened: enabling or disabling media requires restarting broca. `test-attachments`
-remains a non-shipping feature for test seams, not a deployment prerequisite.
+Media input follows the frozen model's catalog input modalities for every session class,
+including heads, workers and sidekicks. No process configuration is required.
+`test-attachments` provides attachment test helpers that cannot be built into release binaries;
+it is not a deployment prerequisite.
 
-Every fresh enabled episode whose model explicitly supports a non-text input modality
+Every fresh episode whose model explicitly supports a non-text input modality
 freezes its adapter media profile, even for text-only input: a tool may return an image
 after the first model request. Requests without media retain their ordinary rendered bytes.
 Resume never adds a profile to an older recorded configuration; those runs keep their media
 markers until a fresh episode is admitted. Existing per-family carrier gates remain in force.
 
-When enabled, `role.describe` declares the llm-runner `attachments` group and its upload
-and `session.media_read` operations. When disabled, it declares neither the group nor
-`session.media_read`; existing upload staging remains available but cannot be sent.
+`role.describe` always declares the llm-runner `attachments` group and its upload
+and `session.media_read` operations. Upload staging is available independently of the model;
+sending an upload requires the frozen profile to accept its kind and exact MIME type.
 The operations follow the pinned llm-runner contract §9.12. In particular,
 `session.media_read {sha256, offset, length}` serves at most 2,097,152 decoded bytes as
 `{data, size, mime}`. Zero length omits `data`; EOF returns empty data, and an offset
@@ -1638,13 +1651,13 @@ Capture authorization uses the stored admission checkpoint and a strictly anchor
 WAL tail, not a replay of the transcript for every chunk. A missing or unusable checkpoint
 requires a named, counted full-replay repair through the shared media-seed fallback counter.
 
-Enabled upload appends are strictly contiguous; replaying a chunk refuses
-`upload_offset_mismatch` with the current `received` count. Disabled legacy staging keeps
-its existing identical-chunk retry behavior. Sends preserve the upload refusal codes
-(`unknown_upload`, `upload_gone`, `upload_not_committed`) instead of reporting a failed
-session open. A disabled send carrying an upload is still refused before admission.
+Upload appends are strictly contiguous; replaying a chunk refuses
+`upload_offset_mismatch` with the current `received` count. Sends preserve the upload refusal
+codes (`unknown_upload`, `upload_gone`, `upload_not_committed`) instead of reporting a failed
+session open. A send carrying a kind the model cannot accept is refused before admission.
 
-Enabled `session.head.input` quotes a finished episode's next model from the in-memory catalog
+`session.head.input` reports a finished episode's next model's accepted input kinds and exact
+MIME types from the in-memory catalog
 and adapter MIME filter without changing the recorded config or fetching catalog data.
 Active resident heads use frozen facts published by the writer's durable metadata tap.
 Nonresident resumable heads cache the frozen facts by session, lineage and WAL sequence;
@@ -1652,13 +1665,13 @@ only a cold position requires a historical read. No stored head-projection shape
 
 Default reads keep media as text markers. `session.read` with `media: "blocks"` returns
 stored references; descriptors and history display rows expose refs rather than payload
-bytes. Enabled blocks reads include stored-content message/part identities for media-bearing
-entries. Default enabled model-view reads also use not-requested text markers; explicit
+bytes. Blocks reads include a digest of each media-bearing message and digests identifying
+each of its content parts. Default model-view reads also use not-requested text markers; explicit
 blocks mode keeps native media references. Provider rendering uses the frozen family's media profile; unsupported person input
 is refused before publication, including ChatGPT audio. Sessions holding media refuse
 agent-data moves before any cut or freeze because move transport currently carries WALs
 only. The existing Engram catalog already includes `media-durable` as a portable filetree
-and excludes temporary, retained and ephemeral media stores; enabling media needs no
+and excludes temporary, retained and ephemeral media stores; model-based admission needs no
 descriptor change.
 
 ### Provider-held calls
@@ -1926,6 +1939,10 @@ provider request bytes from the WAL. A readable session refused by admission is
 sealed `Interrupted` with the refusal reason. An unreadable newer-writer WAL is
 only logged at WARN with its session and missing features: no bytes or metadata
 are changed, and other sessions still resume.
+
+New episodes freeze image-only labeling for multipart image-notice text; older episodes keep
+their literal text projection on resume, while a new episode adopting the rule may rebuild its
+prompt cache once, like a renderer-version bump.
 
 Restart and authentication pauses diverge in the actor's `on_send`, `send_plain`,
 and `steer_submission` paths. Restart pauses answer keyed retries `paused`, queue

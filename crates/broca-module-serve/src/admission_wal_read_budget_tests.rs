@@ -101,7 +101,7 @@ async fn assert_media_free_sparse_resume_legacy_render_and_decode(with_tools: bo
         lengths: Default::default(),
         uploads: Default::default(),
     });
-    let materialized = stand_in.session_store.clone();
+    let materialized = stand_in.session_store.clone().unwrap();
     let executor = LiveLoopExecutor::new(
         store.clone(),
         materialized.clone(),
@@ -220,18 +220,19 @@ async fn assert_media_free_sparse_resume_legacy_render_and_decode(with_tools: bo
         1,
         "only the ordinary final materialization tail read is allowed"
     );
-    let eager_media_setup = usize::from(cfg!(feature = "test-attachments") && with_tools);
+    // Admission already captured the exact byte anchor. Resuming reuses it rather
+    // than sampling file identity or EOF again after dependency resolution.
     assert_eq!(
         after_resume.identities - after_setup.identities,
-        eager_media_setup
+        0
     );
     assert_eq!(
         after_resume.lengths - after_setup.lengths,
-        eager_media_setup
+        0
     );
     assert_eq!(
         after_resume.uploads - after_setup.uploads,
-        usize::from(cfg!(feature = "test-attachments"))
+        1
     );
     {
         let requests = http.requests.lock().unwrap();
@@ -270,7 +271,7 @@ async fn fresh_episode_admission_does_not_add_a_full_wal_read() {
     });
     let executor = Arc::new(LiveLoopExecutor::new(
         store.clone(),
-        stand_in.session_store.clone(),
+        stand_in.session_store.clone().unwrap(),
         stand_in.plane.clone(),
         Some("http://127.0.0.1:9".into()),
     ));

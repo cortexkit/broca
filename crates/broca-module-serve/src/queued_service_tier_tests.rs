@@ -48,7 +48,7 @@ async fn queued_ultrafast_restart_drains_through_the_real_executor_without_chang
     let (mut live, subc_server) = stand_in_executor(&root).await;
     live.provider_base_url = Some(http.url.clone());
     let wal_store = live.wal_store.clone();
-    let sessions = live.session_store.clone();
+    let sessions = live.session_store.clone().unwrap();
     let mut req = drift_request(&root);
     req.model = broca_protocol::ModelHandle::new("openai", "test-ultrafast");
     req.input = serde_json::from_value(serde_json::json!([

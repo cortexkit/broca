@@ -3849,6 +3849,8 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
         block => panic!("expected queued text payload, got {block:?}"),
     };
     let mut snapshot = PriorWalSnapshot {
+        lineage_id: None,
+        anchor: None,
         base_watermark: 0,
         head_seq: 0,
         tail: Arc::new(Vec::new()),
@@ -3922,6 +3924,8 @@ async fn prior_frames_snapshot_skips_reconstruct_read() {
     assert_eq!(store.read_count(), 1, "executor took one prior snapshot");
 
     let snapshot = PriorWalSnapshot {
+        lineage_id: None,
+        anchor: None,
         base_watermark: 0,
         head_seq: prior.last().map_or(0, |frame| frame.seq),
         checkpoint_at_head: AdmissionCheckpointV1::from_frames(&prior).expect("checkpoint"),
@@ -3978,6 +3982,8 @@ async fn stale_prior_frames_fall_back_to_reconstruct_read() {
         .expect("snapshot read succeeds");
     let stale_prefix = prior[..prior.len().saturating_sub(1)].to_vec();
     let stale_snapshot = PriorWalSnapshot {
+        lineage_id: None,
+        anchor: None,
         base_watermark: 0,
         head_seq: stale_prefix.last().map_or(0, |frame| frame.seq),
         checkpoint_at_head: AdmissionCheckpointV1::from_frames(&stale_prefix)

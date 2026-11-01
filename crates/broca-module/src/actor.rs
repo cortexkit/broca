@@ -44,6 +44,10 @@ use tokio_util::sync::CancellationToken;
 use crate::executor::{RunExecutor, RunJob, RunKind};
 use crate::registry::{ActorHandle, CloseToken, LineageKey, RegistryHandle};
 
+mod account_limit_pause;
+#[cfg(all(test, feature = "test-clock"))]
+#[path = "account_limit_pause_tests.rs"]
+mod account_limit_pause_tests;
 #[path = "writer_reclaim.rs"]
 pub mod writer_reclaim;
 
@@ -1469,6 +1473,7 @@ pub struct LineageActor<W: WalStore> {
     /// Startup exhausted its bounded recovery retries without proving the durable queue state.
     /// Mutating admission must recover this state before it can use the in-memory queue view.
     startup_recovery_pending: bool,
+    account_limit_timer: Option<account_limit_pause::TimedPause>,
     /// Idle admission view loaded at actor open or after the previous run's terminal barrier.
     prior_snapshot: Option<PriorWalSnapshot>,
     ceiling_drain_held: bool,
@@ -1559,6 +1564,7 @@ pub struct LineageActor<W: WalStore> {
     /// kept current with `retracted_submissions`. A keyed retry must carry the same order.
     ordered_submissions: HashMap<broca_protocol::SubmissionId, broca_protocol::DeliveryOrder>,
     restart_admitting: bool,
+    deferred_restart_settings: std::collections::VecDeque<LineageCmd>,
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
     /// Set while startup restart recovery drives the admission, because that branch answers
     /// parked `restart_waiters` itself once it knows the episode's outcome.
@@ -1752,10 +1758,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         run_index: Option<Arc<dyn broca_core::RunIndex>>,
         admission_reader: Arc<dyn broca_core::context::AdmissionReader>,
     ) -> ActorHandle {
-        Self::spawn_holding(
+        Self::spawn_with_readers(
             key,
             gen,
-            ActorTenure::Lease(lease),
+            Some(lease),
             writer,
             executor,
             wal_store,
@@ -1767,6 +1773,43 @@ impl<W: WalStore + 'static> LineageActor<W> {
             None,
             None,
             Some(admission_reader),
+        )
+    }
+
+    /// Attach format-selected readers after the existing writer recovery path.
+    /// A missing lease means the writer already owns the session tenure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_readers(
+        key: LineageKey,
+        gen: u64,
+        lease: Option<Box<dyn LeaseHandle>>,
+        writer: Arc<WalHandle>,
+        executor: Arc<dyn RunExecutor>,
+        wal_store: Arc<W>,
+        registry: RegistryHandle,
+        idle_ttl: Duration,
+        fanout: crate::fanout::Fanout<W>,
+        run_index: Option<Arc<dyn broca_core::RunIndex>>,
+        materialized_store: Option<Arc<dyn broca_core::SessionStore>>,
+        export_index: Option<Arc<dyn broca_core::ExportIndex>>,
+        charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
+        admission_reader: Option<Arc<dyn broca_core::context::AdmissionReader>>,
+    ) -> ActorHandle {
+        Self::spawn_holding(
+            key,
+            gen,
+            lease.map_or(ActorTenure::InWriter, ActorTenure::Lease),
+            writer,
+            executor,
+            wal_store,
+            registry,
+            idle_ttl,
+            fanout,
+            run_index,
+            materialized_store,
+            export_index,
+            charge_basis_resolver,
+            admission_reader,
         )
     }
 
@@ -1835,6 +1878,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             export_index,
             charge_basis_resolver,
             startup_recovery_pending: false,
+            account_limit_timer: None,
             prior_snapshot: None,
             ceiling_drain_held: false,
             compaction_watch: Default::default(),
@@ -1865,6 +1909,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             delivered_submissions: HashMap::new(),
             ordered_submissions: HashMap::new(),
             restart_admitting: false,
+            deferred_restart_settings: Default::default(),
             restart_waiters: Vec::new(),
             restart_recovery_owns_waiters: false,
             resuming_for_late_result: false,
@@ -2079,6 +2124,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
             };
             let tick = tokio::time::sleep_until(idle_deadline);
+            let timed_pause = self.account_limit_timer.clone().filter(|_| {
+                matches!(self.state, RunState::Idle)
+                    && self.registry.restart_resume_ready()
+                    && !self.registry.is_stopping()
+            });
+            let account_wake = async {
+                match timed_pause.as_ref() {
+                    Some(pause) => {
+                        tokio::time::sleep(Duration::from_millis(
+                            pause.resume_not_before_ms.saturating_sub(clock.now_ms()),
+                        ))
+                        .await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 biased;
                 _ = seal.cancelled() => {
@@ -2117,6 +2178,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     }
                     if self.close_finished_one_shot().await {
                         return;
+                    }
+                }
+                _ = account_wake => {
+                    if let Some(pause) = timed_pause.clone() {
+                        if let Err(error) = self.wake_account_limit(pause).await {
+                            self.account_limit_timer = None;
+                            self.startup_recovery_pending = true;
+                            tracing::warn!(target: "lifecycle", "account-limit wake deferred to WAL recovery: {error}");
+                        }
                     }
                 }
                 _ = tick => {
@@ -2190,10 +2260,110 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .await
     }
 
-    /// Dispatch ONE command. Shared by the live `recv` arm and the pre-close drain.
-    /// Returns true when an active run ended without a durable terminal and this actor generation
-    /// must exit so the next generation recovers from the WAL before serving more work.
+    fn discard_stale_admission_view(&mut self) {
+        if self.prior_snapshot.as_ref().is_some_and(|snapshot| {
+            self.writer.as_ref().is_none_or(|writer| {
+                writer.next_record_seq() != snapshot.head_seq.saturating_add(1)
+            })
+        }) {
+            self.prior_snapshot = None;
+        }
+    }
+
+    /// Dispatch one command through the live receive arm or the pre-close drain.
+    /// Return true when an undurable run exit requires a new actor generation to recover the WAL.
     async fn handle_cmd(&mut self, cmd: LineageCmd) -> bool {
+        // Idle commands and delegated warm/recovery work can advance the writer without
+        // starting an episode. Keep a cached admission view only while its head still matches.
+        self.discard_stale_admission_view();
+        // The executor already owns its resume snapshot while dependencies are unresolved.
+        // Postpone session-change metadata writes, without changing run-control handling.
+        if self.restart_admitting && Self::defer_restart_command(&cmd) {
+            if let Some(error) = self.observe_writer_poison() {
+                return self.reply_writer_poisoned(cmd, error);
+            }
+            // Bound only settings, never the normal command lane: cancellation, steering
+            // and status must remain available while dependency admission is suspended.
+            if self.deferred_restart_settings.len() >= self.rx.max_capacity() {
+                match cmd {
+                    LineageCmd::SessionRefresh { reply, .. } => {
+                        let _ = reply.send(SessionRefreshOutcome::Error(
+                            "session.refresh deferred settings are full; retry after admission"
+                                .into(),
+                        ));
+                    }
+                    LineageCmd::SessionRefreshPolicy { reply, .. } => {
+                        let _ = reply.send(SessionRefreshPolicyOutcome::Error("session.refresh_policy deferred settings are full; retry after admission".into()));
+                    }
+                    LineageCmd::SessionFlushPrefix { reply, .. } => {
+                        let _ = reply.send(SessionFlushPrefixOutcome::Error("session.flush_prefix deferred settings are full; retry after admission".into()));
+                    }
+                    _ => unreachable!("only settings are deferred"),
+                }
+            } else {
+                self.deferred_restart_settings.push_back(cmd);
+            }
+            return false;
+        }
+        if !self.restart_admitting {
+            Box::pin(self.apply_deferred_restart_settings()).await;
+        }
+        let exit = self.handle_cmd_inner(cmd).await;
+        self.discard_stale_admission_view();
+        exit
+    }
+
+    fn defer_restart_command(cmd: &LineageCmd) -> bool {
+        matches!(
+            cmd,
+            LineageCmd::SessionRefresh { .. }
+                | LineageCmd::SessionRefreshPolicy { .. }
+                | LineageCmd::SessionFlushPrefix { .. }
+        )
+    }
+
+    async fn apply_deferred_restart_settings(&mut self) {
+        while let Some(cmd) = self.deferred_restart_settings.pop_front() {
+            self.discard_stale_admission_view();
+            if let Some(error) = self.observe_writer_poison() {
+                self.reply_writer_poisoned(cmd, error);
+            } else if self.writer.is_none() {
+                Self::reply_retired(cmd);
+            } else {
+                // These commands were received before teardown/expiry was selected. Use
+                // their ordinary typed handlers without re-entering lifecycle dispatch.
+                match cmd {
+                    LineageCmd::SessionRefresh {
+                        generation,
+                        policy,
+                        manifest,
+                        reply,
+                    } => {
+                        let _ =
+                            reply.send(self.on_session_refresh(generation, policy, manifest).await);
+                    }
+                    LineageCmd::SessionRefreshPolicy {
+                        generation,
+                        policy,
+                        send_id,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            self.on_session_refresh_policy(generation, policy, send_id)
+                                .await,
+                        );
+                    }
+                    LineageCmd::SessionFlushPrefix { send_id, reply } => {
+                        let _ = reply.send(self.on_session_flush_prefix(send_id).await);
+                    }
+                    _ => unreachable!("only settings are deferred"),
+                }
+            }
+            self.discard_stale_admission_view();
+        }
+    }
+
+    async fn handle_cmd_inner(&mut self, cmd: LineageCmd) -> bool {
         if let LineageCmd::CutLock { reply, mode } = cmd {
             let busy = if matches!(self.state, RunState::Active { .. }) {
                 Some("run_active".into())
@@ -2476,6 +2646,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 } else {
                     Ok(false)
                 };
+                // Applying or refusing a view can append a notice too. The next send must
+                // not depend on a separate queue-wake command to observe those durable records.
+                self.discard_stale_admission_view();
                 // An applied compaction view is a real frozen-prefix rebuild for a pending
                 // `on_prefix_rebuild` change: the next run applies it. A new run alone is not.
                 if matches!(result, Ok(true)) {
@@ -2793,7 +2966,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(error) => Err(format!("session move check failed: {error}")),
             };
         }
-        self.recover_durable_work_inner().await?;
+        // Recovery can be polled beneath command/admission handling on a worker's
+        // small stack. Keep its large replay/admission future off those caller frames.
+        Box::pin(self.recover_durable_work_inner()).await?;
         if self.registry.has_recovery_debt(&self.key) {
             // A readable replay alone cannot discharge a failed fsync. Prove the recovered
             // session durable before clearing only its debt; keep the historical failure event.
@@ -2910,6 +3085,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
         let tail_resolution = tail_prior.resolution;
 
+        if episode_disposition == EpisodeDisposition::Paused
+            && episode_pause_reason == Some(broca_protocol::PauseReason::AccountLimit)
+            && matches!(
+                tail_resolution,
+                broca_core::ReplayResolution::Interrupted { .. }
+            )
+        {
+            self.write_interrupted_seal(None, SealCause::CrashOrphan)
+                .await?;
+            self.refresh_admission_view().await?;
+            return self.drain_queue_one().await;
+        }
+
         // The terminal run index cannot identify a crash that happened before its own update.
         // Reopening the affected lineage closes that earlier WAL-to-index window directly from
         // the authoritative finished episode. Repeated emission is safe by immutable fact_id.
@@ -3024,6 +3212,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 Err(error) => Err(error.to_string()),
             };
+        }
+
+        if episode_disposition == EpisodeDisposition::Paused
+            && episode_pause_reason == Some(broca_protocol::PauseReason::AccountLimit)
+        {
+            return self.arm_account_limit().await;
         }
 
         if episode_disposition == EpisodeDisposition::Paused
@@ -3751,6 +3945,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                             state.pause_reason,
                             Some(
                                 broca_protocol::PauseReason::Restart
+                                    | broca_protocol::PauseReason::AccountLimit
                                     | broca_protocol::PauseReason::ToolHeld
                             )
                         ) =>
@@ -4040,17 +4235,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if !resume_indexed_run {
             match delivery {
                 broca_protocol::Delivery::Queue => {
-                    // A paused session is not idle, although no run is in flight. Admitted as a
-                    // run, a new message would only re-drive the paused episode (which renders
-                    // nothing until its pause is resolved) and its input would be recorded
-                    // nowhere; queued, it would wait behind a run nothing is going to end. So
-                    // it is refused before anything is written, like a steer. The paused run's
-                    // own retry has this run id and is not refused: it resumes the run.
+                    // A paused episode still owns the session. Unrelated input must neither
+                    // re-drive it nor be silently queued behind an authentication or account
+                    // wait. Its own authorized continuation keeps the original run id.
                     if matches!(self.state, RunState::Idle) {
                         match self.paused_run().await {
                             Ok(Some((paused, reason)))
                                 if paused != run_id
-                                    && reason == broca_protocol::PauseReason::AuthRequired =>
+                                    && matches!(
+                                        reason,
+                                        broca_protocol::PauseReason::AuthRequired
+                                            | broca_protocol::PauseReason::AccountLimit
+                                    ) =>
                             {
                                 return SendOutcome::RunPaused {
                                     run_id: paused,
@@ -4108,6 +4304,20 @@ impl<W: WalStore + 'static> LineageActor<W> {
     ) -> SendOutcome {
         if matches!(self.state, RunState::Idle) && !resume_indexed_run {
             match self.paused_run().await {
+                Ok(Some((paused, reason @ broca_protocol::PauseReason::AccountLimit))) => {
+                    return if paused == run_id {
+                        SendOutcome::Paused {
+                            run_id,
+                            reason,
+                            delivered: None,
+                        }
+                    } else {
+                        SendOutcome::RunPaused {
+                            run_id: paused,
+                            reason,
+                        }
+                    };
+                }
                 Ok(Some((
                     paused,
                     reason @ (broca_protocol::PauseReason::Restart
@@ -4824,6 +5034,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             request_identity_digest: request_identity_digest.clone(),
             tools_were_omitted,
         };
+        // A command can queue/cancel work and start its successor in the same actor turn.
+        self.discard_stale_admission_view();
         if self.prior_snapshot.is_none() {
             if let Err(error) = self.refresh_admission_view().await {
                 return Err(StartRunFailure::Infrastructure(error));
@@ -5220,6 +5432,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // nothing new, so it usually leaves before the seal has to cut it.
             stop_requested: Some(self.registry.stopping_signal()),
             steer: Some(Arc::clone(&steer)),
+            live_steer_after_seq: Some(prior_snapshot.head_seq),
             manifest: manifest.clone(),
             manifest_system_override: self.session_change.applied_generation > 0
                 || (!resuming && self.pending_for_model(&req.model).is_some()),
@@ -5409,6 +5622,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Ok(Err(error)) => Err(StartRunFailure::Admission(error)),
                     Err(_) => Err(StartRunFailure::Infrastructure("run ended before admission".into())),
                 },
+                // Only the separate settings FIFO is bounded; run control stays responsive.
                 Some(command) = self.rx.recv(), if restart_resuming => {
                     // Commands are served while a restart-paused episode waits for its
                     // dependencies, so this one runs inside the suspended admission. Its exit
@@ -5429,6 +5643,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         };
         self.restart_admitting = false;
+        if admission.is_err() && !matches!(&admission, Err(StartRunFailure::Shutdown)) {
+            if let Some(RunState::Active { handle, .. }) = pending_active.take() {
+                handle.abort();
+                let _ = handle.await;
+            } else {
+                self.stop_active_run().await;
+                self.set_idle();
+            }
+        }
+        // The suspended admission owns this FIFO. Apply it before returning to any caller
+        // that can admit a queued successor, including refusal and shutdown recovery. A
+        // refused task has already stopped, so typed settings replies do not call it active.
+        Box::pin(self.apply_deferred_restart_settings()).await;
         // `ResumeRestart` requests that arrived during this admission were parked because it
         // was already resuming the episode. Every path into restart admission must answer them
         // once it ends (a cancel or interrupt finalizer, a queued drain, a cancel recovery),
@@ -5450,16 +5677,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // Shutdown leaves the restart task in self.state so seal_for_shutdown
             // can stop and join it before durably recording the episode's end.
             Err(StartRunFailure::Shutdown) => return Err(StartRunFailure::Shutdown),
-            Err(error) => {
-                if let Some(RunState::Active { handle, .. }) = pending_active.take() {
-                    handle.abort();
-                    let _ = handle.await;
-                } else {
-                    self.stop_active_run().await;
-                    self.set_idle();
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
 
         if admits_the_session {
@@ -6039,12 +6257,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
         let expired = order.expired_at(self.ordered_now_ms());
-        // Like a plain queued send, a send that may start a run is refused on a session paused
-        // for re-authentication: it would wait behind a run nothing is going to end.
+        // Like a plain queued send, unrelated ordered work cannot take ownership from a run
+        // paused for authentication or an account reset.
         if order.starts_runs() && matches!(self.state, RunState::Idle) {
             match self.paused_run().await {
                 Ok(Some((paused, reason)))
-                    if reason == broca_protocol::PauseReason::AuthRequired =>
+                    if matches!(
+                        reason,
+                        broca_protocol::PauseReason::AuthRequired
+                            | broca_protocol::PauseReason::AccountLimit
+                    ) =>
                 {
                     return SendOutcome::RunPaused {
                         run_id: paused,
@@ -7687,6 +7909,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let _ = self.sync_retention_index().await;
         let should_emit_usage = index_state.is_terminal();
         self.set_idle();
+        self.account_limit_timer = None;
         // Only a terminal ends a one-shot's business with this session; a pause stays resumable.
         self.close_after_one_shot = skip_materialization && index_state.is_terminal();
         if owed {
@@ -7712,6 +7935,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
         } else {
             match self.refresh_admission_view().await {
                 Ok(()) => {
+                    if summary.paused == Some(broca_protocol::PauseReason::AccountLimit) {
+                        if let Err(error) = self.arm_account_limit().await {
+                            self.startup_recovery_pending = true;
+                            tracing::warn!(target: "lifecycle", "account-limit timer rebuild deferred: {error}");
+                        }
+                    }
                     if let Err(error) = self.drain_queue_one().await {
                         tracing::warn!(target: "admission", "queued-run drain deferred: {error}");
                     }
@@ -7743,6 +7972,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     }
 
     async fn drain_queue_one_inline(&mut self) -> Result<(), String> {
+        Box::pin(self.apply_deferred_restart_settings()).await;
         if self.registry.is_stopping() {
             return Ok(());
         }
@@ -8002,6 +8232,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if self.startup_recovery_pending {
             reasons.push("startup_recovery");
         }
+        if self.account_limit_timer.is_some() {
+            reasons.push("account_limit_pause");
+        }
         reasons
     }
 
@@ -8249,6 +8482,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// appends. The registry returns false at its total deadline; process exit then ends those
     /// tasks and threads and leaves the WAL authoritative for the next boot's recovery.
     async fn seal_for_shutdown(&mut self) {
+        self.account_limit_timer = None;
         self.finish_restart_waiters(Err("shutdown interrupted restart admission".into()));
         let seal_deadline = tokio::time::Instant::now() + SHUTDOWN_SEAL_BOUND;
         let active = matches!(self.state, RunState::Active { .. });
@@ -8887,6 +9121,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// rest of its teardown is done and drops it where it would drop an actor-held lease,
     /// so both tenure kinds release at the same point of the close.
     async fn shutdown_writer(&mut self) -> WriterClosed {
+        Box::pin(self.apply_deferred_restart_settings()).await;
         if let Some(task) = self.source_warm_task.take() {
             task.stop().await;
         }
@@ -9361,6 +9596,38 @@ impl<W: WalStore + 'static> LineageActor<W> {
         )
         .await
         .map_err(|error| format!("admission snapshot task failed: {error}"))??;
+        let writer = self
+            .writer
+            .as_ref()
+            .expect("writer live while loading admission");
+        if snapshot.lineage_id.is_none() {
+            snapshot.lineage_id = writer.lineage_id().map(|lineage| lineage.to_string());
+        }
+        if snapshot.anchor.is_none()
+            && matches!(
+                &snapshot.checkpoint_at_head.media,
+                Some(broca_core::media_request::DurableMediaSeed::Ready(_))
+            )
+        {
+            let anchor = self
+                .wal_store
+                .file_identity(&self.key)
+                .ok()
+                .flatten()
+                .zip(self.wal_store.live_wal_bytes(&self.key).ok().flatten())
+                .map(|(file_id, byte_end)| broca_wal::WalByteAnchor {
+                    file_id,
+                    byte_end,
+                    seq: safe_head,
+                });
+            // A complete read carries no byte offset. Metadata can supply one only
+            // while no append has advanced its selected cut; never relabel a newer EOF.
+            if writer.next_record_seq() == safe_head.saturating_add(1)
+                && writer.durable_head().load(Ordering::Acquire) == safe_head
+            {
+                snapshot.anchor = anchor;
+            }
+        }
         // Run reconstruction never reads the durable pending queue. Move its allocation into the
         // actor's queue state before sharing the slim checkpoint with executor/core clones.
         let mut pending_fifo = snapshot.take_pending_fifo();
@@ -14576,7 +14843,8 @@ mod tests {
             std::mem::size_of::<Fut>()
         }
         type Actor = LineageActor<FileWalStore>;
-        let recovery = future_size(Actor::recover_durable_work);
+        // Recovery orchestration also heap-owns replay now, so its small future is
+        // no longer a useful relative benchmark for the other control entries.
         for (name, size) in [
             (
                 "recover_startup_admission_view",
@@ -14586,9 +14854,8 @@ mod tests {
             ("start_run", future_size_6(Actor::start_run)),
         ] {
             assert!(
-                size * 4 < recovery,
-                "{name} is carried inline in its callers: {size} bytes, recovery itself is \
-                 {recovery} bytes"
+                size <= 4096,
+                "{name} carries {size} bytes in its callers; keep replay/admission state on the heap"
             );
         }
     }

@@ -54,7 +54,12 @@ impl OverhaulDb {
                 .query_row(
                     "SELECT indexed_seq,lineage_id FROM session WHERE sid=?1",
                     [&key],
-                    |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)),
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<u64>>(0)?.unwrap_or(0),
+                            r.get::<_, String>(1)?,
+                        ))
+                    },
                 )
                 .optional()?)
         })?;
@@ -288,6 +293,9 @@ impl DatabaseEpisodeReader {
     }
 
     pub fn read_model_page(&self, request: &ModelPageRequest) -> Result<EpisodeModelPage, DbError> {
+        if self.sequence() == 0 {
+            return self.full_model_page(request, None);
+        }
         let key = super::index::sid(&self.session)?;
         let result = self.db.read_snapshot(|tx| {
             let mut snapshot = self.snapshot_in(tx,&key,true)?;
@@ -308,7 +316,9 @@ impl DatabaseEpisodeReader {
         });
         match result {
             Ok(result) => Ok(result),
-            Err(DbError::SeedFallback(reason)) => self.full_model_page(request, reason.reason),
+            Err(DbError::SeedFallback(reason)) => {
+                self.full_model_page(request, Some(reason.reason))
+            }
             Err(error) => Err(error),
         }
     }
@@ -316,7 +326,7 @@ impl DatabaseEpisodeReader {
     fn full_model_page(
         &self,
         request: &ModelPageRequest,
-        reason: &'static str,
+        reason: Option<&'static str>,
     ) -> Result<EpisodeModelPage, DbError> {
         let records = self.complete_read()?;
         let mut page = broca_core::read_session_model_page(
@@ -329,7 +339,7 @@ impl DatabaseEpisodeReader {
         page.lineage_id = Some(self.publication.lineage().to_string());
         Ok(EpisodeModelPage {
             page,
-            fallback: Some(reason),
+            fallback: reason,
         })
     }
 
@@ -338,6 +348,9 @@ impl DatabaseEpisodeReader {
         &self,
         at: u64,
     ) -> Result<Option<(IndexedEpisode, Option<EpisodeSeed>)>, DbError> {
+        if self.sequence() == 0 {
+            return Ok(None);
+        }
         let key = super::index::sid(&self.session)?;
         self.db.read_snapshot(|tx| {
             let lineage: String = tx.query_row("SELECT lineage_id FROM session WHERE sid=?1",[&key],|r|r.get(0))?;

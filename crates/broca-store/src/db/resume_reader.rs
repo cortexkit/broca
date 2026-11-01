@@ -75,7 +75,13 @@ fn snapshot(
         .query_row(
             "SELECT tail_seed,lineage_id,indexed_seq FROM session WHERE sid=?1",
             [&key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<u64>>(2)?.unwrap_or(0),
+                ))
+            },
         )
         .optional()
         .map_err(sql)?;
