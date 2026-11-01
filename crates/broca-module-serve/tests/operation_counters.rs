@@ -41,7 +41,6 @@ const MANAGEMENT_OPERATIONS: &[&str] = &[
     "session.warm",
     "vault.audit",
     "session.subscribe",
-    "session.media_read",
     // Served only on routes opened for the classifier role, and counted like the others.
     "classify.run",
     // Served only on tool-provider routes for the sessionless model tools.
