@@ -155,10 +155,6 @@ pub fn gather_with_reader(
         unmapped_credentials: crate::account_routing::published_unmapped_credentials(),
         rings: [
             (
-                "session_log_missing".into(),
-                crate::session_address_health::missing_snapshot(since, now),
-            ),
-            (
                 "session_inventory_repairs".into(),
                 crate::session_address_health::repair_snapshot(since, now),
             ),
@@ -745,7 +741,7 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
                     code,
                 } in snapshot.events
                 {
-                    let key = if check == "tool_outages" || check == "session_log_missing" {
+                    let key = if check == "tool_outages" {
                         module.clone()
                     } else if check == "catalog_stale" {
                         "refusals".into()
@@ -765,11 +761,6 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
                             f.severity = if code == "failed" { Severity::Error } else { Severity::Info };
                             f.summary = format!("Session inventory repairs {} in the observed window.", code);
                             f.hint = "Inspect health.check session_address_refusals.repairs and the session-ref migration log; known sessions remain available during repair.".into();
-                        }
-                        if check == "session_log_missing" {
-                            f.severity = Severity::Error;
-                            f.summary = format!("Session {} has history but its log is missing.", module);
-                            f.hint = "Stop broca and inspect store-maintenance repair-session-root; do not create a replacement log.".into();
                         }
                         f.count=0;f
                     });

@@ -14,7 +14,6 @@ pub(super) fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             expired_at_ms INTEGER
          );
          CREATE UNIQUE INDEX IF NOT EXISTS retention_progress_live ON retention_progress(session) WHERE expired_at_ms IS NULL;
-         CREATE INDEX IF NOT EXISTS retention_progress_session ON retention_progress(session,lineage_id);
          CREATE INDEX IF NOT EXISTS retention_progress_deadline ON retention_progress(expires_at_ms,lineage_id) WHERE expires_at_ms IS NOT NULL;
          CREATE TABLE IF NOT EXISTS retention_run (
             run_id TEXT PRIMARY KEY, lineage_id TEXT NOT NULL REFERENCES retention_progress(lineage_id),
@@ -24,7 +23,6 @@ pub(super) fn initialize(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS retention_run_lineage ON retention_run(lineage_id);
          CREATE INDEX IF NOT EXISTS retention_run_discovery ON retention_run(lineage_id) WHERE withdrawals_owed=1;
          CREATE TABLE IF NOT EXISTS retention_deletion (lineage_id TEXT PRIMARY KEY, session TEXT NOT NULL);
-         CREATE INDEX IF NOT EXISTS retention_deletion_session ON retention_deletion(session,lineage_id);
          CREATE TABLE IF NOT EXISTS retention_withdrawal (
             lineage_id TEXT NOT NULL, session TEXT NOT NULL, call_key TEXT NOT NULL,
             scope_json TEXT NOT NULL, elicitation_id TEXT, provider_id TEXT NOT NULL,
@@ -32,7 +30,6 @@ pub(super) fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             state TEXT NOT NULL CHECK(state IN ('ready','id_unknown','scope_unknown')),
             PRIMARY KEY(lineage_id,call_key)
          );
-         CREATE INDEX IF NOT EXISTS retention_withdrawal_session ON retention_withdrawal(session,lineage_id);
          CREATE TABLE IF NOT EXISTS retention_withdrawal_stop (
             lineage_id TEXT NOT NULL, call_key TEXT NOT NULL, reason TEXT NOT NULL,
             PRIMARY KEY(lineage_id,call_key)
