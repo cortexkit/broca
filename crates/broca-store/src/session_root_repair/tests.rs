@@ -9,6 +9,9 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 #[path = "one_wrong_root_tests.rs"]
 mod one_wrong_root;
 
+#[path = "legacy_run_tests.rs"]
+mod legacy_runs;
+
 struct Fixture {
     root: PathBuf,
     store: SqliteStore,

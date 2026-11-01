@@ -346,7 +346,7 @@ fn plan(conn: &Connection, root: &Path, harness: &str, session: &str) -> Result<
                 )?
                 .missing_history()
                 {
-                    return Err("real_log_not_found: no independently recorded root has a matching historical lineage".into());
+                    return Err("real_log_not_found: no independently recorded root contains every recorded run ID".into());
                 }
                 return Ok(result);
             }
@@ -795,14 +795,6 @@ fn prove_stub_aside(root: &Path, stale: &BindIdentity, live: &BindIdentity) -> R
     let real = wal
         .resolve_live_path(live)?
         .ok_or("real_log_not_live_for_stub: last-write proof requires a live real log")?;
-    let real_lineage = wal
-        .read_records_range(live, 0, None, None)?
-        .lineage_id
-        .ok_or("real_log_lineage_unproven")?
-        .to_string();
-    if lineage == real_lineage {
-        return Err("stub_lineage_not_forked: refusing a matching lineage".into());
-    }
     // Modification time alone cannot prove when the stub was created.
     let created = meta
         .created()

@@ -12,6 +12,7 @@ pub mod indexes;
 pub struct SessionLogEvidence {
     pub content: bool,
     pub removed: bool,
+    pub has_runs: bool,
     pub lineages: std::collections::BTreeSet<String>,
 }
 
@@ -57,9 +58,9 @@ impl SqliteStore {
 }
 
 /// Shared by serving and the offline audit. The byte length only avoids probing
-/// ordinary logs: a forked stub requires a verified, record-free WAL and a lineage
-/// different from recorded history. A new subscriber's first lineage remains
-/// legitimate, as does a fresh lineage after proven deliberate removal.
+/// ordinary logs: a forked stub has a verified lineage frame but no run_started
+/// records to cover the identity's recorded runs. A new subscriber's first
+/// lineage remains legitimate, as does a fresh lineage after proven removal.
 /// Evidence is loaded lazily so the filesystem fast path never locks the store's
 /// database connection. Offline callers can reuse their existing read snapshot.
 pub(crate) fn log_state(
@@ -96,7 +97,13 @@ pub(crate) fn log_state(
     if let (broca_wal::WalRangeRecords::Complete(records), Some(lineage)) =
         (range.records(), range.lineage_id)
     {
-        if records.is_empty() && history.lineages.iter().any(|id| id != &lineage.to_string()) {
+        // A lineage-only log has zero run IDs. One indexed EXISTS proves that
+        // none of the recorded runs is covered, without loading a per-run set.
+        // Metadata-only imports without run-index rows keep their existing
+        // lineage fence; run-backed sessions never require lineage evidence.
+        let uncovered =
+            history.has_runs || history.lineages.iter().any(|id| id != &lineage.to_string());
+        if records.is_empty() && uncovered {
             return Ok(SessionLogState::ForkedStub);
         }
     }
@@ -305,8 +312,26 @@ pub(crate) fn evidence(
     Ok(SessionLogEvidence {
         content,
         removed: removed && !unremoved_run,
+        has_runs: runs,
         lineages,
     })
+}
+
+pub(crate) fn recorded_run_ids(
+    conn: &Connection,
+    session: &BindIdentity,
+) -> Result<std::collections::BTreeSet<String>, EvidenceError> {
+    let mut query = conn.prepare(&format!("SELECT run_id FROM run_index INDEXED BY {} WHERE json_valid(session) AND json_extract(session,'$.project_root')=?1 AND json_extract(session,'$.harness')=?2 AND json_extract(session,'$.session')=?3", indexes::RUNS))?;
+    let rows = query.query_map(
+        params![
+            session.project_root.to_string_lossy(),
+            session.harness,
+            session.session
+        ],
+        |row| row.get(0),
+    )?;
+    let ids = rows.collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
 }
 
 /// Seek past the previous value instead of visiting every duplicate entry.

@@ -27,9 +27,11 @@ materialized projection/meta row, covered log census entry, or deletion
 ledger/tombstone for the exact key is content evidence. When that evidence exists
 but neither a live log nor an archive member is available, reads and actor-opening
 operations refuse `session_log_missing` (`detail.class: "permanent"`) unless removal
-is proven deliberate. The same refusal applies to a verified lineage-only log
-whose lineage differs from unexpired historical run or projection evidence.
-File length is only a probe prefilter, never the lineage proof; ordinary
+is proven deliberate. A verified lineage-only log cannot cover any recorded run:
+if run-index rows exist for the identity, their run IDs are absent from its
+`run_started` records, so it receives the same refusal even when lineage is NULL
+on either side. Metadata-only imports without run rows retain their existing
+lineage fence. File length is only a probe prefilter, never the history proof; ordinary
 content-bearing logs take no additional content read. The refusal names the session and
 `store-maintenance repair-session-root`; it never guesses an address from the
 route's current folder. Expired reads keep `expired`; move fences keep
@@ -219,11 +221,15 @@ expiry records prove removal. The canonical `.moved` ownership marker excludes
 content owned by another machine, as described under **Read and send fencing**.
 
 Each finding includes the reference and bind identity, the state (`missing` or
-`forked_stub`), and any alternate logs with a matching recorded lineage. Candidate
+`forked_stub`), and any alternate logs that contain every recorded run ID for the
+identity in their `run_started` records. Lineage IDs are optional provenance,
+not a prerequisite for this run-backed match. Candidate
 root names must already be recorded in the store; log addresses cannot be
 reversed into folder names, and the audit never guesses from a caller's current
-folder. Without historical lineage evidence it reports a missing address without
-claiming a matching alternate. It retains compact address/root sets and streams
+folder. A root whose log contains only some recorded runs is not an alternative.
+No alternative leaves the finding unrepaired; several alternatives refuse repair
+as ambiguous. Existing lineage-based discovery for metadata-only imports without
+run rows is unchanged. It retains compact address/root sets and streams
 references, rather than loading a join of the run history into memory. Findings
 are evidence for repair preview, not permission to merge transcripts.
 
@@ -263,15 +269,16 @@ without schema initialization or leases.
 
 Repair requires a complete inventory and either two recorded project roots for
 the same `(harness, session)` with one surviving log, or one wrong-root reference
-with a root recorded in another inventory entry or run row whose log matches
-historical lineage evidence. The `audit-session-refs` helper checks these recorded
-root candidates and verifies their logs' lineages; it never takes a root from the
+with a root recorded in another inventory entry or run row whose log contains
+every recorded run ID. The `audit-session-refs` helper checks these recorded
+root candidates and verifies complete run-ID coverage; it never takes a root from the
 repair request's current folder. A lineage-only fork at
 the stale address is permitted only with all of these additional proofs:
 
 - its verified log has a lineage frame and no records or other bytes;
-- its lineage differs from the verified real log, whose lineage must match any
-  recorded run lineage and the existing projection evidence;
+- the verified real log contains all recorded runs; NULL row lineage and an
+  unidentified legacy log do not prevent matching. Existing non-NULL run and
+  projection lineage safeguards still apply when present;
 - the filesystem proves the stub was **created after** the real live log's last
   write. Modification time alone is not creation proof. Unavailable creation time
   refuses as `stub_creation_time_unavailable`; an archived real log cannot supply

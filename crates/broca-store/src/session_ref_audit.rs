@@ -16,7 +16,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 pub struct AlternateLog {
     pub identity: BindIdentity,
     pub address: String,
-    pub lineage_id: String,
+    pub lineage_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,12 +108,9 @@ pub(crate) fn alternate_logs(
     addresses: &BTreeSet<String>,
     roots: &BTreeSet<String>,
 ) -> Result<Vec<AlternateLog>> {
-    let evidence = session_log_evidence::evidence(conn, identity)?;
-    if evidence.lineages.is_empty() {
-        return Ok(Vec::new());
-    }
     let wal = FileWalStore::new(root.join("wal"));
     let mut found = Vec::new();
+    let mut expected = None;
     for project_root in roots {
         if project_root.as_str() == identity.project_root.to_string_lossy().as_ref() {
             continue;
@@ -124,17 +121,38 @@ pub(crate) fn alternate_logs(
         if !addresses.contains(&address) {
             continue;
         }
-        let range = wal.read_records_range(&candidate, 0, None, None)?;
-        let Some(lineage) = range.lineage_id else {
-            continue;
-        };
-        let lineage = lineage.to_string();
-        if !evidence.lineages.contains(&lineage) {
-            continue;
+        // Most missing refs have no candidate file. Load the indexed run set
+        // only when an independently recorded root actually has a log to check.
+        if expected.is_none() {
+            expected = Some(session_log_evidence::recorded_run_ids(conn, identity)?);
         }
+        let required = expected.as_ref().unwrap();
+        let range = wal.read_records_range(&candidate, 0, None, None)?;
+        let lineage = range.lineage_id.map(|id| id.to_string());
         let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
             return Err("alternate_log_incomplete".into());
         };
+        let observed: BTreeSet<_> = records
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                broca_wal::WalRecord::RunStarted { run_id, .. } => Some(run_id.0.clone()),
+                _ => None,
+            })
+            .collect();
+        if !required.is_subset(&observed) {
+            continue;
+        }
+        if required.is_empty() {
+            // Preserve discovery for older metadata-only imports that have no
+            // run-index rows: their existing lineage proof is still required.
+            let evidence = session_log_evidence::evidence(conn, identity)?;
+            if !lineage
+                .as_ref()
+                .is_some_and(|id| evidence.lineages.contains(id))
+            {
+                continue;
+            }
+        }
         if records.iter().any(|frame| matches!(&frame.record, broca_wal::WalRecord::RunStarted { session, .. } if session.session == identity.session)) {
             found.push(AlternateLog { identity: candidate, address, lineage_id: lineage });
         }

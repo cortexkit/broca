@@ -1,7 +1,13 @@
 use super::*;
 use broca_core::{FileWalStore, WalStore};
 use broca_protocol::{BindIdentity, ContentBlock, Message, Role};
-use std::{cell::RefCell, time::Instant};
+use std::{
+    cell::RefCell,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
+
+static NEXT: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static SQL: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -32,8 +38,9 @@ struct CostFixture {
 impl CostFixture {
     fn new(messages: usize, target_runs: usize, other_runs: usize) -> Self {
         let root = broca_test_support::scratch_root().join(format!(
-            "evidence-cost-{}-{messages}-{target_runs}-{other_runs}",
-            std::process::id()
+            "evidence-cost-{}-{}-{messages}-{target_runs}-{other_runs}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&root).unwrap();
         let store = SqliteStore::open(root.join("run-index.db")).unwrap();
@@ -380,4 +387,45 @@ fn repeated_lineage_values_use_bounded_seeks_without_statistics() {
             );
         }
     }
+}
+
+#[test]
+fn recorded_run_ids_use_the_identity_cover_without_lineage_prerequisites() {
+    let fixture = CostFixture::new(0, 16, 32);
+    let mut conn = fixture.store.conn.lock().unwrap();
+    conn.execute(
+        "UPDATE run_index SET lineage_id=NULL WHERE session=?1",
+        [serde_json::to_string(&fixture.session).unwrap()],
+    )
+    .unwrap();
+    SQL.with(|queries| queries.borrow_mut().clear());
+    conn.trace(Some(trace_sql));
+    let runs = recorded_run_ids(&conn, &fixture.session).unwrap();
+    conn.trace(None);
+    assert_eq!(
+        runs,
+        (0..16)
+            .map(|n| format!("target-{n:06}"))
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    let queries = SQL.with(|queries| std::mem::take(&mut *queries.borrow_mut()));
+    assert_eq!(queries.len(), 1);
+    let mut query = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", queries[0]))
+        .unwrap();
+    let details: Vec<String> = query
+        .query_map([], |row| row.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        details
+            .iter()
+            .any(|line| line.contains("SEARCH run_index USING INDEX session_log_evidence_runs")),
+        "{details:?}"
+    );
+    assert!(
+        !details.iter().any(|line| line.contains("SCAN run_index")),
+        "{details:?}"
+    );
 }
