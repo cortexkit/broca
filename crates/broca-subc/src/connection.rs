@@ -33,6 +33,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+mod cutoff_diagnostic_tests;
+
 /// The error code broca answers a reverse request with: a `Request` a module sends toward the
 /// consumer on a route channel. Copied from the subc Rust consumer SDK
 /// (`subc-client-rs/src/consumer.rs`, `REVERSE_REQUEST_UNHANDLED`), which keeps it private
@@ -3803,18 +3806,12 @@ async fn cancelled_or_never(cancel: Option<&CancellationToken>) {
     }
 }
 
-/// Whether a route.open refusal says the target MODULE is unavailable (stopped, starting,
-/// restarting, or not answering), as opposed to anything about the route asked for. These are
-/// the refusals that are the same for every caller of that module, so one caller's refusal is
-/// news for all of them; see [`ModuleGate`].
+/// Whether a route.open refusal uses the shared module gate rather than the scope hold.
+/// The protocol classifier is the single source of retryability, so adopting a protocol
+/// release with another retryable bind code also puts that code behind the existing gate.
+/// Scope codes retain their own hold and never close the module gate for other scopes.
 pub(crate) fn is_module_availability_refusal(code: &str) -> bool {
-    use subc_protocol::error_codes::{
-        MODULE_RELOADING, MODULE_TIMEOUT, MODULE_WARMING, TARGET_UNAVAILABLE,
-    };
-    matches!(
-        code,
-        TARGET_UNAVAILABLE | MODULE_WARMING | MODULE_RELOADING | MODULE_TIMEOUT
-    )
+    subc_protocol::error_codes::is_retryable_route_open(code) && !code.starts_with("scope_")
 }
 
 /// What one open's outcome says about its target module.
@@ -5295,6 +5292,23 @@ mod tests {
         );
         assert!(!is_retryable_route_open(MODULE_REMOVED));
         assert!(!is_retryable_route_open("some_future_code"));
+
+        for code in [
+            MODULE_RELOADING,
+            MODULE_WARMING,
+            TARGET_UNAVAILABLE,
+            MODULE_TIMEOUT,
+            SCOPE_NOT_SYNCED,
+            SCOPE_CHANGED,
+            "bind_blocked_by_reader",
+            "some_future_code",
+        ] {
+            assert_eq!(
+                is_module_availability_refusal(code),
+                is_retryable_route_open(code) && !code.starts_with("scope_"),
+                "module-gate retryability must follow the protocol, excluding scope holds: {code}"
+            );
+        }
 
         // AN UNDECODABLE BODY MUST BE TERMINAL, and this is the arm a future "robustness"
         // edit would break. `decode_error_body` falls back to the raw bytes when the body is
