@@ -398,7 +398,6 @@ impl Fixture {
             charge_basis_resolver: None,
             startup_recovery_pending: false,
             prior_snapshot: None,
-            sender_policy_cache: None,
             pending_fifo: Vec::new(),
             send_reply: None,
             skip_materialization_submissions: HashSet::new(),

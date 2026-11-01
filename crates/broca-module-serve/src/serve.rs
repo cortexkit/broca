@@ -2749,9 +2749,9 @@ async fn authorize_route_request<H: ServeHandler>(
             .authorize_session_retract(session, bind.principal.as_ref(), &bind.scope, submission_id)
             .await
     } else if method == OP_CANCEL {
-        // Cancellation checks the caller together with the current sender grant in the
-        // lineage actor, serialized with refresh, rather than trusting a route-time grant.
-        Ok(())
+        handler
+            .authorize_session_owner(session, bind.principal.as_ref(), &bind.scope)
+            .await
     } else {
         handler
             .authorize_session(session, bind.principal.as_ref())
@@ -3454,13 +3454,7 @@ where
                 }
             };
             match handler
-                .cancel_from(
-                    session,
-                    broca_protocol::RunId(params.run_id),
-                    at,
-                    bind.principal.as_ref(),
-                    &bind.scope,
-                )
+                .cancel_at(session, broca_protocol::RunId(params.run_id), at)
                 .await
             {
                 Ok(resp) => send_json_response(writer, ver, channel, epoch, corr, &resp).await,

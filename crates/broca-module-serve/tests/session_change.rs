@@ -1,7 +1,5 @@
 //! Session-change operations through the real serve loop, WAL writer and episode executor.
 mod delivery_rig;
-#[path = "session_change/interrupt_cancel.rs"]
-mod interrupt_cancel;
 
 use delivery_rig::*;
 use serde_json::{json, Value};

@@ -805,7 +805,6 @@ struct Inner {
     /// Cache only identities and the position after their represented WAL records. Prompts,
     /// queued requests and plan manifests stay out of this bounded, read-only cache.
     owner_snapshots: Mutex<OwnerSnapshots>,
-    sender_snapshots: Mutex<OwnerSnapshots>,
     stopping: tokio_util::sync::CancellationToken,
     seal: tokio_util::sync::CancellationToken,
     seal_state: Mutex<SealState>,
@@ -1035,15 +1034,6 @@ impl OwnerSnapshots {
 
     fn insert(&mut self, key: LineageKey, mut snapshot: OwnershipSnapshot) {
         snapshot.ownership = snapshot.ownership.for_owner_access();
-        self.insert_summary(key, snapshot);
-    }
-
-    fn insert_sender(&mut self, key: LineageKey, mut snapshot: OwnershipSnapshot) {
-        snapshot.ownership = crate::sender_admission::compact(&snapshot.ownership);
-        self.insert_summary(key, snapshot);
-    }
-
-    fn insert_summary(&mut self, key: LineageKey, snapshot: OwnershipSnapshot) {
         if !self.entries.contains_key(&key) {
             if self.entries.len() == MAX_OWNER_SNAPSHOTS {
                 if let Some(oldest) = self.oldest.pop_front() {
@@ -1671,7 +1661,6 @@ impl LineageRegistry {
                 frozen_senders: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 live_ownership: Mutex::new(HashMap::new()),
                 owner_snapshots: Mutex::new(OwnerSnapshots::default()),
-                sender_snapshots: Mutex::new(OwnerSnapshots::default()),
                 stopping: tokio_util::sync::CancellationToken::new(),
                 seal: tokio_util::sync::CancellationToken::new(),
                 seal_state: Mutex::new(SealState::default()),
@@ -2016,244 +2005,6 @@ impl LineageRegistry {
             &records,
             &broca_protocol::SubmissionId(submission_id.into()),
         ))
-    }
-
-    /// Cold grant lookup never opens an actor, whose recovery could write history.
-    pub(crate) async fn interrupt_cancel_granted(
-        &self,
-        key: &LineageKey,
-        module_id: &str,
-    ) -> Result<bool, OpenError> {
-        self.check_authorization_expired(key).await?;
-        let ownership = self.cold_sender_ownership(key).await?;
-        Ok(crate::sender_admission::interrupt_granted(
-            &ownership, module_id,
-        ))
-    }
-
-    /// Reuse an existing actor's admission source without opening or recovering a lineage.
-    pub(crate) async fn warm_cancel_authority(
-        &self,
-        key: &LineageKey,
-        principal: Option<&broca_protocol::BindPrincipal>,
-        scope: &broca_protocol::SendScope,
-        at: broca_wal::record::RunCancelAt,
-    ) -> Result<Option<crate::actor::CancelAuthority>, crate::serve::ServeError> {
-        self.check_authorization_expired(key).await?;
-        let handle = {
-            let slots = self.inner.slots.lock().unwrap();
-            match slots.get(key) {
-                Some(Entry::Open { handle, .. }) => {
-                    let head = handle.durable_head.load(Ordering::Acquire);
-                    if let Some(cached) = self.inner.live_ownership.lock().unwrap().get(key) {
-                        // The first principal never changes within an actor generation.
-                        // Keep owners on their existing path without loading optional policy.
-                        let immutable_authority = cached.ownership.episodes > 0
-                            && (cached.ownership.first_principal.as_ref() == principal
-                                || !matches!(
-                                    cached.ownership.first_principal,
-                                    Some(broca_protocol::BindPrincipal::Reserved { .. })
-                                ));
-                        if cached.generation == handle.gen
-                            && (cached.head == head || immutable_authority)
-                            && broca_core::scope_admission::decide_owner_access(
-                                &cached.ownership,
-                                principal,
-                                scope,
-                            )
-                            .is_ok()
-                        {
-                            return Ok(Some(crate::actor::CancelAuthority::Owner));
-                        }
-                    }
-                    Some(handle.clone())
-                }
-                _ => None,
-            }
-        };
-        if let Some(handle) = handle {
-            let (reply, rx) = tokio::sync::oneshot::channel();
-            if handle
-                .send(crate::actor::LineageCmd::SenderPolicy {
-                    principal: principal.cloned(),
-                    scope: scope.clone(),
-                    at,
-                    reply,
-                })
-                .await
-                .is_ok()
-            {
-                if let Ok(result) = rx.await {
-                    return result;
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// A cold authorization read may repair policy in memory, but must not open an actor,
-    /// acquire its lease, or publish a projection for a caller that could still be refused.
-    async fn cold_sender_ownership(
-        &self,
-        key: &LineageKey,
-    ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
-        let reader = self.inner.reader.as_ref().ok_or_else(|| {
-            OpenError::Open("sender authorization reader is not configured".into())
-        })?;
-        let cached = self
-            .inner
-            .sender_snapshots
-            .lock()
-            .unwrap()
-            .get(key)
-            .cloned();
-        if let Some(snapshot) = cached {
-            let range = self
-                .read_durable_range_for(
-                    reader,
-                    key,
-                    ReadRangeRequest {
-                        after_seq: snapshot.watermark_seq,
-                        anchor: snapshot.anchor,
-                        live_head: None,
-                        through_seq: None,
-                        purpose: ReadPurpose::Authorization,
-                    },
-                )
-                .await?;
-            let records =
-                crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, None)
-                    .records()
-                    .map_err(|error| OpenError::Open(error.to_string()))?;
-            if records.is_empty()
-                && snapshot.lineage_id.is_some()
-                && snapshot.lineage_id == range.lineage_id.map(|id| id.to_string())
-            {
-                return Ok(snapshot.ownership);
-            }
-        }
-        let stored = if let Some(store) = reader.store.clone() {
-            let key = key.clone();
-            spawn_blocking(JobKind::StoreRead, move || {
-                store.read_admission_snapshot(&key)
-            })
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
-        } else {
-            None
-        };
-        if let Some(stored) = stored {
-            if let Some(mut checkpoint) = stored.checkpoint {
-                if checkpoint.at_seq == stored.watermark_seq && checkpoint.ownership_complete() {
-                    let range = self
-                        .read_durable_range_for(
-                            reader,
-                            key,
-                            ReadRangeRequest {
-                                after_seq: stored.watermark_seq,
-                                anchor: stored.anchor,
-                                live_head: None,
-                                through_seq: None,
-                                purpose: ReadPurpose::Authorization,
-                            },
-                        )
-                        .await?;
-                    let records = crate::durable_read::DurableRead::classify(
-                        &range,
-                        stored.watermark_seq,
-                        None,
-                    )
-                    .records()
-                    .map_err(|error| OpenError::Open(error.to_string()))?;
-                    if stored.lineage_id.is_some()
-                        && stored.lineage_id == range.lineage_id.map(|id| id.to_string())
-                        && checkpoint.fold_frames(records).is_ok()
-                    {
-                        if let Some(ownership) = checkpoint.ownership {
-                            let head = checkpoint.at_seq;
-                            let wal = reader.wal_store.clone();
-                            let read_key = key.clone();
-                            let ownership =
-                                crate::sender_admission::resolve(ownership, || async move {
-                                    spawn_blocking(
-                                        JobKind::WalRead,
-                                        broca_wal::access_counter::inherit(move || {
-                                            crate::sender_admission::read_prefix(
-                                                wal.as_ref(),
-                                                &read_key,
-                                                head,
-                                            )
-                                        }),
-                                    )
-                                    .await
-                                    .map_err(|error| error.to_string())?
-                                })
-                                .await
-                                .map_err(OpenError::Open)?;
-                            self.cache_sender_snapshot(
-                                key,
-                                &ownership,
-                                head,
-                                range.lineage_id,
-                                range.anchor_at(head).or(stored.anchor),
-                            );
-                            return Ok(ownership);
-                        }
-                    }
-                }
-            }
-        }
-        let range = self
-            .read_durable_range_for(
-                reader,
-                key,
-                ReadRangeRequest {
-                    after_seq: 0,
-                    anchor: None,
-                    live_head: None,
-                    through_seq: None,
-                    purpose: ReadPurpose::Authorization,
-                },
-            )
-            .await?;
-        let records = crate::durable_read::DurableRead::classify(&range, 0, None)
-            .records()
-            .map_err(|error| OpenError::Open(error.to_string()))?;
-        let checkpoint = broca_core::AdmissionCheckpointV1::from_frames(records)
-            .map_err(|error| OpenError::Open(error.to_string()))?;
-        let ownership = checkpoint.ownership.ok_or_else(|| {
-            OpenError::Open("the admission snapshot carries no ownership summary".into())
-        })?;
-        self.cache_sender_snapshot(
-            key,
-            &ownership,
-            checkpoint.at_seq,
-            range.lineage_id,
-            range.anchor_at(checkpoint.at_seq),
-        );
-        Ok(ownership)
-    }
-
-    fn cache_sender_snapshot(
-        &self,
-        key: &LineageKey,
-        ownership: &broca_core::SessionOwnershipV1,
-        head: u64,
-        lineage_id: Option<broca_wal::WalLineageId>,
-        anchor: Option<broca_wal::WalByteAnchor>,
-    ) {
-        self.inner.sender_snapshots.lock().unwrap().insert_sender(
-            key.clone(),
-            OwnershipSnapshot {
-                ownership: ownership.clone(),
-                watermark_seq: head,
-                lineage_id: lineage_id.map(|id| id.to_string()),
-                anchor,
-                first_episode_position: None,
-            },
-        );
     }
 
     /// Upload standing includes every current plan-named sender, not just session owners.
@@ -3167,50 +2918,16 @@ impl LineageRegistry {
         run_id: broca_protocol::RunId,
         at: broca_wal::record::RunCancelAt,
     ) -> Result<crate::actor::CancelOutcome, OpenError> {
-        self.route_cancel_inner(key, run_id, at, None).await
-    }
-
-    pub async fn route_cancel_from(
-        &self,
-        key: &LineageKey,
-        run_id: broca_protocol::RunId,
-        at: broca_wal::record::RunCancelAt,
-        principal: Option<broca_protocol::BindPrincipal>,
-        scope: broca_protocol::SendScope,
-    ) -> Result<crate::actor::CancelOutcome, OpenError> {
-        self.route_cancel_inner(key, run_id, at, Some((principal, scope)))
-            .await
-    }
-
-    async fn route_cancel_inner(
-        &self,
-        key: &LineageKey,
-        run_id: broca_protocol::RunId,
-        at: broca_wal::record::RunCancelAt,
-        caller: Option<(
-            Option<broca_protocol::BindPrincipal>,
-            broca_protocol::SendScope,
-        )>,
-    ) -> Result<crate::actor::CancelOutcome, OpenError> {
         use crate::actor::{CancelOutcome, LineageCmd};
         loop {
             self.check_move(key, true)?;
             self.check_expired(key, Some(&run_id.0)).await?;
             let handle = self.actor_for(key).await?;
             let (reply, rx) = tokio::sync::oneshot::channel();
-            let cmd = match &caller {
-                Some((principal, scope)) => LineageCmd::CancelFrom {
-                    run_id: run_id.clone(),
-                    at,
-                    principal: principal.clone(),
-                    scope: scope.clone(),
-                    reply,
-                },
-                None => LineageCmd::Cancel {
-                    run_id: run_id.clone(),
-                    at,
-                    reply,
-                },
+            let cmd = LineageCmd::Cancel {
+                run_id: run_id.clone(),
+                at,
+                reply,
             };
             if handle.send(cmd).await.is_err() {
                 continue;
