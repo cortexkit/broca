@@ -582,6 +582,7 @@ pub fn resolve_frozen(
     Ok(FrozenRenderConfig {
         family_id: provider.wire_family,
         renderer_version,
+        image_notice_labels: false,
         wire_model_id: model.id.clone(),
         // The spec's base_url is the catalog-driven override for OpenAI-compatible
         // (and other host-configurable) providers. Empty = the family default.
@@ -690,6 +691,7 @@ fn frozen_from_family_defaults(
     FrozenRenderConfig {
         family_id: family,
         renderer_version: renderer_version_for(family),
+        image_notice_labels: false,
         wire_model_id: wire_model_id.into(),
         base_url: None,
         max_output_tokens: DEFAULT_HELPER_MAX_OUTPUT_TOKENS,

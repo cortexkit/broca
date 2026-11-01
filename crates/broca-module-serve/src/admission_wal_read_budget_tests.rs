@@ -220,14 +220,15 @@ async fn assert_media_free_sparse_resume_legacy_render_and_decode(with_tools: bo
         1,
         "only the ordinary final materialization tail read is allowed"
     );
-    let eager_media_setup = usize::from(with_tools);
+    // Admission already captured the exact byte anchor. Resuming reuses it rather
+    // than sampling file identity or EOF again after dependency resolution.
     assert_eq!(
         after_resume.identities - after_setup.identities,
-        eager_media_setup
+        0
     );
     assert_eq!(
         after_resume.lengths - after_setup.lengths,
-        eager_media_setup
+        0
     );
     assert_eq!(
         after_resume.uploads - after_setup.uploads,

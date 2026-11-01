@@ -344,6 +344,16 @@ impl WalStore for ObservedWalStore {
         )
     }
 
+    fn read_media_seed_suffix(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: u64,
+        anchor: Option<&broca_wal::WalByteAnchor>,
+    ) -> Result<broca_wal::WalRangeRead, WalError> {
+        WalStore::read_media_seed_suffix(&self.inner, session, after_seq, through_seq, anchor)
+    }
+
     fn read_records_range_from_valid_anchor(
         &self,
         session: &BindIdentity,

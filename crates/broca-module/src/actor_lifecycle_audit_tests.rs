@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 #[path = "actor_restart_admission_tests.rs"]
 mod restart_writes;
 
-/// File-backed WAL store with the two failures these tests inject.
+type CoreReadGate = (Arc<tokio::sync::Notify>, std::sync::mpsc::Receiver<()>);
+
+/// File-backed WAL store with deterministic failure and read-interleaving probes.
 struct ProbeWal {
     inner: Arc<FileWalStore>,
     /// Make every move-fence check fail with an I/O error rather than a move refusal.
@@ -24,6 +26,21 @@ struct ProbeWal {
     /// so the wait times out and `read_starved_runtime` records it.
     read_gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     read_starved_runtime: AtomicBool,
+    core_read_gate: std::sync::Mutex<Option<CoreReadGate>>,
+    next_range_must_be_suffix: AtomicBool,
+    suffix_reads: AtomicUsize,
+}
+
+impl ProbeWal {
+    fn interleave_core_read(&self) {
+        let gate = self.core_read_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the control is accepted before the selected prefix read continues");
+        }
+    }
 }
 
 impl WalStore for ProbeWal {
@@ -47,6 +64,7 @@ impl WalStore for ProbeWal {
         &self,
         key: &LineageKey,
     ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        self.interleave_core_read();
         let gate = self.read_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             if gate.recv_timeout(Duration::from_secs(2)).is_err() {
@@ -63,6 +81,17 @@ impl WalStore for ProbeWal {
         through: Option<u64>,
         anchor: Option<&broca_wal::WalByteAnchor>,
     ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+        if after == 0 {
+            self.interleave_core_read();
+        }
+        if after > 0 {
+            self.suffix_reads.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.next_range_must_be_suffix.swap(false, Ordering::SeqCst) && after == 0 {
+            return Err(broca_wal::WalError::Io(std::io::Error::other(
+                "historical prefix is unavailable; use its media seed",
+            )));
+        }
         self.inner.read_records_range(key, after, through, anchor)
     }
 
@@ -137,6 +166,12 @@ struct ProbeExecutor {
     probe_entries: AtomicUsize,
     completed_probe: tokio::sync::Notify,
     session_closes: AtomicUsize,
+    refuse_first_probe: AtomicBool,
+    completions: tokio::sync::Semaphore,
+    manifests: std::sync::Mutex<Vec<Option<String>>>,
+    errors: std::sync::Mutex<Vec<String>>,
+    core_read_gate: std::sync::Mutex<Option<CoreReadGate>>,
+    bounded_core_snapshot: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -146,6 +181,12 @@ impl RunExecutor for ProbeExecutor {
         job: crate::executor::RunJob,
         out: mpsc::Sender<broca_core::OutputEvent>,
     ) -> Result<RunSummary, RunError> {
+        self.manifests.lock().unwrap().push(
+            job.control
+                .manifest
+                .as_ref()
+                .map(|manifest| manifest.plan_identity.clone()),
+        );
         if self.hold_admission {
             if !self.gate_first_probe.load(Ordering::SeqCst)
                 || self.probe_entries.fetch_add(1, Ordering::SeqCst) == 0
@@ -153,8 +194,16 @@ impl RunExecutor for ProbeExecutor {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
+            if self.refuse_first_probe.swap(false, Ordering::SeqCst) {
+                return Err(RunError::Config("dependency refused admission".into()));
+            }
             if self.media_probe.load(Ordering::SeqCst) != 0 {
-                return restart_writes::execute_probe(self, job, out).await;
+                let result = restart_writes::execute_probe(self, job, out).await;
+                if let Err(error) = &result {
+                    self.errors.lock().unwrap().push(error.to_string());
+                }
+                self.completions.add_permits(1);
+                return result;
             }
             return Err(RunError::Config("dependency refused admission".into()));
         }
@@ -233,6 +282,9 @@ impl Fixture {
             move_check_fails: AtomicBool::new(false),
             read_gate: std::sync::Mutex::new(None),
             read_starved_runtime: AtomicBool::new(false),
+            core_read_gate: Default::default(),
+            next_range_must_be_suffix: AtomicBool::new(false),
+            suffix_reads: AtomicUsize::new(0),
         });
         let retained = seed == Seed::Retained;
         let media_probe = matches!(
@@ -362,6 +414,12 @@ impl Fixture {
             probe_entries: AtomicUsize::new(0),
             completed_probe: tokio::sync::Notify::new(),
             session_closes: AtomicUsize::new(0),
+            refuse_first_probe: AtomicBool::new(false),
+            completions: tokio::sync::Semaphore::new(0),
+            manifests: Default::default(),
+            errors: Default::default(),
+            core_read_gate: Default::default(),
+            bounded_core_snapshot: AtomicBool::new(false),
         });
         let registry = crate::registry::LineageRegistry::new(Arc::new(super::tests::SeamOpener {
             lease_store: Arc::new(FileLeaseStore::new(root.join("unused-leases"))),
@@ -462,6 +520,7 @@ impl Fixture {
             ended_submissions: Default::default(),
             delivered_submissions: Default::default(),
             restart_admitting: false,
+            deferred_restart_settings: Default::default(),
             restart_waiters: Vec::new(),
             restart_recovery_owns_waiters: false,
             resuming_for_late_result: false,

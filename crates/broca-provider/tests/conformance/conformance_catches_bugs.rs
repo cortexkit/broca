@@ -15,6 +15,7 @@ use broca_provider::wire::{
 
 fn frozen() -> FrozenRenderConfig {
     FrozenRenderConfig {
+        image_notice_labels: false,
         family_id: WireFamilyId::OpenAiChat,
         renderer_version: 1,
         wire_model_id: "m".into(),

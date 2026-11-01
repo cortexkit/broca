@@ -4858,6 +4858,8 @@ mod executor {
             )
             .unwrap();
             let mut wrong = broca_core::PriorWalSnapshot {
+                lineage_id: None,
+                anchor: None,
                 base_watermark: 0,
                 head_seq: witness.sequence(),
                 checkpoint_at_base: None,

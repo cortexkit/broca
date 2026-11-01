@@ -219,6 +219,8 @@ async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
         assert_eq!(suffix_decodes, 2);
 
         let complete = broca_core::PriorWalSnapshot {
+            lineage_id: None,
+            anchor: None,
             base_watermark: 0,
             head_seq: head,
             tail: Arc::new(frames.clone()),

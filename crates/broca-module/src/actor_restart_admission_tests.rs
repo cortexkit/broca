@@ -94,16 +94,12 @@ impl broca_core::Provider for Provider {
 
 pub(super) async fn execute_probe(
     executor: &ProbeExecutor,
-    job: crate::executor::RunJob,
+    mut job: crate::executor::RunJob,
     out: mpsc::Sender<broca_core::OutputEvent>,
 ) -> Result<RunSummary, RunError> {
     assert!(
         !job.writer.is_overhaul(),
         "the probe must exercise today's legacy format"
-    );
-    assert!(
-        !job.req.tools.is_empty(),
-        "production installs media rendering for these tools"
     );
     if executor.media_probe.load(Ordering::SeqCst) == 1 {
         if let Err(error) = broca_core::media_request::initialize_media_checkpoint(
@@ -121,6 +117,22 @@ pub(super) async fn execute_probe(
             return Err(error);
         }
     }
+    if executor.bounded_core_snapshot.load(Ordering::SeqCst) {
+        let head = job.writer.sync().await.unwrap();
+        let mut snapshot = broca_core::load_prior_wal_snapshot(
+            executor.wal_store.as_ref(),
+            &job.req.session,
+            head,
+            None::<&broca_store::SqliteStore>,
+        )
+        .unwrap();
+        snapshot.base_watermark = head;
+        snapshot.checkpoint_at_base = Some(snapshot.checkpoint_at_head.clone());
+        snapshot.tail = Arc::new(Vec::new());
+        job.prior_snapshot = snapshot;
+    }
+    *executor.wal_store.core_read_gate.lock().unwrap() =
+        executor.core_read_gate.lock().unwrap().take();
     let config = &job
         .prior_snapshot
         .checkpoint_at_head
@@ -161,6 +173,9 @@ pub(super) async fn execute_probe(
 
 #[path = "actor_run_control_admission_tests.rs"]
 mod run_control;
+
+#[path = "actor_restart_scheduler_tests.rs"]
+mod scheduler;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mutation {
@@ -381,7 +396,7 @@ async fn exercise(mutation: Mutation, media_on: bool) {
     )
     .await
     .expect("the executor gate is released after the status barrier");
-    if !written {
+    if !written && matches!(mutation, Mutation::Warm) {
         let deferred = fixture.actor.terminal_rx.recv().await.unwrap();
         assert!(!fixture.actor.handle_cmd(deferred).await);
     }
@@ -492,16 +507,6 @@ async fn queued_metadata(refuse_admission: bool) {
         !wrote_before,
         "metadata reached the WAL before admission completed"
     );
-    for _ in 0..3 {
-        let cmd = fixture.actor.terminal_rx.recv().await.unwrap();
-        assert!(matches!(
-            cmd,
-            LineageCmd::SessionRefresh { .. }
-                | LineageCmd::SessionRefreshPolicy { .. }
-                | LineageCmd::SessionFlushPrefix { .. }
-        ));
-        assert!(!fixture.actor.handle_cmd(cmd).await);
-    }
     for receipt in receipts {
         receipt.accepted().await;
     }

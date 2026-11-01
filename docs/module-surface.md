@@ -1857,6 +1857,10 @@ sealed `Interrupted` with the refusal reason. An unreadable newer-writer WAL is
 only logged at WARN with its session and missing features: no bytes or metadata
 are changed, and other sessions still resume.
 
+New episodes freeze image-only labeling for multipart image-notice text; older episodes keep
+their literal text projection on resume, while a new episode adopting the rule may rebuild its
+prompt cache once, like a renderer-version bump.
+
 Restart and authentication pauses diverge in the actor's `on_send`, `send_plain`,
 and `steer_submission` paths. Restart pauses answer keyed retries `paused`, queue
 plain sends behind the unfinished episode, and persist steers for its next step.

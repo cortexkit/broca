@@ -101,7 +101,13 @@ fn tagged_text_image_text_stays_numbered_once_across_retry_and_replay() {
         frozen.media = Some(profile.clone());
         let render_tags = |prompt: &[Message]| {
             let mut prompt = prompt.to_vec();
-            render_tags_into(&mut prompt, TagRendering::default());
+            render_tags_into(
+                &mut prompt,
+                TagRendering {
+                    image_notice_labels: true,
+                    ..Default::default()
+                },
+            );
             prompt
         };
         let run = || {
@@ -179,7 +185,13 @@ fn image_only_tag_label_does_not_detach_the_prepared_payload() {
             Some(&mut bundle),
             &|prompt| {
                 let mut prompt = prompt.to_vec();
-                render_tags_into(&mut prompt, TagRendering::default());
+                render_tags_into(
+                    &mut prompt,
+                    TagRendering {
+                        image_notice_labels: true,
+                        ..Default::default()
+                    },
+                );
                 prompt
             },
         )
@@ -264,7 +276,13 @@ async fn failed_image_capture_keeps_the_numbered_label_before_its_failure_line()
             Some(&mut bundle),
             &|prompt| {
                 let mut tagged = prompt.to_vec();
-                render_tags_into(&mut tagged, TagRendering::default());
+                render_tags_into(
+                    &mut tagged,
+                    TagRendering {
+                        image_notice_labels: true,
+                        ..Default::default()
+                    },
+                );
                 tagged
             },
         )
@@ -332,7 +350,13 @@ fn prepared_image_text_numbers_original_text_not_media_marker() {
         Some(&mut bundle),
         &|prompt| {
             let mut tagged = prompt.to_vec();
-            render_tags_into(&mut tagged, TagRendering::default());
+            render_tags_into(
+                &mut tagged,
+                TagRendering {
+                    image_notice_labels: true,
+                    ..Default::default()
+                },
+            );
             tagged
         },
     )
@@ -442,7 +466,13 @@ fn prepared_tool_tag_table_preserves_text_targets_and_image_labels_on_every_fami
                 });
                 let tags = |prompt: &[Message]| {
                     let mut tagged = prompt.to_vec();
-                    render_tags_into(&mut tagged, TagRendering::default());
+                    render_tags_into(
+                        &mut tagged,
+                        TagRendering {
+                            image_notice_labels: true,
+                            ..Default::default()
+                        },
+                    );
                     tagged
                 };
                 let bytes =
@@ -517,10 +547,22 @@ fn media_free_marker_looking_text_keeps_legacy_render_bytes() {
     let mut opts = CallOptions::new(prompt.clone());
     let tags = |prompt: &[Message]| {
         let mut tagged = prompt.to_vec();
-        render_tags_into(&mut tagged, TagRendering::default());
+        render_tags_into(
+            &mut tagged,
+            TagRendering {
+                image_notice_labels: true,
+                ..Default::default()
+            },
+        );
         tagged
     };
-    render_tags_into(&mut opts.prompt, TagRendering::default());
+    render_tags_into(
+        &mut opts.prompt,
+        TagRendering {
+            image_notice_labels: true,
+            ..Default::default()
+        },
+    );
     let legacy = crate::families::OpenAiChat.render(&frozen, &opts);
     opts.prompt = prompt.clone();
     let mut prepared = prepare(&session, None, &prompt, &MediaAging::default()).unwrap();

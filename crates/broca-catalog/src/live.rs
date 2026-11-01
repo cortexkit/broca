@@ -686,6 +686,9 @@ pub fn default_max_output_tokens(output_limit: Option<u64>, context_limit: Optio
 
 impl EpisodeRenderConfig<'_> {
     fn apply(self, mut config: FrozenRenderConfig) -> FrozenRenderConfig {
+        config.image_notice_labels = self
+            .recorded_config
+            .is_none_or(|recorded| recorded.image_notice_labels);
         if let Some(session_id) = self.opencode_go_session_id {
             config.opencode_go_session_id = Some(session_id.to_string());
             if config.family_id == WireFamilyId::OpenAiChat {
@@ -1601,6 +1604,7 @@ fn freeze_refusal_fallback(
         return Err("the fallback model echoes thinking only to the model that produced it".into());
     }
     fallback.max_output_tokens = max_tokens;
+    fallback.image_notice_labels = source.image_notice_labels;
     fallback.base_url = source.base_url.clone();
     fallback.cache = source.cache.clone();
     fallback.prompt_cache_key = source.prompt_cache_key.clone();
@@ -2648,6 +2652,36 @@ mod tests {
         let body = serde_json::from_slice(&resolved.provider.render_request(&anthropic_options()))
             .expect("step-one body is JSON");
         (frozen, body)
+    }
+
+    #[test]
+    fn image_notice_labels_are_admitted_once_and_keep_recorded_absence_on_resume() {
+        let catalog = catalog_stating_server_side_fallback(&[("claude-fable-5-1", Some(true))]);
+        with_test_catalog(&catalog, || {
+            for method in [AuthMethod::ApiKey, AuthMethod::Oauth] {
+                let (fresh, _) = resolve_anthropic_episode(
+                    "anthropic/claude-fable-5-1",
+                    method,
+                    false,
+                    EpisodeRenderConfig::default(),
+                );
+                assert!(fresh.image_notice_labels);
+                let mut old = fresh.clone();
+                old.image_notice_labels = false;
+                let recorded = serde_json::to_value(&old).unwrap();
+                assert!(recorded.get("image_notice_labels").is_none());
+                let (resumed, _) = resolve_anthropic_episode(
+                    "anthropic/claude-fable-5-1",
+                    method,
+                    false,
+                    EpisodeRenderConfig {
+                        recorded_config: Some(&old),
+                        ..EpisodeRenderConfig::default()
+                    },
+                );
+                assert_eq!(serde_json::to_value(resumed).unwrap(), recorded);
+            }
+        });
     }
 
     /// The opt-in is set for exactly one shape: an OAuth (identity-lead) run of an `anthropic`
@@ -4077,6 +4111,7 @@ mod responses_tool_admission_tests {
             let recorded: FrozenRenderConfig = serde_json::from_value(blob.clone()).unwrap();
             assert!(!recorded.responses_tools_non_strict);
             let resumed = EpisodeRenderConfig {
+                recorded_config: Some(&recorded),
                 responses_tools_non_strict: Some(recorded.responses_tools_non_strict),
                 chatgpt_effort_updates: Some(recorded.chatgpt_effort_updates),
                 ..Default::default()
@@ -4108,6 +4143,7 @@ mod responses_tool_admission_tests {
         let blob = serde_json::to_value(&admitted).unwrap();
         let recorded: FrozenRenderConfig = serde_json::from_value(blob.clone()).unwrap();
         let resumed = EpisodeRenderConfig {
+            recorded_config: Some(&recorded),
             chatgpt_wire: recorded.chatgpt_wire.as_ref(),
             ..Default::default()
         }

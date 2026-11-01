@@ -290,6 +290,10 @@ impl RunRequest {
 /// Admission-time WAL view: a materialized checkpoint plus only the records after its watermark.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PriorWalSnapshot {
+    /// Identity and exact byte boundary observed with this admission prefix, never
+    /// sampled later after executor dependency resolution.
+    pub lineage_id: Option<String>,
+    pub anchor: Option<broca_wal::WalByteAnchor>,
     /// Store watermark that precedes `tail`; zero for a complete-WAL fallback snapshot.
     pub base_watermark: u64,
     /// Durable writer head captured before this snapshot was loaded.
@@ -436,6 +440,8 @@ where
                         Some(safe_head),
                         snapshot.anchor.as_ref(),
                     ) {
+                        let lineage_id = range.lineage_id.map(|lineage| lineage.to_string());
+                        let anchor = range.next_anchor;
                         let lineage_matches = match (
                             snapshot.lineage_id.as_deref(),
                             range.lineage_id.map(|lineage_id| lineage_id.to_string()),
@@ -471,6 +477,8 @@ where
                                 })
                             {
                                 return Ok(PriorWalSnapshot {
+                                    lineage_id,
+                                    anchor,
                                     base_watermark: snapshot.watermark_seq,
                                     head_seq: safe_head,
                                     tail: Arc::new(records),
@@ -485,9 +493,17 @@ where
         }
     }
 
-    let records = wal_store
-        .read_records(session)
+    // This is a complete-history repair, not a read from an unusable store suffix.
+    // The live file may already contain newer accepted controls; keep only the
+    // records through safe_head and do not consume newer input that the live inbox
+    // may still deliver.
+    let (records, lineage_id) = wal_store
+        .read_records_with_lineage(session)
         .map_err(|error| error.to_string())?;
+    let records: Vec<_> = records
+        .into_iter()
+        .take_while(|frame| frame.seq <= safe_head)
+        .collect();
     let observed_head = records.last().map_or(0, |record| record.seq);
     if observed_head != safe_head {
         return Err(format!(
@@ -497,6 +513,8 @@ where
     let checkpoint_at_head =
         crate::AdmissionCheckpointV1::from_frames(&records).map_err(|error| error.to_string())?;
     Ok(PriorWalSnapshot {
+        lineage_id: lineage_id.map(|lineage| lineage.to_string()),
+        anchor: None,
         base_watermark: 0,
         head_seq: safe_head,
         tail: Arc::new(records),
@@ -561,6 +579,8 @@ pub fn load_prior_wal_snapshot_from_seed(
         let watermark = base.at_seq;
         base.pending_fifo = Arc::new(Vec::new());
         return Ok(PriorWalSnapshot {
+            lineage_id: None,
+            anchor: None,
             base_watermark: watermark,
             head_seq: safe_head,
             tail: Arc::new(tail.iter().map(|p| p.framed.clone()).collect()),
@@ -568,7 +588,10 @@ pub fn load_prior_wal_snapshot_from_seed(
             checkpoint_at_head: head,
         });
     }
-    let frames = full_read()?;
+    let frames: Vec<_> = full_read()?
+        .into_iter()
+        .take_while(|frame| frame.seq <= safe_head)
+        .collect();
     if frames.last().map_or(0, |frame| frame.seq) != safe_head {
         return Err(format!(
             "full admission repair did not reach durable head {safe_head}"
@@ -579,6 +602,8 @@ pub fn load_prior_wal_snapshot_from_seed(
     let checkpoint_at_head =
         crate::AdmissionCheckpointV1::from_frames(&frames).map_err(|error| error.to_string())?;
     Ok(PriorWalSnapshot {
+        lineage_id: None,
+        anchor: None,
         base_watermark: 0,
         head_seq: safe_head,
         tail: Arc::new(frames),
@@ -2418,16 +2443,21 @@ where
             // can see newer durable steers that this inbox still owns. Remove only that WAL
             // suffix from replay, never equal text belonging to an older independent message.
             let live = replayed_live_steers(&snapshot, boundary, writer, wal_store, &req.session)?;
-            let retained = prior
-                .pending_steers
-                .len()
-                .checked_sub(live)
-                .ok_or_else(|| {
-                    RunError::Wal(
-                        "resume initialization cannot reconcile replayed live steers".into(),
-                    )
-                })?;
-            prior.pending_steers.truncate(retained);
+            for (seq, input) in live.into_iter().rev() {
+                let retained = prior
+                    .pending_steers
+                    .len()
+                    .checked_sub(input.len())
+                    .ok_or_else(|| {
+                        RunError::Wal(format!("live steer record {seq} is missing from replay"))
+                    })?;
+                if prior.pending_steers[retained..] != input {
+                    return Err(RunError::Wal(format!(
+                        "live steer record {seq} does not match its replayed input"
+                    )));
+                }
+                prior.pending_steers.truncate(retained);
+            }
         }
     }
     // The store materializes whole committed turns, so an unfinished step's attempt
@@ -2452,14 +2482,14 @@ fn replayed_live_steers<W: WalStore>(
     writer: &WalHandle,
     wal_store: &W,
     session: &BindIdentity,
-) -> Result<usize, RunError> {
+) -> Result<Vec<(u64, Vec<Message>)>, RunError> {
     if boundary > snapshot.head_seq {
         return Err(RunError::Wal(
             "live steer boundary is beyond the replay head".into(),
         ));
     }
     if boundary == snapshot.head_seq {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let loaded;
     let records = if snapshot.base_watermark <= boundary {
@@ -2484,7 +2514,7 @@ fn replayed_live_steers<W: WalStore>(
     let mut next = boundary
         .checked_add(1)
         .ok_or_else(|| RunError::Wal("live steer sequence exhausted".into()))?;
-    let mut messages = 0usize;
+    let mut messages = Vec::new();
     for frame in records
         .iter()
         .filter(|frame| frame.seq > boundary && frame.seq <= snapshot.head_seq)
@@ -2498,9 +2528,7 @@ fn replayed_live_steers<W: WalStore>(
             .checked_add(1)
             .ok_or_else(|| RunError::Wal("live steer sequence exhausted".into()))?;
         if let WalRecord::Steered { input, .. } = &frame.record {
-            messages = messages
-                .checked_add(input.len())
-                .ok_or_else(|| RunError::Wal("live steer count overflow".into()))?;
+            messages.push((frame.seq, input.to_vec()));
         }
     }
     if next != snapshot.head_seq.saturating_add(1) {
@@ -2542,6 +2570,8 @@ fn complete_snapshot<W: WalStore>(
     let checkpoint_at_head = crate::AdmissionCheckpointV1::from_frames(&records)
         .map_err(|error| RunError::Wal(error.to_string()))?;
     Ok(PriorWalSnapshot {
+        lineage_id: None,
+        anchor: None,
         base_watermark: 0,
         head_seq,
         tail: Arc::new(records),
@@ -12114,6 +12144,8 @@ mod tests {
             })).unwrap() },
         ];
         let snapshot = PriorWalSnapshot {
+            lineage_id: None,
+            anchor: None,
             base_watermark: 1,
             head_seq: 1,
             tail: Arc::new(vec![]),

@@ -1,6 +1,6 @@
 use super::*;
 use crate::FileWalStore;
-use broca_wal::{FramedRecord, WalRangeRead, WalRecord};
+use broca_wal::{FramedRecord, WalLineageId, WalRangeRead, WalRecord};
 use std::{
     path::PathBuf,
     sync::{
@@ -48,7 +48,12 @@ impl Fixture {
         wal.append(1, &started, true).unwrap();
         drop(wal);
         let frames = store.read_records(&session).unwrap();
+        let range = store
+            .read_records_range(&session, 0, Some(1), None)
+            .unwrap();
         let snapshot = PriorWalSnapshot {
+            lineage_id: range.lineage_id.map(|lineage| lineage.to_string()),
+            anchor: range.next_anchor,
             base_watermark: 0,
             head_seq: 1,
             tail: Arc::new(frames.clone()),
@@ -109,6 +114,7 @@ enum Fault {
     Incomplete,
     MissingAnchor,
     MismatchedAnchor,
+    RejectOrigin,
 }
 
 struct ObservedWal {
@@ -153,6 +159,11 @@ impl WalStore for ObservedWal {
         anchor: Option<&WalByteAnchor>,
     ) -> Result<WalRangeRead, broca_wal::WalError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        if matches!(self.fault, Fault::RejectOrigin) && after == 0 {
+            return Err(broca_wal::WalError::Io(std::io::Error::other(
+                "origin prefix is archived or exceeds the read cap",
+            )));
+        }
         if matches!(self.fault, Fault::Unreadable) {
             return Err(broca_wal::WalError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -253,6 +264,33 @@ async fn forward_media_initialization_matches_full_replay_and_keeps_new_captures
 }
 
 #[tokio::test]
+async fn ready_media_seed_folds_a_text_only_advance_without_reading_the_origin() {
+    let fixture = Fixture::new(true).await;
+    fixture.advance(false).await;
+    let observed = ObservedWal::new(fixture.store.clone(), Fault::RejectOrigin);
+    let initialized = initialize_media_checkpoint(
+        &fixture.writer,
+        observed.clone(),
+        &fixture.session,
+        &fixture.snapshot,
+    )
+    .await
+    .unwrap();
+    let full = crate::AdmissionCheckpointV1::from_frames(
+        &fixture.store.read_records(&fixture.session).unwrap(),
+    )
+    .unwrap();
+    let Some(DurableMediaSeed::Ready(seed)) = full.media else {
+        panic!("earlier capture survives")
+    };
+    assert_eq!(initialized.checkpoint.encode(), seed.encode());
+    assert_eq!(initialized.checkpoint.at_seq, 2);
+    assert_eq!(initialized.anchor.unwrap().seq, 2);
+    drop(observed);
+    fixture.close().await;
+}
+
+#[tokio::test]
 async fn advanced_media_initialization_refuses_foreign_lineage() {
     let fixture = Fixture::new(false).await;
     let foreign = Fixture::new(false).await;
@@ -271,6 +309,47 @@ async fn advanced_media_initialization_refuses_foreign_lineage() {
     assert!(error.contains("lineage"), "{error}");
     drop(observed);
     foreign.close().await;
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn cached_media_seed_refuses_a_lineage_change_since_admission() {
+    let mut fixture = Fixture::new(true).await;
+    let foreign = Fixture::new(false).await;
+    fixture.snapshot.lineage_id = foreign.snapshot.lineage_id.clone();
+    let error = initialize_media_checkpoint(
+        &fixture.writer,
+        fixture.store.clone(),
+        &fixture.session,
+        &fixture.snapshot,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("lineage changed"), "{error}");
+    foreign.close().await;
+    fixture.close().await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn verified_media_suffix_can_extend_a_seed_beyond_the_full_read_cap() {
+    let fixture = Fixture::new(true).await;
+    fixture.advance(false).await;
+    let limited = Arc::new(FileWalStore::new(fixture.root.join("wal")).with_read_cap_for_test(512));
+    assert!(
+        limited.read_records(&fixture.session).is_err(),
+        "the complete prefix exceeds the read cap"
+    );
+    let initialized = initialize_media_checkpoint(
+        &fixture.writer,
+        limited,
+        &fixture.session,
+        &fixture.snapshot,
+    )
+    .await
+    .unwrap();
+    assert_eq!(initialized.checkpoint.at_seq, 2);
+    assert_eq!(initialized.anchor.unwrap().seq, 2);
     fixture.close().await;
 }
 

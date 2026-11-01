@@ -321,6 +321,18 @@ pub trait WalStore: Send + Sync {
         self.read_records_range(session, after_seq, through_seq, anchor)
     }
 
+    /// Extend an already verified media seed. The read budget may be spent on the
+    /// suffix rather than on rereading its captured historical prefix.
+    fn read_media_seed_suffix(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: u64,
+        anchor: Option<&WalByteAnchor>,
+    ) -> Result<WalRangeRead, WalError> {
+        self.read_records_range(session, after_seq, Some(through_seq), anchor)
+    }
+
     /// Read a suffix only when `anchor` is valid. Live-file implementations avoid scanning
     /// from byte zero; immutable archive members must first verify their whole digest.
     /// Implementations that cannot prove the byte offset return `None`, which lets callers use
@@ -2041,6 +2053,37 @@ pub fn session_addr(session: &BindIdentity) -> String {
 }
 
 impl WalStore for FileWalStore {
+    fn read_media_seed_suffix(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: u64,
+        anchor: Option<&WalByteAnchor>,
+    ) -> Result<WalRangeRead, WalError> {
+        self.check_move(session, false)?;
+        if let Some(anchor) = anchor {
+            if self.archived_member(session)?.member.is_none() {
+                let limit = anchor
+                    .byte_end
+                    .checked_add(self.max_read_bytes)
+                    .ok_or_else(|| {
+                        WalError::Io(io::Error::other("media suffix read budget overflow"))
+                    })?;
+                if let Some(range) = broca_wal::read_records_range_from_valid_anchor(
+                    self.read_path(session)?,
+                    limit,
+                    after_seq,
+                    Some(through_seq),
+                    anchor,
+                )? {
+                    return Ok(range);
+                }
+            }
+        }
+        // Archive members keep their digest verification; a moved/folded live file
+        // must prove the requested suffix again instead of trusting an old inode offset.
+        self.read_records_range(session, after_seq, Some(through_seq), anchor)
+    }
     fn writer_marker_root(&self) -> Option<PathBuf> {
         self.config
             .is_overhaul()
