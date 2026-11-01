@@ -54,6 +54,12 @@ pub struct StateRootDecision<'a> {
     config: WalConfig,
 }
 
+pub struct OwnedStateRootDecision { root: std::path::PathBuf, config: WalConfig }
+impl OwnedStateRootDecision {
+    pub fn root(&self)->&Path { &self.root }
+    pub fn borrowed(&self) -> StateRootDecision<'_> { StateRootDecision { root:&self.root,config:self.config } }
+}
+
 pub struct LegacyStateRoot<'a> {
     root: &'a Path,
 }
@@ -63,6 +69,8 @@ impl LegacyStateRoot<'_> {
     }
 }
 impl<'a> StateRootDecision<'a> {
+    pub fn root(&self)->&Path { self.root }
+    pub fn into_owned(self)->OwnedStateRootDecision { OwnedStateRootDecision { root:self.root.to_path_buf(),config:self.config } }
     pub fn config(&self) -> WalConfig {
         self.config
     }

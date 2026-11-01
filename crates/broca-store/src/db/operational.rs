@@ -110,3 +110,10 @@ pub fn open_diagnostic_reader(
             .map_err(|e| e.to_string())
     }
 }
+
+/// Daemon readers use the root decision retained at boot; tools still classify.
+pub fn open_diagnostic_reader_decided(decision: broca_wal::state_format::StateRootDecision<'_>, config:broca_wal::WalConfig)->Result<Box<dyn DiagnosticEvidenceReader>,String> {
+    if let Some(legacy)=decision.legacy() {
+        crate::SqliteStore::open_boot_legacy_read_only(legacy).map(|db|Box::new(db.with_wal_config(config)) as Box<dyn DiagnosticEvidenceReader>).map_err(|e|e.to_string())
+    } else { OverhaulDb::open_read_only(decision.root()).map(|db|Box::new(db) as Box<dyn DiagnosticEvidenceReader>).map_err(|e|e.to_string()) }
+}

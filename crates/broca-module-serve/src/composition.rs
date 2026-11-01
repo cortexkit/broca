@@ -1,5 +1,6 @@
 //! The daemon's format-selected stores and feed of synced WAL publications.
 
+#[cfg(test)]
 use super::state_format::StateFormat;
 use broca_core::{FileWalStore, SessionInventory, SessionRefIndex, SessionRefResolver};
 use broca_protocol::BindIdentity;
@@ -32,14 +33,31 @@ pub(super) struct Publications {
 
 type SessionGates = HashMap<BindIdentity, std::sync::Weak<Mutex<()>>>;
 
+pub(super) enum RestartDiscovery {
+    Legacy(Arc<broca_store::SqliteStore>),
+    Overhaul(Arc<dyn broca_core::RecoveryDiscovery>),
+}
+pub(super) enum RestartDiscoveryError { Legacy(broca_store::StoreError), Overhaul(String) }
+impl std::fmt::Debug for RestartDiscoveryError {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        match self { Self::Legacy(error)=>std::fmt::Debug::fmt(error,f),Self::Overhaul(error)=>std::fmt::Debug::fmt(error,f) }
+    }
+}
+impl RestartDiscovery {
+    pub fn candidates(&self)->Result<Vec<(String,BindIdentity)>,RestartDiscoveryError> {
+        match self { Self::Legacy(index)=>index.restart_resume_candidates().map_err(RestartDiscoveryError::Legacy),Self::Overhaul(index)=>index.restart_resume_candidates().map_err(RestartDiscoveryError::Overhaul) }
+    }
+}
+
 impl Stores {
     pub fn open_boot_legacy(
         root: broca_wal::state_format::LegacyStateRoot<'_>,
+        wal_config: broca_wal::WalConfig,
     ) -> Result<Self, String> {
         Ok(Self {
             legacy: Some(Arc::new(
                 broca_store::SqliteStore::open_boot_legacy(root)
-                    .map_err(|e| format!("open run index: {e}"))?,
+                    .map_err(|e| format!("open run index: {e}"))?.with_wal_config(wal_config),
             )),
             overhaul: None,
         })
@@ -53,16 +71,7 @@ impl Stores {
         }
     }
 
-    pub fn open(format: StateFormat, root: &Path) -> Result<Self, String> {
-        match format {
-            StateFormat::Legacy => Ok(Self {
-                legacy: Some(Arc::new(
-                    broca_store::SqliteStore::open(root.join("run-index.db"))
-                        .map_err(|e| format!("open run index: {e}"))?,
-                )),
-                overhaul: None,
-            }),
-            StateFormat::Overhaul => {
+    pub fn open_overhaul(root: &Path) -> Result<Self, String> {
                 let db = Arc::new(OverhaulDb::open(root).map_err(|e| e.to_string())?);
                 let publications = Arc::new(Publications {
                     db: db.clone(),
@@ -80,8 +89,6 @@ impl Stores {
                         worker: None,
                     }),
                 })
-            }
-        }
     }
 }
 
@@ -714,6 +721,57 @@ impl Drop for Overhaul {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_invalid_slot_does_not_disable_other_sessions_recovery_or_events() {
+        let root=Root::new("isolated-discovery-failure"); let stores=Stores::open_overhaul(&root.0).unwrap();
+        let overhaul=stores.overhaul.as_ref().unwrap(); let wal_store=wal(&root,overhaul); let events=overhaul.event_store();
+        events.enable_bus_events("test").unwrap(); events.begin_bus_event_period(100).unwrap();
+        let bad=BindIdentity::new("/composition","runner","bad-slot"); let good=BindIdentity::new("/composition","runner","healthy-slot");
+        let mut proofs=Vec::new();
+        for (key,id) in [(&bad,"bad-slot"),(&good,"healthy-slot")] {
+            let mut writer=wal_store.open(key).unwrap(); let mut start=started(key,id); if let WalRecord::RunStarted{ts_ms,..}=&mut start{*ts_ms=Some(101);}
+            writer.append(1,&start,true).unwrap(); let proof=overhaul.publications.witness(key,None).unwrap();
+            overhaul.db.index_run_withdrawals_owed(id,true).unwrap();
+            events.project_new_bus_events(key,&proof.lineage().to_string(),&writer.replay().unwrap(),102).unwrap(); proofs.push(proof);
+        }
+        overhaul.publications.slots.lock().unwrap().get(&bad).unwrap().record(&proofs[1]);
+        let recovery=overhaul.recovery_discovery();
+        let active=recovery.active_runs(); let restart=recovery.restart_resume_candidates(); let debt=recovery.withdrawal_candidates();
+        let census=events.bus_event_open_sessions(); let checkpoint=events.bus_event_checkpoint(&good); let position=events.bus_event_position(&good,&proofs[1].lineage().to_string()); let pending=events.pending_bus_event();
+        for rows in [active,restart] { let rows=rows.expect("healthy recovery discovery must continue"); assert!(rows.iter().any(|(_,key)|key==&good)); assert!(rows.iter().all(|(_,key)|key!=&bad)); }
+        let debt=debt.expect("healthy withdrawal discovery must continue"); assert!(debt.iter().any(|row|row.session==good)); assert!(debt.iter().all(|row|row.session!=bad));
+        assert_eq!(census.unwrap(),vec![good.clone()]); assert!(checkpoint.unwrap().is_some()); assert_eq!(position.unwrap(),1);
+        assert_eq!(pending.unwrap().unwrap().headers.get("run_id").map(String::as_str),Some("healthy-slot"));
+        assert!(events.bus_event_checkpoint(&bad).is_err()); assert!(events.bus_event_position(&bad,&proofs[0].lineage().to_string()).is_err());
+    }
+
+    #[test]
+    fn an_acknowledged_unindexed_run_with_failed_publication_is_not_absent() {
+        let root=Root::new("failed-advisory-refresh"); let stores=Stores::open_overhaul(&root.0).unwrap(); let overhaul=stores.overhaul.as_ref().unwrap(); let wal_store=wal(&root,overhaul);
+        let bad=BindIdentity::new("/composition","runner","unindexed-bad"); let good=BindIdentity::new("/composition","runner","valid-proof");
+        let mut bad_writer=wal_store.open(&bad).unwrap(); bad_writer.append(1,&started(&bad,"acknowledged-bad"),true).unwrap();
+        let good_writer=wal_store.open(&good).unwrap(); good_writer.sync().unwrap();
+        overhaul.publications.slots.lock().unwrap().get(&bad).unwrap().record(&good_writer.durable_publication().unwrap());
+        let opener=broca_module::DefaultOpener::new(Arc::new(broca_core::FileLeaseStore::new(root.0.join("leases"))),wal_store.clone(),Arc::new(RefusesExecution));
+        let registry=broca_module::LineageRegistry::new_with_run_rows(Arc::new(opener),Some(wal_store.clone()),None,Some(overhaul.run_rows(wal_store)));
+        assert!(registry.overhaul_lookup_run("acknowledged-bad").unwrap().is_err(),"failed publication is unknown/unavailable, never a successful absence");
+        assert!(registry.overhaul_restart_resume_candidates().unwrap().is_err());
+        assert!(registry.overhaul_active_runs(&[]).unwrap().is_err());
+    }
+
+    #[test]
+    fn legacy_restart_warning_preserves_typed_debug_bytes() {
+        let root=Root::with_format("restart-warning",false);
+        let stores=Stores::open_boot_legacy(broca_wal::state_format::decide_state_root(&root.0).unwrap().legacy().unwrap(),broca_wal::WalConfig::LEGACY).unwrap();
+        let store=stores.legacy.unwrap();
+        rusqlite::Connection::open(root.0.join("run-index.db")).unwrap().execute_batch("DROP TABLE run_index").unwrap();
+        let direct=store.restart_resume_candidates(); assert!(direct.is_err());
+        let expected=format!("restart resume: cannot list candidate runs: {:?}",Ok::<_,std::io::Error>(direct));
+        let source=RestartDiscovery::Legacy(store);
+        let actual=format!("restart resume: cannot list candidate runs: {:?}",Ok::<_,std::io::Error>(source.candidates()));
+        assert_eq!(actual.as_bytes(),expected.as_bytes());
+    }
+
     #[cfg(feature = "test-clock")]
     fn assert_resume_or_receipt_io_holds_session_gate(resume: bool) {
         use broca_wal::fs_ops::{self, FsOps};
@@ -773,7 +831,7 @@ mod tests {
         } else {
             "receipt-gate"
         });
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal_store = wal(&root, overhaul);
         let bind = BindIdentity::new("/composition", "runner", "read-gate");
@@ -821,7 +879,7 @@ mod tests {
     #[test]
     fn another_sessions_admission_does_not_wait_for_a_rebuild() {
         let root = Root::new("independent-session");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal_store = wal(&root, overhaul);
         let a = BindIdentity::new("/composition", "runner", "slow");
@@ -872,7 +930,7 @@ mod tests {
     #[test]
     fn bad_boot_sessions_do_not_refuse_healthy_sessions() {
         let root = Root::new("partial-boot");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal_store = wal(&root, overhaul);
         let healthy = BindIdentity::new("/composition", "runner", "healthy");
@@ -943,7 +1001,7 @@ mod tests {
     #[test]
     fn acknowledged_run_discovery_catches_up_before_the_publisher_drains() {
         let root = Root::new("fresh-discovery");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal_store = wal(&root, overhaul);
         let bind = BindIdentity::new("/composition", "runner", "discovery");
@@ -968,7 +1026,7 @@ mod tests {
     #[test]
     fn reopening_a_writer_keeps_the_previously_acknowledged_discovery_head() {
         let root = Root::new("reopen-discovery-head");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal_store = wal(&root, overhaul);
         let bind = BindIdentity::new("/composition", "runner", "reopened");
@@ -998,7 +1056,7 @@ mod tests {
     #[test]
     fn run_lookup_and_rows_use_the_acknowledged_prefix_before_a_publisher_tick() {
         let root = Root::new("fresh-run-row");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal_store = wal(&root, overhaul);
         let bind = BindIdentity::new("/composition", "runner", "run-row");
@@ -1054,7 +1112,7 @@ mod tests {
     #[test]
     fn run_event_discovery_catches_acknowledged_runs_before_a_publisher_tick() {
         let root = Root::new("fresh-run-event");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal_store = wal(&root, overhaul);
         let bind = BindIdentity::new("/composition", "runner", "run-event");
@@ -1077,7 +1135,7 @@ mod tests {
     #[tokio::test]
     async fn native_retained_event_get_does_not_require_a_legacy_materializer() {
         let root = Root::new("native-event-get");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal_store = wal(&root, overhaul);
         let bind = BindIdentity::new("/composition", "runner", "event-get");
@@ -1137,7 +1195,7 @@ mod tests {
     #[test]
     fn mismatched_publication_fails_only_its_session_without_poisoning_registration() {
         let root = Root::new("publication-mismatch");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal_store = wal(&root, overhaul);
         let bind = BindIdentity::new("/composition", "runner", "mismatch");
@@ -1218,6 +1276,7 @@ mod tests {
             session: session.clone(),
             ts_ms: None,
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -1372,7 +1431,7 @@ mod tests {
     #[tokio::test]
     async fn real_owned_opener_installs_bounded_admission_model_attach_and_raw_readers() {
         let root = Root::new("real-opener");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal = wal(&root, overhaul);
         let bind = BindIdentity::new("/composition", "runner", "real-opener");
@@ -1508,7 +1567,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_real_opener_constructs_no_overhaul_reader_and_keeps_its_read_path() {
         let root = Root::with_format("legacy-real-opener", false);
-        let stores = Stores::open(StateFormat::Legacy, &root.0).unwrap();
+        let stores = Stores::open_boot_legacy(broca_wal::state_format::decide_state_root(&root.0).unwrap().legacy().unwrap(),broca_wal::WalConfig::LEGACY).unwrap();
         assert!(stores.overhaul.is_none());
         let index = stores.legacy.as_ref().unwrap();
         let wal = Arc::new(FileWalStore::with_config(
@@ -1558,7 +1617,7 @@ mod tests {
     #[tokio::test]
     async fn unfinished_checkpoint_still_uses_whole_log_writer_recovery_on_owned_reopen() {
         let root = Root::new("unfinished-recovery");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal = wal(&root, overhaul);
         let bind = BindIdentity::new("/composition", "runner", "unfinished");
@@ -1622,7 +1681,7 @@ mod tests {
     #[test]
     fn burst_from_raw_maintenance_writer_keeps_latest_proof_until_publisher_drains() {
         let root = Root::new("burst");
-        let mut stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let mut stores = Stores::open_overhaul(&root.0).unwrap();
         assert!(stores.legacy.is_none());
         let overhaul = stores.overhaul.as_mut().unwrap();
         let wal = wal(&root, overhaul);
@@ -1654,7 +1713,7 @@ mod tests {
     #[test]
     fn historical_attach_proof_stops_at_handoff_when_publisher_is_ahead() {
         let root = Root::new("attach-handoff");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal = wal(&root, overhaul);
         let bind = BindIdentity::new("/composition", "runner", "handoff");
@@ -1696,7 +1755,7 @@ mod tests {
     #[test]
     fn forgotten_session_retires_its_proof_without_recreating_projection_rows() {
         let root = Root::new("retire-proof");
-        let mut stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let mut stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_mut().unwrap();
         let wal = wal(&root, overhaul);
         let old = BindIdentity::new("/composition", "runner", "forgotten");
@@ -1734,7 +1793,7 @@ mod tests {
     #[test]
     fn idle_read_catches_up_acknowledged_tail_without_waiting_for_background_worker() {
         let root = Root::new("idle-read");
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal = wal(&root, overhaul);
         let bind = BindIdentity::new("/composition", "runner", "idle");
@@ -1780,7 +1839,7 @@ mod tests {
         let root = Root::new("closed-boot");
         let bind = BindIdentity::new("/composition", "runner", "closed");
         {
-            let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+            let stores = Stores::open_overhaul(&root.0).unwrap();
             let overhaul = stores.overhaul.as_ref().unwrap();
             let wal = wal(&root, overhaul);
             let mut writer = wal.open(&bind).unwrap();
@@ -1788,7 +1847,7 @@ mod tests {
             writer.append(1, &finished(), true).unwrap();
             overhaul.publications.witness(&bind, None).unwrap();
         }
-        let stores = Stores::open(StateFormat::Overhaul, &root.0).unwrap();
+        let stores = Stores::open_overhaul(&root.0).unwrap();
         let overhaul = stores.overhaul.as_ref().unwrap();
         let wal = wal(&root, overhaul);
         let counter = broca_wal::access_counter::WalAccessCounter::default();

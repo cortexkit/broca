@@ -117,11 +117,9 @@ impl ObservedWal {
                         observer(publication)
                     })) {
                         Ok(Ok(())) => {}
-                        Ok(Err(reason)) => return Err(WalError::Io(std::io::Error::other(reason))),
+                        Ok(Err(reason)) => return Err(WalError::PublicationObserver(reason)),
                         Err(_) => {
-                            return Err(WalError::Io(std::io::Error::other(
-                                "publication observer panicked after WAL sync",
-                            )))
+                            return Err(WalError::PublicationObserver("publication observer panicked after WAL sync"))
                         }
                     }
                 }

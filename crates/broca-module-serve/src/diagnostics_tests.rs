@@ -5,6 +5,39 @@ use std::cell::Cell;
 
 const NOW: i64 = 200_000_000;
 
+#[cfg(feature="test-clock")]
+#[test]
+fn legacy_findings_request_does_not_read_a_marker_after_boot() {
+    use broca_wal::fs_ops::{self,FsOps};
+    use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+    struct MarkerProbe { marker:PathBuf, reads:Arc<AtomicUsize> }
+    impl FsOps for MarkerProbe {
+        fn open(&self,p:&Path,o:&fs_ops::OpenOptions)->std::io::Result<Box<dyn fs_ops::FileOps>> {
+            if p==self.marker {self.reads.fetch_add(1,Ordering::Relaxed);return Err(std::io::Error::other("marker unavailable after boot"));}
+            fs_ops::RealFs.open(p,o)
+        }
+        fn metadata(&self,p:&Path)->std::io::Result<std::fs::Metadata>{fs_ops::RealFs.metadata(p)}
+        fn create_dir_all(&self,p:&Path)->std::io::Result<()>{fs_ops::RealFs.create_dir_all(p)}
+        fn rename(&self,a:&Path,b:&Path)->std::io::Result<()>{fs_ops::RealFs.rename(a,b)}
+        fn remove_file(&self,p:&Path)->std::io::Result<()>{fs_ops::RealFs.remove_file(p)}
+        fn sync_dir(&self,p:&Path)->std::io::Result<()>{fs_ops::RealFs.sync_dir(p)}
+        fn create_dir(&self,p:&Path)->std::io::Result<()>{fs_ops::RealFs.create_dir(p)}
+        fn hard_link(&self,a:&Path,b:&Path)->std::io::Result<()>{fs_ops::RealFs.hard_link(a,b)}
+        fn canonicalize(&self,p:&Path)->std::io::Result<PathBuf>{fs_ops::RealFs.canonicalize(p)}
+        fn read_dir(&self,p:&Path)->std::io::Result<fs_ops::ReadDir>{fs_ops::RealFs.read_dir(p)}
+        fn validate_if_exists(&self,p:&Path)->std::io::Result<()>{fs_ops::RealFs.validate_if_exists(p)}
+    }
+    let root=broca_test_support::scratch_root().join(format!("diagnostic-legacy-marker-{}",std::process::id())); std::fs::create_dir_all(&root).unwrap();
+    drop(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
+    install_decided(broca_wal::state_format::decide_state_root(&root).unwrap().into_owned(),broca_wal::WalConfig::LEGACY);
+    std::fs::create_dir(root.join("state-format")).unwrap();
+    let reads=Arc::new(AtomicUsize::new(0)); let owner=principal(); let head=scope(owner.clone(),ScopeKind::Head,false,true);
+    let reply=fs_ops::with_fs_ops(Arc::new(MarkerProbe{marker:root.join("state-format"),reads:reads.clone()}),||serving_reply(json!({}),Some(&owner),&head,Ok(100),NOW));
+    assert!(reply.is_ok(),"a later marker failure cannot change the boot-selected legacy diagnostics: {reply:?}");
+    assert_eq!(reads.load(Ordering::Relaxed),0,"diagnostics.findings must not classify the legacy root again");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn diagnostics_address_unavailability_is_an_error_from_the_first_refusal_per_reason() {
     let store = broca_store::SqliteStore::open_in_memory().unwrap();

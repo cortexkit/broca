@@ -272,6 +272,8 @@ pub enum WalError {
         holder: String,
     },
     Io(std::io::Error),
+    /// The WAL is synced, but its observer could not accept the publication.
+    PublicationObserver(&'static str),
     Frame(FrameError),
     TooLarge {
         max_bytes: u64,
@@ -355,6 +357,7 @@ impl WalError {
             Self::SessionMoved { holder } => Ok(crate::migration::MoveRefusal::Moved { holder }),
             other @ (Self::RelocationIncomplete { .. }
             | Self::Io(_)
+            | Self::PublicationObserver(_)
             | Self::Frame(_)
             | Self::TooLarge { .. }
             | Self::NonMonotonic { .. }
@@ -393,6 +396,7 @@ impl std::fmt::Display for WalError {
             Self::SessionMoving { cut_id } => write!(f, "session_moving {{cutId: {cut_id}}}"),
             Self::SessionMoved { holder } => write!(f, "session_moved {{holder: {holder}}}"),
             WalError::Io(e) => write!(f, "wal io: {e}"),
+            WalError::PublicationObserver(reason) => write!(f,"WAL publication observer refused: {reason}"),
             WalError::Frame(e) => write!(f, "wal frame: {e}"),
             WalError::TooLarge {
                 max_bytes,

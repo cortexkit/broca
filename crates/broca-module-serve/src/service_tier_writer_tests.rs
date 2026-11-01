@@ -29,7 +29,7 @@ impl TierServeRig {
         let (mut live, subc) = stand_in_executor(root).await;
         live.provider_base_url = Some(url.to_owned());
         let wal = live.wal_store.clone();
-        let store = live.session_store.clone();
+        let store = live.session_store.clone().expect("legacy fixture materializer");
         broca_store::session_refs::migrate(
             &root.join("store.db"),
             &broca_core::ReadOnlyWalReader::new(root),

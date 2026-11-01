@@ -328,7 +328,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stores = match state_format {
         state_format::StateFormat::Legacy => composition::Stores::deferred_legacy(),
         state_format::StateFormat::Overhaul => {
-            composition::Stores::open(state_format, &state_root).map_err(ServeIoError)?
+            composition::Stores::open_overhaul(&state_root).map_err(ServeIoError)?
         }
     };
     let mut wal_store = FileWalStore::with_config(state_root.join("wal"), wal_config)
@@ -418,7 +418,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Load the last-known-good before any admission is possible. The fetch leg gets its own
     // consumer connection, but construction performs no fusiform route.open; only the detached
     // poll below can dial that sibling module.
-    broca_module_serve::diagnostics::install(state_root.clone(), wal_config);
+    broca_module_serve::diagnostics::install_decided(wal_decision.into_owned(), wal_config);
     let catalog_cache = Arc::new(broca_catalog::CatalogCache::open(
         state_root.join("catalog/fusiform-lkg.json"),
     ));
@@ -1109,13 +1109,16 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let _restart_resume = {
         let registry = registry.clone();
-        let index = recovery.clone();
+        let index = match &run_index {
+            Some(index)=>composition::RestartDiscovery::Legacy(index.clone()),
+            None=>composition::RestartDiscovery::Overhaul(recovery.clone()),
+        };
         let wal = crash_orphan_wal.clone();
         let describer = scope_describer.clone();
         tokio::spawn(async move {
             describer.wait_registered().await;
             let candidates =
-                spawn_blocking(JobKind::Recovery, move || index.restart_resume_candidates()).await;
+                spawn_blocking(JobKind::Recovery, move || index.candidates()).await;
             match candidates {
                 Ok(Ok(candidates)) => {
                     registry.resume_restart_pauses(wal, candidates).await;

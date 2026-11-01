@@ -15,7 +15,7 @@ pub use inventory::open_session_resolver;
 mod operational;
 mod outbox;
 pub use operational::{
-    open_diagnostic_reader, operational_database_name, DiagnosticEvidenceReader,
+    open_diagnostic_reader, open_diagnostic_reader_decided, operational_database_name, DiagnosticEvidenceReader,
 };
 pub use outbox::OverhaulRunEventStore;
 mod publication;
