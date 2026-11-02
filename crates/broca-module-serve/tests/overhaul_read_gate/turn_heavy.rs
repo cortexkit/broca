@@ -487,7 +487,11 @@ async fn installed_turn_heavy_compaction_read_measurements_media_free_200() {
     run_case(200, false).await;
 }
 
+// The 5,000-step cases are measurements of today's growth, not gates, and take about a
+// minute each. Run them with `--run-ignored all` when measuring; they become pinned gates
+// once the seeds stop growing with model steps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement probe; about a minute per run"]
 async fn installed_turn_heavy_compaction_read_measurements_media_free_5000() {
     run_case(5_000, false).await;
 }
@@ -498,6 +502,7 @@ async fn installed_turn_heavy_compaction_read_measurements_media_200() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement probe; about a minute per run"]
 async fn installed_turn_heavy_compaction_read_measurements_media_5000() {
     run_case(5_000, true).await;
 }
