@@ -379,7 +379,14 @@ mod call_keepalive {
                 ),
                 tool,
             );
-            assert_eq!(summary.reason, RunFinishReason::Interrupted);
+            assert_eq!(
+                summary.reason,
+                if cancel {
+                    RunFinishReason::Cancelled
+                } else {
+                    RunFinishReason::Interrupted
+                }
+            );
             assert_eq!(provider.calls().len(), 1);
             assert_cancel_and_ignore_late(&mut module, &request);
             let records = wal_records(&root, tag);
@@ -641,9 +648,15 @@ mod call_keepalive {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn run_cancel_cancels_every_outstanding_request() {
+    async fn caller_cancel_after_enqueue_is_cancelled_and_keeps_unknown_result() {
         for keepalive in [false, true] {
             let (plane, mut module) = rig();
+            let root = broca_test_support::scratch_root()
+                .join(format!("caller-cancel-unknown-{keepalive}"));
+            let scripted = StubProvider::new(vec![
+                outage_wait_tests::tool_step(),
+                outage_wait_tests::text_step("must not run"),
+            ]);
             let signal = CancellationToken::new();
             let control = RunControl {
                 cancel: Some(signal.clone()),
@@ -656,17 +669,43 @@ mod call_keepalive {
                 request
             };
             let (run, request) = tokio::join!(
-                run("stopped", &plane, control, frozen_manifest(keepalive, None)),
+                run_at(
+                    &root,
+                    "cancelled",
+                    &plane,
+                    control,
+                    frozen_manifest(keepalive, None),
+                    &scripted,
+                    false,
+                ),
                 provider,
             );
-            // A sent call without an answer is ambiguous even when cancellation ended
-            // the wait. Core preserves that outcome rather than claiming it never ran.
-            assert_eq!(run.0.reason, RunFinishReason::Interrupted);
+            // The caller owns the run's terminal reason; the lost tool result remains
+            // uncertain, so cancellation must not claim the side effect never happened.
+            assert_eq!(run.0.reason, RunFinishReason::Cancelled);
+            let records = wal_records(&root, "cancelled");
+            assert_one_unknown_terminal(&records);
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|frame| matches!(frame.record, broca_wal::WalRecord::StepStarted { .. }))
+                    .count(),
+                1,
+                "cancellation must not start another model step"
+            );
+            assert!(matches!(
+                records.last().unwrap().record,
+                broca_wal::WalRecord::RunFinished {
+                    reason: RunFinishReason::Cancelled,
+                    ..
+                }
+            ));
             let recorded = results(&run.1);
             assert_eq!(recorded.len(), 1);
             assert!(recorded[0].is_error);
             assert!(format!("{recorded:?}").contains("run cancelled or stopped"));
             assert_cancel_and_ignore_late(&mut module, &request);
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 }

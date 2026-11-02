@@ -7916,7 +7916,8 @@ where
         // review. The tool-role message above (with the provider-valid synthetic
         // unknown result) is persisted so the conversation stays valid, but the
         // loop does not continue.
-        if let Some(reason) = BatchOutcome::finish_reason(batch.interruption) {
+        if let Some(reason) = BatchOutcome::finish_reason(batch.interruption, is_cancelled(control))
+        {
             if batch.interruption == Some(BatchInterruption::StopRequested) {
                 interrupt_reason = Some("runner_shutdown".to_owned());
             }
@@ -9156,7 +9157,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     prompt.push(results);
 
     Ok((
-        BatchOutcome::finish_reason(batch.interruption),
+        BatchOutcome::finish_reason(batch.interruption, is_cancelled(control)),
         Vec::new(),
         false,
     ))
@@ -10279,7 +10280,15 @@ struct BatchOutcome {
 }
 
 impl BatchOutcome {
-    fn finish_reason(interruption: Option<BatchInterruption>) -> Option<RunFinishReason> {
+    fn finish_reason(
+        interruption: Option<BatchInterruption>,
+        caller_cancelled: bool,
+    ) -> Option<RunFinishReason> {
+        // A caller's cancellation owns the run terminal even when abandoning an enqueued
+        // call leaves its side effects unknown. Keep that uncertainty on the tool result.
+        if caller_cancelled {
+            return Some(RunFinishReason::Cancelled);
+        }
         match interruption {
             Some(BatchInterruption::CallerCancel) => Some(RunFinishReason::Cancelled),
             Some(BatchInterruption::StopRequested) => Some(RunFinishReason::Interrupted),
