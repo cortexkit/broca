@@ -2004,6 +2004,7 @@ mod tests {
                 ReadClass::Validation(ValidationRead::BoundaryFrame),
             ),
             header,
+            frame("authenticated Setup", setup),
         ];
         let mut expected = vec![
             header,
@@ -2026,7 +2027,7 @@ mod tests {
         expected.extend(common);
         expected.extend([terminal_header, terminal_source, state]);
         let op = counter.snapshot().remove(0);
-        assert_eq!((op.reads.len(), op.frames_decoded), (22, 30));
+        assert_eq!((op.reads.len(), op.frames_decoded), (24, 32));
         for (read, (name, off, len, class)) in op.reads.iter().zip(expected) {
             assert_eq!(
                 (read.offset, read.length, read.class),

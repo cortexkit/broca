@@ -3426,6 +3426,7 @@ impl ServeHandler for crate::LineageRegistry {
             page,
             at_seq,
             head_facts,
+            head_media,
             head_facts_complete,
             newest_record_ms,
             retention_activity_ms,
@@ -3472,6 +3473,7 @@ impl ServeHandler for crate::LineageRegistry {
                     run_id: page.lineage_state.last_run_id.as_ref(),
                     state: page.lineage_state.state.as_str(),
                     model: head_facts.model.as_ref(),
+                    stored: head_media.as_ref(),
                 },
             )
             .await?,

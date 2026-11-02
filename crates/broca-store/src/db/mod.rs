@@ -38,7 +38,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 pub use episode_reader::{DatabaseEpisodeReader, EpisodeSnapshot};
 pub use index::{IndexOutcome, LogLocation, PublishedSession};
-pub use readers::{RawPageRequest, RawPageSnapshot};
+pub use readers::{RawHeadMedia, RawPageRequest, RawPageSnapshot};
 pub use rebuild::{AddressFloor, CondemnedLineage, LedgerRows};
 pub use reconcile::{ReconcileOutcome, ReconcileSession};
 

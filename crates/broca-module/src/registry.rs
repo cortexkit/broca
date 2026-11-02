@@ -1147,6 +1147,8 @@ pub struct RouteReadPage {
     /// Durable WAL sequence covered by the same page snapshot.
     pub at_seq: u64,
     pub head_facts: broca_core::head::HeadProjection,
+    /// Log-only media metadata validated alongside this read page.
+    pub head_media: Option<broca_store::db::RawHeadMedia>,
     pub head_facts_complete: bool,
     pub page: broca_core::SessionReadPage,
     /// Projection commits only complete tool turns. Any open batch therefore remains in the
@@ -1430,6 +1432,7 @@ impl RawPageSource {
             page: raw.page,
             at_seq: raw.at_seq,
             head_facts: raw.head,
+            head_media: raw.head_media,
             head_facts_complete: true,
             tools: raw
                 .tools
@@ -4958,6 +4961,7 @@ impl LineageRegistry {
         Ok(RoutedPage::Raw(Box::new(RouteReadPage {
             at_seq,
             head_facts,
+            head_media: None,
             head_facts_complete,
             page,
             open_batch,
