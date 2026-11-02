@@ -78,3 +78,9 @@
 # Python bytecode written when the script suites import helper modules.
 __pycache__/
 *.pyc
+
+# Temporary exhaustive-gate transport inputs; removed before staging the merge.
+!/.cortexkit/scripts/
+/.cortexkit/scripts/*
+!/.cortexkit/scripts/merge-full-linux.sh
+!/.cortexkit/scripts/merge-inputs/
