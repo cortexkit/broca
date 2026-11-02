@@ -24,45 +24,12 @@ exclusions=(
  # the other native lanes this gate does not stage.
  '(package(=broca-module-serve) & binary(=overhaul_real_daemon))'
  # The attempt-hook shards read one shared in-process capture and stamp the enclosing shard
- # into every image name. Under nextest they run in separate processes and collide on that
- # directory: 1025 shards in the recorded run. The Linux preflight runs them on shared-process
- # libtest instead (`cargo test --lib -- --test-threads 16`); they are not a cargo_ignored
- # test and no code changed here.
+ # into every image name, so nextest's per-test processes collide on that directory: 1025
+ # shards in the recorded run. scripts/linux-preflight.sh selects none of them either (its
+ # filter is `kind(test)`, and these are lib tests run on shared-process libtest), so this
+ # gate excludes the same group master's own preflight never runs.
  '(package(=broca-provider) & test(/^transport::tests::attempt_hook_power_loss_portable::/))'
 )
-retired=(
- # Retired by this merge: the merged serializer records the provider's native terminal token,
- # so these synthetic-capture snapshots carry a stale event list. Their owner (the 0.34 branch)
- # retires them; this gate must never let the retirement pass as green.
- 'synthetic_capture_replay::anthropic_signed_thinking'
- 'synthetic_capture_replay::gemini_tool_call'
- 'synthetic_capture_replay::openai_chat_text_completes'
- 'synthetic_capture_replay::openai_chat_tool_call'
- 'synthetic_capture_replay::openai_responses_text_completes'
- 'synthetic_capture_replay::openai_responses_tool_call'
- 'synthetic_capture_replay::anthropic_tool_loop_nonce'
- 'synthetic_capture_replay::switch_ant_gem_anthropic_a'
- 'synthetic_capture_replay::switch_ant_gem_gemini_b'
- 'synthetic_capture_replay::switch_anthropic_a'
- 'synthetic_capture_replay::switch_anthropic_b'
- 'synthetic_capture_replay::switch_gemini_b'
- 'synthetic_capture_replay::switch_ant_oai_anthropic_a'
- 'synthetic_capture_replay::switch_ant_oai_chat_b'
- 'synthetic_capture_replay::switch_oai_ant_anthropic_b'
- 'synthetic_capture_replay::switch_oai_ant_chat_a'
- 'synthetic_capture_replay::switch_oai_gem_gemini_b'
- 'synthetic_capture_replay::switch_oai_gem_chat_a'
- 'synthetic_capture_replay::switch_chat_a'
- 'llm_runner_role::unsupported_output_refs_precedes_plan_overrides_and_never_writes'
-)
-for name in "${retired[@]}"; do
-  printf '%s\n' "$name" >> target/scratch/merge-retired.txt
-  if grep -rqF "$name" crates/broca-provider/tests/it/synthetic_capture_replay.rs \
-       crates/broca-module-serve/tests/it/llm_runner_role.rs 2>/dev/null; then
-    exclusions+=("test(=$name)")
-  fi
-done
-printf '%s\n' "${exclusions[@]}" > target/scratch/merge-exclusions.txt
 while IFS='|' read -r package name seconds; do
   [[ -z "$package" || "$package" == \#* ]] && continue
   exclusions+=("(package(=$package) & test(=$name))")
@@ -119,13 +86,9 @@ if Path('target/scratch/merge-full-linux.log').exists() and Path('target/scratch
     lines=text.splitlines()
     summary['summaries']=[x for x in lines if 'Summary [' in x]
     failures=sorted(set(x.strip() for x in lines if re.search(r'\b(?:FAIL|TIMEOUT|LEAK)\s+\[',x)))
-    # Retirements must be proven, never assumed: an excluded test may only stand excluded when
-    # it is defined no more, so anything excluded that this run still reported as failed is a
-    # retirement that never happened.
-    retired=[name for name in Path('target/scratch/merge-retired.txt').read_text().split('\n') if name] \
-        if Path('target/scratch/merge-retired.txt').exists() else []
-    summary['failed_retirement_candidates']=[name for name in retired if any(f' {name}' in fail for fail in failures)]
+    summary['unmatched_replays']=[x.strip() for x in lines if 'unmatched replays' in x]
     assert not failures, 'selected tests failed'
+    assert not summary['unmatched_replays'], 'a selected test was dropped as a replayed run'
     skips=sorted(set(x.strip() for x in lines if re.match(r'\s*SKIP\b',x)))
     allowed=summary['deployment_observations_not_applicable_by_parent_approval']
     summary['unapproved_fixture_skips']=[x for x in skips if not any(name in x for name in allowed)]
