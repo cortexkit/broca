@@ -148,7 +148,9 @@ struct ReservationReceipt {
 
 #[derive(Default)]
 struct Observed {
+    phase: String,
     waiting: String,
+    module_state: Option<String>,
     run_state: Option<Value>,
     last_event: Option<Value>,
 }
@@ -252,13 +254,31 @@ impl Trace {
     }
 
     async fn phase<T>(&self, phase: &str, work: impl Future<Output = T>) -> T {
+        self.script.observed.lock().unwrap().phase = phase.to_owned();
         self.waiting(phase);
         let label = format!("differential {}: {phase}", self.label);
-        let result = broca_test_support::event_timeout(&label, work, || self.snapshot())
+        let result = broca_test_support::event_timeout(&label, work, || self.failure_snapshot())
             .await
-            .unwrap_or_else(|_| panic!("{label} timed out; {}", self.snapshot()));
+            .unwrap_or_else(|_| panic!("{label} timed out; {}", self.failure_snapshot()));
         self.complete(phase);
         result
+    }
+
+    fn failure_snapshot(&self) -> String {
+        let (phase, module_state) = {
+            let observed = self.script.observed.lock().unwrap();
+            (observed.phase.clone(), observed.module_state.clone())
+        };
+        format!(
+            "phase={phase}; state_root={}; last module state: {}; {}\n{}",
+            self.state.display(),
+            module_state.as_deref().unwrap_or("not observed"),
+            self.snapshot(),
+            broca_test_support::rig_log_diagnostics(
+                &self.root.join("data-home/cortexkit"),
+                &self.state,
+            )
+        )
     }
 }
 
@@ -447,6 +467,60 @@ fn management(id: &str, operations: &[&str]) -> ModuleManifest {
         .build()
 }
 
+/// The connection file precedes module readiness. Retry only the daemon's coded warming refusal,
+/// and inspect its supervisor report before each attempt so a dead broca is not waited out.
+async fn rig_management_open<T, State, Open>(
+    trace: &Trace,
+    module_state: impl Fn() -> State,
+    open: impl Fn() -> Open,
+) -> T
+where
+    State: Future<Output = Value>,
+    Open: Future<Output = broca_subc::connection::ConnResult<T>>,
+{
+    let description = format!("{} management route to broca", trace.label);
+    broca_test_support::wait_until(&description, || async {
+        let state = module_state().await;
+        trace.script.observed.lock().unwrap().module_state = Some(state.to_string());
+        if broca_has_exited(&state) {
+            panic!(
+                "broca process exited or failed to start before management route opened; {}",
+                trace.failure_snapshot()
+            );
+        }
+        match open().await {
+            Ok(route) => Ok(route),
+            Err(error) => {
+                trace.script.observed.lock().unwrap().module_state =
+                    Some(format!("{state}; last open refusal: {error}"));
+                if error.code() != Some("module_warming") {
+                    panic!(
+                        "management route to broca failed: {error}; {}",
+                        trace.failure_snapshot()
+                    );
+                }
+                Err(trace.failure_snapshot())
+            }
+        }
+    })
+    .await
+}
+
+fn broca_has_exited(report: &Value) -> bool {
+    report["supervisor.list"]["modules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|module| module["module_id"] == "broca")
+        .any(|module| {
+            matches!(module["state"].as_str(), Some("failed" | "stopped"))
+                // A restart must not hide a boot crash even if its replacement is already live.
+                || ["last_exit_code", "last_exit_signal", "last_exit_ms", "last_exit_kind"]
+                    .iter()
+                    .any(|key| !module[key].is_null())
+        })
+}
+
 async fn register<H: subc_client_rs::ModuleHandler + 'static>(
     file: &Path,
     manifest: ModuleManifest,
@@ -478,9 +552,9 @@ impl Drop for Rig {
     fn drop(&mut self) {
         let keep = !self.completed || std::thread::panicking();
         if keep {
-            eprintln!("differential failure artifacts: root={} scratch={} state={} daemon_logs={:?} broca_logs={}",
-                self.trace.label, self.root.display(), self.state.display(), self.daemon_logs,
-                self.root.join("data-home/cortexkit/broca/logs").display());
+            // During unwinding a second panic aborts the test binary, so diagnostics are
+            // printed and nothing else may fail here.
+            eprintln!("{}", self.diagnostics());
         }
         self.cleanup();
         self.provider.abort();
@@ -491,6 +565,48 @@ impl Drop for Rig {
 }
 
 impl Rig {
+    /// Keep process identity beside the exit status: the rig owns a daemon child, while the
+    /// daemon owns broca. Their stdout/stderr streams do not identify broca's boot failures.
+    fn diagnostics(&mut self) -> String {
+        let mut output = format!(
+            "differential failure artifacts: root={} scratch={} state={}\n{}",
+            self.trace.label,
+            self.root.display(),
+            self.state.display(),
+            self.trace.failure_snapshot()
+        );
+        match self.daemon.as_mut() {
+            Some(child) => {
+                let pid = child.id();
+                let status = match child.try_wait() {
+                    Ok(Some(status)) => format!("exited before cleanup: {status}"),
+                    Ok(None) => "running".to_owned(),
+                    Err(error) => format!("status unavailable: {error}"),
+                };
+                output.push_str(&format!(
+                    "\ndaemon-{} pid={pid:?}: {status}\n",
+                    self.daemon_logs.len().saturating_sub(1) / 2
+                ));
+            }
+            None => output.push_str("\ndaemon: none spawned\n"),
+        }
+        let logs = self
+            .daemon_logs
+            .chunks(2)
+            .enumerate()
+            .map(|(index, paths)| {
+                // start() names each daemon child `daemon-<n>` and keeps its two log paths in order.
+                let mut part = format!("--- daemon-{index} ---\n");
+                for path in paths {
+                    let label = path.display().to_string();
+                    broca_test_support::append_file_tail(&mut part, &label, path);
+                }
+                part
+            });
+        output.extend(logs);
+        output
+    }
+
     async fn new(overhaul: bool) -> Self {
         let root = broca_test_support::scratch_root().join(format!(
             "overhaul-differential-{}-{overhaul}",
@@ -717,13 +833,30 @@ impl Rig {
         }
     }
 
+    /// Connect and open broca's management route, waiting while broca reports that it is not
+    /// live yet.
     async fn connect(&self) -> (SubcConnection, RouteHandle) {
         self.trace.waiting("connect to daemon");
         let connection = SubcConnection::connect(&self.file()).await.unwrap();
-        let route = connection
-            .route_open_management("broca", &self.identity())
-            .await
-            .unwrap();
+        self.trace.waiting("open management route");
+        let route = rig_management_open(
+            &self.trace,
+            || connection.supervisor_module_report("broca"),
+            || async {
+                connection
+                    .route_open_management_within(
+                        "broca",
+                        &self.identity(),
+                        // The shared hang guard owns the wait; each probe must return its refusal.
+                        broca_subc::connection::RouteOpenRetry::within(
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                        ),
+                    )
+                    .await
+            },
+        )
+        .await;
         self.check();
         (connection, route)
     }
@@ -2207,6 +2340,308 @@ async fn differential_failure_preserves_both_roots_and_daemon_logs() {
     success.completed = true;
     drop(success);
     assert!(!root.exists(), "successful rigs must still clean up");
+}
+
+#[tokio::test]
+async fn differential_failure_dump_names_exited_child_and_broca_logs() {
+    const CHILD_ENV: &str = "BROCA_DIFFERENTIAL_DUMP_CHILD";
+    const EXIT_ENV: &str = "BROCA_DIFFERENTIAL_EXIT_CHILD";
+    const TEST: &str = "differential_failure_dump_names_exited_child_and_broca_logs";
+    if std::env::var_os(EXIT_ENV).is_some() {
+        std::process::exit(1);
+    }
+    if let Some(root) = std::env::var_os(CHILD_ENV) {
+        let mut rig = diagnostic_rig(Path::new(&root).to_str().unwrap(), true);
+        write_startup_logs(&rig.root);
+        let child = broca_test_support::tokio_rig_command(
+            std::env::current_exe().unwrap(),
+            &rig.root,
+            "daemon-0",
+        )
+        .unwrap()
+        .args(["--exact", TEST, "--nocapture"])
+        .env(EXIT_ENV, "1")
+        .spawn()
+        .unwrap();
+        let mut child = broca_test_support::RigChild::new(child, &rig.root, "daemon-0");
+        assert_eq!(child.wait().await.unwrap().code(), Some(1));
+        rig.daemon = Some(child);
+        panic!("intentional rig failure to exercise the drop diagnostic");
+    }
+    let root = broca_test_support::scratch_root().join("failure-dump-child");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env(CHILD_ENV, &root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "intentional rig failure",
+        "differential failure artifacts: root=format-2",
+        "broca boot final marker",
+        "broca startup stderr",
+    ] {
+        assert!(stderr.contains(expected), "missing {expected:?}: {stderr}");
+    }
+    let child_status = stderr
+        .lines()
+        .find(|line| line.starts_with("daemon-0 pid="))
+        .unwrap_or_else(|| panic!("daemon child status was not named: {stderr}"));
+    assert!(
+        child_status.contains("exited before cleanup: exit") && child_status.ends_with("1"),
+        "{child_status}"
+    );
+    assert!(
+        stderr.contains(
+            &root
+                .join("data-home/cortexkit/broca/logs/broca.log")
+                .display()
+                .to_string()
+        ),
+        "{stderr}"
+    );
+    assert!(root.exists(), "failed rig artifacts must be retained");
+    broca_test_support::remove_rig_dir(root);
+}
+
+#[tokio::test(start_paused = true)]
+async fn warming_guard_timeout_reports_the_broca_log_tail() {
+    // The outer phase guard can expire before the inner readiness guard. Exercise both paths
+    // with a paused clock so neither diagnostic can silently lose the module's evidence.
+    for outer_phase in [false, true] {
+        let mut rig = diagnostic_rig(&format!("warming-timeout-{outer_phase}"), true);
+        write_startup_logs(&rig.root);
+        let start = tokio::time::Instant::now();
+        let result = capture_panic(async {
+            let open = rig_management_open(
+                &rig.trace,
+                || async { running_module_report() },
+                || async {
+                    // Read fresh evidence, not just the log that existed before the first probe.
+                    std::fs::write(
+                        rig.root.join("data-home/cortexkit/broca/logs/latest.log"),
+                        "late boot evidence\n",
+                    )
+                    .unwrap();
+                    Err::<(), _>(coded_refusal("module_warming"))
+                },
+            );
+            if outer_phase {
+                rig.trace.phase("restart", open).await;
+            } else {
+                rig.script.observed.lock().unwrap().phase = "restart".into();
+                open.await;
+            }
+        })
+        .await;
+        assert_eq!(start.elapsed(), broca_test_support::EVENT_HANG_GUARD);
+        assert!(result.contains("timed out"), "{result}");
+        for expected in [
+            "phase=restart",
+            "root=format-2",
+            "last module state:",
+            "module_warming",
+            "broca boot final marker",
+            "late boot evidence",
+            "broca startup stderr",
+        ] {
+            assert!(result.contains(expected), "missing {expected:?}: {result}");
+        }
+        assert!(
+            result.contains(&format!("state_root={}", rig.state.display())),
+            "{result}"
+        );
+        assert!(
+            result.contains(
+                &rig.root
+                    .join("data-home/cortexkit/broca/logs/broca.log")
+                    .display()
+                    .to_string()
+            ),
+            "{result}"
+        );
+        assert!(
+            !result.contains("old boot header"),
+            "the report must be a tail: {result}"
+        );
+        rig.completed = true;
+    }
+}
+
+fn coded_refusal(code: &str) -> broca_subc::ConnError {
+    let body = serde_json::json!({
+        "code": code,
+        "message": "module_id 'broca' is supervised but not available \
+                    (state=running, enabled=true, live=false)",
+    });
+    broca_subc::ConnError::Rejected(
+        broca_subc::connection::RejectedMessage::from_error_frame_body_for_test(
+            &serde_json::to_vec(&body).unwrap(),
+        ),
+    )
+}
+
+fn write_startup_logs(root: &Path) {
+    let logs = root.join("data-home/cortexkit/broca/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let mut text = String::from("old boot header\n");
+    for line in 1..=210 {
+        text.push_str(&format!("broca startup line {line}\n"));
+    }
+    text.push_str("broca boot final marker\n");
+    std::fs::write(logs.join("broca.log"), text).unwrap();
+    let run_logs = root.join("data-home/cortexkit/run/logs");
+    std::fs::create_dir_all(&run_logs).unwrap();
+    std::fs::write(run_logs.join("broca.stderr.log"), "broca startup stderr\n").unwrap();
+}
+
+async fn capture_panic(work: impl Future<Output = ()>) -> String {
+    use futures::FutureExt;
+    let panic = std::panic::AssertUnwindSafe(work)
+        .catch_unwind()
+        .await
+        .unwrap_err();
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .expect("panic message must be text")
+}
+
+fn running_module_report() -> Value {
+    json!({"supervisor.list": {"modules": [{
+        "module_id": "broca", "state": "running", "enabled": true, "live": false,
+        "spawn_generation": 1,
+    }]}})
+}
+
+#[tokio::test(start_paused = true)]
+async fn warming_guard_retries_until_the_management_route_opens() {
+    let mut rig = diagnostic_rig("warming-ready", true);
+    let attempts = std::cell::Cell::new(0);
+    let probes = std::cell::Cell::new(0);
+    let start = tokio::time::Instant::now();
+    let opened = rig_management_open(
+        &rig.trace,
+        || {
+            let mut report = running_module_report();
+            if probes.get() == 0 {
+                report["supervisor.list"]["modules"][0]["state"] = json!("starting");
+                report["supervisor.list"]["modules"][0]["spawn_generation"] = json!(0);
+            }
+            probes.set(probes.get() + 1);
+            std::future::ready(report)
+        },
+        || {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(if attempts.get() == 3 {
+                Ok("management route")
+            } else {
+                Err(coded_refusal("module_warming"))
+            })
+        },
+    )
+    .await;
+    assert_eq!(opened, "management route");
+    assert_eq!(attempts.get(), 3);
+    assert_eq!(probes.get(), 3);
+    assert!(start.elapsed() < broca_test_support::EVENT_HANG_GUARD);
+    rig.completed = true;
+}
+
+#[tokio::test(start_paused = true)]
+async fn warming_guard_fails_immediately_for_nonwarming_errors() {
+    let mut rig = diagnostic_rig("warming-terminal", false);
+    for error in [
+        coded_refusal("permission_denied"),
+        coded_refusal("module_reloading"),
+        broca_subc::ConnError::Rejected("module_warming in plain text".into()),
+        broca_subc::ConnError::Transport("connection lost".into()),
+    ] {
+        let expected = error.to_string();
+        let error = Mutex::new(Some(error));
+        let attempts = std::cell::Cell::new(0);
+        let start = tokio::time::Instant::now();
+        let report = capture_panic(async {
+            rig_management_open(
+                &rig.trace,
+                || async { running_module_report() },
+                || {
+                    attempts.set(attempts.get() + 1);
+                    std::future::ready(Err::<(), _>(
+                        error
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .expect("must not retry terminal errors"),
+                    ))
+                },
+            )
+            .await;
+        })
+        .await;
+        assert!(report.contains(&expected), "{report}");
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+    rig.completed = true;
+}
+
+#[tokio::test(start_paused = true)]
+async fn warming_guard_fails_immediately_when_broca_exits() {
+    let mut rig = diagnostic_rig("warming-exited", true);
+    write_startup_logs(&rig.root);
+    let probes = std::cell::Cell::new(0);
+    let opens = std::cell::Cell::new(0);
+    let start = tokio::time::Instant::now();
+    let report = capture_panic(async {
+        rig_management_open(
+            &rig.trace,
+            || {
+                probes.set(probes.get() + 1);
+                let mut state = running_module_report();
+                if probes.get() == 2 {
+                    state["supervisor.list"]["modules"][0]["last_exit_code"] = json!(1);
+                }
+                std::future::ready(state)
+            },
+            || {
+                opens.set(opens.get() + 1);
+                std::future::ready(Err::<(), _>(coded_refusal("module_warming")))
+            },
+        )
+        .await;
+    })
+    .await;
+    assert_eq!(probes.get(), 2);
+    assert_eq!(
+        opens.get(),
+        1,
+        "a dead broca must not get another open attempt"
+    );
+    assert!(start.elapsed() < broca_test_support::EVENT_HANG_GUARD);
+    for expected in [
+        "broca process exited",
+        "\"last_exit_code\":1",
+        "broca boot final marker",
+    ] {
+        assert!(report.contains(expected), "{report}");
+    }
+    // Unrelated module exits do not condemn broca, while a failed spawn and a signal exit do.
+    assert!(!broca_has_exited(&json!({"supervisor.list": {"modules": [
+        {"module_id":"other", "state":"failed", "last_exit_code":1}
+    ]}})));
+    for state in [
+        json!({"module_id":"broca", "state":"failed", "spawn_generation":0}),
+        json!({"module_id":"broca", "state":"stopped", "spawn_generation":1}),
+        json!({"module_id":"broca", "state":"running", "last_exit_signal":9}),
+    ] {
+        assert!(broca_has_exited(
+            &json!({"supervisor.list": {"modules":[state]}})
+        ));
+    }
+    rig.completed = true;
 }
 
 #[tokio::test]
