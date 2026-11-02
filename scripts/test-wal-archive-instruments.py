@@ -70,12 +70,12 @@ class ArchiveInstruments(unittest.TestCase):
             db_path = root / "run-index.db"
             with sqlite3.connect(db_path) as db:
                 db.execute("CREATE TABLE meta(session TEXT, prefix_len INTEGER)")
-                db.execute("INSERT INTO meta VALUES (?, 8)", (key,))
+                db.execute("INSERT INTO meta (session, prefix_len) VALUES (?, 8)", (key,))
                 # THE STORE MUST NAME THE SECOND MEMBER TOO, or the extra member proves
                 # nothing: a walk that stops after the first still resolves everything
                 # the store asked about. It is the second session being NAMED that turns
                 # an early return into a reported-missing row.
-                db.execute("INSERT INTO meta VALUES (?, 4)", (second_key,))
+                db.execute("INSERT INTO meta (session, prefix_len) VALUES (?, 4)", (second_key,))
                 # A REAL STORE ALWAYS HAS BOTH TABLES. This fixture built only meta and
                 # so was never representative: `addressable_keys` has always read
                 # run_index unconditionally, and the store axis now does too.

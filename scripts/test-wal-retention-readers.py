@@ -125,7 +125,7 @@ class RetentionReaders(unittest.TestCase):
                 for label, session in self.sessions.items():
                     key = "\x1f".join(session[k] for k in ("project_root", "harness", "session"))
                     db.execute("INSERT INTO run_index VALUES (?, ?)", (label, json.dumps(session, separators=(",", ":"))))
-                    db.execute("INSERT INTO meta VALUES (?, 1)", (key,))
+                    db.execute("INSERT INTO meta (session, prefix_len) VALUES (?, 1)", (key,))
                     db.execute("INSERT INTO message VALUES (?, ?)", (key, label))
 
     def run_reader(self, script: str, *args: str):

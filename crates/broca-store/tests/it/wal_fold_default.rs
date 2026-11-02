@@ -20,7 +20,7 @@ fn operator_cli_default_remains_fourteen_days_with_store_identities() {
     for days in [13, 15, 29, 31] {
         let session = BindIdentity::new("/cli-fold", "runner", days.to_string());
         conn.execute(
-            "INSERT INTO meta VALUES (?1)",
+            "INSERT INTO meta (session) VALUES (?1)",
             [format!("/cli-fold\u{1f}runner\u{1f}{days}")],
         )
         .unwrap();
@@ -43,7 +43,7 @@ fn operator_cli_default_remains_fourteen_days_with_store_identities() {
         }
     }
     // Invalid rows remain ignored just as in the original private CLI loader.
-    conn.execute("INSERT INTO meta VALUES ('malformed')", [])
+    conn.execute("INSERT INTO meta (session) VALUES ('malformed')", [])
         .unwrap();
     drop(conn);
     let before = std::fs::read(&db).unwrap();

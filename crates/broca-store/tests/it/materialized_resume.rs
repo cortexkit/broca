@@ -136,6 +136,7 @@ fn queued_title(request: &RunRequest, index: usize, bytes: usize) -> [WalRecord;
 
 #[tokio::test]
 async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
+    let unrecorded_before = broca_core::refusal_fallback::refusal_schedule_unrecorded_replays();
     use broca_core::{
         load_prior_wal_snapshot, run_loop_on_writer_admitted_with_prior_snapshot, RunControl,
         StartMode, WalHandle,
@@ -188,6 +189,14 @@ async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
             .read_records_range(&req.session, 0, None, None)
             .unwrap();
         Persister::project_range(materialized.as_ref(), &req.session, &prefix).unwrap();
+        assert_eq!(
+            materialized
+                .read_prefix_with_watermark(&req.session)
+                .unwrap()
+                .refusal,
+            Some(Default::default()),
+            "a session with no schedule records an empty seed, not unknown metadata"
+        );
         for record in queued_title(&req, history_len, 10) {
             wal.append(1, &record, false).unwrap();
         }
@@ -324,6 +333,106 @@ async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
         measurements[0], measurements[1],
         "resume work must not grow with session history"
     );
+    assert_eq!(
+        broca_core::refusal_fallback::refusal_schedule_unrecorded_replays(),
+        unrecorded_before,
+        "recorded empty schedules must never request a full-replay fallback"
+    );
+}
+
+#[tokio::test]
+async fn refusal_materialized_unrecorded_prior_replays_once_and_repairs() {
+    use broca_core::provider::StubProvider;
+    use broca_core::refusal_fallback::{refusal_schedule_unrecorded_replays, StepRoute};
+    let dir = broca_test_support::scratch_root()
+        .join(format!("refusal-unrecorded-{}", std::process::id()));
+    let mut req = request(&dir);
+    let fallback = ModelHandle::new("stub", "fallback");
+    let mut refusal = text_turn("refused", "discarded");
+    if let NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) =
+        refusal.last_mut().unwrap()
+    {
+        *finish_reason = FinishReason::ContentFilter;
+    }
+    let seed_provider = StubProvider::new(vec![refusal, text_turn("fallback", "answer")])
+        .with_refusal_fallback(fallback.clone(), Some(1_000_000));
+    let wal = FileWalStore::new(dir.join("wal"));
+    let (tx, mut rx) = mpsc::channel(512);
+    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    run_loop(
+        req.clone(),
+        &seed_provider,
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(dir.join("leases")),
+        &AllowAll,
+        &wal,
+        &tx,
+    )
+    .await
+    .unwrap();
+    let store = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
+    let range = wal.read_records_range(&req.session, 0, None, None).unwrap();
+    store.project_range(&req.session, &range).unwrap();
+    let frames = wal.read_records(&req.session).unwrap();
+    let mut second = frames
+        .iter()
+        .find_map(|frame| match &frame.record {
+            WalRecord::RunStarted { .. } => Some(frame.record.clone()),
+            _ => None,
+        })
+        .unwrap();
+    req.run_id = RunId("second".into());
+    if let WalRecord::RunStarted { run_id, input, .. } = &mut second {
+        *run_id = req.run_id.clone();
+        *input = req.input.clone().into();
+    }
+    let mut writer = wal.open(&req.session).unwrap();
+    writer.append(1, &second, true).unwrap();
+    drop(writer);
+    let conn = rusqlite::Connection::open(dir.join("store.db")).unwrap();
+    conn.execute("UPDATE meta SET refusal_replay_json=NULL", [])
+        .unwrap();
+    drop(conn);
+    assert!(store
+        .read_prefix_with_watermark(&req.session)
+        .unwrap()
+        .refusal
+        .is_none());
+    let before = refusal_schedule_unrecorded_replays();
+    let provider = StubProvider::new(vec![text_turn("resumed", "answer")])
+        .with_refusal_fallback(fallback, Some(1_000_000));
+    req.input.clear();
+    run_loop_with_store(
+        req.clone(),
+        &provider,
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(dir.join("leases")),
+        &AllowAll,
+        &wal,
+        Some(store.clone()),
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(provider.routes(), vec![StepRoute::Fallback]);
+    assert_eq!(refusal_schedule_unrecorded_replays(), before + 1);
+    // The next projection replaces unknown metadata with a complete, recorded seed.
+    let range = wal.read_records_range(&req.session, 0, None, None).unwrap();
+    store.project_range(&req.session, &range).unwrap();
+    let prefix = store.read_prefix_with_watermark(&req.session).unwrap();
+    let all = wal.read_records(&req.session).unwrap();
+    let at_watermark = broca_core::replay(
+        &all.iter()
+            .filter(|f| f.seq <= prefix.watermark_seq)
+            .map(|f| f.record.clone())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let recorded = prefix.refusal.unwrap();
+    assert_eq!(recorded.schedule, at_watermark.refusal_fallback);
+    assert_eq!(recorded.refused_steps, at_watermark.refused_steps);
+    drop(tx);
+    collector.await.unwrap();
 }
 
 #[derive(Clone)]

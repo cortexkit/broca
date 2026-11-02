@@ -62,8 +62,10 @@ fn scan(state_root: &Path) -> Result<Report, WalError> {
                     .or_default()
                     .push(address);
             }
-            // Tag numbering that would overflow is also a refusal, grouped under its own reason.
-            Err(error @ ReplayError::TagNumbering(_)) => {
+            // Replay failures without episode attribution are grouped under their own reason.
+            Err(
+                error @ (ReplayError::TagNumbering(_) | ReplayError::UnrecordedRefusalSchedule),
+            ) => {
                 report
                     .other_refusals
                     .entry(error.to_string())

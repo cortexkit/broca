@@ -63,6 +63,8 @@ fn producing_run(id: &RunId) -> RunAttribution {
 /// A replay could not produce a coherent state.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplayError {
+    /// A legacy materialized prefix predates refusal-state projection and cannot seed replay.
+    UnrecordedRefusalSchedule,
     /// A new episode (`RunStarted`) opened while the PREVIOUS episode had no durable
     /// terminal (`RunFinished`). The lease + one-active-run-per-lineage invariant
     /// guarantee a new run only starts after the prior episode reaches a durable
@@ -84,6 +86,10 @@ pub enum ReplayError {
 impl std::fmt::Display for ReplayError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ReplayError::UnrecordedRefusalSchedule => {
+                write!(f,
+                "materialized prefix has no recorded refusal state; complete WAL replay required")
+            }
             ReplayError::CorruptLineage {
                 episode_run_id,
                 reason,
@@ -208,8 +214,7 @@ pub struct ReplayState {
     /// The session's client-side refusal-fallback schedule: the last one a `model_step_refused`
     /// or `model_step_finished` recorded, cleared when an episode is admitted with another model
     /// or a day after the schedule last changed. `None` when no refusal armed one. A replay
-    /// that starts from a materialized prefix sees only what its tail recorded: the prefix
-    /// keeps no schedule.
+    /// that starts from a materialized prefix seeds this state before folding its tail.
     pub refusal_fallback: Option<broca_wal::RefusalFallbackSchedule>,
     /// The last episode's steps a `model_step_refused` re-sent to the fallback model.
     pub refused_steps: std::collections::BTreeSet<StepId>,
@@ -2199,6 +2204,7 @@ pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
 /// Persisted state needed to project a WAL suffix without replaying the materialized prefix.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionSeed {
+    pub refusal: crate::refusal_fallback::RefusalReplayState,
     /// First model-produced message of the episode open at the watermark, if it has one.
     pub open_episode_span: Option<u64>,
     /// The episode open at the watermark, as the projection holds it, and every earlier
@@ -2229,6 +2235,7 @@ impl ProjectionSeed {
     pub fn empty() -> Self {
         Self {
             open_episode_span: None,
+            refusal: Default::default(),
             open_episode: None,
             earlier_episodes: Vec::new(),
             projection_episodes: None,
@@ -2252,6 +2259,7 @@ impl ProjectionSeed {
 /// The store-ready result of folding records after a [`ProjectionSeed`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionDelta {
+    pub refusal: crate::refusal_fallback::RefusalReplayState,
     pub episode_spans: Vec<std::ops::Range<u64>>,
     pub open_episode_span: Option<u64>,
     /// Every episode's render inputs after the tail, in lineage order; `None` while the seed's
@@ -2326,6 +2334,7 @@ pub(crate) fn replay_projection_tail_with(
         seed.admission_checkpoint.compaction.as_ref(),
         seed.tag_seed,
         Vec::new(),
+        seed.refusal.clone(),
     )?;
     let mut starts_new_episode = false;
     let mut tail_updates_last_step_usage = false;
@@ -2424,6 +2433,10 @@ pub(crate) fn replay_projection_tail_with(
         )
     };
     Ok(ProjectionDelta {
+        refusal: crate::refusal_fallback::RefusalReplayState {
+            schedule: tail_state.refusal_fallback,
+            refused_steps: tail_state.refused_steps,
+        },
         episode_spans,
         open_episode_span,
         episodes,
@@ -2688,6 +2701,32 @@ pub(crate) fn replay_seeded<'a>(
     require_caller_text: bool,
     tag_seed: crate::tags::TagSeed,
 ) -> Result<ReplayState, ReplayError> {
+    replay_seeded_with_refusal(
+        records,
+        seed_origin,
+        seed_run_id,
+        seed_budget,
+        seed_budget_state,
+        ordinal_base,
+        require_caller_text,
+        tag_seed,
+        Default::default(),
+    )
+}
+
+/// Continue refusal state from a materialized boundary before applying the tail's admissions.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replay_seeded_with_refusal<'a>(
+    records: impl IntoIterator<Item = &'a WalRecord>,
+    seed_origin: Option<broca_protocol::request::ModelHandle>,
+    seed_run_id: Option<RunId>,
+    seed_budget: Option<BudgetConfig>,
+    seed_budget_state: Option<crate::BudgetReplayStateV1>,
+    ordinal_base: u64,
+    require_caller_text: bool,
+    tag_seed: crate::tags::TagSeed,
+    refusal: crate::refusal_fallback::RefusalReplayState,
+) -> Result<ReplayState, ReplayError> {
     replay_seeded_with_compaction(
         records,
         seed_origin,
@@ -2698,6 +2737,7 @@ pub(crate) fn replay_seeded<'a>(
         None,
         tag_seed,
         Vec::new(),
+        refusal,
     )
 }
 
@@ -2732,6 +2772,7 @@ pub(crate) fn replay_seeded_with_held_steers<'a>(
         None,
         tag_seed,
         held_steers,
+        Default::default(),
     )
 }
 
@@ -3101,6 +3142,7 @@ fn replay_seeded_with_compaction<'a>(
     seed_compaction: Option<&crate::compaction::CompactionCheckpoint>,
     tag_seed: crate::tags::TagSeed,
     held_steers: Vec<Message>,
+    refusal: crate::refusal_fallback::RefusalReplayState,
 ) -> Result<ReplayState, ReplayError> {
     let (ordinal_base, require_caller_text) = position;
     let mut placement = Placement::seeded(
@@ -3168,7 +3210,7 @@ fn replay_seeded_with_compaction<'a>(
     let mut saw_run_started = false;
     // Session-scoped, unlike the episode state below: a schedule carries across episodes of
     // the same source model.
-    let mut refusal_fallback: Option<broca_wal::RefusalFallbackSchedule> = None;
+    let mut refusal_fallback = refusal.schedule;
     // The current episode's transient state — reset on each new `RunStarted`. Seed the origin
     // and durable budget facts for a tail whose RunStarted is in the materialized prefix.
     let mut seeded_nudge_indices = seed_budget_state
@@ -3179,6 +3221,7 @@ fn replay_seeded_with_compaction<'a>(
         seeded_last_ordinal: ordinal_base.checked_sub(1),
         origin: seed_origin,
         pending_steers: held_steers,
+        refused_steps: refusal.refused_steps,
         ..Episode::default()
     };
     let mut recovered_calls: Vec<broca_wal::recovery::RecoveryRun> = Vec::new();
@@ -5559,6 +5602,7 @@ pub(crate) mod projection_boundary_tests {
         };
         ProjectionSeed {
             projection_episodes: None,
+            refusal: Default::default(),
             open_episode_span: Some(1),
             open_episode: None,
             earlier_episodes: Vec::new(),

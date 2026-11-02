@@ -15722,6 +15722,7 @@ mod tests {
             context_management: None,
         };
         let seed = crate::ProjectionSeed {
+            refusal: Default::default(),
             open_episode_span: Some(1),
             open_episode: None,
             earlier_episodes: Vec::new(),

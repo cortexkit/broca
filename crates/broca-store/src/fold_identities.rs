@@ -147,7 +147,7 @@ mod tests {
             .unwrap();
         let key = broca_protocol::BindIdentity::new("/project", "harness", "session");
         conn.execute(
-            "INSERT INTO meta VALUES (?1)",
+            "INSERT INTO meta (session) VALUES (?1)",
             ["/project\u{1f}harness\u{1f}session"],
         )
         .unwrap();

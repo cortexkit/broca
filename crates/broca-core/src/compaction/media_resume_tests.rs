@@ -69,6 +69,7 @@ impl crate::MaterializedStore for MediaResumeStore {
             "the original image must not be returned in the held rows"
         );
         Ok(Some(HeldPrefix {
+            refusal: Some(Default::default()),
             lineage_id: self.snapshot.lineage_id.clone(),
             watermark_seq: self.snapshot.watermark_seq,
             prefix_len: self.replay.extent,
