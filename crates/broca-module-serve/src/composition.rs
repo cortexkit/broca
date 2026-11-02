@@ -1,6 +1,5 @@
 //! The daemon's format-selected stores and feed of synced WAL publications.
 
-#[cfg(test)]
 use super::state_format::StateFormat;
 use broca_core::{FileWalStore, SessionInventory, SessionRefIndex, SessionRefResolver};
 use broca_protocol::BindIdentity;
@@ -33,6 +32,30 @@ pub(super) struct Publications {
 
 type SessionGates = HashMap<BindIdentity, std::sync::Weak<Mutex<()>>>;
 
+/// Select the writer-lease ownership policy for the state format.
+pub(super) fn opener_for_state_root(
+    leases: Arc<broca_core::FileLeaseStore>,
+    wal: Arc<FileWalStore>,
+    executor: Arc<dyn broca_module::executor::RunExecutor>,
+    format: StateFormat,
+    root: &Path,
+) -> Result<
+    broca_module::DefaultOpener<broca_core::FileLeaseStore, FileWalStore>,
+    broca_module_serve::ServeIoError,
+> {
+    use broca_module::DefaultOpener;
+    match format {
+        StateFormat::Legacy => Ok(DefaultOpener::new(leases, wal, executor)),
+        StateFormat::Overhaul => {
+            // Record the actual lease root before attaching its owned domain. The
+            // writer, not the actor, must retain authority if an extra Arc survives.
+            DefaultOpener::with_file_leases(root.join("leases"), wal, executor)
+                .with_lease_domain(broca_core::lease::WalLeaseDomain::new(root.join("leases")))
+                .map_err(|error| broca_module_serve::ServeIoError(error.to_string()))
+        }
+    }
+}
+
 pub(super) enum RestartDiscovery {
     Legacy(Arc<broca_store::SqliteStore>),
     Overhaul(Arc<dyn broca_core::RecoveryDiscovery>),
@@ -63,6 +86,41 @@ impl RestartDiscovery {
 }
 
 impl Stores {
+    /// Install the format-selected writer and finish recovery before exposing stores
+    /// to restart handling, inventory or service readers. The caller holds the root lock.
+    pub async fn boot(
+        format: StateFormat,
+        root: &Path,
+        mut wal: FileWalStore,
+    ) -> Result<(Self, Arc<FileWalStore>), String> {
+        let mut stores = match format {
+            StateFormat::Legacy => Self::deferred_legacy(),
+            StateFormat::Overhaul => Self::open_overhaul(root)?,
+        };
+        if let Some(overhaul) = &stores.overhaul {
+            let publications = overhaul.publications.clone();
+            wal = wal.with_session_guard(Arc::new(move |session| {
+                publications.ensure_available(session)
+            }));
+            wal = wal.with_publication_observer(overhaul.publications.observer());
+            wal.set_session_ref_index(overhaul.db.clone());
+        }
+        let wal = Arc::new(wal);
+        broca_module::actor::writer_reclaim::reap_temporary_markers_at_boot(wal.clone()).await?;
+        if let Some(overhaul) = &mut stores.overhaul {
+            let recovery_wal = wal.clone();
+            let publications = overhaul.publications.clone();
+            broca_diagnostics::spawn_blocking(
+                broca_diagnostics::JobKind::Recovery,
+                broca_wal::access_counter::inherit(move || publications.reconcile(&recovery_wal)),
+            )
+            .await
+            .map_err(|error| format!("join boot index reconciliation: {error}"))??;
+            overhaul.start()?;
+        }
+        Ok((stores, wal))
+    }
+
     pub fn open_boot_legacy(
         root: broca_wal::state_format::LegacyStateRoot<'_>,
         wal_config: broca_wal::WalConfig,
@@ -494,7 +552,7 @@ impl Overhaul {
     pub fn start(&mut self) -> Result<(), String> {
         let publications = self.publications.clone();
         let stop = self.stop.clone();
-        self.worker = Some(std::thread::Builder::new().name("broca-db-publisher".into()).spawn(move || {
+        self.worker = Some(std::thread::Builder::new().name("broca-db-publisher".into()).spawn(broca_wal::access_counter::inherit(move || {
             let mut published = HashMap::new();
             loop {
                 let sessions = {
@@ -520,7 +578,7 @@ impl Overhaul {
                 if stop.load(Ordering::Acquire) { break; }
                 std::thread::park_timeout(std::time::Duration::from_millis(10));
             }
-        }).map_err(|e| e.to_string())?);
+        })).map_err(|e| e.to_string())?);
         Ok(())
     }
 }

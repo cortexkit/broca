@@ -20,6 +20,8 @@ pub use operational::{
 };
 pub use outbox::OverhaulRunEventStore;
 mod publication;
+#[cfg(feature = "publication-faults")]
+mod publication_faults;
 mod readers;
 mod rebuild;
 mod reconcile;

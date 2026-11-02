@@ -376,7 +376,7 @@ pub(super) fn publish_checked_in_tx(
         checked.seq,
         lineage,
     )?;
-    let mut seed = seed.unwrap_or_default();
+    let mut seed = seed.unwrap_or_else(OffsetSeed::empty);
     tx.execute("INSERT INTO session (sid,project_root,harness,session_key,session_ref,lineage_id,location,indexed_off,indexed_end,head_ord,tail_seed,admission_seed)
         VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,'','') ON CONFLICT(sid) DO UPDATE SET session_ref=excluded.session_ref,location=excluded.location",
         params![key,bind.project_root.display().to_string(),bind.harness,bind.session,session_ref,lineage,location.as_str()])?;
@@ -416,6 +416,8 @@ pub(super) fn publish_checked_in_tx(
         params![key,lineage,range.seq.map(u64_to_i64).transpose()?,u64_to_i64(off)?,u64_to_i64(range.end)?,identity,u64_to_i64(seed.head_ord())?,seed.encode()?,seed.frozen_policy.map(u64_to_i64).transpose()?,seed.last_activity_ms.map(u64_to_i64).transpose()?,seed.last_write_ms.map(u64_to_i64).transpose()?,seed.title_off.map(u64_to_i64).transpose()?,u64_to_i64(lineage_off)?])?;
     publish_seeds(tx, &key, read)?;
     super::recovery::mark_projection_current(tx, &key)?;
+    #[cfg(feature = "publication-faults")]
+    super::publication_faults::before_commit(checked.seq);
     Ok(IndexOutcome {
         rebuilt,
         indexed_seq: range.seq,

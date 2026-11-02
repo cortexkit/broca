@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use broca_core::{FileLeaseStore, FileWalStore};
-use broca_module::{DefaultOpener, LineageRegistry};
+use broca_module::LineageRegistry;
 use broca_module_serve::{
     spawn_catalog_poll, CatalogPoller, ChargeBasisTable, ConsumerRoutes, ServeEnd, ServeIoError,
 };
@@ -23,6 +23,7 @@ use subc_transport::{authenticate_client, connection_file};
 use tokio::net::TcpStream;
 
 mod composition;
+use composition::opener_for_state_root;
 mod state_format;
 use state_format::BackgroundTask;
 
@@ -326,43 +327,15 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .flatten();
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
     let bus_hints = Arc::new(broca_module_serve::bus_events::Hints::default());
-    let mut stores = match state_format {
-        state_format::StateFormat::Legacy => composition::Stores::deferred_legacy(),
-        state_format::StateFormat::Overhaul => {
-            composition::Stores::open_overhaul(&state_root).map_err(ServeIoError)?
-        }
-    };
     let mut wal_store = FileWalStore::with_config(state_root.join("wal"), wal_config)
         .with_backup_classes(backup_classes.0);
     if bus_event_config.enabled {
         wal_store = wal_store.with_durable_observer(bus_hints.observer());
     }
-    if let Some(overhaul) = &stores.overhaul {
-        let publications = overhaul.publications.clone();
-        wal_store = wal_store.with_session_guard(Arc::new(move |session| {
-            publications.ensure_available(session)
-        }));
-        wal_store = wal_store.with_publication_observer(overhaul.publications.observer());
-        wal_store.set_session_ref_index(overhaul.db.clone());
-    }
-    let wal_store = Arc::new(wal_store);
-    // The state-root lock is held. Reap temporary names before WAL recovery.
-    broca_module::actor::writer_reclaim::reap_temporary_markers_at_boot(wal_store.clone())
+    let (mut stores, wal_store) = composition::Stores::boot(state_format, &state_root, wal_store)
         .await
         .map_err(ServeIoError)?;
-    if let Some(overhaul) = &mut stores.overhaul {
-        let wal = wal_store.clone();
-        let publications = overhaul.publications.clone();
-        // All writers are stopped under the root lock. No recovery or service
-        // reader is constructed until the index has caught up from every live WAL.
-        spawn_blocking(
-            JobKind::Recovery,
-            broca_wal::access_counter::inherit(move || publications.reconcile(&wal)),
-        )
-        .await
-        .map_err(|error| ServeIoError(format!("join boot index reconciliation: {error}")))?
-        .map_err(ServeIoError)?;
-        overhaul.start().map_err(ServeIoError)?;
+    if stores.overhaul.is_some() {
         start_media_sweep(&state_root);
     }
     let crash_orphan_wal = wal_store.clone();
@@ -1358,26 +1331,6 @@ mod runtime_shutdown_tests {
         release_unrelated.send(()).unwrap();
         process.join().unwrap();
         result.expect("an unrelated blocking job delayed runtime exit");
-    }
-}
-
-/// Select the writer-lease ownership policy for the state format.
-fn opener_for_state_root(
-    leases: Arc<FileLeaseStore>,
-    wal: Arc<FileWalStore>,
-    executor: Arc<dyn broca_module::executor::RunExecutor>,
-    format: state_format::StateFormat,
-    root: &Path,
-) -> Result<DefaultOpener<FileLeaseStore, FileWalStore>, ServeIoError> {
-    match format {
-        state_format::StateFormat::Legacy => Ok(DefaultOpener::new(leases, wal, executor)),
-        state_format::StateFormat::Overhaul => {
-            // Record the actual lease root before attaching its owned domain. The
-            // writer, not the actor, must retain authority if an extra Arc survives.
-            DefaultOpener::with_file_leases(root.join("leases"), wal, executor)
-                .with_lease_domain(broca_core::lease::WalLeaseDomain::new(root.join("leases")))
-                .map_err(|error| ServeIoError(error.to_string()))
-        }
     }
 }
 
