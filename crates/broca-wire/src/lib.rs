@@ -4208,6 +4208,8 @@ mod tests {
     use broca_protocol::{ErrorClass, MessageId, ProviderError, RunId, ToolCallId};
     use serde::de::DeserializeOwned;
 
+    include!("native_finish_goldens.rs");
+
     fn assert_json_round_trip<T>(json: serde_json::Value)
     where
         T: Serialize + DeserializeOwned,
@@ -4693,7 +4695,7 @@ mod tests {
         let bytes = include_bytes!("../tests/golden/run_status.grammar_too_large.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "11f75a0f522e8f178a6a55f3e77b98dffd1eda031f71ccbeba8531fe2b6143bc"
+            "caee68af3c00e2bf684eae747698072031b0359150c3ab72f7df1c47e40a61ee"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4704,6 +4706,7 @@ mod tests {
         assert_eq!(value["state"], "completed");
         assert_eq!(value["structured_output"]["enforcement"], "best_effort");
         assert_eq!(value["structured_output"]["reason"], "grammar_too_large");
+        assert_eq!(value["finish"], "stop");
         assert_eq!(value["structured_output"]["validation"], "passed");
         assert_eq!(value["retries_used"], 0);
     }
@@ -4846,6 +4849,10 @@ mod tests {
         let error = serde_json::to_value(error).unwrap();
         assert_eq!(error["class"], "transient");
         assert_eq!(error["provider_code"], "previous_process_ended_unsealed");
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap()["finish"],
+            "tool_calls"
+        );
         assert_eq!(
             crate::usage_compat::legacy_bytes(&serde_json::to_vec(&decoded).unwrap(), bytes),
             bytes
