@@ -1,4 +1,4 @@
-use super::{log_state, EvidenceError, SessionLogEvidence, SessionLogState};
+use super::{log_state, EvidenceError, SessionLogError, SessionLogEvidence, SessionLogState};
 use crate::db::{DbError, OverhaulDb};
 use broca_protocol::BindIdentity;
 use rusqlite::{params, OptionalExtension, Transaction};
@@ -9,7 +9,7 @@ impl OverhaulDb {
         &self,
         session: &BindIdentity,
         wal: &dyn broca_core::WalStore,
-    ) -> Result<SessionLogState, String> {
+    ) -> Result<SessionLogState, SessionLogError> {
         log_state(
             || {
                 self.read_snapshot(|tx| evidence(tx, session))
@@ -18,7 +18,7 @@ impl OverhaulDb {
             session,
             wal,
         )
-        .map_err(|error| error.to_string())
+        .map_err(SessionLogError::from_evidence)
     }
 }
 
@@ -162,7 +162,9 @@ mod tests {
         let (root, db, session, wal) = fixture("unreadable");
         let conn = rusqlite::Connection::open(root.join("broca.db")).unwrap();
         conn.execute_batch("DROP TABLE run").unwrap();
-        let error = SessionAddressResolver::session_log_state(&db, &session, &wal).unwrap_err();
+        let error = SessionAddressResolver::session_log_state(&db, &session, &wal)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("run"), "{error}");
         assert!(!root.join("run-index.db").exists());
     }
@@ -176,7 +178,9 @@ mod tests {
             [broca_core::session_addr(&session)],
         )
         .unwrap();
-        let error = SessionAddressResolver::session_log_state(&db, &session, &wal).unwrap_err();
+        let error = SessionAddressResolver::session_log_state(&db, &session, &wal)
+            .unwrap_err()
+            .to_string();
         assert!(
             error.contains("session_log_evidence_unidentified"),
             "{error}"

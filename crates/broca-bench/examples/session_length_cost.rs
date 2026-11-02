@@ -472,6 +472,12 @@ impl WalStore for CountingWal {
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
         WalStore::wal_present(&self.inner, session)
     }
+    fn wal_present_checked(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<bool>, broca_wal::WalError> {
+        WalStore::wal_present_checked(&self.inner, session)
+    }
     fn live_wal_last_write(
         &self,
         session: &BindIdentity,

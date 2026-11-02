@@ -9,6 +9,41 @@ type EvidenceError = Box<dyn std::error::Error + Send + Sync>;
 pub mod indexes;
 mod overhaul;
 
+/// Keep a WAL probe's typed cause until serving applies its established error
+/// classification. Inventory failures are not evidence that a log is healthy.
+#[derive(Debug)]
+pub enum SessionLogError {
+    Wal(broca_wal::WalError),
+    Inventory(EvidenceError),
+}
+
+impl SessionLogError {
+    pub(crate) fn from_evidence(error: EvidenceError) -> Self {
+        match error.downcast::<broca_wal::WalError>() {
+            Ok(error) => Self::Wal(*error),
+            Err(error) => Self::Inventory(error),
+        }
+    }
+}
+
+impl std::fmt::Display for SessionLogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wal(error) => std::fmt::Display::fmt(error, f),
+            Self::Inventory(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for SessionLogError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Wal(error) => Some(error),
+            Self::Inventory(error) => Some(error.as_ref()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionLogEvidence {
     pub content: bool,
@@ -39,6 +74,15 @@ impl SqliteStore {
         session: &BindIdentity,
         wal: &dyn broca_core::WalStore,
     ) -> Result<SessionLogState, String> {
+        self.checked_session_log_state(session, wal)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn checked_session_log_state(
+        &self,
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<SessionLogState, SessionLogError> {
         log_state(
             || {
                 let conn = self.conn.lock().unwrap();
@@ -47,7 +91,7 @@ impl SqliteStore {
             session,
             wal,
         )
-        .map_err(|error| error.to_string())
+        .map_err(SessionLogError::from_evidence)
     }
     pub fn session_log_evidence(
         &self,
@@ -75,7 +119,7 @@ pub(crate) fn log_state(
         Ok(()) => {}
     }
     let present = wal
-        .wal_present(session)
+        .wal_present_checked(session)?
         .ok_or("cannot establish session WAL location")?;
     if present
         && wal

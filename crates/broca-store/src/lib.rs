@@ -73,7 +73,7 @@ pub trait SessionAddressResolver: Send + Sync {
         &self,
         session: &BindIdentity,
         wal: &dyn broca_core::WalStore,
-    ) -> Result<session_log_evidence::SessionLogState, String>;
+    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError>;
 }
 
 impl SessionAddressResolver for SqliteStore {
@@ -81,8 +81,8 @@ impl SessionAddressResolver for SqliteStore {
         &self,
         session: &BindIdentity,
         wal: &dyn broca_core::WalStore,
-    ) -> Result<session_log_evidence::SessionLogState, String> {
-        SqliteStore::session_log_state(self, session, wal)
+    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError> {
+        SqliteStore::checked_session_log_state(self, session, wal)
     }
 
     fn resolve_session_address(
@@ -99,7 +99,7 @@ impl SessionAddressResolver for db::OverhaulDb {
         &self,
         session: &BindIdentity,
         wal: &dyn broca_core::WalStore,
-    ) -> Result<session_log_evidence::SessionLogState, String> {
+    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError> {
         db::OverhaulDb::session_log_state(self, session, wal)
     }
 

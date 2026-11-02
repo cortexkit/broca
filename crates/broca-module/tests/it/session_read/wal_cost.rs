@@ -81,6 +81,9 @@ impl WalStore for CountingStore {
     fn wal_present(&self, key: &BindIdentity) -> Option<bool> {
         self.inner.wal_present(key)
     }
+    fn wal_present_checked(&self, key: &BindIdentity) -> Result<Option<bool>, broca_wal::WalError> {
+        self.inner.wal_present_checked(key)
+    }
 
     fn live_wal_last_write(&self, key: &BindIdentity) -> Result<Option<SystemTime>, WalError> {
         self.inner.live_wal_last_write(key)
