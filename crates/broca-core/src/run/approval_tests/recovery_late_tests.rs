@@ -191,6 +191,7 @@ async fn fully_decoded_cut_keeps_an_unapproved_late_question_executable() {
         .any(|call| call.call_keys.contains(&key)));
     *rig.questions.answer.lock().unwrap() = "approve";
     next_turn(&rig, "after-fully-decoded-cut").await;
+    drive_late_intake(&rig, &key).await;
     assert_eq!(rig.tools.sent.lock().unwrap().len(), 1);
     assert!(rig.frames().iter().any(|frame| matches!(&frame.record,
         WalRecord::LateResult { call_key, outcome: broca_wal::LateOutcome::Completed, .. } if call_key == &key)));
@@ -205,6 +206,7 @@ async fn completed_origin_without_a_late_intent_still_executes_once() {
     let root = rig.root.join("overhaul/wal");
     rebind_planes(&mut rig, &root);
     next_turn(&rig, "late-positive-control").await;
+    drive_late_intake(&rig, &key).await;
     assert_eq!(rig.tools.sent.lock().unwrap().len(), 1);
     assert_eq!(rig.tools.provider_requests.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -255,6 +257,17 @@ async fn recovery_frozen_question_records_a_later_approval_without_execution() {
 }
 
 #[tokio::test]
+async fn recovery_frozen_question_records_a_later_approval_after_reconciliation_budget_expires() {
+    check_cut_late_intent(
+        false,
+        LateDamage::LostApprovalAndIntent,
+        Some("approve"),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn recovery_frozen_question_records_a_later_decline_without_execution() {
     check_cut_late_intent(
         false,
@@ -265,7 +278,7 @@ async fn recovery_frozen_question_records_a_later_decline_without_execution() {
     .await;
 }
 
-async fn next_turn_with_exhausted_reconciliation_budget(rig: &Rig) {
+async fn next_turn_with_exhausted_reconciliation_budget(rig: &Rig, id: &str) {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     *rig.questions.answer_gate.lock().unwrap() = Some(gate);
     let polls = rig.questions.polls.load(Ordering::SeqCst);
@@ -290,12 +303,7 @@ async fn next_turn_with_exhausted_reconciliation_budget(rig: &Rig) {
     };
     broca_test_support::wait_for(
         "next turn after an exhausted reconciliation budget",
-        async {
-            tokio::join!(
-                Box::pin(next_turn(rig, "late-after-recovery")),
-                expire_budget
-            )
-        },
+        async { tokio::join!(Box::pin(next_turn(rig, id)), expire_budget) },
         || broca_test_support::record_kinds(rig.frames()),
     )
     .await;
@@ -307,11 +315,11 @@ async fn next_turn_with_exhausted_reconciliation_budget(rig: &Rig) {
         .any(|frame| matches!(frame.record, WalRecord::LateApprovalRecorded { .. })));
 }
 
-async fn drive_recovered_late_report(rig: &Rig) {
+async fn drive_late_intake(rig: &Rig, key: &str) {
     // The admission budget includes answer-feed reads and WAL sync. Expiry
     // leaves intake for the next admission, not a background reporting task.
     broca_test_support::wait_for(
-        "recovered late approval execution report",
+        "late approval intake and execution report",
         async {
             let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
             while rig.questions.reports.lock().unwrap().is_empty() {
@@ -330,6 +338,15 @@ async fn drive_recovered_late_report(rig: &Rig) {
         || broca_test_support::record_kinds(rig.frames()),
     )
     .await;
+    assert_eq!(
+        rig.frames()
+            .iter()
+            .filter(|frame| matches!(&frame.record,
+            WalRecord::LateApprovalRecorded { call_key, .. } if call_key == key))
+            .count(),
+        1
+    );
+    assert_eq!(rig.questions.reports.lock().unwrap().len(), 1);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -491,8 +508,12 @@ async fn check_cut_late_intent(
 
     // The next-turn request enters the actual run loop with fresh routing counters.
     // Its only late work belongs to the already Completed origin episode.
-    if exhaust_reconciliation_budget {
-        Box::pin(next_turn_with_exhausted_reconciliation_budget(&rig)).await;
+    if exhaust_reconciliation_budget && later_answer.is_none() {
+        Box::pin(next_turn_with_exhausted_reconciliation_budget(
+            &rig,
+            "late-after-recovery",
+        ))
+        .await;
     } else {
         Box::pin(next_turn(&rig, "late-after-recovery")).await;
     }
@@ -558,7 +579,7 @@ async fn check_cut_late_intent(
         "Completed origin must not authorize a recovery-tombstoned call"
     );
     if later_answer.is_none() {
-        drive_recovered_late_report(&rig).await;
+        drive_late_intake(&rig, &key).await;
         assert!(rig
             .questions
             .reports
@@ -575,7 +596,16 @@ async fn check_cut_late_intent(
             WalRecord::LateApprovalRecorded { call_key, .. } if call_key == &key)));
         let old_head = std::fs::read(broca_wal::head_proof::sidecar_path(&path)).ok();
         *rig.questions.answer.lock().unwrap() = answer;
-        next_turn(&rig, "late-arrived-after-freeze").await;
+        if exhaust_reconciliation_budget {
+            Box::pin(next_turn_with_exhausted_reconciliation_budget(
+                &rig,
+                "late-arrived-after-freeze",
+            ))
+            .await;
+        } else {
+            Box::pin(next_turn(&rig, "late-arrived-after-freeze")).await;
+        }
+        drive_late_intake(&rig, &key).await;
         assert!(rig.tools.sent.lock().unwrap().is_empty());
         assert_eq!(unknown(&rig.frames()), 1);
         let expected_decision = match answer {
