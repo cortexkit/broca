@@ -7,6 +7,8 @@ mod composition;
 mod overhaul_daemon;
 #[path = "../src/state_format.rs"]
 mod state_format;
+#[path = "overhaul_read_gate/turn_heavy.rs"]
+mod turn_heavy;
 use composition::opener_for_state_root;
 
 use broca_wal::access_counter::{OperationAccess, ReadClass, ValidationRead, WalAccessCounter};
@@ -615,9 +617,8 @@ async fn installed_clean_multi_run_read_gate() {
                     "seeded resume differs from full replay"
                 );
             }
-            // Compacted raw pages and head have a separate, explicitly budgeted
-            // fallback fixture. Other sparse service and resume reads must not
-            // scan from the start of the WAL.
+            // Compacted raw pages and head have their own strict read-cost fixture.
+            // This matrix exercises the remaining sparse service and resume paths.
             service_reads(&daemon, &access, &bind, &id, !sparse).await;
             assert_eq!(
                 *daemon.resume_windows.lock().unwrap(),

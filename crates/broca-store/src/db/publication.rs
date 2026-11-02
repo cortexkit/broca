@@ -535,3 +535,81 @@ pub(super) fn publish_seeds(
     )?;
     Ok(())
 }
+
+#[cfg(feature = "publication-faults")]
+impl OverhaulDb {
+    /// Prepare a single-episode read fixture without publishing every historical seed.
+    /// Existing sessions are refused: only the final continuation is retained, so this
+    /// dev-only loader cannot replace normal publication or prepare historical episodes.
+    pub fn publish_read_fixture(
+        &self,
+        bind: &BindIdentity,
+        session_ref: &str,
+        location: LogLocation,
+        publication: &DurablePublication,
+    ) -> Result<IndexOutcome, DbError> {
+        let file = RefCell::new(broca_wal::fs_ops::File::open(publication.path())?);
+        let read = |off: u64, len: u64| {
+            let mut file = file.borrow_mut();
+            file.seek(SeekFrom::Start(off))?;
+            let mut bytes = Vec::new();
+            (&mut *file)
+                .take(len.min(publication.byte_end().saturating_sub(off)))
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        };
+        let header = access_counter::read_at(&read, 0, LINEAGE_FRAME_LEN as u64)?;
+        let lineage = match access_counter::decode_next(&header) {
+            DecodeStep::Lineage {
+                lineage_id,
+                consumed,
+            } if consumed == header.len() && lineage_id == publication.lineage() => {
+                lineage_id.to_string()
+            }
+            _ => {
+                return Err(DbError::Invalid(
+                    "fixture lineage differs from publication".into(),
+                ))
+            }
+        };
+        self.transaction(false, |tx| {
+            let key = index::sid(bind)?;
+            let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM session WHERE sid=?1)", [&key], |r| r.get(0))?;
+            if exists { return Err(DbError::Invalid("read fixture session already indexed".into())); }
+            let range = ValidatedRange::read(&read, LINEAGE_FRAME_LEN as u64, publication.byte_end(), None, publication.sequence(), &lineage)?;
+            if range.frames.iter().filter(|frame| matches!(frame.framed.record, broca_wal::WalRecord::RunStarted { .. })).count() != 1 {
+                return Err(DbError::Invalid("read fixture must contain exactly one episode".into()));
+            }
+            tx.execute("INSERT INTO session (sid,project_root,harness,session_key,session_ref,lineage_id,location,indexed_off,indexed_end,head_ord,tail_seed,admission_seed) VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,'','')",
+                params![key,bind.project_root.display().to_string(),bind.harness,bind.session,session_ref,lineage,location.as_str()])?;
+            let mut seed = OffsetSeed::empty();
+            for frame in &range.frames {
+                if matches!(&frame.framed.record, broca_wal::WalRecord::RunStarted { session, .. } if session != bind) {
+                    return Err(DbError::Invalid("fixture bind differs from indexed session".into()));
+                }
+                index::apply_frame(tx, &key, Some(&lineage), &mut seed, frame)?;
+            }
+            let last = range.frames.last().ok_or_else(|| DbError::Invalid("read fixture is empty".into()))?;
+            tx.execute("UPDATE session SET lineage_id=?2,indexed_seq=?3,indexed_off=?4,indexed_end=?5,indexed_identity=?6,head_ord=?7,locator_seed=?8,frozen_policy=?9,last_activity_ms=?10,last_write_ms=?11,title_off=?12,lineage_off=?13 WHERE sid=?1",
+                params![key,lineage,range.seq.map(u64_to_i64).transpose()?,u64_to_i64(last.off)?,u64_to_i64(range.end)?,last.identity,u64_to_i64(seed.head_ord())?,seed.encode()?,seed.frozen_policy.map(u64_to_i64).transpose()?,seed.last_activity_ms.map(u64_to_i64).transpose()?,seed.last_write_ms.map(u64_to_i64).transpose()?,seed.title_off.map(u64_to_i64).transpose()?,u64_to_i64(range.lineage_off.unwrap_or(0))?])?;
+            publish_seeds(tx, &key, &read)?;
+            let tail: String = tx.query_row("SELECT tail_seed FROM session WHERE sid=?1", [&key], |r| r.get(0))?;
+            ProjectionContinuation::decode_for_execution(&tail).map_err(DbError::SeedFallback)?;
+            super::recovery::mark_projection_current(tx, &key)?;
+            Ok(IndexOutcome { rebuilt: false, indexed_seq: range.seq, indexed_end: range.end, head_ord: seed.head_ord() })
+        })
+    }
+
+    /// Derived tables that must match normal publication in bulk-loader parity checks.
+    pub fn read_fixture_tables() -> &'static [&'static str] {
+        super::schema::REBUILDABLE_TABLES
+    }
+
+    /// Cumulative row changes on the publication writer, not a read-only snapshot connection.
+    pub fn publication_row_changes(&self) -> Result<u64, DbError> {
+        self.conn
+            .lock()
+            .map(|conn| conn.total_changes())
+            .map_err(|_| DbError::Invalid("database writer poisoned".into()))
+    }
+}
