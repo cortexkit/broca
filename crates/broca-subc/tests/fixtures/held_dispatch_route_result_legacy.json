@@ -1,0 +1,1 @@
+{"op":"route.open","target":{"kind":"tool_provider","module_id":"provider"},"identity":{"harness":"runner","session":"session"},"consumer_capabilities":["tool-result/v1"]}

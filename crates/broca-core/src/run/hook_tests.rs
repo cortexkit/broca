@@ -2671,10 +2671,10 @@ async fn post_hook_restream_counts_delta_less_stored_blocks() {
     assert_eq!(parts, vec![1, 2]);
 }
 
-/// Records the `late_results` declaration each batch's manifest carries for the tool's
+/// Records the late-results and keepalive declarations each batch's manifest carries for the tool's
 /// provider, and answers every call at once.
 struct DeclarationProbe {
-    seen: Mutex<Vec<Option<bool>>>,
+    seen: Mutex<Vec<(Option<bool>, Option<bool>)>>,
 }
 
 #[async_trait::async_trait]
@@ -2685,11 +2685,11 @@ impl ToolPlane for DeclarationProbe {
         _: &[ToolCall],
         manifest: &ToolManifest,
     ) -> Result<(), ToolPlaneError> {
-        self.seen.lock().unwrap().push(
-            manifest
-                .provider_declarations("aft")
-                .and_then(|declarations| declarations.late_results),
-        );
+        let declarations = manifest.provider_declarations("aft");
+        self.seen.lock().unwrap().push((
+            declarations.and_then(|declarations| declarations.late_results),
+            declarations.and_then(|declarations| declarations.call_keepalive),
+        ));
         Ok(())
     }
 
@@ -2706,7 +2706,7 @@ impl ToolPlane for DeclarationProbe {
     }
 }
 
-/// A plan manifest whose provider froze the `late_results` capability, or froze nothing.
+/// A plan manifest whose provider froze late-results and keepalive promises, or froze nothing.
 fn declaring(late_results: bool) -> broca_wal::PlanManifest {
     let mut manifest = frozen(Vec::new(), None, false);
     if let broca_wal::FetchOutcome::Answered {
@@ -2715,6 +2715,7 @@ fn declaring(late_results: bool) -> broca_wal::PlanManifest {
     } = &mut manifest.fetches[0].outcome
     {
         *declarations_frozen = late_results.then_some(broca_wal::FrozenProviderDeclarations {
+            call_keepalive: Some(true),
             result_formats: None,
             late_results: Some(true),
             schema_pins: None,
@@ -2760,7 +2761,7 @@ async fn a_batch_reads_provider_declarations_only_from_the_frozen_manifest() {
     .await
     .unwrap();
     let _ = seed_writer.shutdown().await;
-    assert_eq!(*fresh.seen.lock().unwrap(), [Some(true)]);
+    assert_eq!(*fresh.seen.lock().unwrap(), [(Some(true), Some(true))]);
 
     // Resume from the durable model step, with a caller that offers a manifest declaring
     // nothing: the resumed batch still routes by what the session froze.
@@ -2807,7 +2808,7 @@ async fn a_batch_reads_provider_declarations_only_from_the_frozen_manifest() {
     )
     .await
     .unwrap();
-    assert_eq!(*resumed.seen.lock().unwrap(), [Some(true)]);
+    assert_eq!(*resumed.seen.lock().unwrap(), [(Some(true), Some(true))]);
     let _ = writer.shutdown().await;
 }
 

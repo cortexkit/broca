@@ -29,6 +29,10 @@ const TRANSIENT: &str = "transient";
 /// real bound; this only keeps a single call from outliving it.
 const FETCH_REPLY_TIMEOUT: Duration = broca_fetch_plan::ADMISSION_DEADLINE;
 
+type CatalogSnapshot = futures::future::Shared<
+    futures::future::BoxFuture<'static, Result<Arc<Vec<subc_control::CatalogEntry>>, FetchError>>,
+>;
+
 /// Fetches one session's plan over a subc consumer connection.
 pub struct SubcPlanFetcher {
     conn: Arc<SubcConnection>,
@@ -38,6 +42,7 @@ pub struct SubcPlanFetcher {
     hooks: crate::SubcHookPlane,
     compaction: crate::SubcCompactionPlane,
     deadline: tokio::time::Instant,
+    catalog_snapshot: Mutex<Option<CatalogSnapshot>>,
 }
 
 impl SubcPlanFetcher {
@@ -55,6 +60,7 @@ impl SubcPlanFetcher {
             identity,
             scope,
             opened: Mutex::new(Vec::new()),
+            catalog_snapshot: Mutex::new(None),
         }
     }
 
@@ -66,6 +72,29 @@ impl SubcPlanFetcher {
         for route in opened {
             let _ = self.conn.route_close(&route).await;
         }
+    }
+
+    async fn catalog_snapshot(&self) -> Result<Arc<Vec<subc_control::CatalogEntry>>, FetchError> {
+        use futures::FutureExt;
+        let snapshot = self
+            .catalog_snapshot
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| {
+                let conn = self.conn.clone();
+                // The shared future stays in the admission-local cache if an optional caller
+                // stops waiting. Another provider must not start a duplicate control request.
+                async move {
+                    conn.catalog_list()
+                        .await
+                        .map(Arc::new)
+                        .map_err(|error| FetchError::Lost(error.to_string()))
+                }
+                .boxed()
+                .shared()
+            })
+            .clone();
+        snapshot.await
     }
 
     /// The scope selector the session's fetch routes open under, from its frozen scope (`None`
@@ -236,12 +265,28 @@ impl broca_fetch_plan::PlanAdmitter for SubcPlanAdmitter {
 
 #[async_trait]
 impl Fetcher for SubcPlanFetcher {
+    async fn call_keepalive_supported(&self, provider: &str) -> Result<bool, FetchError> {
+        let entries = self.catalog_snapshot().await?;
+        Ok(entries
+            .iter()
+            .find(|entry| entry.module_id == provider)
+            .and_then(|entry| entry.capabilities.as_ref())
+            .is_some_and(|caps| {
+                caps.provides.iter().any(|capability| {
+                    capability == cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY
+                })
+            }))
+    }
     async fn system_text_default_supported(&self, provider: &str) -> Result<bool, FetchError> {
-        let entries = self
-            .conn
-            .catalog_list()
-            .await
-            .map_err(|error| FetchError::Lost(error.to_string()))?;
+        let entries = match self.catalog_snapshot().await {
+            Ok(entries) => entries,
+            Err(error) => {
+                // Required preset discovery keeps its existing retry policy. Only a
+                // successful snapshot, or an optional lookup, is retained for admission.
+                self.catalog_snapshot.lock().unwrap().take();
+                return Err(error);
+            }
+        };
         Ok(entries
             .iter()
             .find(|entry| entry.module_id == provider)
@@ -427,6 +472,158 @@ mod preset_tests {
 mod default_text_tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_cancelled_optional_waiter_does_not_restart_the_shared_catalog_request() {
+        let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+        let fetcher = SubcPlanFetcher::new(
+            Arc::new(conn),
+            BindIdentity::new("/project", "runner", "cancelled-probe"),
+            None,
+        );
+        let request = {
+            let first = fetcher.call_keepalive_supported("provider");
+            tokio::pin!(first);
+            assert!(futures::poll!(&mut first).is_pending());
+            daemon.next_request().await
+        };
+        let mut entry =
+            serde_json::to_value(subc_control::CatalogEntry::new("provider", vec![], vec![]))
+                .unwrap();
+        entry["capabilities"] =
+            json!({"provides":[cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY]});
+        let response = subc_control::ClientControlResponse::CatalogList {
+            generation: 1,
+            modules: vec![serde_json::from_value(entry).unwrap()],
+            subc_ops: vec![],
+        };
+        assert!(daemon.reply(&request, serde_json::to_vec(&response).unwrap()));
+        assert!(fetcher.call_keepalive_supported("provider").await.unwrap());
+        assert!(daemon.take_written_for_test().is_empty());
+    }
+
+    #[tokio::test]
+    async fn required_system_text_discovery_can_retry_a_failed_snapshot() {
+        let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+        let fetcher = SubcPlanFetcher::new(
+            Arc::new(conn),
+            BindIdentity::new("/project", "runner", "required-retry"),
+            None,
+        );
+        let (first, request) =
+            tokio::join!(fetcher.system_text_default_supported("provider"), async {
+                let request = daemon.next_request().await;
+                assert!(daemon.refuse(&request, "module_timeout"));
+                request
+            });
+        assert!(first.is_err());
+        let (second, ()) = tokio::join!(fetcher.system_text_default_supported("provider"), async {
+            let retry = daemon.next_request().await;
+            assert_ne!(retry.header.corr, request.header.corr);
+            let mut entry =
+                serde_json::to_value(subc_control::CatalogEntry::new("provider", vec![], vec![]))
+                    .unwrap();
+            entry["capabilities"] =
+                json!({"provides":[cortexkit_role_tool_provider::SYSTEM_TEXT_DEFAULT]});
+            let response = subc_control::ClientControlResponse::CatalogList {
+                generation: 1,
+                modules: vec![serde_json::from_value(entry).unwrap()],
+                subc_ops: vec![],
+            };
+            assert!(daemon.reply(&retry, serde_json::to_vec(&response).unwrap()));
+        });
+        assert!(second.unwrap());
+        assert!(!fetcher.call_keepalive_supported("provider").await.unwrap());
+        assert!(daemon.take_written_for_test().is_empty());
+    }
+
+    #[tokio::test]
+    async fn keepalive_discovery_shares_one_snapshot_with_existing_system_text_discovery() {
+        let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+        let fetcher = SubcPlanFetcher::new(
+            Arc::new(conn),
+            BindIdentity::new("/project", "runner", "shared-catalog"),
+            None,
+        );
+        let read = async {
+            assert!(fetcher
+                .system_text_default_supported("provider")
+                .await
+                .unwrap());
+            let (first, second) = tokio::join!(
+                fetcher.call_keepalive_supported("provider"),
+                fetcher.call_keepalive_supported("other"),
+            );
+            assert!(first.unwrap());
+            assert!(!second.unwrap());
+        };
+        let reply = async {
+            let request = daemon.next_request().await;
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["op"], "catalog.list");
+            let mut entry =
+                serde_json::to_value(subc_control::CatalogEntry::new("provider", vec![], vec![]))
+                    .unwrap();
+            entry["capabilities"] = json!({"provides":[
+                cortexkit_role_tool_provider::SYSTEM_TEXT_DEFAULT,
+                cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY,
+            ]});
+            let response = subc_control::ClientControlResponse::CatalogList {
+                generation: 1,
+                modules: vec![serde_json::from_value(entry).unwrap()],
+                subc_ops: vec![],
+            };
+            assert!(daemon.reply(&request, serde_json::to_vec(&response).unwrap()));
+        };
+        tokio::join!(read, reply);
+        assert!(
+            daemon.take_written_for_test().is_empty(),
+            "no extra daemon request after the existing lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_promise_comes_only_from_the_matching_provider_manifest() {
+        for (module, provides, expected) in [
+            (
+                "provider",
+                vec![cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY],
+                true,
+            ),
+            ("provider", vec![], false),
+            (
+                "other",
+                vec![cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY],
+                false,
+            ),
+        ] {
+            let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+            let fetcher = SubcPlanFetcher::new(
+                Arc::new(conn),
+                BindIdentity::new("/project", "runner", "catalog"),
+                None,
+            );
+            let read = fetcher.call_keepalive_supported("provider");
+            let reply = async {
+                let request = daemon.next_request().await;
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["op"], "catalog.list");
+                let mut entry =
+                    serde_json::to_value(subc_control::CatalogEntry::new(module, vec![], vec![]))
+                        .unwrap();
+                entry["capabilities"] = json!({"provides":provides});
+                let response = subc_control::ClientControlResponse::CatalogList {
+                    generation: 1,
+                    modules: vec![serde_json::from_value(entry).unwrap()],
+                    subc_ops: vec![],
+                };
+                assert!(daemon.reply(&request, serde_json::to_vec(&response).unwrap()));
+            };
+            let (supported, ()) = tokio::join!(read, reply);
+            assert_eq!(supported.unwrap(), expected);
+            assert!(daemon.take_written_for_test().is_empty());
+        }
+    }
 
     #[tokio::test]
     async fn system_text_default_uses_matching_daemon_catalog_declaration() {

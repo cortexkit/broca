@@ -17,6 +17,7 @@
 mod common;
 
 mod aimock_real_aft;
+mod call_keepalive_latency_real_daemon;
 mod compaction_routes;
 mod consent_ops;
 mod dogfood;
