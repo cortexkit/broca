@@ -2307,6 +2307,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // Cached tool routes and the route Goodbyes sent when sessions close. Asserted below:
         // no route outlives its session, and no Goodbye failed, was dropped or is still owed.
         "tool_routes",
+        // Quota readings forwarded to insula. This probe makes no subscription model call, so
+        // asserted below: nothing sent, failed or dropped, and no reading insula ignored.
+        "usage_observe",
     ]
     .into_iter()
     .collect();
@@ -2322,6 +2325,17 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         metrics["scoped_role_route_refusals"],
         serde_json::json!({}),
         "a process with no refused scoped role opens has an empty refusal-code map"
+    );
+    assert_eq!(
+        metrics["usage_observe"],
+        serde_json::json!({
+            "rows_sent": 0,
+            "batches_sent": 0,
+            "transport_failures": 0,
+            "rows_dropped": 0,
+            "ignored": {},
+        }),
+        "a process that made no subscription call forwards no quota reading and loses none"
     );
     let readers = metrics["session_readers"]
         .as_object()

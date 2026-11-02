@@ -117,7 +117,10 @@ async fn real_publisher_growth_200_steps() {
     publisher_case(200).await;
 }
 
+// A measurement, not a gate: on today's publisher it takes about 500 s, past the test
+// runner's 300 s limit. Run it explicitly with `--run-ignored all` when measuring publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement probe; about 500 s on today's publisher"]
 async fn real_publisher_growth_1000_steps() {
     publisher_case(1_000).await;
 }
