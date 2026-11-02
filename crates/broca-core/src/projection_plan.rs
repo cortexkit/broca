@@ -1213,9 +1213,10 @@ impl ProjectionContinuation {
         tail: &[crate::replay::PositionedFrame],
     ) -> Result<Self, crate::replay::SeedFallback> {
         let prior = self.hydrate(read_at, tail, boundary.seq)?;
-        let delta = replay_projection_tail(
+        let delta = crate::replay::replay_projection_tail_with(
             &prior,
             &tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>(),
+            crate::replay::LeadingInterrupted::RetainKnownEpisode,
         )
         .map_err(|_| crate::replay::SeedFallback::new("projection continuation tail invalid"))?;
         let tags = if delta.messages.is_empty() {
@@ -1450,6 +1451,15 @@ pub struct OffsetDelta {
 }
 
 impl OffsetSeed {
+    /// A current empty locator that can be persisted even before the first record.
+    /// Missing head folds still mean stale state when decoding existing locators.
+    pub fn empty() -> Self {
+        Self {
+            head_fold: Some(Default::default()),
+            ..Default::default()
+        }
+    }
+
     pub fn head_ord(&self) -> u64 {
         self.placement.next_ordinal()
     }
