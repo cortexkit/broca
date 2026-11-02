@@ -695,6 +695,9 @@ pub struct RunControl {
     pub clock: Option<crate::Clock>,
     /// Operator consent frozen only when a fresh episode is admitted; resumes use its WAL policy.
     pub account_limit_pause: bool,
+    /// Boot-loaded wait cap for new pauses. Committed pauses replay their recorded wake
+    /// time without consulting configuration again.
+    pub max_same_account_wait: crate::SameAccountWait,
     /// Immediate cancellation: abort the model stream and stop dispatch, closing the batch
     /// under the existing at-most-once rules before finishing `Cancelled`. `None` disables
     /// this signal. Boundary cancellation uses the shared `steer` inbox instead, so it can
@@ -904,6 +907,7 @@ impl Default for RunControl {
             approval_wait_probe: None,
             clock: None,
             account_limit_pause: false,
+            max_same_account_wait: crate::SameAccountWait::default(),
             cancel: None,
             compaction_plane: None,
             compaction_views: None,
@@ -6475,6 +6479,17 @@ where
         let record_attempt = |mut attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
             let journaled_attempts = &journaled_attempts;
             let last_account_limit_attempt = &last_account_limit_attempt;
+            if !account_limit_pause_enabled {
+                // Disabled runs retain the legacy record bytes. The in-memory evidence is
+                // still needed to count a declined pause; its sequence is never persisted.
+                *last_account_limit_attempt.lock().unwrap() =
+                    attempt.account_observation.limit.as_ref().map(|_| {
+                        crate::account_limit_pause::FailedAccountLimitAttempt {
+                            seq: 0,
+                            attempt: attempt.clone(),
+                        }
+                    });
+            }
             step_attempts.fetch_max(
                 attempt.attempt.saturating_add(1),
                 std::sync::atomic::Ordering::Relaxed,
@@ -7427,29 +7442,46 @@ where
                     )
                     .await;
                 }
-                let account_limit = if account_limit_pause_enabled {
-                    control.now_ms().and_then(|paused_at_ms| {
-                        last_account_limit_attempt
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .and_then(|attempt| {
-                                attempt.pause(
-                                    step_id,
-                                    paused_at_ms,
-                                    &error,
-                                    control.auth_selection.as_ref().or_else(|| {
-                                        prior
-                                            .run_config
-                                            .as_ref()
-                                            .and_then(|config| config.auth_selection.as_ref())
-                                    }),
-                                )
-                            })
-                    })
-                } else {
-                    None
-                };
+                let account_limit = control.now_ms().and_then(|paused_at_ms| {
+                    last_account_limit_attempt
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|attempt| {
+                            let selection = control.auth_selection.as_ref().or_else(|| {
+                                prior
+                                    .run_config
+                                    .as_ref()
+                                    .and_then(|config| config.auth_selection.as_ref())
+                            });
+                            let last_accepted = attempt
+                                .attempt
+                                .served_account_ref
+                                .as_deref()
+                                .or_else(|| {
+                                    selection.and_then(|selection| selection.account_ref.as_deref())
+                                })
+                                .and_then(|account| provider.last_accepted_at_ms(account));
+                            let frozen = prior
+                                .run_config
+                                .as_ref()
+                                .filter(|_| is_resume && !append_episode)
+                                .map(|config| config.frozen_render_config.clone())
+                                .unwrap_or_else(|| provider.render_config_blob());
+                            let budget = crate::account_limit_pause::PauseBudget {
+                                setting: if account_limit_pause_enabled {
+                                    control.max_same_account_wait
+                                } else {
+                                    crate::SameAccountWait::Minutes(0)
+                                },
+                                cache_expiry_ms: crate::session_account_cache_expiry_ms(
+                                    last_accepted,
+                                    &frozen,
+                                ),
+                            };
+                            attempt.pause(step_id, paused_at_ms, &error, selection, &budget)
+                        })
+                });
                 if let Some(pause) = account_limit {
                     return pause_run_impl(
                         writer,

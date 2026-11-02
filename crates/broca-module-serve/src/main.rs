@@ -259,6 +259,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let account_limit_pause = broca_module_serve::config::AccountLimitPauseConfig::load_default()
         .map_err(ServeIoError)?;
+    if account_limit_pause.obsolete_account_limit_pause {
+        tracing::warn!(target: "config", "broca.jsonc key 'account_limit_pause' is obsolete and ignored; use 'max_same_account_wait' instead");
+    }
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
@@ -492,7 +495,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // refusal mapping can take its own switch from the same block.
     executor_impl = executor_impl.with_anthropic_fallbacks(anthropic_fallbacks);
     executor_impl = executor_impl.with_tool_name_aliases(tool_name_aliases);
-    executor_impl = executor_impl.with_account_limit_pause(account_limit_pause.enabled);
+    executor_impl =
+        executor_impl.with_max_same_account_wait(account_limit_pause.max_same_account_wait);
     let charge_basis_table = Arc::new(ChargeBasisTable::load_default_path().map_err(ServeIoError)?);
     if let Some(notice) = charge_basis_table.ignored_version_notice() {
         tracing::warn!(target: "billing", "{notice}");
@@ -3053,7 +3057,8 @@ mod executor {
         /// Consulted only at admission; a resume keeps its recorded policy. Both switches default off.
         anthropic_fallbacks: broca_module_serve::config::AnthropicFallbackConfig,
         tool_name_aliases: broca_module_serve::config::ToolNameAliasesConfig,
-        account_limit_pause: bool,
+        /// Boot-loaded wait bound shared by routing admission and new account-limit pauses.
+        max_same_account_wait: broca_core::SameAccountWait,
         /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
         /// its WAL could not be read), so the WAL is read for it at most once per session.
         cc_suffix_memo: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
@@ -3168,7 +3173,7 @@ mod executor {
                 claude_code_install_id: None,
                 anthropic_fallbacks: Default::default(),
                 tool_name_aliases: Default::default(),
-                account_limit_pause: false,
+                max_same_account_wait: Default::default(),
                 cc_suffix_memo: Default::default(),
                 cc_suffix_wal_bytes: Default::default(),
                 cc_prompt_memo: Default::default(),
@@ -3324,8 +3329,8 @@ mod executor {
             self
         }
 
-        pub fn with_account_limit_pause(mut self, enabled: bool) -> Self {
-            self.account_limit_pause = enabled;
+        pub fn with_max_same_account_wait(mut self, setting: broca_core::SameAccountWait) -> Self {
+            self.max_same_account_wait = setting;
             self
         }
 
@@ -3392,10 +3397,10 @@ mod executor {
             &self,
             req: &broca_core::RunRequest,
             fresh_episode: bool,
-            pinned_method: Option<AuthMethod>,
-            pinned_account: Option<&str>,
+            pinned: (Option<AuthMethod>, Option<&str>),
             conversation_key: Option<&str>,
             inherited_conversation_key: Option<&str>,
+            hold_cap: broca_module_serve::account_routing::AccountHoldCap,
         ) -> Result<AccountChoice, broca_module_serve::account_routing::ChoiceRefusal> {
             if !fresh_episode || self.provider_base_url.is_some() {
                 return Ok(AccountChoice::NotApplicable);
@@ -3403,6 +3408,7 @@ mod executor {
             let (Some(vault), Some(routing)) = (self.vault.as_ref(), self.routing.as_ref()) else {
                 return Ok(AccountChoice::NotApplicable);
             };
+            let (pinned_method, pinned_account) = pinned;
             let static_credential = broca_module_serve::auth_routing::resolve_credential_id(
                 req.model.provider_module_id.as_str(),
                 pinned_method,
@@ -3427,6 +3433,7 @@ mod executor {
                     send_id: req.send_id.as_deref(),
                     run_id: &req.run_id.0,
                     initial_input_bytes,
+                    hold_cap,
                 },
                 latest_listing(Arc::clone(vault)),
                 deadline,
@@ -4277,10 +4284,25 @@ mod executor {
                 .choose_account_for_episode(
                     &job.req,
                     fresh_episode,
-                    pinned_method,
-                    pinned_account,
+                    (pinned_method, pinned_account),
                     job.conversation_key.as_deref(),
                     inherited_key,
+                    broca_module_serve::account_routing::account_hold_cap(
+                        self.max_same_account_wait,
+                        prior_snapshot
+                            .checkpoint_at_head
+                            .last_episode
+                            .as_ref()
+                            .map(|episode| &episode.config),
+                        job.control
+                            .clock
+                            .as_ref()
+                            .map_or_else(|| epoch_millis().max(0) as u64, |clock| clock.now_ms()),
+                        |account| {
+                            self.provider_client
+                                .session_last_accepted_at_ms(&job.req.session, account)
+                        },
+                    ),
                 )
                 .await
             {
@@ -4853,7 +4875,8 @@ mod executor {
             // method-qualified vault credential id.
             let mut control = job.control;
             control.compaction_signals = self.compaction_signals;
-            control.account_limit_pause = self.account_limit_pause;
+            control.max_same_account_wait = self.max_same_account_wait;
+            control.account_limit_pause = self.max_same_account_wait.enabled();
             control.hook_plane = self.hook_plane();
             // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
             // the durable WAL projector. The actor's live-output task discards those same units,

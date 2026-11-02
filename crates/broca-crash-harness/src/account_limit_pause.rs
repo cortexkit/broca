@@ -206,6 +206,10 @@ impl Provider for Limited {
     fn reports_attempt_evidence(&self) -> bool {
         true
     }
+    fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {
+        // Keep the cache warm while the harness truncates the WAL at each record/byte boundary.
+        (account == "acct-a").then_some(1000)
+    }
 }
 
 fn clock(root: &std::path::Path, now: u64) -> Clock {
@@ -253,8 +257,10 @@ async fn drive(
             account_limit_pause: true,
             clock: Some(provider.clock.clone()),
             auth_selection: Some(
-                serde_json::from_value(serde_json::json!({"credential_id":"oauth:stub:work"}))
-                    .unwrap(),
+                serde_json::from_value(
+                    serde_json::json!({"credential_id":"oauth:stub:work","account_ref":"acct-a"}),
+                )
+                .unwrap(),
             ),
             ..Default::default()
         },

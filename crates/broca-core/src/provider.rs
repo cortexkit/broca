@@ -89,6 +89,13 @@ pub trait Provider: Send + Sync {
     fn annotate_cache_evidence(&self, _attempt: &mut broca_protocol::ModelAttempt) {}
     fn cache_attempt_recorded(&self, _locator: Option<String>) {}
 
+    /// Latest 2xx model-attempt send for this account in the bound session. Refusals do
+    /// not refresh this clock, even though cache diagnostics compare against the latest
+    /// attempt regardless of whether the provider accepted it.
+    fn last_accepted_at_ms(&self, _account: &str) -> Option<u64> {
+        None
+    }
+
     /// Pin the freshly resolved credential record version before acquiring run transport.
     fn set_credential_revision(&self, _revision: u64) {}
 
@@ -365,6 +372,10 @@ impl Provider for Box<dyn Provider> {
     }
     fn cache_attempt_recorded(&self, locator: Option<String>) {
         (**self).cache_attempt_recorded(locator)
+    }
+
+    fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {
+        (**self).last_accepted_at_ms(account)
     }
 
     fn set_credential_revision(&self, revision: u64) {

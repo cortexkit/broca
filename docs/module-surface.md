@@ -834,6 +834,20 @@ frozen `conversation_key` and `conversation_key_source: "caller" | "session" | "
 absent on old records. The source is an open string so future values survive replay.
 Raw keys are stored in the WAL on `Queued` and `RunStarted`, not in usage exports.
 
+For each `route.account_for` admission request, broca also sends the top-level integer
+`hold_wait_max_s`: the longest wait it permits routing to hold for the session's previous
+run's frozen account. It is `floor(max(0, min(setting, cache_expiry - now)) / 1 second)`,
+with `max_same_account_wait` converted from minutes to duration and `"max"` omitting that
+setting bound. The setting is loaded once at boot; changes take effect at the next restart.
+The shared cache-expiry computation uses that account's last accepted 2xx
+attempt send time plus the previous run's frozen TTL (explicit 5 minutes or 1 hour; unknown
+means 5 minutes). Setting `0`, no previous run/account, or no accepted attempt sends `0`.
+Admission reads only the existing frozen snapshot and in-memory account evidence, never the
+log. After a restart, the first admission of each session sends `0` until that session has
+run once. `health.check.metrics.account_limit_hold_cap_unknown` counts admissions that sent
+`0` because evidence was not loaded, separately from known-zero allowances. These are broca's
+outgoing request fields; routing decides whether and how to honor the allowance.
+
 `session.send.title` optionally names the work a send carries, for dashboards and logs, on
 every delivery mode. When present it must be a string of 1–200 Unicode scalar values, not all
 whitespace, with no control character (newline and tab included). Anything else, including null
@@ -1391,10 +1405,23 @@ keep their existing behavior and omit this diagnostic.
 - **State enum:** `Idle | Active{run_id, step} | Paused{run_id, reason} | Interrupted{run_id} |
   Terminal{run_id, reason} | Error{run_id, detail}`. `run.status(session)` resolves the
   in-process active run first, then WAL inference.
-- **Timed account pauses:** the root `broca.jsonc` switch `account_limit_pause` defaults to
-  false and must be a boolean. An enabled fresh run freezes consent in its WAL config.
-  A source-classified transient account limit pauses only with a present, checked recovery
-  floor in `[paused_at_ms, paused_at_ms + 60 minutes]`. It resumes itself on the same frozen
+- **Timed account pauses:** the root `broca.jsonc` setting `max_same_account_wait` defaults to
+  `15`. A non-negative integer caps the wait in minutes; `0` never pauses, and `"max"` removes
+  the cap but still respects cache expiry. Other values refuse boot by name. The obsolete
+  `account_limit_pause` key is ignored with one boot warning naming the replacement.
+  The setting is loaded once at boot; changes take effect at the next restart, like other
+  `broca.jsonc` settings. Each fresh run freezes only consent (`setting != 0`) in its existing
+  WAL boolean; a new pause uses the executor's in-memory cap. For a source-classified transient
+  account limit,
+  `wake` is the latest blocking reset/retry floor (including any scheduling jitter),
+  `cache_expiry` is the last 2xx attempt's send time on that account in this session plus the
+  run's frozen cache TTL (explicit 5 minutes or 1 hour; unknown means 5 minutes), and
+  `cap = now + setting` (`"max"` has no cap). Pause only if
+  `wake <= min(cache_expiry, cap)`. A 2xx response counts even if its stream did not complete;
+  a refusal cannot refresh the cache. No accepted response on this account means no pause.
+  A declined wait ends with the existing transient `account_limit_exhausted` error and reset
+  time, allowing Core to revive the worker and routing to choose an account. A committed pause
+  replays its recorded wake without re-deciding these bounds and resumes on the same frozen
   selection, never through a routing account switch. `run.status` reports `state: paused`,
   `reason: account_limit`, `pause_reason: account_limit`, the original structured error and
   optional `resume_not_before_ms`. The durable subscribe `paused` control carries the same
@@ -1403,8 +1430,10 @@ keep their existing behavior and omit this diagnostic.
   An idempotent resend returns the pause/current continuation rather than scheduling a second
   execution. Unrelated sends and steers receive `run_paused`; cancel remains available.
   Newly stale reset refusals retain the terminal path and increment the always-present lifetime
-  health metric `account_limit_stale_resets`. Readers must understand `account-limit-pause/v1`
-  before the writer is deployed or the switch enabled.
+  health metric `account_limit_stale_resets`. `health.check.metrics.account_limit_pause_declined`
+  always reports lifetime counts for `disabled`, `no_accepted_response`, `cache_expires_first`
+  and `beyond_cap`; each decline logs reset, wake, cache expiry, cap and reason at info level.
+  Readers must understand `account-limit-pause/v1` before a consenting run writes it.
 - **Durable run index** in `run-index.db`: `run_id → {session, lineage, submission_id, state,
   wal_path}` so run-keyed ops survive restart. Resume **reuses the original run_id**
   (today it mints `req.run_id`).

@@ -835,11 +835,11 @@ mod state_format_config_tests {
         );
     }
 }
-/// Root-level consent for writing timed account-limit recovery records. Absence keeps the
-/// legacy terminal-error path and does not raise the WAL reader floor.
+/// Root-level same-account wait cap loaded at boot. Consent is frozen at admission.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AccountLimitPauseConfig {
-    pub enabled: bool,
+    pub max_same_account_wait: broca_core::SameAccountWait,
+    pub obsolete_account_limit_pause: bool,
 }
 
 impl AccountLimitPauseConfig {
@@ -853,7 +853,7 @@ impl AccountLimitPauseConfig {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
                 Err(error) => Err(format!(
-                    "read account_limit_pause from {}: {error}",
+                    "read max_same_account_wait from {}: {error}",
                     path.display()
                 )),
             },
@@ -862,18 +862,27 @@ impl AccountLimitPauseConfig {
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
-        #[derive(serde::Deserialize)]
-        struct File {
-            #[serde(default)]
-            account_limit_pause: bool,
-        }
         let text = crate::cache_routing::strip_trailing_commas(
             &crate::cache_routing::strip_jsonc_comments(text),
         );
-        let file: File = serde_json::from_str(&text)
-            .map_err(|error| format!("parse account_limit_pause: {error}"))?;
+        let file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|error| format!("parse max_same_account_wait: {error}"))?;
+        let setting = match file.get("max_same_account_wait") {
+            None => broca_core::SameAccountWait::default(),
+            Some(serde_json::Value::String(value)) if value == "max" => {
+                broca_core::SameAccountWait::Max
+            }
+            Some(value) if value.as_u64().is_some() => {
+                broca_core::SameAccountWait::Minutes(value.as_u64().unwrap())
+            }
+            Some(_) => return Err(
+                "max_same_account_wait must be a non-negative integer number of minutes or \"max\""
+                    .into(),
+            ),
+        };
         Ok(Self {
-            enabled: file.account_limit_pause,
+            max_same_account_wait: setting,
+            obsolete_account_limit_pause: file.contains_key("account_limit_pause"),
         })
     }
 }
@@ -883,25 +892,63 @@ mod account_limit_pause_config_tests {
     use super::AccountLimitPauseConfig;
 
     #[test]
-    fn account_limit_pause_requires_explicit_boolean_consent() {
+    fn max_same_account_wait_defaults_and_typed_values() {
         for text in [
             "{}",
             r#"{"account_limit_pause":false}"#,
             r#"{"other":true}"#,
         ] {
-            assert!(!AccountLimitPauseConfig::parse(text).unwrap().enabled);
+            assert_eq!(
+                AccountLimitPauseConfig::parse(text)
+                    .unwrap()
+                    .max_same_account_wait,
+                broca_core::SameAccountWait::Minutes(15)
+            );
         }
-        assert!(
-            AccountLimitPauseConfig::parse(r#"{"account_limit_pause":true}"#)
-                .unwrap()
-                .enabled
-        );
-        for value in ["null", "1", "\"true\"", "{}", "[]"] {
+        for (value, expected) in [
+            ("0", broca_core::SameAccountWait::Minutes(0)),
+            ("42", broca_core::SameAccountWait::Minutes(42)),
+            ("\"max\"", broca_core::SameAccountWait::Max),
+        ] {
+            assert_eq!(
+                AccountLimitPauseConfig::parse(&format!(r#"{{"max_same_account_wait":{value}}}"#))
+                    .unwrap()
+                    .max_same_account_wait,
+                expected
+            );
+        }
+        for value in [
+            "null", "true", "false", "-1", "1.5", "1.0", "\"15\"", "\"MAX\"", "{}", "[]",
+        ] {
             assert!(AccountLimitPauseConfig::parse(&format!(
-                r#"{{"account_limit_pause":{value}}}"#
+                r#"{{"max_same_account_wait":{value}}}"#
             ))
             .unwrap_err()
-            .contains("account_limit_pause"));
+            .contains("max_same_account_wait"));
         }
+    }
+
+    #[test]
+    fn obsolete_account_limit_pause_is_ignored_without_parsing_its_value() {
+        assert!(
+            !AccountLimitPauseConfig::parse("{}")
+                .unwrap()
+                .obsolete_account_limit_pause
+        );
+        for value in ["true", "false", "null", "1", "{}", "[]", "\"bad\""] {
+            let config =
+                AccountLimitPauseConfig::parse(&format!(r#"{{"account_limit_pause":{value}}}"#))
+                    .unwrap();
+            assert!(config.obsolete_account_limit_pause);
+            assert_eq!(
+                config.max_same_account_wait,
+                broca_core::SameAccountWait::Minutes(15)
+            );
+        }
+        let config = AccountLimitPauseConfig::parse(
+            r#"{"account_limit_pause":true,"max_same_account_wait":0}"#,
+        )
+        .unwrap();
+        assert!(!config.max_same_account_wait.enabled());
     }
 }
