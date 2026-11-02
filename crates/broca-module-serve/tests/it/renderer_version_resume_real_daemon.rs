@@ -304,6 +304,14 @@ impl Rig {
         broca_protocol::BindIdentity::new(&self.project, "runner", session)
     }
 
+    fn storage_key(&self, session: &str) -> broca_protocol::BindIdentity {
+        broca_test_support::resolve_session_address(
+            self.wal_dir().parent().unwrap(),
+            &self.key(session),
+        )
+        .expect("resolve the renderer rig's storage identity")
+    }
+
     async fn send(&self, session: &str, prompt: &str) -> Value {
         let conn = broca_subc::SubcConnection::connect(&self.connection_file)
             .await
@@ -370,6 +378,8 @@ async fn wait_records(
 }
 
 async fn wait_send_finished(rig: &Rig, session: &str, send_id: &str) -> Vec<WalRecord> {
+    use broca_core::WalStore;
+
     let conn = broca_subc::SubcConnection::connect(&rig.connection_file)
         .await
         .expect("connect for durable session head");
@@ -377,7 +387,8 @@ async fn wait_send_finished(rig: &Rig, session: &str, send_id: &str) -> Vec<WalR
         .route_open_management("broca", &rig.key(session))
         .await
         .expect("open durable session head route");
-    let path = broca_core::FileWalStore::new(rig.wal_dir()).wal_path(&rig.key(session));
+    let store = broca_core::FileWalStore::new(rig.wal_dir());
+    let identity = rig.storage_key(session);
     // Raw log bytes may contain RunFinished before the writer has synced them.
     // session.head supplies a durable control cursor: read assertion content only
     // through that cursor. This still recognizes this send's terminal after a
@@ -400,14 +411,9 @@ async fn wait_send_finished(rig: &Rig, session: &str, send_id: &str) -> Vec<WalR
             let cursor = head
                 .head
                 .ok_or_else(|| format!("no durable head: {head:?}"))?;
-            let range = broca_wal::read_records_range(
-                &path,
-                broca_wal::DEFAULT_MAX_READ_BYTES,
-                0,
-                Some(cursor.wal_seq),
-                None,
-            )
-            .map_err(|error| format!("read durable assertion prefix: {error}"))?;
+            let range = store
+                .read_records_range(&identity, 0, Some(cursor.wal_seq), None)
+                .map_err(|error| format!("read durable assertion prefix: {error}"))?;
             if range.lineage_id.map(|id| id.to_string()) != head.lineage_id {
                 return Err("session head and assertion WAL have different lineages".into());
             }
@@ -496,7 +502,7 @@ fn seed_earlier_build_run(
         panic!("the template is a RunStarted");
     };
     *seeded_run = broca_protocol::RunId(run_id.into());
-    *seeded_session = rig.key(session);
+    *seeded_session = rig.storage_key(session);
     *send_id = None;
     *submission_id = None;
     *request_identity_digest = None;
@@ -505,7 +511,9 @@ fn seed_earlier_build_run(
     assert_eq!(blob.remove("provider_text_state"), Some(Value::Bool(true)));
     blob.insert("renderer_version".into(), renderer_version.into());
     let store = broca_core::FileWalStore::new(rig.wal_dir());
-    let mut wal = store.open(&rig.key(session)).expect("open the seeded WAL");
+    let mut wal = store
+        .open(&rig.storage_key(session))
+        .expect("open the seeded WAL");
     wal.append(1, &record, true)
         .expect("seed the earlier build's RunStarted");
 }

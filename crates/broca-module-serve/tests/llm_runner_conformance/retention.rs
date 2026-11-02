@@ -108,6 +108,10 @@ fn seed_first_run(
     started_ms: u64,
     finished_ms: u64,
 ) -> String {
+    assert_eq!(
+        broca_test_support::register_legacy_session(state, key).unwrap(),
+        *key
+    );
     let store = wal_store(state);
     let _lease = lease(state, key);
     let mut wal = store.open_with_retention(key, Some(RETENTION_S)).unwrap();
@@ -429,7 +433,6 @@ async fn ck_broca_retention_marker_never_reaches_the_index_and_is_gone_after_exp
     let root = scratch.join("daemon");
     let state = root.join("broca-state");
     let session = "retained-marker";
-    let key = subject.bind_identity(session);
     let marker = unique_marker("scan");
     let arguments = json!({ "lookup": "marker-tool" });
     subject
@@ -460,6 +463,7 @@ async fn ck_broca_retention_marker_never_reaches_the_index_and_is_gone_after_exp
         .session_route(&live, session, &subject.owner_stamp())
         .await
         .unwrap();
+    let key = subject.bind_identity(session);
     let mut first = Value::Object(subject.send_fields(session, true));
     first["prompt"] = json!(format!("first prompt {marker}"));
     first["title"] = json!(format!("first title {marker}"));

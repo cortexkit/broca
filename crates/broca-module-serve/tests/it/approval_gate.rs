@@ -54,7 +54,9 @@ struct Script {
 }
 impl Script {
     fn records(&self) -> Vec<FramedRecord> {
-        self.wal.read_records(&self.session).unwrap()
+        let state = self.wal.root().parent().expect("the rig's state root");
+        let identity = broca_test_support::resolve_session_address(state, &self.session).unwrap();
+        self.wal.read_records(&identity).unwrap()
     }
     fn log(&self, event: Value) {
         if !matches!(

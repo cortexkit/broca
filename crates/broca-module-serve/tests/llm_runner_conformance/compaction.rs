@@ -721,7 +721,8 @@ async fn compaction_settle_poller_observes_terminal_before_idle_view_and_notice(
             replacement: vec![],
         }),
     );
-    let identity = subject.bind_identity(session);
+    let identity = subject.raw_bind_identity(session);
+    broca_test_support::register_legacy_session(&state, &identity).unwrap();
     let wal = broca_core::FileWalStore::new(state.join("wal"));
     let mut writer = wal.open(&identity).unwrap();
     for mut frame in settlement_records() {
@@ -784,7 +785,8 @@ async fn settlement_requires_public_head_terminal_for_visible_wal_terminal() {
             replacement: vec![],
         }),
     );
-    let identity = subject.bind_identity(session);
+    let identity = subject.raw_bind_identity(session);
+    broca_test_support::register_legacy_session(&state, &identity).unwrap();
     let wal = broca_core::FileWalStore::new(state.join("wal"));
     let mut writer = wal.open(&identity).unwrap();
     for mut frame in settlement_records() {

@@ -1299,7 +1299,7 @@ impl Drop for Live {
 struct BrocaSubject {
     shared: Arc<Shared>,
     model_url: String,
-    /// The project root every session is bound under, the same across restarts.
+    /// The project root for legacy seeds; routed identities use the session-ref inventory.
     project_root: PathBuf,
     /// Where `ck-broca` writes rendered request dumps (`BROCA_DUMP_REQUEST_DIR`), when a test
     /// turns dumps on. The retention scenarios scan it for content that must never be dumped.
@@ -1341,12 +1341,29 @@ impl BrocaSubject {
         }
     }
 
-    fn bind_identity(&self, session: &str) -> broca_protocol::BindIdentity {
+    fn raw_bind_identity(&self, session: &str) -> broca_protocol::BindIdentity {
         #[cfg(feature = "test-clock")]
         if self.mc.is_some() {
             return broca_protocol::BindIdentity::new(self.project_root.clone(), "broca", session);
         }
         broca_protocol::BindIdentity::new(self.project_root.clone(), HARNESS, session)
+    }
+
+    fn bind_identity(&self, session: &str) -> broca_protocol::BindIdentity {
+        let identity = self.raw_bind_identity(session);
+        let root = self
+            .shared
+            .session_roots
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned();
+        match root {
+            Some(root) => broca_test_support::resolve_session_address(&root, &identity)
+                .expect("resolve the conformance session's storage identity"),
+            // Before routing, fixtures may author a legacy seed at this identity.
+            None => identity,
+        }
     }
 
     async fn start(&self, root: &Path) -> Result<Live, HarnessError> {
@@ -2294,7 +2311,11 @@ impl LlmRunnerSubject for BrocaSubject {
             ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
         };
         let fail = |e: String| HarnessError::new(e);
-        let identity = self.bind_identity(session);
+        let identity = broca_test_support::resolve_session_address(
+            &handle.state_root,
+            &self.raw_bind_identity(session),
+        )
+        .expect("resolve the imported session in the target inventory");
         let seed_root = handle.state_root.join(format!("untimed-fixture-{session}"));
         let source = FileWalStore::new(&seed_root);
         let writer = WalHandle::spawn(source.open(&identity).map_err(|e| fail(e.to_string()))?, 1)
@@ -2534,14 +2555,14 @@ impl LlmRunnerSubject for BrocaSubject {
             .lock()
             .unwrap()
             .insert(session.to_owned(), handle.state_root.clone());
-        let identity = self.bind_identity(session);
+        let identity = self.raw_bind_identity(session);
+        let started = Instant::now();
+        let route = self.open(&connection, &identity).await?;
         self.shared
             .session_bindings
             .lock()
             .unwrap()
-            .insert(session.into(), identity.clone());
-        let started = Instant::now();
-        let route = self.open(&connection, &identity).await?;
+            .insert(session.into(), self.bind_identity(session));
         if self.shared.compaction.lock().unwrap().contains_key(session)
             && !self.records(handle, session).is_empty()
         {
@@ -3398,7 +3419,11 @@ impl LlmRunnerSubject for BrocaSubject {
         session: &str,
     ) -> Result<cortexkit_role_llm_runner_conformance::AttributionFixture, HarnessError> {
         use broca_core::{FileLeaseStore, FileWalStore, LeaseStore, WalHandle, WalStore};
-        let identity = self.bind_identity(session);
+        let identity = broca_test_support::resolve_session_address(
+            &handle.state_root,
+            &self.raw_bind_identity(session),
+        )
+        .expect("resolve the imported session in the target inventory");
         let marker = format!("unattributable-import-{session}");
         let seed_root = handle.state_root.join("attribution-import-fixture");
         let seed_store = FileWalStore::new(&seed_root);
@@ -4828,6 +4853,7 @@ async fn ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_cont
     let root = scratch.join("daemon");
     let state = root.join("broca-state");
     let key = subject.bind_identity("rolled-back-retention");
+    broca_test_support::register_legacy_session(&state, &key).unwrap();
     let wal_store = broca_core::FileWalStore::new(state.join("wal"));
     let live_path = wal_store.ephemeral_wal_path(&key);
     let lineage;
@@ -4942,6 +4968,7 @@ async fn ck_broca_boot_completes_incomplete_tombstones_before_serving() {
     let mut cuts = Vec::new();
     for cut in ["live", "moved", "deleted"] {
         let key = subject.bind_identity(cut);
+        broca_test_support::register_legacy_session(&state, &key).unwrap();
         let mut wal = store.open_with_retention(&key, Some(1)).unwrap();
         let mut start: broca_wal::WalRecord = serde_json::from_str(include_str!(
             "../../broca-wal/tests/golden/pre_step_transforms/run_started.json"
@@ -5431,11 +5458,15 @@ async fn reader_release_reads_writer_records_and_refuses_hooked_advancement() {
     let reader_root = scratch.join("reader");
     let state_root = reader_root.join("broca-state");
     let store = broca_core::FileWalStore::new(state_root.join("wal"));
-    let complete_path = store.wal_path(&subject.bind_identity(session));
+    let complete_identity = subject.bind_identity(session);
+    broca_test_support::register_legacy_session(&state_root, &complete_identity).unwrap();
+    let complete_path = store.wal_path(&complete_identity);
     std::fs::create_dir_all(complete_path.parent().unwrap()).unwrap();
     std::fs::write(&complete_path, &bytes).unwrap();
     let inflight = "rollback-inflight";
-    let inflight_path = store.wal_path(&subject.bind_identity(inflight));
+    let inflight_identity = subject.bind_identity(inflight);
+    broca_test_support::register_legacy_session(&state_root, &inflight_identity).unwrap();
+    let inflight_path = store.wal_path(&inflight_identity);
     std::fs::write(&inflight_path, &bytes[..cut_end]).unwrap();
     subject.binary = Some(reader);
     let mut reader_live = subject.start(&reader_root).await.unwrap();
@@ -6393,4 +6424,53 @@ fn attachment_report_guard_rejects_missing_or_skipped_cases() {
         reason: "not checked".into(),
     };
     assert_eq!(attachment_contract_gaps(&report), vec![name]);
+}
+
+#[tokio::test]
+async fn assertion_wal_reader_uses_the_inventory_address_for_a_folderless_session() {
+    use broca_core::{SessionInventory, WalStore};
+
+    let scratch = broca_test_support::scratch_root().join("assertion-inventory-address");
+    let subject = BrocaSubject::new(&scratch).await;
+    let state = scratch.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let inventory = broca_store::SqliteStore::open(state.join("run-index.db")).unwrap();
+    inventory.rebuild_inventory(&state).unwrap();
+    let session = "folderless";
+    let claim = subject.raw_bind_identity(session);
+    let resolved = inventory.resolve_session_address(&claim, None).unwrap();
+    assert_ne!(resolved.project_root, claim.project_root);
+    subject
+        .shared
+        .session_roots
+        .lock()
+        .unwrap()
+        .insert(session.into(), state.clone());
+    let store = broca_core::FileWalStore::new(state.join("wal"));
+    let mut wal = store.open(&resolved).unwrap();
+    wal.append(
+        1,
+        &broca_wal::WalRecord::RunFinished {
+            interrupt_reason: None,
+            reason: broca_protocol::RunFinishReason::Completed,
+            ts_ms: Some(1),
+            usage: Default::default(),
+            error: None,
+            retries_used: 0,
+        },
+        true,
+    )
+    .unwrap();
+    drop(wal);
+    assert_eq!(subject.bind_identity(session), resolved);
+    let live_records = store.read_records(&subject.bind_identity(session)).unwrap();
+    assert_eq!(live_records.len(), 1);
+    assert!(matches!(
+        live_records[0].record,
+        broca_wal::WalRecord::RunFinished {
+            reason: broca_protocol::RunFinishReason::Completed,
+            ..
+        }
+    ));
+    assert!(!store.wal_path(&claim).exists());
 }
