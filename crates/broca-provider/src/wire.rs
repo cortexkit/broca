@@ -115,8 +115,16 @@ pub struct FrozenRenderConfig {
     /// The family render ABI version. A change means a resume can't reproduce the
     /// original bytes, so resume must stop for review rather than re-render.
     pub renderer_version: u32,
+    /// New episodes label multipart image notices; absent in recorded configurations,
+    /// whose literal text projection must remain byte-identical on resume.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub image_notice_labels: bool,
     /// The wire model id (request `model` field, or endpoint path for path-labeled APIs).
     pub wire_model_id: String,
+    /// Provider-published support for system messages inside Anthropic's conversation.
+    /// Absence fails closed; freezing the catalog result keeps resume rendering stable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anthropic_turn_system: bool,
     /// The API base URL, when the provider isn't at the family's default host. This
     /// is what makes the OpenAI-compatible long tail config-only: every
     /// OpenAI-compatible provider is the OpenAI-Chat family pointed at a different
@@ -191,6 +199,8 @@ pub struct FrozenRenderConfig {
     /// bytes are in `service_tier` / `speed`. Kept so a provider's refusal can be recognised
     /// and reported as a refusal of this tier. `None` (no tier requested) is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Keep this closed legacy decoder until recorded flex/default/priority bundles no longer
+    // need to resume. Abstract levels are retained separately as open frozen request bytes.
     pub service_tier_request: Option<crate::service_tier::ServiceTierRequest>,
     /// Legacy DeepSeek flag, retained only to reproduce pre-policy frozen blobs on resume.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

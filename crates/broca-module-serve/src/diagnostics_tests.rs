@@ -5,6 +5,120 @@ use std::cell::Cell;
 
 const NOW: i64 = 200_000_000;
 
+/// The root every test that calls `install_decided` points diagnostics at.
+///
+/// The module records the installed root in a process-wide `OnceLock`, which keeps the first
+/// installation for the life of the process. libtest runs every test of this crate in one
+/// process, so each test installing its own folder would silently keep whichever folder was
+/// installed first. Sharing one folder and serializing installs with `INSTALL_LOCK` means an
+/// installing test always sees the folder it prepared.
+fn installed_root() -> PathBuf {
+    broca_test_support::scratch_root().join("diagnostics-installed")
+}
+
+/// Serializes tests that install a decided root, because installation is process-wide. Each
+/// holder rebuilds `installed_root()` from empty, so it starts from its own contents.
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take `INSTALL_LOCK` and leave an empty `installed_root()`.
+fn install_lock() -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
+    let guard = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let root = installed_root();
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    (guard, root)
+}
+
+#[cfg(feature = "test-clock")]
+#[test]
+fn legacy_findings_request_does_not_read_a_marker_after_boot() {
+    use broca_wal::fs_ops::{self, FsOps};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct MarkerProbe {
+        marker: PathBuf,
+        reads: Arc<AtomicUsize>,
+    }
+    impl FsOps for MarkerProbe {
+        fn open(
+            &self,
+            p: &Path,
+            o: &fs_ops::OpenOptions,
+        ) -> std::io::Result<Box<dyn fs_ops::FileOps>> {
+            if p == self.marker {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                return Err(std::io::Error::other("marker unavailable after boot"));
+            }
+            fs_ops::RealFs.open(p, o)
+        }
+        fn metadata(&self, p: &Path) -> std::io::Result<std::fs::Metadata> {
+            fs_ops::RealFs.metadata(p)
+        }
+        fn create_dir_all(&self, p: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.create_dir_all(p)
+        }
+        fn rename(&self, a: &Path, b: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.rename(a, b)
+        }
+        fn remove_file(&self, p: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.remove_file(p)
+        }
+        fn sync_dir(&self, p: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.sync_dir(p)
+        }
+        fn create_dir(&self, p: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.create_dir(p)
+        }
+        fn hard_link(&self, a: &Path, b: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.hard_link(a, b)
+        }
+        fn canonicalize(&self, p: &Path) -> std::io::Result<PathBuf> {
+            fs_ops::RealFs.canonicalize(p)
+        }
+        fn read_dir(&self, p: &Path) -> std::io::Result<fs_ops::ReadDir> {
+            fs_ops::RealFs.read_dir(p)
+        }
+        fn validate_if_exists(&self, p: &Path) -> std::io::Result<()> {
+            fs_ops::RealFs.validate_if_exists(p)
+        }
+    }
+    // `install_decided` keeps the process's first root, so this test's root must be the one
+    // the installing tests share; holding the lock guarantees it is installed for this root.
+    let (_install, root) = install_lock();
+    drop(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
+    install_decided(
+        broca_wal::state_format::decide_state_root(&root)
+            .unwrap()
+            .into_owned(),
+        broca_wal::WalConfig::LEGACY,
+    );
+    std::fs::create_dir(root.join("state-format")).unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let owner = principal();
+    let head = scope(owner.clone(), ScopeKind::Head, false, true);
+    let reply = fs_ops::with_fs_ops(
+        Arc::new(MarkerProbe {
+            marker: root.join("state-format"),
+            reads: reads.clone(),
+        }),
+        || serving_reply(json!({}), Some(&owner), &head, Ok(100), NOW),
+    );
+    assert!(
+        reply.is_ok(),
+        "a later marker failure cannot change the boot-selected legacy diagnostics: {reply:?}"
+    );
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "diagnostics.findings must not classify the legacy root again"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn diagnostics_address_unavailability_is_an_error_from_the_first_refusal_per_reason() {
     let store = broca_store::SqliteStore::open_in_memory().unwrap();
@@ -118,6 +232,7 @@ fn scope(owner: BindPrincipal, kind: ScopeKind, flow: bool, authorized: bool) ->
 }
 fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
     Evidence {
+        recovery_cuts: Vec::new(),
         runs: store.diagnostic_evidence(since, NOW).unwrap(),
         late_fence_ms: None,
         late_delivery_stuck: vec![],
@@ -143,6 +258,224 @@ fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
         .into(),
     }
 }
+
+#[test]
+fn wal_recovery_cut_finding_reports_unattributed_risk_without_removed_content() {
+    check_recovery_finding(false);
+}
+
+#[test]
+fn wal_recovery_unreadable_raw_evidence_warns_without_blocking_reopen() {
+    check_recovery_finding(true);
+}
+
+fn check_recovery_finding(remove_raw: bool) {
+    use broca_wal::{FileWal, Wal, WalConfig, WalRecord};
+    use std::io::Write;
+    let root = broca_test_support::scratch_root().join(format!(
+        "diagnostic-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let log = root.join("wal/session.wal");
+    let floor = root.join(broca_wal::FEATURE_FLOOR_FILENAME);
+    let mut wal = FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor.clone())
+        .unwrap()
+        .with_feature_floor(floor.clone())
+        .with_wal_config(WalConfig::OVERHAUL)
+        .unwrap();
+    wal.append(
+        1,
+        &WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
+        true,
+    )
+    .unwrap();
+    drop(wal);
+    let mut pending = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    pending
+        .write_all(b"undecodable private removed content")
+        .unwrap();
+    // An intact later frame makes this real corruption, not an ordinary final
+    // torn append that recovery may silently discard without a cut manifest.
+    pending
+        .write_all(
+            &broca_wal::framing::encode_v4(
+                broca_wal::framing::v4::Metadata {
+                    seq: 2,
+                    fence: 1,
+                    appended_ms: 0,
+                    writer_id: [3; 16],
+                },
+                &[broca_wal::framing::FRAME_STAMPS_FEATURE],
+                &WalRecord::StepStarted {
+                    step_id: broca_protocol::StepId(2),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    drop(pending);
+    drop(FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor.clone()).unwrap());
+    if remove_raw {
+        let manifests = broca_wal::recovery::manifests(&log, 1_000_000).unwrap();
+        assert_eq!(manifests.len(), 1);
+        std::fs::remove_file(
+            log.parent()
+                .unwrap()
+                .join(&manifests[0].recovery.sidecar_basename),
+        )
+        .unwrap();
+        let wal = FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor).unwrap();
+        assert!(wal.replay().unwrap().iter().any(|frame| matches!(&frame.record,
+            WalRecord::RecoveryCut { recovery } if recovery.cut_id == manifests[0].recovery.cut_id)));
+    }
+    let index = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
+    let mut evidence = healthy(&index, 0);
+    evidence.recovery_cuts = recovery_cut_findings(&root, NOW);
+    let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
+    let warning = reply
+        .findings
+        .iter()
+        .find(|finding| finding.check == "wal_recovery_cut")
+        .unwrap();
+    assert_eq!(warning.severity, Severity::Warn);
+    assert_eq!(warning.samples[0]["unattributed_tool_risk"], true);
+    if remove_raw {
+        assert!(warning
+            .samples
+            .iter()
+            .any(|sample| sample["removed_evidence"] == "unreadable"));
+    }
+    assert!(warning.samples[0]["session"]
+        .as_str()
+        .unwrap()
+        .contains("session.wal"));
+    assert!(!serde_json::to_string(&reply)
+        .unwrap()
+        .contains("private removed content"));
+    // Close the store before deleting its folder: Windows refuses to delete an open file
+    // (OS error 32).
+    drop(index);
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn wal_recovery_reports_unowned_call_evidence_as_unknown() {
+    use broca_wal::{FileWal, Wal, WalConfig, WalRecord};
+    use std::io::Write;
+    let root = broca_test_support::scratch_root().join(format!(
+        "unowned-recovery-diagnostic-{}",
+        std::process::id()
+    ));
+    let log = root.join("wal/session.wal");
+    let floor = root.join(broca_wal::FEATURE_FLOOR_FILENAME);
+    let mut wal = FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor.clone())
+        .unwrap()
+        .with_feature_floor(floor.clone())
+        .with_wal_config(WalConfig::OVERHAUL)
+        .unwrap();
+    wal.append(
+        1,
+        &WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
+        true,
+    )
+    .unwrap();
+    drop(wal);
+    let result = WalRecord::ToolResult {
+        finished_at_ms: None,
+        tags: None,
+        hooks: None,
+        batch_id: broca_protocol::BatchId("unowned-batch".into()),
+        result: std::sync::Arc::new(broca_core::outcome_unknown_result(
+            &broca_protocol::ToolCallId("call_0".into()),
+        )),
+        outcome: broca_wal::DispatchOutcome::Unknown,
+        reason: None,
+        withdraw_elicitation: None,
+        provider_held: None,
+    };
+    let bytes = broca_wal::framing::encode_v4(
+        broca_wal::framing::v4::Metadata {
+            seq: 3,
+            fence: 1,
+            appended_ms: 0,
+            writer_id: [3; 16],
+        },
+        &[broca_wal::framing::FRAME_STAMPS_FEATURE],
+        &result,
+    )
+    .unwrap();
+    let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    drop(FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor).unwrap());
+    let warnings = recovery_cut_findings(&root, NOW);
+    let warning = warnings
+        .iter()
+        .find(|finding| finding.check == "wal_recovery_cut")
+        .unwrap();
+    assert!(warning
+        .samples
+        .iter()
+        .any(|sample| sample["outcome"] == "unknown"
+            && sample["unowned_calls"].as_array().is_some_and(|calls| calls
+                .iter()
+                .any(|call| call["tool_call_id"] == "call_0" && call["outcome"] == "unknown"))));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_diagnostics_never_reads_recovery_manifests() {
+    // Same shared root as above: `install_decided` ignores a second root in one process.
+    let (_install, root) = install_lock();
+    std::fs::create_dir_all(root.join("wal")).unwrap();
+    drop(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
+    let path = root.join("wal/log.cut-1.json");
+    std::fs::write(&path, b"malformed sidecar on a legacy root").unwrap();
+    install_decided(
+        broca_wal::state_format::decide_state_root(&root)
+            .unwrap()
+            .into_owned(),
+        broca_wal::WalConfig::LEGACY,
+    );
+    let owner = principal();
+    let head = scope(owner.clone(), ScopeKind::Head, false, true);
+    // The trace only needs to observe attempted file operations, so it wraps the real file
+    // system. The power-loss recorder would also work on Unix, but it refuses a non-empty root
+    // on Windows, where std cannot establish hard-link identity.
+    let trace = std::sync::Arc::new(broca_crash_harness::io_trace::IoTraceFs::new(
+        &root,
+        std::sync::Arc::new(broca_wal::fs_ops::RealFs),
+    ));
+    let reply = broca_wal::fs_ops::with_fs_ops(trace.clone(), || {
+        serving_reply(json!({}), Some(&owner), &head, Ok(100), NOW)
+    })
+    .unwrap();
+    assert!(
+        !reply
+            .findings
+            .iter()
+            .any(|finding| finding.check == "wal_recovery_cut"),
+        "legacy diagnostics must not inspect a recovery manifest"
+    );
+    assert!(
+        trace.attempts().is_empty(),
+        "boot-selected legacy diagnostics performs no seam-visible WAL I/O"
+    );
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        b"malformed sidecar on a legacy root"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 type SeedDetails<'a> = (
     Option<&'a str>,
     Option<&'a str>,
@@ -693,7 +1026,7 @@ fn diagnostics_unreadable_sources_are_not_silent() {
         Some(&principal()),
         &scope(principal(), ScopeKind::Head, false, true),
         NOW,
-        |since| gather(&root, Ok(0), since, NOW),
+        |since| gather(&root, Ok(0), since, NOW, broca_wal::WalConfig::LEGACY),
     );
     assert_eq!(result.unwrap_err().code, "store_error");
 }
@@ -915,7 +1248,14 @@ fn diagnostics_reads_rebuild_marker_without_session_access() {
     std::fs::create_dir_all(&root).unwrap();
     let _store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
     std::fs::write(root.join("late-results-rebuild-required"), b"").unwrap();
-    let evidence = gather(&root, Ok(0), 0, live::now_ms()).unwrap();
+    let evidence = gather(
+        &root,
+        Ok(0),
+        0,
+        live::now_ms(),
+        broca_wal::WalConfig::LEGACY,
+    )
+    .unwrap();
     let reply = report(evidence, live::now_ms(), DEFAULT_WINDOW_MS);
     assert!(reply
         .findings
@@ -972,4 +1312,83 @@ fn diagnostics_untimed_overflow_is_explicit_in_finding_and_coverage() {
     );
     assert!(reply.coverage["run_errors"].truncated);
     assert_eq!(finding.samples[0]["scan_limit"], 20000);
+}
+
+#[test]
+fn pending_recovery_is_a_session_finding_not_a_server_refusal() {
+    use broca_core::{MaterializedStore, RunIndex, RunIndexRow, RunIndexState};
+    let root = broca_test_support::scratch_root().join("pending-recovery-diagnostics");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = broca_store::SqliteStore::open(root.join("run-index.db"))
+        .unwrap()
+        .with_wal_config(broca_wal::WalConfig::OVERHAUL);
+    let pending = broca_protocol::BindIdentity::new("/pending-project", "harness", "pending");
+    let healthy = broca_protocol::BindIdentity::new("/healthy-project", "harness", "healthy");
+    for (id, session) in [("pending-run", pending.clone()), ("healthy-run", healthy)] {
+        store
+            .index_run_active(&RunIndexRow {
+                run_id: id.into(),
+                session,
+                submission_id: None,
+                request_identity_digest: None,
+                state: RunIndexState::Active,
+                usage: None,
+                final_step_finish_reason: None,
+                retries_used: 0,
+                title: None,
+                withdrawals_owed: false,
+            })
+            .unwrap();
+    }
+    store
+        .invalidate_wal_recovery(
+            &pending,
+            &broca_wal::recovery::RecoveryCut {
+                cut_id: "pending-cut".into(),
+                sidecar_basename: "log.cut-0".into(),
+                cut_offset: 0,
+                removed_len: 0,
+                removed_sha256: broca_wal::recovery::digest(&[]),
+                reason: broca_wal::recovery::CutReason::UnprovenCorruption,
+                active_run: Some(broca_protocol::RunId("pending-run".into())),
+                runs: vec![],
+                unowned_calls: vec![],
+                unattributed_tool_risk: true,
+            },
+        )
+        .unwrap();
+    let evidence = gather(
+        &root,
+        Ok(0),
+        NOW - 1000,
+        NOW,
+        broca_wal::WalConfig::OVERHAUL,
+    )
+    .expect("pending recovery must not refuse the serving evidence path");
+    assert!(evidence
+        .runs
+        .live
+        .iter()
+        .any(|run| run.run_id == "healthy-run"));
+    assert!(!evidence
+        .runs
+        .live
+        .iter()
+        .any(|run| run.run_id == "pending-run"));
+    let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
+    let session = broca_core::wal_writer::agent_session_ref(&pending);
+    let finding = reply
+        .findings
+        .iter()
+        .find(|finding| {
+            finding.check == "wal_recovery_cut"
+                && finding
+                    .samples
+                    .iter()
+                    .any(|sample| sample["pending"] == true && sample["session"] == session)
+        })
+        .unwrap();
+    assert_eq!(finding.severity, Severity::Warn);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
 }

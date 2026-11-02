@@ -99,12 +99,14 @@ async fn clock_deadline(clock: Option<&crate::Clock>, deadline_ms: u64) {
 
 /// A sibling of HookPlane on the same module-level route machinery. Route errors and answers
 /// that do not decode are failed calls.
+/// Each call carries the session's frozen scope so opening a provider route cannot drop it.
 #[async_trait]
 pub trait CompactionPlane: Send + Sync {
     async fn setup(
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable>;
 
@@ -115,6 +117,7 @@ pub trait CompactionPlane: Send + Sync {
         &self,
         _provider: &str,
         _bind: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, CompactionUnavailable> {
         Err(CompactionUnavailable)
@@ -127,6 +130,7 @@ pub trait CompactionPlane: Send + Sync {
         &self,
         _provider: &str,
         _bind: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _request: RideRequest,
     ) -> Result<RideAnswer, CompactionUnavailable> {
         Err(CompactionUnavailable)
@@ -327,6 +331,7 @@ fn version_list(versions: &[u64]) -> String {
 pub(crate) struct Runtime<'a> {
     pub provider: &'a str,
     pub bind: &'a BindIdentity,
+    pub scope: Option<&'a broca_protocol::SessionScope>,
     pub plane: Option<&'a Arc<dyn CompactionPlane>>,
     pub writer: &'a crate::WalHandle,
     pub control: &'a crate::RunControl,
@@ -340,6 +345,7 @@ pub(crate) struct Runtime<'a> {
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_idle_view(
     bind: &BindIdentity,
+    scope: Option<&broca_protocol::SessionScope>,
     writer: &crate::WalHandle,
     plane: &Arc<dyn CompactionPlane>,
     views: Option<Arc<dyn CompactionViews>>,
@@ -366,6 +372,7 @@ pub async fn apply_idle_view(
         ..crate::RunControl::default()
     };
     let runtime = Runtime {
+        scope,
         provider: &state.provider.clone(),
         bind,
         plane: Some(plane),
@@ -725,7 +732,7 @@ impl Runtime<'_> {
                     let answer = tokio::select! {
                         answer = async {
                             match self.plane {
-                                Some(plane) => plane.ride(self.provider, self.bind, request).await.ok(),
+                                Some(plane) => plane.ride(self.provider, self.bind, self.scope, request).await.ok(),
                                 None => None,
                             }
                         } => answer,
@@ -906,7 +913,7 @@ impl Runtime<'_> {
         // Keep the actual declarations to validate the answer against what was requested.
         let asked = request.clone();
         let answer = tokio::select! {
-            answer = plane.setup(self.provider, self.bind, request) => answer.ok(),
+            answer = plane.setup(self.provider, self.bind, self.scope, request) => answer.ok(),
             _ = clock_deadline(self.control.clock.as_ref(), self.now().saturating_add(self.control.compaction_config.call_budget_ms)) => None,
         }.ok_or_else(unavailable)?;
         if answer.request_id() != request_id {
@@ -1017,7 +1024,7 @@ impl Runtime<'_> {
             return Fetch::Unavailable;
         };
         let answer = tokio::select! {
-            answer = plane.view_get(self.provider, self.bind, ViewGetRequest::for_ready(ready)) => answer.ok(),
+            answer = plane.view_get(self.provider, self.bind, self.scope, ViewGetRequest::for_ready(ready)) => answer.ok(),
             _ = clock_deadline(self.control.clock.as_ref(), self.now().saturating_add(self.control.compaction_config.call_budget_ms)) => None,
         };
         match answer {
@@ -1125,7 +1132,15 @@ impl Runtime<'_> {
                 request = request.with_account(label);
             }
         }
-        let ride = plane.ride(self.provider, self.bind, request);
+        if request.cause == RideCause::ServiceTierChange {
+            if let Some(level) = &state.current_service_tier {
+                request = request.with_service_tier(
+                    cortexkit_role_llm_runner::service_tier::ServiceTier::parse(level)
+                        .expect("current tier comes from the frozen applied level"),
+                );
+            }
+        }
+        let ride = plane.ride(self.provider, self.bind, self.scope, request);
         tokio::pin!(ride);
         let report_at = started.saturating_add(COMPACTION_WAIT_REPORT_AFTER_MS);
         let mut reported = false;

@@ -241,7 +241,53 @@ pub struct DirectBind {
     pub harness: String,
 }
 
+#[derive(Debug)]
+pub enum ExportError {
+    LegacyOnly(broca_store::LegacyOnlyOperator),
+    Export(String),
+}
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LegacyOnly(error) => error.fmt(f),
+            Self::Export(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ExportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LegacyOnly(error) => Some(error),
+            Self::Export(_) => None,
+        }
+    }
+}
+
 pub fn export_with_bind(
+    root: &Path,
+    sessions: &[String],
+    since: Option<u64>,
+    out: &Path,
+    direct: Option<&DirectBind>,
+) -> Result<Summary, String> {
+    export_with_bind_typed(root, sessions, since, out, direct).map_err(|error| error.to_string())
+}
+
+pub fn export_with_bind_typed(
+    root: &Path,
+    sessions: &[String],
+    since: Option<u64>,
+    out: &Path,
+    direct: Option<&DirectBind>,
+) -> Result<Summary, ExportError> {
+    broca_store::require_legacy_operator_root(root, "cache-dump")
+        .map_err(ExportError::LegacyOnly)?;
+    export_legacy_with_bind(root, sessions, since, out, direct).map_err(ExportError::Export)
+}
+
+fn export_legacy_with_bind(
     root: &Path,
     sessions: &[String],
     since: Option<u64>,
@@ -579,6 +625,69 @@ fn mismatch_reason(
         "digest_mismatch_transformations_not_measured"
     } else {
         "digest_mismatch"
+    }
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::*;
+
+    #[test]
+    fn cache_dump_refuses_all_selections_before_index_or_output_access() {
+        crate::bundle::tests::refused_roots("cache-dump", |root| {
+            let direct = DirectBind {
+                project_root: root.join("project"),
+                harness: "test".into(),
+            };
+            for (since, bind) in [(Some(0), None), (None, None), (None, Some(&direct))] {
+                let typed = export_with_bind_typed(
+                    root,
+                    &["session".into()],
+                    since,
+                    &root.join("out"),
+                    bind,
+                )
+                .err()
+                .unwrap();
+                match typed {
+                    ExportError::LegacyOnly(refusal) => {
+                        assert_eq!(refusal.operator, "cache-dump");
+                        assert_eq!(refusal.root, root);
+                    }
+                    ExportError::Export(error) => {
+                        panic!("expected a typed legacy-only refusal: {error}")
+                    }
+                }
+                let error =
+                    export_with_bind(root, &["session".into()], since, &root.join("out"), bind)
+                        .err()
+                        .unwrap();
+                assert!(
+                    error.starts_with("cache-dump is legacy-only: refusing state root "),
+                    "{error}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn cache_dump_missing_marker_keeps_empty_direct_selection_index_free() {
+        let root = crate::bundle::tests::root("cache-dump-legacy");
+        let direct = DirectBind {
+            project_root: root.join("project"),
+            harness: "test".into(),
+        };
+        let summary = export_with_bind(&root, &[], None, &root.join("out"), Some(&direct)).unwrap();
+        assert_eq!(summary.sessions_read, 0);
+        for name in [
+            "run-index.db",
+            "run-index.db-wal",
+            "run-index.db-shm",
+            "state-format",
+        ] {
+            assert!(!root.join(name).exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

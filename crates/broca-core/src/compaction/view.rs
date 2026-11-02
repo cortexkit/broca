@@ -58,6 +58,24 @@ pub struct Announced {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_edit_cost: Option<String>,
+    #[serde(default, skip_serializing_if = "hidden_service_tier")]
+    pub service_tier: Option<String>,
+}
+
+fn hidden_service_tier(value: &Option<String>) -> bool {
+    !broca_protocol::service_tier_enabled() || value.is_none()
+}
+
+fn service_tier_change(state: &CompactionState) -> Option<&str> {
+    if state.history.current_request_bytes.is_none() && state.history.previous_model.is_none() {
+        return None;
+    }
+    let current = state.current_service_tier.as_deref()?;
+    state
+        .announced
+        .as_ref()
+        .filter(|prior| prior.service_tier.as_deref().unwrap_or("standard") != current)
+        .map(|_| current)
 }
 
 impl Announced {
@@ -71,6 +89,9 @@ impl Announced {
             applied_view_version: number(headers::APPLIED_VIEW_VERSION),
             model: map.get(headers::MODEL).cloned(),
             history_edit_cost: map.get(headers::HISTORY_EDIT_COST).cloned(),
+            service_tier: broca_protocol::service_tier_enabled()
+                .then(|| map.get(headers::SERVICE_TIER).cloned())
+                .flatten(),
         }
     }
 }
@@ -256,7 +277,7 @@ fn assemble_judged(
                                             computed.clean = false;
                                         }
                                         probe.tags = broca_protocol::tags::TagSlot::new(Some(std::sync::Arc::new(tags)));
-                                        broca_protocol::tags::render_tags_into(std::slice::from_mut(&mut probe), broca_protocol::tags::TagRendering { assistant_text: true });
+                                        broca_protocol::tags::render_tags_into(std::slice::from_mut(&mut probe), broca_protocol::tags::TagRendering { assistant_text: true, ..Default::default() });
                                         part = probe.content.remove(0);
                                 }
                                 edited.content.push(part);
@@ -910,6 +931,9 @@ pub(crate) fn notice_at(
         }
     }
     events.extend(facts.events);
+    if let Some(current) = service_tier_change(state) {
+        events.push(Event::ServiceTierChange(current.to_owned()));
+    }
     let unchanged = announced.is_some_and(|a| {
         a.lineage_id.as_deref() == Some(facts.lineage_id)
             && a.through_ordinal == Some(through_ordinal)
@@ -932,6 +956,16 @@ pub(crate) fn notice_at(
         facts.model,
     )
     .with_events(events);
+    if let Some(level) = state
+        .current_service_tier
+        .as_deref()
+        .filter(|level| *level != "standard")
+    {
+        notice = notice.with_service_tier(
+            cortexkit_role_llm_runner::service_tier::ServiceTier::parse(level)
+                .expect("current tier comes from the frozen applied level"),
+        );
+    }
     if let Some(cost) = facts.history_edit_cost {
         notice = notice.with_history_edit_cost(cost);
     }
@@ -1121,18 +1155,22 @@ pub fn selection_account_label(selection: &broca_wal::AuthSelection) -> Option<S
 
 /// Why the request at this boundary rewrites its prefix anyway, so that a ride costs the
 /// session nothing it would not pay already (compaction-provider/v1 §8): a model change,
-/// judged against the model the newest notice announced, or an account change, judged
-/// against the account label the newest notice attributed. `None` before the first notice,
+/// judged against the model the newest notice announced, an account change, judged
+/// against the account label the newest notice attributed, or an enabled service-tier change.
+/// `None` before the first notice,
 /// which has nothing to compare with, and before the first notice with a known account,
 /// which baselines without an event so legacy runs keep today's bytes.
 ///
-/// An account change wins over a model change when both happened: either cause rebuilds an
-/// already-warm cache, and the notice carries both events while the ride carries one.
+/// A service-tier change wins over an account change, which wins over a model change: each
+/// rebuilds the cache, and the notice carries all change events while the ride carries one cause.
 ///
 /// broca names no other cause. It places cache markers without knowing the lifetime the model
 /// provider gives them, so it never claims `ttl_expired`. It does not detect a change of the
 /// system text or tool surface between requests, so it never claims `surface_change` either.
 pub fn rewrite_ride_cause(state: &CompactionState, model: &str) -> Option<RideCause> {
+    if service_tier_change(state).is_some() {
+        return Some(RideCause::ServiceTierChange);
+    }
     if let (Some(current), Some(announced)) = (
         state.current_account.as_deref(),
         state.announced_account.as_deref(),

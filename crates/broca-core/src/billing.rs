@@ -934,6 +934,7 @@ mod tests {
 
     fn config(provider: &str, model: &str, credential_id: Option<&str>) -> RunConfig {
         RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -2104,6 +2105,7 @@ mod tests {
             frame(
                 seq,
                 WalRecord::ModelAttemptFinished {
+                    account_limit_disposition: None,
                     attempt_id: None,
                     reservation: None,
                     envelope: None,

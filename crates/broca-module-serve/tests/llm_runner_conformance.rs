@@ -74,6 +74,80 @@ fn caller_module_nonce<'a>(
     };
     Ok(Some((module, nonce)))
 }
+
+fn reset_caller_nonce_files(owner_nonce: &Path) -> Result<(), HarnessError> {
+    // Every stand-in is supervised and receives a new launch nonce after restart. A file
+    // left by the previous process must not satisfy the next caller's readiness check.
+    for module in [
+        OWNER_MODULE,
+        SENDER_MODULE,
+        HEAD_SENDER_MODULE,
+        STRANGER_MODULE,
+        "magic-context",
+    ] {
+        let principal = format!("reserved:{module}");
+        let (_, path) = caller_module_nonce(&principal, owner_nonce)?.expect("known caller module");
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(HarnessError::new(format!(
+                    "resetting {module} caller nonce before launch: {error}"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn caller_nonce_reset_discards_every_previous_supervised_launch() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("caller-nonce-reset-{}", std::process::id()));
+    broca_test_support::remove_rig_dir(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let owner_nonce = root.join("owner.nonce");
+    let mut paths = Vec::new();
+    for module in [
+        OWNER_MODULE,
+        SENDER_MODULE,
+        HEAD_SENDER_MODULE,
+        STRANGER_MODULE,
+        "magic-context",
+    ] {
+        let (_, path) = caller_module_nonce(&format!("reserved:{module}"), &owner_nonce)
+            .unwrap()
+            .unwrap();
+        std::fs::write(&path, "previous-supervised-launch").unwrap();
+        paths.push(path);
+    }
+    std::fs::write(root.join("unrelated.nonce"), "keep").unwrap();
+    reset_caller_nonce_files(&owner_nonce).unwrap();
+    for path in paths {
+        assert!(
+            !path.exists(),
+            "a restarted rig could read an old caller identity from {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read(root.join("unrelated.nonce")).unwrap(),
+        b"keep"
+    );
+    reset_caller_nonce_files(&owner_nonce).unwrap();
+    broca_test_support::remove_rig_dir(&root);
+}
+
+#[test]
+fn caller_nonce_reset_fails_before_launch_if_a_publication_cannot_be_removed() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("caller-nonce-reset-error-{}", std::process::id()));
+    broca_test_support::remove_rig_dir(&root);
+    std::fs::create_dir_all(root.join("sender.nonce")).unwrap();
+    let error = reset_caller_nonce_files(&root.join("owner.nonce")).unwrap_err();
+    assert!(error.to_string().contains(SENDER_MODULE), "{error}");
+    broca_test_support::remove_rig_dir(&root);
+}
 const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 /// The system-prompt marker naming the session a model request belongs to.
 const SESSION_MARKER: &str = "conformance-session:";
@@ -231,6 +305,10 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    service_tier_sessions: Mutex<BTreeSet<String>>,
+    service_tier_keys: Mutex<HashMap<String, String>>,
+    service_tier_rides: Mutex<HashMap<String, Vec<Value>>>,
+    service_tier_request_rides: Mutex<HashMap<String, Vec<u64>>>,
     fixture_connection: Mutex<Option<PathBuf>>,
     default_text_module: Mutex<Option<String>>,
     default_text_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -424,6 +502,12 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
         };
         models.insert(format!("xai/conformance-media-{accepts}"), facts);
     }
+    let mut tier = row(None);
+    tier["rate.input.mode.priority"] =
+        json!({"currency":"USD","exponent":9,"state":"priced","units":2_000_000_000_u64});
+    tier["rate.output.mode.priority"] =
+        json!({"currency":"USD","exponent":9,"state":"priced","units":4_000_000_000_u64});
+    models.insert("xai/conformance-service-tier".into(), tier);
     models.insert(
         format!("{}/{}", output_refs::PROVIDER, output_refs::MODEL),
         output_refs::catalog_row(),
@@ -591,7 +675,12 @@ async fn serve_model_request(
     let messages = request["messages"].as_array().cloned().unwrap_or_default();
     let model = request["model"].as_str().unwrap_or_default();
     let model = model.strip_prefix("mock/").unwrap_or(model);
-    let session = if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
+    let tier_session = request["prompt_cache_key"]
+        .as_str()
+        .and_then(|key| shared.service_tier_keys.lock().unwrap().get(key).cloned());
+    let session = if let Some(session) = tier_session {
+        Some(session)
+    } else if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
         shared
             .scripts
             .lock()
@@ -699,6 +788,26 @@ async fn serve_model_request(
         return Ok(());
     };
     let session = session.expect("a turn was found for it");
+    if shared
+        .service_tier_sessions
+        .lock()
+        .unwrap()
+        .contains(&session)
+    {
+        let rides = shared
+            .service_tier_rides
+            .lock()
+            .unwrap()
+            .get(&session)
+            .map_or(0, |rides| rides.len() as u64);
+        shared
+            .service_tier_request_rides
+            .lock()
+            .unwrap()
+            .entry(session.clone())
+            .or_default()
+            .push(rides);
+    }
     if let Some(served) = shared.failure_turns.lock().unwrap().get_mut(&session) {
         *served += 1;
     }
@@ -1199,7 +1308,7 @@ struct BrocaSubject {
     backup_classes: Option<Vec<String>>,
     bus_events_enabled: bool,
     process_kills_disabled: bool,
-    media_enabled: bool,
+    service_tier_enabled: bool,
     reserved_reader: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
@@ -1223,8 +1332,7 @@ impl BrocaSubject {
             backup_classes: None,
             bus_events_enabled: true,
             process_kills_disabled: false,
-            media_enabled: std::env::var_os("BROCA_CONFORMANCE_MEDIA").is_some()
-                || cfg!(feature = "test-attachments"),
+            service_tier_enabled: std::env::var_os("BROCA_CONFORMANCE_SERVICE_TIER").is_some(),
             reserved_reader: false,
             #[cfg(feature = "test-clock")]
             bus: None,
@@ -1254,7 +1362,7 @@ impl BrocaSubject {
         std::fs::create_dir_all(config_path.parent().unwrap()).map_err(|e| fail(e.to_string()))?;
         std::fs::create_dir_all(&runtime_dir).map_err(|e| fail(e.to_string()))?;
         let owner_nonce = root.join("owner.nonce");
-        let _ = std::fs::remove_file(&owner_nonce);
+        reset_caller_nonce_files(&owner_nonce)?;
         let connection_file = runtime_dir.join("subc-connection.json");
         let _ = std::fs::remove_file(&connection_file);
         let config = json!({
@@ -1342,8 +1450,8 @@ impl BrocaSubject {
                 &self
                     .backup_classes
                     .as_ref()
-                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled}))
-                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled})),
+                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled,"service_tier":{"enabled":self.service_tier_enabled}}))
+                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled,"service_tier":{"enabled":self.service_tier_enabled}})),
             )
             .unwrap(),
         )
@@ -2083,6 +2191,45 @@ impl LlmRunnerSubject for BrocaSubject {
     fn model_finish_reason_source(&self) -> Option<&'static str> {
         Some("openai.chat_completions")
     }
+
+    async fn configure_service_tier(
+        &self,
+        session: &str,
+        case: &str,
+    ) -> Result<bool, HarnessError> {
+        if !self.service_tier_enabled {
+            return Ok(false);
+        }
+        self.shared
+            .service_tier_sessions
+            .lock()
+            .unwrap()
+            .insert(session.to_owned());
+        self.shared.service_tier_keys.lock().unwrap().insert(
+            broca_provider::hash::clamp_prompt_cache_key(&format!("tier-fixture-{session}")),
+            session.to_owned(),
+        );
+        self.shared
+            .failure_turns
+            .lock()
+            .unwrap()
+            .insert(session.to_owned(), 0);
+        if case == "service_tier_ride_before_changed_request" {
+            self.install_setup(
+                session,
+                cortexkit_role_llm_runner_conformance::CompactionSetup::Ready(
+                    cortexkit_role_llm_runner_conformance::CompactionMessage {
+                        compaction_id: "tier-setup".into(),
+                        version: 1,
+                        from: 0,
+                        to: 0,
+                        replacement: vec![],
+                    },
+                ),
+            );
+        }
+        Ok(true)
+    }
     fn attachment_model_fields(&self, session: &str, accepts: bool) -> Option<Map<String, Value>> {
         self.shared
             .attachment_models
@@ -2336,9 +2483,7 @@ impl LlmRunnerSubject for BrocaSubject {
         if broca_module_serve::RETENTION_WRITER_ENABLED {
             capabilities.extend([Capability::Retention, Capability::RetentionClock]);
         }
-        if self.media_enabled {
-            capabilities.insert(Capability::Attachments);
-        }
+        capabilities.insert(Capability::Attachments);
         capabilities
     }
 
@@ -2433,6 +2578,25 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if self
+            .shared
+            .service_tier_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+        {
+            let mut fields = self.compaction_fields(session, first).unwrap_or_default();
+            fields.insert(
+                "model".into(),
+                json!({"provider":"xai","model":"conformance-service-tier"}),
+            );
+            // Cache scope carries fixture identity without adding system text beside a plan.
+            fields.insert(
+                "cache".into(),
+                json!({"key":format!("tier-fixture-{session}")}),
+            );
+            return fields;
+        }
         if session_change_kit_session(session)
             && !self.shared.plan_sessions.lock().unwrap().contains(session)
         {
@@ -2454,7 +2618,7 @@ impl LlmRunnerSubject for BrocaSubject {
             .unwrap()
             .get(session)
             .copied()
-            .or_else(|| (self.media_enabled && session.contains("attachments")).then_some(true))
+            .or_else(|| session.contains("attachments").then_some(true))
         {
             let mut fields =
                 json!({"model":{"provider":"xai","model":format!("conformance-media-{accepts}")}});
@@ -2923,10 +3087,25 @@ impl LlmRunnerSubject for BrocaSubject {
             .unwrap_or_default();
         bodies
             .iter()
-            .map(|body| {
+            .enumerate()
+            .map(|(index, body)| {
                 let request: Value = serde_json::from_slice(body)
                     .map_err(|e| HarnessError::new(format!("a model request is not JSON: {e}")))?;
-                Ok(observe_model_request(&request))
+                let mut observation = observe_model_request(&request);
+                observation.service_tier_applied = request
+                    .get("service_tier")
+                    .and_then(Value::as_str)
+                    .filter(|tier| *tier != "default")
+                    .map(|tier| if tier == "priority" { "fast" } else { tier }.to_owned());
+                observation.service_tier_change_rides = self
+                    .shared
+                    .service_tier_request_rides
+                    .lock()
+                    .unwrap()
+                    .get(session)
+                    .and_then(|counts| counts.get(index))
+                    .copied();
+                Ok(observation)
             })
             .collect()
     }
@@ -3039,13 +3218,6 @@ impl LlmRunnerSubject for BrocaSubject {
     ) -> Option<Value> {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use cortexkit_role_llm_runner::tags::ToolResultBlock;
-        if !self.media_enabled
-            && blocks
-                .iter()
-                .any(|block| matches!(block, ToolResultBlock::Image | ToolResultBlock::Media))
-        {
-            return None;
-        }
         if blocks.is_empty() {
             return Some(json!({OWN_STRUCTURED: {"marker": marker}}));
         }
@@ -3101,13 +3273,10 @@ impl LlmRunnerSubject for BrocaSubject {
         result.tags.get(index).map(|row| row.part.clone())
     }
 
-    /// The older image fixture requires marker text in the stored payload. Captured references
-    /// cannot carry arbitrary text; the marker-free numbering fixture checks those images.
-    /// Without capture, the legacy placeholder's MIME type can carry the marker.
+    /// The image-only tag case locates its result by `marker` text in session.read.
+    /// Keep that marker in the MIME name and use invalid bytes so dispatch stores a
+    /// failure notice. `numbering_tool_result` checks valid native-image tag numbers.
     fn image_tool_result(&self, marker: &str) -> Option<Value> {
-        if self.media_enabled {
-            return None;
-        }
         Some(json!({ OWN_CONTENT: [{
             "type": "image",
             "mimeType": format!("image/png; name={marker}"),
@@ -3577,6 +3746,13 @@ const REQUIRED_STRUCTURED_OUTPUT_CASES: &[&str] = &[
     "structured_output_sibling_never_dispatched",
 ];
 
+const REQUIRED_INTERRUPT_CANCEL_CASES: &[&str] = &[
+    "run_cancel_by_interrupt_now_cancelled",
+    "run_cancel_by_interrupt_without_grant_refused",
+    "run_cancel_by_interrupt_non_now_refused",
+    "run_cancel_by_interrupt_other_session_refused",
+];
+
 const REQUIRED_RETRACT_OWN_SEND_CASES: &[&str] = &[
     "retract_own_send_sender_retracted",
     "retract_own_send_other_sender_refused",
@@ -3595,6 +3771,7 @@ fn check_named_contract_cases(
         .iter()
         .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
         .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
+        .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
     {
         let case = cases
             .iter()
@@ -3634,6 +3811,7 @@ mod named_contract_case_tests {
                 case.name.starts_with("input_token_cap_")
                     || case.name.starts_with("structured_output_")
                     || case.name.starts_with("retract_own_send_")
+                    || case.name.starts_with("run_cancel_by_interrupt_")
             })
             .map(|case| CaseReport {
                 case: case.name,
@@ -3660,6 +3838,7 @@ mod named_contract_case_tests {
             .iter()
             .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
             .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
+            .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
             .copied()
             .chain(std::iter::once("structured_output_streamed_siblings"))
         {
@@ -3828,15 +4007,12 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             report.render()
         );
     }
-    if subject.media_enabled {
-        for case in report
-            .cases
-            .iter()
-            .filter(|case| case.case.starts_with("attachments_"))
-        {
-            assert_eq!(case.outcome, CaseOutcome::Passed, "{}", report.render());
-        }
-    }
+    let attachment_gaps = attachment_contract_gaps(&report);
+    assert!(
+        attachment_gaps.is_empty(),
+        "unchecked attachment cases: {attachment_gaps:?}\n{}",
+        report.render()
+    );
     // Broca declares these operations, so a case that drifts to skipped or inapplicable
     // must not silently pass. Input-cap and structured-output outcomes are checked by name
     // below, including the undeclared streamed-sibling behavior.
@@ -3867,11 +4043,8 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "output_refs_reference_limit",
         "output_refs_read_limits",
         "output_refs_snapshot_budget",
-        if subject.media_enabled {
-            "tags_tool_result_blocks_share_one_number"
-        } else {
-            "tags_count_only_parts_rendered_with_a_number"
-        },
+        "tags_tool_result_blocks_share_one_number",
+        "tags_count_only_parts_rendered_with_a_number",
         "compaction_setup_durable_once",
         "model_view_half_open_ranges_and_travel",
         "compaction_unavailable_distinct_from_refuse",
@@ -4007,6 +4180,22 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         );
     }
     check_named_contract_cases(&report.cases, skip_crash_kills()).unwrap();
+    for name in [
+        "service_tier_unsupported_before_model",
+        "service_tier_run_fixed",
+        "service_tier_ride_before_changed_request",
+        "service_tier_unknown_never_echoed",
+    ] {
+        let case = report.cases.iter().find(|case| case.case == name).unwrap();
+        let expected = if subject.service_tier_enabled {
+            CaseOutcome::Passed
+        } else {
+            CaseOutcome::Inapplicable {
+                reason: "role.describe does not declare service_tier".into(),
+            }
+        };
+        assert_eq!(case.outcome, expected, "{name}: {:?}", case.outcome);
+    }
     if skip_crash_kills() {
         assert!(report.kills.is_empty());
         println!("Crash kills disabled: the kit's overall verdict remains non-conforming without a real kill; run natively without BROCA_CONFORMANCE_SKIP_CRASH_KILLS to verify durability.");
@@ -4120,6 +4309,12 @@ async fn kit_compaction_cases_without_process_kills() {
         "disabling kills changed daemon capability declarations"
     );
     let report = run_suite(&subject, &root.join("suite")).await.unwrap();
+    let attachment_gaps = attachment_contract_gaps(&report);
+    assert!(
+        attachment_gaps.is_empty(),
+        "unchecked attachment cases: {attachment_gaps:?}\n{}",
+        report.render()
+    );
     println!("{}", report.render());
     assert!(report.kills.is_empty());
     assert!(
@@ -5526,6 +5721,36 @@ async fn pending_delivery_order_send_is_retracted_before_tool_result() {
 #[cfg(test)]
 mod held_call_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn service_tier_fixture_uses_cache_scope_identity_for_plan_sends() {
+        let shared = Arc::new(Shared::default());
+        let mut subject = subject(shared.clone());
+        subject.service_tier_enabled = true;
+        let session = "tier-compaction-fixture-with-a-long-session-name-that-needs-clamping";
+        assert!(subject
+            .configure_service_tier(session, "service_tier_ride_before_changed_request")
+            .await
+            .unwrap());
+        let fields = subject.send_fields(session, true);
+        assert!(fields.get("plan").is_some());
+        assert!(
+            fields.get("system").is_none(),
+            "plan fixture identity must not alter system text"
+        );
+        let key =
+            broca_provider::hash::clamp_prompt_cache_key(fields["cache"]["key"].as_str().unwrap());
+        assert_eq!(key.len(), 32, "exercise the renderer's long-key spelling");
+        assert_eq!(
+            shared
+                .service_tier_keys
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(String::as_str),
+            Some(session)
+        );
+    }
     use std::sync::atomic::Ordering;
 
     fn subject(shared: Arc<Shared>) -> BrocaSubject {
@@ -5538,7 +5763,7 @@ mod held_call_tests {
             backup_classes: None,
             bus_events_enabled: false,
             process_kills_disabled: true,
-            media_enabled: false,
+            service_tier_enabled: false,
             reserved_reader: false,
             #[cfg(feature = "test-clock")]
             bus: None,
@@ -6101,4 +6326,71 @@ async fn scripted_model_failure_ends_one_turn_and_preserves_fractional_retry_hin
     assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
     assert!(recovered.contains("recovered"));
     assert_eq!(shared.failure_turns.lock().unwrap()[session], 2);
+}
+
+#[tokio::test]
+async fn conformance_subject_always_declares_attachments() {
+    let root = broca_test_support::scratch_root().join("subject-attachments");
+    let subject = BrocaSubject::new(&root).await;
+    assert!(subject.capabilities().contains(&Capability::Attachments));
+    assert!(subject
+        .numbering_tool_result(
+            "image-block",
+            &[cortexkit_role_llm_runner::tags::ToolResultBlock::Image]
+        )
+        .is_some());
+    assert!(subject.image_tool_result("old-image-rule").is_some());
+}
+
+fn attachment_contract_gaps(
+    report: &cortexkit_role_llm_runner_conformance::SuiteReport,
+) -> Vec<&'static str> {
+    let specs = cortexkit_role_llm_runner_conformance::CASES
+        .iter()
+        .filter(|spec| spec.name.starts_with("attachments_"))
+        .collect::<Vec<_>>();
+    assert!(
+        !specs.is_empty(),
+        "the shared suite must contain attachment cases"
+    );
+    specs
+        .into_iter()
+        .filter(|spec| !matches!(report.outcome(spec.name), Some(CaseOutcome::Passed)))
+        .map(|spec| spec.name)
+        .collect()
+}
+
+#[test]
+fn attachment_report_guard_rejects_missing_or_skipped_cases() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, SuiteReport, SuiteVerdict, CASES};
+    let mut report = SuiteReport {
+        cases: CASES
+            .iter()
+            .filter(|spec| spec.name.starts_with("attachments_"))
+            .map(|spec| CaseReport {
+                case: spec.name,
+                requires: spec.requires.to_vec(),
+                outcome: CaseOutcome::Passed,
+            })
+            .collect(),
+        kills: vec![],
+        verdict: SuiteVerdict::Passed,
+    };
+    assert!(attachment_contract_gaps(&report).is_empty());
+    for index in 0..report.cases.len() {
+        let name = report.cases[index].case;
+        report.cases[index].outcome = CaseOutcome::Skipped {
+            missing: vec![Capability::Attachments],
+        };
+        assert_eq!(attachment_contract_gaps(&report), vec![name]);
+        report.cases[index].outcome = CaseOutcome::Passed;
+    }
+    let missing = report.cases.pop().unwrap();
+    assert_eq!(attachment_contract_gaps(&report), vec![missing.case]);
+    report.cases.push(missing);
+    let name = report.cases[0].case;
+    report.cases[0].outcome = CaseOutcome::PassedWithInapplicableRule {
+        reason: "not checked".into(),
+    };
+    assert_eq!(attachment_contract_gaps(&report), vec![name]);
 }

@@ -1391,6 +1391,10 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             held_calls: state.held_calls,
         },
         State::Paused => RunStatusResponse::Paused {
+            resume_not_before_ms: state
+                .account_limit_pause
+                .as_ref()
+                .map(|pause| pause.resume_not_before_ms),
             auth_selection,
             pause_reason: state
                 .pause_reason
@@ -1398,6 +1402,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
                     matches!(
                         reason,
                         broca_protocol::PauseReason::Restart
+                            | broca_protocol::PauseReason::AccountLimit
                             | broca_protocol::PauseReason::ToolHeld
                     )
                 })
@@ -1548,6 +1553,10 @@ pub enum ServeError {
     },
     RetentionInvalid(crate::retention::InvalidRetention),
     VariantUnsupported(broca_core::run::VariantRefusal),
+    ServiceTierInvalid {
+        reason: &'static str,
+        message: String,
+    },
     /// The session is held by another live writer (another process/host).
     SessionHeld(String),
     /// Opening or admission failed. The optional class is set only from a known cause.
@@ -1694,6 +1703,7 @@ impl std::fmt::Display for ServeError {
             ServeError::RetentionInvalid(_) => write!(f, "invalid retention"),
             ServeError::SessionHeld(s) => write!(f, "session '{s}' held by a live writer"),
             ServeError::VariantUnsupported(e) => write!(f, "open failed: run resolution failed: {e}"),
+            ServeError::ServiceTierInvalid { message, .. } => f.write_str(message),
             ServeError::SessionTooLarge { max_bytes } => write!(f, "session log cannot exceed {max_bytes} bytes"),
             ServeError::RetainedSessionTooLarge { max_bytes } => write!(f, "retained session log cannot exceed {max_bytes} bytes"),
             ServeError::Open(s, _)
@@ -1832,6 +1842,16 @@ pub trait ServeHandler: Send + Sync {
         Ok(())
     }
 
+    /// Diagnostic ownership observation only; a cold cache is unknown, not a non-owner.
+    /// Implementations must not read storage or open an actor to answer this query.
+    fn cached_session_owner(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        None
+    }
+
     /// Owner-only authorization for cancel/retract, independent of route scope and epoch.
     /// A handler without recorded ownership has no protected session.
     async fn authorize_session_owner(
@@ -1841,6 +1861,21 @@ pub trait ServeHandler: Send + Sync {
         _scope: &broca_protocol::SendScope,
     ) -> Result<(), ServeError> {
         Ok(())
+    }
+
+    /// Authorize cancellation before migration fences or parameter validation can disclose
+    /// session state. Only an immediate stop may use a named sender's interrupt grant.
+    /// `None` means an `at` other than `"now"`/`"step_boundary"`, including non-strings.
+    /// An omitted `at` is passed as `Some(RunCancelAt::Now)`.
+    async fn authorize_session_cancel(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        _at: Option<broca_wal::record::RunCancelAt>,
+    ) -> Result<(), ServeError> {
+        self.authorize_session_owner(session, principal, scope)
+            .await
     }
 
     /// Retraction defaults to owner-only unless the handler supports recorded senders.
@@ -2073,6 +2108,21 @@ pub trait ServeHandler: Send + Sync {
                 Some(broca_protocol::ErrorClass::Permanent),
             ))
         }
+    }
+
+    /// Cancel with the daemon-attested caller, never an identity from the request body.
+    /// Handlers without named-sender admission retain owner-only cancellation.
+    async fn cancel_from(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<CancelResponse, ServeError> {
+        self.authorize_session_owner(session, principal, scope)
+            .await?;
+        self.cancel_at(session, run_id, at).await
     }
 
     /// `run.status` / `session.status` — the lineage's current state.
@@ -2407,6 +2457,13 @@ impl crate::LineageRegistry {
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
+    fn cached_session_owner(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        crate::LineageRegistry::cached_session_owner(self, session, principal)
+    }
     async fn run_event_get(
         &self,
         session: &LineageKey,
@@ -2542,6 +2599,33 @@ impl ServeHandler for crate::LineageRegistry {
             .map_err(ServeError::ScopeRefused)
     }
 
+    async fn authorize_session_cancel(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        at: Option<broca_wal::record::RunCancelAt>,
+    ) -> Result<(), ServeError> {
+        // Admission must not synchronize the writer: even a pending StepStarted would
+        // otherwise become durable before an invalid cancellation point is rejected.
+        let refusal = match self
+            .authorize_session_owner(session, principal, scope)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(ServeError::ScopeRefused(refusal)) => refusal,
+            Err(error) => return Err(error),
+        };
+        if at != Some(broca_wal::record::RunCancelAt::StepBoundary) {
+            if let Some(broca_protocol::BindPrincipal::Reserved { module_id }) = principal {
+                if self.interrupt_cancel_granted(session, module_id).await? {
+                    return Ok(());
+                }
+            }
+        }
+        Err(ServeError::ScopeRefused(refusal))
+    }
+
     async fn authorize_session_retract(
         &self,
         session: &LineageKey,
@@ -2549,9 +2633,8 @@ impl ServeHandler for crate::LineageRegistry {
         scope: &broca_protocol::SendScope,
         submission_id: Option<&str>,
     ) -> Result<(), ServeError> {
-        // Runner 0.7.29 CONTRACT.md:2333-2362 (§9.2) extends only session.retract:
-        // owners keep their exact path; another attested sender may withdraw only its
-        // recorded submission. run.cancel remains owner-only, even for that sender.
+        // Retraction admits the submission's recorded sender without requiring the
+        // interrupt:true grant that lets a non-owner stop the running turn.
         match self
             .authorize_session_owner(session, principal, scope)
             .await
@@ -2768,6 +2851,9 @@ impl ServeHandler for crate::LineageRegistry {
                 message: format!("joining steer cannot change the active run's frozen {field}"),
             }),
             SendOutcome::VariantUnsupported(e) => Err(ServeError::VariantUnsupported(e)),
+            SendOutcome::ServiceTierInvalid { reason, message } => {
+                Err(ServeError::ServiceTierInvalid { reason, message })
+            }
             SendOutcome::Upload(error) => Err(ServeError::Upload(error)),
             // Actor errors can combine replay, storage and lifecycle failures after type erasure.
             SendOutcome::Error(e) => Err(ServeError::Open(e, None)),
@@ -4308,6 +4394,41 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<CancelResponse, ServeError> {
         use crate::actor::CancelOutcome;
         match self.route_cancel_at(session, run_id, at).await? {
+            CancelOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
+            CancelOutcome::Error(error) => Err(ServeError::Open(error, None)),
+            CancelOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
+            CancelOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
+            CancelOutcome::Ack => Ok(CancelResponse::Ack),
+            CancelOutcome::NotActive => Ok(CancelResponse::NotActive),
+            CancelOutcome::Reopen => unreachable!("registry retry consumes Reopen"),
+        }
+    }
+
+    async fn cancel_from(
+        &self,
+        session: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<CancelResponse, ServeError> {
+        use crate::actor::CancelOutcome;
+        match self
+            .resolve_cancel_authority(session, principal, scope, at)
+            .await?
+        {
+            crate::actor::CancelAuthority::Owner => {
+                return self.cancel_at(session, run_id, at).await
+            }
+            crate::actor::CancelAuthority::Sender => {}
+        }
+        // Refuse before opening an actor: recovery itself can write. The actor rechecks
+        // the sender grant against any session.refresh accepted since this read.
+        match self
+            .route_cancel_from(session, run_id, at, principal.cloned(), scope.clone())
+            .await?
+        {
+            CancelOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
             CancelOutcome::Error(error) => Err(ServeError::Open(error, None)),
             CancelOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
             CancelOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
@@ -4437,6 +4558,7 @@ mod held_status_tests {
     fn state(index: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
             finish: None,
+            account_limit_pause: None,
             state: index,
             held_calls: Vec::new(),
             budget_detail: None,
@@ -4542,6 +4664,7 @@ mod paused_auth_tests {
             ] {
                 let state = broca_core::ReconciledRunState {
                     finish: None,
+                    account_limit_pause: None,
                     held_calls: Vec::new(),
                     run_usage: Default::default(),
                     budget_detail: None,
@@ -4622,6 +4745,7 @@ mod context_ceiling_tests {
     fn reconciled(state: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
             finish: None,
+            account_limit_pause: None,
             held_calls: Vec::new(),
             state,
             context_ceiling: None,
@@ -4783,6 +4907,7 @@ mod offset_head_tests {
             run_id: RunId("r1".into()),
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,

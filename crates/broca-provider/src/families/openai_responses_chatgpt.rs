@@ -366,6 +366,7 @@ mod tests {
 
     fn opts() -> CallOptions {
         CallOptions::new(vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

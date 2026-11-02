@@ -478,6 +478,9 @@ pub use crate::budget_kernel::{BudgetReplayStateV1, BUDGET_REPLAY_STATE_VERSION}
 /// Admission facts for the last episode at a materialization watermark.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LastEpisodeV1 {
+    /// Timed pause evidence restored from a checkpoint; waking still requires validation against the WAL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_at: Option<broca_wal::record::RunCancelAt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -738,6 +741,8 @@ impl EffortHistoryV1 {
 /// Version-one admission projection at an exact WAL sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionCheckpointV1 {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_cuts: Vec<broca_wal::recovery::RecoveryCut>,
     /// Reference-only media resume state, omitted for media-free histories. A captured-reference
     /// index without a valid matching seed requires a named, counted full-replay repair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -828,6 +833,11 @@ impl AdmissionCheckpointV1 {
     /// A newly applied record in a tail needs canonical replay to recover its
     /// message count. Missing compaction state is checked separately at the seed.
     pub(crate) fn compaction_boundary_complete(&self) -> bool {
+        // Repaired histories must reconstruct call attribution from the whole WAL,
+        // not from a message seed predating physical suffix removal.
+        if !self.recovery_cuts.is_empty() {
+            return false;
+        }
         if !self.media_seed_complete() {
             return false;
         }
@@ -839,6 +849,7 @@ impl AdmissionCheckpointV1 {
 
     pub fn empty() -> Self {
         Self {
+            recovery_cuts: Vec::new(),
             media: None,
             head: Some(crate::head::HeadProjection::default()),
             has_deferred_calls: Some(false),
@@ -981,6 +992,54 @@ impl AdmissionCheckpointV1 {
             None => (None, None),
         };
         match record {
+            WalRecord::RecoveryCut { recovery } => {
+                if !self
+                    .recovery_cuts
+                    .iter()
+                    .any(|cut| cut.cut_id == recovery.cut_id)
+                {
+                    self.recovery_cuts.push((**recovery).clone());
+                }
+            }
+            WalRecord::RecoveryCallClosed {
+                cut_id,
+                run_id,
+                batch_id,
+                step_id,
+                call_key,
+                tool_call_id,
+                result,
+                ..
+            } => {
+                let terminal = broca_wal::recovery::RecoveryCall {
+                    tool_call_id: tool_call_id.clone(),
+                    batch_id: batch_id.clone(),
+                    step_id: *step_id,
+                    call_keys: call_key.iter().cloned().collect(),
+                };
+                let attributed = self.recovery_cuts.iter().any(|cut| {
+                    cut.cut_id == *cut_id
+                        && cut.runs.iter().any(|run| {
+                            run.run_id == *run_id
+                                && run.calls.iter().any(|call| {
+                                    call.tool_call_id == *tool_call_id
+                                        && call_key
+                                            .as_ref()
+                                            .is_none_or(|key| call.call_keys.contains(key))
+                                        && (call.terminal_matches(&terminal)
+                                            || (!call.has_effect_identity()
+                                                && !terminal.has_effect_identity()))
+                                })
+                        })
+                });
+                if !attributed || result.tool_call_id != *tool_call_id {
+                    return Err(ReplayError::CorruptLineage {
+                        episode_run_id: run_id.clone(),
+                        reason: "recovery completion does not match its durable cut attribution"
+                            .into(),
+                    });
+                }
+            }
             WalRecord::RunStarted {
                 session_class,
                 retention,
@@ -1040,6 +1099,7 @@ impl AdmissionCheckpointV1 {
                     history.observe(&config.frozen_render_config);
                 }
                 self.last_episode = Some(LastEpisodeV1 {
+                    account_limit_pause: None,
                     cancel_at: None,
                     on_restart: *on_restart,
                     pause_reason: None,
@@ -1116,13 +1176,19 @@ impl AdmissionCheckpointV1 {
                     if episode.disposition == EpisodeDisposition::Paused {
                         episode.disposition = EpisodeDisposition::Running;
                         episode.pause_reason = None;
+                        episode.account_limit_pause = None;
                     }
                 }
             }
-            WalRecord::RunPaused { reason, .. } => {
+            WalRecord::RunPaused {
+                reason,
+                account_limit,
+                ..
+            } => {
                 if let Some(episode) = self.last_episode.as_mut() {
                     episode.disposition = EpisodeDisposition::Paused;
                     episode.pause_reason = Some(*reason);
+                    episode.account_limit_pause = account_limit.clone();
                 }
             }
             WalRecord::RunFinished {
@@ -1132,6 +1198,7 @@ impl AdmissionCheckpointV1 {
             } => {
                 if let Some(episode) = self.last_episode.as_mut() {
                     episode.disposition = EpisodeDisposition::Finished;
+                    episode.account_limit_pause = None;
                     episode.usage = Some(*usage);
                     episode.retries_used = *retries_used;
                 }
@@ -1468,6 +1535,9 @@ pub fn encode_admission_checkpoint(
     })
 }
 
+/// A recovery fence is not an admission seed, even when it wraps a partial checkpoint.
+pub const WAL_RECOVERY_FENCE_PREFIX: &str = "{\"wal_recovery_fence\":";
+
 /// Decode a supported checkpoint. Unknown versions and malformed payloads are unavailable rather
 /// than an empty lineage, so callers take the full-WAL repair path.
 ///
@@ -1475,6 +1545,9 @@ pub fn encode_admission_checkpoint(
 /// the admission snapshot and the projection seed refuse to build on it (their full-WAL path
 /// repairs it), while readers that only want its last episode may still use it.
 pub fn decode_admission_checkpoint(encoded: &str) -> Option<AdmissionCheckpointV1> {
+    if encoded.starts_with(WAL_RECOVERY_FENCE_PREFIX) {
+        return None;
+    }
     let envelope: AdmissionCheckpointEnvelope = serde_json::from_str(encoded).ok()?;
     if envelope.version != 1 {
         return None;
@@ -1558,6 +1631,8 @@ impl AdmissionSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AdmissionEpisodeSeed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     start: AdmissionSource,
     run_id: RunId,
     refreezes: Vec<AdmissionSource>,
@@ -1726,6 +1801,7 @@ impl AdmissionSeed {
                 provider_call_started: episode.provider_call_started,
                 disposition: episode.disposition,
                 pause_reason: episode.pause_reason,
+                account_limit_pause: episode.account_limit_pause.clone(),
                 cancel_at: episode.cancel_at,
                 usage: episode.usage,
                 retries_used: episode.retries_used,
@@ -1851,6 +1927,7 @@ impl AdmissionSeed {
         episode.provider_call_started = seed.provider_call_started;
         episode.disposition = seed.disposition;
         episode.pause_reason = seed.pause_reason;
+        episode.account_limit_pause = seed.account_limit_pause.clone();
         episode.cancel_at = seed.cancel_at;
         episode.usage = seed.usage;
         episode.retries_used = seed.retries_used;
@@ -2423,8 +2500,8 @@ impl AdmissionContinuation {
     }
 
     fn accounting_source(record: &WalRecord) -> bool {
-        // These sources rebuild head facts, token budgets, output reservations and media
-        // profile/boundary history. Every new record must explicitly choose whether its
+        // These sources rebuild head facts, token budgets, output reservations, recovery
+        // evidence and media profile/boundary history. Every new record must choose whether its
         // effects need a source; an implicit false would silently lose new fold inputs.
         match record {
             WalRecord::RunStarted { .. }
@@ -2438,7 +2515,9 @@ impl AdmissionContinuation {
             | WalRecord::ModelAttemptFinished { .. }
             | WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::OutputReservationClamped { .. }
-            | WalRecord::RunFinished { .. } => true,
+            | WalRecord::RunFinished { .. }
+            | WalRecord::RecoveryCut { .. }
+            | WalRecord::RecoveryCallClosed { .. } => true,
             // Execution manifests come from episode starts; admission policy has its own
             // bounded latest-refresh source, independent of accounting history.
             WalRecord::SessionRefreshAccepted { .. }
@@ -2571,6 +2650,9 @@ impl AdmissionContinuation {
         read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     ) -> Result<AdmissionSeed, crate::replay::SeedFallback> {
         let mut seed = self.seed.clone();
+        // Recovery evidence is reconstructed from authenticated log records, not
+        // trusted from copied checkpoint scalars in the content-free form.
+        seed.scalars.recovery_cuts.clear();
         if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut seed.scalars.media
         {
             media.prepare_content_free_continuation();
@@ -2580,6 +2662,16 @@ impl AdmissionContinuation {
         let mut output = crate::output_reservation::OutputReservationHistory::default();
         let mut has_model_attempt = false;
         for frame in self.accounting_frames(read_at)? {
+            if let WalRecord::RecoveryCut { recovery } = &frame.record {
+                if !seed
+                    .scalars
+                    .recovery_cuts
+                    .iter()
+                    .any(|cut| cut.cut_id == recovery.cut_id)
+                {
+                    seed.scalars.recovery_cuts.push((**recovery).clone());
+                }
+            }
             has_model_attempt |= matches!(frame.record, WalRecord::ModelAttemptFinished { .. });
             head.observe(&frame.record);
             input.fold(&frame.record).map_err(|_| {
@@ -2872,6 +2964,7 @@ impl AdmissionContinuation {
                 WalRecord::RunStarted { .. } => {
                     next.seed.first_run.get_or_insert(source.clone());
                     next.seed.episode = Some(AdmissionEpisodeSeed {
+                        account_limit_pause: None,
                         start: source,
                         run_id: scalars
                             .last_episode
@@ -2942,6 +3035,7 @@ impl AdmissionContinuation {
             episode.provider_call_started = current.provider_call_started;
             episode.disposition = current.disposition;
             episode.pause_reason = current.pause_reason;
+            episode.account_limit_pause = current.account_limit_pause.clone();
             episode.cancel_at = current.cancel_at;
             episode.usage = current.usage;
             episode.retries_used = current.retries_used;
@@ -3001,6 +3095,7 @@ mod tests {
 
     fn message(text: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
@@ -3012,6 +3107,7 @@ mod tests {
 
     fn config(model: &str) -> RunConfig {
         RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -3472,6 +3568,7 @@ mod tests {
             frame(
                 7,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r1".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -3508,6 +3605,7 @@ mod tests {
             frame(
                 13,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r2".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -3623,8 +3721,9 @@ mod tests {
 
     fn exhaustive_checkpoint_fields(full: AdmissionCheckpointV1) -> AdmissionCheckpointV1 {
         // A new checkpoint field must be added to this exhaustive literal and exercised
-        // by the populated roundtrip fixture.
+        // by the populated roundtrip or an explicit unsupported-seed case.
         AdmissionCheckpointV1 {
+            recovery_cuts: full.recovery_cuts,
             has_model_attempt: full.has_model_attempt,
             media: full.media,
             head: full.head,
@@ -3762,6 +3861,59 @@ mod tests {
             "stored continuation lost a populated checkpoint field"
         );
         assert_eq!(head, full);
+    }
+
+    #[test]
+    fn continuation_restores_recovery_evidence_and_requires_full_replay() {
+        let recovery = broca_wal::recovery::RecoveryCut {
+            cut_id: "private-recovery-cut".into(),
+            sidecar_basename: "private-recovery-sidecar".into(),
+            cut_offset: 42,
+            removed_len: 17,
+            removed_sha256: "d".repeat(64),
+            reason: broca_wal::recovery::CutReason::UnpublishedTail,
+            active_run: None,
+            runs: vec![broca_wal::recovery::RecoveryRun {
+                run_id: broca_protocol::RunId("earlier-recovery-run".into()),
+                calls: vec![broca_wal::recovery::RecoveryCall {
+                    tool_call_id: broca_protocol::ToolCallId("private-recovery-call".into()),
+                    step_id: Some(StepId(1)),
+                    batch_id: Some(broca_protocol::BatchId("earlier-batch".into())),
+                    call_keys: Vec::new(),
+                }],
+            }],
+            unattributed_tool_risk: false,
+            unowned_calls: Vec::new(),
+        };
+        let mut frames = offset_corpus()[..4].to_vec();
+        for seq in [5, 6] {
+            frames.push(frame(
+                seq,
+                WalRecord::RecoveryCut {
+                    recovery: Box::new(recovery.clone()),
+                },
+            ));
+        }
+        let (bytes, positions) = offset_log(&frames);
+        let read_at = offset_reader(&bytes);
+        let boundary = offset_boundary(&bytes, &positions, positions.len());
+        let stored = AdmissionContinuation::capture(&read_at, &boundary, &positions).unwrap();
+        let encoded = stored.encode().unwrap();
+        assert_content_free_form(&encoded);
+        for secret in [
+            "private-recovery-cut",
+            "private-recovery-sidecar",
+            "private-recovery-call",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+        let restored = AdmissionContinuation::decode(&encoded).unwrap();
+        let hydrated = restored.hydrated_seed(&read_at).unwrap();
+        assert_eq!(hydrated.scalars.recovery_cuts, vec![recovery]);
+        assert!(
+            restored.hydrate(&read_at, &[], boundary.seq).is_err(),
+            "recovery-marked histories must still use canonical full replay"
+        );
     }
 
     fn continuation_oracle(records: &[FramedRecord]) {
@@ -4813,6 +4965,7 @@ mod tests {
             records.push(frame(
                 0,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r1".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -5092,6 +5245,7 @@ mod tests {
             frame(
                 5,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -5283,6 +5437,7 @@ mod tests {
             frame(
                 6,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r1".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -6028,6 +6183,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            recovery_cuts: Vec::new(),
             has_model_attempt: None,
             media: None,
             output_reservation: None,

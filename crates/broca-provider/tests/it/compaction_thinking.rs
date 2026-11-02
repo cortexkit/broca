@@ -87,6 +87,7 @@ fn start(input: Vec<Message>) -> WalRecord {
         run_id: RunId("compacted-run".into()),
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

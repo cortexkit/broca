@@ -163,6 +163,8 @@ pub(crate) fn build_request_body_with_media_and_provenance(
 ) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
+    let turn_system = crate::turn_system::prepare(frozen, opts);
+    let opts = turn_system.as_ref();
     let prepared = crate::structured_output::prepare(frozen, opts);
     let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);

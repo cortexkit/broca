@@ -39,6 +39,7 @@ impl CompactionPlane for DuePlane {
         &self,
         _: &str,
         _: &broca_protocol::BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         panic!("a recorded Setup must not run again");
@@ -47,6 +48,7 @@ impl CompactionPlane for DuePlane {
         &self,
         _: &str,
         _: &broca_protocol::BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, CompactionUnavailable> {
         self.requests.lock().unwrap().push(request);
@@ -91,6 +93,7 @@ async fn recorded_due_view_survives_refused_fetch_and_restart_then_applies() {
     });
     let dyn_plane: Arc<dyn CompactionPlane> = plane.clone();
     let runtime = Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: Some(&dyn_plane),
@@ -172,6 +175,7 @@ async fn due_view_digest_mismatch_and_elapsed_step_never_clear_the_claim() {
     });
     let dyn_plane: Arc<dyn CompactionPlane> = plane.clone();
     let runtime = Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: Some(&dyn_plane),

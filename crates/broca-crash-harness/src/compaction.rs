@@ -408,8 +408,216 @@ const SCENARIO: Scenario = Scenario {
     scripts,
     render: Render::Canonical,
     plane: tools,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
+
+struct SlowRide;
+
+impl crate::scenario::ScenarioExtension for SlowRide {
+    fn setup(&self, root: &std::path::Path, control: &mut RunControl, _: &mut crate::HarnessPlane) {
+        std::fs::write(root.join("test-clock"), r#"{"now_ms":1000}"#).unwrap();
+        let clock = broca_core::Clock::for_state_root(root).unwrap();
+        control.clock = Some(clock.clone());
+        control.compaction_signals = true;
+        control.compaction_plane = Some(Arc::new(ScriptedCompaction {
+            slow_ride: Some((root.to_path_buf(), clock)),
+            ..Default::default()
+        }));
+        control.compaction_views = None;
+    }
+}
+
+const RIDE_SCENARIO: Scenario = Scenario {
+    name: "compaction-ride-wait",
+    render: Render::CompactionChainReset,
+    extension: Some(&SlowRide),
+    ..SCENARIO
+};
+
+fn old_wait_started() -> WalRecord {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../broca-wal/tests/fixtures/pre_flow_scoped_run_started.json"
+    ))
+    .unwrap();
+    serde_json::from_value(fixture["record"].clone()).unwrap()
+}
+
+fn old_wait_request() -> RunRequest {
+    let WalRecord::RunStarted {
+        run_id,
+        session,
+        config,
+        input,
+        scope,
+        principal,
+        project_id,
+        submission_id,
+        send_id,
+        request_identity_digest,
+        ..
+    } = old_wait_started()
+    else {
+        unreachable!()
+    };
+    let submission = serde_json::from_value(json!({"model":config.model,"input":input,"tools":[],"stop_when":[{"type":"step_count","n":1}]})).unwrap();
+    let mut request =
+        RunRequest::from_submission(submission, run_id, session, SubmissionId("old-wait".into()));
+    request.scope = scope;
+    request.principal = principal;
+    request.project_id = project_id;
+    request.submission_id = submission_id;
+    request.send_id = send_id;
+    request.request_identity_digest = request_identity_digest;
+    request
+}
+
+struct OldOpenWait;
+
+impl crate::scenario::ScenarioExtension for OldOpenWait {
+    fn setup(&self, _: &std::path::Path, _: &mut RunControl, _: &mut HarnessPlane) {}
+
+    fn seed_reference(&self, store: &crate::wal::ObservedWalStore, request: &RunRequest) -> usize {
+        use broca_core::WalStore;
+        let mut wal = store.open(&request.session).unwrap();
+        wal.append(1, &old_wait_started(), true).unwrap();
+        let replacement = Arc::new(vec![serde_json::from_value(
+            json!({"role":"user","content":[{"type":"text","text":"setup head"}]}),
+        )
+        .unwrap()]);
+        wal.append(
+            1,
+            &WalRecord::CompactionMessage {
+                provider: "provider".into(),
+                kind: CompactionMessageKind::Setup,
+                compaction_id: "summary".into(),
+                version: 1,
+                range: broca_wal::CompactionRange { from: 0, to: 0 },
+                sha256: broca_wal::compaction_replacement_sha256(&replacement).unwrap(),
+                replacement,
+                request_id: None,
+                cursor: None,
+                call_when: None,
+                stability: None,
+                ceiling: None,
+                tag_checkpoint: None,
+                ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
+            },
+            true,
+        )
+        .unwrap();
+        let lineage = wal.lineage_id().unwrap().to_string();
+        wal.append(
+            1,
+            &WalRecord::CompactionRequest {
+                provider: "provider".into(),
+                request_id: "old-request".into(),
+            },
+            true,
+        )
+        .unwrap();
+        wal.append(
+            1,
+            &WalRecord::CompactionAnswer {
+                provider: "provider".into(),
+                request_id: "old-request".into(),
+                cursor: broca_wal::CompactionCursor {
+                    lineage_id: lineage,
+                    after_ordinal: None,
+                },
+                disposition: broca_wal::CompactionDisposition::Wait,
+                rejected: None,
+                wait: Some(broca_wal::CompactionWait {
+                    reason: "work".into(),
+                    bound_ms: 10,
+                }),
+            },
+            true,
+        )
+        .unwrap();
+        4
+    }
+
+    fn check(&self, kill: &KillReport, resumed: &Resumed) {
+        let end = kill.durable.end_of_records(4);
+        assert!(
+            resumed.log.bytes.starts_with(&kill.durable.bytes[..end]),
+            "the old wait prefix must remain byte-identical"
+        );
+        assert_eq!(
+            resumed
+                .log
+                .records()
+                .iter()
+                .filter(|record| matches!(record, WalRecord::CompactionWait { .. }))
+                .count(),
+            1
+        );
+        assert!(resumed.plane.dispatched().is_empty());
+        assert_eq!(
+            resumed.provider.request_count(),
+            0,
+            "an old open wait cannot authorize a provider call"
+        );
+    }
+}
+
+const OLD_WAIT_SCENARIO: Scenario = Scenario {
+    name: "old-open-compaction-wait",
+    request: old_wait_request,
+    control: RunControl::default,
+    scripts: Vec::new,
+    render: Render::Canonical,
+    plane: StubToolPlane::new,
+    expected: RunFinishReason::Interrupted,
+    extension: Some(&OldOpenWait),
+};
+
+#[tokio::test]
+async fn old_open_wait_recovery_preserves_seed_and_closes_once_at_every_cut() {
+    let handle = RunnerHandle::new(OLD_WAIT_SCENARIO).await;
+    let zero = handle
+        .kill_at(
+            KillPoint::RecordBoundary {
+                records: 0,
+                torn: false,
+            },
+            KillTrigger::Truncate,
+        )
+        .await;
+    assert_eq!(
+        zero.durable.record_count(),
+        4,
+        "cut zero must preserve the historical input"
+    );
+    assert!(matches!(
+        zero.durable.records().last(),
+        Some(WalRecord::CompactionAnswer {
+            disposition: broca_wal::CompactionDisposition::Wait,
+            ..
+        })
+    ));
+    assert_eq!(
+        handle
+            .reference
+            .log
+            .records()
+            .iter()
+            .filter(|record| matches!(record, WalRecord::CompactionWait { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        handle.reference.sent.is_empty(),
+        "legacy wait recovery must not request a model step"
+    );
+    let kills = handle.every_record_boundary(true).await;
+    assert_eq!(kills.len(), handle.record_boundaries(true).len());
+}
+
+crate::require_process_kill!();
 
 fn legacy_request() -> RunRequest {
     let mut request = request();
@@ -537,6 +745,7 @@ const SIGNED_SCENARIO: Scenario = Scenario {
     scripts: signed_scripts,
     render: Render::CanonicalPrefixBound,
     plane: tools,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
 
@@ -554,6 +763,7 @@ const DECLARED_SIGNED_SCENARIO: Scenario = Scenario {
 
 pub(crate) fn find(name: &str) -> Option<Scenario> {
     [
+        RIDE_SCENARIO,
         SCENARIO,
         LEGACY_SCENARIO,
         TOOL_SCENARIO,
@@ -577,6 +787,7 @@ fn replacement(version: u64, text: &str) -> Value {
 /// boundary whose applied view is older (`stale` announces an older one).
 #[derive(Default)]
 struct ScriptedCompaction {
+    slow_ride: Option<(std::path::PathBuf, broca_core::Clock)>,
     /// At the ceiling, return a smaller view or let the bound expire.
     ceiling: Option<bool>,
     ceiling_time: Option<CeilingTime>,
@@ -629,6 +840,7 @@ impl CompactionPlane for ScriptedCompaction {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         assert_eq!(provider, PROVIDER);
@@ -643,6 +855,13 @@ impl CompactionPlane for ScriptedCompaction {
             )
             .unwrap());
         }
+        if self.slow_ride.is_some() {
+            return Ok(serde_json::from_value(
+                json!({"answer":"ready","request_id":request.request_id,
+                "initial":replacement(1, "setup head"),"ride_wait_ms":30000}),
+            )
+            .unwrap());
+        }
         Ok(
             serde_json::from_value(json!({"answer":"ready","request_id":request.request_id,
             "initial":replacement(1, "setup head")}))
@@ -654,6 +873,7 @@ impl CompactionPlane for ScriptedCompaction {
         &self,
         provider: &str,
         _bind: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, CompactionUnavailable> {
         assert_eq!(provider, PROVIDER);
@@ -672,8 +892,31 @@ impl CompactionPlane for ScriptedCompaction {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: broca_core::compaction_provider::ride::RideRequest,
     ) -> Result<broca_core::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
+        if let Some((root, clock)) = &self.slow_ride {
+            let now = clock.now_ms()
+                + cortexkit_role_llm_runner::run::COMPACTION_WAIT_REPORT_AFTER_MS
+                + 1;
+            std::fs::write(root.join("test-clock"), json!({"now_ms":now}).to_string()).unwrap();
+            clock.refresh().unwrap();
+            broca_test_support::wait_until("durable compaction ride wait", || async {
+                use broca_core::WalStore;
+                let frames = broca_core::FileWalStore::new(root.join("wal"))
+                    .read_records(&crate::compaction::request().session)
+                    .unwrap();
+                if frames
+                    .iter()
+                    .any(|frame| matches!(frame.record, WalRecord::CompactionRideWait { .. }))
+                {
+                    Ok(())
+                } else {
+                    Err("the ride wait has not been recorded".to_owned())
+                }
+            })
+            .await;
+        }
         if let Some(marker) = &self.block_ride {
             std::fs::write(marker, b"ceiling ride entered").unwrap();
             return std::future::pending().await;
@@ -690,6 +933,20 @@ impl CompactionPlane for ScriptedCompaction {
             _ => broca_core::compaction_provider::ride::RideAnswer::nothing(),
         })
     }
+}
+
+#[tokio::test]
+async fn compaction_ride_wait_and_end_survive_every_record_and_torn_cut() {
+    let handle = RunnerHandle::new(RIDE_SCENARIO).await;
+    let records = handle.reference.log.records();
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::CompactionRideWait { .. })));
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::CompactionRideWaitEnded { .. })));
+    let kills = handle.every_record_boundary(true).await;
+    assert_eq!(kills.len(), handle.record_boundaries(true).len());
 }
 
 /// `SIGNED_SCENARIO`'s second view: the first question still folded, and the tool's output

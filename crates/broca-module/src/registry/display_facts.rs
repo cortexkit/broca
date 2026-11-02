@@ -39,6 +39,7 @@ impl LineageRegistry {
             return Ok(cache.rows);
         }
         let expected = cache.seed.as_ref().map(|seed| seed.through_seq);
+        let expected_epoch = cache.publication_epoch;
         let mut seed = cache.seed.take().unwrap_or_default();
         let range = self
             .read_durable_range_for(
@@ -98,7 +99,14 @@ impl LineageRegistry {
             let session = session.clone();
             let lineage = lineage.to_owned();
             spawn_blocking(JobKind::StoreRead, move || {
-                store.publish_display_facts(&session, &lineage, expected, &seed, &versions)
+                store.publish_display_facts(
+                    &session,
+                    &lineage,
+                    expected,
+                    expected_epoch,
+                    &seed,
+                    &versions,
+                )
             })
             .await
             .map_err(|e| OpenError::Open(e.to_string()))?

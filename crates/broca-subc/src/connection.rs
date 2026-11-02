@@ -33,6 +33,12 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+mod cutoff_diagnostic_tests;
+
+#[cfg(all(test, feature = "test-clock"))]
+mod route_local_retry_tests;
+
 /// The error code broca answers a reverse request with: a `Request` a module sends toward the
 /// consumer on a route channel. Copied from the subc Rust consumer SDK
 /// (`subc-client-rs/src/consumer.rs`, `REVERSE_REQUEST_UNHANDLED`), which keeps it private
@@ -1460,7 +1466,7 @@ impl SubcConnection {
         .await
     }
 
-    /// Open an unscoped module-level role using the same bind translation and retry machinery
+    /// Open a module-level role using the same bind translation and retry machinery
     /// as step-transform hooks. The caller bounds the entire route-open future.
     pub(crate) async fn route_open_role_within(
         &self,
@@ -1468,6 +1474,7 @@ impl SubcConnection {
         identity: &BindIdentity,
         role: &str,
         version: &str,
+        scope: Option<subc_protocol::scope::ScopeSelector>,
         retry: RouteOpenRetry,
     ) -> ConnResult<RouteHandle> {
         self.retry_open_through_gate(GateTarget::tool_provider(module_id), retry, || {
@@ -1476,7 +1483,7 @@ impl SubcConnection {
                     module_id: module_id.to_string(),
                 },
                 identity,
-                None,
+                scope.clone(),
                 Some(std::collections::BTreeMap::from([(
                     role.to_owned(),
                     version.to_owned(),
@@ -3594,6 +3601,17 @@ async fn sleep_until_or_never(at: Option<time::Instant>) {
     }
 }
 
+/// The protocol owns whether an individual route open may retry its refusal.
+fn route_open_is_retryable(code: &str) -> bool {
+    // Model a future root-local retryable code without changing the pinned protocol.
+    // The stand-in is unreachable in shipping builds and has no effect on real codes.
+    #[cfg(all(test, feature = "test-clock"))]
+    if code == "test_root_busy" {
+        return true;
+    }
+    subc_protocol::error_codes::is_retryable_route_open(code)
+}
+
 /// The retry loop itself, drawing each backoff wait with `jitter` ([`full_jitter`] outside
 /// tests, so that a test can make the schedule exact). With `outage`, `retry.budget` is the
 /// outage patience and is measured as [`OutageWait`] describes.
@@ -3705,9 +3723,7 @@ where
         }
         match outcome {
             Ok(handle) => return Ok(handle),
-            Err(ConnError::Rejected(message))
-                if subc_protocol::error_codes::is_retryable_route_open(message.code()) =>
-            {
+            Err(ConnError::Rejected(message)) if route_open_is_retryable(message.code()) => {
                 let code = message.code();
                 let held = scope_hold.filter(|_| matches!(code, SCOPE_NOT_SYNCED | SCOPE_CHANGED));
                 if held.is_none() && !patience_started {
@@ -3772,10 +3788,10 @@ async fn cancelled_or_never(cancel: Option<&CancellationToken>) {
     }
 }
 
-/// Whether a route.open refusal says the target MODULE is unavailable (stopped, starting,
-/// restarting, or not answering), as opposed to anything about the route asked for. These are
-/// the refusals that are the same for every caller of that module, so one caller's refusal is
-/// news for all of them; see [`ModuleGate`].
+/// Whether a route.open refusal describes the whole module, so one caller's refusal is
+/// news for every caller sharing its gate. This list is deliberately narrower than the
+/// protocol's retryable codes: a busy root or unavailable session address only makes its
+/// own route wait, and must not pace other roots or sessions behind a module-wide outage.
 pub(crate) fn is_module_availability_refusal(code: &str) -> bool {
     use subc_protocol::error_codes::{
         MODULE_RELOADING, MODULE_TIMEOUT, MODULE_WARMING, TARGET_UNAVAILABLE,
@@ -3790,8 +3806,8 @@ pub(crate) fn is_module_availability_refusal(code: &str) -> bool {
 enum ModuleEvidence<'a> {
     /// The daemon refused the open because the module is unavailable.
     Unavailable(&'a RejectedMessage),
-    /// A scope refusal: about the caller's scope, not the module.
-    ScopeOnly,
+    /// A retryable route or scope refusal: about one caller, not the whole module.
+    RouteOnly,
     /// A route, or a definite answer from the daemon that is not about availability.
     Answered,
     /// A transport or protocol failure, including broca's own attempt timeout (which surfaces
@@ -3805,8 +3821,10 @@ fn module_evidence(outcome: &ConnResult<RouteHandle>) -> ModuleEvidence<'_> {
         Err(ConnError::Rejected(message)) if is_module_availability_refusal(message.code()) => {
             ModuleEvidence::Unavailable(message)
         }
-        Err(ConnError::Rejected(message)) if message.code().starts_with("scope_") => {
-            ModuleEvidence::ScopeOnly
+        Err(ConnError::Rejected(message))
+            if message.code().starts_with("scope_") || route_open_is_retryable(message.code()) =>
+        {
+            ModuleEvidence::RouteOnly
         }
         Err(ConnError::Rejected(_)) => ModuleEvidence::Answered,
         Err(_) => ModuleEvidence::Inconclusive,
@@ -3827,8 +3845,9 @@ fn module_evidence(outcome: &ConnResult<RouteHandle>) -> ModuleEvidence<'_> {
 /// again only on evidence that the module is up: a route, or a definite answer from the daemon
 /// that is not an availability refusal. Each waiting caller then makes its own open, one
 /// bounded burst. A transport or protocol failure (including broca's own attempt timeout) says
-/// nothing either way, and a scope refusal (`scope_*`) is about one caller's scope, so neither
-/// opens or closes the gate. A waiting caller still leaves at its own deadline or cancellation.
+/// nothing either way. A scope refusal (`scope_*`) or another route-local retryable refusal
+/// also neither opens nor closes the gate. A waiting caller still leaves at its own deadline
+/// or cancellation.
 ///
 /// Every close and every reopen starts a new period (`epoch`), and every probe turn has its
 /// own number. So an availability refusal from an open admitted in an earlier period cannot
@@ -4161,11 +4180,11 @@ impl ModuleGate {
                 }
                 ModuleEvidence::Inconclusive if own_turn => closed.probe_failed(now, jitter),
                 // Not about the module: the probe gives up its turn until the next tick.
-                ModuleEvidence::ScopeOnly if own_turn => {
+                ModuleEvidence::RouteOnly if own_turn => {
                     closed.probe = None;
                     closed.next_probe_at = now + jitter(closed.envelope);
                 }
-                ModuleEvidence::Inconclusive | ModuleEvidence::ScopeOnly => return false,
+                ModuleEvidence::Inconclusive | ModuleEvidence::RouteOnly => return false,
             }
             true
         });
@@ -5236,6 +5255,29 @@ mod tests {
         assert!(!is_retryable_route_open(MODULE_REMOVED));
         assert!(!is_retryable_route_open("session_address_ambiguous"));
         assert!(!is_retryable_route_open("some_future_code"));
+
+        for code in [
+            MODULE_RELOADING,
+            MODULE_WARMING,
+            TARGET_UNAVAILABLE,
+            MODULE_TIMEOUT,
+            SCOPE_NOT_SYNCED,
+            SCOPE_CHANGED,
+            "bind_blocked_by_reader",
+            "some_future_code",
+        ] {
+            assert_eq!(
+                is_module_availability_refusal(code),
+                [
+                    TARGET_UNAVAILABLE,
+                    MODULE_WARMING,
+                    MODULE_RELOADING,
+                    MODULE_TIMEOUT
+                ]
+                .contains(&code),
+                "only whole-module refusals belong in the shared gate: {code}"
+            );
+        }
 
         // AN UNDECODABLE BODY MUST BE TERMINAL, and this is the arm a future "robustness"
         // edit would break. `decode_error_body` falls back to the raw bytes when the body is

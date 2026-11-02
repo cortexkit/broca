@@ -228,6 +228,9 @@ pub struct CompactionState {
     /// spuriously nor misses a change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announced_account: Option<String>,
+    /// Recovered from the frozen render bundle before each model step; not checkpointed.
+    #[serde(skip)]
+    pub current_service_tier: Option<String>,
 }
 impl CompactionState {
     /// Send admission uses the last durable request estimate plus the new native messages,

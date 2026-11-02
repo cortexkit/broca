@@ -30,6 +30,8 @@ class FixedQuickcheck(unittest.TestCase):
             shutil.copy2(ROOT / "scripts/lib" / name, scripts / "lib")
         (scripts / "quickcheck-feature-tests.list").write_text("alpha|fixtures|-\n")
         (scripts / "quickcheck-guards.list").write_text("alpha|it|guard::|-\nbeta|it|outside::|-\n")
+        (scripts / "quickcheck-slow-tests.list").write_text(
+            "# comment\nalpha|sweep::all_images|2000\nbeta|other::sweep|90\n")
         bins = self.root / ".cargo/bin"
         bins.mkdir(parents=True)
         self.events = self.root / "events"
@@ -122,10 +124,30 @@ if os.environ.get('FAIL_DOC') and any('/' + os.environ['FAIL_DOC'] + '/' in arg 
         expression = LANE.test_filter
         with patch.object(LANE, "ROOT", self.root):
             selected = expression({"alpha"})
-        self.assertIn("package(=alpha) & (kind(lib) | kind(bin))", selected)
+        self.assertIn("package(=alpha) & (kind(lib) | kind(bin)) & not ((package(=alpha) & test(=sweep::all_images)))",
+                      selected)
         self.assertIn("binary(=fixtures)", selected)
         self.assertIn("binary(=it) & test(guard::)", selected)
         self.assertNotIn("beta", selected)
+
+    def test_slow_sweeps_are_excluded_only_for_their_own_package(self):
+        with patch.object(LANE, "ROOT", self.root):
+            both = LANE.test_filter({"alpha", "beta"})
+            only_beta = LANE.test_filter({"beta"})
+        self.assertIn("test(=sweep::all_images)", both)
+        self.assertIn("test(=other::sweep)", both)
+        self.assertNotIn("sweep::all_images", only_beta)
+        self.assertIn("package(=beta) & (kind(lib) | kind(bin)) & not ((package(=beta) & test(=other::sweep)))",
+                      only_beta)
+
+    def test_the_real_slow_list_names_existing_workspace_packages(self):
+        packages = {p.name for p in (ROOT / "crates").iterdir() if (p / "Cargo.toml").exists()}
+        listed = list(LANE.rows("quickcheck-slow-tests.list"))
+        self.assertTrue(listed)
+        for package, name, seconds in listed:
+            self.assertIn(package, packages)
+            self.assertIn("::", name)
+            self.assertGreater(int(seconds), 60)
 
     def test_outside_lint_and_doctest_failures_do_not_fail_attestation(self):
         result, _ = self.run_lane(LINT_PACKAGE="beta", FAIL_DOC="beta")

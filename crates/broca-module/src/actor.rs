@@ -44,6 +44,10 @@ use tokio_util::sync::CancellationToken;
 use crate::executor::{RunExecutor, RunJob, RunKind};
 use crate::registry::{ActorHandle, CloseToken, LineageKey, RegistryHandle};
 
+mod account_limit_pause;
+#[cfg(all(test, feature = "test-clock"))]
+#[path = "account_limit_pause_tests.rs"]
+mod account_limit_pause_tests;
 #[path = "writer_reclaim.rs"]
 pub mod writer_reclaim;
 
@@ -246,6 +250,19 @@ pub enum LineageCmd {
         at: broca_wal::record::RunCancelAt,
         reply: oneshot::Sender<CancelOutcome>,
     },
+    CancelFrom {
+        run_id: RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<broca_protocol::BindPrincipal>,
+        scope: broca_protocol::SendScope,
+        reply: oneshot::Sender<CancelOutcome>,
+    },
+    SenderPolicy {
+        principal: Option<broca_protocol::BindPrincipal>,
+        scope: broca_protocol::SendScope,
+        at: broca_wal::record::RunCancelAt,
+        reply: oneshot::Sender<Result<Option<CancelAuthority>, crate::serve::ServeError>>,
+    },
     /// Retract a still-pending queued submission (durable tombstone). Replies the outcome.
     Retract {
         submission_id: broca_protocol::SubmissionId,
@@ -355,6 +372,10 @@ pub enum SendOutcome {
     RetentionInvalid(crate::retention::InvalidRetention),
     SessionClassInvalid(String),
     InputTokenBudgetInvalid(String),
+    ServiceTierInvalid {
+        reason: &'static str,
+        message: String,
+    },
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     /// The send's `structured_output` was refused before anything was written; `field` is the
     /// offending member path the role contract names.
@@ -560,12 +581,19 @@ pub enum WarmOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CancelOutcome {
+    ScopeRefused(broca_core::ScopeRefusal),
     Error(String),
     SessionMoving { cut_id: String },
     SessionMoved { holder: String },
     Ack,
     NotActive,
     Reopen,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CancelAuthority {
+    Owner,
+    Sender,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -661,6 +689,7 @@ pub(crate) fn indexed_run_state(
     let use_wal_error = !use_index_metadata || row.state == RunIndexState::Error;
     Ok(Some(ReconciledRunState {
         finish: reconciled.as_ref().and_then(|state| state.finish.clone()),
+        account_limit_pause: None,
         context_ceiling: reconciled
             .as_ref()
             .and_then(|state| state.context_ceiling.clone()),
@@ -1466,8 +1495,10 @@ pub struct LineageActor<W: WalStore> {
     /// Startup exhausted its bounded recovery retries without proving the durable queue state.
     /// Mutating admission must recover this state before it can use the in-memory queue view.
     startup_recovery_pending: bool,
+    account_limit_timer: Option<account_limit_pause::TimedPause>,
     /// Idle admission view loaded at actor open or after the previous run's terminal barrier.
     prior_snapshot: Option<PriorWalSnapshot>,
+    sender_policy_cache: Option<(u64, broca_core::SessionOwnershipV1)>,
     ceiling_drain_held: bool,
     /// Whether this actor has logged its compaction session passing the stored-message watch
     /// threshold; see `crate::compaction_watch`.
@@ -1556,6 +1587,7 @@ pub struct LineageActor<W: WalStore> {
     /// kept current with `retracted_submissions`. A keyed retry must carry the same order.
     ordered_submissions: HashMap<broca_protocol::SubmissionId, broca_protocol::DeliveryOrder>,
     restart_admitting: bool,
+    deferred_restart_settings: std::collections::VecDeque<LineageCmd>,
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
     /// Set while startup restart recovery drives the admission, because that branch answers
     /// parked `restart_waiters` itself once it knows the episode's outcome.
@@ -1749,10 +1781,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         run_index: Option<Arc<dyn broca_core::RunIndex>>,
         admission_reader: Arc<dyn broca_core::context::AdmissionReader>,
     ) -> ActorHandle {
-        Self::spawn_holding(
+        Self::spawn_with_readers(
             key,
             gen,
-            ActorTenure::Lease(lease),
+            Some(lease),
             writer,
             executor,
             wal_store,
@@ -1764,6 +1796,43 @@ impl<W: WalStore + 'static> LineageActor<W> {
             None,
             None,
             Some(admission_reader),
+        )
+    }
+
+    /// Attach format-selected readers after the existing writer recovery path.
+    /// A missing lease means the writer already owns the session tenure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_readers(
+        key: LineageKey,
+        gen: u64,
+        lease: Option<Box<dyn LeaseHandle>>,
+        writer: Arc<WalHandle>,
+        executor: Arc<dyn RunExecutor>,
+        wal_store: Arc<W>,
+        registry: RegistryHandle,
+        idle_ttl: Duration,
+        fanout: crate::fanout::Fanout<W>,
+        run_index: Option<Arc<dyn broca_core::RunIndex>>,
+        materialized_store: Option<Arc<dyn broca_core::SessionStore>>,
+        export_index: Option<Arc<dyn broca_core::ExportIndex>>,
+        charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
+        admission_reader: Option<Arc<dyn broca_core::context::AdmissionReader>>,
+    ) -> ActorHandle {
+        Self::spawn_holding(
+            key,
+            gen,
+            lease.map_or(ActorTenure::InWriter, ActorTenure::Lease),
+            writer,
+            executor,
+            wal_store,
+            registry,
+            idle_ttl,
+            fanout,
+            run_index,
+            materialized_store,
+            export_index,
+            charge_basis_resolver,
+            admission_reader,
         )
     }
 
@@ -1832,7 +1901,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             export_index,
             charge_basis_resolver,
             startup_recovery_pending: false,
+            account_limit_timer: None,
             prior_snapshot: None,
+            sender_policy_cache: None,
             ceiling_drain_held: false,
             compaction_watch: Default::default(),
             pending_fifo: Vec::new(),
@@ -1862,6 +1933,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             delivered_submissions: HashMap::new(),
             ordered_submissions: HashMap::new(),
             restart_admitting: false,
+            deferred_restart_settings: Default::default(),
             restart_waiters: Vec::new(),
             restart_recovery_owns_waiters: false,
             resuming_for_late_result: false,
@@ -2076,6 +2148,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
             };
             let tick = tokio::time::sleep_until(idle_deadline);
+            let timed_pause = self.account_limit_timer.clone().filter(|_| {
+                matches!(self.state, RunState::Idle)
+                    && self.registry.restart_resume_ready()
+                    && !self.registry.is_stopping()
+            });
+            let account_wake = async {
+                match timed_pause.as_ref() {
+                    Some(pause) => {
+                        tokio::time::sleep(Duration::from_millis(
+                            pause.resume_not_before_ms.saturating_sub(clock.now_ms()),
+                        ))
+                        .await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 biased;
                 _ = seal.cancelled() => {
@@ -2114,6 +2202,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     }
                     if self.close_finished_one_shot().await {
                         return;
+                    }
+                }
+                _ = account_wake => {
+                    if let Some(pause) = timed_pause.clone() {
+                        if let Err(error) = self.wake_account_limit(pause).await {
+                            self.account_limit_timer = None;
+                            self.startup_recovery_pending = true;
+                            tracing::warn!(target: "lifecycle", "account-limit wake deferred to WAL recovery: {error}");
+                        }
                     }
                 }
                 _ = tick => {
@@ -2187,10 +2284,110 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .await
     }
 
-    /// Dispatch ONE command. Shared by the live `recv` arm and the pre-close drain.
-    /// Returns true when an active run ended without a durable terminal and this actor generation
-    /// must exit so the next generation recovers from the WAL before serving more work.
+    fn discard_stale_admission_view(&mut self) {
+        if self.prior_snapshot.as_ref().is_some_and(|snapshot| {
+            self.writer.as_ref().is_none_or(|writer| {
+                writer.next_record_seq() != snapshot.head_seq.saturating_add(1)
+            })
+        }) {
+            self.prior_snapshot = None;
+        }
+    }
+
+    /// Dispatch one command through the live receive arm or the pre-close drain.
+    /// Return true when an undurable run exit requires a new actor generation to recover the WAL.
     async fn handle_cmd(&mut self, cmd: LineageCmd) -> bool {
+        // Idle commands and delegated warm/recovery work can advance the writer without
+        // starting an episode. Keep a cached admission view only while its head still matches.
+        self.discard_stale_admission_view();
+        // The executor already owns its resume snapshot while dependencies are unresolved.
+        // Postpone session-change metadata writes, without changing run-control handling.
+        if self.restart_admitting && Self::defer_restart_command(&cmd) {
+            if let Some(error) = self.observe_writer_poison() {
+                return self.reply_writer_poisoned(cmd, error);
+            }
+            // Bound only settings, never the normal command lane: cancellation, steering
+            // and status must remain available while dependency admission is suspended.
+            if self.deferred_restart_settings.len() >= self.rx.max_capacity() {
+                match cmd {
+                    LineageCmd::SessionRefresh { reply, .. } => {
+                        let _ = reply.send(SessionRefreshOutcome::Error(
+                            "session.refresh deferred settings are full; retry after admission"
+                                .into(),
+                        ));
+                    }
+                    LineageCmd::SessionRefreshPolicy { reply, .. } => {
+                        let _ = reply.send(SessionRefreshPolicyOutcome::Error("session.refresh_policy deferred settings are full; retry after admission".into()));
+                    }
+                    LineageCmd::SessionFlushPrefix { reply, .. } => {
+                        let _ = reply.send(SessionFlushPrefixOutcome::Error("session.flush_prefix deferred settings are full; retry after admission".into()));
+                    }
+                    _ => unreachable!("only settings are deferred"),
+                }
+            } else {
+                self.deferred_restart_settings.push_back(cmd);
+            }
+            return false;
+        }
+        if !self.restart_admitting {
+            Box::pin(self.apply_deferred_restart_settings()).await;
+        }
+        let exit = self.handle_cmd_inner(cmd).await;
+        self.discard_stale_admission_view();
+        exit
+    }
+
+    fn defer_restart_command(cmd: &LineageCmd) -> bool {
+        matches!(
+            cmd,
+            LineageCmd::SessionRefresh { .. }
+                | LineageCmd::SessionRefreshPolicy { .. }
+                | LineageCmd::SessionFlushPrefix { .. }
+        )
+    }
+
+    async fn apply_deferred_restart_settings(&mut self) {
+        while let Some(cmd) = self.deferred_restart_settings.pop_front() {
+            self.discard_stale_admission_view();
+            if let Some(error) = self.observe_writer_poison() {
+                self.reply_writer_poisoned(cmd, error);
+            } else if self.writer.is_none() {
+                Self::reply_retired(cmd);
+            } else {
+                // These commands were received before teardown/expiry was selected. Use
+                // their ordinary typed handlers without re-entering lifecycle dispatch.
+                match cmd {
+                    LineageCmd::SessionRefresh {
+                        generation,
+                        policy,
+                        manifest,
+                        reply,
+                    } => {
+                        let _ =
+                            reply.send(self.on_session_refresh(generation, policy, manifest).await);
+                    }
+                    LineageCmd::SessionRefreshPolicy {
+                        generation,
+                        policy,
+                        send_id,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            self.on_session_refresh_policy(generation, policy, send_id)
+                                .await,
+                        );
+                    }
+                    LineageCmd::SessionFlushPrefix { send_id, reply } => {
+                        let _ = reply.send(self.on_session_flush_prefix(send_id).await);
+                    }
+                    _ => unreachable!("only settings are deferred"),
+                }
+            }
+            self.discard_stale_admission_view();
+        }
+    }
+
+    async fn handle_cmd_inner(&mut self, cmd: LineageCmd) -> bool {
         if let LineageCmd::CutLock { reply, mode } = cmd {
             let busy = if matches!(self.state, RunState::Active { .. }) {
                 Some("run_active".into())
@@ -2339,6 +2536,44 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 false
             }
+            LineageCmd::CancelFrom {
+                run_id,
+                at,
+                principal,
+                scope,
+                reply,
+            } => {
+                let held = self.provider_held_episode(&run_id);
+                let outcome = self
+                    .on_cancel_from(&run_id, at, principal.as_ref(), &scope, held)
+                    .await;
+                let acknowledged = matches!(outcome, CancelOutcome::Ack);
+                let _ = reply.send(outcome);
+                if acknowledged
+                    && self.pending_cancels.contains_key(&run_id)
+                    && held != ProviderHeldPresence::NotHeld
+                {
+                    if let RunState::Active { cancel, .. } = &self.state {
+                        cancel.cancel();
+                    } else if let Err(error) = self.retry_pending_cancels().await {
+                        tracing::warn!(%error, "provider-held cancel finalizer failed");
+                    }
+                }
+                false
+            }
+            LineageCmd::SenderPolicy {
+                principal,
+                scope,
+                at,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.cancel_authority(principal.as_ref(), &scope, at)
+                        .await
+                        .map(Some),
+                );
+                false
+            }
             LineageCmd::Retract {
                 submission_id,
                 reply,
@@ -2473,6 +2708,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 } else {
                     Ok(false)
                 };
+                // Applying or refusing a view can append a notice too. The next send must
+                // not depend on a separate queue-wake command to observe those durable records.
+                self.discard_stale_admission_view();
                 // An applied compaction view is a real frozen-prefix rebuild for a pending
                 // `on_prefix_rebuild` change: the next run applies it. A new run alone is not.
                 if matches!(result, Ok(true)) {
@@ -2549,8 +2787,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
             LineageCmd::Import { reply, .. } => {
                 let _ = reply.send(ImportOutcome::Error(broca_core::ImportError::Wal(error)));
             }
-            LineageCmd::Cancel { reply, .. } => {
+            LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                 let _ = reply.send(CancelOutcome::Reopen);
+            }
+            LineageCmd::SenderPolicy { reply, .. } => {
+                let _ = reply.send(Ok(None));
             }
             LineageCmd::Retract { reply, .. } => {
                 let _ = reply.send(if error == "expired" {
@@ -2790,7 +3031,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(error) => Err(format!("session move check failed: {error}")),
             };
         }
-        self.recover_durable_work_inner().await?;
+        // Recovery can be polled beneath command/admission handling on a worker's
+        // small stack. Keep its large replay/admission future off those caller frames.
+        Box::pin(self.recover_durable_work_inner()).await?;
         if self.registry.has_recovery_debt(&self.key) {
             // A readable replay alone cannot discharge a failed fsync. Prove the recovered
             // session durable before clearing only its debt; keep the historical failure event.
@@ -2906,6 +3149,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
             return self.drain_queue_one().await;
         }
         let tail_resolution = tail_prior.resolution;
+
+        if episode_disposition == EpisodeDisposition::Paused
+            && episode_pause_reason == Some(broca_protocol::PauseReason::AccountLimit)
+            && matches!(
+                tail_resolution,
+                broca_core::ReplayResolution::Interrupted { .. }
+            )
+        {
+            self.write_interrupted_seal(None, SealCause::CrashOrphan)
+                .await?;
+            self.refresh_admission_view().await?;
+            return self.drain_queue_one().await;
+        }
 
         // The terminal run index cannot identify a crash that happened before its own update.
         // Reopening the affected lineage closes that earlier WAL-to-index window directly from
@@ -3023,6 +3279,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 Err(error) => Err(error.to_string()),
             };
+        }
+
+        if episode_disposition == EpisodeDisposition::Paused
+            && episode_pause_reason == Some(broca_protocol::PauseReason::AccountLimit)
+        {
+            return self.arm_account_limit().await;
         }
 
         if episode_disposition == EpisodeDisposition::Paused
@@ -3785,6 +4047,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                             state.pause_reason,
                             Some(
                                 broca_protocol::PauseReason::Restart
+                                    | broca_protocol::PauseReason::AccountLimit
                                     | broca_protocol::PauseReason::ToolHeld
                             )
                         ) =>
@@ -3919,6 +4182,52 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
 
+        if broca_protocol::service_tier_enabled() && !resume_indexed_run {
+            let checkpoint = match self.load_checkpoint_at_head().await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return SendOutcome::Transient(error),
+            };
+            let running = match &self.state {
+                RunState::Active { run_id, .. } => self.durable_finish_of_active(run_id).is_none(),
+                RunState::Idle => checkpoint
+                    .last_episode
+                    .as_ref()
+                    .is_some_and(|episode| episode.disposition == EpisodeDisposition::Paused),
+            };
+            if running {
+                if let Some(episode) = &checkpoint.last_episode {
+                    let fixed =
+                        broca_protocol::frozen_service_tier(&episode.config.frozen_render_config);
+                    if request
+                        .service_tier_level
+                        .as_deref()
+                        .is_some_and(|requested| requested != fixed)
+                    {
+                        return SendOutcome::ServiceTierInvalid {
+                            reason: "run_tier_fixed",
+                            message: format!(
+                                "service_tier is fixed at {fixed:?} for run {}",
+                                episode.run_id.0
+                            ),
+                        };
+                    }
+                    request.service_tier_level = (fixed != "standard"
+                        || request.service_tier_level.is_some())
+                    .then(|| fixed.to_owned());
+                }
+            }
+            let mut effective = request.clone();
+            if let Some(episode) = &checkpoint.last_episode {
+                inherit_frozen_parameters(&mut effective, &episode.config);
+            }
+            if let Err(message) = self.executor.check_service_tier(&effective) {
+                return SendOutcome::ServiceTierInvalid {
+                    reason: "unsupported_tier",
+                    message,
+                };
+            }
+        }
+
         // A send that left its model to the session is checked against the plan's model-bearing
         // items here, with the model it inherits: the latest episode's frozen model, which
         // `record_frozen_model` and run start also take. It runs after the same-key receipts
@@ -4032,17 +4341,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if !resume_indexed_run {
             match delivery {
                 broca_protocol::Delivery::Queue => {
-                    // A paused session is not idle, although no run is in flight. Admitted as a
-                    // run, a new message would only re-drive the paused episode (which renders
-                    // nothing until its pause is resolved) and its input would be recorded
-                    // nowhere; queued, it would wait behind a run nothing is going to end. So
-                    // it is refused before anything is written, like a steer. The paused run's
-                    // own retry has this run id and is not refused: it resumes the run.
+                    // A paused episode still owns the session. Unrelated input must neither
+                    // re-drive it nor be silently queued behind an authentication or account
+                    // wait. Its own authorized continuation keeps the original run id.
                     if matches!(self.state, RunState::Idle) {
                         match self.paused_run().await {
                             Ok(Some((paused, reason)))
                                 if paused != run_id
-                                    && reason == broca_protocol::PauseReason::AuthRequired =>
+                                    && matches!(
+                                        reason,
+                                        broca_protocol::PauseReason::AuthRequired
+                                            | broca_protocol::PauseReason::AccountLimit
+                                    ) =>
                             {
                                 return SendOutcome::RunPaused {
                                     run_id: paused,
@@ -4100,6 +4410,20 @@ impl<W: WalStore + 'static> LineageActor<W> {
     ) -> SendOutcome {
         if matches!(self.state, RunState::Idle) && !resume_indexed_run {
             match self.paused_run().await {
+                Ok(Some((paused, reason @ broca_protocol::PauseReason::AccountLimit))) => {
+                    return if paused == run_id {
+                        SendOutcome::Paused {
+                            run_id,
+                            reason,
+                            delivered: None,
+                        }
+                    } else {
+                        SendOutcome::RunPaused {
+                            run_id: paused,
+                            reason,
+                        }
+                    };
+                }
                 Ok(Some((
                     paused,
                     reason @ (broca_protocol::PauseReason::Restart
@@ -4371,7 +4695,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         Err(outcome) => return outcome,
                     };
                     let prepared = match self
-                        .prepare_input(input, broca_protocol::Delivery::Steer, manifest)
+                        .prepare_input(input, broca_protocol::Delivery::Steer, manifest, None)
                         .await
                     {
                         Ok(prepared) => prepared,
@@ -4512,7 +4836,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Err(outcome) => return outcome,
         };
         let prepared = match self
-            .prepare_input(input, broca_protocol::Delivery::Steer, manifest)
+            .prepare_input(input, broca_protocol::Delivery::Steer, manifest, None)
             .await
         {
             Ok(prepared) => prepared,
@@ -4819,6 +5143,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             request_identity_digest: request_identity_digest.clone(),
             tools_were_omitted,
         };
+        // A command can queue/cancel work and start its successor in the same actor turn.
+        self.discard_stale_admission_view();
         if self.prior_snapshot.is_none() {
             if let Err(error) = self.refresh_admission_view().await {
                 return Err(StartRunFailure::Infrastructure(error));
@@ -5068,6 +5394,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     resolved_request.input.clone(),
                     input_delivery,
                     manifest.clone(),
+                    episode_scope.as_ref(),
                 )
                 .await
                 .map_err(|outcome| {
@@ -5215,6 +5542,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // nothing new, so it usually leaves before the seal has to cut it.
             stop_requested: Some(self.registry.stopping_signal()),
             steer: Some(Arc::clone(&steer)),
+            live_steer_after_seq: Some(prior_snapshot.head_seq),
             manifest: manifest.clone(),
             manifest_system_override: self.session_change.applied_generation > 0
                 || (!resuming && self.pending_for_model(&req.model).is_some()),
@@ -5404,6 +5732,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Ok(Err(error)) => Err(StartRunFailure::Admission(error)),
                     Err(_) => Err(StartRunFailure::Infrastructure("run ended before admission".into())),
                 },
+                // Only the separate settings FIFO is bounded; run control stays responsive.
                 Some(command) = self.rx.recv(), if restart_resuming => {
                     // Commands are served while a restart-paused episode waits for its
                     // dependencies, so this one runs inside the suspended admission. Its exit
@@ -5424,6 +5753,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         };
         self.restart_admitting = false;
+        if admission.is_err() && !matches!(&admission, Err(StartRunFailure::Shutdown)) {
+            if let Some(RunState::Active { handle, .. }) = pending_active.take() {
+                handle.abort();
+                let _ = handle.await;
+            } else {
+                self.stop_active_run().await;
+                self.set_idle();
+            }
+        }
+        // The suspended admission owns this FIFO. Apply it before returning to any caller
+        // that can admit a queued successor, including refusal and shutdown recovery. A
+        // refused task has already stopped, so typed settings replies do not call it active.
+        Box::pin(self.apply_deferred_restart_settings()).await;
         // `ResumeRestart` requests that arrived during this admission were parked because it
         // was already resuming the episode. Every path into restart admission must answer them
         // once it ends (a cancel or interrupt finalizer, a queued drain, a cancel recovery),
@@ -5445,16 +5787,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // Shutdown leaves the restart task in self.state so seal_for_shutdown
             // can stop and join it before durably recording the episode's end.
             Err(StartRunFailure::Shutdown) => return Err(StartRunFailure::Shutdown),
-            Err(error) => {
-                if let Some(RunState::Active { handle, .. }) = pending_active.take() {
-                    handle.abort();
-                    let _ = handle.await;
-                } else {
-                    self.stop_active_run().await;
-                    self.set_idle();
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
 
         if admits_the_session {
@@ -5624,6 +5957,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // The title is deliberately not compared: it labels the send without being part of
             // its identity, so a retry carrying another title is answered `Pending` and the
             // queued record keeps the title it was written with.
+            if broca_protocol::service_tier_enabled()
+                && request.service_tier_level.is_none()
+                && request_identity_digest.is_some()
+                && existing.request_identity_digest == request_identity_digest
+            {
+                // Admission may have frozen an inherited tier into the queue. An identical
+                // caller retry still omits it; compare with that original caller identity before
+                // restoring the queue's frozen level, so explicit standard never inherits fast.
+                request
+                    .service_tier_level
+                    .clone_from(&existing.request.service_tier_level);
+            }
             return match submission_difference(&existing.request, &request) {
                 None => SendOutcome::Pending { submission_id },
                 Some(differing) => SendOutcome::SendIdReuse { differing },
@@ -5664,7 +6009,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Err(outcome) => return outcome,
                 };
                 match self
-                    .prepare_input(request.input.clone(), hook_delivery, manifest)
+                    .prepare_input(request.input.clone(), hook_delivery, manifest, None)
                     .await
                 {
                     Ok(prepared) => prepared,
@@ -6036,12 +6381,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
         let expired = order.expired_at(self.ordered_now_ms());
-        // Like a plain queued send, a send that may start a run is refused on a session paused
-        // for re-authentication: it would wait behind a run nothing is going to end.
+        // Like a plain queued send, unrelated ordered work cannot take ownership from a run
+        // paused for authentication or an account reset.
         if order.starts_runs() && matches!(self.state, RunState::Idle) {
             match self.paused_run().await {
                 Ok(Some((paused, reason)))
-                    if reason == broca_protocol::PauseReason::AuthRequired =>
+                    if matches!(
+                        reason,
+                        broca_protocol::PauseReason::AuthRequired
+                            | broca_protocol::PauseReason::AccountLimit
+                    ) =>
                 {
                     return SendOutcome::RunPaused {
                         run_id: paused,
@@ -6131,6 +6480,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 request.input.clone(),
                 broca_protocol::Delivery::Queue,
                 manifest,
+                None,
             )
             .await
         {
@@ -7020,11 +7370,48 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
     }
 
+    async fn on_cancel_from(
+        &mut self,
+        run_id: &RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        held: ProviderHeldPresence,
+    ) -> CancelOutcome {
+        match self.cancel_authority(principal, scope, at).await {
+            Ok(CancelAuthority::Owner) => return self.on_cancel_at(run_id, at, held).await,
+            Ok(CancelAuthority::Sender) => {}
+            Err(crate::serve::ServeError::ScopeRefused(refusal)) => {
+                return CancelOutcome::ScopeRefused(refusal)
+            }
+            Err(error) => return CancelOutcome::Error(error.to_string()),
+        }
+        // The actor serializes the grant recheck with session.refresh commands before
+        // accepting the stop. Recovery observes the durable request before acknowledgement.
+        let outcome = self.on_cancel_at_inner(run_id, at, held, true).await;
+        if matches!(outcome, CancelOutcome::Ack) {
+            if let Some(sender) = principal {
+                tracing::info!(session = ?self.key, run_id = %run_id.0, sender = %sender.as_owner_string(), "named sender stopped run");
+            }
+        }
+        outcome
+    }
+
     async fn on_cancel_at(
         &mut self,
         run_id: &RunId,
         at: broca_wal::record::RunCancelAt,
         held_state: ProviderHeldPresence,
+    ) -> CancelOutcome {
+        self.on_cancel_at_inner(run_id, at, held_state, false).await
+    }
+
+    async fn on_cancel_at_inner(
+        &mut self,
+        run_id: &RunId,
+        at: broca_wal::record::RunCancelAt,
+        held_state: ProviderHeldPresence,
+        durable_now: bool,
     ) -> CancelOutcome {
         if let Err(error) = self.wal_store.check_move(&self.key, true) {
             return match error.into_move_refusal() {
@@ -7104,7 +7491,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     );
                     return CancelOutcome::Ack;
                 }
-                if steer.boundary_cancel().is_cancelled() {
+                if durable_now || steer.boundary_cancel().is_cancelled() {
                     let writer = self
                         .writer
                         .as_ref()
@@ -7144,7 +7531,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
 
         let skip_materialization = self.skip_materialization_runs.contains(run_id);
-        if at == broca_wal::record::RunCancelAt::StepBoundary {
+        if durable_now || at == broca_wal::record::RunCancelAt::StepBoundary {
             let writer = self.writer.as_ref().expect("an open actor owns its writer");
             if let Err(error) = writer
                 .record(WalRecord::RunCancelRequested {
@@ -7444,6 +7831,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     };
                 return Ok(Some(ReconciledRunState {
                     finish: None,
+                    account_limit_pause: None,
                     run_usage,
                     held_calls,
                     budget_detail: None,
@@ -7687,6 +8075,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let _ = self.sync_retention_index().await;
         let should_emit_usage = index_state.is_terminal();
         self.set_idle();
+        self.account_limit_timer = None;
         // Only a terminal ends a one-shot's business with this session; a pause stays resumable.
         self.close_after_one_shot = skip_materialization && index_state.is_terminal();
         if owed {
@@ -7712,6 +8101,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
         } else {
             match self.refresh_admission_view().await {
                 Ok(()) => {
+                    if summary.paused == Some(broca_protocol::PauseReason::AccountLimit) {
+                        if let Err(error) = self.arm_account_limit().await {
+                            self.startup_recovery_pending = true;
+                            tracing::warn!(target: "lifecycle", "account-limit timer rebuild deferred: {error}");
+                        }
+                    }
                     if let Err(error) = self.drain_queue_one().await {
                         tracing::warn!(target: "admission", "queued-run drain deferred: {error}");
                     }
@@ -7743,6 +8138,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     }
 
     async fn drain_queue_one_inline(&mut self) -> Result<(), String> {
+        Box::pin(self.apply_deferred_restart_settings()).await;
         if self.registry.is_stopping() {
             return Ok(());
         }
@@ -8022,6 +8418,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if self.startup_recovery_pending {
             reasons.push("startup_recovery");
         }
+        if self.account_limit_timer.is_some() {
+            reasons.push("account_limit_pause");
+        }
         reasons
     }
 
@@ -8092,8 +8491,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 LineageCmd::Import { reply, .. } => {
                     let _ = reply.send(ImportOutcome::Reopen);
                 }
-                LineageCmd::Cancel { reply, .. } => {
+                LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                     let _ = reply.send(CancelOutcome::Reopen);
+                }
+                LineageCmd::SenderPolicy { reply, .. } => {
+                    let _ = reply.send(Ok(None));
                 }
                 LineageCmd::Retract { reply, .. } => {
                     let _ = reply.send(RetractOutcome::Reopen);
@@ -8269,6 +8671,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// appends. The registry returns false at its total deadline; process exit then ends those
     /// tasks and threads and leaves the WAL authoritative for the next boot's recovery.
     async fn seal_for_shutdown(&mut self) {
+        self.account_limit_timer = None;
         self.finish_restart_waiters(Err("shutdown interrupted restart admission".into()));
         let seal_deadline = tokio::time::Instant::now() + SHUTDOWN_SEAL_BOUND;
         let active = matches!(self.state, RunState::Active { .. });
@@ -8397,6 +8800,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if !already_paused {
             writer
                 .record(WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: run_id.clone(),
                     reason: broca_protocol::PauseReason::ToolHeld,
                     error: None,
@@ -8629,29 +9033,52 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // both the shutdown seal's five-second limit and the global exit deadline remain
         // enforceable.
         let lineage = writer.lineage_id();
-        let (prior, attempts_already_recorded, projection, closing, held_replies) =
-            spawn_blocking(JobKind::WalRead, move || {
-                let frames = wal_store
-                    .read_records_range(&key, 0, Some(head), None)
-                    .map_err(|e| e.to_string())?;
-                let frames = crate::approval::complete_frames(frames, head)?;
-                let projection = crate::approval::projection_from_frames(lineage, &frames)?;
-                let records: Vec<_> = frames.into_iter().map(|frame| frame.record).collect();
-                let recorded =
-                    sealed_step.map(|step| attempts_recorded_for_latest_step(&records, step));
-                broca_core::replay(&records)
-                    .map(|prior| {
-                        let closing = broca_core::resume::provider_held_closing_reason(
-                            &prior,
-                            records.iter(),
-                        );
-                        let held_replies = broca_core::resume::closing_held_replies(records.iter());
-                        (prior, recorded, projection, closing, held_replies)
-                    })
-                    .map_err(|e| e.to_string())
-            })
-            .await
-            .map_err(|e| e.to_string())??;
+        let overhaul = writer.is_overhaul();
+        let (
+            prior,
+            attempts_already_recorded,
+            projection,
+            closing,
+            held_replies,
+            resumed_in_tenure,
+        ) = spawn_blocking(JobKind::WalRead, move || {
+            let frames = wal_store
+                .read_records_range(&key, 0, Some(head), None)
+                .map_err(|e| e.to_string())?;
+            let frames = crate::approval::complete_frames(frames, head)?;
+            let projection = crate::approval::projection_from_frames(lineage, &frames)?;
+            let records: Vec<_> = frames.into_iter().map(|frame| frame.record).collect();
+            // The opener may already record ResumeStarted after WriterOpened
+            // while completing recovery, before the log reaches the actor.
+            let resumed_in_tenure = overhaul
+                && records
+                    .iter()
+                    .rposition(|record| matches!(record, WalRecord::WriterOpened { .. }))
+                    .is_some_and(|opened| {
+                        records[opened + 1..]
+                            .iter()
+                            .any(|record| matches!(record, WalRecord::ResumeStarted { .. }))
+                    });
+            let recorded =
+                sealed_step.map(|step| attempts_recorded_for_latest_step(&records, step));
+            broca_core::replay(&records)
+                .map(|prior| {
+                    let closing =
+                        broca_core::resume::provider_held_closing_reason(&prior, records.iter());
+                    let held_replies = broca_core::resume::closing_held_replies(records.iter());
+                    (
+                        prior,
+                        recorded,
+                        projection,
+                        closing,
+                        held_replies,
+                        resumed_in_tenure,
+                    )
+                })
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         if prior.run_id.is_none() || prior.run_finished_durable {
             return Ok(false);
         }
@@ -8729,7 +9156,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             broca_core::close_out_open_batch(&prior, deferred_close)
         };
         let resuming = cause == SealCause::CrashOrphan;
-        if resuming {
+        if resuming && !resumed_in_tenure {
             writer.record(broca_core::resume_started_record(&prior, head, Vec::new()));
         }
         if !held_replies.is_empty() {
@@ -8883,6 +9310,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// rest of its teardown is done and drops it where it would drop an actor-held lease,
     /// so both tenure kinds release at the same point of the close.
     async fn shutdown_writer(&mut self) -> WriterClosed {
+        Box::pin(self.apply_deferred_restart_settings()).await;
         if let Some(task) = self.source_warm_task.take() {
             task.stop().await;
         }
@@ -9038,8 +9466,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
             LineageCmd::Import { reply, .. } => {
                 let _ = reply.send(ImportOutcome::Reopen);
             }
-            LineageCmd::Cancel { reply, .. } => {
+            LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
                 let _ = reply.send(CancelOutcome::Reopen);
+            }
+            LineageCmd::SenderPolicy { reply, .. } => {
+                let _ = reply.send(Ok(None));
             }
             LineageCmd::Retract { reply, .. } => {
                 let _ = reply.send(RetractOutcome::Reopen);
@@ -9164,10 +9595,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         ownership: broca_core::SessionOwnershipV1,
         module_id: &str,
     ) -> Result<broca_core::SessionOwnershipV1, SendOutcome> {
-        if ownership.sender_admission_complete() {
-            return Ok(ownership);
-        }
-        let repair = async {
+        let repair = crate::sender_admission::resolve(ownership, || async {
             let safe_head = self
                 .writer
                 .as_ref()
@@ -9203,14 +9631,82 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }),
             )
             .await
-            .map_err(|error| error.to_string())??
-            .filter(|ownership| ownership.sender_admission_complete())
-            .ok_or_else(|| "effective sender policy is still unknown".to_owned())
-        }
+            .map_err(|error| error.to_string())?
+        })
         .await;
         repair.map_err(|error| SendOutcome::Transient(format!(
             "cannot establish effective sender policy for module {module_id}; retry the send: {error}"
         )))
+    }
+
+    async fn cancel_authority(
+        &mut self,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        at: broca_wal::record::RunCancelAt,
+    ) -> Result<CancelAuthority, crate::serve::ServeError> {
+        use crate::serve::ServeError;
+        let durable_head = self
+            .writer
+            .as_ref()
+            .expect("writer live while open")
+            .durable_head()
+            .load(Ordering::Acquire);
+        let cached = self
+            .sender_policy_cache
+            .as_ref()
+            .filter(|(head, _)| *head == durable_head)
+            .map(|(head, ownership)| (*head, ownership.clone()));
+        let (safe_head, ownership) = if let Some(cached) = cached {
+            cached
+        } else {
+            let checkpoint = self
+                .load_checkpoint_at_head()
+                .await
+                .map_err(|error| ServeError::Open(error, None))?;
+            (
+                checkpoint.at_seq,
+                checkpoint.ownership.ok_or_else(|| {
+                    ServeError::Open(
+                        "the admission snapshot carries no ownership summary".into(),
+                        None,
+                    )
+                })?,
+            )
+        };
+        let refusal =
+            match broca_core::scope_admission::decide_owner_access(&ownership, principal, scope) {
+                Ok(()) => return Ok(CancelAuthority::Owner),
+                Err(refusal) => refusal,
+            };
+        let Some(broca_protocol::BindPrincipal::Reserved { module_id }) = principal else {
+            return Err(ServeError::ScopeRefused(refusal));
+        };
+        if at != broca_wal::record::RunCancelAt::Now {
+            return Err(ServeError::ScopeRefused(refusal));
+        }
+        let wal = self.wal_store.clone();
+        let key = self.key.clone();
+        let ownership = crate::sender_admission::resolve(ownership, || async move {
+            spawn_blocking(
+                JobKind::WalRead,
+                broca_wal::access_counter::inherit(move || {
+                    crate::sender_admission::read_prefix(wal.as_ref(), &key, safe_head)
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        })
+        .await
+        .map_err(|error| ServeError::Open(error, None))?;
+        let ownership = crate::sender_admission::compact(&ownership);
+        let granted = crate::sender_admission::interrupt_granted(&ownership, module_id);
+        self.sender_policy_cache = Some((safe_head, ownership));
+        if granted {
+            Ok(CancelAuthority::Sender)
+        } else {
+            Err(ServeError::ScopeRefused(refusal))
+        }
     }
 
     fn agent_run_writer_enabled(&self) -> bool {
@@ -9357,6 +9853,38 @@ impl<W: WalStore + 'static> LineageActor<W> {
         )
         .await
         .map_err(|error| format!("admission snapshot task failed: {error}"))??;
+        let writer = self
+            .writer
+            .as_ref()
+            .expect("writer live while loading admission");
+        if snapshot.lineage_id.is_none() {
+            snapshot.lineage_id = writer.lineage_id().map(|lineage| lineage.to_string());
+        }
+        if snapshot.anchor.is_none()
+            && matches!(
+                &snapshot.checkpoint_at_head.media,
+                Some(broca_core::media_request::DurableMediaSeed::Ready(_))
+            )
+        {
+            let anchor = self
+                .wal_store
+                .file_identity(&self.key)
+                .ok()
+                .flatten()
+                .zip(self.wal_store.live_wal_bytes(&self.key).ok().flatten())
+                .map(|(file_id, byte_end)| broca_wal::WalByteAnchor {
+                    file_id,
+                    byte_end,
+                    seq: safe_head,
+                });
+            // A complete read carries no byte offset. Metadata can supply one only
+            // while no append has advanced its selected cut; never relabel a newer EOF.
+            if writer.next_record_seq() == safe_head.saturating_add(1)
+                && writer.durable_head().load(Ordering::Acquire) == safe_head
+            {
+                snapshot.anchor = anchor;
+            }
+        }
         // Run reconstruction never reads the durable pending queue. Move its allocation into the
         // actor's queue state before sharing the slim checkpoint with executor/core clones.
         let mut pending_fifo = snapshot.take_pending_fifo();
@@ -9963,6 +10491,7 @@ mod tests {
             },
         ];
         records.push(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("held".into()),
             reason: broca_protocol::PauseReason::ToolHeld,
             error: None,
@@ -10128,6 +10657,7 @@ mod tests {
                 },
             ];
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 reason: broca_protocol::PauseReason::ToolHeld,
                 error: None,
@@ -10288,6 +10818,7 @@ mod tests {
             }
             let boundary_cut = records.len();
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::AuthRequired,
@@ -10441,6 +10972,7 @@ mod tests {
             // A paused provider-held batch may commit its closing turn before the run's
             // final terminal. A seed at that crash cut already contains the pause.
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::ToolHeld,
@@ -10473,6 +11005,7 @@ mod tests {
         let cut = records.len();
         if !empty_tail {
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::AuthRequired,
@@ -10591,6 +11124,8 @@ mod tests {
         wal: Box<dyn broca_wal::Wal + Send>,
         witness: Arc<std::sync::Mutex<broca_wal::file_wal::DurablePublication>>,
         reader: Arc<dyn broca_core::context::AdmissionReader>,
+        // Fields are dropped in order; remove the directory only after closing its files.
+        _scratch: DatabaseAdmissionScratch,
     }
 
     impl DatabaseAdmissionFixture {
@@ -10605,11 +11140,13 @@ mod tests {
             std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
             let key = BindIdentity::new("/offset-admission", "h", "database");
             let mut wal: Box<dyn broca_wal::Wal + Send> = Box::new(
-                broca_wal::FileWal::open(root.join("wal/log"))
-                    .unwrap()
-                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                    .unwrap()
-                    .with_feature_floor(root.join("wal-floor")),
+                broca_wal::FileWal::open_with_recovery(
+                    root.join("wal/log"),
+                    broca_wal::WalConfig::OVERHAUL,
+                    root.join("wal-floor"),
+                )
+                .unwrap()
+                .with_feature_floor(root.join("wal-floor")),
             );
             for record in records {
                 wal.append(1, record, true).unwrap();
@@ -10626,6 +11163,7 @@ mod tests {
             let source = witness.clone();
             let reader = db.admission_reader(move |_| Ok(source.lock().unwrap().clone()));
             Self {
+                _scratch: DatabaseAdmissionScratch(root.clone()),
                 root,
                 key,
                 db,
@@ -10673,10 +11211,19 @@ mod tests {
         }
     }
 
-    impl Drop for DatabaseAdmissionFixture {
+    struct DatabaseAdmissionScratch(std::path::PathBuf);
+    impl Drop for DatabaseAdmissionScratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn database_admission_fixture_cleanup_closes_database_and_wal() {
+        let fixture = DatabaseAdmissionFixture::new(&database_paused_records(false, 0, false));
+        let root = fixture.root.clone();
+        drop(fixture);
+        assert!(!root.exists(), "fixture left its scratch directory behind");
     }
 
     fn database_paused_records(
@@ -10734,6 +11281,7 @@ mod tests {
             })
             .unwrap();
         records.push(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("held".into()),
             ts_ms: None,
             reason: broca_protocol::PauseReason::AuthRequired,
@@ -11511,7 +12059,7 @@ mod tests {
                 let key = BindIdentity::new(root.join("project"), "broca", "held-cancel");
                 let store = Arc::new(FileWalStore::new(root.join("wal")));
                 let mut records = held_close_seed(&key, true);
-                records.push(WalRecord::RunPaused { run_id: RunId("held".into()), reason: broca_protocol::PauseReason::ToolHeld, error: None, ts_ms: Some(43) });
+                records.push(WalRecord::RunPaused { account_limit: None, run_id: RunId("held".into()), reason: broca_protocol::PauseReason::ToolHeld, error: None, ts_ms: Some(43) });
                 seed_held_wal(&store, &key, &records);
                 let executor = Arc::new(HeldCancelCoreExecutor {
                     wal_store: store.clone(), provider: broca_core::StubProvider::new(vec![]), plane: StubToolPlane::new(),
@@ -11650,6 +12198,7 @@ mod tests {
                 sequential: false,
             },
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("held".into()),
                 reason: broca_protocol::PauseReason::ToolHeld,
                 error: None,
@@ -12010,6 +12559,7 @@ mod tests {
                         let mut records = held_close_seed(&key, sequential);
                         if paused {
                             records.push(WalRecord::RunPaused {
+                                account_limit: None,
                                 run_id: RunId("held".into()),
                                 reason: broca_protocol::PauseReason::ToolHeld,
                                 error: None,
@@ -12134,6 +12684,7 @@ mod tests {
 
     pub(super) fn min_config() -> broca_wal::RunConfig {
         broca_wal::RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -12239,6 +12790,7 @@ mod tests {
             session: key.clone(),
             model: broca_protocol::request::ModelHandle::new("fake", "fake"),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -14569,7 +15121,8 @@ mod tests {
             std::mem::size_of::<Fut>()
         }
         type Actor = LineageActor<FileWalStore>;
-        let recovery = future_size(Actor::recover_durable_work);
+        // Recovery orchestration also heap-owns replay now, so its small future is
+        // no longer a useful relative benchmark for the other control entries.
         for (name, size) in [
             (
                 "recover_startup_admission_view",
@@ -14579,9 +15132,8 @@ mod tests {
             ("start_run", future_size_6(Actor::start_run)),
         ] {
             assert!(
-                size * 4 < recovery,
-                "{name} is carried inline in its callers: {size} bytes, recovery itself is \
-                 {recovery} bytes"
+                size <= 4096,
+                "{name} carries {size} bytes in its callers; keep replay/admission state on the heap"
             );
         }
     }

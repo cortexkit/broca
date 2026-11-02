@@ -14,6 +14,7 @@ use tokio::sync::{Notify, Semaphore};
 
 struct HooksRig {
     calls: Mutex<Vec<(String, HookCall)>>,
+    scopes: Mutex<Vec<Option<broca_protocol::SessionScope>>>,
     unavailable: AtomicBool,
     second_unavailable: AtomicBool,
     pass: AtomicBool,
@@ -28,8 +29,10 @@ impl HookPlane for HooksRig {
         &self,
         provider: &str,
         _: &BindIdentity,
+        scope: Option<&broca_protocol::SessionScope>,
         call: HookCall,
     ) -> Result<HookAnswer, HookUnavailable> {
+        self.scopes.lock().unwrap().push(scope.cloned());
         self.calls
             .lock()
             .unwrap()
@@ -59,6 +62,7 @@ impl Default for HooksRig {
     fn default() -> Self {
         Self {
             calls: Mutex::new(vec![]),
+            scopes: Mutex::new(vec![]),
             unavailable: AtomicBool::new(false),
             second_unavailable: AtomicBool::new(false),
             pass: AtomicBool::new(false),
@@ -396,6 +400,50 @@ async fn wait(notify: &Notify) {
         .await
         .expect("fixture entered stage");
 }
+
+#[tokio::test]
+async fn pre_user_first_send_and_steer_carry_the_frozen_session_scope() {
+    let f = Fixture::new("pre_user", &["pass"], 0);
+    let scope: broca_protocol::SessionScope = serde_json::from_value(json!({
+        "owner":{"kind":"reserved","module_id":"owner"}, "ref":"worker", "scope_epoch":7
+    }))
+    .unwrap();
+    let mut request = f.request("first");
+    request.principal = Some(scope.owner.clone());
+    request.scope = broca_protocol::SendScope::Stamped(broca_protocol::BindScope {
+        scope: scope.clone(),
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
+        owner_authorized: true,
+    });
+    let outcome = f
+        .registry
+        .route_submission_with_plan(
+            &f.key,
+            RunId("first".into()),
+            request,
+            RunKind::FreshOrResume,
+            SendKey::SendId("first".into()),
+            false,
+            Delivery::Queue,
+            Some(SendPlan {
+                identity: "plan".into(),
+                manifest: Some(f.manifest.clone()),
+                model_check: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    wait(&f.model.entered).await;
+    f.send("steer", "next", Delivery::Steer, false).await;
+    assert_eq!(
+        *f.hooks.scopes.lock().unwrap(),
+        vec![Some(scope.clone()), Some(scope)]
+    );
+    f.stop().await;
+}
 fn text(input: &[Message]) -> String {
     input
         .iter()
@@ -675,6 +723,7 @@ async fn paused_restart_steer_is_transformed_and_retry_is_hookless() {
     wal.append(
         1,
         &WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("seed".into()),
             reason: broca_protocol::PauseReason::Restart,
             error: None,

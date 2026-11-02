@@ -13,9 +13,12 @@ mod index;
 mod inventory;
 pub use inventory::open_session_resolver;
 mod operational;
+mod outbox;
 pub use operational::{
-    open_diagnostic_reader, operational_database_name, DiagnosticEvidenceReader,
+    open_diagnostic_reader, open_diagnostic_reader_decided, operational_database_name,
+    DiagnosticEvidenceReader,
 };
+pub use outbox::OverhaulRunEventStore;
 mod publication;
 mod readers;
 mod rebuild;
@@ -83,6 +86,9 @@ pub struct OverhaulDb {
     raw_fallback_notices: Mutex<std::collections::HashSet<String>>,
 }
 
+pub type SessionGateFactory =
+    dyn Fn(&broca_protocol::BindIdentity) -> std::sync::Arc<std::sync::Mutex<()>> + Send + Sync;
+
 impl OverhaulDb {
     /// Read a consistent index snapshot. SQLite's query-only guard prevents an
     /// accidental write from bypassing the transaction durability policy.
@@ -90,10 +96,12 @@ impl OverhaulDb {
         &self,
         read: impl FnOnce(&Transaction<'_>) -> Result<T, DbError>,
     ) -> Result<T, DbError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| DbError::Invalid("database writer poisoned".into()))?;
+        // WAL-mode readers must not queue behind another session's index rebuild.
+        let mut conn = Connection::open_with_flags(
+            self.root.join("broca.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "query_only", true)?;
         let result = (|| {
             let tx = conn.transaction()?;
@@ -130,6 +138,7 @@ impl OverhaulDb {
             retention::initialize(tx)?;
             operational::initialize(tx)?;
             recovery::initialize(tx)?;
+            outbox::initialize(tx)?;
             Ok(())
         })?;
         Ok(db)

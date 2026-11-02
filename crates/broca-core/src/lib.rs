@@ -45,6 +45,7 @@ pub mod projection_plan;
 mod projection_plan_tests;
 pub mod provider;
 pub mod queue;
+pub mod recovery_close_out;
 pub mod refusal_fallback;
 pub mod render;
 pub mod replay;
@@ -172,6 +173,8 @@ pub use wal_writer::{
     SESSION_PROJECTION_INCOMPLETE,
 };
 
+mod account_limit_pause;
+pub use account_limit_pause::account_limit_stale_resets;
 pub mod keep_warm;
 pub mod keep_warm_wait;
 mod plan_system;

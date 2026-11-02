@@ -961,6 +961,7 @@ impl Fixture {
             },
             WalRecord::StepStarted { step_id: StepId(1) },
             WalRecord::ModelAttemptFinished {
+                account_limit_disposition: None,
                 attempt_id: None,
                 reservation: None,
                 envelope: None,

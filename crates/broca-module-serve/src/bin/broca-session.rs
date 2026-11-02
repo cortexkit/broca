@@ -1471,8 +1471,15 @@ impl<'a> RunTurnTracker<'a> {
         // So the rule is structural rather than a second instance fixed: ANY control unit
         // that names a run AND ends this client's interest in it belongs above this gate.
         // Adding one below it reintroduces the hang, which is why they are grouped.
-        if let ControlUnit::Paused { run_id, .. } = unit {
+        if let ControlUnit::Paused { run_id, reason, .. } = unit {
             if run_id.0.as_str() == self.target_run_id {
+                if *reason == broca_protocol::PauseReason::AccountLimit {
+                    // A timed account pause resumes itself on this subscription. Its run id
+                    // identifies the continuation even when a live attach saw no RunStarted.
+                    self.started = true;
+                    self.provisional_text.clear();
+                    return RunTurnAction::Continue;
+                }
                 return RunTurnAction::Paused;
             }
             self.provisional_text.clear();
@@ -2199,35 +2206,37 @@ fn emit_control_to(
             },
             output,
         ),
-        // A pause is terminal for this attach and breaks the run loop, so with no arm here the
-        // client exits non-zero having printed nothing since RUN_STARTED: a run waiting on
-        // re-authentication reads exactly like one that died. It is also the only terminal that
-        // is RESUMABLE under the same run id, which is the part an operator most needs told.
+        // Non-timed pauses end the attach and must say why. Timed account pauses are displayed
+        // here too, but RunTurnTracker keeps their subscription attached for the same-run resume.
         ControlUnit::Paused {
             run_id,
             reason,
             error,
-        } => emit_to(
-            json,
-            &serde_json::json!({
-                "event": "run_paused",
-                "wal_seq": wal_seq,
-                "run_id": run_id.0,
-                "reason": format!("{reason:?}"),
-                "error": error.as_ref().map(|e| e.message.clone()),
-            }),
-            || {
-                format!(
-                    "RUN_PAUSED seq={wal_seq} run_id={} reason={reason:?}{}",
-                    run_id.0,
-                    error
-                        .as_ref()
-                        .map(|e| format!(" msg={}", e.message.replace('\n', "\\n")))
-                        .unwrap_or_default()
-                )
-            },
-            output,
-        ),
+            resume_not_before_ms,
+        } => {
+            let mut value = serde_json::json!({
+                "event": "run_paused", "wal_seq": wal_seq, "run_id": run_id.0,
+                "reason": format!("{reason:?}"), "error": error.as_ref().map(|e| e.message.clone()),
+            });
+            if let Some(deadline) = resume_not_before_ms {
+                value["resume_not_before_ms"] = serde_json::json!(deadline);
+            }
+            emit_to(
+                json,
+                &value,
+                || {
+                    format!(
+                        "RUN_PAUSED seq={wal_seq} run_id={} reason={reason:?}{}",
+                        run_id.0,
+                        error
+                            .as_ref()
+                            .map(|e| format!(" msg={}", e.message.replace('\n', "\\n")))
+                            .unwrap_or_default()
+                    )
+                },
+                output,
+            )
+        }
         _ => {}
     }
 }
@@ -2804,6 +2813,7 @@ mod tests {
     /// A pause naming its run. `Paused` has always carried one.
     fn paused_for(run_id: &str) -> ControlUnit {
         ControlUnit::Paused {
+            resume_not_before_ms: None,
             run_id: RunId(run_id.into()),
             reason: broca_protocol::PauseReason::AuthRequired,
             error: None,
@@ -3461,6 +3471,7 @@ mod tests {
         );
         assert_eq!(
             tracker.consume(&ControlUnit::Paused {
+                resume_not_before_ms: None,
                 run_id: RunId("foreign".into()),
                 reason: PauseReason::AuthRequired,
                 error: None,
@@ -3469,12 +3480,33 @@ mod tests {
         );
         assert_eq!(
             tracker.consume(&ControlUnit::Paused {
+                resume_not_before_ms: None,
                 run_id: RunId("ours".into()),
                 reason: PauseReason::AuthRequired,
                 error: None,
             }),
             RunTurnAction::Paused
         );
+    }
+
+    #[test]
+    fn timed_account_pause_keeps_the_same_turn_attached_until_resume_finishes() {
+        let mut tracker = RunTurnTracker::new("ours");
+        assert_eq!(
+            tracker.consume(&ControlUnit::Paused {
+                resume_not_before_ms: Some(61_000),
+                run_id: RunId("ours".into()),
+                reason: PauseReason::AccountLimit,
+                error: None,
+            }),
+            RunTurnAction::Continue
+        );
+        assert_eq!(
+            tracker.consume(&assistant("resumed answer")),
+            RunTurnAction::Continue
+        );
+        assert_eq!(tracker.final_text, "resumed answer");
+        assert_eq!(tracker.consume(&run_finished()), RunTurnAction::Finished);
     }
 
     fn unrecognized(body: &[u8]) -> UnrecognizedRunState {

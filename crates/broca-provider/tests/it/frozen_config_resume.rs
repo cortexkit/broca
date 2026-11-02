@@ -141,6 +141,7 @@ mod gated {
             session: BindIdentity::new(dir, "c6b", "s1"),
             model: ModelHandle::new("anthropic", "claude-opus-4-8"),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -255,13 +256,23 @@ mod gated {
         request: &RunRequest,
         frozen: &FrozenRenderConfig,
     ) {
+        seed_resumable_request_with_tags(dir, request, frozen, false);
+    }
+
+    fn seed_resumable_request_with_tags(
+        dir: &std::path::Path,
+        request: &RunRequest,
+        frozen: &FrozenRenderConfig,
+        render_tags: bool,
+    ) {
         let wal_store = FileWalStore::new(dir.join("wal"));
         let mut wal = wal_store
             .open(&request.session)
             .expect("open WAL for resumable seed");
         let config = RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
-            render_tags: false,
+            render_tags,
             computed_tags: None,
             model: request.model.clone(),
             tools: request.tools.clone().into(),
@@ -757,6 +768,86 @@ mod gated {
             drop(sent);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_system_crash_after_delivery_record_resumes_with_identical_downgraded_bytes() {
+        assert_turn_system_resume(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_system_crash_after_delivery_record_resumes_with_identical_system_bytes() {
+        assert_turn_system_resume(true).await;
+    }
+
+    async fn assert_turn_system_resume(supported: bool) {
+        use broca_core::delivery_order::{system_delivered, OrderedSend};
+        use broca_protocol::{DeliveryMode, DeliveryOrder, SubmissionId};
+        let dir = broca_test_support::scratch_root().join(format!(
+            "broca-turn-system-resume-{supported}-{}",
+            std::process::id()
+        ));
+        broca_test_support::remove_rig_dir(&dir);
+        let mut frozen = anthropic_apikey_frozen_config("claude-opus-4-8");
+        frozen.anthropic_turn_system = supported;
+        let req = request(&dir);
+        seed_resumable_request(&dir, &req, &frozen);
+        let note = OrderedSend {
+            admitted_at_ms: None,
+            submission_id: SubmissionId("template-note".into()),
+            order: DeliveryOrder {
+                modes: vec![DeliveryMode::TurnSystem],
+                dedupe_key: None,
+                expires_at_ms: None,
+                template: None,
+            },
+            principal: None,
+            input: vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "Keep the summary concise.".into(),
+                }],
+            )],
+        };
+        let delivered = system_delivered(&note, &req.run_id);
+        let mut expected_prompt = req.input.clone();
+        if let WalRecord::SendDelivered {
+            input: Some(input), ..
+        } = &delivered
+        {
+            expected_prompt.extend(input.iter().cloned());
+        } else {
+            panic!("delivery must carry its frozen input");
+        }
+        let provider = FrozenProvider::new(frozen.clone());
+        let expected = provider.render_request(&CallOptions::new(expected_prompt));
+        let store = FileWalStore::new(dir.join("wal"));
+        {
+            let mut wal = store.open(&req.session).unwrap();
+            wal.append(1, &delivered, false).unwrap();
+            wal.append(1, &WalRecord::StepStarted { step_id: StepId(1) }, true)
+                .unwrap();
+        }
+        // No model call or response exists after the durable delivery. Reopen through the
+        // production resume path, which must use the delivered input recorded in the WAL.
+        let summary = drive_request(&dir, &provider, req).await.unwrap();
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+        let calls = provider.sent.lock().unwrap();
+        assert_eq!(calls.get(&0).expect("resumed model call"), &expected);
+        let body: serde_json::Value = serde_json::from_slice(&expected).unwrap();
+        assert!(body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| if supported {
+                message["role"] == "system" && message["content"] == "Keep the summary concise."
+            } else {
+                message["role"] == "user"
+                    && message["content"]
+                        == "<context-note>Keep the summary concise.</context-note>"
+            }));
+        let records = FileWal::open(wal_path(&dir)).unwrap().replay().unwrap();
+        assert!(records.iter().any(|record| record.record == delivered));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1615,6 +1706,54 @@ mod gated {
         assert_eq!(sent[&0], expected);
         assert!(String::from_utf8_lossy(&sent[&0]).contains(MARKER));
         assert!(!String::from_utf8_lossy(&sent[&0]).contains("\"type\":\"image\""));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn imported_multipart_notices_resume_with_legacy_frozen_request_bytes() {
+        use broca_core::{run_import, ImportOrigin, ImportRequest, WalHandle};
+        let dir = broca_test_support::scratch_root()
+            .join(format!("imported-notice-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let req = request(&dir);
+        let imported: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"look"}]},
+            {"role":"assistant","content":[{"type":"tool_call","tool_call_id":"photo","tool_name":"read","input":{}}]},
+            {"role":"tool","content":[{"type":"tool_result","tool_call_id":"photo","output":{"kind":"parts","parts":[
+                {"kind":"text","text":"[image/png not shown to the model: this runner does not pass tool images to models yet]"},
+                {"kind":"text","text":"[media not shown: kind=image mime=image/png bytes=69 sha256=b1ff9c8ea3a7 reason=store_failed]"}
+            ]}}]}
+        ])).unwrap();
+        let wal = FileWalStore::new(dir.join("wal"));
+        let writer = WalHandle::spawn(wal.open(&req.session).unwrap(), 1).unwrap();
+        run_import(
+            ImportRequest {
+                session: req.session.clone(),
+                run_id: RunId("import".into()),
+                project_id: None,
+                principal: None,
+                messages: imported.clone(),
+                origin: ImportOrigin {
+                    source_ref: "fixture:notice-resume".into(),
+                },
+            },
+            &writer,
+            &wal,
+        )
+        .await
+        .unwrap();
+        writer.shutdown().await.unwrap();
+        let admitted = anthropic_frozen_config("claude-opus-4-8");
+        seed_resumable_request_with_tags(&dir, &req, &admitted, true);
+        let prior = read_prior_run_config(&wal, &req.session).unwrap().unwrap();
+        let rebuilt: FrozenRenderConfig =
+            serde_json::from_value(prior.frozen_render_config).unwrap();
+        let mut expected_prompt = imported;
+        expected_prompt.extend(req.input.clone());
+        let expected = AnthropicMessages.render(&admitted, &CallOptions::new(expected_prompt));
+        let provider = FrozenProvider::new(rebuilt);
+        drive_request(&dir, &provider, req).await.unwrap();
+        assert_eq!(provider.sent.lock().unwrap()[&0], expected);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

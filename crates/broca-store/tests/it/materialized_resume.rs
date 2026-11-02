@@ -220,6 +220,8 @@ async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
         assert_eq!(suffix_decodes, 2);
 
         let complete = broca_core::PriorWalSnapshot {
+            lineage_id: None,
+            anchor: None,
             base_watermark: 0,
             head_seq: head,
             tail: Arc::new(frames.clone()),
@@ -457,6 +459,7 @@ fn request(dir: &std::path::Path) -> RunRequest {
         session: BindIdentity::new(dir, "m10", "s1"),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -2298,6 +2301,7 @@ impl broca_core::compaction::CompactionPlane for HeldViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, broca_core::compaction::CompactionUnavailable> {
         if let Some(lineage) = &request.lineage_id {
@@ -2316,6 +2320,7 @@ impl broca_core::compaction::CompactionPlane for HeldViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, broca_core::compaction::CompactionUnavailable> {
         Ok(ViewGetAnswer::view(

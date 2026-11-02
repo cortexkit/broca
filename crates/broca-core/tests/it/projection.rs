@@ -40,6 +40,7 @@ fn framed(seq: u64, record: WalRecord) -> FramedRecord {
 
 fn run_config() -> RunConfig {
     RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -88,6 +89,7 @@ fn started(run: &str) -> WalRecord {
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(run_config()),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -651,6 +653,7 @@ fn paused_run_projects_pause_as_terminal() {
         framed(
             3,
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r1".into()),
                 ts_ms: None,
                 reason: PauseReason::AuthRequired,
@@ -679,7 +682,9 @@ fn paused_run_projects_pause_as_terminal() {
             run_id,
             reason,
             error,
+            resume_not_before_ms,
         } => {
+            assert_eq!(*resume_not_before_ms, None);
             assert_eq!(run_id.0, "r1");
             assert_eq!(*reason, PauseReason::AuthRequired);
             assert_eq!(error.as_ref().map(|e| e.message.as_str()), Some("expired"));
@@ -1057,6 +1062,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
         principal: None,
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1151,6 +1157,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             retries_used: 0,
         },
         WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r-all".into()),
             ts_ms: None,
             reason: PauseReason::AuthRequired,

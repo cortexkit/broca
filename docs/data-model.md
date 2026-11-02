@@ -53,6 +53,9 @@ take it (`crates/broca-module-serve/src/state_root_lock.rs`).
 The WAL is the source of truth. Everything in `run-index.db` is derived from it, although
 not all of it can be regenerated (section 4 says which parts cannot).
 
+Format-2 roots created before the final wiring release must be recreated; these development
+roots are identified by a `run-index.db` file beside `state-format`.
+
 
 broca creates the WAL directory, WAL files and archive containers owner-only (`0700`
 directories, `0600` files), and restricts `run-index.db` and its `-wal`/`-shm` sidecars to
@@ -429,7 +432,7 @@ member yet: the reader must ship in a release before the writer is enabled.
 | `steered` | `send_id` (absent), `request_identity_digest` (absent), `delivery` (absent; `"steer"`), `title` (absent; the steering send's title, informational like `run_started.title`), `input` (the user message(s), after any pre-user transformations), `hooks` (absent; optional pre-user hook metadata, written alongside the prepared `input`). **Must-understand, feature `steer-queue/v1`**: always a `ver = 3` frame. A message a caller added to the running turn. |
 | `delivery_ordered` | `submission_id`, `order` (`{modes, dedupe_key?, expires_at_ms?}`). **Must-understand, feature `delivery-order/v1`**. The ordered `delivery` list of the `queued` record for the same submission that follows it in the same barrier (a running turn's own records may lie between them). Written only for a send using the `delivery_order` group. |
 | `send_ended` | `submission_id`, `reason` (`{kind: "superseded", by}` or `{kind: "expired"}`). **Must-understand, feature `delivery-order/v1`**. A queued ordered send that will never be delivered; removes it from the pending queue like `retracted`. |
-| `send_delivered` | `submission_id`, `run_id`, `mode` (`"steer"` or `"tool_result"`), `input` (with `steer`: placed like a `steered` record's input), `tool_call_id` and `appended_text` (with `tool_result`: rendered after that result's stored output, which is never changed; written between the batch's `tool_batch_finished` and `turn_finished`). **Must-understand, feature `delivery-order/v1`**. Consumes the queued send; an `idle_start` delivery is the `run_started` naming its `submission_id`. |
+| `send_delivered` | `submission_id`, `run_id`, `mode` (`"steer"`, `"tool_result"`, or `"turn_system"`), `input` (with `steer` or `turn_system`: placed like a `steered` record's input), `tool_call_id` and `appended_text` (with `tool_result`: rendered after that result's stored output, which is never changed; written between the batch's `tool_batch_finished` and `turn_finished`). **Must-understand, feature `delivery-order/v1`**. A `turn_system` delivery additionally requires `turn-system/v1`; its system-role input carries `turn_system: true`, preserving its conversation position rather than becoming global instructions. The marker defaults to false and is omitted when false. Every record carrying a marked message requires the feature. Consumes the queued send; an `idle_start` delivery is the `run_started` naming its `submission_id`. |
 
 The pending queue is `queued` minus `retracted` (and `send_ended`) minus those consumed by a
 `run_started` carrying their `submission_id` (or a `send_delivered`). A queued send whose order

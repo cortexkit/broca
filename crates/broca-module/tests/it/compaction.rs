@@ -37,6 +37,7 @@ impl CompactionPlane for Compactor {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         Ok(serde_json::from_value(
@@ -124,6 +125,7 @@ impl CompactionPlane for HeldCompactor {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         self.arrived.add_permits(1);

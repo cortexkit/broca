@@ -168,6 +168,10 @@ pub struct ModelSpec {
     /// claim that the model lacks it. A value the catalog states badly also reads as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_side_fallback: Option<bool>,
+    /// Provider-published support for persistent system messages inside the conversation.
+    /// Missing or false is unsupported, never an admission error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mid_conversation_system: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

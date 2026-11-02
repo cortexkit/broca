@@ -17,6 +17,7 @@ impl SqliteStore {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let key = Self::key(session);
+        let publication_epoch = publication_epoch(self, &tx, &key)?;
         let seed = cached_seed(&tx, &key, lineage)?;
         let mut rows = std::collections::BTreeMap::new();
         if seed.is_some() {
@@ -36,7 +37,11 @@ impl SqliteStore {
                 }
             }
         }
-        Ok(DisplayFactsCache { seed, rows })
+        Ok(DisplayFactsCache {
+            publication_epoch,
+            seed,
+            rows,
+        })
     }
 
     pub(crate) fn display_cache_publish(
@@ -44,12 +49,16 @@ impl SqliteStore {
         session: &BindIdentity,
         lineage: &str,
         expected: Option<u64>,
+        expected_epoch: Option<i64>,
         seed: &DisplayFactsSeed,
         versions: &[DisplayFactVersion],
     ) -> Result<(), String> {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let key = Self::key(session);
+        if publication_epoch(self, &tx, &key)? != expected_epoch {
+            return Err("display facts source changed during WAL recovery".into());
+        }
         let current = cached_seed(&tx, &key, lineage)?;
         let expired: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM retention_lineage WHERE session=?1 AND lineage_id=?2 AND expired_at_ms IS NOT NULL)", params![key,lineage], |row| row.get(0)).map_err(|e| e.to_string())?;
         if expired {
@@ -90,6 +99,25 @@ impl SqliteStore {
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
+}
+
+fn publication_epoch(
+    store: &SqliteStore,
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> Result<Option<i64>, String> {
+    if !store.wal_config.is_overhaul() {
+        return Ok(None);
+    }
+    if crate::wal_recovery::read_fence(tx, key)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|fence| fence.pending)
+    {
+        return Err("display facts are unavailable during WAL recovery".into());
+    }
+    crate::current_projection_state(tx, key, true)
+        .map(|(_, _, epoch)| Some(epoch))
+        .map_err(|e| e.to_string())
 }
 
 fn cached_seed(
@@ -135,7 +163,14 @@ mod tests {
         seed.through_seq = 1;
         store.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_display BEFORE INSERT ON display_fact BEGIN SELECT RAISE(ABORT,'injected display cache failure'); END;").unwrap();
         assert!(store
-            .display_cache_publish(&session, "lineage", None, &seed, &[version(1, "first")])
+            .display_cache_publish(
+                &session,
+                "lineage",
+                None,
+                None,
+                &seed,
+                &[version(1, "first")]
+            )
             .is_err());
         assert!(store
             .display_cache_read(&session, "lineage", 1, &[0])
@@ -149,7 +184,14 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_display")
             .unwrap();
         store
-            .display_cache_publish(&session, "lineage", None, &seed, &[version(1, "first")])
+            .display_cache_publish(
+                &session,
+                "lineage",
+                None,
+                None,
+                &seed,
+                &[version(1, "first")],
+            )
             .unwrap();
         assert!(store
             .display_cache_read(&other, "lineage", 1, &[0])
@@ -158,7 +200,14 @@ mod tests {
             .is_none());
         seed.through_seq = 2;
         store
-            .display_cache_publish(&session, "lineage", Some(1), &seed, &[version(2, "second")])
+            .display_cache_publish(
+                &session,
+                "lineage",
+                Some(1),
+                None,
+                &seed,
+                &[version(2, "second")],
+            )
             .unwrap();
         let first = store
             .display_cache_read(&session, "lineage", 1, &[0])
@@ -170,6 +219,7 @@ mod tests {
                 &session,
                 "lineage",
                 Some(1),
+                None,
                 &seed,
                 &[version(2, "stale writer")],
             )
@@ -186,7 +236,14 @@ mod tests {
         store.drop_session_projection(&session).unwrap();
         store.conn.lock().unwrap().execute("INSERT INTO retention_lineage(lineage_id,session,retention_s,last_activity_ms,expires_at_ms,wal_bytes,expired_at_ms) VALUES(?1,?2,60,1,NULL,0,2)", params!["lineage", SqliteStore::key(&session)]).unwrap();
         store
-            .display_cache_publish(&session, "lineage", None, &seed, &[version(2, "expired")])
+            .display_cache_publish(
+                &session,
+                "lineage",
+                None,
+                None,
+                &seed,
+                &[version(2, "expired")],
+            )
             .unwrap();
         assert!(
             store

@@ -553,6 +553,26 @@ impl RunExecutor for CoreExec {
             None
         }
     }
+
+    async fn apply_idle_compaction(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        writer: &broca_core::WalHandle,
+        records: Vec<broca_wal::WalRecord>,
+        ready: &broca_core::compaction_provider::notice::ViewReady,
+    ) -> Result<bool, String> {
+        broca_module_serve::compaction_bus::apply_idle(
+            session,
+            writer,
+            &records,
+            ready,
+            &self
+                .compaction_plane()
+                .ok_or("compaction provider unavailable")?,
+            None,
+        )
+        .await
+    }
     fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {
         self.hook_plane.lock().unwrap().clone()
     }
@@ -588,15 +608,22 @@ impl RunExecutor for CoreExec {
             let wal = self.wal_store.clone();
             let session = job.req.session.clone();
             let head = job.writer.durable_head();
-            let checkpoint = match &job.prior_snapshot.checkpoint_at_head.media {
-                Some(broca_core::media_request::DurableMediaSeed::Ready(seed)) => (**seed).clone(),
-                Some(broca_core::media_request::DurableMediaSeed::Unreadable(_)) => {
-                    panic!("media fixture seed is unreadable")
+            let checkpoint = match broca_core::media_request::initialize_media_checkpoint(
+                &job.writer,
+                self.wal_store.clone(),
+                &job.req.session,
+                &job.prior_snapshot,
+            )
+            .await
+            {
+                Ok(initialized) => initialized.checkpoint,
+                Err(error) => {
+                    let error = RunError::Wal(error);
+                    if let Some(ack) = job.on_admitted {
+                        let _ = ack.send(Err(error.clone()));
+                    }
+                    return Err(error);
                 }
-                None => job
-                    .writer
-                    .empty_media_checkpoint(job.prior_snapshot.head_seq)
-                    .unwrap(),
             };
             let media = broca_provider::media_request::LiveMedia::from_checkpoint(
                 store,

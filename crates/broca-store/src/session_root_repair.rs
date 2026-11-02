@@ -574,6 +574,8 @@ fn plan_projection_cleanup(
         // succeeds, but leave every live-key row untouched during maintenance.
         SqliteStore::prepare_projection(
             broca_core::projection_plan::ProjectionSnapshot {
+                context_epoch: 0,
+                required_recovery_cuts: Vec::new(),
                 attribution_complete: true,
                 seed: None,
                 watermark: 0,

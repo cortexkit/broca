@@ -100,3 +100,29 @@ pub mod run_events;
 
 #[cfg(all(feature = "test-attachments", not(debug_assertions)))]
 compile_error!("test-attachments is a non-shipping feature");
+
+static SERVICE_TIER_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Fix service-tier admission and discovery before serving requests. Restart to change it.
+pub fn configure_service_tier(enabled: bool) -> Result<(), &'static str> {
+    SERVICE_TIER_ENABLED
+        .set(enabled)
+        .map_err(|_| "service_tier.enabled was already configured; restart broca to change it")
+}
+
+pub fn service_tier_enabled() -> bool {
+    SERVICE_TIER_ENABLED.get().copied().unwrap_or(false)
+}
+
+/// Recover the abstract applied level from the recorded request bytes, never today's catalog.
+pub fn frozen_service_tier(render: &serde_json::Value) -> &'static str {
+    match render
+        .get("service_tier")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("ultrafast") => "ultrafast",
+        Some("priority" | "fast") => "fast",
+        _ if render.get("speed").and_then(serde_json::Value::as_str) == Some("fast") => "fast",
+        _ => "standard",
+    }
+}

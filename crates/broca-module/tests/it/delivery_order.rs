@@ -2076,3 +2076,6 @@ async fn a_named_senders_interrupt_needs_the_grant_and_runs_under_the_owner() {
         );
     }
 }
+
+#[path = "interrupt_cancel_cost.rs"]
+mod interrupt_cancel_cost;

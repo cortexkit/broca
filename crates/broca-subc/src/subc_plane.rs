@@ -46,10 +46,10 @@ use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::{
-    is_module_availability_refusal, retry_route_open, retry_route_open_waiting_out_outage,
-    retry_route_open_with_scope_hold, route_failure_is_known_dead, ConnError, GateTarget,
-    ModuleGate, OutageWait, RouteHandle, RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection,
-    ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL, ROUTE_OPEN_RETRY_MAX_INTERVAL,
+    retry_route_open, retry_route_open_waiting_out_outage, retry_route_open_with_scope_hold,
+    route_failure_is_known_dead, ConnError, GateTarget, ModuleGate, OutageWait, RouteHandle,
+    RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection, ROUTE_OPEN_RETRY_DEADLINE,
+    ROUTE_OPEN_RETRY_INTERVAL, ROUTE_OPEN_RETRY_MAX_INTERVAL,
 };
 use crate::scope_describe::{DescribedScope, ScopeDescriber};
 use crate::tool_deadline::tool_reply_deadline;
@@ -3884,16 +3884,13 @@ fn conn_to_plane(e: ConnError) -> ToolPlaneError {
     ToolPlaneError::Unavailable(e.to_string())
 }
 
-/// Map a tool-dispatch route-open failure to the plane error the loop reports. A refusal
-/// the daemon attributed to the module (`target_unavailable`, `module_reloading`,
-/// `module_warming`, `module_timeout`) that outlasted the tool-dispatch patience becomes
-/// [`ToolPlaneError::ModuleUnavailable`]: proven undelivered, carrying the module, the
-/// daemon's code and its detail. Everything else keeps today's mapping.
+/// Preserve every tool-dispatch route-open refusal, including terminal codes the protocol
+/// does not know. Refusal attribution is independent of retryability: no tool request was
+/// sent, and the model needs the module, code and bounded detail to understand why.
+/// Scoped refusals have already taken their separate scope-specific path.
 fn map_tool_open_refusal(error: RouteEnsureError, module_id: &str) -> ToolPlaneError {
     match error {
-        RouteEnsureError::Connection(ConnError::Rejected(message))
-            if is_module_availability_refusal(message.code()) =>
-        {
+        RouteEnsureError::Connection(ConnError::Rejected(message)) => {
             ToolPlaneError::ModuleUnavailable {
                 module: module_id.to_owned(),
                 code: message.code().to_owned(),

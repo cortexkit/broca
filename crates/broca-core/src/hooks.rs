@@ -28,12 +28,14 @@ pub struct HookUnavailable;
 
 /// Session-scoped route adapter. Opening/reopening a route and any transient retry happen
 /// inside this future, so the core's timeout covers the entire call, not just the RPC.
+/// `scope` is the session's frozen selector identity, not a scope supplied by a hook request.
 #[async_trait]
 pub trait HookPlane: Send + Sync {
     async fn hook(
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&broca_protocol::SessionScope>,
         call: HookCall,
     ) -> Result<HookAnswer, HookUnavailable>;
 }
@@ -276,6 +278,7 @@ pub struct HookRuntime<'a> {
     pub plan: &'a HookPlan,
     pub plane: &'a Arc<dyn HookPlane>,
     pub bind: &'a BindIdentity,
+    pub scope: Option<&'a broca_protocol::SessionScope>,
     pub writer: &'a crate::WalHandle,
     pub cancel: Option<&'a CancellationToken>,
     pub stop: Option<&'a CancellationToken>,
@@ -327,7 +330,7 @@ impl HookRuntime<'_> {
                 _ = cancelled(self.stop) => HookCompletion::Cancelled(HookCancellation::StopRequested),
                 _ = async { match self.seal { Some(seal) => seal.tripped().await, None => std::future::pending().await } } => HookCompletion::Cancelled(HookCancellation::ShutdownSeal),
                 answer = tokio::time::timeout(std::time::Duration::from_millis(sub.budget_ms.min(STEP_TRANSFORM_HOOK_CAP)),
-                    self.plane.hook(&item.provider, self.bind, call)) => HookCompletion::Answer(answer.ok().and_then(Result::ok)),
+                    self.plane.hook(&item.provider, self.bind, self.scope, call)) => HookCompletion::Answer(answer.ok().and_then(Result::ok)),
             };
             let answer = match answer {
                 HookCompletion::Answer(answer) => answer,

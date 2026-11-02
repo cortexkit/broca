@@ -290,6 +290,10 @@ impl RunRequest {
 /// Admission-time WAL view: a materialized checkpoint plus only the records after its watermark.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PriorWalSnapshot {
+    /// Identity and exact byte boundary observed with this admission prefix, never
+    /// sampled later after executor dependency resolution.
+    pub lineage_id: Option<String>,
+    pub anchor: Option<broca_wal::WalByteAnchor>,
     /// Store watermark that precedes `tail`; zero for a complete-WAL fallback snapshot.
     pub base_watermark: u64,
     /// Durable writer head captured before this snapshot was loaded.
@@ -436,6 +440,8 @@ where
                         Some(safe_head),
                         snapshot.anchor.as_ref(),
                     ) {
+                        let lineage_id = range.lineage_id.map(|lineage| lineage.to_string());
+                        let anchor = range.next_anchor;
                         let lineage_matches = match (
                             snapshot.lineage_id.as_deref(),
                             range.lineage_id.map(|lineage_id| lineage_id.to_string()),
@@ -471,6 +477,8 @@ where
                                 })
                             {
                                 return Ok(PriorWalSnapshot {
+                                    lineage_id,
+                                    anchor,
                                     base_watermark: snapshot.watermark_seq,
                                     head_seq: safe_head,
                                     tail: Arc::new(records),
@@ -485,9 +493,17 @@ where
         }
     }
 
-    let records = wal_store
-        .read_records(session)
+    // This is a complete-history repair, not a read from an unusable store suffix.
+    // The live file may already contain newer accepted controls; keep only the
+    // records through safe_head and do not consume newer input that the live inbox
+    // may still deliver.
+    let (records, lineage_id) = wal_store
+        .read_records_with_lineage(session)
         .map_err(|error| error.to_string())?;
+    let records: Vec<_> = records
+        .into_iter()
+        .take_while(|frame| frame.seq <= safe_head)
+        .collect();
     let observed_head = records.last().map_or(0, |record| record.seq);
     if observed_head != safe_head {
         return Err(format!(
@@ -497,6 +513,8 @@ where
     let checkpoint_at_head =
         crate::AdmissionCheckpointV1::from_frames(&records).map_err(|error| error.to_string())?;
     Ok(PriorWalSnapshot {
+        lineage_id: lineage_id.map(|lineage| lineage.to_string()),
+        anchor: None,
         base_watermark: 0,
         head_seq: safe_head,
         tail: Arc::new(records),
@@ -561,6 +579,8 @@ pub fn load_prior_wal_snapshot_from_seed(
         let watermark = base.at_seq;
         base.pending_fifo = Arc::new(Vec::new());
         return Ok(PriorWalSnapshot {
+            lineage_id: None,
+            anchor: None,
             base_watermark: watermark,
             head_seq: safe_head,
             tail: Arc::new(tail.iter().map(|p| p.framed.clone()).collect()),
@@ -568,7 +588,10 @@ pub fn load_prior_wal_snapshot_from_seed(
             checkpoint_at_head: head,
         });
     }
-    let frames = full_read()?;
+    let frames: Vec<_> = full_read()?
+        .into_iter()
+        .take_while(|frame| frame.seq <= safe_head)
+        .collect();
     if frames.last().map_or(0, |frame| frame.seq) != safe_head {
         return Err(format!(
             "full admission repair did not reach durable head {safe_head}"
@@ -579,6 +602,8 @@ pub fn load_prior_wal_snapshot_from_seed(
     let checkpoint_at_head =
         crate::AdmissionCheckpointV1::from_frames(&frames).map_err(|error| error.to_string())?;
     Ok(PriorWalSnapshot {
+        lineage_id: None,
+        anchor: None,
         base_watermark: 0,
         head_seq: safe_head,
         tail: Arc::new(frames),
@@ -670,6 +695,8 @@ pub struct RunControl {
     /// Clock shared with the coordinator's expiry decisions, used for `RunStarted`,
     /// `RunFinished` and `RunPaused` timestamps. Unset uses the system clock.
     pub clock: Option<crate::Clock>,
+    /// Operator consent frozen only when a fresh episode is admitted; resumes use its WAL policy.
+    pub account_limit_pause: bool,
     /// Immediate cancellation: abort the model stream and stop dispatch, closing the batch
     /// under the existing at-most-once rules before finishing `Cancelled`. `None` disables
     /// this signal. Boundary cancellation uses the shared `steer` inbox instead, so it can
@@ -737,6 +764,10 @@ pub struct RunControl {
     /// step boundary, and closes the inbox before it writes a terminal. `None` means nothing can
     /// steer this run, and the loop behaves exactly as without it.
     pub steer: Option<std::sync::Arc<crate::SteerInbox>>,
+    /// The actor's admission snapshot head before it exposes this run's live inbox.
+    /// Replay owns steers at or below this boundary; the inbox owns later steers.
+    /// Keep the original boundary when initialization reloads newer WAL state.
+    pub live_steer_after_seq: Option<u64>,
     /// The frozen plan manifest of a session admitted with a fetch plan. A fresh episode
     /// records it on its `RunStarted`: the first episode freezes it there, and every later one
     /// repeats it so the episodes left after a WAL fold still carry it. A `RunStarted` carrying
@@ -875,6 +906,7 @@ impl Default for RunControl {
             #[cfg(all(test, feature = "test-clock"))]
             approval_wait_probe: None,
             clock: None,
+            account_limit_pause: false,
             cancel: None,
             compaction_plane: None,
             compaction_views: None,
@@ -892,6 +924,7 @@ impl Default for RunControl {
             shutdown_seal: None,
             stop_requested: None,
             steer: None,
+            live_steer_after_seq: None,
             manifest: None,
             manifest_system_override: false,
             account_reporter: None,
@@ -1924,6 +1957,22 @@ where
     A: ApprovalPolicy,
     W: WalStore,
 {
+    if let Some(store) = &store {
+        wal_store.bind_recovery_projection(Some(&req.session), store.clone());
+        if !writer.recovery_cut_ids().is_empty()
+            && store
+                .needs_wal_recovery_projection(&req.session, writer.recovery_cut_ids())
+                .map_err(RunError::Wal)?
+        {
+            let head = writer
+                .durable_head()
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let full = wal_store.read_records_range(&req.session, 0, Some(head), None)?;
+            store
+                .reproject_wal_recovery(&req.session, &full)
+                .map_err(RunError::Wal)?;
+        }
+    }
     #[cfg(feature = "test-clock")]
     let test_control = {
         let mut control = control.clone();
@@ -1972,8 +2021,13 @@ where
         append_episode,
         wal_store,
         store.clone(),
-        prior_snapshot,
-        offsets,
+        ResumeInitialization {
+            prior_snapshot,
+            offsets,
+            live_steer_after_seq: control
+                .live_steer_after_seq
+                .filter(|_| control.steer.is_some()),
+        },
     )
     .await;
     let (mut prior, is_resume, mut append_episode, last_input, approval_frames) = match reconstruct
@@ -2108,21 +2162,31 @@ type ReconstructedPrior = (
     Option<Arc<Vec<broca_wal::FramedRecord>>>,
 );
 
+struct ResumeInitialization<'a> {
+    prior_snapshot: Option<&'a PriorWalSnapshot>,
+    offsets: Option<Box<PreparedOffsetResume>>,
+    live_steer_after_seq: Option<u64>,
+}
+
 async fn reconstruct_prior<W>(
     req: &RunRequest,
     writer: &WalHandle,
     append_episode: bool,
     wal_store: &W,
     store: Option<Arc<dyn SessionStore>>,
-    prior_snapshot: Option<&PriorWalSnapshot>,
-    offsets: Option<Box<PreparedOffsetResume>>,
+    initialization: ResumeInitialization<'_>,
 ) -> Result<ReconstructedPrior, RunError>
 where
     W: WalStore,
 {
+    let ResumeInitialization {
+        prior_snapshot,
+        offsets,
+        live_steer_after_seq,
+    } = initialization;
     require_agent_run_scope_writer(req.scope.as_ref())?;
     let mut offset_prior = None;
-    let snapshot = if let Some(prepared) = offsets {
+    let mut snapshot = if let Some(prepared) = offsets {
         if prior_snapshot_matches_writer_head(writer, &prepared.snapshot)
             && prepared.lineage == writer.lineage_id()
         {
@@ -2198,6 +2262,20 @@ where
     writer.seed_lineage_tags(lineage_tags);
     if offset_prior.is_none() {
         seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
+    }
+    if !writer.recovery_cut_ids().is_empty() {
+        if snapshot.base_watermark != 0 {
+            snapshot = complete_snapshot(wal_store, &req.session)?;
+            offset_prior = None;
+        }
+        if crate::recovery_close_out::complete(writer, &snapshot.tail)
+            .await
+            .map_err(|error| RunError::Wal(error.to_string()))?
+        {
+            snapshot = complete_snapshot(wal_store, &req.session)?;
+            offset_prior = None;
+            seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
+        }
     }
     let episode = snapshot.checkpoint_at_head.last_episode.as_ref();
     let is_resume = episode.is_some();
@@ -2395,6 +2473,29 @@ where
             prior.compaction_history = state.history.clone();
         }
     }
+    if is_resume && !append_episode {
+        if let Some(boundary) = live_steer_after_seq {
+            // The actor made the live inbox from its original admission snapshot. A reload
+            // can see newer durable steers that this inbox still owns. Remove only that WAL
+            // suffix from replay, never equal text belonging to an older independent message.
+            let live = replayed_live_steers(&snapshot, boundary, writer, wal_store, &req.session)?;
+            for (seq, input) in live.into_iter().rev() {
+                let retained = prior
+                    .pending_steers
+                    .len()
+                    .checked_sub(input.len())
+                    .ok_or_else(|| {
+                        RunError::Wal(format!("live steer record {seq} is missing from replay"))
+                    })?;
+                if prior.pending_steers[retained..] != input {
+                    return Err(RunError::Wal(format!(
+                        "live steer record {seq} does not match its replayed input"
+                    )));
+                }
+                prior.pending_steers.truncate(retained);
+            }
+        }
+    }
     // The store materializes whole committed turns, so an unfinished step's attempt
     // is in snapshot.tail. A prefix with no deferred calls has no older approvals to
     // recover. A missing summary or one reporting deferred calls needs complete history:
@@ -2409,6 +2510,69 @@ where
         last_input,
         approval_frames,
     ))
+}
+
+fn replayed_live_steers<W: WalStore>(
+    snapshot: &PriorWalSnapshot,
+    boundary: u64,
+    writer: &WalHandle,
+    wal_store: &W,
+    session: &BindIdentity,
+) -> Result<Vec<(u64, Vec<Message>)>, RunError> {
+    if boundary > snapshot.head_seq {
+        return Err(RunError::Wal(
+            "live steer boundary is beyond the replay head".into(),
+        ));
+    }
+    if boundary == snapshot.head_seq {
+        return Ok(Vec::new());
+    }
+    let loaded;
+    let records = if snapshot.base_watermark <= boundary {
+        snapshot.tail.as_ref()
+    } else {
+        let range = wal_store
+            .read_records_range(session, boundary, Some(snapshot.head_seq), None)
+            .map_err(RunError::from)?;
+        if range.lineage_id != writer.lineage_id() {
+            return Err(RunError::Wal("live steer replay lineage changed".into()));
+        }
+        loaded = match range.into_records() {
+            broca_wal::WalRangeRecords::Complete(records) => records,
+            _ => {
+                return Err(RunError::Wal(
+                    "live steer replay advance is unreadable".into(),
+                ))
+            }
+        };
+        &loaded
+    };
+    let mut next = boundary
+        .checked_add(1)
+        .ok_or_else(|| RunError::Wal("live steer sequence exhausted".into()))?;
+    let mut messages = Vec::new();
+    for frame in records
+        .iter()
+        .filter(|frame| frame.seq > boundary && frame.seq <= snapshot.head_seq)
+    {
+        if frame.seq != next {
+            return Err(RunError::Wal(
+                "live steer replay advance is incomplete".into(),
+            ));
+        }
+        next = next
+            .checked_add(1)
+            .ok_or_else(|| RunError::Wal("live steer sequence exhausted".into()))?;
+        if let WalRecord::Steered { input, .. } = &frame.record {
+            messages.push((frame.seq, input.to_vec()));
+        }
+    }
+    if next != snapshot.head_seq.saturating_add(1) {
+        return Err(RunError::Wal(
+            "live steer replay advance did not reach its head".into(),
+        ));
+    }
+    Ok(messages)
 }
 
 // Public core callers can bypass module admission. Check both their requested scope and the
@@ -2442,6 +2606,8 @@ fn complete_snapshot<W: WalStore>(
     let checkpoint_at_head = crate::AdmissionCheckpointV1::from_frames(&records)
         .map_err(|error| RunError::Wal(error.to_string()))?;
     Ok(PriorWalSnapshot {
+        lineage_id: None,
+        anchor: None,
         base_watermark: 0,
         head_seq,
         tail: Arc::new(records),
@@ -2462,12 +2628,18 @@ fn replay_complete_snapshot_or_wal<W: WalStore>(
             .map(|frame| frame.record.clone())
             .collect()
     } else {
-        wal_store
-            .read_records(session)
-            .map_err(RunError::from)?
+        let frames = wal_store.read_records(session).map_err(RunError::from)?;
+        let selected: Vec<_> = frames
             .into_iter()
-            .map(|frame| frame.record)
-            .collect()
+            .take_while(|frame| frame.seq <= snapshot.head_seq)
+            .collect();
+        if selected.last().map(|frame| frame.seq) != Some(snapshot.head_seq) {
+            return Err(RunError::Wal(
+                "full replay did not reach its selected admission head".into(),
+            ));
+        }
+        // Later accepted steers still belong to the live inbox, not this replay cut.
+        selected.into_iter().map(|frame| frame.record).collect()
     };
     replay(&records).map_err(|error| RunError::Wal(error.to_string()))
 }
@@ -2598,6 +2770,9 @@ where
     A: ApprovalPolicy,
     W: WalStore,
 {
+    if let Some(store) = &store {
+        wal_store.bind_recovery_projection(Some(&req.session), store.clone());
+    }
     // PER-RUN writer: spawn it, run the body on it, then `shutdown().await` it BEFORE the
     // caller drops the lease (so a superseded writer can never append after a new run
     // acquires the session). The coordinator uses `run_loop_on_writer` instead with a
@@ -3606,6 +3781,17 @@ where
     A: ApprovalPolicy,
 {
     held_prompt::release_read_metadata(&mut prior);
+    let account_limit_pause_enabled = if is_resume && !append_episode {
+        prior
+            .run_config
+            .as_ref()
+            .is_some_and(|config| config.account_limit_pause)
+    } else {
+        control.account_limit_pause
+    };
+    let mut account_limit_replay = (is_resume && !append_episode)
+        .then(|| prior.account_limit_pause.clone())
+        .flatten();
     // The session's client-side refusal-fallback schedule as replay left it (see
     // `crate::refusal_fallback`). A fresh episode applies the admission rules to it once its
     // `RunStarted` is durable; a resumed one already has them applied by replay.
@@ -3828,6 +4014,15 @@ where
             .filter(|state| state.open_wait.is_some())
             .cloned()
         {
+            // Recovering an old open wait ends its run without another external call.
+            // Record the resume before closing the wait, with no work authorized to rerun.
+            if prior.run_id.is_some() {
+                writer.record(crate::resume::resume_started_record(
+                    &prior,
+                    last_record_seq(writer),
+                    Vec::new(),
+                ));
+            }
             if let Some(crate::compaction::runtime::Terminal(reason, error)) =
                 crate::compaction::runtime::seal_recorded_wait(writer, &mut state).await?
             {
@@ -3881,10 +4076,12 @@ where
         return Err(error);
     }
     let hook_bind = req.session.clone();
+    let hook_scope = req.scope.clone();
     let hooks = hook_plan
         .as_ref()
         .zip(control.hook_plane.as_ref())
         .map(|(plan, plane)| crate::hooks::HookRuntime {
+            scope: hook_scope.as_ref(),
             plan,
             plane,
             bind: &hook_bind,
@@ -4111,6 +4308,7 @@ where
         compaction_item
             .as_ref()
             .map(|(provider, _, _, _)| crate::compaction::runtime::Runtime {
+                scope: req.scope.as_ref(),
                 provider,
                 bind: &hook_bind,
                 plane: control.compaction_plane.as_ref(),
@@ -4699,6 +4897,7 @@ where
                     let _ = send(
                         out,
                         OutputEvent::Control(ControlUnit::Paused {
+                            resume_not_before_ms: None,
                             run_id: resolved_run_id.clone(),
                             reason: PauseReason::ToolHeld,
                             error: None,
@@ -4783,7 +4982,10 @@ where
             // terminal). Surface the still-paused run and return without sealing it, so
             // a later re-auth resume still sees the pause.
             ReplayResolution::AuthRequired {
-                reason, pending, ..
+                reason,
+                pending,
+                error,
+                ..
             } => {
                 // The last episode is PAUSED awaiting re-auth. A CANCEL while paused WINS
                 // (constraint: a user cancelling a paused-for-auth run wants it gone, not
@@ -4815,13 +5017,71 @@ where
                 // from the reconstructed state and fall through to the loop, exactly like
                 // Resume, writing NO new RunStarted (the run is the same one, not a new
                 // episode).
-                if !auth_resolved && reason != PauseReason::Restart {
+                if reason == PauseReason::AccountLimit
+                    && control.pause_for_auth_at_start.is_none()
+                    && control.auth_selection.as_ref().is_some_and(|selection| {
+                        !crate::account_limit_pause::same_selection(
+                            selection,
+                            prior
+                                .run_config
+                                .as_ref()
+                                .and_then(|config| config.auth_selection.as_ref()),
+                        )
+                    })
+                {
+                    let error = crate::account_limit_pause::selection_changed_error();
+                    control.close_steers();
+                    let _ = send(
+                        out,
+                        OutputEvent::Control(ControlUnit::Error {
+                            error: error.clone().into(),
+                        }),
+                    )
+                    .await;
+                    let (summary, last_fsynced_seq) = finish_run(
+                        writer,
+                        control,
+                        out,
+                        &resolved_run_id,
+                        RunFinishReason::Interrupted,
+                        prior.completed_steps,
+                        prior.usage,
+                        prior.retries_used,
+                        Some(error),
+                        prior_last_step_finish_reason,
+                    )
+                    .await?;
+                    if let Some(projector) = projector {
+                        projector.enqueue_terminal(last_fsynced_seq);
+                    }
+                    return Ok(summary);
+                }
+                let account_limit_ready = reason == PauseReason::AccountLimit
+                    && prior.account_limit_pause.as_ref().is_some_and(|pause| {
+                        control
+                            .now_ms()
+                            .is_some_and(|now| now >= pause.resume_not_before_ms)
+                    });
+                let may_continue = match reason {
+                    PauseReason::AccountLimit => account_limit_ready,
+                    PauseReason::Restart => true,
+                    _ => auth_resolved,
+                };
+                if !may_continue {
                     let _ = send(
                         out,
                         OutputEvent::Control(ControlUnit::Paused {
+                            resume_not_before_ms: prior
+                                .account_limit_pause
+                                .as_ref()
+                                .map(|pause| pause.resume_not_before_ms),
                             run_id: resolved_run_id.clone(),
                             reason,
-                            error: None,
+                            error: if reason == PauseReason::AccountLimit {
+                                error.map(|error| (*error).into())
+                            } else {
+                                None
+                            },
                         }),
                     )
                     .await;
@@ -4835,6 +5095,24 @@ where
                         retries_used: prior.retries_used,
                         final_step_finish_reason: None,
                     });
+                }
+                if reason == PauseReason::AccountLimit {
+                    // A vault re-login refusal has no provider I/O. Keep the auth pause instead
+                    // of treating missing credential/account IDs as changed selection or render config.
+                    if let Some(error) = control.pause_for_auth_at_start.clone() {
+                        return pause_run(
+                            writer,
+                            out,
+                            control,
+                            resolved_run_id.clone(),
+                            PauseReason::AuthRequired,
+                            Some(error),
+                            prior.completed_steps,
+                            prior.usage,
+                            prior.retries_used,
+                        )
+                        .await;
+                    }
                 }
                 // Auth resolved → continue. A pause before the first provider call may have
                 // frozen an incomplete credential-bound render config (Antigravity has no
@@ -4896,6 +5174,7 @@ where
                 if let Some(auth_selection) = control
                     .auth_selection
                     .as_ref()
+                    .filter(|_| reason != PauseReason::AccountLimit)
                     .filter(|selection| Some(*selection) != frozen_auth_selection)
                 {
                     if let Some(config) = &mut warm_config {
@@ -4907,7 +5186,10 @@ where
                     });
                     refreeze_recorded = true;
                 }
-                if reason == PauseReason::Restart {
+                if matches!(
+                    reason,
+                    PauseReason::Restart | PauseReason::AccountLimit | PauseReason::AuthRequired
+                ) {
                     writer.record(resume_continuing);
                     writer.sync().await?;
                 } else if refreeze_recorded {
@@ -5098,6 +5380,7 @@ where
             session: req.session.clone(),
             config: remember_warm_config(
                 RunConfig {
+                    account_limit_pause: account_limit_pause_enabled,
                     turn_directives_v1: req.directives.clone(),
                     render_tags,
                     computed_tags,
@@ -5794,7 +6077,24 @@ where
             account_ref: run_account_ref.clone(),
         });
         let mut model_opts = None;
-        if let Some(runtime) = &compaction_runtime {
+        if account_limit_replay.is_some() {
+            if let Some(state) = compaction_state.as_ref() {
+                // Waiting for an account reset must not adopt a newer compaction view or call the
+                // compaction provider again.
+                let mut request = crate::compaction::BoundaryRequest::default();
+                request
+                    .refresh_checked(&opts, state, &system_positions, |view| {
+                        provider.try_render_request(view)
+                    })
+                    .map_err(|error| RunError::Wal(error.to_string()))?;
+                notice_request_bytes = request.bytes;
+                model_opts = Some(Arc::new(request.into_options()));
+            }
+        }
+        if let Some(runtime) = compaction_runtime
+            .as_ref()
+            .filter(|_| account_limit_replay.is_none())
+        {
             let history_edit_cost = notice_history_edit_cost(control, provider);
             let chain_reset = history_edit_cost
                 == Some(crate::compaction_provider::notice::HistoryEditCost::FullResend)
@@ -5913,6 +6213,9 @@ where
                 .auth_selection
                 .as_ref()
                 .and_then(crate::compaction::view::selection_account_label);
+            state.current_service_tier = broca_protocol::service_tier_enabled().then(|| {
+                broca_protocol::frozen_service_tier(&provider.render_config_blob()).to_owned()
+            });
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
             if !Box::pin(runtime.apply_due_view(
                 state,
@@ -6152,8 +6455,10 @@ where
         let journaled_attempts = writer
             .is_overhaul()
             .then(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let last_account_limit_attempt = std::sync::Mutex::new(None);
         let record_attempt = |mut attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
             let journaled_attempts = &journaled_attempts;
+            let last_account_limit_attempt = &last_account_limit_attempt;
             step_attempts.fetch_max(
                 attempt.attempt.saturating_add(1),
                 std::sync::atomic::Ordering::Relaxed,
@@ -6183,6 +6488,15 @@ where
                     .as_ref()
                     .and_then(|recorded| recorded.lock().unwrap().remove(&attempt.attempt));
                 if let Some(seq) = journaled_seq {
+                    if account_limit_pause_enabled {
+                        *last_account_limit_attempt.lock().unwrap() =
+                            attempt.account_observation.limit.as_ref().map(|_| {
+                                crate::account_limit_pause::FailedAccountLimitAttempt {
+                                    seq,
+                                    attempt: attempt.clone(),
+                                }
+                            });
+                    }
                     // The physical-send journal already wrote the billing terminal. Keep the
                     // account reporter for progress, but never append a second settlement here.
                     if let Some(reporter) = &control.account_reporter {
@@ -6191,6 +6505,29 @@ where
                     return Ok(());
                 }
                 provider.annotate_cache_evidence(&mut attempt);
+                if account_limit_pause_enabled {
+                    let seq = writer
+                        .record(crate::account_limit_pause::attempt_record(
+                            step_id,
+                            attempt.clone(),
+                            true,
+                        ))
+                        .into_result()?;
+                    if let Some(reporter) = &control.account_reporter {
+                        reporter.attempt_recorded(writer.lineage_id(), seq, &attempt);
+                    }
+                    *last_account_limit_attempt.lock().unwrap() =
+                        attempt.account_observation.limit.as_ref().map(|_| {
+                            crate::account_limit_pause::FailedAccountLimitAttempt {
+                                seq,
+                                attempt: attempt.clone(),
+                            }
+                        });
+                    if needs_sync {
+                        writer.sync().await?;
+                    }
+                    return Ok(());
+                }
                 match &control.account_reporter {
                     Some(reporter) => {
                         let seq = writer
@@ -6369,6 +6706,19 @@ where
                     step_context.max_output_tokens = Some(cap);
                 }
             }
+            if let Some(pause) = account_limit_replay.take() {
+                use sha2::Digest;
+                let bytes = provider
+                    .try_render_request(&step_opts)
+                    .map_err(|error| RunError::Wal(error.message))?;
+                if pause.failed_step != step_id
+                    || pause.request_body_len != bytes.len() as u64
+                    || pause.request_body_sha256 != format!("{:x}", sha2::Sha256::digest(&bytes))
+                {
+                    terminal_error = Some(crate::account_limit_pause::request_changed_error());
+                    break 'steps RunFinishReason::Interrupted;
+                }
+            }
             let hook_channel = writer
                 .is_overhaul()
                 .then(tokio::sync::mpsc::unbounded_channel);
@@ -6434,6 +6784,7 @@ where
                     model_step,
                     &mut hook_requests,
                     &mut AttemptJournal {
+                        account_limit_pause: account_limit_pause_enabled,
                         writer,
                         evidence: Some(provider),
                         seal: control.shutdown_seal.as_ref(),
@@ -7064,6 +7415,45 @@ where
                     )
                     .await;
                 }
+                let account_limit = if account_limit_pause_enabled {
+                    control.now_ms().and_then(|paused_at_ms| {
+                        last_account_limit_attempt
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|attempt| {
+                                attempt.pause(
+                                    step_id,
+                                    paused_at_ms,
+                                    &error,
+                                    control.auth_selection.as_ref().or_else(|| {
+                                        prior
+                                            .run_config
+                                            .as_ref()
+                                            .and_then(|config| config.auth_selection.as_ref())
+                                    }),
+                                )
+                            })
+                    })
+                } else {
+                    None
+                };
+                if let Some(pause) = account_limit {
+                    return pause_run_impl(
+                        writer,
+                        out,
+                        control,
+                        resolved_run_id.clone(),
+                        PauseReason::AccountLimit,
+                        Some(error),
+                        Some(pause),
+                        completed_steps,
+                        total_usage,
+                        total_retries_used,
+                        None,
+                    )
+                    .await;
+                }
                 // Surface the error live (direct consumers of `out`, e.g. the broca-run
                 // CLI) AND carry it out of the loop so the durable RunFinished persists
                 // it — module subscribers source control from the WAL projection, not
@@ -7340,6 +7730,7 @@ where
                 // the steered message after it.
                 budget_state = step_budget_state;
                 let mut answer = Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     role: Role::Assistant,
                     content: assembled.content.clone(),
@@ -7450,6 +7841,7 @@ where
             &mut batch.results,
         );
         let mut answer = Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::Assistant,
             content: assembled.content,
@@ -7472,6 +7864,7 @@ where
             None
         };
         let mut results = Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::Tool,
             content: batch
@@ -7963,6 +8356,7 @@ async fn pause_run_impl(
     run_id: RunId,
     reason: broca_protocol::PauseReason,
     error: Option<ProviderError>,
+    account_limit: Option<Box<broca_wal::AccountLimitPause>>,
     steps: u64,
     usage: Usage,
     retries_used: u32,
@@ -8032,8 +8426,15 @@ async fn pause_run_impl(
         return Ok(summary);
     }
 
+    let resume_not_before_ms = account_limit
+        .as_ref()
+        .map(|pause| pause.resume_not_before_ms);
     writer.record(WalRecord::RunPaused {
-        ts_ms: control.now_ms(),
+        ts_ms: account_limit
+            .as_ref()
+            .map(|pause| pause.paused_at_ms)
+            .or_else(|| control.now_ms()),
+        account_limit,
         run_id: run_id.clone(),
         reason,
         error: error.clone(),
@@ -8042,6 +8443,7 @@ async fn pause_run_impl(
     let _ = send(
         out,
         OutputEvent::Control(ControlUnit::Paused {
+            resume_not_before_ms,
             run_id,
             reason,
             error: error.map(SharedProviderError::from),
@@ -8715,6 +9117,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     // resume dispatched takes the tag the writer assigned when it appended that result's
     // record (`WalHandle::take_call_tags`).
     let mut answer = Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::Assistant,
         content: pending.assistant.content,
@@ -8732,6 +9135,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         None
     };
     let mut results = Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::Tool,
         content: batch
@@ -9029,6 +9433,7 @@ impl PendingAttempt {
 }
 
 struct AttemptJournal<'a> {
+    account_limit_pause: bool,
     writer: &'a WalHandle,
     evidence: Option<&'a dyn Provider>,
     seal: Option<&'a crate::ShutdownSeal>,
@@ -9217,8 +9622,11 @@ impl AttemptJournal<'_> {
                 if let Some(provider) = self.evidence {
                     provider.annotate_cache_evidence(&mut attempt);
                 }
-                let mut record =
-                    WalRecord::model_attempt_finished(pending.reservation.step_id, attempt);
+                let mut record = crate::account_limit_pause::attempt_record(
+                    pending.reservation.step_id,
+                    attempt,
+                    self.account_limit_pause,
+                );
                 if let WalRecord::ModelAttemptFinished {
                     attempt_id,
                     reservation,
@@ -9633,6 +10041,8 @@ async fn run_step<P: Provider>(
 /// gets a `tool_result` without reaching the plane; and a `Dispatch` call gets an intent
 /// followed by a `tool_result`.
 enum CallPlan {
+    /// Recovery retained attribution but removed the intent/result bytes.
+    Recovered(ToolCallId),
     /// Approved (input possibly narrowed) — dispatch through the plane.
     Dispatch(PlannedDispatch),
     /// Refused before dispatch (capability/denial/plane-down). Carries ONLY the
@@ -9675,9 +10085,9 @@ fn call_plan_id(plan: &CallPlan) -> ToolCallId {
         CallPlan::HookTerminal { result, .. } | CallPlan::Synthetic { result, .. } => {
             result.tool_call_id.clone()
         }
-        CallPlan::NoDispatch { tool_call_id, .. } | CallPlan::Stopped(tool_call_id) => {
-            tool_call_id.clone()
-        }
+        CallPlan::NoDispatch { tool_call_id, .. }
+        | CallPlan::Stopped(tool_call_id)
+        | CallPlan::Recovered(tool_call_id) => tool_call_id.clone(),
     }
 }
 
@@ -9765,17 +10175,13 @@ fn held_resume_intents(
             };
             let mut dispatch = PlannedDispatch::from(call.clone());
             dispatch.input = Arc::clone(args);
-            dispatch.call_key = call_key.clone().or_else(|| {
-                writer
-                    .lineage_id()
-                    .map(|lineage| crate::context::call_key(lineage, frame.seq))
-            });
+            dispatch.call_key = call_key.clone().or_else(|| writer.call_key(frame.seq));
             if let Some(key) = call_key {
                 dispatch.approved = frames.iter().find_map(|frame| match &frame.record {
                     WalRecord::ToolCallDeferred { args_jcs, .. }
-                        if writer.lineage_id().is_some_and(|lineage| {
-                            crate::context::call_key(lineage, frame.seq) == *key
-                        }) =>
+                        if writer
+                            .call_key(frame.seq)
+                            .is_some_and(|found| found == *key) =>
                     {
                         Some(args_jcs.clone())
                     }
@@ -9800,6 +10206,11 @@ fn step_attempt_was_args_cut(frames: &[broca_wal::FramedRecord], step_id: StepId
             if *attempted_step == step_id && outcome.as_str() == "tool_args_trailing_garbage"))
 }
 
+// A torn batch start is inferred from the owning run and model step during recovery.
+pub(crate) fn tool_batch_id(run_id: &RunId, step_id: StepId) -> BatchId {
+    BatchId(format!("{}-b{}", run_id.0, step_id.0))
+}
+
 fn tool_args_rejection_records(
     run_id: &RunId,
     step_id: StepId,
@@ -9810,7 +10221,7 @@ fn tool_args_rejection_records(
     if rejected.is_empty() {
         return (Vec::new(), None);
     }
-    let batch_id = BatchId(format!("{}-b{}", run_id.0, step_id.0));
+    let batch_id = tool_batch_id(run_id, step_id);
     let mut records = Vec::new();
     if !batch_already_started {
         records.push(WalRecord::ToolBatchStarted {
@@ -9943,7 +10354,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     out: &mpsc::Sender<OutputEvent>,
     ordered: Option<&RunControl>,
 ) -> Result<BatchOutcome, RunError> {
-    let batch_id = BatchId(format!("{}-b{}", run_id.0, step_id.0));
+    let batch_id = tool_batch_id(run_id, step_id);
     let ctx = BatchCtx {
         media_capture: writer.media_capture(),
         batch_id: batch_id.clone(),
@@ -10073,6 +10484,22 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
             .and_then(|results| results.pop_front())
         {
             plan.push(CallPlan::Already(prior));
+            continue;
+        }
+        if writer.recovery_tombstoned(
+            run_id,
+            &call.tool_call_id,
+            &batch_id,
+            Some(step_id),
+            existing_intents
+                .get(&call.tool_call_id)
+                .and_then(|dispatch| dispatch.call_key.as_deref()),
+        ) || existing_intents
+            .get(&call.tool_call_id)
+            .and_then(|dispatch| dispatch.call_key.as_deref())
+            .is_some_and(|key| writer.recovery_tombstoned_key(key))
+        {
+            plan.push(CallPlan::Recovered(call.tool_call_id.clone()));
             continue;
         }
         if let Some(dispatch) = existing_intents.remove(&call.tool_call_id) {
@@ -10283,9 +10710,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                             call_key: None,
                         })
                         .into_result()?;
-                    c.call_key = writer
-                        .lineage_id()
-                        .map(|lineage| crate::context::call_key(lineage, seq));
+                    c.call_key = writer.call_key(seq);
                 }
                 CallPlan::NoDispatch {
                     tool_call_id,
@@ -10318,7 +10743,10 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                         provider_held: None,
                     });
                 }
-                CallPlan::Synthetic { .. } | CallPlan::Already(_) | CallPlan::Stopped(_) => {}
+                CallPlan::Synthetic { .. }
+                | CallPlan::Already(_)
+                | CallPlan::Stopped(_)
+                | CallPlan::Recovered(_) => {}
             }
         }
         writer.sync().await?;
@@ -10386,6 +10814,19 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                         provider_held: None,
                     });
                 }
+                CallPlan::Recovered(tool_call_id) => {
+                    writer.record(WalRecord::ToolResult {
+                        finished_at_ms: None,
+                        tags: None,
+                        hooks: None,
+                        batch_id: batch_id.clone(),
+                        result: Arc::new(crate::resume::outcome_unknown_result(tool_call_id)),
+                        outcome: DispatchOutcome::Unknown,
+                        reason: Some("wal_recovery_cut".into()),
+                        withdraw_elicitation: None,
+                        provider_held: None,
+                    });
+                }
                 CallPlan::Dispatch(_) | CallPlan::Already(_) => {}
             }
         }
@@ -10403,17 +10844,20 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
 
         let mut resolutions: Vec<CallResolution> = Vec::with_capacity(plan.len());
         for p in plan {
-            resolutions.push(resolve(p, &ctx, tool_plane, cancel, stop).await);
+            let recovered = matches!(p, CallPlan::Recovered(_));
+            let resolution = resolve(p, &ctx, tool_plane, cancel, stop).await;
+            debug_assert!(
+                !resolution.ambiguous || recovered,
+                "a no-dispatch plan may be ambiguous only for a recovered call"
+            );
+            resolutions.push(resolution);
         }
-        debug_assert!(
-            !resolutions.iter().any(|r| r.ambiguous),
-            "a plan with no dispatches must not produce ambiguous results"
-        );
-        // No call of this batch was sent, so no result is ambiguous. A scope drain seen at batch
-        // start still stops the run: every later call in the run would meet the same closed
-        // scope. A call the stop request kept back stops it too: the run was asked to start
-        // nothing further.
-        let interruption = if scope_stopped {
+        // No new call was sent, but a recovery tombstone still represents an
+        // earlier dispatch with a lost outcome. Close that run as interrupted.
+        // Scope drains and stop requests retain their ordinary no-dispatch behavior.
+        let interruption = if resolutions.iter().any(|r| r.ambiguous) {
+            Some(BatchInterruption::Ambiguous)
+        } else if scope_stopped {
             Some(BatchInterruption::ScopeDrained)
         } else if let Some(cause) = gating_stop {
             Some(cause)
@@ -10536,6 +10980,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 .lock()
                 .expect("provider-held close-out")
                 .batch = Some(crate::replay::OpenToolBatch {
+                needs_start: false,
                 batch_id: batch_id.clone(),
                 step_id,
                 calls: unfinished
@@ -11281,6 +11726,15 @@ async fn resolve<T: ToolPlane>(
     stop: Option<&CancellationToken>,
 ) -> CallResolution {
     match plan {
+        CallPlan::Recovered(id) => {
+            let mut resolution = CallResolution::plain(
+                crate::resume::outcome_unknown_result(&id),
+                Some(DispatchOutcome::Unknown),
+            );
+            resolution.ambiguous = true;
+            resolution.reason = Some("wal_recovery_cut".into());
+            resolution
+        }
         CallPlan::Stopped(id) => stopped_resolution(&id),
         // A stop requested after this call's intent was written, but before the call was sent:
         // it is not sent. Calls of the batch already sent are left to finish.
@@ -11683,7 +12137,7 @@ async fn finalize_hard_stop(
     submitted: Option<&ToolCallId>,
     closing: Option<(ClosingNotice<'_>, &[ContentBlock])>,
 ) -> Result<RunSummary, RunError> {
-    let batch_id = BatchId(format!("{}-b{}", resolved_run_id.0, step_id.0));
+    let batch_id = tool_batch_id(resolved_run_id, step_id);
     let call_ids: Vec<ToolCallId> = pending.iter().map(|c| c.tool_call_id.clone()).collect();
     if !batch_already_started {
         writer.record(WalRecord::ToolBatchStarted {
@@ -11982,6 +12436,60 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn full_replay_fallback_stays_at_the_selected_admission_head() {
+        struct LaterWal(Vec<broca_wal::FramedRecord>);
+        impl WalStore for LaterWal {
+            fn open(
+                &self,
+                _: &BindIdentity,
+            ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
+                panic!("the replay probe never opens a writer")
+            }
+            fn read_records(
+                &self,
+                _: &BindIdentity,
+            ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+                Ok(self.0.clone())
+            }
+        }
+        let session = BindIdentity::new("/fixture", "test", "replay-cut");
+        let started = serde_json::from_value(serde_json::json!({
+            "type":"run_started","run_id":"run","session":session,
+            "config":{"model":{"provider_module_id":"fake","model_id":"fake"},"tools":[],
+                "tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},
+                "context_epoch":0,"renderer_version":1,"frozen_render_config":null},
+            "input":[{"role":"user","content":[{"type":"text","text":"selected"}]}],
+            "origin":{"kind":"fresh"}
+        }))
+        .unwrap();
+        let frames = vec![
+            broca_wal::FramedRecord { seq: 1, fence: 1, record: started },
+            broca_wal::FramedRecord { seq: 2, fence: 1, record: serde_json::from_value(serde_json::json!({
+                "type":"steered","input":[{"role":"user","content":[{"type":"text","text":"later live input"}]}]
+            })).unwrap() },
+        ];
+        let snapshot = PriorWalSnapshot {
+            lineage_id: None,
+            anchor: None,
+            base_watermark: 1,
+            head_seq: 1,
+            tail: Arc::new(vec![]),
+            checkpoint_at_base: None,
+            checkpoint_at_head: crate::AdmissionCheckpointV1::from_frames(&frames[..1]).unwrap(),
+        };
+        let replayed =
+            replay_complete_snapshot_or_wal(&snapshot, &LaterWal(frames), &session).unwrap();
+        assert!(replayed.pending_steers.is_empty());
+        assert_eq!(replayed.prompt.len(), 1);
+        assert!(serde_json::to_string(&replayed.prompt)
+            .unwrap()
+            .contains("selected"));
+        assert!(!serde_json::to_string(&replayed.prompt)
+            .unwrap()
+            .contains("later live input"));
+    }
+
     fn attempt_template() -> broca_wal::record::AttemptReservation {
         serde_json::from_value(serde_json::json!({
             "run_id":"billing-run", "step_id":1, "attempt":0, "send_index":1,
@@ -12110,6 +12618,7 @@ mod tests {
         let recorded = Default::default();
         let mut journal = AttemptJournal {
             evidence: None,
+            account_limit_pause: false,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -12268,6 +12777,7 @@ mod tests {
         let seal = crate::ShutdownSeal::new();
         let mut journal = AttemptJournal {
             evidence: None,
+            account_limit_pause: false,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -12316,6 +12826,7 @@ mod tests {
             &RunControl::default(),
             RunId("billing-run".into()),
             broca_protocol::PauseReason::AuthRequired,
+            None,
             None,
             0,
             Usage::default(),
@@ -12393,6 +12904,7 @@ mod tests {
         let recorded = Default::default();
         let mut journal = AttemptJournal {
             evidence: None,
+            account_limit_pause: false,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12445,6 +12957,7 @@ mod tests {
         let recorded = Default::default();
         let mut journal = AttemptJournal {
             evidence: None,
+            account_limit_pause: false,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12539,6 +13052,7 @@ mod tests {
         let recorded = Default::default();
         let mut journal = AttemptJournal {
             evidence: None,
+            account_limit_pause: false,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12624,6 +13138,7 @@ mod tests {
         let recorded = Default::default();
         let mut journal = AttemptJournal {
             evidence: None,
+            account_limit_pause: false,
             writer: &writer,
             seal: None,
             template,
@@ -12839,6 +13354,7 @@ mod tests {
         let recorded = Default::default();
         let mut journal = AttemptJournal {
             evidence: None,
+            account_limit_pause: false,
             writer: &writer,
             seal: None,
             template: attempt_template(),
@@ -12901,6 +13417,7 @@ mod tests {
         let recorded = Default::default();
         let mut journal = AttemptJournal {
             evidence: None,
+            account_limit_pause: false,
             writer: &writer,
             seal: Some(&seal),
             template: attempt_template(),
@@ -13146,6 +13663,7 @@ mod tests {
         let mut prior = crate::replay::replay(&[]).unwrap();
         prior.render_episodes = None;
         prior.run_config = Some(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -15169,6 +15687,7 @@ mod tests {
         }
 
         let config = RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -15214,6 +15733,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                recovery_cuts: Vec::new(),
                 has_model_attempt: None,
                 media: None,
                 head: None,
@@ -15230,6 +15750,7 @@ mod tests {
                 ownership: Some(crate::SessionOwnershipV1::default()),
                 at_seq: 8,
                 last_episode: Some(crate::LastEpisodeV1 {
+                    account_limit_pause: None,
                     cancel_at: None,
                     on_restart: None,
                     pause_reason: None,
@@ -16588,12 +17109,9 @@ mod approval_gate {
         let seq = writer.record(prepared.clone()).into_result()?;
         // No route operation can observe this key until the Prepared frame is durable.
         writer.sync().await?;
-        let key = crate::context::call_key(
-            writer
-                .lineage_id()
-                .ok_or_else(|| RunError::Wal("Prepared lineage missing".into()))?,
-            seq,
-        );
+        let key = writer
+            .call_key(seq)
+            .ok_or_else(|| RunError::Wal("Prepared lineage missing".into()))?;
         history.fold(seq, prepared.clone());
         Ok(Slot::Held(Held {
             key,
@@ -16635,9 +17153,7 @@ mod approval_gate {
                         hooks: call.hooks.clone(),
                     })
                     .into_result()?;
-                call.call_key = writer
-                    .lineage_id()
-                    .map(|lineage| crate::context::call_key(lineage, seq));
+                call.call_key = writer.call_key(seq);
             }
             CallPlan::NoDispatch {
                 tool_call_id,
@@ -16724,7 +17240,7 @@ mod approval_gate {
         }
         let ctx = BatchCtx {
             media_capture: writer.media_capture(),
-            batch_id: BatchId(format!("{}-b{}", run_id.0, step.0)),
+            batch_id: tool_batch_id(run_id, step),
             bind: session.clone(),
             run_id: run_id.clone(),
             scope: scope.cloned(),
@@ -16834,6 +17350,31 @@ mod approval_gate {
                 .and_then(|queue| queue.pop_front())
             {
                 Slot::Ready(Some(CallPlan::Already(result)))
+            } else if writer.recovery_tombstoned(
+                run_id,
+                &call.tool_call_id,
+                &ctx.batch_id,
+                Some(step),
+                held.get(&call.tool_call_id)
+                    .map(|prepared| prepared.key.as_str())
+                    .or_else(|| {
+                        resume
+                            .intents
+                            .get(&call.tool_call_id)
+                            .and_then(|dispatch| dispatch.call_key.as_deref())
+                    }),
+            ) || resume
+                .intents
+                .get(&call.tool_call_id)
+                .and_then(|dispatch| dispatch.call_key.as_deref())
+                .is_some_and(|key| writer.recovery_tombstoned_key(key))
+                || held
+                    .get(&call.tool_call_id)
+                    .is_some_and(|prepared| writer.recovery_tombstoned_key(&prepared.key))
+            {
+                // A restored approval cannot authorize repeating an external
+                // effect whose outcome recovery marked unknown.
+                Slot::Ready(Some(CallPlan::Recovered(call.tool_call_id.clone())))
             } else if let Some(dispatch) = resume.intents.remove(&call.tool_call_id) {
                 Slot::Ready(Some(CallPlan::Dispatch(dispatch)))
             } else if let Some(prepared) = held.remove(&call.tool_call_id) {
@@ -17326,6 +17867,7 @@ mod approval_gate {
                     .lock()
                     .expect("provider-held close-out")
                     .batch = Some(crate::replay::OpenToolBatch {
+                    needs_start: false,
                     batch_id: ctx.batch_id.clone(),
                     step_id: step,
                     calls: slots
@@ -17729,6 +18271,14 @@ mod approval_gate {
         let Feedback::Released(held, Some(answer)) = event else {
             return Ok(());
         };
+        if history
+            .projection
+            .calls
+            .get(&held.key)
+            .is_some_and(lost_approval_terminal)
+        {
+            return late_answer(history, writer, &held.ctx(ctx), control, &held.key, answer).await;
+        }
         let Some(projected) = history.projection.calls.get(&held.key) else {
             return Ok(());
         };
@@ -17917,6 +18467,12 @@ mod approval_gate {
             }
         }
     }
+    fn lost_approval_terminal(call: &crate::replay::ProjectedDeferredCall) -> bool {
+        call.late_result
+            .as_deref()
+            .is_some_and(crate::recovery_close_out::is_lost_approval_receipt)
+    }
+
     async fn late_answer(
         history: &mut History,
         writer: &WalHandle,
@@ -17932,7 +18488,8 @@ mod approval_gate {
         }) else {
             return Ok(());
         };
-        if call.late_result.is_some() || !history.projection.late_allowed(call) {
+        let frozen = lost_approval_terminal(call);
+        if !frozen && (call.late_result.is_some() || !history.projection.late_allowed(call)) {
             return Ok(());
         }
         let WalRecord::ToolCallDeferred { ask, .. } = &*call.prepared else {
@@ -17953,7 +18510,11 @@ mod approval_gate {
             Err(error) if error.retryable => return Ok(()),
             Err(error) => return late_refusal(history, writer, key, &error).await,
         };
-        record_late_answer(history, writer, key, authorized_late, late_execution).await
+        record_late_answer(history, writer, key, authorized_late, late_execution).await?;
+        if frozen {
+            report_late(control, ctx, &held, LateOutcome::Unknown).await;
+        }
+        Ok(())
     }
 
     pub(super) async fn record_late_answer(
@@ -18004,6 +18565,22 @@ mod approval_gate {
         }) else {
             return Ok(());
         };
+        if lost_approval_terminal(call) {
+            // Route refusal has no authenticated answer from which to invent a decision.
+            let id = call.elicitation_id.clone().unwrap_or_default();
+            history.record(
+                writer,
+                WalRecord::LateApprovalRecorded {
+                    call_key: key.into(),
+                    elicitation_id: id,
+                    decision: LateDecision::None,
+                    approval_digest: None,
+                    late_execution: None,
+                },
+            );
+            writer.sync().await?;
+            return Ok(());
+        }
         if call.late_result.is_some() || !history.projection.late_allowed(call) {
             return Ok(());
         }
@@ -18034,25 +18611,53 @@ mod approval_gate {
         Ok(())
     }
 
+    fn late_recovery_tombstoned(
+        projection: &crate::replay::DeferredCallProjection,
+        writer: &WalHandle,
+        call: &crate::replay::ProjectedDeferredCall,
+    ) -> bool {
+        let key = broca_wal::recovery::physical_call_key(
+            &projection.lineage_id,
+            call.prepared_seq,
+            call.recovery_generation.as_deref(),
+        );
+        let identity = projection.effect_identity(call);
+        projection.recovery_tombstoned(call)
+            || call
+                .run_id
+                .as_ref()
+                .zip(identity.as_ref())
+                .is_some_and(|(run, identity)| {
+                    identity.batch_id.as_ref().is_some_and(|batch| {
+                        writer.recovery_tombstoned(
+                            run,
+                            &identity.tool_call_id,
+                            batch,
+                            identity.step_id,
+                            Some(&key),
+                        )
+                    })
+                })
+            || writer.recovery_tombstoned_key(&key)
+    }
+
     async fn close_stopped_late(
         history: &mut History,
         writer: &WalHandle,
         bind: &BindIdentity,
         control: &RunControl,
     ) -> Result<(), RunError> {
-        let Some(stopped) = &history.projection.stopped_runs else {
-            return Ok(());
-        };
+        let stopped = history.projection.stopped_runs.as_ref();
         let calls: Vec<_> = history
             .projection
             .calls
             .iter()
             .filter(|(_, call)| {
                 crate::replay::DeferredCallProjection::late_open(call)
-                    && call
-                        .run_id
-                        .as_ref()
-                        .is_some_and(|run| stopped.contains(&run.0))
+                    && (late_recovery_tombstoned(&history.projection, writer, call)
+                        || call.run_id.as_ref().is_some_and(|run| {
+                            stopped.is_some_and(|stopped| stopped.contains(&run.0))
+                        }))
             })
             .map(|(key, call)| (key.clone(), call.clone()))
             .collect();
@@ -18066,7 +18671,9 @@ mod approval_gate {
             else {
                 unreachable!()
             };
-            let sent = projected.late_dispatch_intent.is_some() || history.frames.iter().any(|frame| matches!(&frame.record, WalRecord::ToolDispatchIntent { call_key: Some(anchor), .. } if anchor == &key));
+            let sent = late_recovery_tombstoned(&history.projection, writer, &projected)
+                || projected.late_dispatch_intent.is_some()
+                || history.frames.iter().any(|frame| matches!(&frame.record, WalRecord::ToolDispatchIntent { call_key: Some(anchor), .. } if anchor == &key));
             let outcome = if sent {
                 LateOutcome::Unknown
             } else {
@@ -18147,6 +18754,49 @@ mod approval_gate {
             rebuilt.fold_frames(&history.frames.appended);
             history.projection = rebuilt;
         }
+        // Recovery receipts close the effect before admission can dispatch it.
+        // Report that durable outcome through the existing idempotent approval
+        // channel without manufacturing a second LateResult terminal.
+        if let Some(plane) = &control.elicitation_plane {
+            for call in history.projection.calls.values() {
+                if !matches!(
+                    call.late_result.as_deref(),
+                    Some(WalRecord::RecoveryCallClosed { .. })
+                ) || !matches!(
+                    call.late_approval.as_deref(),
+                    Some(WalRecord::LateApprovalRecorded {
+                        decision: LateDecision::Approved,
+                        ..
+                    })
+                ) {
+                    continue;
+                }
+                if let (
+                    Some(id),
+                    Some(run_id),
+                    WalRecord::ToolCallDeferred {
+                        batch_id, scope, ..
+                    },
+                ) = (&call.elicitation_id, &call.run_id, call.prepared.as_ref())
+                {
+                    let ctx = BatchCtx {
+                        media_capture: writer.media_capture(),
+                        batch_id: batch_id.clone(),
+                        bind: session.clone(),
+                        run_id: run_id.clone(),
+                        scope: Some(scope.clone()),
+                    };
+                    crate::consent::report(
+                        plane.as_ref(),
+                        &ctx,
+                        id,
+                        crate::tool_plane::ApprovalExecution::OutcomeUnknown,
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
         close_stopped_late(history, writer, session, control).await?;
         if control.elicitation_plane.is_none() {
             history.require_installed_plane(control)?;
@@ -18156,10 +18806,10 @@ mod approval_gate {
             .calls
             .iter()
             .filter(|(_, call)| {
-                history.projection.late_allowed(call)
+                (lost_approval_terminal(call) || history.projection.late_allowed(call))
                     && call.decision == Some(DeferredDecision::Expired)
                     && call.late_approval.is_none()
-                    && call.late_result.is_none()
+                    && (lost_approval_terminal(call) || call.late_result.is_none())
             })
             .map(|(key, call)| (key.clone(), call.clone()))
             .collect();
@@ -18308,7 +18958,8 @@ mod approval_gate {
                     matches!(&frame.record,
                 WalRecord::ToolDispatchIntent { call_key: Some(anchor), .. } if anchor == &key)
                 });
-            if dispatch_exists {
+            if dispatch_exists || late_recovery_tombstoned(&history.projection, writer, &projected)
+            {
                 history.record(
                     writer,
                     WalRecord::LateResult {
@@ -18399,6 +19050,7 @@ mod approval_gate {
                 .as_ref()
                 .zip(control.hook_plane.as_ref())
                 .map(|(plan, adapter)| crate::hooks::HookRuntime {
+                    scope: ctx.scope.as_ref(),
                     plan,
                     plane: adapter,
                     bind: session,
@@ -18745,7 +19397,7 @@ async fn pause_run(
     retries: u32,
 ) -> Result<RunSummary, RunError> {
     pause_run_impl(
-        writer, out, control, run_id, reason, error, steps, usage, retries, None,
+        writer, out, control, run_id, reason, error, None, steps, usage, retries, None,
     )
     .await
 }
@@ -18764,7 +19416,7 @@ async fn pause_approval(
 ) -> Result<RunSummary, RunError> {
     let batch_id = match open.first().map(|call| &*call.prepared) {
         Some(WalRecord::ToolCallDeferred { batch_id, .. }) => batch_id.clone(),
-        _ if provider_held => BatchId(format!("{}-b{}", run.0, steps)),
+        _ if provider_held => tool_batch_id(run, StepId(steps)),
         _ => return Err(RunError::Wal("approval pause lacks open calls".into())),
     };
     let ctx = BatchCtx {
@@ -18784,6 +19436,7 @@ async fn pause_approval(
         } else {
             PauseReason::Restart
         },
+        None,
         None,
         steps,
         usage,

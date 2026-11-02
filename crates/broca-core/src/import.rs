@@ -421,6 +421,7 @@ pub async fn run_import_with_store<W: WalStore>(
 
 fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig {
     RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: Some(broca_wal::ComputedTagRules {

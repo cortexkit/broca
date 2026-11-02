@@ -798,6 +798,9 @@ fn map_model(model_id: &str, entry: &Value, raw_policy: RawPolicy) -> ModelSpec 
         // copy states none, but a test catalog can, so both read paths agree. A value that is
         // not a boolean reads as unstated, like the fusiform reader's.
         server_side_fallback: entry.get("server_side_fallback").and_then(Value::as_bool),
+        mid_conversation_system: entry
+            .get("mid_conversation_system")
+            .and_then(Value::as_bool),
         release_date: entry
             .get("release_date")
             .and_then(Value::as_str)
@@ -1721,6 +1724,7 @@ mod tests {
         )
         .expect("bundled catalog models publish known capability flags");
         let opts = CallOptions::new(vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1808,6 +1812,7 @@ mod tests {
         use broca_provider::registry::wire_family;
 
         let request = CallOptions::new(vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -2118,6 +2123,7 @@ mod tests {
         let request = || {
             let mut opts = CallOptions::new(vec![
                 Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,
@@ -2128,6 +2134,7 @@ mod tests {
                     }],
                 },
                 Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,

@@ -4,14 +4,79 @@ use broca_core::{FileWalStore, WalHandle, WalStore};
 use broca_wal::fs_ops::{FileOps, FsOps, OpenOptions, ReadDir};
 use std::fs::Metadata;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::sync::atomic::AtomicBool;
+use std::sync::{atomic::AtomicBool, Mutex};
 
 struct FaultFs {
     inner: Arc<BatchFs>,
     log: PathBuf,
     fail_sync: Arc<AtomicBool>,
+    fail_sync_after: Option<Arc<Mutex<usize>>>,
+    fail_manifest_dir_sync: bool,
+    manifest_renamed: AtomicBool,
     fail_unlink: AtomicBool,
     unlink_attempted: AtomicBool,
+}
+
+/// Reuse the log-sync injector for a repair whose resize must remain observable
+/// after the failed barrier. The caller clears the flag before retrying.
+pub(crate) fn recovery_sync_fault(
+    root: &Path,
+    log: PathBuf,
+) -> (Arc<dyn FsOps>, Arc<AtomicBool>, Arc<RecordingFs>) {
+    let inner = Arc::new(BatchFs::new());
+    let recording = inner.begin(root);
+    let fail_sync = Arc::new(AtomicBool::new(true));
+    let fs = Arc::new(FaultFs {
+        inner,
+        log,
+        fail_sync: fail_sync.clone(),
+        fail_sync_after: None,
+        fail_manifest_dir_sync: false,
+        manifest_renamed: AtomicBool::new(false),
+        fail_unlink: AtomicBool::new(false),
+        unlink_attempted: AtomicBool::new(false),
+    });
+    (fs, fail_sync, recording)
+}
+
+/// The first log barrier protects truncation; fail the next one after marker
+/// bytes are visible, so retry must not mistake visibility for durability.
+pub(crate) fn recovery_marker_sync_fault(
+    root: &Path,
+    log: PathBuf,
+) -> (Arc<dyn FsOps>, Arc<RecordingFs>) {
+    let inner = Arc::new(BatchFs::new());
+    let recording = inner.begin(root);
+    let fs = Arc::new(FaultFs {
+        inner,
+        log,
+        fail_sync: Arc::new(AtomicBool::new(false)),
+        fail_sync_after: Some(Arc::new(Mutex::new(2))),
+        fail_manifest_dir_sync: false,
+        manifest_renamed: AtomicBool::new(false),
+        fail_unlink: AtomicBool::new(false),
+        unlink_attempted: AtomicBool::new(false),
+    });
+    (fs, recording)
+}
+
+pub(crate) fn recovery_manifest_dir_sync_fault(
+    root: &Path,
+    log: PathBuf,
+) -> (Arc<dyn FsOps>, Arc<RecordingFs>) {
+    let inner = Arc::new(BatchFs::new());
+    let recording = inner.begin(root);
+    let fs = Arc::new(FaultFs {
+        inner,
+        log,
+        fail_sync: Arc::new(AtomicBool::new(false)),
+        fail_sync_after: None,
+        fail_manifest_dir_sync: true,
+        manifest_renamed: AtomicBool::new(false),
+        fail_unlink: AtomicBool::new(false),
+        unlink_attempted: AtomicBool::new(false),
+    });
+    (fs, recording)
 }
 
 impl FsOps for FaultFs {
@@ -21,6 +86,7 @@ impl FsOps for FaultFs {
             Ok(Box::new(FaultFile {
                 inner,
                 fail_sync: self.fail_sync.clone(),
+                fail_sync_after: self.fail_sync_after.clone(),
             }))
         } else {
             Ok(inner)
@@ -33,7 +99,14 @@ impl FsOps for FaultFs {
         self.inner.create_dir_all(path)
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        self.inner.rename(from, to)
+        self.inner.rename(from, to)?;
+        if to.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.contains(".cut-") && name.ends_with(".json")
+        }) {
+            self.manifest_renamed.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         if path
@@ -48,6 +121,9 @@ impl FsOps for FaultFs {
         self.inner.remove_file(path)
     }
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
+        if self.fail_manifest_dir_sync && self.manifest_renamed.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("injected manifest directory sync failure"));
+        }
         self.inner.sync_dir(path)
     }
     fn create_dir(&self, path: &Path) -> io::Result<()> {
@@ -70,6 +146,7 @@ impl FsOps for FaultFs {
 struct FaultFile {
     inner: Box<dyn FileOps>,
     fail_sync: Arc<AtomicBool>,
+    fail_sync_after: Option<Arc<Mutex<usize>>>,
 }
 impl Read for FaultFile {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -100,12 +177,21 @@ impl FileOps for FaultFile {
         if self.fail_sync.load(Ordering::SeqCst) {
             return Err(io::Error::other("injected writer close sync failure"));
         }
+        if self.fail_sync_after.as_ref().is_some_and(|remaining| {
+            let mut remaining = remaining.lock().unwrap();
+            let fail = *remaining == 1;
+            *remaining = remaining.saturating_sub(1);
+            fail
+        }) {
+            return Err(io::Error::other("injected recovery marker sync failure"));
+        }
         self.inner.sync_all()
     }
     fn try_clone(&self) -> io::Result<Box<dyn FileOps>> {
         Ok(Box::new(Self {
             inner: self.inner.try_clone()?,
             fail_sync: self.fail_sync.clone(),
+            fail_sync_after: self.fail_sync_after.clone(),
         }))
     }
     fn lock(&self) -> io::Result<()> {
@@ -129,6 +215,9 @@ fn spawn(root: &Scratch) -> (WalHandle, Arc<FaultFs>, Arc<RecordingFs>) {
         inner: Arc::new(BatchFs::new()),
         log: store.wal_path(&session),
         fail_sync: Arc::new(AtomicBool::new(false)),
+        fail_sync_after: None,
+        fail_manifest_dir_sync: false,
+        manifest_renamed: AtomicBool::new(false),
         fail_unlink: AtomicBool::new(false),
         unlink_attempted: AtomicBool::new(false),
     });
@@ -219,3 +308,4 @@ async fn real_handle_unlink_failure_preserves_durable_close_and_marker_for_recla
     assert!(matches!(records[1].record, WalRecord::WriterClosed { .. }));
     assert!(marker_kept);
 }
+crate::require_process_kill!();

@@ -312,9 +312,39 @@ pub use cortexkit_anthropic_policy::RATELIMIT_UNIFIED_HEADER_PREFIX;
 /// refusal the transport classified (see `ProviderError::resets_at_ms` and its siblings).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptAccountLimit {
+    pub disposition: AccountLimitDisposition,
+    /// Source receipt time used to anchor a relative retry hint, not the later pause time.
+    pub observed_at_ms: u64,
     pub resets_at_ms: Option<u64>,
     pub resets_at_source: Option<String>,
     pub limit_window: Option<String>,
+}
+
+/// A producer's positive identification of an account-scoped, self-resetting usage limit.
+/// Status codes and provider-detail strings alone never authorize account-specific recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountLimitDisposition {
+    pub kind: AccountLimitKind,
+    pub scope: AccountLimitScope,
+}
+
+impl AccountLimitDisposition {
+    pub const ACCOUNT: Self = Self {
+        kind: AccountLimitKind::AccountLimit,
+        scope: AccountLimitScope::Account,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountLimitKind {
+    AccountLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountLimitScope {
+    Account,
 }
 
 /// A token refresh performed inside one step: either after the provider rejected the token the

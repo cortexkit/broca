@@ -1,0 +1,31 @@
+{
+  "source": "ba14a1bce",
+  "capture": "pre-recovery SQL bodies on current schema and locked dependencies",
+  "statements": {
+    "diagnostics": [
+      "BEGIN DEFERRED",
+      "SELECT substr(run_id,1,256), state, state_changed_ms, substr(provider_module_id,1,256), substr(credential_id,1,512), substr(error_class,1,64), substr(error_code,1,128), pause_reason, substr(interrupt_reason,1,128) FROM run_index INDEXED BY bus_event_live_runs WHERE state IN ('active','paused') ORDER BY state_changed_ms DESC,rowid DESC LIMIT 20001",
+      "SELECT substr(run_id,1,256), state, state_changed_ms, substr(provider_module_id,1,256), substr(credential_id,1,512), substr(error_class,1,64), substr(error_code,1,128), pause_reason, substr(interrupt_reason,1,128) FROM run_index INDEXED BY diagnostics_errors_time WHERE state='error' AND state_changed_ms>=10 AND state_changed_ms<=20 ORDER BY state_changed_ms DESC,rowid DESC LIMIT 20001",
+      "SELECT substr(run_id,1,256), state, state_changed_ms, substr(provider_module_id,1,256), substr(credential_id,1,512), substr(error_class,1,64), substr(error_code,1,128), pause_reason, substr(interrupt_reason,1,128) FROM run_index INDEXED BY diagnostics_interruptions_time WHERE state IN ('interrupted','transform_unavailable') AND state_changed_ms>=10 AND state_changed_ms<=20 ORDER BY state_changed_ms DESC,rowid DESC LIMIT 20001",
+      "SELECT substr(run_id,1,256), state, state_changed_ms, substr(provider_module_id,1,256), substr(credential_id,1,512), substr(error_class,1,64), substr(error_code,1,128), pause_reason, substr(interrupt_reason,1,128) FROM run_index INDEXED BY diagnostics_errors_time WHERE state='error' AND state_changed_ms IS NULL ORDER BY rowid DESC LIMIT 20001",
+      "SELECT substr(run_id,1,256), state, state_changed_ms, substr(provider_module_id,1,256), substr(credential_id,1,512), substr(error_class,1,64), substr(error_code,1,128), pause_reason, substr(interrupt_reason,1,128) FROM run_index INDEXED BY diagnostics_interruptions_time WHERE state IN ('interrupted','transform_unavailable') AND state_changed_ms IS NULL ORDER BY rowid DESC LIMIT 20001",
+      "COMMIT"
+    ],
+    "lookup": [
+      "SELECT session, submission_id, request_identity_digest, state, usage_json, final_step_finish_reason_json, retries_used, title, withdrawals_owed FROM run_index WHERE run_id='legacy-run'"
+    ],
+    "projection": [
+      "BEGIN DEFERRED",
+      "SELECT run_attribution_version FROM meta WHERE session='/legacy-project\u001fharness\u001flegacy-sql'",
+      "SELECT EXISTS(SELECT 1 FROM message WHERE session='/legacy-project\u001fharness\u001flegacy-sql' AND run_json IS NULL LIMIT 1)",
+      "SELECT watermark_seq, prefix_len FROM meta WHERE session='/legacy-project\u001fharness\u001flegacy-sql'",
+      "SELECT COUNT(*) FROM message WHERE session='/legacy-project\u001fharness\u001flegacy-sql'",
+      "SELECT completed_steps, usage_json, COALESCE(retries_used, 0), last_run_id, wal_anchor_file_id, wal_anchor_seq, wal_anchor_byte_end, last_step_usage_json, last_step_finish_reason_json, admission_checkpoint_json FROM meta WHERE session='/legacy-project\u001fharness\u001flegacy-sql'",
+      "SELECT watermark_seq, prefix_len FROM meta WHERE session='/legacy-project\u001fharness\u001flegacy-sql'",
+      "SELECT COUNT(*) FROM message WHERE session='/legacy-project\u001fharness\u001flegacy-sql'",
+      "SELECT lineage_id FROM meta WHERE session='/legacy-project\u001fharness\u001flegacy-sql'",
+      "SELECT control_head_wal_seq, control_head_sub_index FROM meta WHERE session='/legacy-project\u001fharness\u001flegacy-sql'",
+      "COMMIT"
+    ]
+  }
+}

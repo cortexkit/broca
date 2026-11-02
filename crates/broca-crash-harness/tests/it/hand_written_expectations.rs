@@ -207,3 +207,5 @@ async fn every_cut_of_one_tool_call_resumes_as_written_down_by_hand() {
         );
     }
 }
+
+broca_crash_harness::require_process_kill!();

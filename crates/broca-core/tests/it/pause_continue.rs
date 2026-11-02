@@ -24,6 +24,65 @@ use broca_wal::{FileWal, RunConfig, Wal, WalRecord};
 use serde_json::json;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "test-clock")]
+#[path = "pause_continue/account_limit.rs"]
+mod account_limit;
+
+#[tokio::test]
+async fn legacy_restart_pause_keeps_its_existing_auth_refreeze_behavior() {
+    let root = broca_test_support::scratch_root().join("restart-auth-refreeze-compatibility");
+    std::fs::create_dir_all(&root).unwrap();
+    let session = BindIdentity::new(root.join("project"), "h", "restart");
+    let wal = FileWalStore::new(root.join("wal"));
+    let leases = FileLeaseStore::new(root.join("leases"));
+    let old = serde_json::from_value(json!({"credential_id":"oauth:stub:old"})).unwrap();
+    seed_resume_without_terminal(&wal, &session, Some(old));
+    WalStore::open(&wal, &session)
+        .unwrap()
+        .append(
+            1,
+            &WalRecord::RunPaused {
+                account_limit: None,
+                run_id: RunId("r-orig".into()),
+                ts_ms: None,
+                reason: PauseReason::Restart,
+                error: None,
+            },
+            true,
+        )
+        .unwrap();
+    let new = serde_json::from_value(json!({"credential_id":"oauth:stub:new"})).unwrap();
+    let provider = StubProvider::new(vec![text_reply("done", "done")]);
+    let plane = StubToolPlane::new().with_tool("edit", |_| {
+        StubReply::Output(ToolOutput::Text {
+            text: "edited".into(),
+        })
+    });
+    let (tx, mut rx) = mpsc::channel(256);
+    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let summary = broca_core::run_loop_with_control(
+        tool_req("r-orig", &session, "hello"),
+        &provider,
+        &plane,
+        &leases,
+        &AllowAll,
+        &wal,
+        None,
+        broca_core::RunControl {
+            auth_selection: Some(new),
+            ..Default::default()
+        },
+        &tx,
+    )
+    .await
+    .unwrap();
+    drop(tx);
+    collector.await.unwrap();
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    assert!(records_of(&wal, &session).iter().any(|record| matches!(record,
+        WalRecord::RunAuthRefrozen { auth_selection, .. } if auth_selection.credential_id == "oauth:stub:new")));
+}
+
 fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
         input_written_at_ms: None,
@@ -42,6 +101,7 @@ fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -135,6 +195,7 @@ fn tool_req(run_id: &str, session: &BindIdentity, prompt: &str) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -190,6 +251,7 @@ fn seed_resume_without_terminal(
             session: session.clone(),
             ts_ms: None,
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -214,6 +276,7 @@ fn seed_resume_without_terminal(
                 context_management: None,
             }),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -1413,6 +1476,93 @@ struct ProjectCapturingProvider {
     inner: StubProvider,
     project_id: Option<String>,
     sent: Mutex<Vec<Vec<u8>>>,
+}
+
+#[tokio::test]
+async fn auth_pause_resume_records_its_boundary_and_pause_sequence() {
+    use broca_core::{run_loop_resume_after_auth_with_control, run_loop_with_control, RunControl};
+
+    let root = broca_test_support::scratch_root().join("auth-resume-record-before-refreeze");
+    std::fs::create_dir_all(&root).unwrap();
+    let session = BindIdentity::new("/auth-resume-project", "h", "auth-resume-record");
+    let wal = FileWalStore::new(root.join("wal"));
+    let leases = FileLeaseStore::new(root.join("leases"));
+    let plane = StubToolPlane::new();
+    let (tx, mut rx) = mpsc::channel(256);
+    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let paused = run_loop_with_control(
+        req(&session, "hello"),
+        &ProjectCapturingProvider::new(None, vec![]),
+        &plane,
+        &leases,
+        &AllowAll,
+        &wal,
+        None,
+        RunControl {
+            pause_for_auth_at_start: Some(
+                serde_json::from_value(json!({
+                    "class":"auth_required", "message":"credential unresolved"
+                }))
+                .unwrap(),
+            ),
+            ..Default::default()
+        },
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(paused.paused, Some(PauseReason::AuthRequired));
+    let before = wal.read_records(&session).unwrap();
+    let pause = before.last().unwrap();
+    assert!(matches!(
+        pause.record,
+        WalRecord::RunPaused {
+            reason: PauseReason::AuthRequired,
+            ..
+        }
+    ));
+    let resumed = run_loop_resume_after_auth_with_control(
+        req(&session, "hello"),
+        &ProjectCapturingProvider::new(Some("resolved-project"), vec![text_reply("done", "done")]),
+        &plane,
+        &leases,
+        &AllowAll,
+        &wal,
+        None,
+        RunControl {
+            auth_selection: Some(
+                serde_json::from_value(json!({"credential_id":"provider:resolved"})).unwrap(),
+            ),
+            ..Default::default()
+        },
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed.reason, RunFinishReason::Completed);
+    drop(tx);
+    collector.await.unwrap();
+    let after = wal.read_records(&session).unwrap();
+    let appended = &after[before.len()..];
+    assert_eq!(
+        appended
+            .iter()
+            .filter(|frame| matches!(frame.record, WalRecord::ResumeStarted { .. }))
+            .count(),
+        1
+    );
+    assert!(matches!(&appended[2].record,
+        WalRecord::ResumeStarted { episode, resumed_from_seq, .. }
+            if episode == &RunId("r1".into()) && *resumed_from_seq == pause.seq));
+    assert!(matches!(
+        appended[0].record,
+        WalRecord::RunConfigRefrozen { .. }
+    ));
+    assert!(matches!(
+        appended[1].record,
+        WalRecord::RunAuthRefrozen { .. }
+    ));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 impl ProjectCapturingProvider {

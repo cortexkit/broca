@@ -42,7 +42,10 @@
 //! re-runs the current test binary with only that test selected; the entry is a no-op in an
 //! ordinary test run.
 
+extern crate self as broca_crash_harness;
+
 pub mod invariants;
+pub mod io_trace;
 pub mod power_loss;
 
 #[cfg(all(test, unix))]
@@ -52,6 +55,8 @@ pub mod wal;
 #[cfg(all(test, unix))]
 mod writer_id_tests;
 
+#[cfg(test)]
+mod account_limit_pause;
 #[cfg(test)]
 mod compaction;
 
@@ -87,8 +92,8 @@ const REACH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Where a kill lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KillPoint {
-    /// Exactly the first `records` records are durable. With `torn`, part of the next frame is
-    /// on disk as well, as an append the kill cut short.
+    /// Exactly the first `records` scenario appends are durable, after any fixed historical
+    /// seed. Fresh scenarios have no seed. With `torn`, part of the next frame is on disk too.
     RecordBoundary { records: usize, torn: bool },
     /// The runner is inside this call when it dies.
     InFlight(InFlight),
@@ -186,6 +191,7 @@ pub struct RunnerHandle {
     stop: Option<StopAt>,
     base: PathBuf,
     next_root: AtomicUsize,
+    seeded_records: usize,
 }
 
 impl RunnerHandle {
@@ -223,12 +229,26 @@ impl RunnerHandle {
         let root = base.join("reference");
         std::fs::create_dir_all(&root).expect("create the reference state root");
         let store = ObservedWalStore::new(root.join("wal"));
+        let seeded_records = scenario.extension.map_or(0, |extension| {
+            extension.seed_reference(&store, &(scenario.request)())
+        });
+        let seed_bytes = if seeded_records != 0 {
+            let seed = LogImage::read(&wal_path(&root, &(scenario.request)().session));
+            assert_eq!(seed.record_count(), seeded_records);
+            assert_eq!(seed.torn_tail, 0, "the fixed recovery input must decode");
+            seed.bytes
+        } else {
+            Vec::new()
+        };
         let provider = ScriptedProvider::for_scenario(&scenario);
-        let (control, trip) = stop_control(&scenario, stop, true);
-        let plane = match trip {
+        let (mut control, trip) = stop_control(&scenario, stop, true);
+        let mut plane = match trip {
             Some(token) => HarnessPlane::for_scenario(&scenario).stopping_on_dispatch(token),
             None => HarnessPlane::for_scenario(&scenario),
         };
+        if let Some(extension) = scenario.extension {
+            extension.setup(&root, &mut control, &mut plane);
+        }
         let outcome = drive(
             (scenario.request)(),
             control,
@@ -249,7 +269,14 @@ impl RunnerHandle {
             scenario.name,
             provider.rejected()
         );
+        if let Some(extension) = scenario.extension {
+            extension.complete_reference(&root, &store, &provider).await;
+        }
         let log = LogImage::read(&wal_path(&root, &(scenario.request)().session));
+        assert!(
+            log.bytes.starts_with(&seed_bytes),
+            "recovery rewrote its fixed historical input"
+        );
         assert_eq!(
             log.torn_tail, 0,
             "{}: the reference log is torn",
@@ -266,6 +293,7 @@ impl RunnerHandle {
             stop,
             base,
             next_root: AtomicUsize::new(0),
+            seeded_records,
         }
     }
 
@@ -283,10 +311,11 @@ impl RunnerHandle {
         wal_path(root, &(self.scenario.request)().session)
     }
 
-    /// Every record boundary of the reference log, from before the first record through after
-    /// the last, each optionally also as a torn append of the frame after it.
+    /// Every append boundary after the scenario's fixed historical input. With no seed this
+    /// starts before the first record, exactly as a fresh run does. Each boundary optionally
+    /// also tears the next frame.
     pub fn record_boundaries(&self, torn: bool) -> Vec<KillPoint> {
-        let total = self.reference.log.record_count();
+        let total = self.reference.log.record_count() - self.seeded_records;
         let mut points = Vec::new();
         for records in 0..=total {
             points.push(KillPoint::RecordBoundary {
@@ -308,12 +337,13 @@ impl RunnerHandle {
         match (&point, trigger) {
             (KillPoint::RecordBoundary { records, torn }, KillTrigger::Truncate) => {
                 let root = self.fresh_root();
-                let cut = cut_log(&self.reference.log, *records, *torn);
+                let absolute = records + self.seeded_records;
+                let cut = cut_log(&self.reference.log, absolute, *torn);
                 write_log(&self.session_wal(&root), &cut);
-                let after_sync = Some(if *records == 0 {
+                let after_sync = Some(if absolute == 0 {
                     true
                 } else {
-                    let seq = match &self.reference.log.record_frame(records - 1).unwrap().body {
+                    let seq = match &self.reference.log.record_frame(absolute - 1).unwrap().body {
                         wal::FrameBody::Record(framed) => framed.seq,
                         wal::FrameBody::Lineage(_) => unreachable!("a record frame"),
                     };
@@ -330,6 +360,10 @@ impl RunnerHandle {
                 }
             }
             (KillPoint::InFlight(in_flight), KillTrigger::ProcessKill) => {
+                assert_eq!(
+                    self.seeded_records, 0,
+                    "seeded recovery scenarios have no external call to kill"
+                );
                 assert!(
                     self.stop.is_none(),
                     "{}: a spawned runner cannot be asked to stop",
@@ -356,9 +390,13 @@ impl RunnerHandle {
     /// plane so everything they record belongs to the resume alone.
     pub async fn resume(&self, kill: &KillReport) -> Resumed {
         let provider = ScriptedProvider::for_scenario(&self.scenario);
-        let plane = HarnessPlane::for_scenario(&self.scenario);
+        provider.restore(&kill.durable);
+        let mut plane = HarnessPlane::for_scenario(&self.scenario);
         let store = FileWalStore::new(kill.state_root.join("wal"));
-        let (control, _) = self.control(false);
+        let (mut control, _) = self.control(false);
+        if let Some(extension) = self.scenario.extension {
+            extension.setup(&kill.state_root, &mut control, &mut plane);
+        }
         let outcome = drive(
             (self.scenario.request)(),
             control,
@@ -389,7 +427,11 @@ impl RunnerHandle {
             provider: &resumed.provider,
             plane: &resumed.plane,
             reference_sent: &self.reference.sent,
+            invocations: &resumed.outcome.invocations,
         });
+        if let Some(extension) = self.scenario.extension {
+            extension.check(kill, resumed);
+        }
     }
 
     /// Kill at `point`, resume, and check.
@@ -419,20 +461,25 @@ impl RunnerHandle {
     /// must converge, write its own resume record, and add nothing the first already made
     /// durable.
     pub async fn every_boundary_inside_resume(&self, kill: &KillReport) -> Vec<KillReport> {
-        let first = self.resume(kill).await;
-        self.check(kill, &first);
+        // The caller may already have resumed the original root. Replay the immutable kill
+        // image on a fresh root so this sweep still starts at exactly that recorded prefix.
+        let first_kill = self.copy_kill_image(kill);
+        let first = self.resume(&first_kill).await;
+        self.check(&first_kill, &first);
         let from = kill.durable.record_count();
         let total = first.log.record_count();
         let mut kills = Vec::new();
-        for records in from + 1..=total {
+        for (records, torn) in (from..=total).flat_map(|records| {
+            std::iter::once((records, false)).chain((records < total).then_some((records, true)))
+        }) {
             let root = self.fresh_root();
-            let cut = cut_log(&first.log, records, false);
+            let cut = cut_log(&first.log, records, torn);
             write_log(&self.session_wal(&root), &cut);
             let nested = KillReport {
                 scenario: self.scenario.name,
                 point: KillPoint::RecordBoundary {
-                    records,
-                    torn: false,
+                    records: records - self.seeded_records,
+                    torn,
                 },
                 method: KillMethod::Truncation,
                 after_sync: None,
@@ -440,11 +487,20 @@ impl RunnerHandle {
                 state_root: root,
                 durable: LogImage::parse(cut),
             };
-            let resumed = self.resume(&nested).await;
-            self.check(&nested, &resumed);
+            // Leave returned roots at their reported cut, so callers can resume them too.
+            let validation = self.copy_kill_image(&nested);
+            let resumed = self.resume(&validation).await;
+            self.check(&validation, &resumed);
             kills.push(nested);
         }
         kills
+    }
+
+    fn copy_kill_image(&self, kill: &KillReport) -> KillReport {
+        let mut copy = kill.clone();
+        copy.state_root = self.fresh_root();
+        write_log(&self.session_wal(&copy.state_root), &kill.durable.bytes);
+        copy
     }
 }
 
@@ -472,7 +528,7 @@ fn stop_control(
 
 /// The bytes of `log` cut just after its first `records` records, plus half of the next frame
 /// when `torn`.
-fn cut_log(log: &LogImage, records: usize, torn: bool) -> Vec<u8> {
+pub fn cut_log(log: &LogImage, records: usize, torn: bool) -> Vec<u8> {
     let mut end = log.end_of_records(records);
     if torn {
         let next = log
@@ -580,6 +636,10 @@ pub fn serve_child(find: fn(&str) -> Option<Scenario>) {
     let marker = scenario::reached_marker(&root);
     let mut provider = ScriptedProvider::for_scenario(&scenario);
     let mut plane = HarnessPlane::for_scenario(&scenario);
+    let mut control = (scenario.control)();
+    if let Some(extension) = scenario.extension {
+        extension.setup(&root, &mut control, &mut plane);
+    }
     match in_flight {
         InFlight::ToolDispatch(id) => plane = plane.blocking_at(id, marker),
         InFlight::ProviderStep(step) => provider = provider.blocking_at(step, marker),
@@ -592,7 +652,7 @@ pub fn serve_child(find: fn(&str) -> Option<Scenario>) {
         let store = FileWalStore::new(root.join("wal"));
         drive(
             (scenario.request)(),
-            (scenario.control)(),
+            control,
             &root,
             &store,
             &provider,
@@ -613,6 +673,109 @@ macro_rules! crash_harness_child {
         #[test]
         fn crash_harness_child() {
             $crate::serve_child($find);
+        }
+    };
+}
+
+/// A small real-loop scenario used to enforce a process kill in each integration-test file.
+#[doc(hidden)]
+pub fn process_kill_probe() -> Scenario {
+    fn request() -> broca_core::RunRequest {
+        broca_core::RunRequest::from_submission(
+            serde_json::from_value(serde_json::json!({
+                "model": {"provider_module_id":"stub", "model_id":"m"},
+                "input": [{"role":"user", "content":[{"type":"text", "text":"probe"}]}]
+            }))
+            .unwrap(),
+            broca_protocol::RunId("process-kill-probe".into()),
+            broca_protocol::BindIdentity::new("/probe", "harness", "process-kill"),
+            broca_protocol::SubmissionId("probe".into()),
+        )
+    }
+    fn scripts() -> Vec<Vec<broca_protocol::NormalizedEvent>> {
+        use broca_protocol::*;
+        vec![vec![
+            NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                message: AssistantMessage {
+                    message_id: MessageId("probe-answer".into()),
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                },
+            }),
+            NormalizedEvent::Control(ProviderControl::Finished {
+                usage: Usage::default(),
+                finish_reason: broca_protocol::content::FinishReason::Stop,
+                retries_used: 0,
+            }),
+        ]]
+    }
+    Scenario {
+        name: "process_kill_probe",
+        request,
+        control: broca_core::RunControl::default,
+        scripts,
+        render: Render::Canonical,
+        plane: broca_core::StubToolPlane::new,
+        expected: broca_protocol::RunFinishReason::Completed,
+        extension: None,
+    }
+}
+
+#[doc(hidden)]
+pub async fn check_file_process_kill(child_test: &str) {
+    let handle = RunnerHandle::new(process_kill_probe()).await;
+    let root = handle.fresh_root();
+    let point = InFlight::ProviderStep(1);
+    let encoded = point.encode();
+    let method = kill_child_test_at_marker(
+        child_test,
+        child_test,
+        &[
+            (ENV_SCENARIO, std::ffi::OsStr::new(handle.scenario.name)),
+            (ENV_ROOT, root.as_os_str()),
+            (ENV_POINT, std::ffi::OsStr::new(&encoded)),
+        ],
+        &scenario::reached_marker(&root),
+    );
+    let kill = KillReport {
+        scenario: handle.scenario.name,
+        point: KillPoint::InFlight(point),
+        method,
+        after_sync: None,
+        inside_resume_from: None,
+        durable: LogImage::read(&handle.session_wal(&root)),
+        state_root: root,
+    };
+    let resumed = handle.resume(&kill).await;
+    handle.check(&kill, &resumed);
+    let mut suite = Suite::new("file process-kill obligation");
+    suite.record([kill]);
+    assert_eq!(suite.finish()["Sigkill"], 1);
+}
+
+/// Include a real process kill and shared-invariant resume in the invoking test file.
+/// The source inventory test requires this macro in every harness test owner.
+#[macro_export]
+macro_rules! require_process_kill {
+    () => {
+        #[test]
+        fn file_process_kill_child() {
+            $crate::serve_child(|name| {
+                (name == "process_kill_probe").then($crate::process_kill_probe)
+            });
+        }
+
+        #[tokio::test]
+        async fn file_requires_real_process_kill() {
+            let module = module_path!();
+            let prefix = module.split_once("::").map_or("", |(_, rest)| rest);
+            let child = if prefix.is_empty() {
+                "file_process_kill_child".to_owned()
+            } else {
+                format!("{prefix}::file_process_kill_child")
+            };
+            $crate::check_file_process_kill(&child).await;
         }
     };
 }
@@ -667,3 +830,10 @@ pub fn resume_records(records: &[WalRecord]) -> usize {
         .filter(|record| matches!(record, WalRecord::ResumeStarted { .. }))
         .count()
 }
+
+crate::require_process_kill!();
+#[cfg(all(test, unix))]
+mod v4_recovery_tests;
+
+#[cfg(all(test, unix))]
+mod legacy_io_tests;

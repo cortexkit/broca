@@ -94,3 +94,5 @@ mod usage_presence;
 mod chatgpt_effort_updates;
 mod compaction_thinking;
 mod hooks_render_golden;
+
+mod turn_system;

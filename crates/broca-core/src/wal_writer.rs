@@ -15,8 +15,8 @@
 
 use broca_diagnostics::JobKind;
 
-// Writer recovery and the writer-marker replay must retain the opening
-// operation when their synchronous I/O moves to the blocking pool.
+// Carry the caller's WAL access-counter context into blocking recovery work so
+// startup reads stay attributed when execution moves to another thread.
 fn spawn_blocking<F, T>(kind: JobKind, work: F) -> tokio::task::JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -65,6 +65,17 @@ pub type WriterAndLease = (Box<dyn Wal + Send>, Box<dyn LeaseHandle>);
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).
 pub trait WalStore: Send + Sync {
+    fn bind_recovery_projection(
+        &self,
+        _session: Option<&BindIdentity>,
+        _store: Arc<dyn crate::SessionStore>,
+    ) {
+    }
+    /// Called only under the writer lease, before retention/admission read the
+    /// physical log. Read-only store operations never initiate repair.
+    fn recover_existing(&self, _session: &BindIdentity) -> Result<(), WalError> {
+        Ok(())
+    }
     /// State-root location for the writer-id/v1 marker protocol. Legacy stores need none.
     fn writer_marker_root(&self) -> Option<PathBuf> {
         None
@@ -321,6 +332,18 @@ pub trait WalStore: Send + Sync {
         self.read_records_range(session, after_seq, through_seq, anchor)
     }
 
+    /// Extend an already verified media seed. The read budget may be spent on the
+    /// suffix rather than on rereading its captured historical prefix.
+    fn read_media_seed_suffix(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: u64,
+        anchor: Option<&WalByteAnchor>,
+    ) -> Result<WalRangeRead, WalError> {
+        self.read_records_range(session, after_seq, Some(through_seq), anchor)
+    }
+
     /// Read a suffix only when `anchor` is valid. Live-file implementations avoid scanning
     /// from byte zero; immutable archive members must first verify their whole digest.
     /// Implementations that cannot prove the byte offset return `None`, which lets callers use
@@ -370,6 +393,7 @@ pub trait WalStore: Send + Sync {
 /// deterministic hash of the session's bind identity so the same session always maps
 /// to the same log across processes and restarts.
 pub struct FileWalStore {
+    recovery_views: Mutex<RecoveryViews>,
     root: PathBuf,
     /// The frame format every log this store opens writes, decided once at boot (see
     /// [`FileWalStore::with_config`]). [`FileWalStore::new`] is legacy only.
@@ -384,14 +408,115 @@ pub struct FileWalStore {
     move_reads: AtomicU64,
     retention_changes: Arc<retention_changes::Changes>,
     durable_observer: Option<Arc<DurableWalObserver>>,
+    publication_observer: Option<Arc<PublicationObserverFactory>>,
+    session_guard: Option<Arc<SessionGuard>>,
     #[cfg(any(test, feature = "test-clock"))]
     range_reads: AtomicU64,
+}
+
+#[derive(Default)]
+struct RecoveryViews {
+    global: Vec<std::sync::Weak<dyn crate::SessionStore>>,
+    sessions: std::collections::HashMap<String, Vec<std::sync::Weak<dyn crate::SessionStore>>>,
+}
+
+impl RecoveryViews {
+    fn bind(&mut self, session: Option<&BindIdentity>, store: Arc<dyn crate::SessionStore>) {
+        let list = match session {
+            Some(session) => self.sessions.entry(session_addr(session)).or_default(),
+            None => &mut self.global,
+        };
+        list.retain(|view| view.strong_count() > 0);
+        let view = Arc::downgrade(&store);
+        if !list.iter().any(|old| old.ptr_eq(&view)) {
+            list.push(view);
+        }
+    }
+    fn snapshot(&self, session: &BindIdentity) -> Vec<Arc<dyn crate::SessionStore>> {
+        let mut views = Vec::new();
+        for view in self.global.iter().chain(
+            self.sessions
+                .get(&session_addr(session))
+                .into_iter()
+                .flatten(),
+        ) {
+            if let Some(view) = view.upgrade() {
+                if !views.iter().any(|old| Arc::ptr_eq(old, &view)) {
+                    views.push(view);
+                }
+            }
+        }
+        views
+    }
+}
+
+struct ProjectionRecovery {
+    session: BindIdentity,
+    views: Vec<Arc<dyn crate::SessionStore>>,
+    max_bytes: u64,
+}
+
+impl ProjectionRecovery {
+    fn failed(&self, stage: &str, error: impl std::fmt::Display) -> WalError {
+        WalError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "WAL recovery {stage} for session {} ({}): {error}",
+                self.session.session,
+                agent_session_ref(&self.session)
+            ),
+        ))
+    }
+}
+
+impl broca_wal::recovery::RecoveryHooks for ProjectionRecovery {
+    fn before_cut(&self, cut: &broca_wal::recovery::RecoveryCut) -> Result<(), WalError> {
+        for view in &self.views {
+            view.invalidate_wal_recovery(&self.session, cut)
+                .map_err(|e| self.failed("invalidation refused before cut", e))?;
+        }
+        Ok(())
+    }
+    fn after_repair(
+        &self,
+        log: &Path,
+        cut_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<(), WalError> {
+        let mut full = None;
+        for view in &self.views {
+            if view
+                .needs_wal_recovery_projection(&self.session, cut_ids)
+                .map_err(|e| self.failed("projection check", e))?
+            {
+                if full.is_none() {
+                    full = Some(
+                        broca_wal::file_wal::read_records_range(log, self.max_bytes, 0, None, None)
+                            .map_err(|e| self.failed("projection WAL read", e))?,
+                    );
+                }
+                view.reproject_wal_recovery(&self.session, full.as_ref().unwrap())
+                    .map_err(|e| self.failed("reprojection refused after cut", e))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Non-I/O notification of a successful WAL barrier, including raw maintenance writers.
 /// The callback must retain only the session identity and durable head, not record bodies.
 pub type DurableWalObserver =
     dyn Fn(&BindIdentity, u64, Option<broca_wal::WalLineageId>) + Send + Sync;
+
+/// Installed at open, away from barriers. Its returned callback must perform no
+/// I/O or blocking work; it only records the writer's descriptor-bound proof.
+/// An observer error refuses the acknowledgement after sync; recovery retains
+/// the durable WAL bytes rather than treating an unavailable index as current.
+pub type PublicationObserverFactory =
+    dyn Fn(&BindIdentity, &Path, broca_wal::WalLineageId) -> Arc<PublicationObserver> + Send + Sync;
+pub type PublicationObserver = dyn Fn(broca_wal::file_wal::DurablePublicationRef<'_>) -> Result<(), &'static str>
+    + Send
+    + Sync;
+pub type SessionGuard = dyn Fn(&BindIdentity) -> Result<(), String> + Send + Sync;
 
 /// THREE STATES, NOT TWO, and collapsing any pair of them has now caused a defect each.
 ///
@@ -587,6 +712,9 @@ impl FileWalStore {
     }
 
     pub fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {
+        if let Some(guard) = &self.session_guard {
+            guard(session).map_err(|error| WalError::Io(io::Error::other(error)))?;
+        }
         // A cut file may name the session by its folder-based v1 reference (recorded before
         // the v2 switch) or by its v2 reference. Check both in one pass, so a pending release
         // under either reference outranks a moved tombstone for writes.
@@ -801,6 +929,7 @@ impl FileWalStore {
         refusal: Option<broca_wal::StateRootError>,
     ) -> Self {
         Self {
+            recovery_views: Mutex::new(RecoveryViews::default()),
             root,
             config,
             refusal,
@@ -810,6 +939,8 @@ impl FileWalStore {
             move_reads: AtomicU64::new(0),
             retention_changes: Arc::default(),
             durable_observer: None,
+            publication_observer: None,
+            session_guard: None,
             #[cfg(any(test, feature = "test-clock"))]
             range_reads: AtomicU64::new(0),
         }
@@ -835,6 +966,15 @@ impl FileWalStore {
 
     pub fn with_durable_observer(mut self, observer: Arc<DurableWalObserver>) -> Self {
         self.durable_observer = Some(observer);
+        self
+    }
+
+    pub fn with_publication_observer(mut self, factory: Arc<PublicationObserverFactory>) -> Self {
+        self.publication_observer = Some(factory);
+        self
+    }
+    pub fn with_session_guard(mut self, guard: Arc<SessionGuard>) -> Self {
+        self.session_guard = Some(guard);
         self
     }
 
@@ -1140,13 +1280,25 @@ impl FileWalStore {
             session.session
         );
         let retained = path == self.ephemeral_wal_path(session);
-        let wal = FileWal::open_with_manifest_and_session_ref(
-            path.clone(),
-            self.manifest_path(),
-            session_addr(session),
-            identity,
-            agent_session_ref(session),
-        )?
+        let wal = match self.recovery_hooks(session) {
+            Some(hooks) => FileWal::open_with_manifest_and_recovery_hooks(
+                path.clone(),
+                self.manifest_path(),
+                session_addr(session),
+                identity,
+                agent_session_ref(session),
+                (self.config, self.feature_floor_path()),
+                hooks,
+            ),
+            None => FileWal::open_with_manifest_and_recovery(
+                path.clone(),
+                self.manifest_path(),
+                session_addr(session),
+                identity,
+                agent_session_ref(session),
+                (self.config, self.feature_floor_path()),
+            ),
+        }?
         .with_recovery_cap(self.max_read_bytes)
         .with_feature_floor(self.feature_floor_path())
         .with_wal_config(self.config)?;
@@ -1204,6 +1356,10 @@ impl FileWalStore {
             ),
         );
         let retained = Arc::new(AtomicBool::new(retained));
+        let publication_observer = self
+            .publication_observer
+            .as_ref()
+            .and_then(|factory| Some(factory(session, wal.log_path()?, wal.lineage_id()?)));
         Ok((
             Box::new(retention_changes::ObservedWal {
                 inner: wal,
@@ -1212,6 +1368,7 @@ impl FileWalStore {
                 retained: retained.clone(),
                 session: session.clone(),
                 durable_observer: self.durable_observer.clone(),
+                publication_observer,
             }),
             retained,
         ))
@@ -1963,6 +2120,23 @@ impl FileWalStore {
             .join(broca_wal::FEATURE_FLOOR_FILENAME)
     }
 
+    fn recovery_hooks(
+        &self,
+        session: &BindIdentity,
+    ) -> Option<Arc<dyn broca_wal::recovery::RecoveryHooks>> {
+        if !self.config.is_overhaul() {
+            return None;
+        }
+        let views = self.recovery_views.lock().unwrap().snapshot(session);
+        (!views.is_empty()).then(|| {
+            Arc::new(ProjectionRecovery {
+                session: session.clone(),
+                views,
+                max_bytes: self.max_read_bytes,
+            }) as Arc<dyn broca_wal::recovery::RecoveryHooks>
+        })
+    }
+
     /// Path to the diagnostic index for this WAL tree.
     pub fn manifest_path(&self) -> PathBuf {
         self.root
@@ -2041,6 +2215,74 @@ pub fn session_addr(session: &BindIdentity) -> String {
 }
 
 impl WalStore for FileWalStore {
+    fn bind_recovery_projection(
+        &self,
+        session: Option<&BindIdentity>,
+        store: Arc<dyn crate::SessionStore>,
+    ) {
+        if self.config.is_overhaul() {
+            self.recovery_views.lock().unwrap().bind(session, store);
+        }
+    }
+    fn recover_existing(&self, session: &BindIdentity) -> Result<(), WalError> {
+        if !self.config.is_overhaul() {
+            return Ok(());
+        }
+        self.check_move(session, true)?;
+        if let Some(path) = self.resolve_live_path(session)? {
+            drop(match self.recovery_hooks(session) {
+                Some(hooks) => FileWal::open_with_manifest_and_recovery_hooks(
+                    path,
+                    self.manifest_path(),
+                    session_addr(session),
+                    String::new(),
+                    agent_session_ref(session),
+                    (self.config, self.feature_floor_path()),
+                    hooks,
+                ),
+                None => FileWal::open_with_manifest_and_recovery(
+                    path,
+                    self.manifest_path(),
+                    session_addr(session),
+                    String::new(),
+                    agent_session_ref(session),
+                    (self.config, self.feature_floor_path()),
+                ),
+            }?);
+        }
+        Ok(())
+    }
+    fn read_media_seed_suffix(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: u64,
+        anchor: Option<&WalByteAnchor>,
+    ) -> Result<WalRangeRead, WalError> {
+        self.check_move(session, false)?;
+        if let Some(anchor) = anchor {
+            if self.archived_member(session)?.member.is_none() {
+                let limit = anchor
+                    .byte_end
+                    .checked_add(self.max_read_bytes)
+                    .ok_or_else(|| {
+                        WalError::Io(io::Error::other("media suffix read budget overflow"))
+                    })?;
+                if let Some(range) = broca_wal::read_records_range_from_valid_anchor(
+                    self.read_path(session)?,
+                    limit,
+                    after_seq,
+                    Some(through_seq),
+                    anchor,
+                )? {
+                    return Ok(range);
+                }
+            }
+        }
+        // Archive members keep their digest verification; a moved/folded live file
+        // must prove the requested suffix again instead of trusting an old inode offset.
+        self.read_records_range(session, after_seq, Some(through_seq), anchor)
+    }
     fn writer_marker_root(&self) -> Option<PathBuf> {
         self.config
             .is_overhaul()
@@ -3394,6 +3636,11 @@ thread_local! {
 
 /// The loop's handle to the writer task.
 pub struct WalHandle {
+    recovery_cut_ids: std::collections::BTreeSet<String>,
+    recovery_calls: Vec<broca_wal::recovery::RecoveryRun>,
+    recovery_call_keys: std::collections::BTreeSet<String>,
+    /// Cut boundaries namespace later calls without changing keys of retained Prepared frames.
+    physical_key_generations: Vec<(u64, String)>,
     /// Advisory display placement follows accepted queue order, not the lagging fsync head.
     display_placement: Mutex<Option<crate::placement::Placement>>,
     /// Zero means unlimited; finite limits only decrease over the writer's lifetime.
@@ -3455,6 +3702,73 @@ pub struct WalHandle {
 }
 
 impl WalHandle {
+    /// Whether startup must reconcile owner-scoped physical recovery evidence.
+    /// This is cached from the configured open and performs no filesystem probe.
+    pub fn has_recovery_cuts(&self) -> bool {
+        !self.recovery_cut_ids.is_empty()
+    }
+
+    pub(crate) fn recovery_cut_ids(&self) -> &std::collections::BTreeSet<String> {
+        &self.recovery_cut_ids
+    }
+    /// Model-facing IDs require their owner and effect scope; another step may
+    /// legitimately reuse the same ID under a different batch or physical key.
+    pub(crate) fn recovery_tombstoned(
+        &self,
+        run: &broca_protocol::RunId,
+        call: &broca_protocol::ToolCallId,
+        batch: &broca_protocol::BatchId,
+        step: Option<broca_protocol::StepId>,
+        key: Option<&str>,
+    ) -> bool {
+        let identity = broca_wal::recovery::RecoveryCall {
+            tool_call_id: call.clone(),
+            batch_id: Some(batch.clone()),
+            step_id: step,
+            call_keys: key.into_iter().map(str::to_owned).collect(),
+        };
+        self.recovery_calls
+            .iter()
+            .filter(|recovered| &recovered.run_id == run)
+            .flat_map(|r| &r.calls)
+            .any(|c| {
+                &c.tool_call_id == call && (!c.has_effect_identity() || c.matches_effect(&identity))
+            })
+    }
+    pub(crate) fn recovery_tombstoned_key(&self, key: &str) -> bool {
+        self.recovery_call_keys.contains(key)
+    }
+
+    pub(crate) fn call_key(&self, seq: u64) -> Option<String> {
+        let lineage = self.lineage_id()?;
+        let generation = self
+            .physical_key_generations
+            .iter()
+            .rev()
+            .find(|(cut_seq, _)| *cut_seq < seq)
+            .map(|(_, id)| id.as_str());
+        Some(broca_wal::recovery::physical_call_key(
+            &lineage.to_string(),
+            seq,
+            generation,
+        ))
+    }
+
+    /// Check a cached media seed's head without rebuilding its already-captured placement.
+    pub(crate) fn validate_media_seed_head(&self, at_seq: u64) -> Result<(), String> {
+        let _enqueue = self.lock_enqueue();
+        self.check_media_seed_head(at_seq)
+    }
+
+    fn check_media_seed_head(&self, at_seq: u64) -> Result<(), String> {
+        if self.durable_head.load(Ordering::Acquire) != at_seq
+            || at_seq.checked_add(1) != Some(self.next_seq.load(Ordering::Acquire))
+        {
+            return Err("media seed head changed before executor initialization".into());
+        }
+        Ok(())
+    }
+
     /// A media-free prefix has no captures or aging history to restore. Its already-seeded
     /// placement is sufficient to start tracking the first later capture without rereading it.
     pub fn empty_media_checkpoint(
@@ -3462,11 +3776,7 @@ impl WalHandle {
         at_seq: u64,
     ) -> Result<crate::media_request::MediaCheckpoint, String> {
         let _enqueue = self.lock_enqueue();
-        if self.durable_head.load(Ordering::Acquire) != at_seq
-            || self.next_seq.load(Ordering::Acquire) != at_seq + 1
-        {
-            return Err("media seed head changed before executor initialization".into());
-        }
+        self.check_media_seed_head(at_seq)?;
         let placement = self
             .display_placement
             .lock()
@@ -3813,6 +4123,32 @@ impl WalHandle {
         .await
     }
 
+    /// Trace ordinary owned admission without changing its writer-open cause.
+    #[cfg(feature = "test-clock")]
+    pub async fn open_and_spawn_owned_with_fs_for_test<W: WalStore + 'static>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        observer: Option<RecordObserver>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+        fs: Arc<dyn broca_wal::fs_ops::FsOps>,
+    ) -> Result<WalHandle, WalOpenError> {
+        Self::open_and_spawn_owned_with_cause(
+            wal_store,
+            session,
+            tenure,
+            observer,
+            retention,
+            session_class,
+            OwnedWriterStartup {
+                cause: None,
+                fs: Some(fs),
+            },
+        )
+        .await
+    }
+
     /// Supersede a stopped writer under the same owned session tenure as ordinary admission.
     pub async fn open_and_spawn_owned_for_reclaim<W: WalStore + 'static>(
         wal_store: Arc<W>,
@@ -3971,7 +4307,13 @@ impl WalHandle {
             };
             #[cfg(feature = "test-clock")]
             {
-                with_writer_fs(startup.fs, spawn)
+                if let Some(fs) = startup.fs {
+                    with_writer_fs(Some(fs.clone()), || {
+                        broca_wal::fs_ops::with_fs_ops(fs, spawn)
+                    })
+                } else {
+                    with_writer_fs(None, spawn)
+                }
             }
             #[cfg(not(feature = "test-clock"))]
             {
@@ -4049,16 +4391,80 @@ impl WalHandle {
         }
         // Lifecycle records do not start a conversation. A warmed writer-only log still needs
         // the same first-send placement, retention and runner-tag state as an empty log.
+        let recovered_frames = if v4 {
+            broca_wal::access_counter::writer_open(
+                wal.log_path().unwrap_or(std::path::Path::new("")),
+                false,
+                || wal.replay(),
+            )
+            .map_err(|error| WalWriteError::Failed(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+        let recovery_calls = recovered_frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                WalRecord::RecoveryCut { recovery } => Some(recovery.runs.clone()),
+                WalRecord::RecoveryCallClosed {
+                    run_id,
+                    tool_call_id,
+                    call_key,
+                    batch_id,
+                    step_id,
+                    ..
+                } => Some(vec![broca_wal::recovery::RecoveryRun {
+                    run_id: run_id.clone(),
+                    calls: vec![broca_wal::recovery::RecoveryCall {
+                        tool_call_id: tool_call_id.clone(),
+                        step_id: *step_id,
+                        batch_id: batch_id.clone(),
+                        call_keys: call_key.iter().cloned().collect(),
+                    }],
+                }]),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let physical_key_generations = recovered_frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                WalRecord::RecoveryCut { recovery } => Some((frame.seq, recovery.cut_id.clone())),
+                _ => None,
+            })
+            .collect();
+        let recovery_cut_ids = recovered_frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                WalRecord::RecoveryCut { recovery } => Some(recovery.cut_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let recovery_call_keys = recovered_frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                WalRecord::RecoveryCut { recovery } => Some(recovery.as_ref()),
+                _ => None,
+            })
+            .flat_map(|cut| {
+                cut.runs
+                    .iter()
+                    .flat_map(|run| &run.calls)
+                    .flat_map(|call| &call.call_keys)
+                    .chain(cut.unowned_calls.iter().flat_map(|call| &call.call_keys))
+            })
+            .cloned()
+            .chain(
+                recovered_frames
+                    .iter()
+                    .filter_map(|frame| match &frame.record {
+                        WalRecord::RecoveryCallClosed { call_key, .. } => call_key.clone(),
+                        _ => None,
+                    }),
+            )
+            .collect();
         let unstarted = last_seq == 0
             || (v4
-                && broca_wal::access_counter::writer_open(
-                    wal.log_path().unwrap_or(std::path::Path::new("")),
-                    false,
-                    || wal.replay(),
-                )
-                .map_err(|error| WalWriteError::Failed(error.to_string()))?
-                .iter()
-                .all(|frame| {
+                && recovered_frames.iter().all(|frame| {
                     matches!(
                         frame.record,
                         WalRecord::WriterOpened { .. }
@@ -4236,6 +4642,10 @@ impl WalHandle {
         // Only later publication markers need this separate enqueue-side charge.
         publication_bytes.store(0, Ordering::SeqCst);
         Ok(WalHandle {
+            recovery_cut_ids,
+            recovery_calls,
+            recovery_call_keys,
+            physical_key_generations,
             display_placement: Mutex::new(unstarted.then(Default::default)),
             input_token_limit: AtomicU64::new(0),
             move_check: None,
@@ -4492,6 +4902,16 @@ impl WalHandle {
         reserved_terminal: bool,
         assigned: &mut Option<Vec<MessageTags>>,
     ) -> RecordOutcome {
+        // The enqueue lock also allocates this sequence. Persist the generated
+        // ordinary key so readers replaying only a WAL suffix need not reconstruct
+        // which repair cut preceded the record.
+        if !self.physical_key_generations.is_empty() {
+            if let WalRecord::ToolDispatchIntent { call_key, .. } = &mut record {
+                if call_key.is_none() {
+                    *call_key = self.call_key(self.next_seq.load(Ordering::SeqCst));
+                }
+            }
+        }
         if let Some(error @ WalWriteError::RelocationIncomplete { .. }) =
             current_write_error(&self.poisoned)
         {
@@ -4799,6 +5219,129 @@ impl WalHandle {
         let _guard = self.lock_enqueue();
         for record in records {
             self.enqueue_record(record, false).into_result()?;
+        }
+        Ok(())
+    }
+
+    /// Admit an entire recovery close-out before publishing any of its records.
+    /// A crash can still preserve a frame prefix, which the recovery planner must
+    /// reconcile on reopen. A byte-cap refusal publishes no prefix or terminal.
+    pub fn record_recovery_close_out(&self, records: Vec<WalRecord>) -> Result<(), WalWriteError> {
+        let _guard = self.lock_enqueue();
+        if !self.v4 {
+            return Err(WalWriteError::Failed(
+                "recovery close-out requires an overhaul writer".into(),
+            ));
+        }
+        if let Some(error) = current_write_error(&self.poisoned) {
+            return Err(error);
+        }
+        let mut tags = *self.lineage_tags.lock().unwrap();
+        let mut prepared_records = Vec::with_capacity(records.len());
+        let mut frame_bytes = 0u64;
+        for mut record in records {
+            if !matches!(
+                &record,
+                WalRecord::ResumeStarted { .. }
+                    | WalRecord::ToolBatchStarted { .. }
+                    | WalRecord::ToolBatchFinished { .. }
+                    | WalRecord::TurnFinished { .. }
+                    | WalRecord::ToolResult {
+                        outcome: broca_wal::DispatchOutcome::Unknown,
+                        ..
+                    }
+                    | WalRecord::RecoveryCallClosed { .. }
+            ) {
+                return Err(WalWriteError::Failed(
+                    "record is not a recovery close-out record".into(),
+                ));
+            }
+            if let WalRecord::ToolResult {
+                finished_at_ms: at, ..
+            } = &mut record
+            {
+                if at.is_none() {
+                    *at = crate::run::epoch_millis();
+                }
+            }
+            let assigned = match tags.as_mut() {
+                Some(state) => crate::tags::stamp(state, &mut record),
+                None if crate::tags::tag_shape(&record).is_some()
+                    && record.runner_tags().is_empty() =>
+                {
+                    return Err(WalWriteError::Failed(
+                        "recovery close-out requires seeded runner tags".into(),
+                    ));
+                }
+                None => None,
+            };
+            let prepared = self
+                .prepare_v4(&record)?
+                .expect("overhaul writer prepares v4 frames");
+            frame_bytes = frame_bytes.saturating_add(prepared.frame_len() as u64);
+            prepared_records.push((record, prepared, assigned));
+        }
+        if let Some(budget) = &self.append_budget {
+            let mut budget = budget.lock().unwrap();
+            if budget.refused {
+                return Err(budget.refusal());
+            }
+            let end = budget
+                .used_bytes
+                .saturating_add(frame_bytes)
+                .saturating_add(
+                    budget
+                        .overhead
+                        .saturating_mul(prepared_records.len() as u64),
+                );
+            if end
+                .saturating_add(self.publication_bytes.load(Ordering::SeqCst))
+                .saturating_add(budget.reserve)
+                .saturating_add(budget.reopen_reserve)
+                .saturating_add(budget.writer_close_reserve)
+                > budget.max_bytes
+            {
+                budget.refused = true;
+                return Err(budget.refusal());
+            }
+            budget.used_bytes = end;
+        }
+        *self.lineage_tags.lock().unwrap() = tags;
+        for (record, prepared, assigned) in prepared_records {
+            let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+            if let (Some(assigned), WalRecord::ToolResult { result, .. }) = (&assigned, &record) {
+                if let Some(live) = self.live_tags.lock().unwrap().as_mut() {
+                    live.calls
+                        .entry(result.tool_call_id.clone())
+                        .or_default()
+                        .push_back(assigned[0].clone());
+                }
+            }
+            {
+                let mut placement = self.display_placement.lock().unwrap();
+                if placement
+                    .as_mut()
+                    .is_some_and(|p| p.observe(&record).is_err())
+                {
+                    *placement = None;
+                }
+            }
+            self.capture_for_append(seq, &record);
+            if self
+                .tx
+                .send(WalCommand::AppendV4 {
+                    seq,
+                    record: Box::new(record),
+                    prepared,
+                })
+                .is_err()
+            {
+                let error = format!(
+                    "recovery close-out command for seq {seq} could not reach the writer task"
+                );
+                set_poison(&self.poisoned, error.clone());
+                return Err(WalWriteError::Failed(error));
+            }
         }
         Ok(())
     }
@@ -7192,10 +7735,14 @@ mod head_proof_tests {
         handle.shutdown().await.unwrap();
         assert!(sidecar_path(&source).exists());
         let destination = root.0.join("wal-ephemeral/placed.wal");
-        let mut wal = FileWal::open(&source)
-            .unwrap()
-            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-            .unwrap();
+        let mut wal = FileWal::open_with_recovery(
+            &source,
+            broca_wal::WalConfig::OVERHAUL,
+            store.feature_floor_path(),
+        )
+        .unwrap()
+        .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+        .unwrap();
         assert_eq!(wal.log_path(), Some(source.as_path()));
         wal.relocate_unstarted(&destination).unwrap();
         assert_eq!(wal.log_path(), Some(destination.as_path()));

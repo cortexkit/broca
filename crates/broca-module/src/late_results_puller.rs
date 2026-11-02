@@ -1876,6 +1876,7 @@ mod tests {
                 sequential: false,
             },
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("run".into()),
                 reason: broca_wal::PauseReason::ToolHeld,
                 error: None,
@@ -1891,6 +1892,7 @@ mod tests {
 
     fn min_config() -> broca_wal::RunConfig {
         broca_wal::RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -2337,6 +2339,7 @@ mod tests {
                 completed_at_ms: None,
                 next_tag: None,
                 next_notice_seq: None,
+                recovery_artifacts: Vec::new(),
             })
             .unwrap(),
         )
@@ -3514,9 +3517,17 @@ mod tests {
                 "withdraw must follow the durable cancel seal"
             );
             self.seen.lock().unwrap().push(call.call_key.clone());
-            if self.mode == "offline" {
+            if matches!(
+                self.mode,
+                "offline" | "scope_not_live" | "scope_ended" | "scope_not_carrier"
+            ) {
+                let code = if self.mode == "offline" {
+                    "target_unavailable"
+                } else {
+                    self.mode
+                };
                 let error = serde_json::from_value(
-                    json!({"code": "target_unavailable", "message": "offline"}),
+                    json!({"code": code, "message": "withdraw route refused"}),
                 )
                 .unwrap();
                 (
@@ -3600,6 +3611,81 @@ mod tests {
         service.recover().await.unwrap();
         assert_eq!(*route.seen.lock().unwrap(), ["lineage:4"]);
         assert_eq!(service.health()["failed"], 0);
+    }
+
+    #[tokio::test]
+    async fn held_withdrawal_scope_gone_refusals_are_reported_without_failure_or_resend() {
+        use crate::held_slots::HeldWithdrawal;
+        for (code, failed, scope_gone) in [
+            ("scope_not_live", 0, 1),
+            ("scope_ended", 0, 1),
+            ("scope_not_carrier", 1, 0),
+        ] {
+            let root = rig_root(&format!("withdraw-{code}"));
+            let bind = session(code);
+            let wal = Arc::new(FileWalStore::new(root.join("wal")));
+            let mut records = held_records("lineage:4", "tools", &bind);
+            records.push(WalRecord::RunFinished {
+                reason: broca_protocol::RunFinishReason::Cancelled,
+                interrupt_reason: None,
+                ts_ms: Some(50),
+                usage: Default::default(),
+                error: None,
+                retries_used: 0,
+            });
+            write_wal_gated(&wal, &bind, &records);
+            let before = std::fs::read(wal.wal_path(&bind)).unwrap();
+            let path = root.join("late-results.db");
+            let store = Arc::new(LateResultsStore::open(&path).unwrap());
+            store
+                .register_calls(&held_registrations(&framed(records), &bind))
+                .unwrap();
+            let route = Arc::new(WithdrawalRoute {
+                wal: wal.clone(),
+                seen: Mutex::default(),
+                mode: code,
+            });
+            let service =
+                crate::held_withdrawals::HeldWithdrawals::new(store, wal.clone(), route.clone());
+            service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+            let reply = broca_core::tool_plane::ProviderHeldReply {
+                tool_call_id: ToolCallId("a".into()),
+                call_key: "lineage:4".into(),
+                module: "tools".into(),
+                reason: "approval".into(),
+                detail_digest: None,
+            };
+            service.withdraw(&reply).await.unwrap();
+            service.withdraw(&reply).await.unwrap();
+            let health = service.health();
+            assert_eq!(health["failed"], failed, "{code}: {health}");
+            assert_eq!(health["scope_gone"], scope_gone, "{code}: {health}");
+            assert_eq!(health["pending"], 0);
+            let details_key = if scope_gone > 0 {
+                "scope_gone_details"
+            } else {
+                "failure_details"
+            };
+            assert_eq!(
+                health[details_key],
+                json!([{"code":code, "answer":null, "reason":null}])
+            );
+            drop(service);
+            let store = Arc::new(LateResultsStore::open(&path).unwrap());
+            store.recovery_snapshot().unwrap();
+            let service =
+                crate::held_withdrawals::HeldWithdrawals::new(store, wal.clone(), route.clone());
+            service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+            service.recover().await.unwrap();
+            assert_eq!(service.health()["failed"], failed);
+            assert_eq!(service.health()["scope_gone"], scope_gone);
+            assert_eq!(
+                route.seen.lock().unwrap().len(),
+                1,
+                "terminal refusals never resend"
+            );
+            assert_eq!(std::fs::read(wal.wal_path(&bind)).unwrap(), before);
+        }
     }
 
     #[tokio::test]

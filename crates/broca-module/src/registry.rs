@@ -760,11 +760,11 @@ pub enum CutLockMode {
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 
 struct Inner {
-    session_address_inventory: std::sync::OnceLock<Arc<broca_store::SqliteStore>>,
+    run_event_reader: std::sync::OnceLock<Arc<RunEventLookup>>,
+    session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
     episode_source: std::sync::OnceLock<Arc<EpisodeReadSource>>,
     session_inventory_readiness: std::sync::OnceLock<Arc<dyn SessionInventoryReadiness>>,
-    #[cfg(test)]
-    raw_pages: std::sync::OnceLock<Arc<RawPageTestBundle>>,
+    raw_pages: std::sync::OnceLock<Arc<RawPageSource>>,
     tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
     actor_idle_holds: Mutex<HashMap<LineageKey, (u64, Vec<&'static str>)>>,
     /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
@@ -806,6 +806,7 @@ struct Inner {
     /// Cache only identities and the position after their represented WAL records. Prompts,
     /// queued requests and plan manifests stay out of this bounded, read-only cache.
     owner_snapshots: Mutex<OwnerSnapshots>,
+    sender_snapshots: Mutex<OwnerSnapshots>,
     stopping: tokio_util::sync::CancellationToken,
     seal: tokio_util::sync::CancellationToken,
     seal_state: Mutex<SealState>,
@@ -1035,6 +1036,15 @@ impl OwnerSnapshots {
 
     fn insert(&mut self, key: LineageKey, mut snapshot: OwnershipSnapshot) {
         snapshot.ownership = snapshot.ownership.for_owner_access();
+        self.insert_summary(key, snapshot);
+    }
+
+    fn insert_sender(&mut self, key: LineageKey, mut snapshot: OwnershipSnapshot) {
+        snapshot.ownership = crate::sender_admission::compact(&snapshot.ownership);
+        self.insert_summary(key, snapshot);
+    }
+
+    fn insert_summary(&mut self, key: LineageKey, snapshot: OwnershipSnapshot) {
         if !self.entries.contains_key(&key) {
             if self.entries.len() == MAX_OWNER_SNAPSHOTS {
                 if let Some(oldest) = self.oldest.pop_front() {
@@ -1109,6 +1119,8 @@ struct ReadSources {
 type EpisodePublication = dyn Fn(&LineageKey, Option<u64>) -> Result<broca_wal::file_wal::DurablePublication, String>
     + Send
     + Sync;
+pub type RunEventLookup =
+    dyn Fn(&str) -> Result<Option<(LineageKey, Vec<u8>)>, String> + Send + Sync;
 
 /// Opt-in database composition. The callback supplies the writer's durable publication
 /// at the sequence requested for an attach, or the latest publication for a page.
@@ -1116,11 +1128,67 @@ type EpisodePublication = dyn Fn(&LineageKey, Option<u64>) -> Result<broca_wal::
 pub struct EpisodeReadSource {
     db: Arc<broca_store::db::OverhaulDb>,
     publication: Arc<EpisodePublication>,
+    gate: Option<Arc<broca_store::db::SessionGateFactory>>,
+    access: Option<broca_wal::access_counter::WalAccessCounter>,
 }
 
 impl EpisodeReadSource {
     pub fn new(db: Arc<broca_store::db::OverhaulDb>, publication: Arc<EpisodePublication>) -> Self {
-        Self { db, publication }
+        Self {
+            db,
+            publication,
+            gate: None,
+            access: None,
+        }
+    }
+
+    pub fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
+        self.gate = Some(Arc::new(move |_| gate.clone()));
+        self
+    }
+    pub fn with_session_gates(mut self, gate: Arc<broca_store::db::SessionGateFactory>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    pub fn with_access_counter(
+        mut self,
+        access: broca_wal::access_counter::WalAccessCounter,
+    ) -> Self {
+        self.access = Some(access);
+        self
+    }
+
+    pub(crate) fn with_reader<T>(
+        &self,
+        key: &LineageKey,
+        head: Option<u64>,
+        read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if let Some(access) = &self.access {
+            return access
+                .operation(if head.is_some() {
+                    "model attach"
+                } else {
+                    "model page"
+                })
+                .run(|| self.with_reader_inner(key, head, read));
+        }
+        self.with_reader_inner(key, head, read)
+    }
+
+    fn with_reader_inner<T>(
+        &self,
+        key: &LineageKey,
+        head: Option<u64>,
+        read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let gate = self.gate.as_ref().map(|factory| factory(key));
+        let _guard = gate
+            .as_ref()
+            .map(|gate| gate.lock().map_err(|e| e.to_string()))
+            .transpose()?;
+        read(self.reader(key, head)?)
     }
 
     pub(crate) fn reader(
@@ -1145,8 +1213,31 @@ pub(crate) struct RawPageTestBundle {
     pub publications: Mutex<HashMap<LineageKey, broca_wal::file_wal::DurablePublication>>,
 }
 
-#[cfg(test)]
-impl RawPageTestBundle {
+/// WAL-backed raw reads installed only by the boot-selected overhaul bundle.
+pub struct RawPageSource {
+    db: Arc<broca_store::db::OverhaulDb>,
+    publication: Arc<EpisodePublication>,
+    gate: Option<Arc<broca_store::db::SessionGateFactory>>,
+}
+
+impl RawPageSource {
+    pub fn new(db: Arc<broca_store::db::OverhaulDb>, publication: Arc<EpisodePublication>) -> Self {
+        Self {
+            db,
+            publication,
+            gate: None,
+        }
+    }
+
+    pub fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
+        self.gate = Some(Arc::new(move |_| gate.clone()));
+        self
+    }
+    pub fn with_session_gates(mut self, gate: Arc<broca_store::db::SessionGateFactory>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
     fn page(
         &self,
         key: &LineageKey,
@@ -1154,17 +1245,19 @@ impl RawPageTestBundle {
         limit: Option<u64>,
         tools: bool,
     ) -> Result<Box<RouteReadPage>, OpenError> {
-        let publications = self.publications.lock().unwrap();
-        let publication = publications
-            .get(key)
-            .ok_or_else(|| OpenError::Open("raw page publication not supplied".into()))?;
+        let gate = self.gate.as_ref().map(|factory| factory(key));
+        let _guard = gate
+            .as_ref()
+            .map(|gate| gate.lock().map_err(|e| OpenError::Open(e.to_string())))
+            .transpose()?;
+        let publication = (self.publication)(key, None).map_err(OpenError::Open)?;
         let raw = self
             .db
             .read_raw_page(
                 key,
                 &broca_core::agent_session_ref(key),
                 broca_store::db::LogLocation::Live,
-                publication,
+                &publication,
                 broca_store::db::RawPageRequest {
                     from_ordinal: from,
                     limit,
@@ -1193,16 +1286,18 @@ impl RawPageTestBundle {
         key: &LineageKey,
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
-        let publications = self.publications.lock().unwrap();
-        let publication = publications
-            .get(key)
-            .ok_or_else(|| OpenError::Open("raw tag publication not supplied".into()))?;
+        let gate = self.gate.as_ref().map(|factory| factory(key));
+        let _guard = gate
+            .as_ref()
+            .map(|gate| gate.lock().map_err(|e| OpenError::Open(e.to_string())))
+            .transpose()?;
+        let publication = (self.publication)(key, None).map_err(OpenError::Open)?;
         self.db
             .read_raw_tag_location(
                 key,
                 &broca_core::agent_session_ref(key),
                 broca_store::db::LogLocation::Live,
-                publication,
+                &publication,
                 tag,
             )
             .map(Some)
@@ -1254,8 +1349,21 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    pub fn set_run_event_reader(&self, reader: Arc<RunEventLookup>) {
+        assert!(
+            self.inner.run_event_reader.set(reader).is_ok(),
+            "run-event reader already installed"
+        );
+    }
     /// Supply the durable identity inventory before accepting routed session binds.
     pub fn set_session_address_inventory(&self, inventory: Arc<broca_store::SqliteStore>) {
+        self.set_session_address_resolver(inventory);
+    }
+
+    pub fn set_session_address_resolver(
+        &self,
+        inventory: Arc<dyn broca_store::SessionAddressResolver>,
+    ) {
         assert!(
             self.inner.session_address_inventory.set(inventory).is_ok(),
             "session address inventory already configured"
@@ -1331,14 +1439,29 @@ impl LineageRegistry {
         }
     }
 
-    /// Install database episode reads explicitly; boot-time store selection is unchanged.
+    /// Install the episode reader selected by the boot-time state format.
     pub fn with_episode_source(self, source: Arc<EpisodeReadSource>) -> Self {
         assert!(self.inner.episode_source.set(source).is_ok());
         self
     }
     #[cfg(test)]
     pub(crate) fn with_raw_pages_for_test(self, bundle: Arc<RawPageTestBundle>) -> Self {
-        assert!(self.inner.raw_pages.set(bundle).is_ok());
+        self.with_raw_page_source(Arc::new(RawPageSource::new(
+            bundle.db.clone(),
+            Arc::new(move |key, _| {
+                bundle
+                    .publications
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| "raw page publication not supplied".into())
+            }),
+        )))
+    }
+
+    pub fn with_raw_page_source(self, source: Arc<RawPageSource>) -> Self {
+        assert!(self.inner.raw_pages.set(source).is_ok());
         self
     }
     pub(crate) fn upload_store(&self) -> Option<broca_core::media_uploads::Uploads> {
@@ -1419,14 +1542,26 @@ impl LineageRegistry {
         session: &LineageKey,
         event_key: &str,
     ) -> Result<broca_wire::RunEventGetResponse, crate::serve::ServeError> {
-        let Some(store) = self.inner.reader.as_ref().and_then(|r| r.store.clone()) else {
+        let native = self.inner.run_event_reader.get().cloned();
+        let store = self.inner.reader.as_ref().and_then(|r| r.store.clone());
+        if native.is_none() && store.is_none() {
             return Ok(broca_wire::RunEventGetResponse::Absent);
-        };
+        }
+        if native.is_some() {
+            self.check_move(session, false)
+                .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?;
+        }
         let event_key = event_key.to_owned();
         let key = event_key.clone();
-        let row = spawn_blocking(broca_diagnostics::JobKind::StoreRead, move || {
-            store.read_run_event(&key)
-        })
+        let row = spawn_blocking(
+            broca_diagnostics::JobKind::StoreRead,
+            move || match native {
+                Some(reader) => reader(&key),
+                None => store
+                    .ok_or_else(|| "run-event reader unavailable".to_string())?
+                    .read_run_event(&key),
+            },
+        )
         .await
         .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?
         .map_err(|e| crate::serve::ServeError::Open(e, None))?;
@@ -1631,10 +1766,10 @@ impl LineageRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                run_event_reader: std::sync::OnceLock::new(),
                 session_address_inventory: std::sync::OnceLock::new(),
                 episode_source: std::sync::OnceLock::new(),
                 session_inventory_readiness: std::sync::OnceLock::new(),
-                #[cfg(test)]
                 raw_pages: std::sync::OnceLock::new(),
                 tool_route_health: std::sync::OnceLock::new(),
                 actor_idle_holds: Mutex::new(HashMap::new()),
@@ -1662,6 +1797,7 @@ impl LineageRegistry {
                 frozen_senders: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 live_ownership: Mutex::new(HashMap::new()),
                 owner_snapshots: Mutex::new(OwnerSnapshots::default()),
+                sender_snapshots: Mutex::new(OwnerSnapshots::default()),
                 stopping: tokio_util::sync::CancellationToken::new(),
                 seal: tokio_util::sync::CancellationToken::new(),
                 seal_state: Mutex::new(SealState::default()),
@@ -1939,6 +2075,46 @@ impl LineageRegistry {
         Ok(sender)
     }
 
+    /// Observe ownership already learned by ordinary requests, without telemetry-only IO.
+    /// Only a current live summary is authoritative while an actor is open. A closed session
+    /// can reuse frozen owner identities from a nonempty ownership summary; an empty ownership
+    /// summary does not establish an owner.
+    pub(crate) fn cached_session_owner(
+        &self,
+        key: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        fn matches(
+            ownership: &broca_core::SessionOwnershipV1,
+            principal: Option<&broca_protocol::BindPrincipal>,
+        ) -> Option<bool> {
+            (ownership.episodes > 0).then(|| {
+                principal.is_some()
+                    && (ownership.first_principal.as_ref() == principal
+                        || ownership
+                            .scope
+                            .as_ref()
+                            .is_some_and(|scope| Some(&scope.owner) == principal))
+            })
+        }
+        let slots = self.inner.slots.lock().unwrap();
+        if let Some(Entry::Open { handle, .. }) = slots.get(key) {
+            let live = self.inner.live_ownership.lock().unwrap();
+            return live.get(key).and_then(|cached| {
+                (cached.generation == handle.gen
+                    && cached.head == handle.durable_head.load(Ordering::Acquire))
+                .then(|| matches(&cached.ownership, principal))
+                .flatten()
+            });
+        }
+        self.inner
+            .owner_snapshots
+            .lock()
+            .unwrap()
+            .get(key)
+            .and_then(|snapshot| matches(&snapshot.ownership, principal))
+    }
+
     /// Cancel/retract ownership from a live reader, a checkpoint plus its durable suffix, or
     /// the complete WAL when no checkpoint is usable. Never open an actor to obtain it.
     pub(crate) async fn owner_ownership(
@@ -1966,6 +2142,301 @@ impl LineageRegistry {
             &records,
             &broca_protocol::SubmissionId(submission_id.into()),
         ))
+    }
+
+    /// Cold grant lookup never opens an actor, whose recovery could write history.
+    pub(crate) async fn interrupt_cancel_granted(
+        &self,
+        key: &LineageKey,
+        module_id: &str,
+    ) -> Result<bool, OpenError> {
+        self.check_authorization_expired(key).await?;
+        let ownership = self.sender_ownership_for_authorization(key).await?;
+        Ok(crate::sender_admission::interrupt_granted(
+            &ownership, module_id,
+        ))
+    }
+
+    /// Reuse an existing actor's admission source without opening or recovering a lineage.
+    pub(crate) async fn warm_cancel_authority(
+        &self,
+        key: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        at: broca_wal::record::RunCancelAt,
+    ) -> Result<Option<crate::actor::CancelAuthority>, crate::serve::ServeError> {
+        self.check_authorization_expired(key).await?;
+        match self.check_move(key, true) {
+            // Moving/moved sessions need owner_ownership's full log validation. Cached
+            // authority could hide corrupt history; move errors must wait for authorization.
+            Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error.into()),
+            Ok(()) => {}
+        }
+        let handle = {
+            let slots = self.inner.slots.lock().unwrap();
+            match slots.get(key) {
+                Some(Entry::Open { handle, .. }) => {
+                    let head = handle.durable_head.load(Ordering::Acquire);
+                    if let Some(cached) = self.inner.live_ownership.lock().unwrap().get(key) {
+                        // The first principal never changes within an actor generation.
+                        // Keep owners on the cached ownership path without querying sender policy.
+                        let immutable_authority = cached.ownership.episodes > 0
+                            && (cached.ownership.first_principal.as_ref() == principal
+                                || !matches!(
+                                    cached.ownership.first_principal,
+                                    Some(broca_protocol::BindPrincipal::Reserved { .. })
+                                ));
+                        if cached.generation == handle.gen
+                            && (cached.head == head || immutable_authority)
+                            && broca_core::scope_admission::decide_owner_access(
+                                &cached.ownership,
+                                principal,
+                                scope,
+                            )
+                            .is_ok()
+                        {
+                            return Ok(Some(crate::actor::CancelAuthority::Owner));
+                        }
+                    }
+                    Some(handle.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(handle) = handle {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if handle
+                .send(crate::actor::LineageCmd::SenderPolicy {
+                    principal: principal.cloned(),
+                    scope: scope.clone(),
+                    at,
+                    reply,
+                })
+                .await
+                .is_ok()
+            {
+                if let Ok(result) = rx.await {
+                    return result;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn resolve_cancel_authority(
+        &self,
+        key: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        at: broca_wal::record::RunCancelAt,
+    ) -> Result<crate::actor::CancelAuthority, crate::serve::ServeError> {
+        use crate::{actor::CancelAuthority, serve::ServeError};
+        if let Some(authority) = self
+            .warm_cancel_authority(key, principal, scope, at)
+            .await?
+        {
+            return Ok(authority);
+        }
+        let ownership = self.owner_ownership(key).await?;
+        let refusal =
+            match broca_core::scope_admission::decide_owner_access(&ownership, principal, scope) {
+                Ok(()) => return Ok(CancelAuthority::Owner),
+                Err(refusal) => refusal,
+            };
+        if let (
+            broca_wal::record::RunCancelAt::Now,
+            Some(broca_protocol::BindPrincipal::Reserved { module_id }),
+        ) = (at, principal)
+        {
+            if self.interrupt_cancel_granted(key, module_id).await? {
+                return Ok(CancelAuthority::Sender);
+            }
+        }
+        Err(ServeError::ScopeRefused(refusal))
+    }
+
+    /// Read existing durable policy without opening an actor or advancing a live writer.
+    /// Older policy may be repaired in memory, never published for an unadmitted caller.
+    async fn sender_ownership_for_authorization(
+        &self,
+        key: &LineageKey,
+    ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
+        let reader = self.inner.reader.as_ref().ok_or_else(|| {
+            OpenError::Open("sender authorization reader is not configured".into())
+        })?;
+        let live_head = {
+            let slots = self.inner.slots.lock().unwrap();
+            match slots.get(key) {
+                Some(Entry::Open { handle, .. }) => {
+                    Some(handle.durable_head.load(Ordering::Acquire))
+                }
+                _ => None,
+            }
+        };
+        let cached = self
+            .inner
+            .sender_snapshots
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .filter(|snapshot| live_head.is_none_or(|head| snapshot.watermark_seq <= head));
+        if let Some(snapshot) = cached {
+            let range = self
+                .read_durable_range_for(
+                    reader,
+                    key,
+                    ReadRangeRequest {
+                        after_seq: snapshot.watermark_seq,
+                        anchor: snapshot.anchor,
+                        live_head,
+                        through_seq: None,
+                        purpose: ReadPurpose::Authorization,
+                    },
+                )
+                .await?;
+            let records = crate::durable_read::DurableRead::classify(
+                &range,
+                snapshot.watermark_seq,
+                live_head,
+            )
+            .records()
+            .map_err(|error| OpenError::Open(error.to_string()))?;
+            if records.is_empty()
+                && snapshot.lineage_id.is_some()
+                && snapshot.lineage_id == range.lineage_id.map(|id| id.to_string())
+            {
+                return Ok(snapshot.ownership);
+            }
+        }
+        let stored = if let Some(store) = reader.store.clone() {
+            let key = key.clone();
+            spawn_blocking(JobKind::StoreRead, move || {
+                store.read_admission_snapshot(&key)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+        } else {
+            None
+        };
+        if let Some(stored) = stored {
+            if let Some(mut checkpoint) = stored.checkpoint {
+                if checkpoint.at_seq == stored.watermark_seq
+                    && checkpoint.ownership_complete()
+                    && live_head.is_none_or(|head| stored.watermark_seq <= head)
+                {
+                    let range = self
+                        .read_durable_range_for(
+                            reader,
+                            key,
+                            ReadRangeRequest {
+                                after_seq: stored.watermark_seq,
+                                anchor: stored.anchor,
+                                live_head,
+                                through_seq: None,
+                                purpose: ReadPurpose::Authorization,
+                            },
+                        )
+                        .await?;
+                    let records = crate::durable_read::DurableRead::classify(
+                        &range,
+                        stored.watermark_seq,
+                        live_head,
+                    )
+                    .records()
+                    .map_err(|error| OpenError::Open(error.to_string()))?;
+                    if stored.lineage_id.is_some()
+                        && stored.lineage_id == range.lineage_id.map(|id| id.to_string())
+                        && checkpoint.fold_frames(records).is_ok()
+                    {
+                        if let Some(ownership) = checkpoint.ownership {
+                            let head = checkpoint.at_seq;
+                            let wal = reader.wal_store.clone();
+                            let read_key = key.clone();
+                            let ownership =
+                                crate::sender_admission::resolve(ownership, || async move {
+                                    spawn_blocking(
+                                        JobKind::WalRead,
+                                        broca_wal::access_counter::inherit(move || {
+                                            crate::sender_admission::read_prefix(
+                                                wal.as_ref(),
+                                                &read_key,
+                                                head,
+                                            )
+                                        }),
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string())?
+                                })
+                                .await
+                                .map_err(OpenError::Open)?;
+                            self.cache_sender_snapshot(
+                                key,
+                                &ownership,
+                                head,
+                                range.lineage_id,
+                                range.anchor_at(head).or(stored.anchor),
+                            );
+                            return Ok(ownership);
+                        }
+                    }
+                }
+            }
+        }
+        let range = self
+            .read_durable_range_for(
+                reader,
+                key,
+                ReadRangeRequest {
+                    after_seq: 0,
+                    anchor: None,
+                    live_head,
+                    through_seq: None,
+                    purpose: ReadPurpose::Authorization,
+                },
+            )
+            .await?;
+        let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
+            .records()
+            .map_err(|error| OpenError::Open(error.to_string()))?;
+        let checkpoint = broca_core::AdmissionCheckpointV1::from_frames(records)
+            .map_err(|error| OpenError::Open(error.to_string()))?;
+        let ownership = checkpoint.ownership.ok_or_else(|| {
+            OpenError::Open("the admission snapshot carries no ownership summary".into())
+        })?;
+        self.cache_sender_snapshot(
+            key,
+            &ownership,
+            checkpoint.at_seq,
+            range.lineage_id,
+            range.anchor_at(checkpoint.at_seq),
+        );
+        Ok(ownership)
+    }
+
+    fn cache_sender_snapshot(
+        &self,
+        key: &LineageKey,
+        ownership: &broca_core::SessionOwnershipV1,
+        head: u64,
+        lineage_id: Option<broca_wal::WalLineageId>,
+        anchor: Option<broca_wal::WalByteAnchor>,
+    ) {
+        self.inner.sender_snapshots.lock().unwrap().insert_sender(
+            key.clone(),
+            OwnershipSnapshot {
+                ownership: ownership.clone(),
+                watermark_seq: head,
+                lineage_id: lineage_id.map(|id| id.to_string()),
+                anchor,
+                first_episode_position: None,
+            },
+        );
     }
 
     /// Upload standing includes every current plan-named sender, not just session owners.
@@ -2879,16 +3350,50 @@ impl LineageRegistry {
         run_id: broca_protocol::RunId,
         at: broca_wal::record::RunCancelAt,
     ) -> Result<crate::actor::CancelOutcome, OpenError> {
+        self.route_cancel_inner(key, run_id, at, None).await
+    }
+
+    pub async fn route_cancel_from(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<broca_protocol::BindPrincipal>,
+        scope: broca_protocol::SendScope,
+    ) -> Result<crate::actor::CancelOutcome, OpenError> {
+        self.route_cancel_inner(key, run_id, at, Some((principal, scope)))
+            .await
+    }
+
+    async fn route_cancel_inner(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        caller: Option<(
+            Option<broca_protocol::BindPrincipal>,
+            broca_protocol::SendScope,
+        )>,
+    ) -> Result<crate::actor::CancelOutcome, OpenError> {
         use crate::actor::{CancelOutcome, LineageCmd};
         loop {
             self.check_move(key, true)?;
             self.check_expired(key, Some(&run_id.0)).await?;
             let handle = self.actor_for(key).await?;
             let (reply, rx) = tokio::sync::oneshot::channel();
-            let cmd = LineageCmd::Cancel {
-                run_id: run_id.clone(),
-                at,
-                reply,
+            let cmd = match &caller {
+                Some((principal, scope)) => LineageCmd::CancelFrom {
+                    run_id: run_id.clone(),
+                    at,
+                    principal: principal.clone(),
+                    scope: scope.clone(),
+                    reply,
+                },
+                None => LineageCmd::Cancel {
+                    run_id: run_id.clone(),
+                    at,
+                    reply,
+                },
             };
             if handle.send(cmd).await.is_err() {
                 continue;
@@ -3701,9 +4206,15 @@ impl LineageRegistry {
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
         self.check_expired(key, None).await?;
-        #[cfg(test)]
         if let Some(bundle) = self.inner.raw_pages.get() {
-            return bundle.tag_location(key, tag);
+            let bundle = bundle.clone();
+            let key = key.clone();
+            return spawn_blocking(
+                JobKind::StoreRead,
+                broca_wal::access_counter::inherit(move || bundle.tag_location(&key, tag)),
+            )
+            .await
+            .map_err(|error| OpenError::Open(error.to_string()))?;
         }
         let Some(store) = self
             .inner
@@ -3796,25 +4307,31 @@ impl LineageRegistry {
             let source = source.clone();
             let key = key.clone();
             let request = request.clone();
-            return spawn_blocking(JobKind::StoreRead, move || {
-                source
-                    .reader(&key, None)?
-                    .read_model_page(&request)
-                    .map(|page| RoutedPage::Model(page.page))
-                    .map_err(|error| error.to_string())
-            })
+            return spawn_blocking(
+                JobKind::StoreRead,
+                broca_wal::access_counter::inherit(move || {
+                    source.with_reader(&key, None, |reader| {
+                        reader
+                            .read_model_page(&request)
+                            .map(|page| RoutedPage::Model(page.page))
+                            .map_err(|error| error.to_string())
+                    })
+                }),
+            )
             .await
             .map_err(|error| OpenError::Open(error.to_string()))?
             .map_err(OpenError::Open);
         }
-        #[cfg(test)]
         if model.is_none() {
             if let Some(bundle) = self.inner.raw_pages.get() {
                 let bundle = bundle.clone();
                 let key = key.clone();
-                return spawn_blocking(JobKind::StoreRead, move || {
-                    bundle.page(&key, from_ordinal, limit, include_tools)
-                })
+                return spawn_blocking(
+                    JobKind::StoreRead,
+                    broca_wal::access_counter::inherit(move || {
+                        bundle.page(&key, from_ordinal, limit, include_tools)
+                    }),
+                )
                 .await
                 .map_err(|e| OpenError::Open(e.to_string()))?
                 .map(RoutedPage::Raw);
@@ -4779,8 +5296,8 @@ impl LineageRegistry {
         (opened, failed)
     }
 
-    /// Resume WAL-confirmed restart pauses after dependency routes are registered. Candidate
-    /// index rows may lag the WAL; only a latest durable restart pause authorizes a resume.
+    /// Rebuild WAL-confirmed restart and timed-account continuations after routes are registered.
+    /// Candidate index rows may lag; only the latest durable pause authorizes continuation.
     pub async fn resume_restart_pauses(
         &self,
         wal_store: Arc<dyn broca_core::WalStore>,
@@ -4822,7 +5339,8 @@ impl LineageRegistry {
             };
             let resume = match &prior.resolution {
                 broca_core::ReplayResolution::AuthRequired { reason, .. } => match reason {
-                    broca_protocol::PauseReason::Restart => true,
+                    broca_protocol::PauseReason::Restart
+                    | broca_protocol::PauseReason::AccountLimit => true,
                     broca_protocol::PauseReason::AuthRequired
                     | broca_protocol::PauseReason::ToolHeld => false,
                 },
@@ -6424,6 +6942,7 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -7051,6 +7570,7 @@ mod offset_page_tests {
 
     fn run_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

@@ -760,17 +760,42 @@ pub trait MaterializedStore: Send + Sync {
 
     /// Publish fact versions and their complete continuation in one transaction. An expected
     /// sequence mismatch means another reader won, not permission to overwrite its seed.
+    /// Stores with recovery epochs also reject publication from a pre-cut read ticket.
     fn publish_display_facts(
         &self,
         _session: &BindIdentity,
         _lineage: &str,
         _expected_seq: Option<u64>,
+        _expected_epoch: Option<i64>,
         _seed: &crate::display_facts::DisplayFactsSeed,
         _versions: &[crate::display_facts::DisplayFactVersion],
     ) -> Result<(), String> {
         Ok(())
     }
 
+    /// Invalidate rebuildable views durably before physical WAL recovery cuts.
+    /// Usage export facts are independent authority and must not be changed.
+    fn invalidate_wal_recovery(
+        &self,
+        _session: &BindIdentity,
+        _cut: &broca_wal::recovery::RecoveryCut,
+    ) -> Result<(), String> {
+        Err("materialized store cannot durably invalidate a WAL recovery".into())
+    }
+    fn needs_wal_recovery_projection(
+        &self,
+        _session: &BindIdentity,
+        _cut_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn reproject_wal_recovery(
+        &self,
+        _session: &BindIdentity,
+        _range: &WalRangeRead,
+    ) -> Result<(), String> {
+        Err("materialized store cannot reproject a WAL recovery".into())
+    }
     fn read_retained_head(
         &self,
         _session: &BindIdentity,
@@ -1626,6 +1651,7 @@ impl SessionReadReason {
             }
             SessionReadReason::Pause(PauseReason::AuthRequired) => "auth_required",
             SessionReadReason::Pause(PauseReason::Restart) => "restart",
+            SessionReadReason::Pause(PauseReason::AccountLimit) => "account_limit",
             SessionReadReason::Pause(PauseReason::ToolHeld) => "tool_held",
         }
     }
@@ -1930,8 +1956,10 @@ pub struct ToolCallDispatch {
 /// An ordinary call's fallback key, from its own `ToolDispatchIntent`.
 ///
 /// Ordinary calls use their own intent: sibling calls share a step record but have
-/// distinct intents. A synced sequence is never reissued, and the log identity
-/// distinguishes replacements at one address. Consent preparation can make a call
+/// distinct intents. This fallback spelling is for unrepaired history. After a
+/// repair the writer records a cut-generation key so reused sequences cannot alias
+/// removed calls. The log identity distinguishes replacements at one address.
+/// Consent preparation can make a call
 /// durable earlier; its key is then recorded on the later intent and preserved by
 /// [`tool_call_key`]. Model ids may repeat without reusing either kind of key.
 /// The spelling is printable ASCII, below the tool-provider role's 256-byte bound.
@@ -2413,6 +2441,8 @@ pub(crate) fn merge_prefix_and_tail(
     };
     tail_episodes.render = tail_state.render_episodes.clone().unwrap_or_default();
     let state = crate::ReplayState {
+        account_limit_pause: None,
+        recovered_calls: Vec::new(),
         extent: tail_state.extent,
         tags_await_setup: tail_state.tags_await_setup,
         input_budget: tail_state.input_budget,
@@ -2859,6 +2889,7 @@ mod catch_up_tests {
             seq: 13,
             fence: 1,
             record: WalRecord::RunPaused {
+                account_limit: None,
                 ts_ms: Some(4000),
                 reason: broca_protocol::PauseReason::Restart,
                 run_id: RunId("paused".into()),
@@ -2992,6 +3023,7 @@ mod tests {
                 session: BindIdentity::new("/tmp/p", "h", "s"),
                 ts_ms: None,
                 config: Box::new(RunConfig {
+                    account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,
                     computed_tags: None,
@@ -3016,6 +3048,7 @@ mod tests {
                     context_management: None,
                 }),
                 input: vec![Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     role: Role::User,
                     content: vec![ContentBlock::Text { text: "hi".into() }],
@@ -4036,6 +4069,7 @@ mod episode_merge_regression {
 
     fn config(model: &str) -> RunConfig {
         RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -4084,6 +4118,7 @@ mod episode_merge_regression {
             session: BindIdentity::new("/tmp/p", "h", "s"),
             config: Box::new(config(model)),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: text.into() }],

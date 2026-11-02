@@ -339,3 +339,5 @@ async fn paused_boundary_cancel_acks_and_seals_without_another_step() {
         })
     ));
 }
+
+broca_crash_harness::require_process_kill!();

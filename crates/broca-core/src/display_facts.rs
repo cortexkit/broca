@@ -60,6 +60,9 @@ pub struct DisplayFactVersion {
 
 #[derive(Debug, Clone, Default)]
 pub struct DisplayFactsCache {
+    /// A read-side publication ticket for stores that fence same-lineage recovery.
+    /// It is not persisted in a display fact or included in a request identity.
+    pub publication_epoch: Option<i64>,
     pub seed: Option<DisplayFactsSeed>,
     pub rows: BTreeMap<u64, DisplayFacts>,
 }

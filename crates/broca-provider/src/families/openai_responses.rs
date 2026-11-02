@@ -347,7 +347,7 @@ fn instructions_from_policy(prompt: &[Message], policy: SystemPromptPolicy) -> O
     }
     let mut parts = Vec::new();
     for m in prompt {
-        if m.role == Role::System {
+        if m.role == Role::System && !m.turn_system {
             let t = text_content(&m.content);
             if !t.is_empty() {
                 parts.push(t);
@@ -434,7 +434,7 @@ fn convert_input_items_with_provenance(
                 }
             }
         }
-        if skip_system && message.role == Role::System {
+        if skip_system && message.role == Role::System && !message.turn_system {
             continue;
         }
         let start = provenance.as_ref().map(|_| out.len());
@@ -560,6 +560,12 @@ fn convert_easy_message(
     m: &Message,
     media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Value {
+    if m.turn_system {
+        return json!({
+            "role": "developer",
+            "content": [{"type": "input_text", "text": crate::turn_system::text(m)}],
+        });
+    }
     let role = match m.role {
         Role::System => "system",
         Role::User => "user",

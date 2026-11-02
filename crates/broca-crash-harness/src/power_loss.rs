@@ -344,6 +344,80 @@ impl RecordingFs {
         self.enumerate_with_budget(&mut remaining)
     }
 
+    /// Schedule one operation cut without changing the persistence model or the
+    /// existing all-cut API. Each selected cut has a hard 100,000-visit budget;
+    /// exceeding it refuses rather than returning a sampled prefix.
+    pub fn enumerate_cut(&self, cut: usize) -> io::Result<Vec<SurvivingState>> {
+        let journal = self.journal.lock().unwrap();
+        let operations = journal.operations.get(..cut).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "requested operation cut exceeds the recorded history",
+            )
+        })?;
+        check_recursion_budget(operations)?;
+        let mut histories: BTreeMap<Stream, Vec<Vec<Change>>> = BTreeMap::new();
+        let mut durable: BTreeMap<Stream, usize> = BTreeMap::new();
+        for operation in operations {
+            match operation {
+                Operation::Observe => {}
+                Operation::Change(changes) => {
+                    let mut grouped: BTreeMap<Stream, Vec<Change>> = BTreeMap::new();
+                    for change in changes {
+                        grouped
+                            .entry(change.stream())
+                            .or_default()
+                            .push(change.clone());
+                    }
+                    for (stream, changes) in grouped {
+                        histories.entry(stream).or_default().push(changes);
+                    }
+                }
+                Operation::Sync(stream) => {
+                    durable.insert(stream.clone(), histories.get(stream).map_or(0, Vec::len));
+                }
+            }
+        }
+        let streams: Vec<_> = histories
+            .iter()
+            .map(|(stream, changes)| {
+                (
+                    changes.as_slice(),
+                    durable.get(stream).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        let mut states = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut remaining = 100_000;
+        enumerate_streams(
+            &streams,
+            0,
+            journal.initial.clone(),
+            false,
+            &mut |image, partial| {
+                if remaining == 0 {
+                    return Err(state_limit());
+                }
+                remaining -= 1;
+                let state = image.visible();
+                if seen.insert(state.clone()) {
+                    states.push(SurvivingState {
+                        cut,
+                        family: if partial {
+                            Family::PartialPersistence
+                        } else {
+                            Family::SyncedOnly
+                        },
+                        state,
+                    });
+                }
+                Ok(())
+            },
+        )?;
+        Ok(states)
+    }
+
     /// Inspect trace coverage without depending on the bytes that deduplicate at each cut.
     pub fn operation_kinds(&self) -> Vec<OperationKind> {
         self.journal
@@ -1025,6 +1099,56 @@ mod tests {
     }
 
     #[test]
+    fn selected_cut_matches_every_state_of_the_existing_all_cut_enumerator() {
+        let root = Scratch::new();
+        let recording = root.recording();
+        with_fs_ops(recording.clone(), || {
+            let mut file = fs_ops::File::create(root.0.join("data")).unwrap();
+            file.write_all(b"abc").unwrap();
+            file.sync_all().unwrap();
+            fs_ops::sync_dir(&root.0).unwrap();
+            file.write_all(b"xyz").unwrap();
+        });
+        let all = recording.enumerate(100_000).unwrap();
+        recording.assert_all_cuts_covered(&all);
+        for cut in 0..=recording.operation_kinds().len() {
+            let selected = recording.enumerate_cut(cut).unwrap();
+            assert!(!selected.is_empty());
+            let expected: Vec<_> = all
+                .iter()
+                .filter(|state| state.cut == cut)
+                .map(|state| (state.cut, state.family, &state.state))
+                .collect();
+            let actual: Vec<_> = selected
+                .iter()
+                .map(|state| (state.cut, state.family, &state.state))
+                .collect();
+            assert_eq!(actual, expected, "operation cut {cut}");
+        }
+        assert!(recording
+            .enumerate_cut(recording.operation_kinds().len() + 1)
+            .is_err());
+    }
+
+    #[test]
+    fn selected_cut_refuses_at_its_hard_limit_instead_of_sampling() {
+        let root = Scratch::new();
+        let recording = root.recording();
+        with_fs_ops(recording.clone(), || {
+            let mut file = fs_ops::File::create(root.0.join("data")).unwrap();
+            file.sync_all().unwrap();
+            fs_ops::sync_dir(&root.0).unwrap();
+            for _ in 0..8 {
+                file.write_all(b"abc").unwrap();
+            }
+        });
+        let error = recording
+            .enumerate_cut(recording.operation_kinds().len())
+            .unwrap_err();
+        assert!(error.to_string().contains("state limit"), "{error}");
+    }
+
+    #[test]
     fn power_loss_trace_and_cut_coverage_survive_zero_byte_deduplication() {
         let counts: Vec<_> = [0, 1]
             .into_iter()
@@ -1692,3 +1816,4 @@ fn power_loss_non_unix_refuses_nonempty_initial_roots() {
     assert!(RecordingFs::new(&root).is_err());
     fs::remove_dir_all(root).unwrap();
 }
+broca_crash_harness::require_process_kill!();

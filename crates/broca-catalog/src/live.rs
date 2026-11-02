@@ -128,8 +128,7 @@ pub struct ResolveOptions<'a> {
     /// refused, naming the offered tiers. A resume passes the frozen tier through
     /// `EpisodeRenderConfig` instead.
     pub service_tier: Option<ServiceTier>,
-    /// Abstract level recovered from a durable queue written by a later release. Fresh public
-    /// sends never set this reader-only input. Resumed runs use their recorded render bundle.
+    /// Abstract level from a public send or durable queue. Resumed runs use their recorded bundle.
     pub queued_service_tier: Option<&'a str>,
     /// Where a fresh token for the run's own credential comes from when the provider rejects
     /// the served one with a 401 mid-run or its token is about to expire. Used only with
@@ -686,6 +685,9 @@ pub fn default_max_output_tokens(output_limit: Option<u64>, context_limit: Optio
 
 impl EpisodeRenderConfig<'_> {
     fn apply(self, mut config: FrozenRenderConfig) -> FrozenRenderConfig {
+        config.image_notice_labels = self
+            .recorded_config
+            .is_none_or(|recorded| recorded.image_notice_labels);
         if let Some(session_id) = self.opencode_go_session_id {
             config.opencode_go_session_id = Some(session_id.to_string());
             if config.family_id == WireFamilyId::OpenAiChat {
@@ -944,6 +946,9 @@ fn resolve_provider_inner(
             "openai-compatible",
             opts.auth_method,
         );
+        // Opaque endpoints share fresh-episode render rules with catalog routes.
+        // Recorded episodes take the earlier recorded-config branch instead.
+        let frozen = episode_render.apply(frozen);
         let provider =
             resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
         return Ok(ProviderResolution {
@@ -1601,6 +1606,7 @@ fn freeze_refusal_fallback(
         return Err("the fallback model echoes thinking only to the model that produced it".into());
     }
     fallback.max_output_tokens = max_tokens;
+    fallback.image_notice_labels = source.image_notice_labels;
     fallback.base_url = source.base_url.clone();
     fallback.cache = source.cache.clone();
     fallback.prompt_cache_key = source.prompt_cache_key.clone();
@@ -1800,8 +1806,7 @@ fn apply_service_tier(
     broca_provider::service_tier::freeze_service_tier(frozen, provider_id, requested)
 }
 
-/// Interpret the abstract level retained by a queued request without extending the legacy
-/// stored enum. Public send admission cannot set this input until the writer release ships.
+/// Interpret an abstract level without extending the legacy stored enum.
 fn apply_queued_service_tier(
     frozen: &mut FrozenRenderConfig,
     level: &str,
@@ -1851,6 +1856,20 @@ fn apply_queued_service_tier(
         provider_id,
         catalog_model,
         priced_modes,
+    )
+}
+
+/// Check an enqueue against its model row and selected family without making a model call.
+pub fn check_service_tier_level(
+    family: WireFamilyId,
+    level: &str,
+    provider_id: &str,
+    catalog_model: &str,
+    priced_modes: &[String],
+) -> Result<(), String> {
+    let mut frozen = broca_provider::families::frozen_config_for_family(family, catalog_model);
+    apply_queued_service_tier(&mut frozen, level, provider_id, catalog_model, priced_modes).map_err(
+        |error| format!("service_tier {level:?} is unsupported for {catalog_model}: {error}"),
     )
 }
 
@@ -2648,6 +2667,36 @@ mod tests {
         let body = serde_json::from_slice(&resolved.provider.render_request(&anthropic_options()))
             .expect("step-one body is JSON");
         (frozen, body)
+    }
+
+    #[test]
+    fn image_notice_labels_are_admitted_once_and_keep_recorded_absence_on_resume() {
+        let catalog = catalog_stating_server_side_fallback(&[("claude-fable-5-1", Some(true))]);
+        with_test_catalog(&catalog, || {
+            for method in [AuthMethod::ApiKey, AuthMethod::Oauth] {
+                let (fresh, _) = resolve_anthropic_episode(
+                    "anthropic/claude-fable-5-1",
+                    method,
+                    false,
+                    EpisodeRenderConfig::default(),
+                );
+                assert!(fresh.image_notice_labels);
+                let mut old = fresh.clone();
+                old.image_notice_labels = false;
+                let recorded = serde_json::to_value(&old).unwrap();
+                assert!(recorded.get("image_notice_labels").is_none());
+                let (resumed, _) = resolve_anthropic_episode(
+                    "anthropic/claude-fable-5-1",
+                    method,
+                    false,
+                    EpisodeRenderConfig {
+                        recorded_config: Some(&old),
+                        ..EpisodeRenderConfig::default()
+                    },
+                );
+                assert_eq!(serde_json::to_value(resumed).unwrap(), recorded);
+            }
+        });
     }
 
     /// The opt-in is set for exactly one shape: an OAuth (identity-lead) run of an `anthropic`
@@ -4077,6 +4126,7 @@ mod responses_tool_admission_tests {
             let recorded: FrozenRenderConfig = serde_json::from_value(blob.clone()).unwrap();
             assert!(!recorded.responses_tools_non_strict);
             let resumed = EpisodeRenderConfig {
+                recorded_config: Some(&recorded),
                 responses_tools_non_strict: Some(recorded.responses_tools_non_strict),
                 chatgpt_effort_updates: Some(recorded.chatgpt_effort_updates),
                 ..Default::default()
@@ -4108,6 +4158,7 @@ mod responses_tool_admission_tests {
         let blob = serde_json::to_value(&admitted).unwrap();
         let recorded: FrozenRenderConfig = serde_json::from_value(blob.clone()).unwrap();
         let resumed = EpisodeRenderConfig {
+            recorded_config: Some(&recorded),
             chatgpt_wire: recorded.chatgpt_wire.as_ref(),
             ..Default::default()
         }

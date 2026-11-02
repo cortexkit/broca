@@ -182,6 +182,15 @@ async fn gated_daemon_test() {{
         self.assertTrue(flags, "no -F flags found in linux-preflight.sh's features array")
         self.assertEqual(flags, selection.PREFLIGHT_FEATURE_FLAGS)
 
+    def test_power_loss_matrix_is_selected_only_by_the_portable_lane(self) -> None:
+        linux = (ROOT / "scripts/linux-preflight.sh").read_text()
+        native = (ROOT / "scripts/rust-test-gate.sh").read_text()
+        self.assertIn("-F broca-provider/portable-power-loss", linux)
+        self.assertIn("--test-threads 16", linux)
+        self.assertNotIn("broca-provider/portable-power-loss", native)
+        transport = (ROOT / "crates/broca-provider/src/transport.rs").read_text()
+        self.assertIn('all(feature = "portable-power-loss", target_os = "linux")', transport)
+
     def test_repository_rig_tests_are_excluded_by_nextest_filter(self) -> None:
         targets = selection._target_metadata(ROOT)
         provider_it = next(

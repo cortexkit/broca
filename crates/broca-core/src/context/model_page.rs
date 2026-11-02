@@ -1008,6 +1008,7 @@ mod episode_page_tests {
             run_id: RunId(run_id.into()),
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: true,
                 computed_tags: Some(ComputedTagRules { checkpoint: 0 }),

@@ -77,6 +77,7 @@ struct Script {
     gate: Notify,
     entered: Notify,
     dispatched: Mutex<Vec<String>>,
+    requested: Mutex<Vec<(String, u64)>>,
     pause_next_run: Mutex<bool>,
 }
 
@@ -113,7 +114,19 @@ struct ScriptedProvider(Arc<Script>);
 
 #[async_trait]
 impl Provider for ScriptedProvider {
-    async fn step(&self, _step_id: StepId, _opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+    async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+        check_tool_pairing(&opts.prompt).expect("the live actor request must be provider-valid");
+        let run = &opts
+            .step_context
+            .as_ref()
+            .expect("the loop identifies each request")
+            .run_id;
+        self.0
+            .requested
+            .lock()
+            .unwrap()
+            .push((run.clone(), step_id.0));
+        let message_id = MessageId(format!("{run}-{}", step_id.0));
         self.0.wait_if_held(Hold::Model).await;
         let step = self
             .0
@@ -141,7 +154,7 @@ impl Provider for ScriptedProvider {
         tx.send(NormalizedEvent::Control(
             ProviderControl::AssistantMessage {
                 message: AssistantMessage {
-                    message_id: MessageId("m".into()),
+                    message_id,
                     content,
                 },
             },
@@ -206,6 +219,21 @@ impl RunExecutor for CoreExec {
         job: RunJob,
         out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
+        if job
+            .req
+            .input
+            .iter()
+            .any(|message| text_of(message) == Some("rejected-queued"))
+        {
+            if let Some(admitted) = job.on_admitted {
+                let _ = admitted.send(Err(RunError::Config(
+                    "scripted permanent model-resolution refusal".into(),
+                )));
+            }
+            return Err(RunError::Config(
+                "scripted permanent model-resolution refusal".into(),
+            ));
+        }
         let mode = match job.kind {
             RunKind::AppendEpisode => StartMode::AppendEpisode,
             RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
@@ -291,6 +319,16 @@ impl Session {
     }
 
     async fn send(&self, send_id: &str, text: &str, delivery: Delivery) -> SendResponse {
+        self.send_with_order(send_id, text, delivery, None).await
+    }
+
+    async fn send_with_order(
+        &self,
+        send_id: &str,
+        text: &str,
+        delivery: Delivery,
+        order: Option<broca_protocol::DeliveryOrder>,
+    ) -> SendResponse {
         let request = RunRequest {
             input_written_at_ms: None,
             directives: None,
@@ -349,7 +387,7 @@ impl Session {
                 kind: RunKind::FreshOrResume,
                 delivery,
                 plan: None,
-                order: None,
+                order,
             })
             .await
             .unwrap_or_else(|error| panic!("send {send_id}: {error}"))
@@ -367,6 +405,10 @@ impl Session {
     /// Wait until the actor is idle, nothing is queued, and every episode has ended (or is
     /// paused): nothing more will be written without a new send.
     async fn settle(&self) -> LogImage {
+        self.settle_with_ordered_pending(false).await
+    }
+
+    async fn settle_with_ordered_pending(&self, allow_ordered_pending: bool) -> LogImage {
         broca_test_support::wait_until("idle session with no pending or open episodes", || async {
             let idle = matches!(
                 self.registry.status(&session()).await,
@@ -374,7 +416,16 @@ impl Session {
             );
             let log = self.log();
             let records = log.records();
-            if idle && broca_core::pending_submissions(&records).is_empty() && all_ended(&records) {
+            let pending = broca_core::pending_submissions(&records);
+            let settled = pending.is_empty()
+                || (allow_ordered_pending
+                    && pending.iter().all(|entry| {
+                        entry
+                            .order
+                            .as_ref()
+                            .is_some_and(|order| !order.starts_runs())
+                    }));
+            if idle && settled && all_ended(&records) {
                 return Ok(log);
             }
             Err(format!(
@@ -408,6 +459,10 @@ fn all_ended(records: &[WalRecord]) -> bool {
 
 #[derive(Clone, Copy)]
 enum Scenario {
+    /// A queued send is permanently refused before it can open an episode.
+    RetractedQueue,
+    /// Two keyed ordered steers arrive during a tool call; only the replacement is delivered.
+    OrderedSteer,
     /// A steer sent while a tool call runs.
     SteerDuringToolCall,
     /// A steer sent between two model steps (after the first turn's barrier).
@@ -425,6 +480,8 @@ enum Scenario {
 impl Scenario {
     fn name(self) -> &'static str {
         match self {
+            Scenario::RetractedQueue => "retracted-queue",
+            Scenario::OrderedSteer => "ordered-steer",
             Scenario::SteerDuringToolCall => "steer-during-tool-call",
             Scenario::SteerBetweenSteps => "steer-between-steps",
             Scenario::InterruptDuringModelStream => "interrupt-during-model-stream",
@@ -437,6 +494,7 @@ impl Scenario {
     fn steps(self) -> Vec<Step> {
         match self {
             Scenario::SteerDuringToolCall
+            | Scenario::OrderedSteer
             | Scenario::SteerBetweenSteps
             | Scenario::InterruptDuringToolCall => vec![Step::Call("call-1"), Step::Text("answer")],
             _ => vec![],
@@ -446,6 +504,38 @@ impl Scenario {
     async fn reference(self, session: &Session) {
         let script = &session.script;
         match self {
+            Scenario::RetractedQueue => {
+                script.hold(Hold::Model, true);
+                session.send("turn-1", "task", Delivery::Queue).await;
+                session.wait_entered().await;
+                session
+                    .send("rejected", "rejected-queued", Delivery::Queue)
+                    .await;
+                script.hold(Hold::Model, false);
+            }
+            Scenario::OrderedSteer => {
+                script.hold(Hold::Tool, true);
+                session.send("turn-1", "task", Delivery::Queue).await;
+                session.wait_entered().await;
+                let order = || broca_protocol::DeliveryOrder {
+                    modes: vec![broca_protocol::DeliveryMode::Steer],
+                    dedupe_key: Some("replace-steer".into()),
+                    expires_at_ms: None,
+                    template: None,
+                };
+                session
+                    .send_with_order(
+                        "ordered-old",
+                        "discarded-steer",
+                        Delivery::Queue,
+                        Some(order()),
+                    )
+                    .await;
+                session
+                    .send_with_order("ordered-new", "steered", Delivery::Queue, Some(order()))
+                    .await;
+                script.hold(Hold::Tool, false);
+            }
             Scenario::SteerDuringToolCall => {
                 script.hold(Hold::Tool, true);
                 session.send("turn-1", "task", Delivery::Queue).await;
@@ -514,7 +604,12 @@ fn steered_texts(records: &[WalRecord]) -> Vec<String> {
     records
         .iter()
         .filter_map(|record| match record {
-            WalRecord::Steered { input, .. } => input.first().and_then(text_of).map(str::to_owned),
+            WalRecord::Steered { input, .. }
+            | WalRecord::SendDelivered {
+                input: Some(input),
+                mode: broca_protocol::DeliveryMode::Steer,
+                ..
+            } => input.first().and_then(text_of).map(str::to_owned),
             _ => None,
         })
         .collect()
@@ -585,10 +680,93 @@ fn check(
 ) {
     let before = cut.records();
     let records = after.records();
+    let frames = after.framed();
+    let mut run_ids = HashSet::new();
+    let mut messages = HashSet::new();
+    let mut appended_resumes = std::collections::HashMap::<String, usize>::new();
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            frame.seq,
+            index as u64 + 1,
+            "{label}: sequence numbers must stay gapless"
+        );
+        match &frame.record {
+            WalRecord::RunStarted { run_id, .. } => assert!(
+                run_ids.insert(run_id.clone()),
+                "{label}: a run id was reused"
+            ),
+            WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } => assert!(
+                messages.insert(assistant_message.message_id.clone()),
+                "{label}: an assistant message id was reused"
+            ),
+            WalRecord::ResumeStarted {
+                episode,
+                resumed_from_seq,
+                replayed,
+                redone,
+                indeterminate,
+            } => {
+                let prior = broca_core::replay(&records[..index]).unwrap();
+                assert!(
+                    !prior.run_finished_durable,
+                    "{label}: a finished episode was resumed"
+                );
+                assert_eq!(
+                    Some(episode),
+                    prior.run_id.as_ref(),
+                    "{label}: resume episode"
+                );
+                assert_eq!(*resumed_from_seq, index as u64, "{label}: resume sequence");
+                assert_eq!(
+                    replayed.model_steps, prior.completed_steps,
+                    "{label}: replayed model steps"
+                );
+                assert_eq!(
+                    replayed.messages,
+                    prior.prompt.len() as u64,
+                    "{label}: replayed messages"
+                );
+                assert!(
+                    redone.is_empty(),
+                    "{label}: startup sealing must redo no work"
+                );
+                let expected = match prior.resolution {
+                    broca_core::ReplayResolution::Interrupted { indeterminate } => indeterminate,
+                    _ => Vec::new(),
+                };
+                assert_eq!(indeterminate, &expected, "{label}: indeterminate calls");
+                if index >= before.len() {
+                    let count = appended_resumes.entry(episode.0.clone()).or_default();
+                    *count += 1;
+                    assert_eq!(*count, 1, "{label}: startup resumed the same episode twice");
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(active) = active_run(&before) {
+        assert_eq!(
+            appended_resumes.get(&active.0),
+            Some(&1),
+            "{label}: startup must record its one sealing resume"
+        );
+    }
+    if let Some(lineage) = cut.lineage_id() {
+        assert_eq!(
+            after.lineage_id(),
+            Some(lineage),
+            "{label}: lineage changed"
+        );
+    }
 
-    // The durable prefix is untouched: recovery only appends.
+    // Complete frames are the durable prefix. A torn next frame is discarded by recovery,
+    // not preserved as part of the append-only history.
     assert!(
-        after.bytes.starts_with(&cut.bytes),
+        after
+            .bytes
+            .starts_with(&cut.bytes[..cut.end_of_records(cut.record_count())]),
         "{label}: recovery rewrote the durable prefix"
     );
 
@@ -633,7 +811,10 @@ fn check(
             "{label}: steer {text:?} delivered {} times",
             at.len()
         );
-        if matches!(scenario, Scenario::SteerDuringToolCall) {
+        if matches!(
+            scenario,
+            Scenario::SteerDuringToolCall | Scenario::OrderedSteer
+        ) {
             let result_at = prompt.iter().position(|message| message.role == Role::Tool);
             if let Some(result_at) = result_at {
                 assert!(
@@ -684,14 +865,54 @@ fn check(
         }
     }
 
-    // Every durable queued message runs exactly once, interrupts first.
-    let durable_queue = queued(&before);
+    // Every ordinary durable queued message is consumed once: by an episode, or by a
+    // permanent pre-admission refusal. Ordered steer-only sends must never start episodes.
+    let ordered: HashSet<String> = before
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::DeliveryOrdered { submission_id, .. } => Some(submission_id.0.clone()),
+            _ => None,
+        })
+        .collect();
+    let durable_queue: Vec<_> = queued(&before)
+        .into_iter()
+        .filter(|(id, _)| !ordered.contains(id))
+        .collect();
+    for id in &ordered {
+        let terminals = records.iter().filter(|record| matches!(record,
+            WalRecord::SendEnded { submission_id, .. } | WalRecord::SendDelivered { submission_id, .. } if &submission_id.0 == id)).count();
+        assert!(
+            terminals <= 1,
+            "{label}: ordered send {id} was consumed more than once"
+        );
+        assert!(
+            !episodes
+                .iter()
+                .any(|(_, consumed, _)| consumed.as_ref() == Some(id)),
+            "{label}: a steer-only order started its own run"
+        );
+        if records.iter().any(|record| matches!(record, WalRecord::Queued { submission_id, .. } if &submission_id.0 == id)) {
+            let pending = broca_core::pending_submissions(&records).iter().filter(|entry| &entry.submission_id.0 == id).count();
+            assert_eq!(terminals + pending, 1, "{label}: an ordered send must be pending or consumed exactly once");
+        }
+    }
     for (submission, _) in &durable_queue {
         let runs = episodes
             .iter()
             .filter(|(_, consumed, _)| consumed.as_deref() == Some(submission))
             .count();
-        assert_eq!(runs, 1, "{label}: {submission} ran {runs} times");
+        let retracted = records.iter().filter(|record| matches!(record,
+            WalRecord::Retracted { submission_id, failure: Some(_), .. } if &submission_id.0 == submission)).count();
+        assert_eq!(
+            runs + retracted,
+            1,
+            "{label}: {submission} ran {runs} times and was retracted {retracted} times"
+        );
+        if before.iter().any(|record| matches!(record, WalRecord::Queued { submission_id, request, .. }
+            if &submission_id.0 == submission && request.input.iter().any(|message| text_of(message) == Some("rejected-queued")))) {
+            assert_eq!(runs, 0, "{label}: permanent refusal must not create a ghost run");
+            assert_eq!(retracted, 1);
+        }
     }
     if let Some((interrupt, _)) = durable_queue
         .iter()
@@ -734,13 +955,13 @@ fn check(
         .iter()
         .filter(|(_, consumed, _)| consumed.is_some())
         .count();
-    let retracted_in_cut = before
+    let retracted = records
         .iter()
-        .filter(|record| matches!(record, WalRecord::Retracted { .. }))
+        .filter(|record| matches!(record, WalRecord::Retracted { submission_id, failure: Some(_), .. } if durable_queue.iter().any(|(id, _)| id == &submission_id.0)))
         .count();
     assert_eq!(
         episodes.len(),
-        episodes_of(&before).len() + durable_queue.len() - consumed_in_cut - retracted_in_cut,
+        episodes_of(&before).len() + durable_queue.len() - consumed_in_cut - retracted,
         "{label}: recovery started a turn nobody queued"
     );
 
@@ -812,8 +1033,27 @@ async fn recover(scenario: Scenario, cut: &[u8]) -> (LogImage, LogImage, Vec<Str
         .registry
         .mark_crash_orphans(recovery.wal.as_ref(), candidates, started);
     recovery.registry.seal_marked_crash_orphans(sweep).await;
-    let after = recovery.settle().await;
+    // A steer-only ordered send can remain queued after a crash seals its target run: it
+    // must wait for some later run, never start one merely to empty the queue.
+    let after = recovery
+        .settle_with_ordered_pending(matches!(scenario, Scenario::OrderedSteer))
+        .await;
     let redispatched = recovery.script.dispatched.lock().unwrap().clone();
+    let existing: HashSet<_> = cut
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::RunStarted { run_id, .. } => Some(run_id.0.clone()),
+            _ => None,
+        })
+        .collect();
+    for (run, step) in recovery.script.requested.lock().unwrap().iter() {
+        assert!(
+            !existing.contains(run),
+            "{}: startup sealing re-requested step {step} of existing run {run}",
+            scenario.name()
+        );
+    }
     let _ = std::fs::remove_dir_all(&recovery.root);
     (cut, after, redispatched)
 }
@@ -828,11 +1068,25 @@ async fn every_record_boundary(scenario: Scenario) -> usize {
     let mut steer_pending_at_crash = 0;
     let mut interrupt_durable_run_unfinished = 0;
     let mut cancelled_before_new_run = 0;
-    for records in 0..=total {
-        let cut = log.bytes[..log.end_of_records(records)].to_vec();
+    let mut retracted_at_crash = 0;
+    for (records, torn) in (0..=total).flat_map(|records| {
+        std::iter::once((records, false)).chain((records < total).then_some((records, true)))
+    }) {
+        let cut = broca_crash_harness::cut_log(&log, records, torn);
         let (cut, after, redispatched) = recover(scenario, &cut).await;
         let before = cut.records();
-        if matches!(before.last(), Some(WalRecord::Steered { .. })) {
+        retracted_at_crash +=
+            usize::from(matches!(before.last(), Some(WalRecord::Retracted { .. })));
+        if matches!(
+            before.last(),
+            Some(
+                WalRecord::Steered { .. }
+                    | WalRecord::SendDelivered {
+                        mode: broca_protocol::DeliveryMode::Steer,
+                        ..
+                    }
+            )
+        ) {
             steer_pending_at_crash += 1;
         }
         let interrupt_durable = queued(&before)
@@ -854,7 +1108,10 @@ async fn every_record_boundary(scenario: Scenario) -> usize {
             cancelled_before_new_run += 1;
         }
         check(
-            &format!("{} cut after {records} of {total} records", scenario.name()),
+            &format!(
+                "{} cut after {records} of {total} records (torn={torn})",
+                scenario.name()
+            ),
             scenario,
             &cut,
             &after,
@@ -863,11 +1120,17 @@ async fn every_record_boundary(scenario: Scenario) -> usize {
     }
     let _ = std::fs::remove_dir_all(&reference.root);
     match scenario {
-        Scenario::SteerDuringToolCall | Scenario::SteerBetweenSteps => assert!(
-            steer_pending_at_crash > 0,
-            "{}: no cut fell right after the steer",
-            scenario.name()
+        Scenario::RetractedQueue => assert!(
+            retracted_at_crash > 0,
+            "a cut must retain the permanent queued refusal"
         ),
+        Scenario::SteerDuringToolCall | Scenario::SteerBetweenSteps | Scenario::OrderedSteer => {
+            assert!(
+                steer_pending_at_crash > 0,
+                "{}: no cut fell right after the steer",
+                scenario.name()
+            )
+        }
         Scenario::InterruptAheadOfQueued => assert!(interrupt_durable_run_unfinished > 0),
         _ => {
             assert!(
@@ -888,9 +1151,58 @@ async fn every_record_boundary(scenario: Scenario) -> usize {
 fn assert_reference(scenario: Scenario, records: &[WalRecord]) {
     let endings: Vec<Vec<String>> = episodes_of(records).into_iter().map(|e| e.2).collect();
     match scenario {
-        Scenario::SteerDuringToolCall | Scenario::SteerBetweenSteps => {
+        Scenario::RetractedQueue => {
+            assert_eq!(endings, [vec!["completed".to_owned()]]);
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| matches!(
+                        record,
+                        WalRecord::Retracted {
+                            failure: Some(_),
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+            assert!(!broca_core::replay(records)
+                .unwrap()
+                .prompt
+                .iter()
+                .any(|message| text_of(message) == Some("rejected-queued")));
+        }
+        Scenario::SteerDuringToolCall | Scenario::SteerBetweenSteps | Scenario::OrderedSteer => {
             assert_eq!(endings, [vec!["completed".to_owned()]]);
             assert_eq!(steered_texts(records), ["steered"]);
+            if matches!(scenario, Scenario::OrderedSteer) {
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|record| matches!(record, WalRecord::DeliveryOrdered { .. }))
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|record| matches!(record, WalRecord::SendEnded { .. }))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|record| matches!(record, WalRecord::SendDelivered { .. }))
+                        .count(),
+                    1
+                );
+                assert!(!broca_core::replay(records)
+                    .unwrap()
+                    .prompt
+                    .iter()
+                    .any(|message| text_of(message) == Some("discarded-steer")));
+            }
         }
         Scenario::InterruptDuringModelStream | Scenario::InterruptDuringToolCall => {
             assert_eq!(
@@ -934,6 +1246,16 @@ async fn run_scenario(scenario: Scenario) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn steer_during_a_tool_call_at_every_record_boundary() {
     run_scenario(Scenario::SteerDuringToolCall).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordered_steer_replacement_at_every_record_boundary() {
+    run_scenario(Scenario::OrderedSteer).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn permanent_queued_refusal_at_every_record_boundary() {
+    run_scenario(Scenario::RetractedQueue).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1209,3 +1531,5 @@ async fn a_steer_delivery_receipt_is_the_same_after_a_sigkill_and_restart() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+broca_crash_harness::require_process_kill!();

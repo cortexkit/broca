@@ -72,6 +72,11 @@ const MAX_INFLIGHT_ROUTE_REQUESTS: usize = 64;
 const DISPATCH_LANE_SWEEP_MIN: usize = 64;
 const DROP_LOG_KEY_LIMIT: usize = 256;
 
+/// Start reader-census coverage at daemon startup, before accepting any routes.
+pub fn initialize_session_readers() {
+    crate::session_readers::initialize();
+}
+
 // Serve-side drops are inbound daemon frames rejected by broca's route-binding guard below.
 // They are distinct from broca_subc::FRAME_DROPS, which counts frames dropped on the
 // client-side outbound routes.
@@ -392,6 +397,11 @@ fn health_status(details: &[String]) -> subc_protocol::session::HealthStatus {
     }
 }
 
+fn held_withdrawal_health_detail(withdrawals: &serde_json::Value) -> Option<String> {
+    (withdrawals["failed"].as_u64().unwrap_or(0) > 0 || withdrawals.get("error").is_some())
+        .then(|| "provider-held tool.withdraw failures need attention".into())
+}
+
 fn now_epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -540,6 +550,8 @@ struct BindObservation {
     /// The daemon-stamped principal, converted without change. `None` when the bind carried
     /// none, which is what a daemon that predates principal stamping sends.
     principal: Option<broca_protocol::BindPrincipal>,
+    /// Render once per bind so repeated status polls never allocate a census key.
+    reader_principal: Option<Arc<str>>,
     /// The daemon's scope stamp on the bind, or why there is none. Every send over the route
     /// carries it to admission, which decides the owner check and the scope to freeze.
     scope: broca_protocol::SendScope,
@@ -1088,6 +1100,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
     H: ServeHandler + 'static,
 {
+    initialize_session_readers();
     let stall_state = stall::connection_state();
     let (tx, rx) = broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, stall_state.egress.clone());
     let mut writer = tokio::spawn(drain_writer(write_half, rx));
@@ -1851,6 +1864,7 @@ async fn handle_control_request(
             // records who started it. A session may later adopt a scope only if the scope's
             // owner is the principal on every earlier episode, and an episode recorded without
             // one can never satisfy that.
+            let principal_observation = principal.as_ref().map(to_bind_principal);
             let bind = BindObservation {
                 management: matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. }),
                 agent_data: matches!(&target, subc_protocol::RouteTarget::InternalService { service_id, .. }
@@ -1863,8 +1877,13 @@ async fn handle_control_request(
                 } else {
                     RouteRole::LlmRunner
                 },
-                project_id: scope.as_ref().and_then(|stamp| stamp.project_id.clone()),
-                principal: principal.as_ref().map(to_bind_principal),
+                // The 0.34 bind carries no untrusted project claim. Authenticated project
+                // authority remains on the separate scope/stamped-project path below.
+                project_id: None,
+                reader_principal: Some(crate::session_readers::principal_label(
+                    principal_observation.as_ref(),
+                )),
+                principal: principal_observation,
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
                 stamped_project: scope
                     .as_ref()
@@ -2057,10 +2076,8 @@ async fn handle_control_request(
                 details
                     .push("late-results-rebuild-required: intake completeness is unknown".into());
             }
-            if held_runtime["withdrawals"]["failed"].as_u64().unwrap_or(0) > 0
-                || held_runtime["withdrawals"].get("error").is_some()
-            {
-                details.push("provider-held tool.withdraw failures need attention".into());
+            if let Some(detail) = held_withdrawal_health_detail(&held_runtime["withdrawals"]) {
+                details.push(detail);
             }
             if retention_unreadable > 0 {
                 details.push(format!("{retention_unreadable} retained logs blocked by unreadability without a current projection"));
@@ -2196,6 +2213,11 @@ async fn handle_control_request(
             // this process serves no model-tool route.
             "llm_tools_consent": routes.llm_tools.as_ref().map(|tools| tools.consent_health()),
                 });
+            metrics["scoped_role_route_refusals"] =
+                serde_json::json!(broca_subc::scoped_role_route_refusals());
+            metrics["session_readers"] = crate::session_readers::health();
+            metrics["account_limit_stale_resets"] =
+                serde_json::json!(broca_core::account_limit_stale_resets());
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
                 // status Ok. Fusiform reachability is deliberately absent because health never
@@ -2552,7 +2574,7 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
             .map_err(|_| ServeIoError("request concurrency limiter closed".into()))?;
         let authorization = tokio::select! {
             _ = conn_cancel.cancelled() => return Ok(()),
-            result = authorize_route_request(handler.as_ref(), &session, &bind, &req.method, None) => result,
+            result = authorize_route_request(handler.as_ref(), &session, &bind, &req.method, &req.params) => result,
         };
         if let Err(error) = authorization {
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -2646,11 +2668,11 @@ where
             PreparedRouteRequest::Request(req) => req.method.as_str(),
             PreparedRouteRequest::Subscribe { .. } => OP_SUBSCRIBE,
         };
-        let submission_id = match &prepared {
-            PreparedRouteRequest::Request(req) => req.params.get("submission_id").and_then(serde_json::Value::as_str),
-            PreparedRouteRequest::Subscribe { .. } => None,
+        let params = match &prepared {
+            PreparedRouteRequest::Request(req) => &req.params,
+            PreparedRouteRequest::Subscribe { params, .. } => params,
         };
-        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method, submission_id).await {
+        if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method, params).await {
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
         let write = matches!(
@@ -2666,6 +2688,12 @@ where
             }
         }
         count_management_operation(method);
+        if let Some(op) = crate::session_readers::operation(method) {
+            crate::session_readers::record(
+                bind.reader_principal.as_ref(), op,
+                handler.cached_session_owner(&session, bind.principal.as_ref()),
+            );
+        }
         if describe {
             trace_describe("task_started", channel, epoch, corr);
         }
@@ -2725,15 +2753,30 @@ async fn authorize_route_request<H: ServeHandler>(
     session: &BrocaBindIdentity,
     bind: &BindObservation,
     method: &str,
-    submission_id: Option<&str>,
+    params: &serde_json::Value,
 ) -> Result<(), ServeError> {
     if method == OP_RETRACT {
         handler
-            .authorize_session_retract(session, bind.principal.as_ref(), &bind.scope, submission_id)
+            .authorize_session_retract(
+                session,
+                bind.principal.as_ref(),
+                &bind.scope,
+                params
+                    .get("submission_id")
+                    .and_then(serde_json::Value::as_str),
+            )
             .await
     } else if method == OP_CANCEL {
+        let at = match params.get("at") {
+            None => Some(broca_wal::record::RunCancelAt::Now),
+            Some(at) => match at.as_str() {
+                Some("now") => Some(broca_wal::record::RunCancelAt::Now),
+                Some("step_boundary") => Some(broca_wal::record::RunCancelAt::StepBoundary),
+                _ => None,
+            },
+        };
         handler
-            .authorize_session_owner(session, bind.principal.as_ref(), &bind.scope)
+            .authorize_session_cancel(session, bind.principal.as_ref(), &bind.scope, at)
             .await
     } else {
         handler
@@ -2888,7 +2931,37 @@ where
                 )
                 .await;
             }
-            let mut params: SendParams = match serde_json::from_value(req.params.clone()) {
+            let mut send_params = req.params.clone();
+            let service_tier_level = if broca_protocol::service_tier_enabled() {
+                match cortexkit_role_llm_runner::service_tier::parse_request(
+                    req.params.get("service_tier"),
+                ) {
+                    Ok(level) => {
+                        if let Some(object) = send_params.as_object_mut() {
+                            object.remove("service_tier");
+                        }
+                        level.map(|level| level.as_str().to_owned())
+                    }
+                    Err(problem) => {
+                        return send_error_body(
+                            writer,
+                            ver,
+                            channel,
+                            epoch,
+                            corr,
+                            ErrorBody::new(
+                                "invalid_params",
+                                format!("unsupported service_tier {}", req.params["service_tier"]),
+                            )
+                            .with_detail(problem.detail()),
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut params: SendParams = match serde_json::from_value(send_params) {
                 Ok(p) => p,
                 Err(e) => {
                     let field = broca_wire::send_budget_refusal_field(&req.params)
@@ -3186,6 +3259,13 @@ where
             };
             send_req.request.project_id = bind.project_id.clone();
             send_req.request.inherit_frozen = inherit_frozen;
+            if broca_protocol::service_tier_enabled() {
+                send_req.request.service_tier_level = service_tier_level;
+                send_req
+                    .request
+                    .inherit_frozen
+                    .retain(|param| *param != broca_protocol::request::InheritedParam::ServiceTier);
+            }
             send_req.stop_sequences_named =
                 req.params.pointer("/generation/stop_sequences").is_some();
             send_req.request.principal = bind.principal.clone();
@@ -3398,7 +3478,13 @@ where
                 }
             };
             match handler
-                .cancel_at(session, broca_protocol::RunId(params.run_id), at)
+                .cancel_from(
+                    session,
+                    broca_protocol::RunId(params.run_id),
+                    at,
+                    bind.principal.as_ref(),
+                    &bind.scope,
+                )
                 .await
             {
                 Ok(resp) => send_json_response(writer, ver, channel, epoch, corr, &resp).await,
@@ -4530,6 +4616,7 @@ fn refused_send_code(error: &ServeError) -> String {
             broca_wire::INVALID_PARAMS.into()
         }
         ServeError::VariantUnsupported(_) => "variant_unsupported".into(),
+        ServeError::ServiceTierInvalid { .. } => "invalid_params".into(),
         ServeError::SessionHeld(_) => "session_held".into(),
         ServeError::Open(_, _) => "open_failed".into(),
         ServeError::HistoryUnreachable { .. } => broca_wire::HISTORY_UNREACHABLE.into(),
@@ -4707,6 +4794,7 @@ async fn send_serve_error(
         ServeError::Open(_, _) => "open_failed",
         ServeError::WalNewerWriter { .. } => broca_wire::WAL_NEWER_WRITER,
         ServeError::VariantUnsupported(_) => "variant_unsupported",
+        ServeError::ServiceTierInvalid { .. } => "invalid_params",
         ServeError::SendRetracted { .. } => "send_retracted",
         ServeError::SendEnded {
             submission_id,
@@ -4821,6 +4909,9 @@ async fn send_serve_error(
             "variant": refusal.variant,
             "defined": refusal.defined,
         }));
+    }
+    if let ServeError::ServiceTierInvalid { reason, .. } = err {
+        body = body.with_detail(serde_json::json!({"field":"service_tier", "reason":reason}));
     }
     if let ServeError::WalNewerWriter { missing, .. } = err {
         // Serialized from `broca_wire::WalNewerWriterDetail`, whose bytes the golden file
@@ -6132,6 +6223,83 @@ mod tests {
         assert_eq!(logs[1].fields["phase"], "close");
         assert_eq!(logs[1].fields["outcome"], "cancelled");
         assert_eq!(logs[0].fields["session"], logs[1].fields["session"]);
+    }
+
+    #[tokio::test]
+    async fn scope_gone_withdrawals_do_not_degrade_health_but_other_failures_do() {
+        struct NoRetry;
+        #[async_trait::async_trait]
+        impl broca_module::held_withdrawals::WithdrawTransport for NoRetry {
+            async fn withdraw(
+                &self,
+                _: &broca_core::tool_plane::LateResultRegistration,
+            ) -> (
+                cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+                serde_json::Value,
+            ) {
+                panic!("a terminal refusal must not be retried");
+            }
+        }
+        for (code, failed, scope_gone, expected) in [
+            (
+                subc_protocol::error_codes::SCOPE_NOT_LIVE,
+                0,
+                1,
+                subc_protocol::session::HealthStatus::Ok,
+            ),
+            (
+                subc_protocol::error_codes::SCOPE_ENDED,
+                0,
+                1,
+                subc_protocol::session::HealthStatus::Ok,
+            ),
+            (
+                subc_protocol::error_codes::SCOPE_NOT_CARRIER,
+                1,
+                0,
+                subc_protocol::session::HealthStatus::Degraded,
+            ),
+        ] {
+            let root = broca_test_support::scratch_root().join(format!("withdrawal-health-{code}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let store = Arc::new(
+                broca_module::late_results_store::LateResultsStore::open(
+                    &root.join("late-results.db"),
+                )
+                .unwrap(),
+            );
+            let call = broca_core::tool_plane::LateResultRegistration {
+                lineage: "lineage".into(),
+                call_key: "lineage:4".into(),
+                module: "tools".into(),
+                bind: BrocaBindIdentity::new("/project", "broca", code),
+                scope: None,
+            };
+            store.register_calls(std::slice::from_ref(&call)).unwrap();
+            // Existing outbox rows keep their terminal state; only health accounting changes.
+            store
+                .record_withdrawal(&call, "failed", 1, &serde_json::json!({"code":code}))
+                .unwrap();
+            let service = broca_module::held_withdrawals::HeldWithdrawals::new(
+                store,
+                Arc::new(broca_core::FileWalStore::new(root.join("wal"))),
+                Arc::new(NoRetry),
+            );
+            service.bind_stopping_signal(CancellationToken::new());
+            service.recover().await.unwrap();
+            let withdrawals = service.health();
+            assert_eq!(withdrawals["failed"], failed, "{code}: {withdrawals}");
+            assert_eq!(
+                withdrawals["scope_gone"], scope_gone,
+                "{code}: {withdrawals}"
+            );
+            let details: Vec<_> = held_withdrawal_health_detail(&withdrawals)
+                .into_iter()
+                .collect();
+            assert_eq!(health_status(&details), expected, "{withdrawals}");
+        }
+        let error = serde_json::json!({"failed": 0, "error": "unreadable"});
+        assert!(held_withdrawal_health_detail(&error).is_some());
     }
 
     #[test]
@@ -7927,6 +8095,7 @@ mod tests {
             run_id: broca_protocol::RunId("legacy".into()),
             session,
             config: Box::new(broca_wal::RunConfig {
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -8353,6 +8522,7 @@ mod tests {
                     role: RouteRole::LlmRunner,
                     project_id: None,
                     principal: None,
+                    reader_principal: None,
                     scope: broca_protocol::SendScope::Unstamped,
                     stamped_project: None,
                     consumer_format: Default::default(),
@@ -8817,6 +8987,203 @@ mod tests {
             _run_id: broca_protocol::RunId,
         ) -> Result<RunStatusResponse, ServeError> {
             unimplemented!()
+        }
+    }
+
+    struct CancelAdmissionProbe {
+        unreadable: bool,
+        pending_release: bool,
+        migration_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ServeHandler for CancelAdmissionProbe {
+        async fn authorize_session_owner(
+            &self,
+            _: &BrocaBindIdentity,
+            principal: Option<&broca_protocol::BindPrincipal>,
+            scope: &broca_protocol::SendScope,
+        ) -> Result<(), ServeError> {
+            if self.unreadable {
+                return Err(ServeError::Open(
+                    "ownership history is unreadable".into(),
+                    None,
+                ));
+            }
+            let ownership = broca_core::SessionOwnershipV1 {
+                episodes: 1,
+                first_principal: Some(broca_protocol::BindPrincipal::Reserved {
+                    module_id: "owner".into(),
+                }),
+                ..Default::default()
+            };
+            broca_core::scope_admission::decide_owner_access(&ownership, principal, scope)
+                .map_err(ServeError::ScopeRefused)
+        }
+        async fn check_migration(&self, _: &BrocaBindIdentity, _: bool) -> Result<(), ServeError> {
+            self.migration_reads.fetch_add(1, Ordering::SeqCst);
+            if self.pending_release {
+                Err(ServeError::SessionMoving {
+                    cut_id: "cut-a".into(),
+                })
+            } else {
+                Err(ServeError::SessionMoved {
+                    holder: "remote".into(),
+                })
+            }
+        }
+        async fn send(&self, _: SendRequest) -> Result<SendResponse, ServeError> {
+            unreachable!()
+        }
+        async fn retract(
+            &self,
+            _: &BrocaBindIdentity,
+            _: broca_protocol::SubmissionId,
+        ) -> Result<RetractResponse, ServeError> {
+            unreachable!()
+        }
+        async fn subscribe(
+            &self,
+            _: &BrocaBindIdentity,
+            _: SubscribeFrom,
+            _: mpsc::Sender<Delivery>,
+        ) -> Result<(), ServeError> {
+            unreachable!()
+        }
+        async fn read(&self, _: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
+            unreachable!()
+        }
+        async fn cancel(
+            &self,
+            _: &BrocaBindIdentity,
+            _: broca_protocol::RunId,
+        ) -> Result<CancelResponse, ServeError> {
+            unreachable!()
+        }
+        async fn status(&self, _: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
+            unreachable!()
+        }
+        async fn run_status(
+            &self,
+            _: &BrocaBindIdentity,
+            _: broca_protocol::RunId,
+        ) -> Result<RunStatusResponse, ServeError> {
+            unreachable!()
+        }
+    }
+
+    async fn cancel_admission_probe(
+        unreadable: bool,
+        pending_release: bool,
+        owner: bool,
+    ) -> (serde_json::Value, usize) {
+        let handler = Arc::new(CancelAdmissionProbe {
+            unreadable,
+            pending_release,
+            migration_reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (mut daemon, mut written, serve) =
+            bound_frame_loop(handler.clone(), "cancel-admission").await;
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 2,
+            target: subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new("runner", "cancel-admission"),
+            principal: Some(subc_protocol::Principal::Reserved {
+                module_id: if owner { "owner" } else { "outsider" }.into(),
+            }),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                20,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next_written(&mut written).await.header.ty,
+            FrameType::Response
+        );
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                7,
+                2,
+                21,
+                serde_json::to_vec(
+                    &serde_json::json!({"method":"run.cancel","params":{"unknown":true}}),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let reply = next_written(&mut written).await;
+        assert_eq!((reply.header.ty, reply.header.corr), (FrameType::Error, 21));
+        let body = serde_json::from_slice(&reply.body).unwrap();
+        let reads = handler.migration_reads.load(Ordering::SeqCst);
+        drop(daemon);
+        serve.await.unwrap().unwrap();
+        (body, reads)
+    }
+
+    #[tokio::test]
+    async fn cancel_unauthorized_precedes_migration_and_invalid_params() {
+        for pending_release in [false, true] {
+            let (body, reads) = cancel_admission_probe(false, pending_release, false).await;
+            assert_eq!(body["code"], "scope_owner_mismatch", "{body}");
+            assert_eq!(
+                reads, 0,
+                "an unauthorized caller must not reach the migration gate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_unreadable_ownership_precedes_migration_for_owner_and_non_owner() {
+        for owner in [false, true] {
+            for pending_release in [false, true] {
+                let (body, reads) = cancel_admission_probe(true, pending_release, owner).await;
+                assert_eq!(body["code"], "open_failed", "{body}");
+                assert_eq!(
+                    reads, 0,
+                    "unreadable ownership must fail before the migration gate"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_authorized_owner_retains_moved_and_moving_fences() {
+        for pending_release in [false, true] {
+            let (body, reads) = cancel_admission_probe(false, pending_release, true).await;
+            assert_eq!(
+                body["code"],
+                if pending_release {
+                    "session_moving"
+                } else {
+                    "session_moved"
+                },
+                "{body}"
+            );
+            assert_eq!(reads, 1);
         }
     }
 
@@ -9642,6 +10009,16 @@ mod tests {
             (FrameType::Response, 0, 2)
         );
         let health: serde_json::Value = serde_json::from_slice(&health.body).unwrap();
+        assert!(
+            health["metrics"]["scoped_role_route_refusals"].is_object(),
+            "health.check includes scoped role-open refusal counts keyed by daemon code"
+        );
+        assert!(
+            health["metrics"]["account_limit_stale_resets"]
+                .as_u64()
+                .is_some(),
+            "health.check always exposes the stale account-reset counter"
+        );
         assert_eq!(
             health["metrics"]["retention_repairs_pending"].as_u64(),
             Some(0),

@@ -1641,6 +1641,7 @@ impl broca_core::HookPlane for AdmissionPassHook {
         &self,
         _: &str,
         _: &broca_protocol::BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _: cortexkit_role_step_transform_provider::hook::HookCall,
     ) -> Result<
         cortexkit_role_step_transform_provider::answer::HookAnswer,
@@ -1938,6 +1939,7 @@ async fn a_reader_without_an_installed_compaction_plane_refuses_before_writing()
             &self,
             _: &str,
             _: &broca_protocol::BindIdentity,
+            _scope: Option<&broca_protocol::SessionScope>,
             _: broca_core::compaction_provider::setup::SetupRequest,
         ) -> Result<
             broca_core::compaction_provider::setup::SetupAnswer,
@@ -2529,7 +2531,7 @@ async fn real_mc_compaction_client_uses_isolated_daemon_and_joint_setup() {
     let plane = broca_subc::SubcCompactionPlane::new(conn);
     let request = serde_json::from_value(cases[0]["request"]["params"].clone()).unwrap();
     let setup = plane
-        .setup("magic-context", &bind, request)
+        .setup("magic-context", &bind, None, request)
         .await
         .expect("real MC Setup over shared role route");
     let mut actual = serde_json::to_value(&setup).unwrap();

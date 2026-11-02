@@ -88,3 +88,5 @@ async fn the_script_fixtures_are_what_the_runner_writes_for_a_resume_close_out()
         );
     }
 }
+
+broca_crash_harness::require_process_kill!();

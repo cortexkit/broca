@@ -358,6 +358,7 @@ impl Fixture {
         let (self_tx, rx) = mpsc::channel(64);
         let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
         let mut actor = LineageActor {
+            account_limit_timer: None,
             ceiling_drain_held: false,
             compaction_watch: Default::default(),
             admitting_session_class: None,
@@ -400,6 +401,7 @@ impl Fixture {
             charge_basis_resolver: None,
             startup_recovery_pending: false,
             prior_snapshot: None,
+            sender_policy_cache: None,
             pending_fifo: Vec::new(),
             send_reply: None,
             skip_materialization_submissions: HashSet::new(),
@@ -427,6 +429,7 @@ impl Fixture {
             ended_submissions: Default::default(),
             delivered_submissions: Default::default(),
             restart_admitting: false,
+            deferred_restart_settings: Default::default(),
             restart_waiters: Vec::new(),
             restart_recovery_owns_waiters: false,
             resuming_for_late_result: false,

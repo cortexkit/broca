@@ -68,6 +68,7 @@ impl HookPlane for Scripted {
         &self,
         provider: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         call: HookCall,
     ) -> Result<HookAnswer, HookUnavailable> {
         self.calls
@@ -190,6 +191,7 @@ fn runtime<'a>(
     writer: &'a WalHandle,
 ) -> HookRuntime<'a> {
     HookRuntime {
+        scope: None,
         plan,
         plane,
         bind,
@@ -1450,6 +1452,7 @@ impl HookPlane for BlockingHooks {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         call: HookCall,
     ) -> Result<HookAnswer, HookUnavailable> {
         let id = match call.subject {
@@ -1937,6 +1940,7 @@ impl HookPlane for DropTracked {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _: HookCall,
     ) -> Result<HookAnswer, HookUnavailable> {
         struct OnDrop(Arc<std::sync::atomic::AtomicBool>);

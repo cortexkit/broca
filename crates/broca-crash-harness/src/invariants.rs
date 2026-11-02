@@ -41,12 +41,21 @@ pub struct CheckInput<'a> {
     pub plane: &'a HarnessPlane,
     /// The request bytes of the uninterrupted run, by 0-based step index.
     pub reference_sent: &'a BTreeMap<usize, Vec<u8>>,
+    pub invocations: &'a [crate::scenario::Invocation],
 }
 
 /// What a resume that continues the episode must list as redone, from replay's resolution:
 /// the planned calls that never left the process, or the model step that has no durable
 /// output. A resume that seals redoes nothing.
 fn expected_redo(prior: &ReplayState) -> Vec<ResumeRedo> {
+    // An old durable compaction wait ends its run; it cannot authorize another model call.
+    if prior
+        .compaction
+        .state()
+        .is_some_and(|state| state.open_wait.is_some())
+    {
+        return Vec::new();
+    }
     match &prior.resolution {
         ReplayResolution::Resume {
             pending: Some(pending),
@@ -64,6 +73,23 @@ fn expected_redo(prior: &ReplayState) -> Vec<ResumeRedo> {
     }
 }
 
+fn resume_record_after_refreezes<'a>(appended: &'a [WalRecord], label: &str) -> &'a WalRecord {
+    let first = appended
+        .iter()
+        .find(|record| {
+            !matches!(
+                record,
+                WalRecord::RunConfigRefrozen { .. } | WalRecord::RunAuthRefrozen { .. }
+            )
+        })
+        .unwrap_or_else(|| panic!("{label}: no resume record after refreezes"));
+    assert!(
+        matches!(first, WalRecord::ResumeStarted { .. }),
+        "{label}: the resume wrote {first:?} before its resume record"
+    );
+    first
+}
+
 /// Run every check. Panics naming the kill and the property that failed.
 pub fn check(input: &CheckInput<'_>) {
     let label = input.label;
@@ -71,7 +97,6 @@ pub fn check(input: &CheckInput<'_>) {
     let after_framed = input.after.framed();
     let after: Vec<WalRecord> = after_framed.iter().map(|f| f.record.clone()).collect();
     let prior = replay(&prefix).unwrap_or_else(|e| panic!("{label}: the prefix must replay: {e}"));
-    let appended = &after[prefix.len().min(after.len())..];
 
     // 1. Ids and ordinals are never reused or renumbered.
     //    The resume appends only: what was durable stays exactly as it was.
@@ -269,10 +294,15 @@ pub fn check(input: &CheckInput<'_>) {
             );
         }
     }
-    if matches!(
-        prior.resolution,
-        ReplayResolution::Interrupted { .. } | ReplayResolution::LineageIdle { .. }
-    ) {
+    if prior
+        .compaction
+        .state()
+        .is_some_and(|state| state.open_wait.is_some())
+        || matches!(
+            prior.resolution,
+            ReplayResolution::Interrupted { .. } | ReplayResolution::LineageIdle { .. }
+        )
+    {
         assert_eq!(
             input.provider.request_count(),
             0,
@@ -295,63 +325,112 @@ pub fn check(input: &CheckInput<'_>) {
         );
     }
 
-    // 6. One resume record per resume, written before anything else the resume writes, saying
+    // 6. One resume record per resume, before any work. Only the resume's renderer and
+    //    credential updates (RunConfigRefrozen/RunAuthRefrozen) may precede it, so the background
+    //    cache warmer sees the new config before unpausing. The marker says
     //    what replay found; none when there was no unfinished episode to resume. The resume
     //    record never changes the reconstructed conversation and never appears in a provider
     //    request.
-    let resume_records: Vec<&WalRecord> = appended
-        .iter()
-        .filter(|record| matches!(record, WalRecord::ResumeStarted { .. }))
-        .collect();
-    if resumes_an_episode {
-        assert_eq!(
-            resume_records.len(),
-            1,
-            "{label}: expected one resume record, got {resume_records:?}"
-        );
-        let expected_indeterminate = match &prior.resolution {
-            ReplayResolution::Interrupted { indeterminate } => indeterminate.clone(),
-            _ => Vec::new(),
-        };
-        let last_seq = input.prefix.framed().last().map_or(0, |framed| framed.seq);
-        match &appended[0] {
-            WalRecord::ResumeStarted {
-                episode,
-                resumed_from_seq,
-                replayed,
-                redone,
-                indeterminate,
-            } => {
-                assert_eq!(
-                    Some(episode),
-                    prior.run_id.as_ref(),
-                    "{label}: resume record episode"
-                );
-                assert_eq!(*resumed_from_seq, last_seq, "{label}: resume record seq");
-                assert_eq!(
-                    replayed.model_steps, prior.completed_steps,
-                    "{label}: replayed steps"
-                );
-                assert_eq!(
-                    replayed.messages,
-                    prior.prompt.len() as u64,
-                    "{label}: replayed messages"
-                );
-                assert_eq!(
-                    indeterminate, &expected_indeterminate,
-                    "{label}: indeterminate calls"
-                );
-                assert_eq!(redone, &expected_redo(&prior), "{label}: redone");
-            }
-            other => {
-                panic!("{label}: the resume's first record is {other:?}, not its resume record")
-            }
-        }
-    } else {
+    // A cut before the first record starts a fresh run, which may itself pause and resume.
+    // Check every loop entry against its own durable prefix, not just the original kill.
+    assert!(
+        !input.invocations.is_empty(),
+        "{label}: no real-loop invocation was observed"
+    );
+    assert_eq!(
+        input.invocations[0].prefix, prefix_framed,
+        "{label}: the first invocation did not start from the killed prefix"
+    );
+    for (index, invocation) in input.invocations.iter().enumerate() {
         assert!(
-            resume_records.is_empty(),
-            "{label}: a resume record with nothing to resume"
+            invocation.prefix.len() <= after_framed.len(),
+            "{label}: an invocation lost durable records"
         );
+        assert_eq!(
+            &after_framed[..invocation.prefix.len()],
+            invocation.prefix.as_slice(),
+            "{label}: an invocation rewrote its reconstructed prefix"
+        );
+        let invocation_records: Vec<_> = invocation
+            .prefix
+            .iter()
+            .map(|frame| frame.record.clone())
+            .collect();
+        let prior = replay(&invocation_records).expect("the invocation prefix replays");
+        let end = input
+            .invocations
+            .get(index + 1)
+            .map_or(after.len(), |next| next.prefix.len());
+        let appended = &after[invocation.prefix.len()..end];
+        let stays_paused = matches!(
+            prior.resolution,
+            ReplayResolution::AuthRequired {
+                reason: broca_protocol::PauseReason::AuthRequired,
+                ..
+            }
+        ) && !invocation.auth_resolved;
+        if stays_paused {
+            assert!(
+                appended.is_empty(),
+                "{label}: an unresolved auth pause wrote new records"
+            );
+        }
+        let resumes_an_episode =
+            prior.run_id.is_some() && !prior.run_finished_durable && !stays_paused;
+        let resume_records: Vec<&WalRecord> = appended
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ResumeStarted { .. }))
+            .collect();
+        if resumes_an_episode {
+            assert_eq!(
+                resume_records.len(),
+                1,
+                "{label}: expected one resume record, got {resume_records:?}"
+            );
+            let expected_indeterminate = match &prior.resolution {
+                ReplayResolution::Interrupted { indeterminate } => indeterminate.clone(),
+                _ => Vec::new(),
+            };
+            let last_seq = invocation.prefix.last().map_or(0, |framed| framed.seq);
+            match resume_record_after_refreezes(appended, label) {
+                WalRecord::ResumeStarted {
+                    episode,
+                    resumed_from_seq,
+                    replayed,
+                    redone,
+                    indeterminate,
+                } => {
+                    assert_eq!(
+                        Some(episode),
+                        prior.run_id.as_ref(),
+                        "{label}: resume record episode"
+                    );
+                    assert_eq!(*resumed_from_seq, last_seq, "{label}: resume record seq");
+                    assert_eq!(
+                        replayed.model_steps, prior.completed_steps,
+                        "{label}: replayed steps"
+                    );
+                    assert_eq!(
+                        replayed.messages,
+                        prior.prompt.len() as u64,
+                        "{label}: replayed messages"
+                    );
+                    assert_eq!(
+                        indeterminate, &expected_indeterminate,
+                        "{label}: indeterminate calls"
+                    );
+                    assert_eq!(redone, &expected_redo(&prior), "{label}: redone");
+                }
+                other => {
+                    panic!("{label}: the resume's first record is {other:?}, not its resume record")
+                }
+            }
+        } else {
+            assert!(
+                resume_records.is_empty(),
+                "{label}: a resume record without an active continuation"
+            );
+        }
     }
     let without_resume_records: Vec<WalRecord> = after
         .iter()
@@ -430,3 +509,39 @@ pub fn check(input: &CheckInput<'_>) {
         }
     }
 }
+
+#[test]
+fn resume_record_order_rejects_work_before_the_marker() {
+    use serde_json::json;
+    let resume = WalRecord::ResumeStarted {
+        episode: broca_protocol::RunId("r".into()),
+        resumed_from_seq: 1,
+        replayed: Default::default(),
+        redone: vec![],
+        indeterminate: vec![],
+    };
+    for value in [
+        json!({"type":"step_started","step_id":1}),
+        json!({"type":"tool_dispatch_intent","batch_id":"b","tool_call_id":"t","args":{}}),
+        json!({"type":"tool_result","batch_id":"b","result":{"tool_call_id":"t","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}),
+        json!({"type":"run_finished","reason":"completed","usage":{}}),
+    ] {
+        let record = serde_json::from_value(value).unwrap();
+        assert!(std::panic::catch_unwind(|| resume_record_after_refreezes(
+            &[record, resume.clone()],
+            "forbidden prefix"
+        )
+        .clone())
+        .is_err());
+    }
+    let refreeze = WalRecord::RunAuthRefrozen {
+        ts_ms: None,
+        auth_selection: serde_json::from_value(json!({"credential_id":"resolved"})).unwrap(),
+    };
+    assert_eq!(
+        resume_record_after_refreezes(&[refreeze, resume.clone()], "allowed prefix"),
+        &resume
+    );
+}
+
+crate::require_process_kill!();

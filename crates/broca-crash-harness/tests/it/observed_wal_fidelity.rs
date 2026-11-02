@@ -44,3 +44,5 @@ fn observed_wrappers_forward_every_production_override() {
         );
     }
 }
+
+broca_crash_harness::require_process_kill!();

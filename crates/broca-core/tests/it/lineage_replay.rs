@@ -25,6 +25,7 @@ use broca_wal::{PauseReason, RunConfig, RunOrigin, WalRecord};
 
 fn run_config(max_tokens: u32) -> RunConfig {
     RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -78,6 +79,7 @@ fn start(run: &str, text: &str, max_tokens: u32) -> WalRecord {
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(run_config(max_tokens)),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -295,6 +297,7 @@ fn episode_terminal_does_not_seal_the_lineage() {
 fn auth_required_pause_is_resumable_not_sealed() {
     let mut recs = vec![start("r1", "q1", 100), step_text(1, "partial")];
     recs.push(WalRecord::RunPaused {
+        account_limit: None,
         ts_ms: None,
         run_id: RunId("r1".into()),
         reason: PauseReason::AuthRequired,
@@ -355,6 +358,7 @@ fn pause_takes_precedence_over_natural_end() {
         start("r1", "q1", 100),
         step_text(1, "answer"),
         WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r1".into()),
             ts_ms: None,
             reason: PauseReason::AuthRequired,
@@ -404,6 +408,7 @@ fn run_started_over_paused_episode_is_corrupt() {
         start("r1", "q1", 100),
         step_text(1, "partial"),
         WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r1".into()),
             ts_ms: None,
             reason: PauseReason::AuthRequired,
@@ -438,6 +443,7 @@ fn replay_recovers_the_last_episodes_config() {
 fn restart_pause_is_resumable_not_sealed() {
     let mut records = vec![start("r1", "q1", 100), step_text(1, "partial")];
     records.push(WalRecord::RunPaused {
+        account_limit: None,
         ts_ms: None,
         run_id: RunId("r1".into()),
         reason: PauseReason::Restart,

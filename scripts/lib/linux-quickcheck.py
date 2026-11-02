@@ -46,7 +46,12 @@ def rows(filename):
 def test_filter(wanted):
     # nextest consumes the already-built binary inventory; filters never reach
     # Cargo's package selection or create another set of dependency artifacts.
-    selections = [f"(package(={p}) & (kind(lib) | kind(bin)))" for p in sorted(wanted)]
+    # Exhaustive sweeps listed in quickcheck-slow-tests.list run once per batch in the Linux
+    # preflight instead of in every commit attestation.
+    slow = [f"(package(={package}) & test(={name}))"
+            for package, name, *_ in rows("quickcheck-slow-tests.list") if package in wanted]
+    unit = "(kind(lib) | kind(bin))" if not slow else f"(kind(lib) | kind(bin)) & not ({' | '.join(slow)})"
+    selections = [f"(package(={p}) & {unit})" for p in sorted(wanted)]
     for package, target, *_ in rows("quickcheck-feature-tests.list"):
         if package in wanted:
             selections.append(f"(package(={package}) & binary(={target}))")

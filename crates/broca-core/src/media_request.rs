@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::media_store::{MediaReadError, MediaStore};
 use crate::placement::{AppendKind, Placement, PlacementAction};
 
+mod initialization;
 mod seed;
+pub use initialization::{initialize_media_checkpoint, InitializedMedia};
 
 impl seed::MediaCheckpoint {
     /// Restore the authenticated compaction state without replaying media admissions;

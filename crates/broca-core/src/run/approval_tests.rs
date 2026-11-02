@@ -38,6 +38,10 @@ use memory_wal::MemoryWal;
 #[path = "approval_tests/resume_close_out_tests.rs"]
 mod resume_close_out_tests;
 
+#[cfg(feature = "test-clock")]
+#[path = "approval_tests/recovery_late_tests.rs"]
+mod recovery_late_tests;
+
 // These limits catch hangs, not slow storage or approval performance. Logic tests
 // use a sync-aware memory WAL; disk crash-cut tests opt in to a file-backed rig.
 const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(120);
@@ -65,6 +69,7 @@ impl crate::HookPlane for Hooks {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         hook: HookCall,
     ) -> Result<HookAnswer, crate::HookUnavailable> {
         if let Subject::PreTool { input, .. } = &hook.subject {
@@ -133,18 +138,26 @@ impl ElicitationPlane for Questions {
         _: u64,
     ) -> Result<ApprovalFiling, ApprovalRouteError> {
         let seq: u64 = key.rsplit_once(':').unwrap().1.parse().unwrap();
-        assert_eq!(
-            key,
-            format!("{}:{seq}", self.lineage),
-            "the filing must reuse the Prepared anchor"
-        );
+        let records = rig_records(&self.store, self.memory.as_ref(), &ctx.bind).unwrap();
+        let generation = records
+            .iter()
+            .take_while(|frame| frame.seq < seq)
+            .filter_map(|frame| match &frame.record {
+                WalRecord::RecoveryCut { recovery } => Some(&recovery.cut_id),
+                _ => None,
+            })
+            .last();
+        let expected = match generation {
+            Some(generation) => format!("{}~{generation}:{seq}", self.lineage),
+            None => format!("{}:{seq}", self.lineage),
+        };
+        assert_eq!(key, expected, "the filing must reuse the Prepared anchor");
         assert!(
             self.head.load(Ordering::SeqCst) >= seq,
             "Prepared synced before filing"
         );
         assert!(
-            rig_records(&self.store, self.memory.as_ref(), &ctx.bind)
-                .unwrap()
+            records
                 .iter()
                 .any(|frame| frame.seq == seq && frame.record == *record),
             "Prepared frame must be durable before filing"
@@ -998,6 +1011,7 @@ impl Rig {
         restart: bool,
     ) -> BatchOutcome {
         let runtime = HookRuntime {
+            scope: None,
             plan: &self.plan,
             plane: self.control.hook_plane.as_ref().unwrap(),
             bind: &self.bind,

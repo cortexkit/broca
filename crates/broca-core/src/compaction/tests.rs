@@ -425,6 +425,7 @@ impl CompactionPlane for Scripted {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         self.setups.fetch_add(1, Ordering::SeqCst);
@@ -472,6 +473,7 @@ async fn run_setup_for(
         setups: AtomicUsize::new(0),
     });
     let runtime = runtime::Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: Some(&plane),
@@ -615,6 +617,7 @@ impl CompactionPlane for SlowRide {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         Err(CompactionUnavailable)
@@ -623,6 +626,7 @@ impl CompactionPlane for SlowRide {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::ride::RideRequest,
     ) -> Result<crate::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
         self.deadlines.lock().unwrap().push(request.deadline_ms);
@@ -647,6 +651,7 @@ async fn ride_after(
     });
     let plane: Arc<dyn CompactionPlane> = slow.clone();
     let runtime = runtime::Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: Some(&plane),
@@ -773,6 +778,153 @@ async fn recorded_waits_are_sealed_without_a_provider() {
         assert!(state.open_wait.is_none());
         let _ = writer.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn legacy_wait_resume_is_recorded_before_its_only_closure() {
+    use crate::{FileLeaseStore, FileWalStore, RunControl, RunRequest, WalStore};
+    struct NoProvider;
+    #[async_trait::async_trait]
+    impl crate::Provider for NoProvider {
+        async fn step(
+            &self,
+            _: broca_protocol::StepId,
+            _: &broca_protocol::CallOptions,
+        ) -> tokio::sync::mpsc::Receiver<broca_protocol::NormalizedEvent> {
+            panic!("legacy wait recovery must not request a provider step")
+        }
+    }
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../broca-wal/tests/fixtures/pre_flow_scoped_run_started.json"
+    ))
+    .unwrap();
+    let started: WalRecord = serde_json::from_value(fixture["record"].clone()).unwrap();
+    let WalRecord::RunStarted {
+        run_id,
+        session,
+        config,
+        input,
+        scope,
+        principal,
+        project_id,
+        submission_id,
+        send_id,
+        request_identity_digest,
+        ..
+    } = started.clone()
+    else {
+        unreachable!()
+    };
+    let submission = serde_json::from_value(serde_json::json!({"model":config.model,"input":input,"tools":[],"stop_when":[{"type":"step_count","n":1}]})).unwrap();
+    let mut request = RunRequest::from_submission(
+        submission,
+        run_id.clone(),
+        session,
+        broca_protocol::SubmissionId("old-wait".into()),
+    );
+    request.scope = scope;
+    request.principal = principal;
+    request.project_id = project_id;
+    request.submission_id = submission_id;
+    request.send_id = send_id;
+    request.request_identity_digest = request_identity_digest;
+    let root = broca_test_support::scratch_root().join("legacy-wait-resume-marker");
+    let store = FileWalStore::new(root.join("wal"));
+    let mut wal = store.open(&request.session).unwrap();
+    wal.append(1, &started, true).unwrap();
+    wal.append(1, &setup_record(None), true).unwrap();
+    wal.append(
+        1,
+        &WalRecord::CompactionRequest {
+            provider: "provider".into(),
+            request_id: "old-request".into(),
+        },
+        true,
+    )
+    .unwrap();
+    let lineage = wal.lineage_id().unwrap().to_string();
+    wal.append(
+        1,
+        &WalRecord::CompactionAnswer {
+            provider: "provider".into(),
+            request_id: "old-request".into(),
+            cursor: CompactionCursor {
+                lineage_id: lineage,
+                after_ordinal: None,
+            },
+            disposition: CompactionDisposition::Wait,
+            rejected: None,
+            wait: Some(CompactionWait {
+                reason: "work".into(),
+                bound_ms: 10,
+            }),
+        },
+        true,
+    )
+    .unwrap();
+    drop(wal);
+    let before = store.read_records(&request.session).unwrap();
+    let path = store.wal_path(&request.session);
+    let bytes = std::fs::read(&path).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+    let leases = FileLeaseStore::new(root.join("lease"));
+    let summary = crate::run_loop_with_control(
+        request.clone(),
+        &NoProvider,
+        &crate::StubToolPlane::new(),
+        &leases,
+        &crate::AllowAll,
+        &store,
+        None,
+        RunControl::default(),
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.reason, RunFinishReason::Interrupted);
+    let after = store.read_records(&request.session).unwrap();
+    let appended = &after[before.len()..];
+    assert_eq!(
+        appended
+            .iter()
+            .filter(|frame| matches!(frame.record, WalRecord::ResumeStarted { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        matches!(&appended[0].record, WalRecord::ResumeStarted { episode, resumed_from_seq, redone, indeterminate, .. }
+        if episode == &run_id && *resumed_from_seq == before.last().unwrap().seq && redone.is_empty() && indeterminate.is_empty())
+    );
+    assert!(matches!(
+        appended[1].record,
+        WalRecord::CompactionWait {
+            exited: CompactionWaitExit::Interrupted,
+            ..
+        }
+    ));
+    assert!(matches!(
+        appended[2].record,
+        WalRecord::RunFinished {
+            reason: RunFinishReason::Interrupted,
+            ..
+        }
+    ));
+    assert_eq!(appended.len(), 3);
+    assert!(std::fs::read(&path).unwrap().starts_with(&bytes));
+    crate::run_loop_with_control(
+        request.clone(),
+        &NoProvider,
+        &crate::StubToolPlane::new(),
+        &leases,
+        &crate::AllowAll,
+        &store,
+        None,
+        RunControl::default(),
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(store.read_records(&request.session).unwrap(), after);
 }
 
 /// The replacement ceiling is broca's own, independent of configuration: an initial message
@@ -1139,6 +1291,7 @@ impl CompactionPlane for OneView {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         let mut answer = ready();
@@ -1153,6 +1306,7 @@ impl CompactionPlane for OneView {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::view::ViewGetRequest,
     ) -> Result<crate::compaction_provider::view::ViewGetAnswer, CompactionUnavailable> {
         use crate::compaction_provider::view::ViewGetAnswer;
@@ -1183,6 +1337,7 @@ impl CompactionPlane for OneView {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::ride::RideRequest,
     ) -> Result<crate::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
         use crate::compaction_provider::ride::RideAnswer;
@@ -1244,6 +1399,7 @@ async fn presetless_compaction_setup_omits_the_member_on_the_real_call() {
             &self,
             _: &str,
             _: &BindIdentity,
+            _scope: Option<&broca_protocol::SessionScope>,
             request: SetupRequest,
         ) -> Result<SetupAnswer, CompactionUnavailable> {
             assert!(serde_json::to_value(&request)
@@ -1977,6 +2133,7 @@ impl CompactionPlane for RacingViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         Err(CompactionUnavailable)
@@ -1985,6 +2142,7 @@ impl CompactionPlane for RacingViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::view::ViewGetRequest,
     ) -> Result<crate::compaction_provider::view::ViewGetAnswer, CompactionUnavailable> {
         self.fetches.lock().unwrap().push(request.view_version);
@@ -2035,6 +2193,7 @@ async fn idle_boundary_applies_only_the_newest_view_announced_during_its_fetch()
     let (applied, ()) = tokio::join!(
         runtime::apply_idle_view(
             &session,
+            None,
             &writer,
             &plane,
             Some(views),
@@ -2095,6 +2254,7 @@ async fn step_boundary_logs_applied_and_superseded_views_with_session_ref() {
         ..Default::default()
     };
     let runtime = runtime::Runtime {
+        scope: None,
         provider: "provider",
         bind: &session,
         plane: Some(&plane),
@@ -2190,6 +2350,7 @@ async fn idle_view_records_lower_estimate_and_repairs_every_cut_before_wake() {
         let plane: Arc<dyn CompactionPlane> = plane;
         assert!(runtime::apply_idle_view(
             &bind(),
+            None,
             &writer,
             &plane,
             None,

@@ -1316,6 +1316,7 @@ async fn run_status_pause_cause_matches_session_read() {
         &[
             started(&key, "run-paused", "auth"),
             WalRecord::RunPaused {
+                account_limit: None,
                 ts_ms: None,
                 run_id: RunId("run-paused".into()),
                 reason: PauseReason::AuthRequired,
@@ -1392,6 +1393,7 @@ async fn run_status_without_a_cause_omits_the_cause_keys() {
         &[
             started(&paused, "run-paused-bare", "auth"),
             WalRecord::RunPaused {
+                account_limit: None,
                 ts_ms: None,
                 run_id: RunId("run-paused-bare".into()),
                 reason: PauseReason::AuthRequired,
@@ -1669,6 +1671,7 @@ async fn idle_read_flush_failure_hides_the_unproven_tail() {
 
 fn min_config() -> RunConfig {
     RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -2392,6 +2395,7 @@ async fn session_read_and_control_projection_skip_provider_attempt_records() {
                 (1, broca_protocol::AttemptOutcome::Complete),
             ] {
                 with_attempts.push(WalRecord::ModelAttemptFinished {
+                    account_limit_disposition: None,
                     attempt_id: None,
                     reservation: None,
                     envelope: None,
@@ -3266,6 +3270,7 @@ async fn read_lineage_state_paused_and_active_with_open_dispatch() {
         &[
             started(&paused, "run-paused", "auth"),
             WalRecord::RunPaused {
+                account_limit: None,
                 ts_ms: None,
                 run_id: RunId("run-paused".into()),
                 reason: PauseReason::AuthRequired,

@@ -328,7 +328,7 @@ fn scan_constructors(source: &str, variants: &[&str], deferred_fields: bool) -> 
                                     .rev()
                                     .find(|at| tokens[*at] == "fn")
                                     .is_some_and(|at| {
-                                        tokens.get(at + 1) == Some(&"close_out_open_batch")
+                                        tokens.get(at + 1) == Some(&"close_out_surviving_batch")
                                     })
                             {
                                 found.push(format!("{}.{}", tokens[i], tokens[at]));
@@ -633,4 +633,17 @@ fn no_production_path_writes_deferred_call_records() {
         true
     )
     .is_empty());
+    for (helper, allowed) in [
+        ("close_out_surviving_batch", true),
+        ("close_out_open_batch", false),
+        ("untrusted_helper", false),
+    ] {
+        let source =
+            format!("fn {helper}() {{ WalRecord::ToolResult {{ withdraw_elicitation, }} }}");
+        assert_eq!(
+            scan_constructors(&source, DEFERRED_VARIANTS, true).is_empty(),
+            allowed,
+            "only the surviving-batch seal helper can forward a withdrawal"
+        );
+    }
 }

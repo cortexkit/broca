@@ -592,6 +592,7 @@ fn text_reply(message_id: String, text: String) -> Vec<NormalizedEvent> {
 
 fn message(role: Role, text: String) -> Message {
     Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,

@@ -9,6 +9,10 @@ use broca_core::{
     *,
 };
 use broca_crash_harness::wal::LogImage;
+use broca_crash_harness::{
+    scenario::{HarnessPlane, ScenarioExtension},
+    KillReport, Render, Resumed, RunnerHandle, Scenario,
+};
 use broca_protocol::*;
 use broca_wal::{DeferredDecision, WalRecord};
 use serde_json::json;
@@ -131,6 +135,7 @@ impl HookPlane for Hook {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         call: HookCall,
     ) -> Result<HookAnswer, HookUnavailable> {
         if serde_json::to_value(&call.subject).unwrap()["phase"] == "approve" {
@@ -327,7 +332,10 @@ impl ToolPlane for Tools {
         let frames = FileWalStore::new(&self.root)
             .read_records(&ctx.bind)
             .unwrap();
-        assert!(frames.iter().any(|frame| matches!(&frame.record, WalRecord::ApprovalRecorded { call_key, decision:DeferredDecision::Approved, .. } if call_key == key)));
+        assert!(frames.iter().any(|frame| matches!(&frame.record,
+            WalRecord::ApprovalRecorded { call_key, decision:DeferredDecision::Approved, .. }
+            | WalRecord::LateApprovalRecorded { call_key, decision:broca_wal::LateDecision::Approved, .. }
+            if call_key == key)));
         self.dispatch(ctx, call).await
     }
 }
@@ -384,68 +392,50 @@ async fn run(
     (summary, sent, model.steps.load(Ordering::SeqCst), keys)
 }
 
-#[tokio::test]
-async fn every_approval_record_boundary_resumes_without_second_dispatch_or_model_step() {
-    let reference = root("reference");
-    let (summary, sent, _, _) = run(&reference, req(), false).await;
-    assert_eq!(summary.reason, caller::RunFinishReason::Completed);
-    assert_eq!(sent.len(), 2);
-    let path = FileWalStore::new(&reference).wal_path(&req().session);
-    let log = LogImage::read(&path);
-    for cut in 1..=log.record_count() {
-        let dir = root("cut");
-        let store = FileWalStore::new(&dir);
-        let path = store.wal_path(&req().session);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, &log.bytes[..log.end_of_records(cut)]).unwrap();
-        let before = store.read_records(&req().session).unwrap();
-        let prepared: Vec<_> = before
-            .iter()
-            .filter(|frame| matches!(frame.record, WalRecord::ToolCallDeferred { .. }))
-            .map(|frame| frame.seq)
-            .collect();
-        let intents: Vec<_> = before
-            .iter()
-            .filter_map(|frame| match &frame.record {
-                WalRecord::ToolDispatchIntent { tool_call_id, .. } => Some(tool_call_id.0.clone()),
-                _ => None,
-            })
-            .collect();
-        let (_, resumed_sent, _, keys) = run(&dir, req(), false).await;
-        assert!(
-            resumed_sent.iter().all(|id| !intents.contains(id)),
-            "cut {cut} must never resend a durable intent"
-        );
-        let after = store.read_records(&req().session).unwrap();
-        for seq in prepared {
-            assert_eq!(
-                after
-                    .iter()
-                    .filter(|frame| frame.seq == seq
-                        && matches!(frame.record, WalRecord::ToolCallDeferred { .. }))
-                    .count(),
-                1
-            );
-        }
-        if !keys.is_empty() {
-            let lineage = log.lineage_id().unwrap();
-            for key in keys {
-                assert!(key.starts_with(&format!("{lineage}:")));
+struct ApprovalScenario;
+
+impl ScenarioExtension for ApprovalScenario {
+    fn setup(&self, root: &Path, control: &mut RunControl, plane: &mut HarnessPlane) {
+        let root = root.join("wal");
+        control.manifest = Some(Arc::new(plan()));
+        control.hook_plane = Some(Arc::new(Hook));
+        control.elicitation_plane = Some(Arc::new(Questions {
+            stop: None,
+            keys: Mutex::new(Vec::new()),
+            root: root.clone(),
+            kill: false,
+        }));
+        plane.set_inner(Arc::new(Tools {
+            sent: Mutex::new(Vec::new()),
+            root,
+            kill: false,
+        }));
+    }
+
+    fn check(&self, kill: &KillReport, resumed: &Resumed) {
+        let before = kill.durable.framed();
+        let after = resumed.log.framed();
+        for frame in &before {
+            if matches!(frame.record, WalRecord::ToolCallDeferred { .. }) {
+                assert_eq!(after.iter().filter(|next| *next == frame).count(), 1);
+            }
+            if let WalRecord::ToolDispatchIntent { tool_call_id, .. } = &frame.record {
+                assert_eq!(resumed.plane.dispatch_count(tool_call_id), 0);
             }
         }
-        let finished_before = before
-            .iter()
-            .filter(|frame| {
-                matches!(
-                    frame.record,
-                    WalRecord::ModelStepFinished {
-                        step_id: StepId(1),
-                        ..
-                    }
-                )
-            })
-            .count();
-        if finished_before > 0 {
+        if before.iter().any(|frame| {
+            matches!(
+                frame.record,
+                WalRecord::ModelStepFinished {
+                    step_id: StepId(1),
+                    ..
+                }
+            )
+        }) {
+            assert!(
+                !resumed.provider.sent().contains_key(&0),
+                "step 1 must not be regenerated"
+            );
             assert_eq!(
                 after
                     .iter()
@@ -457,13 +447,465 @@ async fn every_approval_record_boundary_resumes_without_second_dispatch_or_model
                         }
                     ))
                     .count(),
-                1,
-                "Prepared resume never regenerates its model step"
+                1
             );
         }
-        std::fs::remove_dir_all(dir).unwrap();
+        let lineage = resumed.log.lineage_id().unwrap();
+        for frame in &after {
+            if let WalRecord::ApprovalRecorded { call_key, .. } = &frame.record {
+                assert!(call_key.starts_with(&format!("{lineage}:")));
+            }
+        }
     }
-    std::fs::remove_dir_all(reference).unwrap();
+}
+
+fn approval_scripts() -> Vec<Vec<NormalizedEvent>> {
+    [
+        vec![
+            ContentBlock::ToolCall(call("a", "edit")),
+            ContentBlock::ToolCall(call("b", "edit")),
+        ],
+        vec![ContentBlock::Text {
+            text: "done".into(),
+        }],
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, content)| {
+        vec![
+            NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                message: AssistantMessage {
+                    message_id: MessageId(format!("m{}", index + 1)),
+                    content,
+                },
+            }),
+            NormalizedEvent::Control(ProviderControl::Finished {
+                usage: Usage::default(),
+                finish_reason: if index == 0 {
+                    content::FinishReason::ToolCalls
+                } else {
+                    content::FinishReason::Stop
+                },
+                retries_used: 0,
+            }),
+        ]
+    })
+    .collect()
+}
+
+const APPROVAL: Scenario = Scenario {
+    name: "approval_deferred",
+    request: req,
+    control: RunControl::default,
+    scripts: approval_scripts,
+    render: Render::Canonical,
+    plane: StubToolPlane::new,
+    expected: caller::RunFinishReason::Completed,
+    extension: Some(&ApprovalScenario),
+};
+
+struct ExpiringHook;
+
+#[async_trait]
+impl HookPlane for ExpiringHook {
+    async fn hook(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: Option<&SessionScope>,
+        call: HookCall,
+    ) -> Result<HookAnswer, HookUnavailable> {
+        if serde_json::to_value(&call.subject).unwrap()["phase"] == "approve" {
+            Ok(serde_json::from_value(json!({"answer":"ask","ask":{
+                "prompt":"Allow?","expires_at_ms":2000,"on_expiry":"deny",
+                "material_damage":false,"late_execution":"execute"
+            }}))
+            .unwrap())
+        } else {
+            Ok(HookAnswer::Pass)
+        }
+    }
+}
+
+struct LateQuestions {
+    inner: Questions,
+    root: PathBuf,
+    clock: Clock,
+}
+
+impl LateQuestions {
+    fn expire_filed(&self, ctx: &BatchCtx) {
+        let filed = FileWalStore::new(&self.inner.root).read_records(&ctx.bind).unwrap().iter().any(|frame|
+            matches!(&frame.record, WalRecord::AwaitingApproval { pending, .. } if pending.iter().any(|entry| entry.elicitation_id.is_some())));
+        if filed && !self.late(ctx) {
+            std::fs::write(self.root.join("test-clock"), r#"{"now_ms":3000}"#).unwrap();
+            self.clock.refresh().unwrap();
+        }
+    }
+    fn late(&self, ctx: &BatchCtx) -> bool {
+        FileWalStore::new(&self.inner.root)
+            .read_records(&ctx.bind)
+            .unwrap()
+            .iter()
+            .any(|frame| {
+                matches!(
+                    frame.record,
+                    WalRecord::RunPaused {
+                        reason: PauseReason::AuthRequired,
+                        ..
+                    }
+                )
+            })
+    }
+
+    fn question(&self, ctx: &BatchCtx, id: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        let mut question = self.inner.question(ctx, id)?;
+        if !self.late(ctx) {
+            question.terminal = false;
+            question.record["state"] = json!("pending");
+            let object = question.record.as_object_mut().unwrap();
+            object.remove("answered_choice_id");
+            object.remove("approval_digest");
+        }
+        Ok(question)
+    }
+}
+
+#[async_trait]
+impl ElicitationPlane for LateQuestions {
+    async fn request(
+        &self,
+        ctx: &BatchCtx,
+        key: &str,
+        record: &WalRecord,
+        now: u64,
+    ) -> Result<ApprovalFiling, ApprovalRouteError> {
+        self.inner.request(ctx, key, record, now).await
+    }
+    async fn answers(
+        &self,
+        ctx: &BatchCtx,
+        since: Option<&ApprovalCursor>,
+    ) -> Result<ApprovalPage, ApprovalRouteError> {
+        self.expire_filed(ctx);
+        let keys = self.inner.keys.lock().unwrap().clone();
+        let seq = keys.len() as u64 + u64::from(self.late(ctx));
+        let records = if since.is_some_and(|cursor| cursor.seq >= seq) {
+            Vec::new()
+        } else {
+            keys.iter()
+                .map(|key| {
+                    self.question(ctx, &format!("q:{key}"))
+                        .map(|question| question.record)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(ApprovalPage {
+            records,
+            cursor: ApprovalCursor {
+                provider_incarnation: "late-incarnation".into(),
+                seq,
+            },
+        })
+    }
+    async fn get(&self, ctx: &BatchCtx, id: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        self.question(ctx, id)
+    }
+    async fn r#await(
+        &self,
+        ctx: &BatchCtx,
+        id: &str,
+        _: u64,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        if !self.late(ctx) {
+            std::fs::write(self.root.join("test-clock"), r#"{"now_ms":3000}"#).unwrap();
+            self.clock.refresh().unwrap();
+        }
+        self.question(ctx, id)
+    }
+    async fn withdraw(&self, ctx: &BatchCtx, id: &str) -> ApprovalWithdrawal {
+        self.inner.withdraw(ctx, id).await
+    }
+}
+
+struct LateScenario;
+
+impl ScenarioExtension for LateScenario {
+    fn setup(&self, root: &Path, control: &mut RunControl, plane: &mut HarnessPlane) {
+        let wal = root.join("wal");
+        let frames = match FileWalStore::new(&wal).read_records(&req().session) {
+            Ok(frames) => frames,
+            Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Vec::new()
+            }
+            Err(error) => panic!("read late approval scenario: {error}"),
+        };
+        let expired = frames.iter().any(|frame| {
+            matches!(
+                frame.record,
+                WalRecord::ApprovalRecorded {
+                    decision: DeferredDecision::Expired,
+                    ..
+                }
+            )
+        });
+        std::fs::write(
+            root.join("test-clock"),
+            json!({"now_ms":if expired { 3000 } else { 1000 }}).to_string(),
+        )
+        .unwrap();
+        let clock = Clock::for_state_root(root).unwrap();
+        control.clock = Some(clock.clone());
+        control.manifest = Some(Arc::new(plan()));
+        control.hook_plane = Some(Arc::new(ExpiringHook));
+        control.elicitation_plane = Some(Arc::new(LateQuestions {
+            inner: Questions {
+                stop: None,
+                keys: Mutex::new(Vec::new()),
+                root: wal.clone(),
+                kill: false,
+            },
+            root: root.into(),
+            clock,
+        }));
+        plane.set_inner(Arc::new(Tools {
+            sent: Mutex::new(Vec::new()),
+            root: wal,
+            kill: false,
+        }));
+    }
+
+    fn check(&self, kill: &KillReport, resumed: &Resumed) {
+        ApprovalScenario.check(kill, resumed);
+        let before = kill.durable.records();
+        if before
+            .iter()
+            .any(|record| matches!(record, WalRecord::LateDispatchIntent { .. }))
+        {
+            assert_eq!(
+                resumed.plane.dispatch_count(&ToolCallId("a".into())),
+                0,
+                "{}: late intent must not be resent",
+                kill.label()
+            );
+        }
+        let after = resumed.log.records();
+        assert!(
+            after
+                .iter()
+                .filter(|record| matches!(record, WalRecord::LateDispatchIntent { .. }))
+                .count()
+                <= 1
+        );
+        if after
+            .iter()
+            .any(|record| matches!(record, WalRecord::LateDispatchIntent { .. }))
+        {
+            assert_eq!(
+                after
+                    .iter()
+                    .filter(|record| matches!(record, WalRecord::LateResult { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+fn late_scripts() -> Vec<Vec<NormalizedEvent>> {
+    let mut scripts = approval_scripts();
+    if let NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) =
+        &mut scripts[0][0]
+    {
+        message.content.truncate(1);
+    }
+    scripts
+}
+
+const LATE_APPROVAL: Scenario = Scenario {
+    name: "late_approval",
+    scripts: late_scripts,
+    render: Render::DeferredAuthResume,
+    extension: Some(&LateScenario),
+    ..APPROVAL
+};
+
+struct UnavailableQuestions;
+
+fn missing_card() -> ApprovalRouteError {
+    ApprovalRouteError {
+        code: "elicitation_not_found".into(),
+        retryable: false,
+    }
+}
+
+#[async_trait]
+impl ElicitationPlane for UnavailableQuestions {
+    async fn request(
+        &self,
+        _: &BatchCtx,
+        _: &str,
+        _: &WalRecord,
+        _: u64,
+    ) -> Result<ApprovalFiling, ApprovalRouteError> {
+        Err(missing_card())
+    }
+    async fn answers(
+        &self,
+        _: &BatchCtx,
+        _: Option<&ApprovalCursor>,
+    ) -> Result<ApprovalPage, ApprovalRouteError> {
+        Ok(ApprovalPage {
+            records: Vec::new(),
+            cursor: ApprovalCursor {
+                provider_incarnation: "missing".into(),
+                seq: 0,
+            },
+        })
+    }
+    async fn get(&self, _: &BatchCtx, _: &str) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        Err(missing_card())
+    }
+    async fn r#await(
+        &self,
+        _: &BatchCtx,
+        _: &str,
+        _: u64,
+    ) -> Result<ApprovalQuestion, ApprovalRouteError> {
+        Err(missing_card())
+    }
+}
+
+struct WithdrawnCard;
+
+#[async_trait]
+impl ScenarioExtension for WithdrawnCard {
+    fn setup(&self, root: &Path, control: &mut RunControl, plane: &mut HarnessPlane) {
+        ApprovalScenario.setup(root, control, plane);
+        control.elicitation_plane = Some(Arc::new(UnavailableQuestions));
+    }
+
+    fn check(&self, kill: &KillReport, resumed: &Resumed) {
+        ApprovalScenario.check(kill, resumed);
+    }
+
+    async fn complete_reference(
+        &self,
+        _: &Path,
+        store: &broca_crash_harness::wal::ObservedWalStore,
+        _: &broca_crash_harness::ScriptedProvider,
+    ) {
+        let request = req();
+        let frames = store.read_records(&request.session).unwrap();
+        let wal = Arc::new(Mutex::new(store.open(&request.session).unwrap()));
+        let lineage = wal.lock().unwrap().lineage_id().unwrap();
+        let fence = frames.last().unwrap().fence;
+        for frame in &frames {
+            if let WalRecord::ToolCallDeferred {
+                batch_id, scope, ..
+            } = &frame.record
+            {
+                let ctx = BatchCtx {
+                    bind: request.session.clone(),
+                    run_id: request.run_id.clone(),
+                    batch_id: batch_id.clone(),
+                    scope: Some(scope.clone()),
+                    media_capture: None,
+                };
+                let key = format!("{lineage}:{}", frame.seq);
+                broca_core::consent::close_out(
+                    &UnavailableQuestions,
+                    &ctx,
+                    &key,
+                    &frame.record,
+                    None,
+                    broca_core::run::epoch_millis().unwrap(),
+                    |record| {
+                        let result = wal
+                            .lock()
+                            .unwrap()
+                            .append(fence, &record, true)
+                            .map(|_| ())
+                            .map_err(|_| ApprovalRouteError {
+                                code: "wal_error".into(),
+                                retryable: true,
+                            });
+                        std::future::ready(result)
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn withdrawal_acknowledgement_holds_every_invariant_at_every_boundary() {
+    let handle = RunnerHandle::new(Scenario {
+        name: "withdrawn_card",
+        extension: Some(&WithdrawnCard),
+        ..APPROVAL
+    })
+    .await;
+    assert_eq!(
+        handle
+            .reference
+            .log
+            .records()
+            .iter()
+            .filter(|record| matches!(record, WalRecord::QuestionWithdrawalAcknowledged { .. }))
+            .count(),
+        2
+    );
+    let kills = handle.every_record_boundary(true).await;
+    assert_eq!(kills.len(), handle.record_boundaries(true).len());
+}
+
+#[tokio::test]
+async fn late_approval_intent_and_result_hold_every_invariant_at_every_boundary() {
+    let handle = RunnerHandle::new(LATE_APPROVAL).await;
+    for kind in [
+        "tool_call_deferred",
+        "approval_recorded",
+        "late_approval_recorded",
+        "late_dispatch_intent",
+        "late_result",
+    ] {
+        assert!(
+            handle
+                .reference
+                .log
+                .records()
+                .iter()
+                .any(|record| serde_json::to_value(record).unwrap()["type"] == kind),
+            "missing {kind}"
+        );
+    }
+    let kills = handle.every_record_boundary(true).await;
+    assert_eq!(kills.len(), handle.record_boundaries(true).len());
+}
+
+#[tokio::test]
+async fn every_approval_record_boundary_resumes_without_second_dispatch_or_model_step() {
+    let handle = RunnerHandle::new(APPROVAL).await;
+    for kind in [
+        "tool_call_deferred",
+        "awaiting_approval",
+        "approval_recorded",
+    ] {
+        assert!(
+            handle
+                .reference
+                .log
+                .records()
+                .iter()
+                .any(|record| serde_json::to_value(record).unwrap()["type"] == kind),
+            "missing {kind}"
+        );
+    }
+    let kills = handle.every_record_boundary(true).await;
+    assert_eq!(kills.len(), handle.record_boundaries(true).len());
 }
 
 #[tokio::test]
@@ -595,3 +1037,5 @@ async fn resumed_wait_keeps_the_wal_frozen_restart_policy_when_request_changes()
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+broca_crash_harness::require_process_kill!();

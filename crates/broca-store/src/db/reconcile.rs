@@ -1,13 +1,9 @@
 //! Boot-only recovery of derived rows. No service should read the index until
 //! the caller has reconciled its session inventory while all writers are stopped.
 
-use std::cell::RefCell;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use broca_protocol::BindIdentity;
-use broca_wal::access_counter;
-use broca_wal::framing::{DecodeStep, LINEAGE_FRAME_LEN};
 
 use super::publication::{self, CheckedEnd};
 use super::{index, DbError, IndexOutcome, LogLocation, OverhaulDb};
@@ -27,13 +23,13 @@ pub struct ReconcileOutcome {
     /// Bytes after the last complete frame. Recovery never truncates the WAL;
     /// the next writer open owns removal of this unpublished suffix.
     pub ignored_suffix_bytes: u64,
+    pub publication: broca_wal::file_wal::DurablePublication,
 }
 
 impl OverhaulDb {
     /// Reconcile the caller's complete WAL inventory before enabling service
     /// reads or restart/orphan handling. Each session commits independently, so
     /// an interrupted boot can safely repeat the inventory from the beginning.
-    /// This capability is deliberately not registered by the daemon yet.
     pub fn reconcile_boot<'a>(
         &self,
         sessions: impl IntoIterator<Item = ReconcileSession<'a>>,
@@ -71,40 +67,13 @@ impl OverhaulDb {
     ) -> Result<ReconcileOutcome, DbError> {
         // Use one descriptor for authentication, tail recovery and sync. A
         // path-based EOF is not a durable publication witness.
-        let file = RefCell::new(
-            broca_wal::fs_ops::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(session.path)?,
-        );
-        let size = file.borrow().metadata()?.len();
-        if size > broca_wal::DEFAULT_MAX_READ_BYTES {
-            return Err(DbError::Invalid(
-                "boot WAL exceeds session byte ceiling".into(),
-            ));
-        }
-        let read = |off: u64, len: u64| {
-            let mut file = file.borrow_mut();
-            file.seek(SeekFrom::Start(off))?;
-            let mut bytes = Vec::new();
-            (&mut *file)
-                .take(len.min(size.saturating_sub(off)))
-                .read_to_end(&mut bytes)?;
-            Ok(bytes)
-        };
+        let recovery =
+            broca_wal::file_wal::WalRecovery::open(session.path, broca_wal::DEFAULT_MAX_READ_BYTES)
+                .map_err(DbError::Wal)?;
+        let size = recovery.byte_len();
+        let read = |off, len| recovery.read_at(off, len);
         self.transaction(false, |tx| {
-            let header = access_counter::read_at(&read, 0, LINEAGE_FRAME_LEN as u64)?;
-            let lineage = match access_counter::decode_next(&header) {
-                DecodeStep::Lineage {
-                    lineage_id,
-                    consumed,
-                } if consumed == LINEAGE_FRAME_LEN && header.len() == consumed => lineage_id,
-                _ => {
-                    return Err(DbError::Invalid(
-                        "boot WAL has no complete lineage header".into(),
-                    ))
-                }
-            };
+            let lineage = recovery.lineage();
             let key = index::sid(session.bind)?;
             let prepared = publication::prepare_cursor(
                 tx,
@@ -112,31 +81,28 @@ impl OverhaulDb {
                 &lineage.to_string(),
                 size,
                 &read,
-                Some(if force {
-                    "boot session rebuild requested"
-                } else {
-                    "boot index missing or invalid"
+                Some(&recovery),
+                Some(publication::RebuildRequest {
+                    reason: if force {
+                        "boot session rebuild requested"
+                    } else {
+                        "boot index missing or invalid"
+                    },
+                    force,
                 }),
-                force,
             )?;
-            let (start, seq) = prepared.start();
+            let (start, _) = prepared.start();
             // Only a rebuild starts at zero. Its origin read and every decode
             // remain in the same shared operation as bounded boot catch-up.
-            let bytes = access_counter::read_at(&read, start, size - start)?;
-            if bytes.len() as u64 != size - start {
-                return Err(DbError::Invalid(
-                    "boot WAL shortened during recovery".into(),
-                ));
-            }
-            let recovered = broca_wal::file_wal::recover_prefix(&bytes, start, seq, Some(lineage))
+            let publication = recovery
+                .recover_and_sync(prepared.recovery_cursor())
                 .map_err(DbError::Wal)?;
-            let end = recovered.valid_end;
-            file.borrow().sync_all()?;
+            let end = publication.byte_end();
             let lineage = lineage.to_string();
             let checked = CheckedEnd {
                 lineage: &lineage,
                 end,
-                seq: recovered.last_seq.unwrap_or(0),
+                seq: publication.sequence(),
             };
             // Reuse publication's validator and seed advancement. All hydration
             // is capped at the recovered end, never at the torn physical EOF.
@@ -154,6 +120,7 @@ impl OverhaulDb {
             Ok(ReconcileOutcome {
                 index,
                 ignored_suffix_bytes: size - end,
+                publication,
             })
         })
     }

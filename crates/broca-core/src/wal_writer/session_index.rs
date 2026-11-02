@@ -191,6 +191,13 @@ impl AdmissionWal {
 }
 
 impl Wal for AdmissionWal {
+    fn borrowed_publication(&self) -> Option<broca_wal::file_wal::DurablePublicationRef<'_>> {
+        if self.wal.wal_config().is_overhaul() {
+            self.wal.borrowed_publication()
+        } else {
+            None
+        }
+    }
     fn durable_publication(&self) -> Option<broca_wal::file_wal::DurablePublication> {
         if self.wal.wal_config().is_overhaul() {
             self.wal.durable_publication()

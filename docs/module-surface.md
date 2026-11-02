@@ -359,6 +359,24 @@ request increments after authorization and migration checks, even when its param
 later return an error. Authorization and migration refusals are not counted. The existing
 `session_reads` and `actor_opens` counters remain available with their existing meanings.
 
+`health.check.metrics.session_readers` is a process-wide, in-memory census of authorized
+read attempts, separate from the legacy numeric `metrics.session_reads`. Its `entries` array
+contains `{principal, op, owner, count, last_ms}` for `session.read`, `session.history`,
+`session.head`, `session.subscribe`, `run.status`, `run.result`, `run.tool_calls`, `send.status`
+and `session.media_read`. Authorization and migration refusals are excluded; later parameter
+or handler errors still count. Subscriptions count once when opened, not once per frame.
+The principal is rendered from the daemon's route stamp (`reserved:<module_id>`, `direct`,
+`unverified`, or the existing principal type's other rendering); a bind from an older daemon
+with no stamp is named `unattested`. Request parameters cannot change that attribution.
+`owner` is true for the recorded first sender or scope owner, false for other callers, and
+null when ordinary requests have not yet loaded ownership into the cache. Unknown reads
+retain their own keys rather than being reclassified later. Telemetry never reads storage
+or opens an actor to discover ownership. The key is `(principal, op, owner)` with at most 256
+distinct keys; attempts introducing further keys increment `overflow`, while existing keys
+continue counting. Counts, `overflow` and the epoch-millisecond `last_ms` values reset on
+restart; `since_ms` is the daemon's process-start coverage timestamp. No census is written
+to a log or store.
+
 To see one debug record per served operation, add a `CK_LOG` value to broca's module environment
 in `subc.jsonc`:
 
@@ -496,10 +514,56 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   omission for every send. Any other send must name `model`. When an inheriting send is
   queued behind a running turn, its recorded request carries the frozen model itself, so a
   build that does not know the inherited set still runs it on the session's model.
+  With the service-tier writer enabled, `service_tier` follows the fixed-run rules below
+  instead of inheriting from an ended run.
 
 Broca does not send `service_tier` to account routing; a tier chosen by a router reaches broca
 only through the caller's send. Broca does not report `service_tier_applied` or
 `service_tier_served` to account routing.
+
+#### Service-tier writer switch
+
+The boot-only root setting in `broca.jsonc` is `"service_tier": {"enabled": true}`.
+An absent block, an empty block or `"enabled": false` leaves it **off**. A bare boolean,
+an unknown member in the block, or a non-boolean `enabled` refuses boot naming
+`service_tier.enabled`. Other root settings remain owned by their existing loaders.
+Like `anthropic_fallbacks.refusal_resend.enabled`, changing this switch requires a restart.
+
+Off preserves the legacy `flex`/`default`/`priority` admission and frozen bundles, WAL bytes,
+discovery, default replies and provider requests. It does not declare the `service_tier`
+group or add tier members to default run usage. Queue reading remains available
+even when the writer switch is off.
+
+On declares `service_tier` and `role.describe.service_tiers`, and accepts only the abstract
+`standard`, `fast` and `ultrafast` levels on `session.send`. A new run without the member
+starts at standard; a send into an unfinished run inherits its fixed tier when absent.
+Explicitly changing that tier, including explicitly asking for standard, refuses
+`invalid_params` with detail `{field: "service_tier", reason: "run_tier_fixed"}`.
+Unknown levels and unsupported routes refuse before a model call with reason
+`unsupported_tier`, naming the level and, for route refusals, the model. Fast renders
+OpenAI `priority`; ultrafast is available only on an OpenAI wire whose model row has priced
+input and output ultrafast modes. Non-standard modes are never priced from base rates.
+Discovery lists family support, not a promise that every model on that family prices a mode.
+
+Tier-bearing queued sends retain the open `service_tier_level` string and require a reader
+supporting `service-tier-queue/v1`, available since broca 0.3.298. Admitted runs render their recorded configuration on resume,
+without consulting the current catalog for tier eligibility. The legacy closed
+`service_tier_request` decoder stays for old render bundles; it does not gain abstract variants.
+
+With the switch on, `run.status` and `run.result` add optional
+`usage.service_tier_applied` (non-standard only) and `usage.service_tier_served`. Served comes
+only from provider statements, including an explicitly reported standard. Missing reports do
+not vote; conflicting reports leave served absent, including after restart. Unmapped served
+strings remain verbatim. The existing durable run/step records rebuild this projection;
+there is no new durable usage accumulator. A compaction session sends `compaction.ride` with
+cause `service_tier_change` to its compaction provider before the first changed-tier request,
+including a return to standard, and its next notice
+carries the change event and non-standard condition. Unchanged tiers do not ride.
+
+The service-tier switch does not depend on role-routing's route-selection and reporting
+contract. Broca uses its own `route.account_for` / `route.account_observe` protocol instead.
+Those calls still carry neither the applied nor served tier.
+The switch adopts llm-runner service tiers, not a second account-routing path.
 
 #### Hard session input-token cap
 
@@ -1221,7 +1285,7 @@ retain it in `Queued.principal`. Request-body sender claims never grant access. 
 unverified or ambiguous attribution grants no exception to the owner's existing path.
 Answers and durable tombstones are identical to an owner's withdrawal: `retracted`,
 `already_started` or `not_pending`. A delivered steer is `not_pending`. This does not
-extend `run.cancel`, which remains owner-only, or change sessions without a recorded owner.
+extend `run.cancel` by itself, or change sessions without a recorded owner.
 
 Plan-named senders may share a `send_id` without sharing a submission. The first sender
 keeps the legacy run ID; a later delegated sender colliding with another recorded sender
@@ -1266,7 +1330,16 @@ not compare that stamp with an authority or reject an append solely because it i
 
 ## 13. Cancel token + provider watchdog (core change)
 
-`run.cancel` is owner-only. Omitted `at` (or `at: "now"`) retains immediate cancellation:
+`run.cancel` admits the session's owners. Broca also declares `run_cancel_by_interrupt`:
+an attested named sender whose current effective grant has `interrupt: true` may cancel
+with omitted `at` or `at: "now"`, but never `step_boundary`. The latest accepted refresh
+controls this grant even before its execution plan applies; removed senders and callers
+named only in another session are refused `scope_owner_mismatch` without writes. Sender
+cancels use the same `"ack"` / `"not_active"` replies and `cancelled` terminal as owners,
+with no sender field added to either. The accepted sender stop is durable before `"ack"`,
+so recovery finishes the cancellation without dispatching an in-flight call again.
+
+Omitted `at` (or `at: "now"`) retains immediate cancellation:
 the model stream is cancelled and sent tool calls retain the existing at-most-once recovery
 rules. `at: "step_boundary"` finishes the in-flight model step and its entire tool batch,
 records the results, and writes no further `StepStarted` before `RunFinished{Cancelled}`.
@@ -1312,6 +1385,20 @@ keep their existing behavior and omit this diagnostic.
 - **State enum:** `Idle | Active{run_id, step} | Paused{run_id, reason} | Interrupted{run_id} |
   Terminal{run_id, reason} | Error{run_id, detail}`. `run.status(session)` resolves the
   in-process active run first, then WAL inference.
+- **Timed account pauses:** the root `broca.jsonc` switch `account_limit_pause` defaults to
+  false and must be a boolean. An enabled fresh run freezes consent in its WAL config.
+  A source-classified transient account limit pauses only with a present, checked recovery
+  floor in `[paused_at_ms, paused_at_ms + 60 minutes]`. It resumes itself on the same frozen
+  selection, never through a routing account switch. `run.status` reports `state: paused`,
+  `reason: account_limit`, `pause_reason: account_limit`, the original structured error and
+  optional `resume_not_before_ms`. The durable subscribe `paused` control carries the same
+  floor after its barrier; the subscription stays attached for ordinary resume progress.
+  `session.head.last_run_state` remains reason-only, with no new ordinal or deadline member.
+  An idempotent resend returns the pause/current continuation rather than scheduling a second
+  execution. Unrelated sends and steers receive `run_paused`; cancel remains available.
+  Newly stale reset refusals retain the terminal path and increment the always-present lifetime
+  health metric `account_limit_stale_resets`. Readers must understand `account-limit-pause/v1`
+  before the writer is deployed or the switch enabled.
 - **Durable run index** in `run-index.db`: `run_id → {session, lineage, submission_id, state,
   wal_path}` so run-keyed ops survive restart. Resume **reuses the original run_id**
   (today it mints `req.run_id`).
@@ -1336,9 +1423,8 @@ keep their existing behavior and omit this diagnostic.
   contract, not a defect.
 - **`TransformUnavailable` is read, never written:** older WAL records and run-index rows carry
   it, and readers report it (`run.status`, `session.read`, the run index), but this build never
-  ends a run with it. It is terminal, not a pause: a pause is only for a failure with a
-  caller-side resolver contract (`AuthRequired` → the caller re-authenticates, then resumes the
-  SAME run).
+  ends a run with it. It is terminal, not a pause: a pause preserves a resolvable nonterminal
+  cause and the same run rather than sealing the episode.
 - **Active model-step progress:** run-keyed `run.status` can include an optional `step` object
   `{step_id, started_at_ms, attempt, attempt_started_at_ms, last_content_at_ms?,
   max_content_gap_ms?, max_content_gap_ended_at_ms?}`. It is a cheap snapshot of the live actor's
@@ -1727,7 +1813,13 @@ for an already-durably-cancelled call. Neither shutdown nor restart creates a wi
 by itself, and a call that completed before its sibling was cancelled is not withdrawn. The
 registry's stop signal suppresses new withdrawal attempts and retries during drain; an earlier
 request may already have reached the provider. Health exposes pending/failed withdrawals and
-their refusal codes.
+their refusal codes. Route refusals `scope_not_live` and `scope_ended` mean withdrawal is
+impossible under the original scope, not that the held call was cancelled or its outcome is
+known. They count in `provider_held.withdrawals.scope_gone`, not `failed`, and do not degrade
+health; `scope_gone_details` retains at most ten diagnostics with the same `code`, `answer`
+and `reason` fields as `failure_details`. All other refusals and errors still count as failures.
+After a cancelled call's terminal is durable, a later result is only receipted and acked as a
+no-op when the module's on-demand feed next drains, not guaranteed to be delivered to the run.
 
 Late-result pullers start before withdrawal recovery, which runs independently and obeys the
 registry's stop signal. Withdrawal recovery snapshots the outbox once, groups rows by session,
@@ -1898,6 +1990,10 @@ provider request bytes from the WAL. A readable session refused by admission is
 sealed `Interrupted` with the refusal reason. An unreadable newer-writer WAL is
 only logged at WARN with its session and missing features: no bytes or metadata
 are changed, and other sessions still resume.
+
+New episodes freeze image-only labeling for multipart image-notice text; older episodes keep
+their literal text projection on resume, while a new episode adopting the rule may rebuild its
+prompt cache once, like a renderer-version bump.
 
 Restart and authentication pauses diverge in the actor's `on_send`, `send_plain`,
 and `steer_submission` paths. Restart pauses answer keyed retries `paused`, queue

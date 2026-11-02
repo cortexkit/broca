@@ -33,6 +33,7 @@ pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
         run_id: RunId(run.into()),
         session: BindIdentity::new("/retention-test", "runner", "session"),
         config: Box::new(RunConfig {
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -114,6 +115,8 @@ pub(crate) fn frames(retention: Option<u64>) -> Vec<FramedRecord> {
 
 fn snapshot(seed: Option<ProjectionSeed>, watermark: u64) -> ProjectionSnapshot {
     ProjectionSnapshot {
+        context_epoch: 0,
+        required_recovery_cuts: Vec::new(),
         attribution_complete: true,
         seed,
         watermark,

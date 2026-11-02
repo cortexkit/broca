@@ -99,8 +99,10 @@ impl subc_client_rs::ModuleHandler for Provider {
 
 struct Serving {
     plane: Arc<SubcHookPlane>,
+    conn: Arc<broca_subc::SubcConnection>,
     script: Arc<Script>,
     bind: BindIdentity,
+    scope: Option<broca_protocol::SessionScope>,
     serve: Vec<tokio::task::JoinHandle<()>>,
     _rig: Rig,
 }
@@ -114,11 +116,27 @@ impl Drop for Serving {
 }
 
 async fn start(tag: &str, replies: Vec<Reply>, description: Value, bind_silent: bool) -> Serving {
+    start_with_scope(tag, replies, description, bind_silent, false).await
+}
+
+async fn start_with_scope(
+    tag: &str,
+    replies: Vec<Reply>,
+    description: Value,
+    bind_silent: bool,
+    scoped: bool,
+) -> Serving {
     use subc_protocol::manifest::{Concurrency, ModuleManifest, ProviderRole};
-    let rig = Rig::start_with_modules(tag, vec![])
-        .await
-        .expect("real ck-subc required");
-    let conn = Arc::new(rig.connect().await);
+    let (rig, conn, scope) = if scoped {
+        let (rig, conn, scope) = super::common::role_scope::start(tag).await;
+        (rig, conn, Some(scope))
+    } else {
+        let rig = Rig::start_with_modules(tag, vec![])
+            .await
+            .expect("real ck-subc required");
+        let conn = Arc::new(rig.connect().await);
+        (rig, conn, None)
+    };
     let script = Arc::new(Script {
         describe: Mutex::new(description),
         replies: Mutex::new(replies.into()),
@@ -151,9 +169,11 @@ async fn start(tag: &str, replies: Vec<Reply>, description: Value, bind_silent: 
     }
     let bind = BindIdentity::new(&rig.dir, "broca", "ses_01J9Z");
     Serving {
-        plane: Arc::new(SubcHookPlane::new(conn)),
+        plane: Arc::new(SubcHookPlane::new(conn.clone())),
+        conn,
         script,
         bind,
+        scope,
         serve: serves,
         _rig: rig,
     }
@@ -172,6 +192,7 @@ async fn hook(serving: &Serving) -> bool {
         .hook_with_deadline(
             "transform-test",
             &serving.bind,
+            None,
             call(&serving.bind),
             Instant::now() + Duration::from_secs(2),
         )
@@ -196,13 +217,26 @@ fn op_count(serving: &Serving, method: &str) -> usize {
 
 #[tokio::test]
 async fn hook_and_declaration_use_the_role_route_and_frozen_wire_vectors() {
+    hook_and_declaration_vectors(false).await;
+}
+
+#[tokio::test]
+async fn declare_and_every_hook_including_pre_user_use_the_frozen_scope() {
+    hook_and_declaration_vectors(true).await;
+}
+
+async fn hook_and_declaration_vectors(scoped: bool) {
     let vectors = fixture("hook-requests.json")["requests"]
         .as_array()
         .unwrap()
         .clone();
     let declaration = json!({"subscriptions": [], "provider_extra": {"unchanged": true}});
-    let serving = start(
-        "hook-wire",
+    let serving = start_with_scope(
+        if scoped {
+            "hook-wire-scoped"
+        } else {
+            "hook-wire"
+        },
         std::iter::once(Reply::Json(declaration.clone()))
             .chain(
                 vectors
@@ -212,6 +246,7 @@ async fn hook_and_declaration_use_the_role_route_and_frozen_wire_vectors() {
             .collect(),
         describe(),
         false,
+        scoped,
     )
     .await;
     let request: DeclareRequest = serde_json::from_value(json!({"preset": "head",
@@ -222,6 +257,7 @@ async fn hook_and_declaration_use_the_role_route_and_frozen_wire_vectors() {
         .declare(
             "transform-test",
             &serving.bind,
+            serving.scope.as_ref(),
             &request,
             Instant::now() + Duration::from_secs(2),
         )
@@ -233,7 +269,12 @@ async fn hook_and_declaration_use_the_role_route_and_frozen_wire_vectors() {
         assert!(matches!(
             serving
                 .plane
-                .hook("transform-test", &serving.bind, call)
+                .hook(
+                    "transform-test",
+                    &serving.bind,
+                    serving.scope.as_ref(),
+                    call
+                )
                 .await,
             Ok(cortexkit_role_step_transform_provider::answer::HookAnswer::Pass)
         ));
@@ -262,12 +303,47 @@ async fn hook_and_declaration_use_the_role_route_and_frozen_wire_vectors() {
             binds[0]["role_versions"],
             json!({"step-transform-provider": "v1"})
         );
-        assert!(
-            binds[0].get("scope").is_none_or(Value::is_null),
-            "unscoped role route"
-        );
+        if let Some(scope) = &serving.scope {
+            assert_eq!(binds[0]["scope"]["owner"], json!(scope.owner));
+            assert_eq!(binds[0]["scope"]["ref"], scope.scope_ref);
+            assert_eq!(binds[0]["scope"]["scope_epoch"], scope.scope_epoch);
+        } else {
+            assert!(
+                binds[0].get("scope").is_none_or(Value::is_null),
+                "unscoped role route"
+            );
+        }
     }
     serving.plane.close_session_routes(&serving.bind).await;
+}
+
+#[tokio::test]
+async fn admission_transform_declaration_uses_the_frozen_scope() {
+    use broca_fetch_plan::Fetcher;
+    let serving = start_with_scope(
+        "hook-admission-scope",
+        vec![Reply::Json(json!({"subscriptions":[]}))],
+        describe(),
+        false,
+        true,
+    )
+    .await;
+    let fetcher = broca_subc::SubcPlanFetcher::new(
+        serving.conn.clone(),
+        serving.bind.clone(),
+        serving.scope.clone(),
+    );
+    let request = serde_json::from_value(json!({"params":{}, "composition":{}})).unwrap();
+    fetcher.declare("transform-test", &request).await.unwrap();
+    {
+        let binds = serving.script.binds.lock().unwrap();
+        assert_eq!(binds.len(), 1);
+        let scope = serving.scope.as_ref().unwrap();
+        assert_eq!(binds[0]["scope"]["owner"], json!(scope.owner));
+        assert_eq!(binds[0]["scope"]["ref"], scope.scope_ref);
+        assert_eq!(binds[0]["scope"]["scope_epoch"], scope.scope_epoch);
+    }
+    fetcher.close().await;
 }
 
 #[tokio::test]
@@ -302,14 +378,19 @@ async fn route_cache_keys_include_every_caller_identity_component() {
     ] {
         assert!(serving
             .plane
-            .hook("transform-test", &bind, call(&bind))
+            .hook("transform-test", &bind, None, call(&bind))
             .await
             .is_ok());
         serving.plane.close_session_routes(&bind).await;
     }
     assert!(serving
         .plane
-        .hook("transform-test-other", &serving.bind, call(&serving.bind))
+        .hook(
+            "transform-test-other",
+            &serving.bind,
+            None,
+            call(&serving.bind)
+        )
         .await
         .is_ok());
     assert_eq!(bind_count(&serving), 5);
@@ -373,6 +454,7 @@ async fn missing_required_op_is_named_before_hooks_or_declarations() {
         .declare(
             "transform-test",
             &serving.bind,
+            None,
             &request,
             Instant::now() + Duration::from_secs(2),
         )
@@ -405,7 +487,7 @@ async fn mismatched_caller_identity_never_opens_a_route() {
         }
         assert!(serving
             .plane
-            .hook("transform-test", &serving.bind, call)
+            .hook("transform-test", &serving.bind, None, call)
             .await
             .is_err());
     }
@@ -432,7 +514,7 @@ async fn budget_bounds_silent_provider_and_route_open() {
         let deadline = Instant::now() + Duration::from_secs(10);
         let request = tokio::spawn(async move {
             plane
-                .hook_with_deadline("transform-test", &bind, call(&bind), deadline)
+                .hook_with_deadline("transform-test", &bind, None, call(&bind), deadline)
                 .await
         });
         broca_test_support::wait_until("silent hook provider reached", || async {
@@ -479,7 +561,8 @@ async fn cancelling_a_hook_evicts_the_inflight_route() {
     .await;
     let plane = serving.plane.clone();
     let bind = serving.bind.clone();
-    let task = tokio::spawn(async move { plane.hook("transform-test", &bind, call(&bind)).await });
+    let task =
+        tokio::spawn(async move { plane.hook("transform-test", &bind, None, call(&bind)).await });
     tokio::time::timeout(Duration::from_secs(2), serving.script.hook_seen.notified())
         .await
         .unwrap();
@@ -504,6 +587,7 @@ async fn transient_retry_consumes_the_original_deadline() {
         .hook_with_deadline(
             "transform-test",
             &serving.bind,
+            None,
             call(&serving.bind),
             started + Duration::from_millis(200)
         )
@@ -535,7 +619,7 @@ async fn declaration_vectors_and_refusals_are_preserved_for_admission() {
     .await;
     let request = DeclareRequest::new(Default::default());
     assert!(
-        matches!(serving.plane.declare("transform-test", &serving.bind, &request,
+        matches!(serving.plane.declare("transform-test", &serving.bind, None, &request,
         Instant::now() + Duration::from_secs(2)).await,
         Err(broca_fetch_plan::FetchError::ProviderRefused {
             code,
@@ -557,6 +641,7 @@ async fn declaration_vectors_and_refusals_are_preserved_for_admission() {
                 .declare(
                     "transform-test",
                     &serving.bind,
+                    None,
                     &request,
                     Instant::now() + Duration::from_secs(2)
                 )

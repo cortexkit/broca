@@ -73,6 +73,7 @@ impl WithdrawTransport for NoWithdraw {
 
 fn config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -281,6 +282,7 @@ async fn large_stale_outbox_does_not_delay_held_result_intake() {
         sequential: false,
     });
     log.push(WalRecord::RunPaused {
+        account_limit: None,
         run_id: RunId("run".into()),
         reason: broca_protocol::PauseReason::ToolHeld,
         error: None,

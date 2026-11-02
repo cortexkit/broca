@@ -120,6 +120,7 @@ fn held_status_changes_share_the_status_read_fold_and_replay_cursors() {
     records.push(second.clone());
     records.push(second); // Re-observing identical metadata does not change the list.
     records.push(WalRecord::RunPaused {
+        account_limit: None,
         ts_ms: Some(43),
         run_id: RunId("r".into()),
         reason: broca_protocol::PauseReason::ToolHeld,

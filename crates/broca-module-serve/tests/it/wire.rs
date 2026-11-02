@@ -398,6 +398,7 @@ impl RunExecutor for ReauthCoreExec {
             }
             self.first_pause_release.notified().await;
             job.writer.record(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: job.req.run_id.clone(),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::AuthRequired,
@@ -521,6 +522,7 @@ impl RunExecutor for ReauthCoreExec {
 
 fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -1511,6 +1513,40 @@ async fn wait_for_completed_run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     wait_for_run_state(reader, writer, channel, run_id, "completed", first_corr).await
 }
 
+/// A terminal run can remain active until the actor processes executor completion. A fresh
+/// send that must start immediately needs the session's idle status, not only that terminal.
+async fn wait_for_session_idle<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    channel: u16,
+    first_corr: u64,
+) {
+    let transport = tokio::sync::Mutex::new((reader, writer, first_corr));
+    broca_test_support::wait_until("session is idle with no active run", || async {
+        let mut transport = transport.lock().await;
+        let (reader, writer, corr) = &mut *transport;
+        write_req(
+            writer,
+            channel,
+            *corr,
+            serde_json::json!({
+                "method": "run.status", "params": {}
+            }),
+        )
+        .await;
+        *corr += 1;
+        let response = read_one(reader).await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        if body["result"]["state"] == "idle" && body["result"].get("run_id").is_none() {
+            Ok(())
+        } else {
+            Err(format!("session status: {body}"))
+        }
+    })
+    .await;
+}
+
 /// HELLO + route.bind + session.send with a system prompt writes a RunStarted record whose
 /// input leads with Role::System and preserves the exact text bytes.
 #[tokio::test]
@@ -2143,6 +2179,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         "stream_chunks",
         "display_index_resets",
         "session_reads",
+        "session_readers",
         "actor_opens",
         "management_ops",
         // The liveness signal for the scheduled WAL archive. Present even when the knob
@@ -2201,6 +2238,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // credential source, as here); its counters are read through a real daemon in
         // account_selection_real_daemon.
         "account_selection",
+        // Refusals ended because their computed reset/retry deadline was already before
+        // broca's pause time. This healthy daemon has seen none; assert zero below.
+        "account_limit_stale_resets",
         "stall_watchdog",
         // Retained sessions whose expiry could not be confirmed because their log is unreadable
         // and the index is not provably current, so deletion keeps them. Present at zero.
@@ -2220,6 +2260,8 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // storage root. Every route.bind request in this probe omits the scope stamp;
         // assert all four counters and no dedupe-set overflow below.
         "scoped_session_workdirs",
+        // No scoped provider route opens in this healthy probe, so no refusal codes were counted.
+        "scoped_role_route_refusals",
         // A complete inventory and valid session identities refuse no binds in this isolated
         // healthy process. Pin all reason counters at zero below, not just their presence.
         "session_address_refusals",
@@ -2244,6 +2286,31 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
          failure to fix by adding it to the list -- decide what it must read on a healthy \
          daemon and assert that below, because an unasserted metric is one the fleet reads \
          during an incident and nothing defends."
+    );
+    assert_eq!(
+        metrics["scoped_role_route_refusals"],
+        serde_json::json!({}),
+        "a process with no refused scoped role opens has an empty refusal-code map"
+    );
+    let readers = metrics["session_readers"]
+        .as_object()
+        .expect("reader census is present");
+    assert!(readers["since_ms"].as_i64().is_some_and(|ms| ms > 0));
+    assert!(readers["overflow"].is_u64());
+    for entry in readers["entries"]
+        .as_array()
+        .expect("reader census entries")
+    {
+        assert!(entry["count"].is_u64());
+        assert!(entry["last_ms"].is_i64());
+        assert!(entry["principal"].is_string());
+        assert!(entry["op"].is_string());
+        assert!(entry["owner"].is_boolean() || entry["owner"].is_null());
+    }
+    assert_eq!(
+        metrics["account_limit_stale_resets"],
+        serde_json::json!(0),
+        "the isolated healthy daemon has not ended a refusal for stale account timing"
     );
     // This in-process adapter has no daemon bootstrap or watchdog file. The real
     // binary enables the witness during boot; a library-only connection says so.
@@ -2341,8 +2408,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         })
     );
     // `rebuild_required: true` would mean late results may be missing from the intake, and a
-    // failed withdrawal is a held call whose provider was never told it was cancelled. Both
-    // degrade health; neither can happen on a root that never held a call. A root that never
+    // failed withdrawal needs attention. Both degrade health; neither can happen on a root
+    // that never held a call. A scope-gone refusal is reported without degrading health, and
+    // its counter must also be zero on this healthy, never-held root. A root that never
     // held a call also has no boot withdrawal sweep (nothing running, no rows left to recover)
     // and no late-results entry pinned past the five-minute warning.
     assert_eq!(
@@ -2357,6 +2425,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
             "withdrawals": {
                 "failed": 0,
                 "pending": 0,
+                "scope_gone": 0,
                 "sweep_running": false,
                 "rows_remaining": 0,
             },
@@ -4792,32 +4861,16 @@ async fn project_observation_wire(import: bool) {
                 "messages":[{"role":"user","content":[{"type":"text","text":"imported"}]}]
             }})
         };
-        // A send that arrives while the previous run is still releasing the actor is queued and
-        // answers `pending` with no run id, even though run.status already reports that run
-        // completed. Retrying the same send_id writes nothing and answers with the run id once
-        // the queued send has started, so retry until it does.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut corr = 11;
-        let response = loop {
-            write_req(&mut writer, 7, corr, request.clone()).await;
-            let response = read_one(&mut reader).await;
-            assert_eq!(
-                response.header.ty,
-                FrameType::Response,
-                "{}",
-                String::from_utf8_lossy(&response.body)
-            );
-            let response: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-            if response["result"]["state"] != "pending" {
-                break response;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "send turn-{index} stayed queued: {response}"
-            );
-            corr += 1;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
+        wait_for_session_idle(&mut reader, &mut writer, 7, 1_000).await;
+        write_req(&mut writer, 7, 11, request).await;
+        let response = read_one(&mut reader).await;
+        assert_eq!(
+            response.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let response: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         let run_id = response["result"]["run_id"]
             .as_str()
             .unwrap_or_else(|| panic!("send reply has no run id: {response}"));
@@ -4925,6 +4978,14 @@ struct GatedCoreExec {
     store: Arc<broca_store::SqliteStore>,
     gate: Arc<Notify>,
     runs: AtomicUsize,
+    completion_gate: Option<Arc<CompletionGate>>,
+}
+
+/// The executor seam holds the first completion after core has synced and emitted its terminal.
+/// The actor cannot process completion until the executor returns, regardless of scheduling.
+struct CompletionGate {
+    held: Notify,
+    release: Notify,
 }
 
 #[async_trait]
@@ -4947,7 +5008,7 @@ impl RunExecutor for GatedCoreExec {
         let plane = StubToolPlane::new();
         let materialized_store =
             job.materialized_store(self.store.clone() as Arc<dyn broca_core::SessionStore>);
-        run_loop_on_writer_admitted(
+        let result = run_loop_on_writer_admitted(
             job.req,
             &job.writer,
             mode,
@@ -4960,7 +5021,14 @@ impl RunExecutor for GatedCoreExec {
             &out,
             job.on_admitted,
         )
-        .await
+        .await;
+        if first {
+            if let Some(gate) = &self.completion_gate {
+                gate.held.notify_one();
+                gate.release.notified().await;
+            }
+        }
+        result
     }
 }
 
@@ -4990,6 +5058,13 @@ fn other_agent() -> subc_protocol::Principal {
 
 impl PrincipalRig {
     async fn start(tag: &str) -> Self {
+        Self::start_with_completion_gate(tag, None).await
+    }
+
+    async fn start_with_completion_gate(
+        tag: &str,
+        completion_gate: Option<Arc<CompletionGate>>,
+    ) -> Self {
         let dir = tmpdir(tag);
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
@@ -4999,6 +5074,7 @@ impl PrincipalRig {
             store: store.clone(),
             gate: gate.clone(),
             runs: AtomicUsize::new(0),
+            completion_gate,
         });
         let opener = Arc::new(
             DefaultOpener::new(
@@ -5179,6 +5255,76 @@ impl PrincipalRig {
         // and Windows refuses to remove a directory with an open file, so ignore the result.
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+#[tokio::test]
+async fn a_fresh_send_after_terminal_status_is_pending_until_completion_is_processed() {
+    let completion = Arc::new(CompletionGate {
+        held: Notify::new(),
+        release: Notify::new(),
+    });
+    let mut rig =
+        PrincipalRig::start_with_completion_gate("terminal-before-idle", Some(completion.clone()))
+            .await;
+    rig.bind(7, None).await;
+    let first = rig.send(7, "first").await;
+    let first_run = first["run_id"]
+        .as_str()
+        .expect("first send starts immediately");
+    rig.gate.notify_one();
+    broca_test_support::wait_for(
+        "executor holds after its durable terminal",
+        completion.held.notified(),
+        || format!("first run: {first_run}"),
+    )
+    .await;
+    let terminal =
+        wait_for_completed_run(&mut rig.reader, &mut rig.writer, 7, first_run, 100).await;
+    assert_eq!(terminal["state"], "completed");
+
+    let corr = rig.next_corr();
+    write_req(
+        &mut rig.writer,
+        7,
+        corr,
+        serde_json::json!({
+            "method":"run.status", "params":{}
+        }),
+    )
+    .await;
+    let status = read_one(&mut rig.reader).await;
+    assert_eq!(status.header.ty, FrameType::Response);
+    let status: serde_json::Value = serde_json::from_slice(&status.body).unwrap();
+    assert_eq!(status["result"]["state"], "active");
+    assert_eq!(status["result"]["run_id"], first_run);
+
+    let corr = rig.next_corr();
+    write_req(
+        &mut rig.writer,
+        7,
+        corr,
+        serde_json::json!({
+            "method":"session.send", "params":{
+                "prompt":"Continue.", "model":{"provider":"fake", "model":"fake"}
+            }
+        }),
+    )
+    .await;
+    let response = read_one(&mut rig.reader).await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    let response: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let pending = &response["result"];
+    assert_eq!(pending["state"], "pending");
+    assert!(pending["submission_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert!(pending.get("run_id").is_none(), "{response}");
+    println!("terminal={terminal}; session={status}; second_send={response}");
+
+    completion.release.notify_one();
+    wait_for_session_idle(&mut rig.reader, &mut rig.writer, 7, 200).await;
+    assert_eq!(run_started_principals(&rig.records()).len(), 2);
+    rig.finish().await;
 }
 
 fn run_started_principals(records: &[WalRecord]) -> Vec<Option<String>> {
@@ -7221,6 +7367,7 @@ async fn send_declared_tool_reply_is_validated_frozen_and_inherited_over_the_ser
     let first: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
     let first_run = first["result"]["run_id"].as_str().unwrap().to_string();
     wait_for_completed_run(&mut creader, &mut cwriter, 7, &first_run, 100).await;
+    wait_for_session_idle(&mut creader, &mut cwriter, 7, 1_000).await;
 
     // A later send that omits `tools` inherits the frozen surface, deadline included.
     write_req(

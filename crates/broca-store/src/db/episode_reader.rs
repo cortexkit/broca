@@ -54,7 +54,12 @@ impl OverhaulDb {
                 .query_row(
                     "SELECT indexed_seq,lineage_id FROM session WHERE sid=?1",
                     [&key],
-                    |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)),
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<u64>>(0)?.unwrap_or(0),
+                            r.get::<_, String>(1)?,
+                        ))
+                    },
                 )
                 .optional()?)
         })?;
@@ -288,6 +293,9 @@ impl DatabaseEpisodeReader {
     }
 
     pub fn read_model_page(&self, request: &ModelPageRequest) -> Result<EpisodeModelPage, DbError> {
+        if self.sequence() == 0 {
+            return self.full_model_page(request, None);
+        }
         let key = super::index::sid(&self.session)?;
         let result = self.db.read_snapshot(|tx| {
             let mut snapshot = self.snapshot_in(tx,&key,true)?;
@@ -308,7 +316,9 @@ impl DatabaseEpisodeReader {
         });
         match result {
             Ok(result) => Ok(result),
-            Err(DbError::SeedFallback(reason)) => self.full_model_page(request, reason.reason),
+            Err(DbError::SeedFallback(reason)) => {
+                self.full_model_page(request, Some(reason.reason))
+            }
             Err(error) => Err(error),
         }
     }
@@ -316,7 +326,7 @@ impl DatabaseEpisodeReader {
     fn full_model_page(
         &self,
         request: &ModelPageRequest,
-        reason: &'static str,
+        reason: Option<&'static str>,
     ) -> Result<EpisodeModelPage, DbError> {
         let records = self.complete_read()?;
         let mut page = broca_core::read_session_model_page(
@@ -329,7 +339,7 @@ impl DatabaseEpisodeReader {
         page.lineage_id = Some(self.publication.lineage().to_string());
         Ok(EpisodeModelPage {
             page,
-            fallback: Some(reason),
+            fallback: reason,
         })
     }
 
@@ -338,6 +348,9 @@ impl DatabaseEpisodeReader {
         &self,
         at: u64,
     ) -> Result<Option<(IndexedEpisode, Option<EpisodeSeed>)>, DbError> {
+        if self.sequence() == 0 {
+            return Ok(None);
+        }
         let key = super::index::sid(&self.session)?;
         self.db.read_snapshot(|tx| {
             let lineage: String = tx.query_row("SELECT lineage_id FROM session WHERE sid=?1",[&key],|r|r.get(0))?;
@@ -372,16 +385,27 @@ mod tests {
         db: Arc<OverhaulDb>,
         wal: broca_wal::FileWal,
         bind: BindIdentity,
+        // Fields are dropped in order; remove the directory only after closing its files.
+        _scratch: Scratch,
     }
 
-    impl Drop for Fixture {
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
     fn text(value: &str) -> Message {
         Message::new(Role::User, vec![ContentBlock::Text { text: value.into() }])
+    }
+
+    #[test]
+    fn fixture_cleanup_closes_database_and_wal() {
+        let fixture = Fixture::new(&corpus(0));
+        let root = fixture.root.clone();
+        drop(fixture);
+        assert!(!root.exists(), "fixture left its scratch directory behind");
     }
 
     fn corpus(prefix: usize) -> Vec<WalRecord> {
@@ -446,15 +470,18 @@ mod tests {
                 unreachable!()
             };
             let bind = session.clone();
-            let wal = broca_wal::FileWal::open(root.join("session.wal"))
-                .unwrap()
-                .with_feature_floor(root.join("wal-floor"))
-                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                .unwrap();
+            let wal = broca_wal::FileWal::open_with_recovery(
+                root.join("session.wal"),
+                broca_wal::WalConfig::OVERHAUL,
+                root.join("wal-floor"),
+            )
+            .unwrap()
+            .with_feature_floor(root.join("wal-floor"));
             Self {
                 db: Arc::new(OverhaulDb::open(&root).unwrap()),
                 wal,
                 bind,
+                _scratch: Scratch(root.clone()),
                 root,
             }
         }

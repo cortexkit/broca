@@ -1268,6 +1268,7 @@ fn rewrite_last_pause_as_restart(wal_path: &Path) {
         panic!("the WAL ends with a pause: {:?}", framed.record);
     };
     let restart = WalRecord::RunPaused {
+        account_limit: None,
         run_id,
         ts_ms,
         reason: broca_protocol::PauseReason::Restart,

@@ -1179,6 +1179,7 @@ mod provider_held_tests {
             .append(
                 1,
                 &WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("run".into()),
                     reason: PauseReason::ToolHeld,
                     error: None,
