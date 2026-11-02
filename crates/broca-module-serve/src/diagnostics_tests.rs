@@ -5,6 +5,32 @@ use std::cell::Cell;
 
 const NOW: i64 = 200_000_000;
 
+/// The root every test that calls `install_decided` points diagnostics at.
+///
+/// The module records the installed root in a process-wide `OnceLock`, which keeps the first
+/// installation for the life of the process. libtest runs every test of this crate in one
+/// process, so each test installing its own folder would silently keep whichever folder was
+/// installed first. Sharing one folder and serializing installs with `INSTALL_LOCK` means an
+/// installing test always sees the folder it prepared.
+fn installed_root() -> PathBuf {
+    broca_test_support::scratch_root().join("diagnostics-installed")
+}
+
+/// Serializes tests that install a decided root, because installation is process-wide. Each
+/// holder rebuilds `installed_root()` from empty, so it starts from its own contents.
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take `INSTALL_LOCK` and leave an empty `installed_root()`.
+fn install_lock() -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
+    let guard = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let root = installed_root();
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    (guard, root)
+}
+
 #[cfg(feature = "test-clock")]
 #[test]
 fn legacy_findings_request_does_not_read_a_marker_after_boot() {
@@ -60,9 +86,9 @@ fn legacy_findings_request_does_not_read_a_marker_after_boot() {
             fs_ops::RealFs.validate_if_exists(p)
         }
     }
-    let root = broca_test_support::scratch_root()
-        .join(format!("diagnostic-legacy-marker-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
+    // `install_decided` keeps the process's first root, so this test's root must be the one
+    // the installing tests share; holding the lock guarantees it is installed for this root.
+    let (_install, root) = install_lock();
     drop(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
     install_decided(
         broca_wal::state_format::decide_state_root(&root)
@@ -407,8 +433,8 @@ fn wal_recovery_reports_unowned_call_evidence_as_unknown() {
 
 #[test]
 fn legacy_diagnostics_never_reads_recovery_manifests() {
-    let root = broca_test_support::scratch_root()
-        .join(format!("legacy-diagnostics-io-{}", std::process::id()));
+    // Same shared root as above: `install_decided` ignores a second root in one process.
+    let (_install, root) = install_lock();
     std::fs::create_dir_all(root.join("wal")).unwrap();
     drop(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
     let path = root.join("wal/log.cut-1.json");
