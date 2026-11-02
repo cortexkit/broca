@@ -674,8 +674,18 @@ impl<F: WireFamily + 'static> RenderJob<F> {
         let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
         // This scan is deliberately in the same blocking job as rendering: it walks the entire
         // prompt to preserve aliases from historical tool calls on every resumed step.
+        let mut tools = std::borrow::Cow::Borrowed(self.opts.tools.as_slice());
+        if let Some(so) = &self.frozen.structured_output {
+            if so.mode == broca_protocol::structured_output::Mode::SubmitTool {
+                // Family renderers append this declaration too. The reverse map must see the
+                // same names before the runner recognizes a structured-output submission.
+                tools
+                    .to_mut()
+                    .push(crate::structured_output::submit_tool(so.schema()));
+            }
+        }
         let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build_with_aliases(
-            &self.opts.tools,
+            &tools,
             &self.opts.prompt,
             &self.frozen.tool_name_aliases,
         ));
