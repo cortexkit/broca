@@ -41,6 +41,10 @@ fn is_valid_wire_name(name: &str) -> bool {
 
 /// Explicit wire names must already fit the selected family's grammar; unlike generated
 /// grammar aliases, operator aliases are never repaired or suffixed to resolve collisions.
+///
+/// Only builds with broca-core linked (the `live` provider, or this crate's tests) have the
+/// error type it returns.
+#[cfg(any(feature = "live", test))]
 pub fn validate_operator_aliases(
     family: crate::spec::WireFamilyId,
     tools: &[Tool],
