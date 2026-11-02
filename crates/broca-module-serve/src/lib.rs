@@ -58,6 +58,7 @@ pub mod step_events;
 pub mod system_one;
 pub mod trajectory;
 pub mod transport_config;
+pub mod usage_observe;
 pub mod vault_audit;
 pub mod vault_config;
 pub mod wal_archive;

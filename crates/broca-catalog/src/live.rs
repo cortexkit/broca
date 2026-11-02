@@ -93,6 +93,8 @@ impl CodeAssistRoute<'_> {
 /// policies within the same `AnthropicMessages` family.
 #[derive(Debug, Clone, Default)]
 pub struct ResolveOptions<'a> {
+    /// An optional runtime-only raw quota tap, never part of the render bundle.
+    pub quota_observer: Option<Arc<dyn broca_provider::quota::QuotaObserver>>,
     /// Fresh admission's concrete operator aliases and complete canonical tool declarations.
     /// Recorded episodes use only their frozen bundle.
     pub tool_name_aliases: Option<(
@@ -509,6 +511,34 @@ pub fn provider_for_recorded_config(
     http_client: ProviderHttpClient,
     clock: &broca_core::clock::Clock,
 ) -> Result<Box<dyn broca_core::provider::Provider>, String> {
+    provider_for_recorded_config_with_quota_observer(
+        provider_id,
+        model_id,
+        frozen,
+        auth,
+        auth_method,
+        frozen_account_ref,
+        served_account_ref,
+        http_client,
+        clock,
+        None,
+    )
+}
+
+/// Build a recorded provider with the run's optional, runtime-only quota tap.
+#[allow(clippy::too_many_arguments)]
+pub fn provider_for_recorded_config_with_quota_observer(
+    provider_id: &str,
+    model_id: &str,
+    frozen: FrozenRenderConfig,
+    auth: &AuthMode,
+    auth_method: Option<AuthMethod>,
+    frozen_account_ref: Option<&str>,
+    served_account_ref: Option<&str>,
+    http_client: ProviderHttpClient,
+    clock: &broca_core::clock::Clock,
+    quota_observer: Option<Arc<dyn broca_provider::quota::QuotaObserver>>,
+) -> Result<Box<dyn broca_core::provider::Provider>, String> {
     let model = format!("{provider_id}/{model_id}");
     let provider_id = recorded_auth_provider(&frozen, &model, provider_id);
     let auth_kind = provider_route_auth_kind(
@@ -529,6 +559,7 @@ pub fn provider_for_recorded_config(
         frozen,
         resolved_auth.handle,
         ProviderOptions {
+            quota_observer,
             refresher: resolved_auth.refresher,
             auth_method: resolved_auth
                 .auth_method
@@ -2040,6 +2071,7 @@ fn resolved_live_provider(
         frozen,
         auth,
         ProviderOptions {
+            quota_observer: opts.quota_observer.clone(),
             refresher,
             auth_method: auth_method.map(|method| method.as_token().to_owned()),
             frozen_account_ref: opts.frozen_account_ref.map(str::to_owned),

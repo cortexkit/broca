@@ -52,6 +52,9 @@ pub mod live;
 #[cfg(feature = "live")]
 pub mod transport;
 
+#[cfg(feature = "live")]
+pub mod quota;
+
 pub use broca_protocol::provider::NormalizedEvent;
 pub use normalize::{AnthropicNormalizer, NormalizeError};
 pub use request_invalid::safe_provider_subcode;

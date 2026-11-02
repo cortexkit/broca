@@ -352,6 +352,26 @@ request increments after authorization and migration checks, even when its param
 later return an error. Authorization and migration refusals are not counted. The existing
 `session_reads` and `actor_opens` counters remain available with their existing meanings.
 
+`health.check.metrics.usage_observe` reports best-effort raw quota forwarding to insula:
+`rows_sent` and `batches_sent` count rows and batches handed to the management transport
+(not insula's accepted readings), `transport_failures` counts failed, refused, timed-out or
+malformed batch replies, `rows_dropped` counts oversized rows or queue overflow/contention,
+and `ignored` counts insula's `ignored[].reason` values. Counts reset on restart.
+Only Anthropic `oauth` and OpenAI `chatgpt` runs with a frozen vault-resolved credential id
+participate. The account, when present, is the run's frozen vault-returned account reference.
+Broca forwards unified Claude headers and allowlisted Codex headers/raw `codex.rate_limits`
+JSON, without interpreting quota values. The per-conversation `x-codex-turn-state` token
+is never forwarded. No observation enters the WAL, rendering or billing lanes.
+
+The always-on sender uses a management route to `insula` without a project scope, with the same attested
+consumer connection as routing. Every 30 seconds it takes all pending readings and sends
+one `usage.observe` batch, once, with a five-second budget and no retries. Each
+`(credentialId, provider, headers-or-frame)` holds only its newest observation (the latest
+received wins equal timestamps). At most 128 keys are pending; rows must serialize to less
+than 16 KiB. New keys at capacity, oversized rows, unrepresentable non-UTF-8 headers and
+rows arriving while the queue is locked are dropped and counted. Provider requests never
+wait for the queue lock or insula IO. A failed batch is discarded, not requeued.
+
 `health.check.metrics.session_readers` is a process-wide, in-memory census of authorized
 read attempts, separate from the legacy numeric `metrics.session_reads`. Its `entries` array
 contains `{principal, op, owner, count, last_ms}` for `session.read`, `session.history`,

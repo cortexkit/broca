@@ -654,6 +654,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             account_selection,
         ));
         broca_module_serve::account_routing::publish_counters(routing.counters());
+        broca_module_serve::usage_observe::start(
+            Arc::clone(&vault_conn),
+            broca_protocol::BindIdentity::new(
+                state_root.to_string_lossy().to_string(),
+                "broca",
+                "quota",
+            ),
+        );
         // System One reads its provider keys by grant like a run does, on a vault route of its
         // own so its credential reads never queue behind a session's. Both providers share it.
         let system_one_vault = Arc::new(broca_subc::VaultClient::new(
@@ -4111,7 +4119,7 @@ mod executor {
                     pause.message
                 )));
             }
-            let provider = broca_catalog::live::provider_for_recorded_config(
+            let provider = broca_catalog::live::provider_for_recorded_config_with_quota_observer(
                 provider_id,
                 &config.model.model_id,
                 frozen,
@@ -4121,6 +4129,11 @@ mod executor {
                 resolution.account_id.as_deref(),
                 self.provider_client.clone(),
                 &self.clock,
+                broca_module_serve::usage_observe::observer(
+                    provider_id,
+                    resolution.method.map(|method| method.as_token()),
+                    selection,
+                ),
             )
             .map_err(WarmError::Unavailable)?;
             broca_module::executor::send_warm_with_hook(
@@ -4481,6 +4494,17 @@ mod executor {
                 .map(|route| self.tool_name_aliases.for_tools(route, &admitted_tools))
                 .unwrap_or_default();
             let resolve_options = broca_catalog::live::ResolveOptions {
+                quota_observer: broca_module_serve::usage_observe::observer(
+                    job.req.model.provider_module_id.as_str(),
+                    resolution.method.map(|method| method.as_token()),
+                    if fresh_episode {
+                        resolution.selection.as_ref()
+                    } else {
+                        prior_run
+                            .as_ref()
+                            .and_then(|prior| prior.config.auth_selection.as_ref())
+                    },
+                ),
                 tool_name_aliases: fresh_episode.then_some((&admitted_tools, &aliases)),
                 media: fresh_episode,
                 media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
@@ -5706,6 +5730,7 @@ mod executor {
                     frozen_account_ref: None,
                     clock: None,
                     refusal_fallback_model: None,
+                    quota_observer: None,
                 },
             );
             match result {
@@ -5738,6 +5763,7 @@ mod executor {
                 frozen_account_ref: None,
                 clock: None,
                 refusal_fallback_model: None,
+                quota_observer: None,
             };
             let paused = AuthResolution {
                 mode: AuthMode::None,
