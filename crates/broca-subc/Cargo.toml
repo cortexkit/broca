@@ -13,6 +13,9 @@ test-clock = []
 test-attachments = ["broca-core/test-attachments", "broca-protocol/test-attachments"]
 # Test-only one-shot Goodbye enqueue failure, to exercise cleanup against a real daemon.
 test-route-close = []
+# Test-only decoding of a daemon refusal body, so a rig that stands in for the daemon hands its
+# consumer the same coded refusal the wire would produce.
+test-refusals = []
 
 [dependencies]
 broca-diagnostics = { path = "../broca-diagnostics" }

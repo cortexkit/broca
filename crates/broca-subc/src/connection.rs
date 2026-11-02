@@ -150,6 +150,13 @@ pub struct RejectedMessage {
 }
 
 impl RejectedMessage {
+    /// Decode a daemon refusal for daemon-free tests. Plain-text constructors intentionally
+    /// cannot supply the structured code on which the retry policy depends.
+    #[cfg(feature = "test-refusals")]
+    pub fn from_error_frame_body_for_test(body: &[u8]) -> Self {
+        decode_error_body(body)
+    }
+
     fn structured(code: String, message: String) -> Self {
         let text = format!("{code} — {message}");
         Self {
