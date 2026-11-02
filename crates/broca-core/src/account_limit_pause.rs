@@ -3,6 +3,114 @@ use broca_wal::{AccountLimitPause, AuthSelection, WalRecord};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static STALE_RESETS: AtomicU64 = AtomicU64::new(0);
+static DECLINED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Live upper bound on a same-account wait, additionally bounded by prompt-cache expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameAccountWait {
+    Minutes(u64),
+    Max,
+}
+
+impl Default for SameAccountWait {
+    fn default() -> Self {
+        Self::Minutes(15)
+    }
+}
+
+impl SameAccountWait {
+    pub fn enabled(self) -> bool {
+        self != Self::Minutes(0)
+    }
+
+    fn cap(self, now_ms: u64) -> Option<u64> {
+        match self {
+            Self::Minutes(minutes) => Some(now_ms.saturating_add(minutes.saturating_mul(60_000))),
+            Self::Max => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclineReason {
+    Disabled,
+    NoAcceptedResponse,
+    CacheExpiresFirst,
+    BeyondCap,
+}
+
+impl DeclineReason {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::NoAcceptedResponse => "no_accepted_response",
+            Self::CacheExpiresFirst => "cache_expires_first",
+            Self::BeyondCap => "beyond_cap",
+        }
+    }
+}
+
+/// Lifetime declined pause counts, including zero readings for every reason.
+pub fn account_limit_pause_declined() -> serde_json::Value {
+    let mut counts = serde_json::Map::new();
+    for reason in [
+        DeclineReason::Disabled,
+        DeclineReason::NoAcceptedResponse,
+        DeclineReason::CacheExpiresFirst,
+        DeclineReason::BeyondCap,
+    ] {
+        counts.insert(
+            reason.name().into(),
+            DECLINED[reason as usize].load(Ordering::Relaxed).into(),
+        );
+    }
+    counts.into()
+}
+
+pub(crate) struct PauseBudget {
+    pub setting: SameAccountWait,
+    pub cache_expiry_ms: Option<u64>,
+}
+
+impl PauseBudget {
+    fn decide(&self, now_ms: u64, wake_ms: u64) -> Result<(), DeclineReason> {
+        if !self.setting.enabled() {
+            return Err(DeclineReason::Disabled);
+        }
+        let expiry = self
+            .cache_expiry_ms
+            .ok_or(DeclineReason::NoAcceptedResponse)?;
+        let cap = self.setting.cap(now_ms);
+        if wake_ms > expiry && cap.is_none_or(|cap| expiry <= cap) {
+            return Err(DeclineReason::CacheExpiresFirst);
+        }
+        if cap.is_some_and(|cap| wake_ms > cap) {
+            return Err(DeclineReason::BeyondCap);
+        }
+        Ok(())
+    }
+}
+
+/// Cache expiry for a session/account's most recent accepted model attempt. Callers supply
+/// that account's 2xx send time, not the response completion time or the latest refusal.
+/// Unknown cache policies use five minutes; only explicit one-hour markers extend it.
+/// No accepted send means no cache to protect.
+pub fn session_account_cache_expiry_ms(
+    last_accepted_at_ms: Option<u64>,
+    frozen: &serde_json::Value,
+) -> Option<u64> {
+    let ttl_ms = if frozen
+        .pointer("/cache/class")
+        .and_then(|class| class.as_str())
+        == Some("markers")
+        && frozen.pointer("/cache/ttl").and_then(|ttl| ttl.as_str()) == Some("1h")
+    {
+        3_600_000
+    } else {
+        300_000
+    };
+    last_accepted_at_ms.map(|sent| sent.saturating_add(ttl_ms))
+}
 
 /// Lifetime refusals this process ended because their computed account reset was already past.
 pub fn account_limit_stale_resets() -> u64 {
@@ -14,13 +122,7 @@ pub(crate) enum TimingRefusal {
     Untimed,
     Invalid,
     Stale,
-    Distant,
 }
-
-// A worker must not sleep until a weekly reset. Ending a longer wait lets Core revive the
-// worker by starting a replacement that routing can assign to another model. Short waits can
-// preserve the admitted selection and its prompt-cache opportunity.
-pub(crate) const MAX_ACCOUNT_LIMIT_PAUSE_MS: u64 = 60 * 60 * 1000;
 
 pub(crate) fn request_changed_error() -> ProviderError {
     ProviderError {
@@ -99,12 +201,9 @@ pub(crate) fn resume_floor(
         (None, Some(retry)) => retry,
         (None, None) => return Err(TimingRefusal::Untimed),
     };
-    let wait = floor
+    floor
         .checked_sub(paused_at_ms)
         .ok_or(TimingRefusal::Stale)?;
-    if wait > MAX_ACCOUNT_LIMIT_PAUSE_MS {
-        return Err(TimingRefusal::Distant);
-    }
     Ok(floor)
 }
 
@@ -142,6 +241,7 @@ impl FailedAccountLimitAttempt {
         paused_at_ms: u64,
         error: &ProviderError,
         selection: Option<&AuthSelection>,
+        budget: &PauseBudget,
     ) -> Option<Box<AccountLimitPause>> {
         if error.class != ErrorClass::Transient {
             return None;
@@ -169,6 +269,13 @@ impl FailedAccountLimitAttempt {
             }
             Err(_) => return None,
         };
+        if let Err(reason) = budget.decide(paused_at_ms, resume_not_before_ms) {
+            DECLINED[reason as usize].fetch_add(1, Ordering::Relaxed);
+            tracing::info!(reset = ?source.resets_at_ms, wake = resume_not_before_ms,
+                cache_expiry = ?budget.cache_expiry_ms, cap = ?budget.setting.cap(paused_at_ms),
+                reason = reason.name(), "account-limit pause declined");
+            return None;
+        }
         Some(Box::new(AccountLimitPause {
             failed_step: step,
             failed_attempt_seq: self.seq,
@@ -199,6 +306,109 @@ impl FailedAccountLimitAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_limit_pause_budget_covers_cache_cap_and_consent() {
+        let now = 120_000;
+        let frozen = serde_json::json!({"cache":{"class":"markers","ttl":"5m"}});
+        let expiry = session_account_cache_expiry_ms(Some(0), &frozen);
+        for (name, setting, cache_expiry_ms, wake, expected) in [
+            (
+                "before both",
+                SameAccountWait::Minutes(15),
+                expiry,
+                240_000,
+                Ok(()),
+            ),
+            (
+                "cache expires first",
+                SameAccountWait::Minutes(15),
+                expiry,
+                1_920_000,
+                Err(DeclineReason::CacheExpiresFirst),
+            ),
+            (
+                "beyond cap",
+                SameAccountWait::Minutes(1),
+                expiry,
+                240_000,
+                Err(DeclineReason::BeyondCap),
+            ),
+            (
+                "disabled",
+                SameAccountWait::Minutes(0),
+                expiry,
+                120_000,
+                Err(DeclineReason::Disabled),
+            ),
+            (
+                "no accepted response",
+                SameAccountWait::Max,
+                None,
+                120_000,
+                Err(DeclineReason::NoAcceptedResponse),
+            ),
+            (
+                "cache equality",
+                SameAccountWait::Max,
+                expiry,
+                300_000,
+                Ok(()),
+            ),
+            (
+                "cap equality",
+                SameAccountWait::Minutes(1),
+                expiry,
+                180_000,
+                Ok(()),
+            ),
+        ] {
+            assert_eq!(
+                PauseBudget {
+                    setting,
+                    cache_expiry_ms
+                }
+                .decide(now, wake),
+                expected,
+                "{name}"
+            );
+        }
+        let hour = serde_json::json!({"cache":{"class":"markers","ttl":"1h"}});
+        let budget = PauseBudget {
+            setting: SameAccountWait::Max,
+            cache_expiry_ms: session_account_cache_expiry_ms(Some(0), &hour),
+        };
+        assert_eq!(budget.decide(now, 3_600_000), Ok(()));
+        assert_eq!(
+            budget.decide(now, 3_600_001),
+            Err(DeclineReason::CacheExpiresFirst)
+        );
+    }
+
+    #[test]
+    fn session_account_cache_expiry_uses_send_time_frozen_ttl_and_unknown_default() {
+        for (frozen, ttl) in [
+            (serde_json::Value::Null, 300_000),
+            (
+                serde_json::json!({"cache":{"class":"markers","ttl":"5m"}}),
+                300_000,
+            ),
+            (
+                serde_json::json!({"cache":{"class":"markers","ttl":"1h"}}),
+                3_600_000,
+            ),
+            (
+                serde_json::json!({"cache":{"class":"hints","retention":"24h"}}),
+                300_000,
+            ),
+        ] {
+            assert_eq!(
+                session_account_cache_expiry_ms(Some(1000), &frozen),
+                Some(1000 + ttl)
+            );
+            assert_eq!(session_account_cache_expiry_ms(None, &frozen), None);
+        }
+    }
 
     #[test]
     fn account_selection_identity_rejects_known_changes_and_keeps_unknown_witnesses_unknown() {
@@ -240,18 +450,8 @@ mod tests {
                 Err(TimingRefusal::Stale),
             ),
             ("upper edge", Some(3_601_000), None, Ok(3_601_000)),
-            (
-                "too far by one ms",
-                Some(3_601_001),
-                None,
-                Err(TimingRefusal::Distant),
-            ),
-            (
-                "weekly reset",
-                Some(604_801_000),
-                None,
-                Err(TimingRefusal::Distant),
-            ),
+            ("no fixed ceiling", Some(3_601_001), None, Ok(3_601_001)),
+            ("weekly reset", Some(604_801_000), None, Ok(604_801_000)),
             ("relative only", None, Some(60.0), Ok(61_000)),
             ("fraction rounds up", None, Some(0.0001), Ok(1001)),
             ("zero retry is present", None, Some(0.0), Ok(1000)),
@@ -410,14 +610,20 @@ mod tests {
             }))
             .unwrap();
             let evidence = FailedAccountLimitAttempt { seq: 3, attempt };
+            let budget = PauseBudget {
+                setting: SameAccountWait::default(),
+                cache_expiry_ms: Some(301_000),
+            };
             assert_eq!(
                 evidence
-                    .pause(StepId(1), 1000, &error, Some(&selection))
+                    .pause(StepId(1), 1000, &error, Some(&selection), &budget)
                     .is_some(),
                 expected,
                 "{name}"
             );
-            assert!(evidence.pause(StepId(1), 1000, &error, None).is_none());
+            assert!(evidence
+                .pause(StepId(1), 1000, &error, None, &budget)
+                .is_none());
         }
     }
 }

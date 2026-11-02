@@ -115,6 +115,10 @@ impl Provider for LimitedProvider {
     fn reports_attempt_evidence(&self) -> bool {
         true
     }
+    fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {
+        // The timer fixture starts with a cached account from an earlier session run.
+        (account == "acct-a").then_some(1000)
+    }
 }
 
 struct Executor {

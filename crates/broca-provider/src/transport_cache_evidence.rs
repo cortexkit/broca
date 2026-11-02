@@ -67,6 +67,7 @@ struct State {
     locator: Option<String>,
     view: Option<u64>,
     previous: Option<Previous>,
+    accepted_by_account: HashMap<String, u64>,
 }
 
 struct Previous {
@@ -121,15 +122,32 @@ impl Session {
         let mut locator = None;
         let mut view = None;
         let mut previous_view = None;
+        let mut accepted_by_account = HashMap::new();
         let records: Vec<_> = frames.iter().map(|f| f.record.clone()).collect();
         for frame in frames {
             match &frame.record {
                 broca_wal::WalRecord::CompactionViewApplied { view_version, .. } => {
                     view = Some(*view_version)
                 }
-                broca_wal::WalRecord::ModelAttemptFinished { .. } => {
+                broca_wal::WalRecord::ModelAttemptFinished {
+                    http_status,
+                    sent_at_ms,
+                    served_account_ref,
+                    envelope,
+                    reservation,
+                    ..
+                } => {
                     locator = lineage.as_ref().map(|id| format!("{id}:{}", frame.seq));
                     previous_view = view;
+                    let sent = envelope
+                        .as_deref()
+                        .and_then(|e| e.sent_at_ms)
+                        .or(*sent_at_ms);
+                    let account = reservation
+                        .as_deref()
+                        .and_then(|r| r.credential.account_ref.as_deref())
+                        .or(served_account_ref.as_deref());
+                    note_accepted(&mut accepted_by_account, *http_status, sent, account);
                 }
                 _ => {}
             }
@@ -200,6 +218,7 @@ impl Session {
             locator,
             view,
             previous,
+            accepted_by_account,
         };
     }
 
@@ -207,10 +226,26 @@ impl Session {
         self.0.lock().unwrap().view = view;
     }
     pub(super) fn annotate(&self, attempt: &mut ModelAttempt) {
+        let mut state = self.0.lock().unwrap();
+        note_accepted(
+            &mut state.accepted_by_account,
+            attempt.http_status,
+            attempt.sent_at_ms,
+            attempt.served_account_ref.as_deref(),
+        );
         if let Some(evidence) = attempt.cache_evidence.as_mut() {
             evidence["compared_to"] =
-                serde_json::to_value(&self.0.lock().unwrap().locator).expect("locator serializes");
+                serde_json::to_value(&state.locator).expect("locator serializes");
         }
+    }
+
+    pub(super) fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap()
+            .accepted_by_account
+            .get(account)
+            .copied()
     }
     pub(super) fn recorded(&self, locator: Option<String>) {
         let mut state = self.0.lock().unwrap();
@@ -269,6 +304,21 @@ impl Session {
         state.previous = current;
         state.seeded = state.previous.is_some();
         evidence
+    }
+}
+
+fn note_accepted(
+    accepted: &mut HashMap<String, u64>,
+    status: Option<u16>,
+    sent: Option<u64>,
+    account: Option<&str>,
+) {
+    if !status.is_some_and(|status| (200..300).contains(&status)) {
+        return;
+    }
+    if let Some((account, sent)) = account.zip(sent) {
+        let last = accepted.entry(account.to_owned()).or_insert(sent);
+        *last = (*last).max(sent);
     }
 }
 
@@ -489,5 +539,44 @@ mod tests {
                 .is_none(),
             "a gap must not be bridged"
         );
+    }
+    #[test]
+    fn accepted_account_clock_tracks_all_2xx_sends_and_seeds_prior_runs() {
+        let session = Session::default();
+        let mut frames = Vec::new();
+        for (account, status, sent, outcome) in [
+            ("a", Some(200), Some(100), "complete"),
+            ("b", Some(200), Some(200), "eof_before_completion"),
+            ("a", Some(204), Some(300), "provider_error"),
+            ("a", Some(429), Some(400), "http_error"),
+            ("a", None, Some(500), "no_status"),
+            ("a", Some(200), None, "complete"),
+            ("a", Some(200), Some(50), "cancelled"),
+        ] {
+            let mut attempt: ModelAttempt = serde_json::from_value(serde_json::json!({
+                "attempt":0, "request_body_len":1, "request_body_sha256":"a".repeat(64),
+                "response_body_len":0, "response_body_sha256":"0".repeat(64),
+                "outcome":outcome, "ts_ms":1000, "served_account_ref":account,
+                "http_status":status, "sent_at_ms":sent
+            }))
+            .unwrap();
+            session.annotate(&mut attempt);
+            frames.push(broca_wal::FramedRecord {
+                seq: frames.len() as u64 + 1,
+                fence: 1,
+                record: broca_wal::WalRecord::model_attempt_finished(
+                    broca_protocol::StepId(1),
+                    attempt,
+                ),
+            });
+        }
+        assert_eq!(session.last_accepted_at_ms("a"), Some(300));
+        assert_eq!(session.last_accepted_at_ms("b"), Some(200));
+        assert_eq!(session.last_accepted_at_ms("other"), None);
+        let restarted = Session::default();
+        restarted.seed(&frames, Some("lineage".into()));
+        assert_eq!(restarted.last_accepted_at_ms("a"), Some(300));
+        assert_eq!(restarted.last_accepted_at_ms("b"), Some(200));
+        assert_eq!(restarted.last_accepted_at_ms("other"), None);
     }
 }

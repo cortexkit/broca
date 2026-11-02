@@ -259,6 +259,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let account_limit_pause = broca_module_serve::config::AccountLimitPauseConfig::load_default()
         .map_err(ServeIoError)?;
+    if account_limit_pause.obsolete_account_limit_pause {
+        tracing::warn!(target: "config", "broca.jsonc key 'account_limit_pause' is obsolete and ignored; use 'max_same_account_wait' instead");
+    }
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
@@ -492,7 +495,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // refusal mapping can take its own switch from the same block.
     executor_impl = executor_impl.with_anthropic_fallbacks(anthropic_fallbacks);
     executor_impl = executor_impl.with_tool_name_aliases(tool_name_aliases);
-    executor_impl = executor_impl.with_account_limit_pause(account_limit_pause.enabled);
     let charge_basis_table = Arc::new(ChargeBasisTable::load_default_path().map_err(ServeIoError)?);
     if let Some(notice) = charge_basis_table.ignored_version_notice() {
         tracing::warn!(target: "billing", "{notice}");
@@ -3053,7 +3055,6 @@ mod executor {
         /// Consulted only at admission; a resume keeps its recorded policy. Both switches default off.
         anthropic_fallbacks: broca_module_serve::config::AnthropicFallbackConfig,
         tool_name_aliases: broca_module_serve::config::ToolNameAliasesConfig,
-        account_limit_pause: bool,
         /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
         /// its WAL could not be read), so the WAL is read for it at most once per session.
         cc_suffix_memo: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
@@ -3168,7 +3169,6 @@ mod executor {
                 claude_code_install_id: None,
                 anthropic_fallbacks: Default::default(),
                 tool_name_aliases: Default::default(),
-                account_limit_pause: false,
                 cc_suffix_memo: Default::default(),
                 cc_suffix_wal_bytes: Default::default(),
                 cc_prompt_memo: Default::default(),
@@ -3321,11 +3321,6 @@ mod executor {
             config: broca_module_serve::config::AnthropicFallbackConfig,
         ) -> Self {
             self.anthropic_fallbacks = config;
-            self
-        }
-
-        pub fn with_account_limit_pause(mut self, enabled: bool) -> Self {
-            self.account_limit_pause = enabled;
             self
         }
 
@@ -4853,7 +4848,17 @@ mod executor {
             // method-qualified vault credential id.
             let mut control = job.control;
             control.compaction_signals = self.compaction_signals;
-            control.account_limit_pause = self.account_limit_pause;
+            control.max_same_account_wait = Some(Arc::new(|| {
+                match broca_module_serve::config::AccountLimitPauseConfig::load_default() {
+                    Ok(config) => config.max_same_account_wait,
+                    Err(error) => {
+                        tracing::warn!(%error, "invalid live max_same_account_wait; declining same-account waits");
+                        broca_core::SameAccountWait::Minutes(0)
+                    }
+                }
+            }));
+            control.account_limit_pause =
+                control.max_same_account_wait.as_ref().unwrap()().enabled();
             control.hook_plane = self.hook_plane();
             // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
             // the durable WAL projector. The actor's live-output task discards those same units,

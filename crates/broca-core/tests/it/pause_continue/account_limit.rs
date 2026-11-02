@@ -13,6 +13,7 @@ struct Limited {
     tool: bool,
     reset_ms: Option<u64>,
     drift: AtomicBool,
+    accepted_at_ms: Option<u64>,
 }
 
 impl Limited {
@@ -23,6 +24,8 @@ impl Limited {
             tool,
             reset_ms: Some(61_000),
             drift: AtomicBool::new(false),
+            // Most pause tests start with a cached account from a previous run.
+            accepted_at_ms: Some(1000),
         }
     }
 
@@ -40,7 +43,8 @@ impl Limited {
             "attempt": ordinal, "request_body_len": bytes.len(),
             "request_body_sha256": format!("{:x}", sha2::Sha256::digest(&bytes)),
             "response_body_len": 0, "response_body_sha256": "0".repeat(64),
-            "outcome": if rejected { "http_error" } else { "complete" }, "ts_ms": 1000
+            "outcome": if rejected { "http_error" } else { "complete" }, "ts_ms": 1000,
+            "served_account_ref":"acct-a", "http_status":if rejected {429} else {200}, "sent_at_ms":1000
         }))
         .unwrap();
         if rejected {
@@ -116,6 +120,11 @@ impl Provider for Limited {
     fn reports_attempt_evidence(&self) -> bool {
         true
     }
+    fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {
+        (account == "acct-a")
+            .then_some(self.accepted_at_ms)
+            .flatten()
+    }
 }
 
 async fn drive(
@@ -141,6 +150,54 @@ async fn drive(
     .unwrap();
     drop(tx);
     (summary, output.await.unwrap())
+}
+
+#[tokio::test]
+async fn account_limit_declines_when_cache_is_lost_or_no_account_response_was_accepted() {
+    for (name, accepted, reset) in [
+        ("cache-expired", Some(1000), 1_801_000),
+        ("no-accepted-response", None, 61_000),
+    ] {
+        let root = broca_test_support::scratch_root().join(format!("account-limit-decline-{name}"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("test-clock"), br#"{"now_ms":121000}"#).unwrap();
+        let wal = FileWalStore::new(root.join("wal"));
+        let leases = FileLeaseStore::new(root.join("leases"));
+        let session = BindIdentity::new(root.join("project"), "h", name);
+        let mut provider = Limited::new(false, true);
+        provider.accepted_at_ms = accepted;
+        provider.reset_ms = Some(reset.max(181_000));
+        let (summary, output) = drive(
+            req(&session, "hello"),
+            &provider,
+            &StubToolPlane::new(),
+            &leases,
+            &wal,
+            RunControl {
+                account_limit_pause: true,
+                max_same_account_wait: Some(Arc::new(|| broca_core::SameAccountWait::Max)),
+                clock: Some(broca_core::Clock::for_state_root(&root).unwrap()),
+                auth_selection: Some(
+                    serde_json::from_value(
+                        json!({"credential_id":"oauth:stub:work","account_ref":"acct-a"}),
+                    )
+                    .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(summary.reason, RunFinishReason::Error, "{name}");
+        assert_eq!(summary.paused, None, "{name}");
+        assert!(output.iter().any(|event| matches!(event,
+            OutputEvent::Control(ControlUnit::Error { error })
+            if error.class == ErrorClass::Transient && error.provider_code.as_deref() == Some("account_limit_exhausted"))));
+        assert!(records_of(&wal, &session)
+            .iter()
+            .any(|record| matches!(record,
+            WalRecord::RunFinished { error:Some(error), .. }
+            if error.class == ErrorClass::Transient && error.resets_at_ms == provider.reset_ms)));
+    }
 }
 
 #[tokio::test]
@@ -263,8 +320,8 @@ async fn timed_account_limit_run_edges_and_stale_health_counter_are_pinned() {
     for (name, reset, pauses) in [
         ("lower", 1000, true),
         ("stale", 999, false),
-        ("upper", 3_601_000, true),
-        ("distant", 3_601_001, false),
+        ("cache-boundary", 301_000, true),
+        ("cache-expired", 301_001, false),
     ] {
         let root = broca_test_support::scratch_root().join(format!("account-limit-edge-{name}"));
         std::fs::create_dir_all(&root).unwrap();
@@ -313,7 +370,9 @@ async fn disabled_account_pause_keeps_legacy_account_error_bytes_and_no_feature(
     let wal = FileWalStore::new(root.join("wal"));
     let leases = FileLeaseStore::new(root.join("leases"));
     let session = BindIdentity::new(root.join("project"), "h", "off");
-    let provider = Limited::new(false, true);
+    let mut provider = Limited::new(false, true);
+    // Disabling pauses must not require accepted-response evidence.
+    provider.accepted_at_ms = None;
     let (summary, _) = drive(
         req(&session, "hello"),
         &provider,

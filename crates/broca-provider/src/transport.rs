@@ -1340,6 +1340,14 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         }
     }
 
+    fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {
+        self.cache_session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|session| session.last_accepted_at_ms(account))
+    }
+
     fn reasoning_is_prefix_bound(&self) -> bool {
         self.frozen.family_id.thinking_is_prefix_bound()
     }
