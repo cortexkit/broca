@@ -23,11 +23,11 @@ exclusions=(
  # A real-daemon differential: it asserts (does not skip) on SUBC_CORE_BIN, so it belongs with
  # the other native lanes this gate does not stage.
  '(package(=broca-module-serve) & binary(=overhaul_real_daemon))'
- # The attempt-hook shards read one shared in-process capture and stamp the enclosing shard
- # into every image name, so nextest's per-test processes collide on that directory: 1025
- # shards in the recorded run. scripts/linux-preflight.sh selects none of them either (its
- # filter is `kind(test)`, and these are lib tests run on shared-process libtest), so this
- # gate excludes the same group master's own preflight never runs.
+ # The attempt-hook power-loss matrix is 1025 lib shards that share one in-process capture and
+ # stamp the enclosing shard into its image directory names, so nextest's separate process per
+ # test has them all collide on that directory. scripts/linux-preflight.sh selects none of them
+ # either: its filter requires `kind(test)`, while these run as lib tests on shared-process
+ # libtest. This gate excludes exactly that matrix and nothing else.
  '(package(=broca-provider) & test(/^transport::tests::attempt_hook_power_loss_portable::/))'
 )
 while IFS='|' read -r package name seconds; do
