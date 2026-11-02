@@ -323,24 +323,23 @@ impl Fixture {
             })
             .collect()
     }
-    fn lease_bytes(&self) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-        fn visit(path: &std::path::Path, files: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
-            let Ok(entries) = std::fs::read_dir(path) else {
-                return;
-            };
-            for entry in entries {
-                let entry = entry.unwrap();
-                if entry.file_type().unwrap().is_dir() {
-                    visit(&entry.path(), files);
-                } else {
-                    files.push((entry.path(), std::fs::read(entry.path()).unwrap()));
-                }
-            }
-        }
-        let mut files = Vec::new();
-        visit(&self.rig.dir.join("leases"), &mut files);
-        files.sort();
-        files
+    async fn assert_no_extra_lease_epochs(&self) {
+        use broca_core::LeaseStore;
+
+        // Windows forbids reading a lease file through another handle while its
+        // writer holds the byte-range lock. Check the persisted epoch through the
+        // lease store after shutdown instead of reading that file during a stop.
+        self.rig.registry.stop_and_seal().await;
+        let root = self.rig.dir.join("leases");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        let lease = broca_core::FileLeaseStore::new(root)
+            .acquire(&broca_core::lease_key_for(&self.key))
+            .unwrap();
+        assert_eq!(
+            lease.epoch(),
+            2,
+            "only the authorized actor may acquire the first lease epoch; inspection acquires the second"
+        );
     }
     async fn cancel(
         &self,
@@ -361,7 +360,6 @@ impl Fixture {
     async fn refused(&self, run: &str) -> Cost {
         let before = std::fs::read(self.wal.inner.wal_path(&self.key)).unwrap();
         let store = self.store_bytes();
-        let leases = self.lease_bytes();
         let opens = self.opener.opens.load(Ordering::SeqCst);
         let wal_opens = self.wal.opens.load(Ordering::SeqCst);
         self.wal.reset();
@@ -393,11 +391,6 @@ impl Fixture {
             before
         );
         assert_eq!(self.store_bytes(), store, "refused stop changed store rows");
-        assert_eq!(
-            self.lease_bytes(),
-            leases,
-            "refused stop acquired a new lease epoch"
-        );
         cost
     }
 }
@@ -493,6 +486,7 @@ async fn interrupt_cancel_read_cost_matches_send_at_1k_and_150k_messages() {
                 fixture.cancel("phone", "missing-run").await.unwrap(),
                 broca_module::CancelResponse::NotActive
             );
+            fixture.assert_no_extra_lease_epochs().await;
         }
     }
     assert_eq!(
@@ -581,6 +575,7 @@ async fn interrupt_cancel_old_fold_repair_is_read_only_and_cached_warm_and_cold(
         no_more_than(&warm, &send);
         no_more_than(&granted, &send);
         println!("messages={messages} old cold={cold:?} cold_repeat={cold_repeat:?} warm={warm:?} warm_repeat={warm_repeat:?} granted={granted:?} send={send:?}");
+        fixture.assert_no_extra_lease_epochs().await;
     }
 }
 
@@ -649,7 +644,6 @@ async fn interrupt_cancel_unreadable_move_fence_does_not_trust_warm_authority() 
             bytes[0] ^= 0xff;
             std::fs::write(&wal_path, &bytes).unwrap();
             let store = fixture.store_bytes();
-            let leases = fixture.lease_bytes();
             let opens = fixture.opener.opens.load(Ordering::SeqCst);
             let wal_opens = fixture.wal.opens.load(Ordering::SeqCst);
             let error = fixture.cancel(sender, "seed").await.unwrap_err();
@@ -663,9 +657,9 @@ async fn interrupt_cancel_unreadable_move_fence_does_not_trust_warm_authority() 
                 "authorization repaired corrupt history"
             );
             assert_eq!(fixture.store_bytes(), store);
-            assert_eq!(fixture.lease_bytes(), leases);
             assert_eq!(fixture.opener.opens.load(Ordering::SeqCst), opens);
             assert_eq!(fixture.wal.opens.load(Ordering::SeqCst), wal_opens);
+            fixture.assert_no_extra_lease_epochs().await;
         }
     }
 }

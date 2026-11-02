@@ -4427,6 +4427,9 @@ mod database_attach_tests {
         }
         assert!(deliveries.try_recv().is_err());
         fanout.teardown().await;
+        // Teardown joins tasks, but the episode source still owns a database handle.
+        // Release that handle before removing the database files on Windows.
+        drop(fanout);
         drop(wal);
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
