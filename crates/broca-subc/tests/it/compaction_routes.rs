@@ -271,18 +271,11 @@ async fn setup_role_route_and_frozen_vectors(scoped: bool) {
             "a compaction route must not present the tool-module harness"
         );
         assert_eq!(binds[0]["identity"]["session"], serving.bind.session);
-        // The daemon canonicalises the bound project root, so compare canonical paths: on macOS
-        // the scratch root sits under the /var -> /private/var symlink.
-        let bound_root = std::path::PathBuf::from(
-            binds[0]["identity"]["project_root"]
-                .as_str()
-                .expect("bound project_root is a string"),
-        );
+        // Wire identity carries only harness/session; project attribution belongs to scope.
         assert_eq!(
-            std::fs::canonicalize(&bound_root).expect("canonicalise the bound root"),
-            std::fs::canonicalize(&serving.bind.project_root)
-                .expect("canonicalise the session root"),
-            "a compaction route must bind the session's own project root"
+            binds[0]["identity"],
+            json!({"harness": serving.bind.harness, "session": serving.bind.session}),
+            "a compaction route must not carry a project folder"
         );
         assert_eq!(
             binds[0]["role_versions"],
