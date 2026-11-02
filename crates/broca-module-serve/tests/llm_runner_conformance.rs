@@ -4006,7 +4006,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "read_display_facts_default_absent",
         "read_display_facts_opt_in_envelope",
         "read_display_facts_undeclared_refused",
-        "message_senders_rows_name_their_sender",
     ] {
         let case = report
             .cases
@@ -4022,6 +4021,23 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             report.render()
         );
     }
+    // The kit times the sender check against the live `message_started` event, and this
+    // adapter has no live observation hook, so the case passes with exactly that one rule
+    // reported not applicable. Pin that outcome rather than accepting any partial pass.
+    let message_senders = report
+        .cases
+        .iter()
+        .find(|case| case.case == "message_senders_rows_name_their_sender")
+        .expect("message_senders_rows_name_their_sender");
+    assert!(
+        matches!(
+            &message_senders.outcome,
+            CaseOutcome::PassedWithInapplicableRule { reason }
+                if reason.contains("message_senders_timing_at_message_started")
+        ),
+        "{}",
+        report.render()
+    );
     for name in [
         "message_checkpoint_numbering_starts_at_message_count",
         "message_checkpoint_head_matches_certified_cut",
