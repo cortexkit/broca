@@ -654,7 +654,11 @@ dependencies = [
 name = "broca-test-support"
 version = "0.3.300"
 dependencies = [
+ "broca-core",
  "broca-owner-only",
+ "broca-protocol",
+ "broca-store",
+ "broca-wal",
  "libproc",
  "nix",
  "sha2",

@@ -34,6 +34,8 @@ mod process;
 mod recorded_process;
 mod rig_logs;
 mod rig_stdio;
+#[cfg(feature = "session-address")]
+mod session_address;
 mod tracing_capture;
 mod wait;
 pub use ckdev::{
@@ -47,6 +49,8 @@ pub use rig_logs::{append_file_tail, rig_log_diagnostics};
 pub use rig_stdio::{
     dump_rig_process_logs_on_failure, rig_command, rig_process_logs, tokio_rig_command, RigChild,
 };
+#[cfg(feature = "session-address")]
+pub use session_address::{register_legacy_session, resolve_session_address};
 pub use tracing_capture::{capture_logs, LogCapture, LogEvent};
 pub use wait::{
     event_timeout, record_kinds, wait_for, wait_until, wait_until_sync, EVENT_HANG_GUARD,

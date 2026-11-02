@@ -108,7 +108,7 @@ nkeys = "0.4.5"
 cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }
 broca-owner-only = { workspace = true, features = ["test-support"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.
-broca-test-support = { path = "../broca-test-support" }
+broca-test-support = { path = "../broca-test-support", features = ["session-address"] }
 # `test-known-feature` lets a test play a build that predates a WAL feature this one knows, to
 # prove such a build refuses a session holding it. Test builds only; see that feature.
 broca-wal = { path = "../broca-wal", features = ["test-known-feature"] }
