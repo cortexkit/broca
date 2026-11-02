@@ -2206,6 +2206,7 @@ async fn handle_control_request(
             metrics["scoped_role_route_refusals"] =
                 serde_json::json!(broca_subc::scoped_role_route_refusals());
             metrics["session_readers"] = crate::session_readers::health();
+            metrics["usage_observe"] = crate::usage_observe::published_metrics();
             metrics["account_limit_stale_resets"] =
                 serde_json::json!(broca_core::account_limit_stale_resets());
             if let Some(Ok(catalog)) = catalog_health {
