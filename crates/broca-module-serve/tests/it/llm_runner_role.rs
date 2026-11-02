@@ -2685,6 +2685,24 @@ async fn unsupported_output_refs_precedes_plan_overrides_and_never_writes() {
     assert!(describe.declares(groups::OUTPUT_REFS));
     // This rig installs no plan admitter. Even though production discovery advertises the
     // reader, a handler without an output-reference admitter must refuse before overrides.
+    // A plan-less send, sent first so the session has a baseline: `session.refresh` below
+    // refuses a session with no baseline before it ever reaches the plan, and this test is
+    // about the plan check's place, not about that refusal.
+    rig.script.push(&[Step::Text("baseline")]);
+    let baseline = call(
+        &mut rig,
+        ops::SESSION_SEND,
+        serde_json::json!({
+            "send_id":"unsupported-baseline","prompt":"baseline",
+            "model":{"provider":"fake","model":"fake"},"tools":[]
+        }),
+    )
+    .await;
+    assert_eq!(result(&baseline)["state"], "active", "baseline send");
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    // The checks below compare against this head and this WAL, so nothing they claim to have
+    // refused may have written.
     for flag in [true, false] {
         let before = result(&call(&mut rig, ops::SESSION_HEAD, serde_json::json!({})).await);
         let wal = rig.wal_bytes();
