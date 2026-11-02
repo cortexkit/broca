@@ -623,3 +623,64 @@ fn refuse_ignores_malformed_recovery_manifests_and_matches_decoder() {
         assert!(!crate::head_proof::sidecar_path(&scratch.log()).exists());
     }
 }
+#[cfg(feature = "fs-override")]
+#[test]
+fn oracle_prefix_matches_real_recovery_for_damaged_and_zeroed_frames() {
+    for zero_version in [false, true] {
+        let scratch = Scratch::new("oracle-prefix");
+        let mut wal = scratch.overhaul();
+        wal.append(1, &plain(1), true).unwrap();
+        let first_append = std::fs::read(scratch.log()).unwrap();
+        let kept_records = wal.replay().unwrap();
+        let damaged_seq = wal.append(1, &plain(2), true).unwrap();
+        wal.append(1, &plain(3), true).unwrap();
+        drop(wal);
+        let mut damaged = std::fs::read(scratch.log()).unwrap();
+        let mut second_start = 0;
+        let second_end = loop {
+            match crate::framing::decode_next(&damaged[second_start..]) {
+                DecodeStep::Record { framed, consumed } if framed.seq == damaged_seq => {
+                    assert_eq!(framed.record, plain(2));
+                    break second_start + consumed;
+                }
+                DecodeStep::Record { consumed, .. } | DecodeStep::Lineage { consumed, .. } => {
+                    second_start += consumed
+                }
+                _ => panic!("the clean fixture must decode before injecting damage"),
+            }
+        };
+        // Keep the verified log-identity frame immediately before the damaged record.
+        let kept_bytes = damaged[..second_start].to_vec();
+        assert!(kept_bytes.starts_with(&first_append));
+        if zero_version {
+            damaged[second_start + 4] = 0;
+        } else {
+            damaged[second_end - 1] ^= 1;
+        }
+        std::fs::write(scratch.log(), &damaged).unwrap();
+
+        let selected = crate::recovery::test_recovery_prefix(&damaged).unwrap();
+        assert_eq!(selected.valid_end, kept_bytes.len() as u64);
+        assert_eq!(selected.last_seq, Some(1));
+        assert_eq!(
+            std::fs::read(scratch.log()).unwrap(),
+            damaged,
+            "observation must not modify the damaged image"
+        );
+
+        let reopened = scratch.overhaul();
+        let recovered = reopened.replay().unwrap();
+        assert_eq!(&recovered[..kept_records.len()], kept_records.as_slice());
+        assert!(std::fs::read(scratch.log())
+            .unwrap()
+            .starts_with(&kept_bytes));
+        let cut = recovered
+            .iter()
+            .find_map(|frame| match &frame.record {
+                WalRecord::RecoveryCut { recovery } => Some(recovery),
+                _ => None,
+            })
+            .expect("real recovery must record its cut before the intact later frame");
+        assert_eq!(cut.cut_offset, selected.valid_end);
+    }
+}

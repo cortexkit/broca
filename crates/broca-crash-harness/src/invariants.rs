@@ -90,6 +90,22 @@ fn resume_record_after_refreezes<'a>(appended: &'a [WalRecord], label: &str) -> 
     first
 }
 
+/// The observed entry must equal the verified input, not merely share its prefix.
+pub(crate) fn check_first_invocation(
+    prefix: &[broca_wal::FramedRecord],
+    invocations: &[crate::scenario::Invocation],
+    label: &str,
+) {
+    assert!(
+        !invocations.is_empty(),
+        "{label}: no real-loop invocation was observed"
+    );
+    assert_eq!(
+        invocations[0].prefix, prefix,
+        "{label}: the first invocation did not start from the killed prefix"
+    );
+}
+
 /// Run every check. Panics naming the kill and the property that failed.
 pub fn check(input: &CheckInput<'_>) {
     let label = input.label;
@@ -333,14 +349,7 @@ pub fn check(input: &CheckInput<'_>) {
     //    request.
     // A cut before the first record starts a fresh run, which may itself pause and resume.
     // Check every loop entry against its own durable prefix, not just the original kill.
-    assert!(
-        !input.invocations.is_empty(),
-        "{label}: no real-loop invocation was observed"
-    );
-    assert_eq!(
-        input.invocations[0].prefix, prefix_framed,
-        "{label}: the first invocation did not start from the killed prefix"
-    );
+    check_first_invocation(&prefix_framed, input.invocations, label);
     for (index, invocation) in input.invocations.iter().enumerate() {
         assert!(
             invocation.prefix.len() <= after_framed.len(),
