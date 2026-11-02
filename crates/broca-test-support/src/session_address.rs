@@ -5,14 +5,28 @@ use broca_protocol::BindIdentity;
 use broca_store::SessionAddressResolver;
 use broca_wal::state_format::decide_state_root;
 
-/// Resolve a rig's storage identity through the same inventory used by serving.
-/// Incomplete inventory remains an error: a reader must not guess another WAL address.
+/// Read an already-admitted rig session's identity from the production inventory.
+/// The format-selected read-only opener neither migrates schemas nor reserves new addresses,
+/// so assertions can read committed identities while the daemon holds SQLite's writer lock.
 pub fn resolve_session_address(root: &Path, claim: &BindIdentity) -> Result<BindIdentity, String> {
-    with_inventory(root, |resolver, _| {
-        resolver
-            .resolve_session_address(claim, None)
-            .map_err(|error| error.to_string())
-    })
+    claim.validate_keyable()?;
+    let reference = broca_core::agent_session_ref(claim);
+    let reader = broca_store::db::open_session_resolver(root)?;
+    let mut snapshot = reader.resolve_refs(&[&reference])?;
+    match snapshot.sessions.remove(&reference) {
+        Some((_, identity))
+            if identity.harness == claim.harness && identity.session == claim.session =>
+        {
+            Ok(identity)
+        }
+        Some(_) => Err("the inventory reference names a different harness/session".into()),
+        None if snapshot.complete => {
+            Err("session is not inventoried; bind it through serving before reading its WAL".into())
+        }
+        None => {
+            Err("session is absent from an incomplete inventory; its address is unknown".into())
+        }
+    }
 }
 
 /// Enroll an authored legacy seed before writing or moving its WAL.
@@ -59,7 +73,9 @@ mod tests {
         let store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
         broca_core::SessionInventory::rebuild_inventory(&store, &root).unwrap();
         let claim = BindIdentity::new(root.join("project"), "harness", "session");
+        let admitted = store.resolve_session_address(&claim, None).unwrap();
         let resolved = resolve_session_address(&root, &claim).unwrap();
+        assert_eq!(resolved, admitted);
         assert_eq!(resolved.project_root, Path::new("broca-unscoped-v1"));
         assert_eq!(resolved.harness, "harness");
         assert_eq!(resolved.session, "session");
@@ -86,6 +102,20 @@ mod tests {
         let root = root("address-incomplete");
         let claim = BindIdentity::new(root.join("project"), "harness", "session");
         assert!(resolve_session_address(&root, &claim).is_err());
+        assert!(!root.join("run-index.db").exists());
+    }
+
+    #[test]
+    fn a_reader_does_not_reserve_an_absent_pair_in_a_complete_inventory() {
+        let root = root("address-absent");
+        let store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
+        broca_core::SessionInventory::rebuild_inventory(&store, &root).unwrap();
+        let claim = BindIdentity::new(root.join("project"), "harness", "new-session");
+        assert!(resolve_session_address(&root, &claim).is_err());
+        let reference = broca_core::agent_session_ref(&claim);
+        let snapshot = broca_core::SessionRefResolver::resolve_refs(&store, &[&reference]).unwrap();
+        assert!(snapshot.complete);
+        assert!(snapshot.sessions.is_empty());
     }
 
     #[test]

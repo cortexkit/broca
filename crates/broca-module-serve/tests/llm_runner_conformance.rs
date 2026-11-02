@@ -1366,6 +1366,27 @@ impl BrocaSubject {
         }
     }
 
+    async fn fixture_identity(
+        &self,
+        handle: &Live,
+        session: &str,
+    ) -> Result<broca_protocol::BindIdentity, HarnessError> {
+        let connection = self.connection(handle, &self.owner_stamp()).await?;
+        let route = self
+            .open(&connection, &self.raw_bind_identity(session))
+            .await?;
+        let identity = broca_test_support::resolve_session_address(
+            &handle.state_root,
+            &self.raw_bind_identity(session),
+        )
+        .map_err(HarnessError::new);
+        connection
+            .route_close(&route)
+            .await
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        identity
+    }
+
     async fn start(&self, root: &Path) -> Result<Live, HarnessError> {
         let fail = |what: String| HarnessError::new(what);
         let config_home = root.join("config");
@@ -2311,11 +2332,7 @@ impl LlmRunnerSubject for BrocaSubject {
             ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
         };
         let fail = |e: String| HarnessError::new(e);
-        let identity = broca_test_support::resolve_session_address(
-            &handle.state_root,
-            &self.raw_bind_identity(session),
-        )
-        .expect("resolve the imported session in the target inventory");
+        let identity = self.fixture_identity(handle, session).await?;
         let seed_root = handle.state_root.join(format!("untimed-fixture-{session}"));
         let source = FileWalStore::new(&seed_root);
         let writer = WalHandle::spawn(source.open(&identity).map_err(|e| fail(e.to_string()))?, 1)
@@ -3420,11 +3437,7 @@ impl LlmRunnerSubject for BrocaSubject {
         session: &str,
     ) -> Result<cortexkit_role_llm_runner_conformance::AttributionFixture, HarnessError> {
         use broca_core::{FileLeaseStore, FileWalStore, LeaseStore, WalHandle, WalStore};
-        let identity = broca_test_support::resolve_session_address(
-            &handle.state_root,
-            &self.raw_bind_identity(session),
-        )
-        .expect("resolve the imported session in the target inventory");
+        let identity = self.fixture_identity(handle, session).await?;
         let marker = format!("unattributable-import-{session}");
         let seed_root = handle.state_root.join("attribution-import-fixture");
         let seed_store = FileWalStore::new(&seed_root);
@@ -6485,4 +6498,28 @@ async fn conformance_subject_declares_the_served_finish_reason_group() {
         subject.model_finish_reason_source(),
         Some("openai.chat_completions")
     );
+}
+
+#[test]
+fn assertion_address_lookup_does_not_contend_with_a_held_writer() {
+    for overhaul in [false, true] {
+        let root = broca_test_support::scratch_root()
+            .join(format!("assertion-address-held-writer-{overhaul}"));
+        std::fs::create_dir_all(&root).unwrap();
+        if overhaul {
+            std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+        }
+        let seed = broca_protocol::BindIdentity::new(root.join("legacy"), "harness", "session");
+        broca_test_support::register_legacy_session(&root, &seed).unwrap();
+        let database = root.join(if overhaul { "broca.db" } else { "run-index.db" });
+        let blocker = rusqlite::Connection::open(database).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let claim = broca_protocol::BindIdentity::new(root.join("route"), "harness", "session");
+        assert_eq!(
+            broca_test_support::resolve_session_address(&root, &claim).unwrap(),
+            seed,
+            "the committed identity must remain readable while another connection owns the writer"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+    }
 }

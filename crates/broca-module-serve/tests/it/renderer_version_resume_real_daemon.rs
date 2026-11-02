@@ -481,13 +481,21 @@ fn finished(records: &[WalRecord]) -> Option<&WalRecord> {
 /// Write, as the only record of `session`'s WAL, the `RunStarted` an earlier build recorded for
 /// the admission `template` describes: run `run_id`, renderer version `renderer_version`, and a
 /// frozen config without `provider_text_state`, which that build did not have.
-fn seed_earlier_build_run(
+async fn seed_earlier_build_run(
     rig: &Rig,
     template: &WalRecord,
     session: &str,
     run_id: &str,
     renderer_version: u32,
 ) {
+    let connection = broca_subc::SubcConnection::connect(&rig.connection_file)
+        .await
+        .unwrap();
+    let route = connection
+        .route_open_management("broca", &rig.key(session))
+        .await
+        .unwrap();
+    connection.route_close(&route).await.unwrap();
     let mut record = template.clone();
     let WalRecord::RunStarted {
         run_id: seeded_run,
@@ -563,7 +571,8 @@ async fn a_run_admitted_at_a_reproducible_renderer_version_resumes_and_an_undecl
         "reproducible",
         "admitted-at-v3",
         current - 1,
-    );
+    )
+    .await;
     let requests_before = bodies.lock().unwrap().len();
     rig.send("reproducible", "Continue after the deploy.").await;
     let records = wait_records(&rig, "reproducible", |records| {
@@ -600,7 +609,8 @@ async fn a_run_admitted_at_a_reproducible_renderer_version_resumes_and_an_undecl
         "undeclared",
         "admitted-at-v2",
         current - 2,
-    );
+    )
+    .await;
     rig.send("undeclared", "Continue after the deploy.").await;
     let records = wait_records(&rig, "undeclared", |records| {
         finished(episode(records, "admitted-at-v2")).is_some()
