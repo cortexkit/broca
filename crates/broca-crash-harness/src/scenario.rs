@@ -682,11 +682,35 @@ pub struct Invocation {
     pub auth_resolved: bool,
 }
 
-fn invocation<W: WalStore>(store: &W, request: &RunRequest, auth_resolved: bool) -> Invocation {
+fn invocation<W: WalStore>(
+    store: &W,
+    request: &RunRequest,
+    state_root: &Path,
+    auth_resolved: bool,
+) -> Invocation {
     let prefix = match store.read_records(&request.session) {
         Ok(frames) => frames,
         Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             Vec::new()
+        }
+        Err(error)
+            if store.wal_config().is_overhaul()
+                && store.wal_config().recovery == broca_wal::recovery::RecoveryPolicy::Repair
+                && matches!(
+                    &error,
+                    broca_wal::WalError::Corrupt { .. }
+                        | broca_wal::WalError::SequenceGap { .. }
+                        | broca_wal::WalError::NonMonotonic { .. }
+                ) =>
+        {
+            // The writer has not opened yet. Use production recovery's kept prefix
+            // without repairing the file or substituting the stricter ordinary reader rule.
+            let bytes = std::fs::read(crate::wal_path(state_root, &request.session))
+                .unwrap_or_else(|read_error| panic!("read invocation image: {read_error}"));
+            let kept = broca_wal::recovery::test_recovery_prefix(&bytes).unwrap_or_else(
+                |recovery_error| panic!("read invocation prefix: {recovery_error}"),
+            );
+            crate::LogImage::parse(bytes[..kept.valid_end as usize].to_vec()).framed()
         }
         Err(error) => panic!("read invocation prefix: {error}"),
     };
@@ -700,6 +724,7 @@ fn next_invocation<W: WalStore>(
     first: &mut Option<Invocation>,
     store: &W,
     request: &RunRequest,
+    state_root: &Path,
     auth_resolved: bool,
 ) -> Invocation {
     match first.take() {
@@ -707,7 +732,7 @@ fn next_invocation<W: WalStore>(
             invocation.auth_resolved = auth_resolved;
             invocation
         }
-        None => invocation(store, request, auth_resolved),
+        None => invocation(store, request, state_root, auth_resolved),
     }
 }
 
@@ -725,7 +750,7 @@ pub async fn drive<W: WalStore>(
 ) -> RunOutcome {
     // Legacy compaction admission can seed its Setup before entering the loop. Include that
     // prelude in the first observed call, rather than treating it as state present at the kill.
-    let mut first_invocation = Some(invocation(wal_store, &request, false));
+    let mut first_invocation = Some(invocation(wal_store, &request, state_root, false));
     #[cfg(test)]
     let control = {
         let mut control = control;
@@ -778,6 +803,7 @@ pub async fn drive<W: WalStore>(
                 &mut first_invocation,
                 wal_store,
                 &request,
+                state_root,
                 false,
             ));
             let paused = run_loop_with_control(
@@ -810,6 +836,7 @@ pub async fn drive<W: WalStore>(
                 &mut first_invocation,
                 wal_store,
                 &request,
+                state_root,
                 true,
             ));
             broca_core::run_loop_resume_after_auth_with_control(
@@ -821,6 +848,7 @@ pub async fn drive<W: WalStore>(
                 &mut first_invocation,
                 wal_store,
                 &request,
+                state_root,
                 false,
             ));
             run_loop_with_control(
@@ -833,6 +861,7 @@ pub async fn drive<W: WalStore>(
             &mut first_invocation,
             wal_store,
             &request,
+            state_root,
             false,
         ));
         let first = broca_test_support::event_timeout(
@@ -861,6 +890,7 @@ pub async fn drive<W: WalStore>(
                 &mut first_invocation,
                 wal_store,
                 &request,
+                state_root,
                 true,
             ));
             broca_test_support::event_timeout(
@@ -880,6 +910,7 @@ pub async fn drive<W: WalStore>(
             &mut first_invocation,
             wal_store,
             &request,
+            state_root,
             false,
         ));
         run_loop_with_control(
@@ -898,6 +929,214 @@ pub async fn drive<W: WalStore>(
         reason: summary.reason,
         events: collector.await.expect("event collector"),
         invocations,
+    }
+}
+
+#[cfg(test)]
+mod invocation_tests {
+    use super::*;
+    use broca_core::FileWalStore;
+    use broca_wal::{FileWal, FramedRecord, Wal, WalConfig, WalError, WalRecord};
+
+    struct Image {
+        root: PathBuf,
+        request: RunRequest,
+        store: FileWalStore,
+        kept: Vec<FramedRecord>,
+        damaged: Vec<u8>,
+    }
+
+    impl Image {
+        fn new(retained: usize, zero_version: bool) -> Self {
+            Self::with_first_step(retained, zero_version, 1)
+        }
+
+        fn with_first_step(retained: usize, zero_version: bool, first_step: u64) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let root = broca_test_support::scratch_root().join(format!(
+                "invocation-prefix-{}",
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let request = (crate::process_kill_probe().request)();
+            let store = FileWalStore::with_config(root.join("wal"), WalConfig::OVERHAUL);
+            let path = store.wal_path(&request.session);
+            let floor = root.join(broca_wal::FEATURE_FLOOR_FILENAME);
+            let mut wal = FileWal::open_with_recovery(&path, WalConfig::OVERHAUL, floor.clone())
+                .unwrap()
+                .with_feature_floor(floor);
+            for step in 1..=retained {
+                wal.append(
+                    1,
+                    &WalRecord::StepStarted {
+                        step_id: StepId(if step == 1 { first_step } else { step as u64 }),
+                    },
+                    true,
+                )
+                .unwrap();
+            }
+            let kept = wal.replay().unwrap();
+            wal.append(
+                1,
+                &WalRecord::StepStarted {
+                    step_id: StepId(50),
+                },
+                true,
+            )
+            .unwrap();
+            wal.append(
+                1,
+                &WalRecord::StepStarted {
+                    step_id: StepId(51),
+                },
+                true,
+            )
+            .unwrap();
+            drop(wal);
+            let clean = crate::LogImage::read(&path);
+            let frame = clean.record_frame(retained).unwrap();
+            let at = if zero_version {
+                frame.start + 4
+            } else {
+                frame.end - 1
+            };
+            let mut damaged = clean.bytes;
+            if zero_version {
+                damaged[at] = 0;
+            } else {
+                damaged[at] ^= 1;
+            }
+            std::fs::write(&path, &damaged).unwrap();
+            Self {
+                root,
+                request,
+                store,
+                kept,
+                damaged,
+            }
+        }
+
+        fn observe(&self) -> Invocation {
+            invocation(&self.store, &self.request, &self.root, false)
+        }
+    }
+
+    impl Drop for Image {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn panic_message(failure: Box<dyn std::any::Any + Send>) -> String {
+        failure
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                failure
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn invocation_observes_kept_prefix_without_repairing_damaged_image() {
+        for zero_version in [false, true] {
+            let image = Image::new(1, zero_version);
+            let observed = image.observe();
+            assert_eq!(observed.prefix, image.kept);
+            crate::invariants::check_first_invocation(&image.kept, &[observed], "kept input");
+            assert_eq!(
+                std::fs::read(image.store.wal_path(&image.request.session)).unwrap(),
+                image.damaged
+            );
+        }
+    }
+
+    #[test]
+    fn kept_prefix_check_rejects_a_different_recoverable_entry() {
+        let expected = Image::new(1, false);
+        for (retained, first_step) in [(0, 1), (1, 99), (2, 1)] {
+            let other = Image::with_first_step(retained, true, first_step);
+            let observed = other.observe();
+            assert_eq!(observed.prefix, other.kept);
+            assert_ne!(observed.prefix, expected.kept);
+            if retained == 2 {
+                assert!(observed.prefix.starts_with(&expected.kept));
+            }
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::invariants::check_first_invocation(
+                    &expected.kept,
+                    &[observed],
+                    "wrong kept input",
+                )
+            }))
+            .expect_err("another valid kept prefix must not satisfy the exact entry check");
+            assert!(panic_message(failure)
+                .contains("the first invocation did not start from the killed prefix"));
+        }
+    }
+
+    struct ReadFailure(u8);
+
+    impl WalStore for ReadFailure {
+        fn open(&self, _: &broca_protocol::BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
+            panic!("observation must never open a writer")
+        }
+        fn read_records(
+            &self,
+            _: &broca_protocol::BindIdentity,
+        ) -> Result<Vec<FramedRecord>, WalError> {
+            Err(match self.0 {
+                0 => WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "observer-permission-denied",
+                )),
+                1 => WalError::NewerWriter {
+                    offset: 0,
+                    ver: 3,
+                    missing: vec!["observer-future-feature".into()],
+                },
+                _ => WalError::Corrupt {
+                    offset: 5,
+                    source: broca_wal::framing::FrameError::NonTailIncompleteFrame,
+                },
+            })
+        }
+        fn wal_config(&self) -> WalConfig {
+            if self.0 == 2 {
+                WalConfig {
+                    recovery: broca_wal::recovery::RecoveryPolicy::Refuse,
+                    ..WalConfig::OVERHAUL
+                }
+            } else {
+                WalConfig::OVERHAUL
+            }
+        }
+    }
+
+    #[test]
+    fn invocation_still_panics_on_io_newer_writer_and_refuse_policy_errors() {
+        let request = (crate::process_kill_probe().request)();
+        for kind in 0..=2 {
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                invocation(
+                    &ReadFailure(kind),
+                    &request,
+                    Path::new("unused-observer-root"),
+                    false,
+                )
+            }))
+            .err()
+            .expect("a non-recoverable read must stay fatal");
+            let message = panic_message(failure);
+            assert!(message.contains("read invocation prefix:"));
+            if kind == 0 {
+                assert!(message.contains("observer-permission-denied"));
+            }
+            if kind == 1 {
+                assert!(message.contains("observer-future-feature"));
+            }
+        }
     }
 }
 
