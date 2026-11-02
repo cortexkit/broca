@@ -2392,17 +2392,24 @@ async fn differential_failure_dump_names_exited_child_and_broca_logs() {
         child_status.contains("exited before cleanup: exit") && child_status.ends_with("1"),
         "{child_status}"
     );
+    // The dump joins the log path segment by segment, so on Windows it mixes separators.
+    // Compare with every separator normalized, so the check is about the path, not its spelling.
     assert!(
-        stderr.contains(
+        slashed(&stderr).contains(&slashed(
             &root
                 .join("data-home/cortexkit/broca/logs/broca.log")
                 .display()
                 .to_string()
-        ),
+        )),
         "{stderr}"
     );
     assert!(root.exists(), "failed rig artifacts must be retained");
     broca_test_support::remove_rig_dir(root);
+}
+
+/// A path rendered with `/` separators only.
+fn slashed(text: &str) -> String {
+    text.replace('\\', "/")
 }
 
 #[tokio::test(start_paused = true)]
@@ -2453,12 +2460,12 @@ async fn warming_guard_timeout_reports_the_broca_log_tail() {
             "{result}"
         );
         assert!(
-            result.contains(
+            slashed(&result).contains(&slashed(
                 &rig.root
                     .join("data-home/cortexkit/broca/logs/broca.log")
                     .display()
                     .to_string()
-            ),
+            )),
             "{result}"
         );
         assert!(
