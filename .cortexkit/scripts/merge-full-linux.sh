@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Run from the repository root whatever directory invokes this, so the relative paths below
+# (the slow-test list, the merge inputs) resolve.
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 mkdir -p target/scratch
 out=.cortexkit/internal-docs/investigations/merge-258769b37-linux
 mkdir -p "$out"
