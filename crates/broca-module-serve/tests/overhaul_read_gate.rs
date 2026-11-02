@@ -1,10 +1,15 @@
 //! The installed format-2 bundle without transport, using the real service handlers.
 
 // Compile the daemon's boot implementation itself, not a second implementation of its order.
+// These files are compiled whole, and this test calls only the handles it measures, so the
+// rest is dead code in this test target.
+#[allow(dead_code)]
 #[path = "../src/composition.rs"]
 mod composition;
+#[allow(dead_code)]
 #[path = "../src/overhaul_daemon.rs"]
 mod overhaul_daemon;
+#[allow(dead_code)]
 #[path = "../src/state_format.rs"]
 mod state_format;
 use composition::opener_for_state_root;
