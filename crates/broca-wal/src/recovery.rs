@@ -734,6 +734,17 @@ struct Prefix {
     damaged: bool,
 }
 
+/// Let tests observe exactly the prefix selected by overhaul recovery, without
+/// opening or modifying a log. This delegates to the same scan used by `before_open`.
+#[cfg(feature = "fs-override")]
+pub fn test_recovery_prefix(bytes: &[u8]) -> Result<crate::file_wal::WalRecoveryPrefix, WalError> {
+    let scan = prefix(bytes, true)?;
+    Ok(crate::file_wal::WalRecoveryPrefix {
+        valid_end: scan.end as u64,
+        last_seq: (scan.seq != 0).then_some(scan.seq),
+    })
+}
+
 fn prefix(bytes: &[u8], require_v4: bool) -> Result<Prefix, WalError> {
     let mut scan = Prefix {
         end: 0,

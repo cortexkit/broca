@@ -2380,7 +2380,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     }
     assert_eq!(
         metrics["session_address_refusals"],
-        serde_json::json!({"incomplete_inventory":0,"gap_marker":0,"store_error":0,"wait_expired":0,"migration_failed":0,"ambiguous":0,"invalid_identity":0,"repairs":{"started":0,"completed":0,"failed":0}}),
+        serde_json::json!({"incomplete_inventory":0,"gap_marker":0,"store_error":0,"wait_expired":0,"migration_failed":0,"ambiguous":0,"invalid_identity":0,"session_log_missing":0,"repairs":{"started":0,"completed":0,"failed":0}}),
         "a healthy inventory and valid identities must not refuse a session address"
     );
     let workdirs = metrics["scoped_session_workdirs"]
@@ -6490,6 +6490,38 @@ async fn admission_open_failed_preserves_legacy_message() {
 
 struct TemporaryWalReader;
 
+#[derive(Default)]
+struct TemporaryPresenceProbe {
+    probes: std::sync::atomic::AtomicUsize,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl broca_core::WalStore for TemporaryPresenceProbe {
+    fn open(
+        &self,
+        _: &BindIdentity,
+    ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
+        unreachable!("a failed read probe must not open a writer")
+    }
+
+    fn wal_present_checked(&self, _: &BindIdentity) -> Result<Option<bool>, broca_wal::WalError> {
+        self.probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(broca_wal::WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "temporary WAL read interruption",
+        )))
+    }
+
+    fn read_records(
+        &self,
+        _: &BindIdentity,
+    ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![])
+    }
+}
+
 impl broca_core::WalStore for TemporaryWalReader {
     fn open(
         &self,
@@ -6680,6 +6712,21 @@ async fn transient_open_failed_wal_refusal_golden() {
         body,
         include_bytes!("../../../broca-wire/tests/golden/open_failed_transient.json")
     );
+    route.finish().await;
+}
+
+#[tokio::test]
+async fn transient_log_state_probe_preserves_class_and_original_cause() {
+    let probe = Arc::new(TemporaryPresenceProbe::default());
+    let mut route =
+        PreparedWalRoute::start_with("transient-presence-probe", |_| {}, Some(probe.clone())).await;
+    let body = route.expect_error(2, read_request()).await;
+    assert_eq!(
+        body,
+        include_bytes!("../../../broca-wire/tests/golden/open_failed_transient.json")
+    );
+    assert!(probe.probes.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    assert!(probe.reads.load(std::sync::atomic::Ordering::SeqCst) > 0);
     route.finish().await;
 }
 

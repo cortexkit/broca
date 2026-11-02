@@ -51,22 +51,41 @@ mod retained_head;
 pub mod retention;
 pub mod retention_withdrawals;
 pub mod session_address;
+pub mod session_log_evidence;
+pub mod session_ref_audit;
 pub mod session_refs;
 pub mod session_root_repair;
 pub mod system_one;
 mod wal_recovery;
 pub use fold_identities::{fold_identities, require_legacy_operator_root, LegacyOnlyOperator};
 
-/// Reserve a logical session's storage address in the format-selected inventory.
+/// Reserve a logical session's storage address and verify its history through
+/// the format-selected inventory.
 pub trait SessionAddressResolver: Send + Sync {
     fn resolve_session_address(
         &self,
         bind: &BindIdentity,
         workdir: Option<&Path>,
     ) -> Result<BindIdentity, session_address::SessionAddressError>;
+
+    /// Check history without opening a writer. Evidence failures must remain
+    /// errors; an unreadable inventory cannot certify a new or available log.
+    fn session_log_state(
+        &self,
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError>;
 }
 
 impl SessionAddressResolver for SqliteStore {
+    fn session_log_state(
+        &self,
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError> {
+        SqliteStore::checked_session_log_state(self, session, wal)
+    }
+
     fn resolve_session_address(
         &self,
         bind: &BindIdentity,
@@ -77,6 +96,14 @@ impl SessionAddressResolver for SqliteStore {
 }
 
 impl SessionAddressResolver for db::OverhaulDb {
+    fn session_log_state(
+        &self,
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError> {
+        db::OverhaulDb::session_log_state(self, session, wal)
+    }
+
     fn resolve_session_address(
         &self,
         bind: &BindIdentity,
@@ -1506,6 +1533,7 @@ impl SqliteStore {
         diagnostics::init_schema(conn)?;
         compaction_receipts::init_schema(conn)?;
         compaction_facts::init_schema(conn)?;
+        session_log_evidence::indexes::install(conn)?;
         let source = export_index::init_schema(conn).map_err(StoreError::from)?;
         if from_version < STORE_SCHEMA_VERSION {
             // `user_version` provides one global checkpoint for this idempotent schema path.

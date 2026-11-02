@@ -32,6 +32,8 @@ mod attribution;
 mod display_facts;
 #[path = "session_read/media.rs"]
 mod media;
+#[path = "session_read/root_repair.rs"]
+mod root_repair;
 #[path = "session_read/run_usage.rs"]
 mod run_usage;
 #[path = "session_read/tags.rs"]
@@ -105,6 +107,12 @@ impl WalStore for ReadCountingWalStore {
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
         self.inner.wal_present(session)
     }
+    fn wal_present_checked(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<bool>, broca_wal::WalError> {
+        self.inner.wal_present_checked(session)
+    }
 
     fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, broca_wal::WalError> {
         self.inner.open(session)
@@ -172,6 +180,12 @@ impl WalStore for ZeroRangeCountingWalStore {
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
         self.inner.wal_present(session)
     }
+    fn wal_present_checked(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<bool>, broca_wal::WalError> {
+        self.inner.wal_present_checked(session)
+    }
 
     fn live_wal_last_write(
         &self,
@@ -223,6 +237,12 @@ impl WalStore for NoFileIdentityWalStore {
 
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
         self.inner.wal_present(session)
+    }
+    fn wal_present_checked(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<bool>, broca_wal::WalError> {
+        self.inner.wal_present_checked(session)
     }
 
     fn live_wal_last_write(
@@ -1772,6 +1792,236 @@ fn read_request(
         max_bytes: None,
         media: Default::default(),
     }
+}
+
+async fn stale_inventory_fixture() -> (Rig, BindIdentity, BindIdentity, Vec<u8>) {
+    use broca_core::SessionRefIndex;
+    let rig = Rig::new("stale-inventory-diagnosis", Arc::new(NoopExec));
+    let old = BindIdentity::new(rig.dir.join("old-project"), "broca", "cktui-stale");
+    let real = BindIdentity::new(rig.dir.join("new-project"), "broca", "cktui-stale");
+    let mut wal = rig.wal_store.open(&old).unwrap();
+    wal.append(1, &started(&old, "real-run", "real content"), false)
+        .unwrap();
+    wal.append(1, &assistant_text(0, "real answer"), false)
+        .unwrap();
+    wal.append(1, &finished_ok(), true).unwrap();
+    drop(wal);
+    std::fs::rename(rig.wal_store.wal_path(&old), rig.wal_store.wal_path(&real)).unwrap();
+    let real_bytes = std::fs::read(rig.wal_store.wal_path(&real)).unwrap();
+    rig.store
+        .index_run_active(&RunIndexRow {
+            withdrawals_owed: false,
+            title: None,
+            run_id: "real-run".into(),
+            session: old.clone(),
+            submission_id: None,
+            request_identity_digest: None,
+            state: RunIndexState::Active,
+            usage: None,
+            final_step_finish_reason: None,
+            retries_used: 0,
+        })
+        .unwrap();
+    rig.store
+        .index_run_terminal("real-run", RunIndexState::Completed, None, None, 0)
+        .unwrap();
+    rig.store
+        .record_session(&broca_core::session_addr(&old), &old)
+        .unwrap();
+    rig.registry
+        .set_session_address_inventory(rig.store.clone());
+    let resolved = rig
+        .registry
+        .resolve_session_address(&real, None)
+        .await
+        .unwrap();
+    assert_eq!(resolved, old);
+    (rig, resolved, real, real_bytes)
+}
+
+#[tokio::test]
+async fn historical_missing_log_guards_history_and_activation_without_creating() {
+    assert_historical_session_ops_do_not_fork(false).await;
+}
+
+#[tokio::test]
+async fn forked_stub_guards_history_and_activation_without_changing_the_log() {
+    assert_historical_session_ops_do_not_fork(true).await;
+}
+
+async fn assert_historical_session_ops_do_not_fork(forked_stub: bool) {
+    let mut failures = Vec::new();
+    for op in [
+        "read",
+        "head",
+        "baseline",
+        "status",
+        "subscribe",
+        "warm",
+        "send",
+        "scoped_bind",
+    ] {
+        let (rig, resolved, real, real_bytes) = stale_inventory_fixture().await;
+        if forked_stub {
+            let history = rig
+                .wal_store
+                .read_records_range(&real, 0, None, None)
+                .unwrap();
+            rig.store.project_range(&resolved, &history).unwrap();
+            let evidence = rig.store.session_log_evidence(&resolved).unwrap();
+            assert!(
+                evidence
+                    .lineages
+                    .contains(&history.lineage_id.unwrap().to_string()),
+                "{evidence:?}"
+            );
+            let stub = rig.wal_store.open(&resolved).unwrap();
+            assert_ne!(stub.lineage_id(), history.lineage_id);
+            drop(stub);
+            assert_eq!(
+                std::fs::metadata(rig.wal_store.wal_path(&resolved))
+                    .unwrap()
+                    .len(),
+                69
+            );
+            assert!(
+                rig.store
+                    .session_log_state(&resolved, rig.wal_store.as_ref())
+                    .unwrap()
+                    .missing_history(),
+                "{evidence:?}"
+            );
+        }
+        let stub = rig.wal_store.wal_path(&resolved);
+        let before = std::fs::read(&stub).ok();
+        let result = match op {
+            "scoped_bind" => {
+                let stamp = broca_protocol::BindScope {
+                    scope: broca_protocol::SessionScope {
+                        owner: broca_protocol::BindPrincipal::Reserved {
+                            module_id: "core".into(),
+                        },
+                        scope_ref: "work".into(),
+                        scope_epoch: 1,
+                        flow_id: None,
+                        sender: None,
+                        agent_id: None,
+                        run_id: None,
+                    },
+                    owner_authorized: true,
+                    kind: broca_protocol::ScopeKind::Head,
+                    parent: None,
+                    parent_state: None,
+                };
+                rig.registry
+                    .bind_adoption_refusal(&resolved, None, &stamp)
+                    .await
+                    .map(|_| ())
+            }
+            "read" => rig
+                .registry
+                .read(read_request(&resolved, None, Some(20)))
+                .await
+                .map(|_| ()),
+            "head" => rig.registry.head(&resolved).await.map(|_| ()),
+            "baseline" => rig
+                .registry
+                .baseline(&resolved, None, &Default::default())
+                .await
+                .map(|_| ()),
+            "status" => rig.registry.status(&resolved).await.map(|reply| {
+                assert_eq!(reply, broca_module::serve::StatusResponse::Idle);
+            }),
+            "subscribe" => {
+                let (sink, _received) = tokio::sync::mpsc::channel(16);
+                rig.registry
+                    .subscribe(&resolved, broca_module::serve::SubscribeFrom::Start, sink)
+                    .await
+            }
+            "warm" => rig.registry.warm(&resolved, None).await.map(|_| ()),
+            "send" => {
+                let request = req(&resolved, "new-run", "must not fork");
+                rig.registry
+                    .send(broca_module::serve::SendRequest {
+                        session_class: None,
+                        retention: None,
+                        stop_sequences_named: false,
+                        title: None,
+                        conversation_key: None,
+                        delivery: Default::default(),
+                        session: resolved.clone(),
+                        run_id: request.run_id.clone(),
+                        send_id: None,
+                        request: Box::new(request.to_submission()),
+                        skip_materialization: false,
+                        kind: RunKind::FreshOrResume,
+                        plan: None,
+                        order: None,
+                    })
+                    .await
+                    .map(|_| ())
+            }
+            _ => unreachable!(),
+        };
+        let expected = if op == "status" {
+            result.is_ok()
+        } else if op == "scoped_bind" && forked_stub {
+            matches!(
+                &result,
+                Err(broca_module::serve::ServeError::Open(reason, Some(broca_protocol::ErrorClass::Transient)))
+                    if reason.contains("empty session WAL contradicts materialized history")
+            )
+        } else {
+            result.as_ref().is_err_and(|error| {
+                matches!(
+                    error,
+                    broca_module::serve::ServeError::SessionLogMissing { .. }
+                ) && error.to_string().contains("repair-session-root")
+            })
+        };
+        if !expected {
+            failures.push(format!("{op}: {result:?}"));
+        }
+        if std::fs::read(&stub).ok() != before {
+            failures.push(format!("{op}: created or changed a WAL"));
+        }
+        assert_eq!(
+            std::fs::read(rig.wal_store.wal_path(&real)).unwrap(),
+            real_bytes
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn interrupted_first_bind_reservation_can_subscribe_and_send_after_retry() {
+    use broca_core::SessionRefIndex;
+    let rig = Rig::new("reservation-retry", crate::common::FakeExecutor::auto());
+    let key = rig.key("new-session");
+    rig.store
+        .record_session(&broca_core::session_addr(&key), &key)
+        .unwrap();
+    rig.registry
+        .set_session_address_inventory(rig.store.clone());
+    let retry = rig
+        .registry
+        .resolve_session_address(&key, None)
+        .await
+        .unwrap();
+    assert!(!rig.wal_store.wal_path(&key).exists());
+    assert!(!rig.store.session_log_evidence(&key).unwrap().content);
+    let (sink, _received) = tokio::sync::mpsc::channel(16);
+    rig.registry
+        .subscribe(&retry, broca_module::serve::SubscribeFrom::Start, sink)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(rig.wal_store.wal_path(&key))
+            .unwrap()
+            .len(),
+        69
+    );
+    send(&rig, &retry, "new-run", "first input").await;
 }
 
 fn read_request_with_tools(
@@ -4785,4 +5035,39 @@ async fn imported_message_over_frame_limit_is_refused_with_identity() {
         } if session == key.session
     ));
     drop(rig);
+}
+
+#[tokio::test]
+async fn missing_history_keeps_an_explicit_lineage_changed_refusal() {
+    for forked_stub in [false, true] {
+        let (rig, resolved, real, real_bytes) = stale_inventory_fixture().await;
+        let history = rig
+            .wal_store
+            .read_records_range(&real, 0, None, None)
+            .unwrap();
+        let requested = history.lineage_id.unwrap().to_string();
+        if forked_stub {
+            rig.store.project_range(&resolved, &history).unwrap();
+            drop(rig.wal_store.open(&resolved).unwrap());
+        }
+        let path = rig.wal_store.wal_path(&resolved);
+        let before = std::fs::read(&path).ok();
+        let projection = rig.store.read_prefix_with_watermark(&resolved).unwrap();
+        let mut request = read_request(&resolved, None, Some(20));
+        request.lineage_id = Some(requested.clone());
+        let error = rig.registry.read(request).await.unwrap_err();
+        assert!(
+            matches!(error, broca_module::serve::ServeError::LineageChanged { requested: ref id } if id == &requested),
+            "{error:?}"
+        );
+        assert_eq!(std::fs::read(path).ok(), before);
+        assert_eq!(
+            rig.store.read_prefix_with_watermark(&resolved).unwrap(),
+            projection
+        );
+        assert_eq!(
+            std::fs::read(rig.wal_store.wal_path(&real)).unwrap(),
+            real_bytes
+        );
+    }
 }

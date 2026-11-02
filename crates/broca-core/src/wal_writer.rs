@@ -213,6 +213,12 @@ pub trait WalStore: Send + Sync {
         None
     }
 
+    /// Preserve a failed location probe's typed cause for admission checks.
+    /// Stores with no fallible probe keep their explicit known/unknown answer.
+    fn wal_present_checked(&self, session: &BindIdentity) -> Result<Option<bool>, WalError> {
+        Ok(self.wal_present(session))
+    }
+
     /// When the session's LIVE log was last written, without consulting any archive.
     ///
     /// `Ok(None)` means there is no live log: the session was folded into an archive (or never
@@ -2447,6 +2453,10 @@ impl WalStore for FileWalStore {
     }
 
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
+        self.wal_present_checked(session).ok().flatten()
+    }
+
+    fn wal_present_checked(&self, session: &BindIdentity) -> Result<Option<bool>, WalError> {
         // ONE OBSERVATION, NOT TWO. This used to stat the live path and then consult the
         // archive, which left a window: an extraction restoring the live file between the
         // two steps produced `Some(false)` -- "authoritatively no log" -- about a log at
@@ -2459,13 +2469,10 @@ impl WalStore for FileWalStore {
         // means exactly that live-wins return; a missing archive directory is a CONFIRMED
         // miss and sets the flag.
         //
-        // An IO failure stays `None` rather than becoming `false`: reporting "no log here"
-        // for a log we were merely unable to look at is the conflation this method exists
-        // to remove.
-        match self.archived_member(session) {
-            Ok(lookup) => Some(lookup.member.is_some() || lookup.live_present),
-            Err(_) => None,
-        }
+        // An IO failure is not absence. Preserve it for checked callers; the
+        // legacy Option adapter above still maps that failure to unknown, not false.
+        self.archived_member(session)
+            .map(|lookup| Some(lookup.member.is_some() || lookup.live_present))
     }
 
     fn live_wal_last_write(

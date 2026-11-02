@@ -10,6 +10,12 @@ use broca_module::serve::{
 
 struct EmptyFlowHistory;
 impl broca_core::WalStore for EmptyFlowHistory {
+    fn wal_present(&self, _: &BrocaBindIdentity) -> Option<bool> {
+        Some(true)
+    }
+    fn live_wal_bytes(&self, _: &BrocaBindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+        Ok(Some(0))
+    }
     fn open(
         &self,
         _: &BrocaBindIdentity,

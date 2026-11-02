@@ -1493,6 +1493,9 @@ impl WalStore for CountedWal {
     fn wal_present(&self, key: &LineageKey) -> Option<bool> {
         self.wal.wal_present(key)
     }
+    fn wal_present_checked(&self, key: &LineageKey) -> Result<Option<bool>, broca_wal::WalError> {
+        self.wal.wal_present_checked(key)
+    }
     fn lineage_exists(
         &self,
         key: &LineageKey,

@@ -223,6 +223,11 @@ pub enum OpenError {
         session_ref: String,
         reason: String,
     },
+    SessionLogMissing {
+        session: String,
+        harness: String,
+        read: Option<HistoryReadContext>,
+    },
     /// The session's WAL holds a complete frame that requires WAL features this build does not
     /// know (`missing`): a newer broca wrote it. Kept apart from [`OpenError::Open`] because the
     /// remedy differs: retrying cannot help, only placing a build that knows the features can.
@@ -234,7 +239,73 @@ pub enum OpenError {
     },
 }
 
+/// Metadata from a successful would-be empty read. It carries no message content
+/// and lets serving retain established cursor refusals before a history refusal.
+#[derive(Debug, Clone)]
+pub struct HistoryReadContext {
+    pub lineage_id: Option<String>,
+    pub prompt_len: Option<u64>,
+    pub tags_await_setup: bool,
+}
+
 impl OpenError {
+    fn for_empty_read(
+        self,
+        lineage_id: Option<String>,
+        prompt_len: Option<u64>,
+        tags_await_setup: bool,
+    ) -> Self {
+        match self {
+            Self::SessionLogMissing {
+                session, harness, ..
+            } => Self::SessionLogMissing {
+                session,
+                harness,
+                read: Some(HistoryReadContext {
+                    lineage_id,
+                    prompt_len,
+                    tags_await_setup,
+                }),
+            },
+            other => other,
+        }
+    }
+    fn temporary_io(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::TimedOut
+        )
+    }
+
+    fn from_log_state(error: broca_store::session_log_evidence::SessionLogError) -> Self {
+        match error {
+            broca_store::session_log_evidence::SessionLogError::Wal(error) => {
+                Self::from_wal_read(format!("wal range-read failed: {error}"), &error)
+            }
+            broca_store::session_log_evidence::SessionLogError::Inventory(error) => {
+                let temporary = error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(Self::temporary_io)
+                    || matches!(error.downcast_ref::<broca_store::db::DbError>(), Some(broca_store::db::DbError::Io(io)) if Self::temporary_io(io));
+                if let Some(broca_store::db::DbError::Wal(wal)) =
+                    error.downcast_ref::<broca_store::db::DbError>()
+                {
+                    return Self::from_wal_read(error.to_string(), wal);
+                }
+                if temporary {
+                    Self::Classified {
+                        reason: error.to_string(),
+                        class: broca_protocol::ErrorClass::Transient,
+                    }
+                } else {
+                    Self::Open(error.to_string())
+                }
+            }
+        }
+    }
+
     pub(crate) fn relocation_or_open(error: broca_wal::WalError) -> Self {
         match error {
             error @ broca_wal::WalError::RelocationIncomplete { .. } => {
@@ -301,19 +372,10 @@ impl OpenError {
                 reason,
             },
             // For generic I/O failures, only these temporary OS kinds establish retryability.
-            broca_wal::WalError::Io(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                OpenError::Classified {
-                    reason,
-                    class: broca_protocol::ErrorClass::Transient,
-                }
-            }
+            broca_wal::WalError::Io(error) if Self::temporary_io(error) => OpenError::Classified {
+                reason,
+                class: broca_protocol::ErrorClass::Transient,
+            },
             // Corruption, replay/shape errors and opaque failures are not presumed retryable.
             _ => OpenError::Open(reason),
         }
@@ -361,6 +423,8 @@ impl std::fmt::Display for OpenError {
             OpenError::RetentionInvalid(_) => write!(f, "invalid retention"),
             OpenError::SessionClassInvalid(message) => f.write_str(message),
             OpenError::LeaseHeld(s) => write!(f, "session '{s}' held by a live writer"),
+            OpenError::SessionLogMissing { session, harness, .. } => write!(f,
+                "session_log_missing: session {session:?} in harness {harness:?} has history but no log; stop broca and inspect store-maintenance repair-session-root STATE_ROOT --harness {harness:?} --session {session:?}"),
             OpenError::Open(s)
             | OpenError::Classified { reason: s, .. }
             | OpenError::HistoryUnreachable { reason: s, .. }
@@ -1132,6 +1196,44 @@ pub struct EpisodeReadSource {
     access: Option<broca_wal::access_counter::WalAccessCounter>,
 }
 
+// Validate the zero-record source before refusing its empty rebuild, so an
+// existing source I/O or witness refusal keeps its cause without changing rows.
+fn check_empty_publication_source(
+    publication: &broca_wal::file_wal::DurablePublication,
+) -> Result<(), OpenError> {
+    use std::io::Read;
+    let source_error = |error| {
+        let temporary = OpenError::temporary_io(&error);
+        let reason = broca_store::db::DbError::Io(error).to_string();
+        if temporary {
+            OpenError::Classified {
+                reason,
+                class: broca_protocol::ErrorClass::Transient,
+            }
+        } else {
+            OpenError::Open(reason)
+        }
+    };
+    let mut file = broca_wal::fs_ops::File::open(publication.path()).map_err(source_error)?;
+    let mut header = Vec::new();
+    (&mut file)
+        .take(broca_wal::framing::LINEAGE_FRAME_LEN as u64)
+        .read_to_end(&mut header)
+        .map_err(source_error)?;
+    match broca_wal::framing::decode_next(&header) {
+        broca_wal::framing::DecodeStep::Lineage {
+            lineage_id,
+            consumed,
+        } if consumed == header.len() && lineage_id == publication.lineage() => Ok(()),
+        _ => Err(OpenError::Open(
+            broca_store::db::DbError::Invalid(
+                "durable publication lineage differs from its witness".into(),
+            )
+            .to_string(),
+        )),
+    }
+}
+
 impl EpisodeReadSource {
     pub fn new(db: Arc<broca_store::db::OverhaulDb>, publication: Arc<EpisodePublication>) -> Self {
         Self {
@@ -1175,6 +1277,57 @@ impl EpisodeReadSource {
                 .run(|| self.with_reader_inner(key, head, read));
         }
         self.with_reader_inner(key, head, read)
+    }
+
+    fn with_reader_checked<T>(
+        &self,
+        key: &LineageKey,
+        head: Option<u64>,
+        empty_history_check: Result<(), OpenError>,
+        read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
+    ) -> Result<T, OpenError> {
+        let work = || {
+            let gate = self.gate.as_ref().map(|factory| factory(key));
+            let _guard = gate
+                .as_ref()
+                .map(|gate| {
+                    gate.lock()
+                        .map_err(|error| OpenError::Open(error.to_string()))
+                })
+                .transpose()?;
+            let publication = (self.publication)(key, head).map_err(OpenError::Open)?;
+            if head.is_some_and(|head| publication.sequence() != head) {
+                return Err(OpenError::Open(
+                    "episode publication does not name attach barrier".into(),
+                ));
+            }
+            if publication.sequence() == 0 {
+                // Refuse before an empty publication can replace historical
+                // index rows. Nonempty publications keep their original source
+                // validation and refusal paths.
+                if empty_history_check.is_err() {
+                    check_empty_publication_source(&publication)?;
+                }
+                empty_history_check.map_err(|error| {
+                    error.for_empty_read(Some(publication.lineage().to_string()), None, false)
+                })?;
+            }
+            let reader = self
+                .db
+                .episode_reader(key.clone(), publication)
+                .map_err(|error| OpenError::Open(error.to_string()))?;
+            read(reader).map_err(OpenError::Open)
+        };
+        if let Some(access) = &self.access {
+            return access
+                .operation(if head.is_some() {
+                    "model attach"
+                } else {
+                    "model page"
+                })
+                .run(work);
+        }
+        work()
     }
 
     fn with_reader_inner<T>(
@@ -1244,6 +1397,7 @@ impl RawPageSource {
         from: Option<u64>,
         limit: Option<u64>,
         tools: bool,
+        empty_history_check: Result<(), OpenError>,
     ) -> Result<Box<RouteReadPage>, OpenError> {
         let gate = self.gate.as_ref().map(|factory| factory(key));
         let _guard = gate
@@ -1251,6 +1405,14 @@ impl RawPageSource {
             .map(|gate| gate.lock().map_err(|e| OpenError::Open(e.to_string())))
             .transpose()?;
         let publication = (self.publication)(key, None).map_err(OpenError::Open)?;
+        if publication.sequence() == 0 {
+            if empty_history_check.is_err() {
+                check_empty_publication_source(&publication)?;
+            }
+            empty_history_check.map_err(|error| {
+                error.for_empty_read(Some(publication.lineage().to_string()), Some(0), false)
+            })?;
+        }
         let raw = self
             .db
             .read_raw_page(
@@ -2958,31 +3120,35 @@ impl LineageRegistry {
                     // fix the slot, so no waiter hangs. If this task is cancelled or panics
                     // mid-await, `OpenGuard` clears the Opening slot.
                     let open_guard = OpenGuard::new(self.inner.clone(), key.clone(), ready.clone());
-                    ACTOR_OPENS.fetch_add(1, Ordering::Relaxed);
-                    #[cfg(all(test, feature = "test-clock"))]
-                    if status {
-                        let probe = self.inner.status_open_probe.lock().unwrap().take();
-                        if let Some(probe) = probe {
-                            probe();
+                    let result = async {
+                        self.check_session_log(key).await?;
+                        ACTOR_OPENS.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(all(test, feature = "test-clock"))]
+                        if status {
+                            let probe = self.inner.status_open_probe.lock().unwrap().take();
+                            if let Some(probe) = probe {
+                                probe();
+                            }
+                        }
+                        if status {
+                            self.inner
+                                .opener
+                                .open_for_status(key, gen, self.handle())
+                                .await
+                        } else {
+                            self.inner
+                                .opener
+                                .open_with_class(
+                                    key,
+                                    gen,
+                                    self.handle(),
+                                    retention,
+                                    session_class.clone(),
+                                )
+                                .await
                         }
                     }
-                    let result = if status {
-                        self.inner
-                            .opener
-                            .open_for_status(key, gen, self.handle())
-                            .await
-                    } else {
-                        self.inner
-                            .opener
-                            .open_with_class(
-                                key,
-                                gen,
-                                self.handle(),
-                                retention,
-                                session_class.clone(),
-                            )
-                            .await
-                    };
+                    .await;
                     {
                         let mut slots = self.inner.slots.lock().unwrap();
                         match &result {
@@ -4302,7 +4468,10 @@ impl LineageRegistry {
         include_tools: bool,
         model: Option<&broca_core::ModelPageRequest>,
     ) -> Result<RoutedPage, OpenError> {
-        self.check_expired(key, None).await?;
+        self.check_history_expired(key).await?;
+        // Keep the evidence before a format-selected reader can rebuild rows,
+        // but let that reader's established errors win over a new refusal.
+        let empty_history_check = self.check_session_log(key).await;
         if let (Some(request), Some(source)) = (model, self.inner.episode_source.get()) {
             let source = source.clone();
             let key = key.clone();
@@ -4310,7 +4479,7 @@ impl LineageRegistry {
             return spawn_blocking(
                 JobKind::StoreRead,
                 broca_wal::access_counter::inherit(move || {
-                    source.with_reader(&key, None, |reader| {
+                    source.with_reader_checked(&key, None, empty_history_check, |reader| {
                         reader
                             .read_model_page(&request)
                             .map(|page| RoutedPage::Model(page.page))
@@ -4319,8 +4488,7 @@ impl LineageRegistry {
                 }),
             )
             .await
-            .map_err(|error| OpenError::Open(error.to_string()))?
-            .map_err(OpenError::Open);
+            .map_err(|error| OpenError::Open(error.to_string()))?;
         }
         if model.is_none() {
             if let Some(bundle) = self.inner.raw_pages.get() {
@@ -4329,7 +4497,13 @@ impl LineageRegistry {
                 return spawn_blocking(
                     JobKind::StoreRead,
                     broca_wal::access_counter::inherit(move || {
-                        bundle.page(&key, from_ordinal, limit, include_tools)
+                        bundle.page(
+                            &key,
+                            from_ordinal,
+                            limit,
+                            include_tools,
+                            empty_history_check,
+                        )
                     }),
                 )
                 .await
@@ -4504,8 +4678,14 @@ impl LineageRegistry {
                 ),
             });
         }
+        let mut has_durable_records = match tail.records() {
+            broca_wal::WalRangeRecords::Complete(records)
+            | broca_wal::WalRangeRecords::Partial(records)
+            | broca_wal::WalRangeRecords::Unknown(records) => !records.is_empty(),
+            broca_wal::WalRangeRecords::Absent => false,
+        };
         let lineage_id = tail.lineage_id;
-        if attribution_backfill {
+        if attribution_backfill && (has_durable_records || empty_history_check.is_ok()) {
             let opener = self.inner.opener.clone();
             let session = key.clone();
             let range = tail.clone();
@@ -4554,6 +4734,7 @@ impl LineageRegistry {
                             ))
                         }
                     };
+                    has_durable_records |= !full_records.is_empty();
                     broca_core::read_session_model_page(&snapshot, records, request, || {
                         Ok(full_records)
                     })
@@ -4562,6 +4743,10 @@ impl LineageRegistry {
             }
             .map_err(|error| OpenError::Open(format!("model replay failed: {error}")))?;
             page.lineage_id = lineage_id.map(|id| id.to_string()).or(page.lineage_id);
+            if !has_durable_records {
+                empty_history_check
+                    .map_err(|error| error.for_empty_read(page.lineage_id.clone(), None, false))?;
+            }
             if let Some((store, session, stale_lineage_id)) = lineage_repair {
                 repair_materialized_lineage(store, session, stale_lineage_id, tail).await;
             }
@@ -4731,6 +4916,12 @@ impl LineageRegistry {
                     let prefix = self
                         .read_durable_range(reader, key, 0, None, Some(prefix_watermark))
                         .await?;
+                    has_durable_records |= match prefix.records() {
+                        broca_wal::WalRangeRecords::Complete(records)
+                        | broca_wal::WalRangeRecords::Partial(records)
+                        | broca_wal::WalRangeRecords::Unknown(records) => !records.is_empty(),
+                        broca_wal::WalRangeRecords::Absent => false,
+                    };
                     let prefix_tools = latest_run_started_tools(match prefix.records() {
                         broca_wal::WalRangeRecords::Complete(records)
                         | broca_wal::WalRangeRecords::Partial(records)
@@ -4753,6 +4944,15 @@ impl LineageRegistry {
             None
         };
 
+        if !has_durable_records {
+            empty_history_check.map_err(|error| {
+                error.for_empty_read(
+                    page.lineage_id.map(|id| id.to_string()),
+                    Some(page.prompt_len),
+                    page.tags_await_setup,
+                )
+            })?;
+        }
         if let Some((store, session, stale_lineage_id)) = lineage_repair {
             repair_materialized_lineage(store, session, stale_lineage_id, tail).await;
         }
@@ -5504,6 +5704,7 @@ impl LineageRegistry {
                             sweep.not_live += 1;
                         }
                         OpenError::Expired { .. }
+                        | OpenError::SessionLogMissing { .. }
                         | OpenError::RetentionInvalid(_)
                         | OpenError::SessionClassInvalid(_) => sweep.open_failed += 1,
                         OpenError::LeaseHeld(_) => sweep.lease_held += 1,
@@ -5532,6 +5733,13 @@ impl LineageRegistry {
 }
 
 impl RegistryHandle {
+    pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
+        LineageRegistry {
+            inner: self.inner.clone(),
+        }
+        .check_session_log(key)
+        .await
+    }
     pub(crate) fn note_session_ownership(
         &self,
         key: &LineageKey,
@@ -7466,6 +7674,51 @@ impl LineageRegistry {
         .map_err(OpenError::from_retention)?;
         if let Some(expired_at_ms) = expired {
             return Err(OpenError::Expired { expired_at_ms });
+        }
+        Ok(())
+    }
+
+    async fn check_history_expired(&self, key: &LineageKey) -> Result<(), OpenError> {
+        match self.check_expired(key, None).await {
+            Err(error @ OpenError::Expired { .. }) => {
+                // A retired older generation cannot hide a newer missing
+                // transcript. Run-index lookups use their own run-scoped expiry.
+                self.check_session_log(key).await?;
+                Err(error)
+            }
+            result => result,
+        }
+    }
+
+    /// Identity-only reservations may still create their first subscriber lineage.
+    /// Historical content evidence, unlike a reservation, forbids replacing an
+    /// unexplained missing log. Both read admission and writer activation use this
+    /// check, including a second writer check under the acquired session lease.
+    /// `session.status` may still recover an existing log's torn tail or append an
+    /// orphan's terminal; it must never mint a replacement for missing history.
+    pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
+        let (Some(inventory), Some(reader)) = (
+            self.inner.session_address_inventory.get().cloned(),
+            self.inner.reader.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let wal = reader.wal_store.clone();
+        let session = key.clone();
+        let missing = spawn_blocking(JobKind::StoreRead, move || {
+            let state = inventory
+                .session_log_state(&session, wal.as_ref())
+                .map_err(OpenError::from_log_state)?;
+            Ok::<_, OpenError>(state.missing_history())
+        })
+        .await
+        .map_err(|error| OpenError::Open(error.to_string()))??;
+        if missing {
+            return Err(OpenError::SessionLogMissing {
+                session: key.session.clone(),
+                harness: key.harness.clone(),
+                read: None,
+            });
         }
         Ok(())
     }
