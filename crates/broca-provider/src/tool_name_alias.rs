@@ -39,6 +39,44 @@ fn is_valid_wire_name(name: &str) -> bool {
     name.len() <= MAX_TOOL_NAME_BYTES && name.chars().all(is_allowed)
 }
 
+/// Explicit wire names must already fit the selected family's grammar; unlike generated
+/// grammar aliases, operator aliases are never repaired or suffixed to resolve collisions.
+pub fn validate_operator_aliases(
+    family: crate::spec::WireFamilyId,
+    tools: &[Tool],
+    aliases: &BTreeMap<String, String>,
+) -> Result<(), broca_core::run::ToolAliasInvalid> {
+    use crate::spec::WireFamilyId;
+    let declared: BTreeSet<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    let mut occupied = BTreeSet::new();
+    for (canonical, alias) in aliases {
+        let reason = if alias.is_empty()
+            || !is_valid_wire_name(alias)
+            || (matches!(
+                family,
+                WireFamilyId::Gemini | WireFamilyId::GoogleCodeAssist
+            ) && !alias.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
+        {
+            Some(format!(
+                "alias {alias:?} is not a valid tool name for {family:?}"
+            ))
+        } else if declared.contains(alias.as_str()) && alias != canonical {
+            Some(format!("alias {alias:?} equals another declared tool name"))
+        } else if !occupied.insert(alias) {
+            Some(format!("alias {alias:?} is used by another tool"))
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(broca_core::run::ToolAliasInvalid {
+                tool: canonical.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn alias_for_attempt(name: &str, attempt: u64) -> String {
     let sanitized: String = name
         .chars()
@@ -83,6 +121,56 @@ pub struct ToolNameMap {
 }
 
 impl ToolNameMap {
+    /// Compose operator-selected names with the existing provider-grammar allocation. Allocating
+    /// after substitution reserves explicit aliases before generated names can occupy their bytes.
+    pub fn build_with_aliases(
+        tools: &[Tool],
+        prompt: &[Message],
+        aliases: &BTreeMap<String, String>,
+    ) -> Self {
+        if aliases.is_empty() {
+            return Self::build(tools, prompt);
+        }
+        let original = Self::build(tools, prompt);
+        let names: Vec<_> = original.canonical_to_wire.keys().cloned().collect();
+        let mut reserved: BTreeSet<_> = names
+            .iter()
+            .cloned()
+            .chain(aliases.values().cloned())
+            .collect();
+        let intermediate: BTreeMap<_, _> = names
+            .iter()
+            .map(|name| {
+                let wire = if let Some(alias) = aliases.get(name) {
+                    alias.clone()
+                } else if aliases.values().any(|alias| alias == name) {
+                    // A tool no longer declared can still appear in history. Its canonical name
+                    // must not steal a newly configured alias's reverse mapping.
+                    let mut attempt = 0;
+                    loop {
+                        let candidate = alias_for_attempt(name, attempt);
+                        if reserved.insert(candidate.clone()) {
+                            break candidate;
+                        }
+                        attempt += 1;
+                    }
+                } else {
+                    name.clone()
+                };
+                (name.clone(), wire)
+            })
+            .collect();
+        let substituted = Self::from_names(intermediate.values());
+        let mut map = Self::default();
+        for canonical in names {
+            let wire = substituted.wire_name(&intermediate[&canonical]).to_owned();
+            map.canonical_to_wire
+                .insert(canonical.clone(), wire.clone());
+            map.wire_to_canonical.insert(wire, canonical);
+        }
+        map
+    }
+
     /// Build a map from the current tool manifest and any historical tool calls in the prompt.
     ///
     /// The prompt scan keeps resumed turns aligned with the manifest even when a caller supplies

@@ -160,6 +160,7 @@ broca specifics:
   | Code | Class | Detail |
   |---|---|---|
   | `variant_unsupported` | `permanent` | `{model, variant, defined}` |
+  | `tool_alias_invalid` | `permanent` | `{tool, class: "permanent"}` |
   | `wal_newer_writer` | `permanent` | `{kind: "newer_writer", missing: [<feature names>]}` |
   | `agent_run_scopes_unsupported` | `permanent` | `{<session scope>}` |
   | `session_log_missing` | `detail.class: permanent` | `{class, session, harness}`; a writer would recreate historical content or a read would falsely report empty history; existing named refusals and valid index answers keep precedence; stop broca and inspect `store-maintenance repair-session-root` |

@@ -2251,6 +2251,30 @@ impl WalRecord {
         } else {
             base
         };
+        let frozen = match self {
+            Self::RunStarted { config, .. } => Some(&config.frozen_render_config),
+            Self::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => Some(frozen_render_config),
+            _ => None,
+        };
+        let aliases = |config: &Value| {
+            config
+                .get("tool_name_aliases")
+                .and_then(Value::as_object)
+                .is_some_and(|map| !map.is_empty())
+        };
+        let base = if frozen.is_some_and(|config| {
+            aliases(config)
+                || config
+                    .pointer("/refusal_fallback/frozen")
+                    .is_some_and(aliases)
+        }) {
+            with_feature(base, crate::framing::TOOL_NAME_ALIASES_FEATURE)
+        } else {
+            base
+        };
         let base = if self.carries_openrouter_reasoning() {
             with_feature(base, crate::framing::OPENROUTER_REASONING_FEATURE)
         } else {

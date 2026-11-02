@@ -129,6 +129,7 @@ impl Provider for ResolvedStubProvider {
 
 fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
     ResolveOptions {
+        tool_name_aliases: None,
         media: false,
         media_profile: None,
         claude_code_persona: None,

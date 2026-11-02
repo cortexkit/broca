@@ -580,6 +580,7 @@ pub fn resolve_frozen(
         "reasoning",
     )?;
     Ok(FrozenRenderConfig {
+        tool_name_aliases: Default::default(),
         family_id: provider.wire_family,
         renderer_version,
         image_notice_labels: false,
@@ -691,6 +692,7 @@ fn frozen_from_family_defaults(
 ) -> FrozenRenderConfig {
     let q = default_quirks(family);
     FrozenRenderConfig {
+        tool_name_aliases: Default::default(),
         anthropic_turn_system: false,
         family_id: family,
         renderer_version: renderer_version_for(family),

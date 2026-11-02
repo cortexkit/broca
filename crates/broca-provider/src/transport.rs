@@ -653,9 +653,10 @@ impl<F: WireFamily + 'static> RenderJob<F> {
         let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
         // This scan is deliberately in the same blocking job as rendering: it walks the entire
         // prompt to preserve aliases from historical tool calls on every resumed step.
-        let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build(
+        let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build_with_aliases(
             &self.opts.tools,
             &self.opts.prompt,
+            &self.frozen.tool_name_aliases,
         ));
         let body = if let Some(renderer) = &self.media_renderer {
             renderer(

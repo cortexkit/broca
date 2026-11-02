@@ -4605,6 +4605,7 @@ fn refused_send_code(error: &ServeError) -> String {
             broca_wire::INVALID_PARAMS.into()
         }
         ServeError::VariantUnsupported(_) => "variant_unsupported".into(),
+        ServeError::ToolAliasInvalid(_) => "tool_alias_invalid".into(),
         ServeError::ServiceTierInvalid { .. } => "invalid_params".into(),
         ServeError::SessionHeld(_) => "session_held".into(),
         ServeError::Open(_, _) => "open_failed".into(),
@@ -4791,6 +4792,7 @@ async fn send_serve_error(
         ServeError::Open(_, _) => "open_failed",
         ServeError::WalNewerWriter { .. } => broca_wire::WAL_NEWER_WRITER,
         ServeError::VariantUnsupported(_) => "variant_unsupported",
+        ServeError::ToolAliasInvalid(_) => "tool_alias_invalid",
         ServeError::ServiceTierInvalid { .. } => "invalid_params",
         ServeError::SendRetracted { .. } => "send_retracted",
         ServeError::SendEnded {
@@ -4906,6 +4908,9 @@ async fn send_serve_error(
             "variant": refusal.variant,
             "defined": refusal.defined,
         }));
+    }
+    if let ServeError::ToolAliasInvalid(refusal) = err {
+        body = body.with_detail(serde_json::json!({"tool": refusal.tool, "class": "permanent"}));
     }
     if let ServeError::ServiceTierInvalid { reason, .. } = err {
         body = body.with_detail(serde_json::json!({"field":"service_tier", "reason":reason}));
@@ -6861,6 +6866,32 @@ mod tests {
         let frame = rx.recv().await.unwrap();
         assert_eq!(frame.header.ty, FrameType::Error);
         assert_eq!(frame.body.as_slice(), br#"{"code":"variant_unsupported","message":"open failed: run resolution failed: model 'anthropic/claude-opus-5' does not define variant 'max'; its variants are [none, low, medium, high]","detail":{"defined":["none","low","medium","high"],"model":"anthropic/claude-opus-5","variant":"max"}}"#);
+    }
+
+    #[tokio::test]
+    async fn tool_alias_invalid_error_body_names_tool_and_permanent_class() {
+        let refusal = broca_core::run::ToolAliasInvalid {
+            tool: "bash".into(),
+            reason: "alias collides".into(),
+        };
+        assert_eq!(
+            broca_core::RunError::ToolAliasInvalid(refusal.clone()).admission_error_class(),
+            broca_protocol::error::ErrorClass::Permanent
+        );
+        let (tx, mut rx) = broca_diagnostics::channel(1, Arc::default());
+        send_serve_error(
+            &tx,
+            PROTOCOL_VERSION,
+            7,
+            3,
+            11,
+            &ServeError::ToolAliasInvalid(refusal),
+        )
+        .await
+        .unwrap();
+        let frame = rx.recv().await.unwrap();
+        assert_eq!(frame.header.ty, FrameType::Error);
+        assert_eq!(frame.body.as_slice(), br#"{"code":"tool_alias_invalid","message":"tool_alias_invalid: tool \"bash\": alias collides","detail":{"class":"permanent","tool":"bash"}}"#);
     }
 
     /// The served newer-writer refusal is byte for byte `broca-wire/tests/golden/

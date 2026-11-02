@@ -951,6 +951,23 @@ impl std::fmt::Display for VariantRefusal {
 
 impl std::error::Error for VariantRefusal {}
 
+/// An operator alias cannot be used for the declared tool on the selected provider wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolAliasInvalid {
+    pub tool: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for ToolAliasInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tool_alias_invalid: tool {:?}: {}",
+            self.tool, self.reason
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RunError {
     /// The session is already held by a live writer (only one writer per session).
@@ -992,6 +1009,7 @@ pub enum RunError {
     Upload(crate::media_uploads::UploadError),
     /// Unsupported reasoning variant, refused before durable admission.
     VariantUnsupported(VariantRefusal),
+    ToolAliasInvalid(ToolAliasInvalid),
     /// Admission failed because a required dependency is temporarily unavailable. Nothing
     /// durable was written, so callers may retry the same send through their standard
     /// transient-error policy.
@@ -1116,6 +1134,7 @@ impl RunError {
             Self::Config(_)
             | Self::MediaUnsupported(_)
             | Self::VariantUnsupported(_)
+            | Self::ToolAliasInvalid(_)
             | Self::SendIdReuse { .. }
             | Self::SystemPromptChanged
             | Self::ContextManagementChanged { .. }
@@ -1153,6 +1172,7 @@ impl std::fmt::Display for RunError {
             RunError::Panicked => write!(f, "run task panicked before producing a terminal"),
             RunError::TagNumbering(overflow) => write!(f, "{overflow}"),
             RunError::VariantUnsupported(s) => write!(f, "run resolution failed: {s}"),
+            RunError::ToolAliasInvalid(s) => write!(f, "{s}"),
             RunError::Config(s) => write!(f, "run resolution failed: {s}"),
             RunError::MediaUnsupported(s) => write!(f, "{s}"),
             RunError::Upload(error) => write!(f, "{error}"),
