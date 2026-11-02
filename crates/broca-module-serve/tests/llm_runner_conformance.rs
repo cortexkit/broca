@@ -2465,6 +2465,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::MaxSteps,
             Capability::NoTools,
             Capability::RunStatus,
+            Capability::FinishReason,
             Capability::RunUsage,
             Capability::SessionUsage,
             Capability::RunCancel,
@@ -6473,4 +6474,15 @@ async fn assertion_wal_reader_uses_the_inventory_address_for_a_folderless_sessio
         }
     ));
     assert!(!store.wal_path(&claim).exists());
+}
+
+#[tokio::test]
+async fn conformance_subject_declares_the_served_finish_reason_group() {
+    let scratch = broca_test_support::scratch_root().join("finish-reason-declaration");
+    let subject = BrocaSubject::new(&scratch).await;
+    assert!(subject.capabilities().contains(&Capability::FinishReason));
+    assert_eq!(
+        subject.model_finish_reason_source(),
+        Some("openai.chat_completions")
+    );
 }
