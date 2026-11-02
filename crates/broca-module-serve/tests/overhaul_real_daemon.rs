@@ -24,6 +24,10 @@ const TITLE: &str = "content-sentinel-title-238ed435";
 const ANSWER: &str = "content-sentinel-answer-5bcd1cc0";
 const OUTPUT: &str = "content-sentinel-tool-6257cdad";
 const SENTINELS: &[&str] = &[PROMPT, SYSTEM, TITLE, ANSWER, OUTPUT];
+const GENERATION_DURATION_FIELDS: &[&str] = &[
+    "sent_to_last_content_ms",  // crates/broca-protocol/src/usage.rs:116
+    "first_to_last_content_ms", // crates/broca-protocol/src/usage.rs:117
+];
 
 fn no_legacy_index(root: &Path) {
     for name in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
@@ -1399,6 +1403,30 @@ impl Sources {
                 let mut result = object.clone();
                 for (key, value) in object {
                     result[key] = match key.as_str() {
+                        "usage" if value.get("generation").is_some() => {
+                            let entries = value["generation"]
+                                .as_array()
+                                .expect("usage.generation must be an array");
+                            let mut usage = self.normalize(value);
+                            for (entry, normalized) in entries
+                                .iter()
+                                .zip(usage["generation"].as_array_mut().unwrap())
+                            {
+                                assert!(
+                                    entry.is_object(),
+                                    "usage.generation entry must be an object: {entry}"
+                                );
+                                // Independent calls have different wall-clock intervals, not different token totals.
+                                for &field in GENERATION_DURATION_FIELDS {
+                                    let duration = entry.get(field).unwrap_or_else(|| {
+                                        panic!("missing usage.generation.{field}: {entry}")
+                                    });
+                                    assert!(duration.as_u64().is_some(), "usage.generation.{field} must be non-negative milliseconds: {duration}");
+                                    normalized[field] = json!("@DURATION_MS@");
+                                }
+                            }
+                            usage
+                        }
                         "lineage_id" | "incarnation" if !value.is_null() => {
                             assert_eq!(value, &self.lineage);
                             json!("@LINEAGE@")
@@ -2717,6 +2745,170 @@ fn differential_api_key_attempts_use_wal_without_routing_reports() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn differential_generation_durations_are_scoped_to_usage_in_all_replies() {
+    assert_eq!(
+        GENERATION_DURATION_FIELDS,
+        ["sent_to_last_content_ms", "first_to_last_content_ms"]
+    );
+    fields(
+        &generation_entry(0, 0),
+        &[
+            "model",
+            "service_tier",
+            "speed",
+            "model_calls",
+            "output_tokens",
+            "reasoning_tokens",
+            "sent_to_last_content_ms",
+            "first_to_last_content_ms",
+        ],
+    );
+    let sources = billing_fixture(false).sources;
+    let left = generation_replies(generation_entry(1, 0));
+    let right = generation_replies(generation_entry(4, 2));
+    for (legacy, overhaul) in left.iter().zip(&right) {
+        assert_eq!(
+            sources.normalize(legacy),
+            sources.normalize(overhaul),
+            "{}",
+            legacy["method"]
+        );
+    }
+}
+
+fn generation_entry(sent_to_last: u64, first_to_last: u64) -> Value {
+    serde_json::to_value(broca_protocol::usage::GenerationUsage {
+        model: "generation-model".into(),
+        service_tier: Some("priority".into()),
+        speed: Some("fast".into()),
+        model_calls: 2,
+        output_tokens: 6,
+        reasoning_tokens: Some(0),
+        sent_to_last_content_ms: sent_to_last,
+        first_to_last_content_ms: first_to_last,
+    })
+    .unwrap()
+}
+
+fn generation_replies(entry: Value) -> Vec<Value> {
+    let usage = json!({"input_tokens":7,"output_tokens":6,"generation":[entry]});
+    let mut replies: Vec<_> = [
+        "run.status.paused",
+        "run.result",
+        "run.status",
+        "run.status.tail",
+    ]
+    .into_iter()
+    .map(|method| json!({"method":method,"reply":{"usage":usage}}))
+    .collect();
+    replies.push(json!({"method":"session.subscribe.handoff","events":[
+        {"kind":"control","unit":{"type":"run_finished","usage":usage}},
+        {"event":{"type":"run_finished","usage":usage}}
+    ]}));
+    replies
+}
+
+#[test]
+fn differential_generation_duration_fields_are_required_and_nonnegative() {
+    for overhaul in [false, true] {
+        let sources = billing_fixture(overhaul).sources;
+        let normalize = |entry| sources.normalize(&generation_replies(entry)[0]);
+        let zero = normalize(generation_entry(0, 0));
+        for &field in GENERATION_DURATION_FIELDS {
+            assert_eq!(
+                zero["reply"]["usage"]["generation"][0][field],
+                "@DURATION_MS@"
+            );
+            let mut missing = generation_entry(0, 0);
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                std::panic::catch_unwind(|| normalize(missing.clone())).is_err(),
+                "missing {field} must fail even if both formats omit it"
+            );
+            for invalid in [json!(-1), Value::Null, json!("unknown"), json!(0.5)] {
+                let mut entry = generation_entry(0, 0);
+                entry[field] = invalid;
+                assert!(
+                    std::panic::catch_unwind(|| normalize(entry.clone())).is_err(),
+                    "accepted invalid {field}"
+                );
+            }
+        }
+        for generation in [Value::Null, json!({}), json!([null])] {
+            assert!(std::panic::catch_unwind(
+                || sources.normalize(&json!({"usage":{"generation":generation}}))
+            )
+            .is_err());
+        }
+    }
+}
+
+#[test]
+fn differential_generation_metadata_and_entry_presence_remain_exact() {
+    let sources = billing_fixture(false).sources;
+    let normalize = |entry| sources.normalize(&generation_replies(entry)[0]);
+    let original = normalize(generation_entry(1, 0));
+    for (field, changed) in [
+        ("model", json!("different-model")),
+        ("service_tier", json!("standard")),
+        ("speed", json!("slow")),
+        ("model_calls", json!(3)),
+        ("output_tokens", json!(9)),
+        ("reasoning_tokens", json!(1)),
+    ] {
+        let mut entry = generation_entry(4, 2);
+        entry[field] = changed;
+        assert_ne!(original, normalize(entry), "masked semantic field {field}");
+        let mut missing = generation_entry(4, 2);
+        missing.as_object_mut().unwrap().remove(field);
+        assert_ne!(
+            original,
+            normalize(missing),
+            "lost semantic field presence {field}"
+        );
+    }
+    let mut left = generation_entry(1, 0);
+    let mut right = generation_entry(4, 2);
+    left["sent_to_first_content_ms"] = json!(1);
+    right["sent_to_first_content_ms"] = json!(4);
+    assert_ne!(
+        normalize(left),
+        normalize(right),
+        "an unlisted duration-like field must remain exact"
+    );
+    let left = json!({"generation":[generation_entry(1, 0)]});
+    let right = json!({"generation":[generation_entry(4, 2)]});
+    assert_ne!(
+        sources.normalize(&left),
+        sources.normalize(&right),
+        "generation outside usage is not normalized"
+    );
+    let left = json!({"usage":{"generation":[generation_entry(1, 0)],"sent_to_last_content_ms":1}});
+    let right =
+        json!({"usage":{"generation":[generation_entry(4, 2)],"sent_to_last_content_ms":4}});
+    assert_ne!(
+        sources.normalize(&left),
+        sources.normalize(&right),
+        "duration outside the generation entry is not normalized"
+    );
+    let mut other = generation_entry(4, 2);
+    other["model"] = json!("other-model");
+    let left = json!({"usage":{"generation":[generation_entry(1, 0),other.clone()]}});
+    let missing = json!({"usage":{"generation":[generation_entry(4, 2)]}});
+    let reordered = json!({"usage":{"generation":[other,generation_entry(4, 2)]}});
+    assert_ne!(
+        sources.normalize(&left),
+        sources.normalize(&missing),
+        "entry count must remain exact"
+    );
+    assert_ne!(
+        sources.normalize(&left),
+        sources.normalize(&reordered),
+        "entry order must remain exact"
+    );
 }
 
 #[test]
