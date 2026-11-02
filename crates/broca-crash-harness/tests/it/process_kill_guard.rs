@@ -59,7 +59,7 @@ fn every_harness_test_file_requires_a_real_process_kill() {
     visit(root, &root.join("tests"), &mut owners);
     visit(root, &root.join("src"), &mut owners);
     assert!(
-        owners >= 26,
+        owners >= 27,
         "the source inventory must visit the test owners"
     );
 }

@@ -1244,8 +1244,8 @@ async fn a_cut_between_the_outcome_unknown_results_and_the_seal_resumes_without_
     let nested = handle.every_boundary_inside_resume(&kill).await;
     assert_eq!(
         nested.len(),
-        6,
-        "resume record, two results, batch and turn commits, seal"
+        13,
+        "six close-out records: seven clean boundaries and six torn appends"
     );
 
     // Every close-out record is durable and the Interrupted `RunFinished` is not: the resume
