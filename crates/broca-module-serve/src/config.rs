@@ -843,6 +843,18 @@ pub struct AccountLimitPauseConfig {
 }
 
 impl AccountLimitPauseConfig {
+    /// A malformed live edit cannot authorize a wait. Boot validation still rejects malformed
+    /// `max_same_account_wait` values, naming the setting in the error.
+    pub fn live_setting() -> broca_core::SameAccountWait {
+        match Self::load_default() {
+            Ok(config) => config.max_same_account_wait,
+            Err(error) => {
+                tracing::warn!(%error, "invalid live max_same_account_wait; declining same-account waits");
+                broca_core::SameAccountWait::Minutes(0)
+            }
+        }
+    }
+
     pub fn load_default() -> Result<Self, String> {
         use crate::config_home::ConfigHome;
         match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")

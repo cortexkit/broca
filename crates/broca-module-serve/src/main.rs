@@ -3387,10 +3387,10 @@ mod executor {
             &self,
             req: &broca_core::RunRequest,
             fresh_episode: bool,
-            pinned_method: Option<AuthMethod>,
-            pinned_account: Option<&str>,
+            pinned: (Option<AuthMethod>, Option<&str>),
             conversation_key: Option<&str>,
             inherited_conversation_key: Option<&str>,
+            hold_cap: broca_module_serve::account_routing::AccountHoldCap,
         ) -> Result<AccountChoice, broca_module_serve::account_routing::ChoiceRefusal> {
             if !fresh_episode || self.provider_base_url.is_some() {
                 return Ok(AccountChoice::NotApplicable);
@@ -3398,6 +3398,7 @@ mod executor {
             let (Some(vault), Some(routing)) = (self.vault.as_ref(), self.routing.as_ref()) else {
                 return Ok(AccountChoice::NotApplicable);
             };
+            let (pinned_method, pinned_account) = pinned;
             let static_credential = broca_module_serve::auth_routing::resolve_credential_id(
                 req.model.provider_module_id.as_str(),
                 pinned_method,
@@ -3422,6 +3423,7 @@ mod executor {
                     send_id: req.send_id.as_deref(),
                     run_id: &req.run_id.0,
                     initial_input_bytes,
+                    hold_cap,
                 },
                 latest_listing(Arc::clone(vault)),
                 deadline,
@@ -4272,10 +4274,25 @@ mod executor {
                 .choose_account_for_episode(
                     &job.req,
                     fresh_episode,
-                    pinned_method,
-                    pinned_account,
+                    (pinned_method, pinned_account),
                     job.conversation_key.as_deref(),
                     inherited_key,
+                    broca_module_serve::account_routing::account_hold_cap(
+                        broca_module_serve::config::AccountLimitPauseConfig::live_setting(),
+                        prior_snapshot
+                            .checkpoint_at_head
+                            .last_episode
+                            .as_ref()
+                            .map(|episode| &episode.config),
+                        job.control
+                            .clock
+                            .as_ref()
+                            .map_or_else(|| epoch_millis().max(0) as u64, |clock| clock.now_ms()),
+                        |account| {
+                            self.provider_client
+                                .session_last_accepted_at_ms(&job.req.session, account)
+                        },
+                    ),
                 )
                 .await
             {
@@ -4848,15 +4865,9 @@ mod executor {
             // method-qualified vault credential id.
             let mut control = job.control;
             control.compaction_signals = self.compaction_signals;
-            control.max_same_account_wait = Some(Arc::new(|| {
-                match broca_module_serve::config::AccountLimitPauseConfig::load_default() {
-                    Ok(config) => config.max_same_account_wait,
-                    Err(error) => {
-                        tracing::warn!(%error, "invalid live max_same_account_wait; declining same-account waits");
-                        broca_core::SameAccountWait::Minutes(0)
-                    }
-                }
-            }));
+            control.max_same_account_wait = Some(Arc::new(
+                broca_module_serve::config::AccountLimitPauseConfig::live_setting,
+            ));
             control.account_limit_pause =
                 control.max_same_account_wait.as_ref().unwrap()().enabled();
             control.hook_plane = self.hook_plane();

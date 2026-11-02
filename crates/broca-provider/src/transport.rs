@@ -152,6 +152,17 @@ fn build_http_pool(builder: reqwest::ClientBuilder, decode: bool) -> reqwest::Cl
 }
 
 impl ProviderHttpClient {
+    /// Read accepted-attempt evidence without loading a session or reading its WAL.
+    /// `None` means not loaded in this process; `Some(None)` means loaded with no accepted
+    /// send on this account. This distinction lets admission count conservative cold starts.
+    pub fn session_last_accepted_at_ms(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        account: &str,
+    ) -> Option<Option<u64>> {
+        self.cache_sessions.accepted_at_ms(session, account)
+    }
+
     fn build(
         builder: impl Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
         request_gzip: request_gzip::RequestGzipPolicy,

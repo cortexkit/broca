@@ -16,6 +16,19 @@ impl std::fmt::Debug for Sessions {
 }
 
 impl Sessions {
+    pub(super) fn accepted_at_ms(
+        &self,
+        bind: &broca_protocol::BindIdentity,
+        account: &str,
+    ) -> Option<Option<u64>> {
+        let sessions = self.0.lock().unwrap();
+        let session = sessions.get(bind)?;
+        let state = session.0.lock().unwrap();
+        state
+            .accepted_loaded
+            .then(|| state.accepted_by_account.get(account).copied())
+    }
+
     pub(super) fn bind(&self, bind: &broca_protocol::BindIdentity) -> Arc<Session> {
         self.0
             .lock()
@@ -68,6 +81,7 @@ struct State {
     view: Option<u64>,
     previous: Option<Previous>,
     accepted_by_account: HashMap<String, u64>,
+    accepted_loaded: bool,
 }
 
 struct Previous {
@@ -219,6 +233,7 @@ impl Session {
             view,
             previous,
             accepted_by_account,
+            accepted_loaded: true,
         };
     }
 
@@ -227,6 +242,7 @@ impl Session {
     }
     pub(super) fn annotate(&self, attempt: &mut ModelAttempt) {
         let mut state = self.0.lock().unwrap();
+        state.accepted_loaded = true;
         note_accepted(
             &mut state.accepted_by_account,
             attempt.http_status,
@@ -410,6 +426,26 @@ impl Pending {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn accepted_account_clock_distinguishes_unloaded_from_known_empty_without_a_read() {
+        let sessions = Sessions::default();
+        let bind = broca_protocol::BindIdentity::new("/project", "runner", "session");
+        assert_eq!(sessions.accepted_at_ms(&bind, "a"), None);
+        let session = sessions.bind(&bind);
+        assert_eq!(sessions.accepted_at_ms(&bind, "a"), None);
+        session.seed(&[], Some("lineage".into()));
+        assert_eq!(sessions.accepted_at_ms(&bind, "a"), Some(None));
+        assert_eq!(sessions.accepted_at_ms(&bind, "other"), Some(None));
+        note_accepted(
+            &mut session.0.lock().unwrap().accepted_by_account,
+            Some(200),
+            Some(1000),
+            Some("a"),
+        );
+        assert_eq!(sessions.accepted_at_ms(&bind, "a"), Some(Some(1000)));
+        assert_eq!(sessions.accepted_at_ms(&bind, "other"), Some(None));
+    }
 
     fn previous() -> Previous {
         let family = crate::spec::WireFamilyId::OpenAiResponses;

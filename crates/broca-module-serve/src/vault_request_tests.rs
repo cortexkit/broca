@@ -1661,6 +1661,7 @@ async fn routed_chatgpt_choice() -> AccountChoice {
     });
     let credential = broca_module_serve::CredentialId::parse("chatgpt:openai").unwrap();
     let choice = choose_account(&client, ChoiceInputs {
+        hold_cap: Default::default(),
         conversation_key: None, inherited_conversation_key: None,
         static_credential: &credential, caller_named_account: false,
         model: "gpt-6.1", session: &broca_protocol::BindIdentity::new("/tmp", "broca", "chatgpt"),

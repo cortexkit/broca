@@ -834,6 +834,19 @@ frozen `conversation_key` and `conversation_key_source: "caller" | "session" | "
 absent on old records. The source is an open string so future values survive replay.
 Raw keys are stored in the WAL on `Queued` and `RunStarted`, not in usage exports.
 
+For each `route.account_for` admission request, broca also sends the top-level integer
+`hold_wait_max_s`: the longest wait it permits routing to hold for the session's previous
+run's frozen account. It is `floor(max(0, min(setting, cache_expiry - now)) / 1 second)`,
+with `max_same_account_wait` converted from minutes to duration and `"max"` omitting that
+setting bound. The shared cache-expiry computation uses that account's last accepted 2xx
+attempt send time plus the previous run's frozen TTL (explicit 5 minutes or 1 hour; unknown
+means 5 minutes). Setting `0`, no previous run/account, or no accepted attempt sends `0`.
+Admission reads only the existing frozen snapshot and in-memory account evidence, never the
+log. After a restart, the first admission of each session sends `0` until that session has
+run once. `health.check.metrics.account_limit_hold_cap_unknown` counts admissions that sent
+`0` because evidence was not loaded, separately from known-zero allowances. These are broca's
+outgoing request fields; routing decides whether and how to honor the allowance.
+
 `session.send.title` optionally names the work a send carries, for dashboards and logs, on
 every delivery mode. When present it must be a string of 1–200 Unicode scalar values, not all
 whitespace, with no control character (newline and tab included). Anything else, including null

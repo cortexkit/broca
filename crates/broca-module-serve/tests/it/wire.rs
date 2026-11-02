@@ -2273,6 +2273,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // broca's pause time. This healthy daemon has seen none; assert zero below.
         "account_limit_stale_resets",
         "account_limit_pause_declined",
+        "account_limit_hold_cap_unknown",
         "stall_watchdog",
         // Retained sessions whose expiry could not be confirmed because their log is unreadable
         // and the index is not provably current, so deletion keeps them. Present at zero.
@@ -2357,6 +2358,10 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         metrics["account_limit_stale_resets"],
         serde_json::json!(0),
         "the isolated healthy daemon has not ended a refusal for stale account timing"
+    );
+    assert_eq!(
+        metrics["account_limit_hold_cap_unknown"],
+        serde_json::json!(0)
     );
     assert_eq!(
         metrics["account_limit_pause_declined"],
