@@ -1344,3 +1344,4 @@ fn interrupted_relocation_validates_pairing_and_discovery() {
     assert!(pairing_window_seen && moved_proof_seen && orphan_rejected);
     eprintln!("interrupted relocation: {states_checked} power-loss states");
 }
+crate::require_process_kill!();

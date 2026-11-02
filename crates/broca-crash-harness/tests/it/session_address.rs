@@ -10,6 +10,7 @@ fn request() -> broca_core::RunRequest {
 
 const FIRST_SEND: Scenario = Scenario {
     name: "session_address_first_send",
+    extension: None,
     request,
     control: broca_core::RunControl::default,
     scripts: one_edit_scripts,
@@ -116,3 +117,5 @@ async fn interrupted_first_send_resumes_under_its_reserved_workdir_address() {
     }
     std::fs::remove_dir_all(fixture).unwrap();
 }
+
+broca_crash_harness::require_process_kill!();

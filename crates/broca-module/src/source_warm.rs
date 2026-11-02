@@ -49,6 +49,21 @@ pub(crate) enum Event {
 #[derive(Clone)]
 pub(crate) struct Events(broadcast::Sender<Event>);
 
+// Compaction changes and old synchronous waits retire the previous warm request. When
+// recovery ends a waiting run, ResumeStarted must not revive that old candidate. Sharing
+// this classification keeps live notifications and initial WAL reconstruction consistent.
+fn invalidates_cached_prefix(record: &WalRecord) -> bool {
+    matches!(
+        record,
+        WalRecord::CompactionMessage { .. }
+            | WalRecord::CompactionViewApplied { .. }
+            | WalRecord::CompactionAnswer {
+                disposition: broca_wal::CompactionDisposition::Wait,
+                ..
+            }
+    )
+}
+
 impl Default for Events {
     fn default() -> Self {
         Self(broadcast::channel(128).0)
@@ -57,26 +72,25 @@ impl Default for Events {
 
 impl Events {
     pub(crate) fn observe(&self, seq: u64, record: &WalRecord) -> bool {
-        let relevant = match record {
-            WalRecord::RunStarted { .. }
-            | WalRecord::ResumeStarted { .. }
-            | WalRecord::ModelStepRefused { .. }
-            | WalRecord::RunFinished { .. }
-            | WalRecord::RunPaused { .. }
-            | WalRecord::RunCancelRequested { .. }
-            | WalRecord::RunConfigRefrozen { .. }
-            | WalRecord::RunAuthRefrozen { .. }
-            | WalRecord::CompactionMessage { .. }
-            | WalRecord::CompactionViewApplied { .. }
-            | WalRecord::WriterClosed { .. } => true,
-            WalRecord::ModelStepFinished { .. } => true,
-            WalRecord::ModelAttemptFinished {
-                credential_refresh,
-                served_account_ref,
-                ..
-            } => credential_refresh.is_some() || served_account_ref.is_some(),
-            _ => false,
-        };
+        let relevant = invalidates_cached_prefix(record)
+            || match record {
+                WalRecord::RunStarted { .. }
+                | WalRecord::ResumeStarted { .. }
+                | WalRecord::ModelStepRefused { .. }
+                | WalRecord::RunFinished { .. }
+                | WalRecord::RunPaused { .. }
+                | WalRecord::RunCancelRequested { .. }
+                | WalRecord::RunConfigRefrozen { .. }
+                | WalRecord::RunAuthRefrozen { .. }
+                | WalRecord::WriterClosed { .. } => true,
+                WalRecord::ModelStepFinished { .. } => true,
+                WalRecord::ModelAttemptFinished {
+                    credential_refresh,
+                    served_account_ref,
+                    ..
+                } => credential_refresh.is_some() || served_account_ref.is_some(),
+                _ => false,
+            };
         if relevant && self.0.receiver_count() != 0 {
             let _ = self.0.send(Event::Record(seq, Box::new(record.clone())));
             return true;
@@ -174,7 +188,7 @@ impl State {
                     config.auth_selection = Some(auth_selection.clone());
                 }
             }
-            WalRecord::CompactionMessage { .. } | WalRecord::CompactionViewApplied { .. } => {
+            _ if invalidates_cached_prefix(record) => {
                 self.candidate = None;
             }
             WalRecord::ModelAttemptFinished {

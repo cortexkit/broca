@@ -213,3 +213,5 @@ async fn restart_pause_and_resume_are_safe_at_every_record_boundary() {
     );
     continuing.every_boundary_inside_resume(&kill).await;
 }
+
+broca_crash_harness::require_process_kill!();

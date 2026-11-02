@@ -1321,3 +1321,5 @@ async fn a_runner_sigkilled_inside_a_tool_dispatch_resumes_into_the_close_out() 
     suite.record([kill]);
     suite.finish();
 }
+
+broca_crash_harness::require_process_kill!();

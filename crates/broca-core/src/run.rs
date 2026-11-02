@@ -4011,6 +4011,15 @@ where
             .filter(|state| state.open_wait.is_some())
             .cloned()
         {
+            // Recovering an old open wait ends its run without another external call.
+            // Record the resume before closing the wait, with no work authorized to rerun.
+            if prior.run_id.is_some() {
+                writer.record(crate::resume::resume_started_record(
+                    &prior,
+                    last_record_seq(writer),
+                    Vec::new(),
+                ));
+            }
             if let Some(crate::compaction::runtime::Terminal(reason, error)) =
                 crate::compaction::runtime::seal_recorded_wait(writer, &mut state).await?
             {
@@ -5174,7 +5183,10 @@ where
                     });
                     refreeze_recorded = true;
                 }
-                if matches!(reason, PauseReason::Restart | PauseReason::AccountLimit) {
+                if matches!(
+                    reason,
+                    PauseReason::Restart | PauseReason::AccountLimit | PauseReason::AuthRequired
+                ) {
                     writer.record(resume_continuing);
                     writer.sync().await?;
                 } else if refreeze_recorded {

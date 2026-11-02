@@ -159,15 +159,16 @@ pub fn wal_path(state_root: &Path, session: &BindIdentity) -> PathBuf {
 /// durability barrier. The runner cannot tell it from the plain store; the harness uses the
 /// barriers to say, for each record boundary, whether a crash there falls just after a sync
 /// or inside a batch of appends that had not been synced yet.
+#[derive(Clone)]
 pub struct ObservedWalStore {
-    inner: FileWalStore,
+    inner: Arc<FileWalStore>,
     synced: Arc<Mutex<BTreeSet<u64>>>,
 }
 
 impl ObservedWalStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
-            inner: FileWalStore::new(root),
+            inner: Arc::new(FileWalStore::new(root)),
             synced: Arc::default(),
         }
     }
@@ -189,22 +190,22 @@ impl WalStore for ObservedWalStore {
         session: Option<&BindIdentity>,
         store: Arc<dyn broca_core::SessionStore>,
     ) {
-        WalStore::bind_recovery_projection(&self.inner, session, store)
+        WalStore::bind_recovery_projection(self.inner.as_ref(), session, store)
     }
 
     fn recover_existing(&self, session: &BindIdentity) -> Result<(), WalError> {
-        WalStore::recover_existing(&self.inner, session)
+        WalStore::recover_existing(self.inner.as_ref(), session)
     }
 
     fn writer_marker_root(&self) -> Option<PathBuf> {
-        WalStore::writer_marker_root(&self.inner)
+        WalStore::writer_marker_root(self.inner.as_ref())
     }
     fn wal_config(&self) -> broca_wal::WalConfig {
-        WalStore::wal_config(&self.inner)
+        WalStore::wal_config(self.inner.as_ref())
     }
 
     fn uploads(&self) -> Option<broca_core::media_uploads::Uploads> {
-        WalStore::uploads(&self.inner)
+        WalStore::uploads(self.inner.as_ref())
     }
 
     fn read_records_tail_bounded(
@@ -212,19 +213,19 @@ impl WalStore for ObservedWalStore {
         session: &BindIdentity,
         tail_bytes: u64,
     ) -> Result<Option<broca_wal::WalRangeRead>, WalError> {
-        WalStore::read_records_tail_bounded(&self.inner, session, tail_bytes)
+        WalStore::read_records_tail_bounded(self.inner.as_ref(), session, tail_bytes)
     }
 
     fn backup_classes(&self) -> Vec<String> {
-        WalStore::backup_classes(&self.inner)
+        WalStore::backup_classes(self.inner.as_ref())
     }
 
     fn retired_tag_floor(&self, session: &BindIdentity) -> Result<u64, WalError> {
-        WalStore::retired_tag_floor(&self.inner, session)
+        WalStore::retired_tag_floor(self.inner.as_ref(), session)
     }
 
     fn retired_notice_floor(&self, session: &BindIdentity) -> Result<u64, WalError> {
-        WalStore::retired_notice_floor(&self.inner, session)
+        WalStore::retired_notice_floor(self.inner.as_ref(), session)
     }
 
     fn open_with_class(
@@ -234,7 +235,7 @@ impl WalStore for ObservedWalStore {
         session_class: Option<&str>,
     ) -> Result<Box<dyn Wal + Send>, WalError> {
         Ok(self.observe(WalStore::open_with_class(
-            &self.inner,
+            self.inner.as_ref(),
             session,
             retention,
             session_class,
@@ -248,8 +249,13 @@ impl WalStore for ObservedWalStore {
         session_class: Option<&str>,
         lease: Box<dyn broca_core::LeaseHandle>,
     ) -> Result<(Box<dyn Wal + Send>, Box<dyn broca_core::LeaseHandle>), WalError> {
-        let (wal, lease) =
-            WalStore::open_writer(&self.inner, session, retention, session_class, lease)?;
+        let (wal, lease) = WalStore::open_writer(
+            self.inner.as_ref(),
+            session,
+            retention,
+            session_class,
+            lease,
+        )?;
         Ok((self.observe(wal), lease))
     }
 
@@ -260,17 +266,22 @@ impl WalStore for ObservedWalStore {
         session_class: Option<&str>,
         lease: Box<dyn broca_core::LeaseHandle>,
     ) -> Result<(Box<dyn Wal + Send>, Box<dyn broca_core::LeaseHandle>), WalError> {
-        let (wal, lease) =
-            WalStore::open_owned_writer(&self.inner, session, retention, session_class, lease)?;
+        let (wal, lease) = WalStore::open_owned_writer(
+            self.inner.as_ref(),
+            session,
+            retention,
+            session_class,
+            lease,
+        )?;
         Ok((self.observe(wal), lease))
     }
 
     fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {
-        WalStore::check_move(&self.inner, session, write)
+        WalStore::check_move(self.inner.as_ref(), session, write)
     }
 
     fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
-        Ok(self.observe(WalStore::open(&self.inner, session)?))
+        Ok(self.observe(WalStore::open(self.inner.as_ref(), session)?))
     }
 
     fn open_with_retention(
@@ -279,7 +290,7 @@ impl WalStore for ObservedWalStore {
         retention: Option<u64>,
     ) -> Result<Box<dyn Wal + Send>, WalError> {
         Ok(self.observe(WalStore::open_with_retention(
-            &self.inner,
+            self.inner.as_ref(),
             session,
             retention,
         )?))
@@ -290,44 +301,44 @@ impl WalStore for ObservedWalStore {
         session: &BindIdentity,
         meta: Option<&broca_core::AdmissionStoreSnapshot>,
     ) -> Result<bool, WalError> {
-        WalStore::lineage_exists(&self.inner, session, meta)
+        WalStore::lineage_exists(self.inner.as_ref(), session, meta)
     }
 
     fn first_user_message(
         &self,
         session: &BindIdentity,
     ) -> Result<(Option<broca_protocol::Message>, u64), WalError> {
-        WalStore::first_user_message(&self.inner, session)
+        WalStore::first_user_message(self.inner.as_ref(), session)
     }
 
     fn is_retention_lineage(&self, session: &BindIdentity) -> Result<bool, WalError> {
-        WalStore::is_retention_lineage(&self.inner, session)
+        WalStore::is_retention_lineage(self.inner.as_ref(), session)
     }
 
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
-        WalStore::wal_present(&self.inner, session)
+        WalStore::wal_present(self.inner.as_ref(), session)
     }
 
     fn live_wal_last_write(
         &self,
         session: &BindIdentity,
     ) -> Result<Option<std::time::SystemTime>, WalError> {
-        WalStore::live_wal_last_write(&self.inner, session)
+        WalStore::live_wal_last_write(self.inner.as_ref(), session)
     }
 
     fn live_wal_bytes(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
-        WalStore::live_wal_bytes(&self.inner, session)
+        WalStore::live_wal_bytes(self.inner.as_ref(), session)
     }
 
     fn read_records(&self, session: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
-        WalStore::read_records(&self.inner, session)
+        WalStore::read_records(self.inner.as_ref(), session)
     }
 
     fn read_records_with_lineage(
         &self,
         session: &BindIdentity,
     ) -> Result<(Vec<FramedRecord>, Option<WalLineageId>), WalError> {
-        WalStore::read_records_with_lineage(&self.inner, session)
+        WalStore::read_records_with_lineage(self.inner.as_ref(), session)
     }
 
     fn read_records_range(
@@ -337,7 +348,7 @@ impl WalStore for ObservedWalStore {
         through_seq: Option<u64>,
         anchor: Option<&broca_wal::WalByteAnchor>,
     ) -> Result<broca_wal::WalRangeRead, WalError> {
-        WalStore::read_records_range(&self.inner, session, after_seq, through_seq, anchor)
+        WalStore::read_records_range(self.inner.as_ref(), session, after_seq, through_seq, anchor)
     }
 
     fn read_records_range_for_authorization(
@@ -348,7 +359,7 @@ impl WalStore for ObservedWalStore {
         anchor: Option<&broca_wal::WalByteAnchor>,
     ) -> Result<broca_wal::WalRangeRead, WalError> {
         WalStore::read_records_range_for_authorization(
-            &self.inner,
+            self.inner.as_ref(),
             session,
             after_seq,
             through_seq,
@@ -363,7 +374,13 @@ impl WalStore for ObservedWalStore {
         through_seq: u64,
         anchor: Option<&broca_wal::WalByteAnchor>,
     ) -> Result<broca_wal::WalRangeRead, WalError> {
-        WalStore::read_media_seed_suffix(&self.inner, session, after_seq, through_seq, anchor)
+        WalStore::read_media_seed_suffix(
+            self.inner.as_ref(),
+            session,
+            after_seq,
+            through_seq,
+            anchor,
+        )
     }
 
     fn read_records_range_from_valid_anchor(
@@ -374,7 +391,7 @@ impl WalStore for ObservedWalStore {
         anchor: &broca_wal::WalByteAnchor,
     ) -> Result<Option<broca_wal::WalRangeRead>, WalError> {
         WalStore::read_records_range_from_valid_anchor(
-            &self.inner,
+            self.inner.as_ref(),
             session,
             after_seq,
             through_seq,
@@ -383,22 +400,22 @@ impl WalStore for ObservedWalStore {
     }
 
     fn flush_for_read(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
-        WalStore::flush_for_read(&self.inner, session)
+        WalStore::flush_for_read(self.inner.as_ref(), session)
     }
 
     fn file_identity(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
-        WalStore::file_identity(&self.inner, session)
+        WalStore::file_identity(self.inner.as_ref(), session)
     }
 
     fn flush_for_authorization(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
-        WalStore::flush_for_authorization(&self.inner, session)
+        WalStore::flush_for_authorization(self.inner.as_ref(), session)
     }
 
     fn file_identity_for_authorization(
         &self,
         session: &BindIdentity,
     ) -> Result<Option<u64>, WalError> {
-        WalStore::file_identity_for_authorization(&self.inner, session)
+        WalStore::file_identity_for_authorization(self.inner.as_ref(), session)
     }
 }
 

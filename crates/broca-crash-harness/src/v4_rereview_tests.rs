@@ -282,3 +282,4 @@ fn v4_recovery_missing_log_cannot_authorize_a_manifest_replay() {
     );
     assert!(!root.log().exists());
 }
+crate::require_process_kill!();

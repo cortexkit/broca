@@ -1497,12 +1497,16 @@ pub enum WalRecord {
         decision: ApprovalDecision,
     },
 
-    /// Written once by each resume of an episode that has no durable terminal, before the
-    /// resume writes anything else or calls anyone: which episode it resumed, from which
+    /// Written once by every resume of an episode that has no durable terminal, including
+    /// after a pause, before any step, tool intent, result or terminal the resume writes.
+    /// Only the resume's own `RunConfigRefrozen` and `RunAuthRefrozen` may precede it: the
+    /// background cache warmer reads this record as "the run is active again" and must already
+    /// have applied the refrozen configuration before sending a warm request. The record says
+    /// which episode resumed, from which
     /// durable record, what it rebuilt from the log without calling a provider or a tool, what
     /// it is about to do again, and which tool calls it found with no recorded outcome.
     ///
-    /// PURELY INFORMATIONAL under the skip contract on this enum: replay, the reconstructed
+    /// Replay, the reconstructed
     /// prompt, projection, the control stream, billing and export all skip it exactly as they
     /// skip [`WalRecord::Unknown`], so an older build that does not know the kind reads the
     /// same session. It never enters a rendered request. The tool results a resume writes for
@@ -2014,7 +2018,7 @@ impl WalRecord {
         }
     }
 
-    /// Whether every session reader skips this record: a type from a newer build
+    /// Whether conversation and admission readers skip this record: a type from a newer build
     /// ([`WalRecord::Unknown`]) or one this build knows but that carries no session semantics
     /// ([`WalRecord::ModelAttemptFinished`], [`WalRecord::ResumeStarted`]). Sites that pick
     /// "the first/next record that matters" filter on this so an informational record can
