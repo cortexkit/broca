@@ -168,6 +168,19 @@ struct WalObservation {
     incomplete: bool,
 }
 
+fn observed_run_state(record: &Value, current_run: &mut Value) -> Option<Value> {
+    let (state, run_id) = match record["type"].as_str()? {
+        "run_started" => {
+            *current_run = record["run_id"].clone();
+            ("active", current_run.clone())
+        }
+        "run_paused" => ("paused", record["run_id"].clone()),
+        "run_finished" => ("finished", current_run.clone()),
+        _ => return None,
+    };
+    Some(json!({"run_id":run_id,"state":state,"reason":record["reason"]}))
+}
+
 fn observe_wal(state: &Path) -> WalObservation {
     let mut observation = WalObservation::default();
     let Ok(entries) = std::fs::read_dir(state.join("wal")) else {
@@ -182,6 +195,7 @@ fn observe_wal(state: &Path) -> WalObservation {
             continue;
         };
         let mut at = 0;
+        let mut current_run = Value::Null;
         while at < bytes.len() {
             match decode_next(&bytes[at..]) {
                 DecodeStep::Lineage { consumed, .. } => at += consumed,
@@ -197,16 +211,8 @@ fn observe_wal(state: &Path) -> WalObservation {
                     };
                     let kind = record["type"].as_str().unwrap_or("unknown");
                     observation.last = Some((framed.seq, kind.to_owned()));
-                    let state = match kind {
-                        "run_started" => Some("active"),
-                        "run_paused" => Some("paused"),
-                        "run_finished" => Some("finished"),
-                        _ => None,
-                    };
-                    if let Some(state) = state {
-                        observation.run_state = Some(
-                            json!({"run_id":record["run_id"],"state":state,"reason":record["reason"]}),
-                        );
+                    if let Some(state) = observed_run_state(&record, &mut current_run) {
+                        observation.run_state = Some(state);
                     }
                 }
                 _ => {
@@ -859,7 +865,8 @@ fn capture_reservation(
         return Err(format!("reservation {id} does not describe this HTTP body"));
     }
     if records.iter().any(|source| {
-        source.record["attempt_id"] == id && source.record["type"] != "attempt_reserved"
+        source.record.get("attempt_id").and_then(Value::as_str) == Some(id)
+            && source.record["type"] != "attempt_reserved"
     }) {
         return Err(format!(
             "attempt {id} settled before its HTTP request was answered"
@@ -1270,7 +1277,7 @@ impl Sources {
         for (i, source) in self
             .records
             .iter()
-            .filter(|s| s.record["attempt_id"].is_string())
+            .filter(|s| s.record.get("attempt_id").is_some_and(Value::is_string))
             .enumerate()
         {
             let id = source.record["attempt_id"].as_str().unwrap();
@@ -1366,8 +1373,19 @@ impl Sources {
         let end = value["run_end_seq"].as_u64().unwrap();
         assert_eq!(self.source(start).record["type"], "run_started");
         assert_eq!(self.source(start).record["run_id"], value["run_id"]);
+        assert!(end > start, "run.tool_calls end must follow its start");
         assert_eq!(self.source(end).record["type"], "run_finished");
-        assert_eq!(self.source(end).record["run_id"], value["run_id"]);
+        // RunStarted owns the episode; RunFinished has no run_id.
+        // See crates/broca-wal/src/record.rs:643-658,1241-1260.
+        assert!(
+            !self.records.iter().any(|source| source.seq > start
+                && source.seq < end
+                && matches!(
+                    source.record["type"].as_str(),
+                    Some("run_started" | "run_finished")
+                )),
+            "run.tool_calls endpoints must delimit one episode"
+        );
         value["run_start_seq"] = json!(self.position(start));
         value["run_end_seq"] = json!(self.position(end));
         self.call_position(&mut value);
@@ -1506,8 +1524,8 @@ fn correspondence(left: &Sources, right: &Sources) {
         );
         for field in ["step_id", "tool_call_id", "batch_id", "args"] {
             assert_eq!(
-                left.normalize(&a.record[field]),
-                right.normalize(&b.record[field]),
+                a.record.get(field).map(|value| left.normalize(value)),
+                b.record.get(field).map(|value| right.normalize(value)),
                 "source identity {field} at {} / {}",
                 a.seq,
                 b.seq
@@ -2459,7 +2477,7 @@ fn billing_fixture(overhaul: bool) -> BillingFixture {
     } else {
         None
     };
-    bodies.extend([terminal, json!({"type":"run_finished","run_id":"run-a"})]);
+    bodies.extend([terminal, json!({"type":"run_finished"})]);
     let records: Vec<_> = bodies
         .into_iter()
         .enumerate()
@@ -2956,53 +2974,55 @@ fn differential_cursor_field_coverage_rejects_uncompared_additions() {
     .is_err());
 }
 
+fn cursor_sources(overhaul: bool) -> Sources {
+    let shift = u64::from(overhaul);
+    let bodies = [
+        json!({"type":"run_started","run_id":"run-a"}),
+        json!({"type":"model_step_finished","assistant_message":{"content":[{"type":"tool_call"}]}}),
+        json!({"type":"tool_batch_finished"}),
+        json!({"type":"model_step_finished","assistant_message":{"content":[{"type":"tool_call"}]}}),
+        json!({"type":"tool_batch_finished"}),
+        json!({"type":"run_finished"}),
+    ];
+    let records: Vec<_> = bodies
+        .into_iter()
+        .enumerate()
+        .map(|(i, record)| Source {
+            seq: i as u64 + 1 + shift,
+            end: (i as u64 + 1) * 100,
+            record,
+        })
+        .collect();
+    Sources {
+        lineage: format!("lineage-{overhaul}"),
+        logical: records
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.seq, i + 1))
+            .collect(),
+        records,
+        root: "/root".into(),
+        runs: vec!["run-a".into()],
+        file_id: 7,
+        projected: BTreeSet::new(),
+        overhaul,
+    }
+}
+
+fn cursor_token(sources: &Sources) -> Value {
+    let shift = u64::from(sources.overhaul);
+    json!({"version":1,"run_id":"run-a","lineage_id":sources.lineage,
+        "run_start_seq":1+shift,"run_end_seq":6+shift,"step_seq":4+shift,"call_index":0,"batch_end_seq":5+shift,"ordinal":3,
+        "anchor_before":if sources.overhaul { Value::Null } else { json!({"file_id":7,"seq":3,"byte_end":300}) },
+        "after_batch":[],"authentication":"0".repeat(64)})
+}
+
 #[test]
 fn differential_cursor_validates_root_local_seek_hint_and_all_fields() {
-    fn sources(overhaul: bool) -> Sources {
-        let shift = u64::from(overhaul);
-        let bodies = [
-            json!({"type":"run_started","run_id":"run-a"}),
-            json!({"type":"model_step_finished","assistant_message":{"content":[{"type":"tool_call"}]}}),
-            json!({"type":"tool_batch_finished"}),
-            json!({"type":"model_step_finished","assistant_message":{"content":[{"type":"tool_call"}]}}),
-            json!({"type":"tool_batch_finished"}),
-            json!({"type":"run_finished","run_id":"run-a"}),
-        ];
-        let records: Vec<_> = bodies
-            .into_iter()
-            .enumerate()
-            .map(|(i, record)| Source {
-                seq: i as u64 + 1 + shift,
-                end: (i as u64 + 1) * 100,
-                record,
-            })
-            .collect();
-        Sources {
-            lineage: format!("lineage-{overhaul}"),
-            logical: records
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (s.seq, i + 1))
-                .collect(),
-            records,
-            root: "/root".into(),
-            runs: vec!["run-a".into()],
-            file_id: 7,
-            projected: BTreeSet::new(),
-            overhaul,
-        }
-    }
-    let left = sources(false);
-    let right = sources(true);
-    let token = json!({"version":1,"run_id":"run-a","lineage_id":left.lineage,
-        "run_start_seq":1,"run_end_seq":6,"step_seq":4,"call_index":0,"batch_end_seq":5,"ordinal":3,
-        "anchor_before":{"file_id":7,"seq":3,"byte_end":300},"after_batch":[],"authentication":"0".repeat(64)});
-    let mut other = token.clone();
-    other["lineage_id"] = json!(right.lineage);
-    for key in ["run_start_seq", "run_end_seq", "step_seq", "batch_end_seq"] {
-        other[key] = json!(other[key].as_u64().unwrap() + 1);
-    }
-    other["anchor_before"] = Value::Null;
+    let left = cursor_sources(false);
+    let right = cursor_sources(true);
+    let token = cursor_token(&left);
+    let other = cursor_token(&right);
     assert_eq!(
         left.calls_cursor(&token.to_string()),
         right.calls_cursor(&other.to_string())
@@ -3016,4 +3036,112 @@ fn differential_cursor_validates_root_local_seek_hint_and_all_fields() {
     let mut invented_hint = other.clone();
     invented_hint["anchor_before"] = token["anchor_before"].clone();
     assert!(std::panic::catch_unwind(|| right.calls_cursor(&invented_hint.to_string())).is_err());
+}
+
+#[test]
+fn differential_cursor_end_is_owned_by_one_structural_episode() {
+    for overhaul in [false, true] {
+        let sources = cursor_sources(overhaul);
+        let token = cursor_token(&sources);
+        assert!(sources
+            .records
+            .last()
+            .unwrap()
+            .record
+            .get("run_id")
+            .is_none());
+        sources.calls_cursor(&token.to_string());
+        for fault in [
+            "wrong start id",
+            "wrong start kind",
+            "end at start",
+            "wrong end kind",
+            "intervening start",
+            "intervening finish",
+        ] {
+            let mut sources = cursor_sources(overhaul);
+            let mut token = cursor_token(&sources);
+            match fault {
+                "wrong start id" => sources.records[0].record["run_id"] = json!("foreign-run"),
+                "wrong start kind" => sources.records[0].record["type"] = json!("step_started"),
+                "end at start" => token["run_end_seq"] = token["run_start_seq"].clone(),
+                "wrong end kind" => sources.records[5].record["type"] = json!("step_started"),
+                "intervening start" => {
+                    sources.records[2].record = json!({"type":"run_started","run_id":"run-a"})
+                }
+                "intervening finish" => sources.records[2].record = json!({"type":"run_finished"}),
+                _ => unreachable!(),
+            }
+            assert!(
+                std::panic::catch_unwind(|| sources.calls_cursor(&token.to_string())).is_err(),
+                "accepted {fault}"
+            );
+        }
+
+        let mut history = cursor_sources(overhaul);
+        let mut token = cursor_token(&history);
+        let next_episode: Vec<_> = history
+            .records
+            .iter()
+            .map(|source| Source {
+                seq: source.seq + 6,
+                end: source.end + 600,
+                record: source.record.clone(),
+            })
+            .collect();
+        history.records[0].record["run_id"] = json!("previous-run");
+        history.records.extend(next_episode);
+        history.runs = vec!["previous-run".into(), "run-a".into()];
+        history.logical = history
+            .records
+            .iter()
+            .enumerate()
+            .map(|(index, source)| (source.seq, index + 1))
+            .collect();
+        for field in ["run_start_seq", "run_end_seq", "step_seq", "batch_end_seq"] {
+            token[field] = json!(token[field].as_u64().unwrap() + 6);
+        }
+        if !overhaul {
+            token["anchor_before"]["seq"] = json!(9);
+            token["anchor_before"]["byte_end"] = json!(900);
+        }
+        let normalized = history.calls_cursor(&token.to_string());
+        assert_eq!(normalized["run_start_seq"], 7);
+        token["run_end_seq"] = json!(6 + u64::from(overhaul));
+        assert!(
+            std::panic::catch_unwind(|| history.calls_cursor(&token.to_string())).is_err(),
+            "an earlier episode's RunFinished cannot close the current run"
+        );
+    }
+}
+
+#[test]
+fn differential_wal_observation_infers_finished_run_from_start() {
+    let mut current = Value::Null;
+    let started = observed_run_state(
+        &json!({"type":"run_started","run_id":"first-run"}),
+        &mut current,
+    )
+    .unwrap();
+    assert_eq!(started["run_id"], "first-run");
+    let paused = observed_run_state(
+        &json!({"type":"run_paused","run_id":"first-run","reason":"auth_required"}),
+        &mut current,
+    )
+    .unwrap();
+    assert_eq!(paused["run_id"], "first-run");
+    let finish = json!({"type":"run_finished","reason":"completed"});
+    assert!(finish.get("run_id").is_none());
+    assert_eq!(
+        observed_run_state(&finish, &mut current).unwrap()["run_id"],
+        "first-run"
+    );
+    observed_run_state(
+        &json!({"type":"run_started","run_id":"second-run"}),
+        &mut current,
+    )
+    .unwrap();
+    let finished = observed_run_state(&finish, &mut current).unwrap();
+    assert_eq!(finished["run_id"], "second-run");
+    assert_eq!(finished["state"], "finished");
 }
