@@ -1544,6 +1544,7 @@ pub enum ServeError {
     },
     RetentionInvalid(crate::retention::InvalidRetention),
     VariantUnsupported(broca_core::run::VariantRefusal),
+    ToolAliasInvalid(broca_core::run::ToolAliasInvalid),
     ServiceTierInvalid {
         reason: &'static str,
         message: String,
@@ -1728,6 +1729,7 @@ impl std::fmt::Display for ServeError {
             ServeError::RetentionInvalid(_) => write!(f, "invalid retention"),
             ServeError::SessionHeld(s) => write!(f, "session '{s}' held by a live writer"),
             ServeError::VariantUnsupported(e) => write!(f, "open failed: run resolution failed: {e}"),
+            ServeError::ToolAliasInvalid(e) => write!(f, "{e}"),
             ServeError::ServiceTierInvalid { message, .. } => f.write_str(message),
             ServeError::SessionTooLarge { max_bytes } => write!(f, "session log cannot exceed {max_bytes} bytes"),
             ServeError::RetainedSessionTooLarge { max_bytes } => write!(f, "retained session log cannot exceed {max_bytes} bytes"),
@@ -2879,6 +2881,7 @@ impl ServeHandler for crate::LineageRegistry {
                 message: format!("joining steer cannot change the active run's frozen {field}"),
             }),
             SendOutcome::VariantUnsupported(e) => Err(ServeError::VariantUnsupported(e)),
+            SendOutcome::ToolAliasInvalid(e) => Err(ServeError::ToolAliasInvalid(e)),
             SendOutcome::ServiceTierInvalid { reason, message } => {
                 Err(ServeError::ServiceTierInvalid { reason, message })
             }

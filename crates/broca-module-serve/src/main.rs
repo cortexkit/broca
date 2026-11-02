@@ -243,6 +243,19 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // block refuses boot by name, like the sections above; without one, both stay off.
     let anthropic_fallbacks = broca_module_serve::config::AnthropicFallbackConfig::load_default()
         .map_err(ServeIoError)?;
+    let tool_name_aliases =
+        broca_module_serve::config::ToolNameAliasesConfig::load_default().map_err(ServeIoError)?;
+    for (route, aliases) in &tool_name_aliases.0 {
+        match aliases {
+            broca_module_serve::config::ToolAliasRoute::Names { names } if !names.is_empty() => {
+                tracing::info!(credential_route = %route, alias_count = names.len(), "tool name aliases configured");
+            }
+            broca_module_serve::config::ToolAliasRoute::Prefix { prefix_all } => {
+                tracing::info!(credential_route = %route, alias_count = "all", prefix = %prefix_all, "tool name aliases configured; concrete count resolved at admission");
+            }
+            _ => {}
+        }
+    }
     let account_limit_pause = broca_module_serve::config::AccountLimitPauseConfig::load_default()
         .map_err(ServeIoError)?;
     let consumer_routes = ConsumerRoutes::resolve(
@@ -505,6 +518,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Both content-filter fallback switches, read above with the other early config so the
     // refusal mapping can take its own switch from the same block.
     executor_impl = executor_impl.with_anthropic_fallbacks(anthropic_fallbacks);
+    executor_impl = executor_impl.with_tool_name_aliases(tool_name_aliases);
     executor_impl = executor_impl.with_account_limit_pause(account_limit_pause.enabled);
     let charge_basis_table = Arc::new(ChargeBasisTable::load_default_path().map_err(ServeIoError)?);
     if let Some(notice) = charge_basis_table.ignored_version_notice() {
@@ -3077,6 +3091,7 @@ mod executor {
         /// The operator switches and refusal-resend model mapping for Anthropic OAuth runs.
         /// Consulted only at admission; a resume keeps its recorded policy. Both switches default off.
         anthropic_fallbacks: broca_module_serve::config::AnthropicFallbackConfig,
+        tool_name_aliases: broca_module_serve::config::ToolNameAliasesConfig,
         account_limit_pause: bool,
         /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
         /// its WAL could not be read), so the WAL is read for it at most once per session.
@@ -3191,6 +3206,7 @@ mod executor {
                 routing: None,
                 claude_code_install_id: None,
                 anthropic_fallbacks: Default::default(),
+                tool_name_aliases: Default::default(),
                 account_limit_pause: false,
                 cc_suffix_memo: Default::default(),
                 cc_suffix_wal_bytes: Default::default(),
@@ -3331,6 +3347,14 @@ mod executor {
         }
 
         /// Install the operator switches for Anthropic content-filter fallback.
+        pub fn with_tool_name_aliases(
+            mut self,
+            config: broca_module_serve::config::ToolNameAliasesConfig,
+        ) -> Self {
+            self.tool_name_aliases = config;
+            self
+        }
+
         pub fn with_anthropic_fallbacks(
             mut self,
             config: broca_module_serve::config::AnthropicFallbackConfig,
@@ -4489,7 +4513,22 @@ mod executor {
             } else {
                 None
             };
+            let alias_route = resolution.method.map(|method| {
+                format!("{}:{}", method.as_token(), job.req.model.provider_module_id)
+            });
+            let admitted_tools: Vec<_> = job
+                .req
+                .tools
+                .iter()
+                .filter(|tool| job.req.policy_allowed.contains(&tool.name))
+                .cloned()
+                .collect();
+            let aliases = alias_route
+                .as_deref()
+                .map(|route| self.tool_name_aliases.for_tools(route, &admitted_tools))
+                .unwrap_or_default();
             let resolve_options = broca_catalog::live::ResolveOptions {
+                tool_name_aliases: fresh_episode.then_some((&admitted_tools, &aliases)),
                 media: fresh_episode,
                 media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
                 claude_code_persona: fresh_persona.as_ref(),
@@ -5038,6 +5077,7 @@ mod executor {
         use super::*;
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
+        include!("tool_name_alias_tests.rs");
         include!("queued_service_tier_tests.rs");
         include!("service_tier_writer_tests.rs");
         include!("vault_request_tests.rs");
@@ -5693,6 +5733,7 @@ mod executor {
                         .into(),
                 ),
                 &broca_catalog::live::ResolveOptions {
+                    tool_name_aliases: None,
                     media: false,
                     media_profile: None,
                     claude_code_persona: None,
@@ -5724,6 +5765,7 @@ mod executor {
         fn chatgpt_pause_only_construction_is_gated_and_repaired_resume_is_strict() {
             install_test_catalog();
             let options = broca_catalog::live::ResolveOptions {
+                tool_name_aliases: None,
                 media: false,
                 media_profile: None,
                 claude_code_persona: None,

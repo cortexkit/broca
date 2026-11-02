@@ -191,7 +191,12 @@ fn build_request_body_with_media_and_provenance(
         body["service_tier"] = serde_json::Value::String(service_tier.clone());
     }
     if let Some(wire) = &frozen.chatgpt_wire {
-        wire.apply_with_provenance(&mut body, prepared.as_ref(), provenance);
+        wire.apply_with_provenance(
+            &mut body,
+            prepared.as_ref(),
+            &frozen.tool_name_aliases,
+            provenance,
+        );
     }
     body
 }

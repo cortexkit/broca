@@ -93,6 +93,12 @@ impl CodeAssistRoute<'_> {
 /// policies within the same `AnthropicMessages` family.
 #[derive(Debug, Clone, Default)]
 pub struct ResolveOptions<'a> {
+    /// Fresh admission's concrete operator aliases and complete canonical tool declarations.
+    /// Recorded episodes use only their frozen bundle.
+    pub tool_name_aliases: Option<(
+        &'a [broca_protocol::request::Tool],
+        &'a std::collections::BTreeMap<String, String>,
+    )>,
     /// Consider media facts for a fresh, media-enabled episode. A tool can return media even
     /// when the caller's input is text; models with no known media modality keep no profile.
     pub media: bool,
@@ -162,6 +168,22 @@ pub struct ResolveOptions<'a> {
     pub refusal_fallback_model: Option<&'a str>,
 }
 
+fn freeze_tool_aliases(
+    mut frozen: FrozenRenderConfig,
+    opts: &ResolveOptions<'_>,
+) -> Result<FrozenRenderConfig, ResolutionError> {
+    if let Some((tools, aliases)) = opts.tool_name_aliases {
+        broca_provider::tool_name_alias::validate_operator_aliases(
+            frozen.family_id,
+            tools,
+            aliases,
+        )
+        .map_err(ResolutionError::ToolAliasInvalid)?;
+        frozen.tool_name_aliases = aliases.clone();
+    }
+    Ok(frozen)
+}
+
 /// The Claude Code persona an episode renders with, as the code starting it knows it.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub enum EpisodePersona<'a> {
@@ -218,6 +240,7 @@ pub struct ProviderResolution {
 #[derive(Debug, Clone)]
 pub enum ResolutionError {
     Config(String),
+    ToolAliasInvalid(broca_core::run::ToolAliasInvalid),
     VariantUnsupported(broca_provider::variant::VariantRefusal),
 }
 impl From<String> for ResolutionError {
@@ -234,6 +257,7 @@ impl std::fmt::Display for ResolutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config(s) => f.write_str(s),
+            Self::ToolAliasInvalid(e) => e.fmt(f),
             Self::VariantUnsupported(e) => e.fmt(f),
         }
     }
@@ -266,6 +290,7 @@ impl From<ResolutionError> for broca_core::RunError {
     fn from(value: ResolutionError) -> Self {
         match value {
             ResolutionError::Config(s) => Self::Config(s),
+            ResolutionError::ToolAliasInvalid(e) => Self::ToolAliasInvalid(e),
             ResolutionError::VariantUnsupported(e) => Self::VariantUnsupported(e),
         }
     }
@@ -948,7 +973,7 @@ fn resolve_provider_inner(
         );
         // Opaque endpoints share fresh-episode render rules with catalog routes.
         // Recorded episodes take the earlier recorded-config branch instead.
-        let frozen = episode_render.apply(frozen);
+        let frozen = freeze_tool_aliases(episode_render.apply(frozen), opts)?;
         let provider =
             resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
         return Ok(ProviderResolution {
@@ -1166,7 +1191,7 @@ fn resolve_provider_inner(
                 .media
                 .filter(|profile| profile.modalities.supports_media());
         }
-        let frozen = episode_render.apply(frozen);
+        let frozen = freeze_tool_aliases(episode_render.apply(frozen), opts)?;
         let resolved_base_url = frozen
             .base_url
             .clone()
@@ -1363,7 +1388,7 @@ fn resolve_provider_inner(
             .media
             .filter(|profile| profile.modalities.supports_media());
     }
-    let mut frozen = episode_render.apply(frozen);
+    let mut frozen = freeze_tool_aliases(episode_render.apply(frozen), opts)?;
     if let Some(fallback_model) = opts.refusal_fallback_model {
         match freeze_refusal_fallback(
             &frozen,
@@ -1607,6 +1632,7 @@ fn freeze_refusal_fallback(
     }
     fallback.max_output_tokens = max_tokens;
     fallback.image_notice_labels = source.image_notice_labels;
+    fallback.tool_name_aliases = source.tool_name_aliases.clone();
     fallback.base_url = source.base_url.clone();
     fallback.cache = source.cache.clone();
     fallback.prompt_cache_key = source.prompt_cache_key.clone();

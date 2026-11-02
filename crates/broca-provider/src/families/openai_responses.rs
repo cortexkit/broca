@@ -231,7 +231,11 @@ fn render_prepared_body_with_provenance(
 ) -> Value {
     let view = crate::families::compaction_view(frozen.family_id, prepared);
     let opts = view.as_ref();
-    let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
+    let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
+        &opts.tools,
+        &opts.prompt,
+        &frozen.tool_name_aliases,
+    );
     let input = convert_input_items_with_provenance(
         &opts.prompt,
         frozen.system_prompt.clone(),

@@ -558,6 +558,10 @@ contract. Broca uses its own `route.account_for` / `route.account_observe` proto
 Those calls still carry neither the applied nor served tier.
 The switch adopts llm-runner service tiers, not a second account-routing path.
 
+#### Tool-name aliases
+
+The operator's `broca.jsonc` may set `"tool_name_aliases": {"oauth:example": {"names": {"bash": "client_bash"}}}` or use `{"prefix_all": "client_"}` for that credential route to rename every declared tool. Each route accepts exactly one form and no other members; malformed shapes refuse boot. Keys are credential routing keys (`<method>:<provider>`), not account IDs. Aliases affect only provider requests and are restored on replies; stored tools, history and dispatch remain canonical. Invalid names or collisions refuse admission as permanent `tool_alias_invalid` with `detail.tool` naming the tool, before any write. The resolved map is frozen into each new run; resume and retry retain it even after the config changes or is removed. Restart to load operator config changes.
+
 #### Hard session input-token cap
 
 The `input_token_cap` discovery group enables optional `session.send.budget.max_input_tokens`

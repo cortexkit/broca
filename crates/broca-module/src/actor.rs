@@ -383,6 +383,7 @@ pub enum SendOutcome {
         field: String,
     },
     VariantUnsupported(broca_core::run::VariantRefusal),
+    ToolAliasInvalid(broca_core::run::ToolAliasInvalid),
     Upload(broca_core::media_uploads::UploadError),
     /// The run started immediately (the lineage was idle).
     Active {
@@ -4442,6 +4443,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 Err(StartRunFailure::Admission(RunError::VariantUnsupported(e))) => {
                     SendOutcome::VariantUnsupported(e)
+                }
+                Err(StartRunFailure::Admission(RunError::ToolAliasInvalid(e))) => {
+                    SendOutcome::ToolAliasInvalid(e)
                 }
                 Err(StartRunFailure::Admission(RunError::AccountSelectionRefused(refusal))) => {
                     SendOutcome::AccountSelectionRefused(refusal)

@@ -1,6 +1,104 @@
 //! Operator policy for model tools. Missing configuration is deliberately conservative:
 //! private content stays within the explicitly trusted provider set.
 
+/// Operator-selected wire names, keyed by credential routing key rather than account identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolNameAliasesConfig(pub std::collections::BTreeMap<String, ToolAliasRoute>);
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ToolAliasRoute {
+    Names {
+        names: std::collections::BTreeMap<String, String>,
+    },
+    Prefix {
+        prefix_all: String,
+    },
+}
+
+impl ToolNameAliasesConfig {
+    pub fn load_default() -> Result<Self, String> {
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
+            crate::config_home::ConfigHome::Resolved { path, .. } => {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => Self::parse(&text),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(Self::default())
+                    }
+                    Err(error) => Err(format!(
+                        "read tool_name_aliases from {}: {error}",
+                        path.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let mut file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|error| format!("parse tool_name_aliases: {error}"))?;
+        match file.remove("tool_name_aliases") {
+            None => Ok(Self::default()),
+            Some(value) => serde_json::from_value(value)
+                .map(Self)
+                .map_err(|error| format!("tool_name_aliases: {error}")),
+        }
+    }
+
+    pub fn for_tools(
+        &self,
+        route: &str,
+        tools: &[broca_protocol::request::Tool],
+    ) -> std::collections::BTreeMap<String, String> {
+        tools
+            .iter()
+            .filter_map(|tool| match self.0.get(route)? {
+                ToolAliasRoute::Names { names } => names
+                    .get(&tool.name)
+                    .map(|alias| (tool.name.clone(), alias.clone())),
+                ToolAliasRoute::Prefix { prefix_all } => {
+                    Some((tool.name.clone(), format!("{prefix_all}{}", tool.name)))
+                }
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tool_name_aliases_config_tests {
+    use super::*;
+
+    #[test]
+    fn tool_name_aliases_config_shape_is_strict() {
+        assert!(ToolNameAliasesConfig::parse("{}").unwrap().0.is_empty());
+        for text in [
+            r#"{"tool_name_aliases":null}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"bash":"client_bash"}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"names":{},"prefix_all":"client_"}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"prefix_all":"client_","unknown":true}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"names":{"bash":1}}}}"#,
+        ] {
+            assert!(
+                ToolNameAliasesConfig::parse(text)
+                    .unwrap_err()
+                    .contains("tool_name_aliases"),
+                "{text}"
+            );
+        }
+        for text in [
+            r#"{"tool_name_aliases":{"oauth:p":{"names":{"bash":"client_bash"}}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"prefix_all":"client_"}}}"#,
+        ] {
+            assert_eq!(ToolNameAliasesConfig::parse(text).unwrap().0.len(), 1);
+        }
+    }
+}
+
 /// Opt-in writer policy for the `service-tier-queue/v1` representation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
