@@ -32,11 +32,21 @@ pub struct RawPageSnapshot {
     pub page: SessionReadPage,
     pub at_seq: u64,
     pub head: broca_core::head::HeadProjection,
+    pub head_media: Option<RawHeadMedia>,
     pub last_title: Option<String>,
     pub last_write_ms: Option<u64>,
     pub retention_activity_ms: Option<u64>,
     pub tools: Option<(RunId, std::sync::Arc<Vec<broca_protocol::request::Tool>>)>,
     pub dispatches: BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
+}
+
+/// Ephemeral media metadata from the raw page's authenticated log snapshot.
+/// Media profiles are read from log records, never persisted in the database.
+#[derive(Debug, Clone)]
+pub struct RawHeadMedia {
+    pub run_id: broca_protocol::RunId,
+    pub media: Option<serde_json::Value>,
+    pub interrupt_reason: Option<String>,
 }
 
 struct Session {
@@ -326,6 +336,44 @@ struct Sources<'a> {
 }
 
 impl<'a> Sources<'a> {
+    fn compaction_frame(
+        &mut self,
+        tx: &Transaction<'_>,
+        key: &str,
+        off: u64,
+    ) -> Result<(), DbError> {
+        let bad = || {
+            DbError::SeedFallback(SeedFallback::new(
+                "raw page requires compaction source hydration",
+            ))
+        };
+        let auth: Option<(u64, u64, Vec<u8>)> = tx.query_row(
+            "SELECT frame_end,seq,frame_identity FROM source_auth WHERE sid=?1 AND frame_off=?2",
+            params![key, off], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional()?;
+        let (end, seq, identity) = auth.ok_or_else(bad)?;
+        let len = end
+            .checked_sub(off)
+            .filter(|len| *len > 0 && end <= self.end)
+            .ok_or_else(bad)?;
+        let bytes = access_counter::read_at(self.read, off, len)?;
+        match access_counter::decode_next(&bytes) {
+            DecodeStep::Record { framed, consumed }
+                if consumed == bytes.len()
+                    && framed.seq == seq
+                    && Sha256::digest(&bytes).as_slice() == identity
+                    && matches!(
+                        framed.record,
+                        WalRecord::CompactionMessage { .. } | WalRecord::CompactionAnswer { .. }
+                    ) =>
+            {
+                self.frames.insert(off, (end, *framed));
+                Ok(())
+            }
+            _ => Err(bad()),
+        }
+    }
+
     fn range(&mut self, lo: u64, hi: u64) -> Result<Vec<FramedRecord>, DbError> {
         if let Some(frames) = self.ranges.get(&(lo, hi)) {
             return Ok(frames.clone());
@@ -541,8 +589,21 @@ fn page(
         Vec::new(),
     )
     .map_err(DbError::SeedFallback)?;
+    let compaction_sources: u64 = tx.query_row(
+        "SELECT count(*) FROM source_auth WHERE sid=?1",
+        [key],
+        |r| r.get(0),
+    )?;
+    if compaction_sources != seed.admission.compaction.len() as u64 {
+        return Err(DbError::SeedFallback(SeedFallback::new(
+            "raw page requires compaction source hydration",
+        )));
+    }
+    for off in &seed.admission.compaction {
+        sources.compaction_frame(tx, key, *off)?;
+    }
     let mut ownership = continuation
-        .raw_read_ownership()
+        .raw_read_ownership(read)
         .map_err(DbError::SeedFallback)?;
     let tail_frames: Vec<_> = tail.iter().map(|p| p.framed.clone()).collect();
     if broca_core::replay::project_deferred_calls(
@@ -695,6 +756,49 @@ fn page(
         .and_then(|e| e.terminal_off)
         .map(|off| sources.frame(off))
         .transpose()?;
+    let mut head_media = current.as_ref().and_then(|frame| match &frame.record {
+        WalRecord::RunStarted { run_id, config, .. } => Some(RawHeadMedia {
+            run_id: run_id.clone(),
+            media: config.frozen_render_config.get("media").cloned(),
+            interrupt_reason: None,
+        }),
+        _ => None,
+    });
+    if let Some(off) = seed.admission.refreeze {
+        let frame = sources.frame(off)?;
+        if current
+            .as_ref()
+            .is_none_or(|current| frame.seq <= current.seq)
+        {
+            return Err(invalid("raw head media refreeze precedes episode"));
+        }
+        match (&mut head_media, frame.record) {
+            (
+                Some(media),
+                WalRecord::RunConfigRefrozen {
+                    frozen_render_config,
+                    ..
+                },
+            ) => {
+                media.media = frozen_render_config.get("media").cloned();
+            }
+            _ => return Err(invalid("raw head media refreeze mismatch")),
+        }
+    }
+    if let (Some(media), Some(frame)) = (&mut head_media, &terminal) {
+        match &frame.record {
+            WalRecord::RunFinished {
+                reason,
+                interrupt_reason,
+                ..
+            } => {
+                media.interrupt_reason = (*reason == broca_protocol::RunFinishReason::Interrupted)
+                    .then(|| interrupt_reason.clone())
+                    .flatten();
+            }
+            _ => return Err(invalid("raw head media terminal mismatch")),
+        }
+    }
     let mut state_snapshot = StorePageSnapshot::empty();
     state_snapshot.last_run_id = current.as_ref().and_then(|f| match &f.record {
         WalRecord::RunStarted { run_id, .. } => Some(run_id.clone()),
@@ -755,6 +859,7 @@ fn page(
         },
         at_seq: session.seq,
         head,
+        head_media,
         last_title,
         last_write_ms: seed.last_write_ms,
         retention_activity_ms: seed.frozen_policy.and(seed.last_activity_ms),
@@ -885,6 +990,36 @@ fn full_page(
     for frame in &frames {
         head.observe(&frame.record);
     }
+    let mut head_media = None;
+    for frame in &frames {
+        match &frame.record {
+            WalRecord::RunStarted { run_id, config, .. } => {
+                head_media = Some(RawHeadMedia {
+                    run_id: run_id.clone(),
+                    media: config.frozen_render_config.get("media").cloned(),
+                    interrupt_reason: None,
+                });
+            }
+            WalRecord::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => {
+                if let Some(media) = &mut head_media {
+                    media.media = frozen_render_config.get("media").cloned();
+                }
+            }
+            WalRecord::RunFinished {
+                reason: broca_protocol::RunFinishReason::Interrupted,
+                interrupt_reason,
+                ..
+            } => {
+                if let Some(media) = &mut head_media {
+                    media.interrupt_reason = interrupt_reason.clone();
+                }
+            }
+            _ => {}
+        }
+    }
     let last_title = frames
         .iter()
         .rev()
@@ -910,6 +1045,7 @@ fn full_page(
         dispatches,
         at_seq: publication.sequence(),
         head,
+        head_media,
         last_title,
         last_write_ms,
         retention_activity_ms: None,

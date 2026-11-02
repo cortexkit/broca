@@ -378,6 +378,7 @@ impl DatabaseEpisodeReader {
 mod tests {
     use super::*;
     use broca_protocol::{ContentBlock, Message, Role};
+    use broca_wal::access_counter::{ReadClass, WalAccessCounter};
     use broca_wal::{Wal, WalRecord};
 
     struct Fixture {
@@ -694,6 +695,131 @@ mod tests {
             .0;
         records.splice(at..at, [setup, answer.clone(), answer]);
         records
+    }
+
+    fn modern_compacted_raw_records() -> Vec<WalRecord> {
+        let mut records = with_noop_compaction(corpus(8));
+        records.push(setup(3));
+        if let WalRecord::CompactionMessage { tag_checkpoint, .. } = records.last_mut().unwrap() {
+            *tag_checkpoint = Some(broca_wal::SetupTagCheckpoint {
+                tag_checkpoint: 50,
+                cut: "m4".into(),
+            });
+        }
+        for (n, record) in records.iter_mut().enumerate() {
+            match record {
+                WalRecord::RunStarted {
+                    written_at_ms,
+                    config,
+                    ..
+                } => {
+                    *written_at_ms = Some(1_000 + n as u64);
+                    config.render_tags = true;
+                    config.computed_tags = Some(broca_wal::ComputedTagRules { checkpoint: 0 });
+                    config.frozen_render_config["media"] = serde_json::json!({"images":{"max":4}});
+                }
+                WalRecord::ModelStepFinished { written_at_ms, .. }
+                | WalRecord::SendDelivered { written_at_ms, .. } => {
+                    *written_at_ms = Some(1_000 + n as u64)
+                }
+                _ => {}
+            }
+        }
+        records
+    }
+
+    fn raw_page(fixture: &Fixture, from: Option<u64>) -> super::super::RawPageSnapshot {
+        fixture
+            .db
+            .read_raw_page(
+                &fixture.bind,
+                "episode",
+                LogLocation::Live,
+                &fixture.wal.durable_publication().unwrap(),
+                super::super::RawPageRequest {
+                    from_ordinal: from,
+                    limit: Some(2),
+                    include_tools: true,
+                },
+            )
+            .unwrap()
+    }
+
+    fn assert_raw_full_replay(
+        fixture: &Fixture,
+        actual: &super::super::RawPageSnapshot,
+        from: Option<u64>,
+    ) {
+        let frames = fixture.wal.replay().unwrap();
+        let mut expected = broca_core::read_session_page(
+            &broca_core::StorePageSnapshot::empty(),
+            &frames,
+            from,
+            Some(2),
+        )
+        .unwrap();
+        expected.lineage_id = Some(fixture.wal.durable_publication().unwrap().lineage());
+        assert_eq!(actual.page, expected);
+        let checkpoint = broca_core::AdmissionCheckpointV1::from_frames(&frames).unwrap();
+        assert_eq!(actual.head, checkpoint.head.unwrap());
+        let episode = checkpoint.last_episode.unwrap();
+        let media = actual.head_media.as_ref().unwrap();
+        assert_eq!(media.run_id, episode.run_id);
+        assert_eq!(
+            media.media,
+            episode.config.frozen_render_config.get("media").cloned()
+        );
+    }
+
+    #[test]
+    fn database_compacted_raw_pages_equal_full_replay_at_every_cut() {
+        let records = modern_compacted_raw_records();
+        let mut fixture = Fixture::new(&records);
+        let mut compacted = false;
+        for (cut, record) in records.iter().enumerate() {
+            fixture.append(record);
+            compacted |= matches!(record, WalRecord::CompactionMessage { .. });
+            for from in [None, Some(0), Some(3), Some(8)] {
+                let counter = WalAccessCounter::default();
+                let actual = counter
+                    .operation("compacted raw publication cut")
+                    .run(|| raw_page(&fixture, from));
+                assert_raw_full_replay(&fixture, &actual, from);
+                let op = counter.snapshot().remove(0);
+                if compacted {
+                    assert!(
+                        op.seed_fallbacks.is_empty(),
+                        "cut {cut}: {:?}",
+                        op.seed_fallbacks
+                    );
+                    assert!(
+                        op.reads.iter().all(|r| r.class != ReadClass::Origin),
+                        "cut {cut}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn database_compacted_raw_locators_fail_closed_by_name() {
+        for sql in [
+            "UPDATE source_auth SET frame_identity=zeroblob(32)",
+            "DELETE FROM source_auth",
+            "UPDATE session SET locator_seed=json_set(locator_seed,'$[1].admission.compaction',json('[]'))",
+        ] {
+            let records = modern_compacted_raw_records();
+            let mut fixture = Fixture::new(&records);
+            for record in &records { fixture.append(record); }
+            fixture.db.authoritative_transaction(|tx| { tx.execute_batch(sql)?; Ok(()) }).unwrap();
+            let counter = WalAccessCounter::default();
+            let actual = counter.operation("invalid raw compaction source").run(|| raw_page(&fixture, None));
+            assert_raw_full_replay(&fixture, &actual, None);
+            assert!(!actual.index_validated);
+            let op = counter.snapshot().remove(0);
+            assert_eq!(op.seed_fallbacks, ["raw page requires compaction source hydration"]);
+            assert_eq!(op.reads.iter().filter(|r| r.class == ReadClass::Origin).count(), 1);
+        }
     }
 
     #[test]

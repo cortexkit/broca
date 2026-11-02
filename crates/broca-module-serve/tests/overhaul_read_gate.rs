@@ -966,9 +966,183 @@ fn compaction_plan() -> Box<broca_wal::PlanManifest> {
     })
 }
 
+struct FullReplayHeadOpener;
+
+#[async_trait::async_trait]
+impl broca_module::registry::LineageOpener for FullReplayHeadOpener {
+    async fn open(
+        &self,
+        _: &BindIdentity,
+        _: u64,
+        _: broca_module::registry::RegistryHandle,
+    ) -> Result<broca_module::registry::ActorHandle, broca_module::registry::OpenError> {
+        panic!("the full-replay read oracle must not open an actor")
+    }
+}
+
+fn full_replay_registry(daemon: &OverhaulDaemon) -> broca_module::LineageRegistry {
+    // No materialized store or overhaul adapter: both reads replay the same
+    // durable log, including its file timestamp used by session.head.
+    broca_module::LineageRegistry::new_with_reader(
+        std::sync::Arc::new(FullReplayHeadOpener),
+        daemon.wal.clone(),
+        None,
+    )
+}
+
+async fn assert_head_and_raw_equal_full_replay(daemon: &OverhaulDaemon, bind: &BindIdentity) {
+    let oracle = full_replay_registry(daemon);
+    for from in [None, Some(0), Some(2)] {
+        let mut request = SessionReadRequest::new(bind.clone(), from, Some(2));
+        request.media = cortexkit_role_llm_runner::read::MediaMode::Descriptors;
+        let expected = oracle.read(request.clone()).await.unwrap();
+        let actual = daemon.registry.read(request).await.unwrap();
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+    }
+    let counter = WalAccessCounter::default();
+    let expected = counter
+        .operation("full-replay head oracle")
+        .run_future(oracle.head(bind))
+        .await
+        .unwrap();
+    assert!(counter.snapshot()[0]
+        .reads
+        .iter()
+        .any(|r| r.class == ReadClass::Origin));
+    let expected = serde_json::to_value(expected).unwrap();
+    let counter = WalAccessCounter::default();
+    let actual = counter
+        .operation("head byte equality")
+        .run_future(daemon.registry.head(bind))
+        .await
+        .unwrap();
+    check_operation(&counter.snapshot()[0], &[], false);
+    let actual = serde_json::to_value(actual).unwrap();
+    assert_eq!(
+        actual.as_object().unwrap().len(),
+        expected.as_object().unwrap().len()
+    );
+    for (field, value) in expected.as_object().unwrap() {
+        assert_eq!(&actual[field], value, "session.head field {field}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn installed_compacted_raw_pages_and_head_have_named_fallback_budgets() {
+async fn installed_raw_and_head_bytes_equal_full_replay_with_compaction_and_media() {
     let template = partial_turn().await;
+    for (media, sparse) in [(false, false), (true, false), (false, true), (true, true)] {
+        let root = root(&format!("head-oracle-{media}-{sparse}"));
+        let bind = BindIdentity::new("/installed", "runner", format!("head-{media}-{sparse}"));
+        let access = WalAccessCounter::default();
+        let daemon = OverhaulDaemon::boot(&root, access.clone()).await;
+        let mut records = template.clone();
+        if let WalRecord::RunStarted {
+            manifest, input, ..
+        } = &mut records[0]
+        {
+            *input = vec![
+                broca_protocol::Message::new(
+                    broca_protocol::Role::User,
+                    vec![ContentBlock::Text {
+                        text: "prefix".into()
+                    }]
+                );
+                8
+            ]
+            .into();
+            if sparse {
+                *manifest = Some(compaction_plan());
+            }
+        }
+        if sparse {
+            let replacement = std::sync::Arc::new(vec![broca_protocol::Message::new(
+                broca_protocol::Role::User,
+                vec![ContentBlock::Text {
+                    text: "summary".into(),
+                }],
+            )]);
+            records.insert(
+                1,
+                WalRecord::CompactionMessage {
+                    provider: "compactor".into(),
+                    kind: broca_wal::CompactionMessageKind::Setup,
+                    compaction_id: "head-window".into(),
+                    version: 1,
+                    range: broca_wal::CompactionRange { from: 1, to: 7 },
+                    sha256: broca_wal::compaction_replacement_sha256(&replacement).unwrap(),
+                    replacement,
+                    request_id: None,
+                    cursor: None,
+                    call_when: None,
+                    stability: None,
+                    ceiling: None,
+                    tag_checkpoint: None,
+                    ride_wait_ms: None,
+                    view_features: None,
+                    view_due: None,
+                },
+            );
+        }
+        if media {
+            let profile = broca_provider::media_profile::select_media_profile(
+                broca_provider::spec::WireFamilyId::AnthropicMessages,
+                Some(broca_provider::media_profile::MediaQuirk::Anthropic),
+                "model",
+                broca_provider::spec::InputModalities {
+                    image: Some(true),
+                    ..Default::default()
+                },
+                None,
+            );
+            // A later refreeze, rather than RunStarted, is authoritative for input capabilities.
+            records.insert(
+                1,
+                WalRecord::RunConfigRefrozen {
+                    renderer_version: 2,
+                    ts_ms: Some(12),
+                    frozen_render_config: json!({"media": profile}),
+                },
+            );
+        }
+        records.push(WalRecord::RunFinished {
+            reason: broca_protocol::RunFinishReason::Interrupted,
+            interrupt_reason: Some("transport_lost".into()),
+            ts_ms: Some(13),
+            usage: Default::default(),
+            error: None,
+            retries_used: 0,
+        });
+        let (seq, writer) = write_turn(&daemon, &access, &bind, "head-run", &records, media).await;
+        published(&daemon, &bind, seq).await;
+        writer.shutdown().await.unwrap();
+        published(&daemon, &bind, seq + 1).await;
+        assert_head_and_raw_equal_full_replay(&daemon, &bind).await;
+        let cold = daemon.registry.head(&bind).await.unwrap();
+        assert_eq!(
+            cold.last_run_state.unwrap().reason.as_deref(),
+            Some("transport_lost")
+        );
+        if media {
+            let input = serde_json::to_string(&cold.input).unwrap();
+            assert!(
+                input.contains("\"yes\""),
+                "image-accepting head input: {input}"
+            );
+        }
+        submit(&daemon, &bind, "head-run", json!([]), "interrupted").await;
+        assert_head_and_raw_equal_full_replay(&daemon, &bind).await;
+        daemon.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_compacted_raw_pages_and_head_use_bounded_reads() {
+    let template = partial_turn().await;
+    let mut measurements = Vec::new();
     for messages in [1_000, 150_000] {
         let root = root(&format!("compacted-raw-{messages}"));
         let bind = BindIdentity::new("/installed", "runner", format!("raw-{messages}"));
@@ -1034,7 +1208,7 @@ async fn installed_compacted_raw_pages_and_head_have_named_fallback_budgets() {
             let counter = WalAccessCounter::default();
             let started = std::time::Instant::now();
             counter
-                .operation(format!("compacted {kind} exception"))
+                .operation(format!("compacted {kind}"))
                 .run_future(async {
                     if kind == "raw page" {
                         let page = daemon
@@ -1050,37 +1224,46 @@ async fn installed_compacted_raw_pages_and_head_have_named_fallback_budgets() {
                 .await;
             let elapsed = started.elapsed();
             let measured = counter.snapshot().remove(0);
-            let origins = if kind == "raw page" { 1 } else { 3 };
-            check_budget(
-                &measured,
-                &[("raw page requires compaction source hydration", 1)],
-                false,
-                origins,
-            );
-            println!("compacted {kind} exception: session_messages={messages} wall_ms={:.3} bytes_read={} origin_reads={origins} named_fallbacks=1",
-                elapsed.as_secs_f64() * 1_000.0, measured.reads.iter().map(|read| read.length).sum::<u64>());
+            println!("compacted {kind}: session_messages={messages} wall_ms={:.3} bytes_read={} origin_reads={} named_fallbacks={}",
+                elapsed.as_secs_f64() * 1_000.0, measured.reads.iter().map(|read| read.length).sum::<u64>(),
+                measured.reads.iter().filter(|read| read.class == ReadClass::Origin).count(), fallbacks(&measured).values().sum::<usize>());
+            measurements.push(measured);
         }
+        assert_head_and_raw_equal_full_replay(&daemon, &bind).await;
         resume(&daemon, &bind, "raw-run").await;
         let counter = WalAccessCounter::default();
         let started = std::time::Instant::now();
         counter
-            .operation("compacted warm head exception")
+            .operation("compacted warm head")
             .run_future(daemon.registry.head(&bind))
             .await
             .unwrap();
         let elapsed = started.elapsed();
         let measured = counter.snapshot().remove(0);
-        check_budget(
-            &measured,
-            &[("raw page requires compaction source hydration", 1)],
-            false,
-            1,
-        );
-        println!("compacted warm head exception: session_messages={messages} wall_ms={:.3} bytes_read={} origin_reads=1 named_fallbacks=1",
-            elapsed.as_secs_f64() * 1_000.0, measured.reads.iter().map(|read| read.length).sum::<u64>());
+        println!("compacted warm head: session_messages={messages} wall_ms={:.3} bytes_read={} origin_reads={} named_fallbacks={}",
+            elapsed.as_secs_f64() * 1_000.0, measured.reads.iter().map(|read| read.length).sum::<u64>(),
+            measured.reads.iter().filter(|read| read.class == ReadClass::Origin).count(), fallbacks(&measured).values().sum::<usize>());
+        measurements.push(measured);
+        assert_head_and_raw_equal_full_replay(&daemon, &bind).await;
         no_legacy_index(&root);
         daemon.shutdown().await;
         std::fs::remove_dir_all(root).unwrap();
+    }
+    for (small, large) in measurements[..3].iter().zip(&measurements[3..]) {
+        assert_eq!(
+            small.reads.len(),
+            large.reads.len(),
+            "{} positioned read count grew",
+            small.name
+        );
+        assert_eq!(
+            small.frames_decoded, large.frames_decoded,
+            "{} decode count grew",
+            small.name
+        );
+    }
+    for measured in measurements {
+        check_operation(&measured, &[], false);
     }
 }
 
