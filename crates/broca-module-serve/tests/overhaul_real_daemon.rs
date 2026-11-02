@@ -1406,6 +1406,56 @@ impl Sources {
         value
     }
 
+    fn subscribe_lanes(&self, events: &Value) -> Value {
+        let mut control = vec![];
+        let mut display = vec![];
+        let mut previous_cursor = None;
+        for (index, event) in events
+            .as_array()
+            .expect("subscribe events must be an array")
+            .iter()
+            .enumerate()
+        {
+            let frame = event
+                .as_object()
+                .expect("subscribe frame must be an object");
+            let seq = frame
+                .get("seq")
+                .and_then(Value::as_u64)
+                .expect("subscribe frame must carry seq");
+            assert_eq!(
+                seq,
+                cortexkit_role_llm_runner::live::FIRST_SEQ + index as u64,
+                "each root must retain its own contiguous merged stream sequence"
+            );
+            let mut normalized = event.clone();
+            // seq counts merged deliveries, not durable units.
+            // See crates/broca-module-serve/src/serve.rs:4144-4257.
+            normalized["seq"] = json!("@STREAM_SEQ@");
+            // No cross-lane order is promised: crates/broca-module/src/fanout.rs:1379-1435.
+            match frame
+                .get("kind")
+                .and_then(Value::as_str)
+                .expect("subscribe frame must carry its lane")
+            {
+                "control" => {
+                    let position = cursor(&event["cursor"]);
+                    if let Some(previous) = previous_cursor {
+                        assert!(
+                            previous < position,
+                            "control cursors must be strictly ordered without duplicates"
+                        );
+                    }
+                    previous_cursor = Some(position);
+                    control.push(self.normalize(&normalized));
+                }
+                "display" => display.push(self.normalize(&normalized)),
+                other => panic!("unknown subscribe lane {other}"),
+            }
+        }
+        json!({"control":control,"display":display})
+    }
+
     fn normalize(&self, value: &Value) -> Value {
         match value {
             Value::Array(values) => {
@@ -1421,6 +1471,16 @@ impl Sources {
                 let mut result = object.clone();
                 for (key, value) in object {
                     result[key] = match key.as_str() {
+                        "events"
+                            if object.get("method").and_then(Value::as_str).is_some_and(
+                                |method| {
+                                    method == "session.subscribe"
+                                        || method.starts_with("session.subscribe.")
+                                },
+                            ) =>
+                        {
+                            self.subscribe_lanes(value)
+                        }
                         "usage" if value.get("generation").is_some() => {
                             let entries = value["generation"]
                                 .as_array()
@@ -2766,6 +2826,235 @@ fn differential_api_key_attempts_use_wal_without_routing_reports() {
 }
 
 #[test]
+fn differential_subscribe_lanes_allow_only_cross_lane_reordering() {
+    let (sources, frames) = subscribe_lane_fixture();
+    for method in [
+        "session.subscribe",
+        "session.subscribe.handoff",
+        "session.subscribe.replay",
+        "session.subscribe.live",
+    ] {
+        let legacy = subscribe_reply(method, &frames, &[0, 2, 1, 3, 4]);
+        let overhaul = subscribe_reply(method, &frames, &[0, 1, 2, 3, 4]);
+        assert_eq!(
+            sources.normalize(&legacy),
+            sources.normalize(&overhaul),
+            "{method}"
+        );
+        let display_first = subscribe_reply(method, &frames, &[2, 0, 1, 3, 4]);
+        assert_eq!(
+            sources.normalize(&legacy),
+            sources.normalize(&display_first),
+            "live fan-out does not promise run_started before display"
+        );
+    }
+}
+
+fn subscribe_lane_fixture() -> (Sources, Vec<Value>) {
+    use broca_protocol::{caller::ControlUnit, display::DisplayEvent, RunId, StepId};
+    use cortexkit_role_llm_runner::live::{LiveEvent, RunEnded, RunStarted};
+    let control = |seq, unit, event| {
+        serde_json::from_slice::<Value>(
+            &broca_wire::encode_live_subscribe_control(seq, 0, &unit, 1, &event).unwrap(),
+        )
+        .unwrap()
+    };
+    let display = |delta: &str| {
+        serde_json::from_slice::<Value>(
+            &broca_wire::encode_live_subscribe_display(
+                &DisplayEvent::TextDelta {
+                    mid: Some("m1".into()),
+                    part: Some(0),
+                    message_id: broca_protocol::MessageId("provider-message".into()),
+                    tool_call_id: None,
+                    delta: delta.into(),
+                },
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let frames = vec![
+        control(
+            1,
+            ControlUnit::RunStarted {
+                run_id: RunId("run-a".into()),
+                submission_id: None,
+            },
+            LiveEvent::RunStarted(RunStarted::new("run-a".to_owned())),
+        ),
+        control(
+            2,
+            ControlUnit::StepStarted { step_id: StepId(1) },
+            LiveEvent::DisplayReset,
+        ),
+        display("first"),
+        display("second"),
+        control(
+            3,
+            ControlUnit::RunFinished {
+                run_id: Some(RunId("run-a".into())),
+                reason: broca_protocol::RunFinishReason::Completed,
+                usage: None,
+                final_step_finish_reason: None,
+                indeterminate_tool_calls: None,
+                retries_used: 0,
+            },
+            LiveEvent::RunFinished(RunEnded::new("run-a".to_owned(), "completed".to_owned())),
+        ),
+    ];
+    let records: Vec<_> = [
+        json!({"type":"run_started","run_id":"run-a"}),
+        json!({"type":"step_started","step_id":1}),
+        json!({"type":"run_finished"}),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, record)| Source {
+        seq: index as u64 + 1,
+        end: (index as u64 + 1) * 100,
+        record,
+    })
+    .collect();
+    (
+        Sources {
+            lineage: "lane-lineage".into(),
+            logical: records
+                .iter()
+                .enumerate()
+                .map(|(index, source)| (source.seq, index + 1))
+                .collect(),
+            records,
+            root: "/state".into(),
+            runs: vec!["run-a".into()],
+            file_id: 7,
+            projected: BTreeSet::from([(1, 0), (2, 0), (3, 0)]),
+            overhaul: false,
+        },
+        frames,
+    )
+}
+
+fn subscribe_reply(method: &str, frames: &[Value], order: &[usize]) -> Value {
+    let events: Vec<_> = order
+        .iter()
+        .enumerate()
+        .map(|(index, &frame)| {
+            let mut frame = frames[frame].clone();
+            frame["seq"] = json!(cortexkit_role_llm_runner::live::FIRST_SEQ + index as u64);
+            frame
+        })
+        .collect();
+    json!({"method":method,"events":events})
+}
+
+#[test]
+fn differential_subscribe_lane_contents_and_contract_remain_exact() {
+    let (sources, frames) = subscribe_lane_fixture();
+    let baseline = sources.normalize(&subscribe_reply(
+        "session.subscribe.handoff",
+        &frames,
+        &[0, 1, 2, 3, 4],
+    ));
+    for fault in [
+        "display content",
+        "control unit",
+        "control event",
+        "display metadata",
+    ] {
+        let mut changed = frames.clone();
+        match fault {
+            "display content" => changed[2]["event"]["delta"] = json!("changed"),
+            "control unit" => changed[1]["unit"]["step_id"] = json!(2),
+            "control event" => changed[1]["event"] = json!({"type":"other-event"}),
+            "display metadata" => changed[2]["metadata"] = json!("must survive"),
+            _ => unreachable!(),
+        }
+        assert_ne!(
+            baseline,
+            sources.normalize(&subscribe_reply(
+                "session.subscribe.handoff",
+                &changed,
+                &[0, 1, 2, 3, 4]
+            )),
+            "masked {fault}"
+        );
+    }
+    let mut original = frames.clone();
+    original[2]["event"]["seq"] = json!(1);
+    let mut changed = original.clone();
+    changed[2]["event"]["seq"] = json!(99);
+    assert_ne!(
+        sources.normalize(&subscribe_reply(
+            "session.subscribe",
+            &original,
+            &[0, 1, 2, 3, 4]
+        )),
+        sources.normalize(&subscribe_reply(
+            "session.subscribe",
+            &changed,
+            &[0, 1, 2, 3, 4]
+        )),
+        "nested seq is payload, not a merged ordinal"
+    );
+    for order in [vec![0, 1, 3, 2, 4], vec![0, 1, 3, 4], vec![0, 2, 3, 4]] {
+        assert_ne!(
+            baseline["events"],
+            sources.normalize(&subscribe_reply(
+                "session.subscribe.replay",
+                &frames,
+                &order
+            ))["events"],
+            "lane order and frame presence must remain exact"
+        );
+    }
+    let left = subscribe_reply("session.read", &frames, &[0, 2, 1, 3, 4]);
+    let right = subscribe_reply("session.read", &frames, &[0, 1, 2, 3, 4]);
+    assert_ne!(
+        sources.normalize(&left),
+        sources.normalize(&right),
+        "only subscribe collections are split"
+    );
+    for fault in [
+        "missing seq",
+        "seq gap",
+        "missing lane",
+        "unknown lane",
+        "missing cursor",
+        "unknown cursor",
+    ] {
+        let mut reply = subscribe_reply("session.subscribe.live", &frames, &[0, 1, 2, 3, 4]);
+        match fault {
+            "missing seq" => {
+                reply["events"][1].as_object_mut().unwrap().remove("seq");
+            }
+            "seq gap" => reply["events"][1]["seq"] = json!(99),
+            "missing lane" => {
+                reply["events"][1].as_object_mut().unwrap().remove("kind");
+            }
+            "unknown lane" => reply["events"][1]["kind"] = json!("unknown"),
+            "missing cursor" => {
+                reply["events"][1].as_object_mut().unwrap().remove("cursor");
+            }
+            "unknown cursor" => reply["events"][1]["cursor"]["wal_seq"] = json!(99),
+            _ => unreachable!(),
+        }
+        assert!(
+            std::panic::catch_unwind(|| sources.normalize(&reply)).is_err(),
+            "accepted {fault}"
+        );
+    }
+    for order in [vec![1, 0, 2, 3, 4], vec![0, 1, 1, 2, 3, 4]] {
+        let reply = subscribe_reply("session.subscribe.replay", &frames, &order);
+        assert!(
+            std::panic::catch_unwind(|| sources.normalize(&reply)).is_err(),
+            "control cursors must not reorder or repeat"
+        );
+    }
+}
+
+#[test]
 fn differential_generation_durations_are_scoped_to_usage_in_all_replies() {
     assert_eq!(
         GENERATION_DURATION_FIELDS,
@@ -2784,9 +3073,9 @@ fn differential_generation_durations_are_scoped_to_usage_in_all_replies() {
             "first_to_last_content_ms",
         ],
     );
-    let sources = billing_fixture(false).sources;
-    let left = generation_replies(generation_entry(1, 0));
-    let right = generation_replies(generation_entry(4, 2));
+    let sources = generation_sources(false);
+    let left = generation_replies(&sources, generation_entry(1, 0));
+    let right = generation_replies(&sources, generation_entry(4, 2));
     for (legacy, overhaul) in left.iter().zip(&right) {
         assert_eq!(
             sources.normalize(legacy),
@@ -2811,7 +3100,15 @@ fn generation_entry(sent_to_last: u64, first_to_last: u64) -> Value {
     .unwrap()
 }
 
-fn generation_replies(entry: Value) -> Vec<Value> {
+fn generation_sources(overhaul: bool) -> Sources {
+    let mut sources = billing_fixture(overhaul).sources;
+    sources
+        .projected
+        .insert((sources.records.last().unwrap().seq, 0));
+    sources
+}
+
+fn generation_replies(sources: &Sources, entry: Value) -> Vec<Value> {
     let usage = json!({"input_tokens":7,"output_tokens":6,"generation":[entry]});
     let mut replies: Vec<_> = [
         "run.status.paused",
@@ -2822,18 +3119,20 @@ fn generation_replies(entry: Value) -> Vec<Value> {
     .into_iter()
     .map(|method| json!({"method":method,"reply":{"usage":usage}}))
     .collect();
-    replies.push(json!({"method":"session.subscribe.handoff","events":[
-        {"kind":"control","unit":{"type":"run_finished","usage":usage}},
-        {"event":{"type":"run_finished","usage":usage}}
-    ]}));
+    replies.push(json!({"method":"session.subscribe.handoff","events":[{
+        "kind":"control","seq":cortexkit_role_llm_runner::live::FIRST_SEQ,
+        "cursor":{"wal_seq":sources.records.last().unwrap().seq,"sub_index":0},
+        "unit":{"type":"run_finished","run_id":"run-a","usage":usage},
+        "event":{"type":"run_finished","run_id":"run-a","usage":usage}
+    }]}));
     replies
 }
 
 #[test]
 fn differential_generation_duration_fields_are_required_and_nonnegative() {
     for overhaul in [false, true] {
-        let sources = billing_fixture(overhaul).sources;
-        let normalize = |entry| sources.normalize(&generation_replies(entry)[0]);
+        let sources = generation_sources(overhaul);
+        let normalize = |entry| sources.normalize(&generation_replies(&sources, entry)[0]);
         let zero = normalize(generation_entry(0, 0));
         for &field in GENERATION_DURATION_FIELDS {
             assert_eq!(
@@ -2866,8 +3165,8 @@ fn differential_generation_duration_fields_are_required_and_nonnegative() {
 
 #[test]
 fn differential_generation_metadata_and_entry_presence_remain_exact() {
-    let sources = billing_fixture(false).sources;
-    let normalize = |entry| sources.normalize(&generation_replies(entry)[0]);
+    let sources = generation_sources(false);
+    let normalize = |entry| sources.normalize(&generation_replies(&sources, entry)[0]);
     let original = normalize(generation_entry(1, 0));
     for (field, changed) in [
         ("model", json!("different-model")),
