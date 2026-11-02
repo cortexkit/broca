@@ -461,8 +461,11 @@ impl RunnerHandle {
     /// must converge, write its own resume record, and add nothing the first already made
     /// durable.
     pub async fn every_boundary_inside_resume(&self, kill: &KillReport) -> Vec<KillReport> {
-        let first = self.resume(kill).await;
-        self.check(kill, &first);
+        // The caller may already have resumed the original root. Replay the immutable kill
+        // image on a fresh root so this sweep still starts at exactly that recorded prefix.
+        let first_kill = self.copy_kill_image(kill);
+        let first = self.resume(&first_kill).await;
+        self.check(&first_kill, &first);
         let from = kill.durable.record_count();
         let total = first.log.record_count();
         let mut kills = Vec::new();
@@ -484,11 +487,20 @@ impl RunnerHandle {
                 state_root: root,
                 durable: LogImage::parse(cut),
             };
-            let resumed = self.resume(&nested).await;
-            self.check(&nested, &resumed);
+            // Leave returned roots at their reported cut, so callers can resume them too.
+            let validation = self.copy_kill_image(&nested);
+            let resumed = self.resume(&validation).await;
+            self.check(&validation, &resumed);
             kills.push(nested);
         }
         kills
+    }
+
+    fn copy_kill_image(&self, kill: &KillReport) -> KillReport {
+        let mut copy = kill.clone();
+        copy.state_root = self.fresh_root();
+        write_log(&self.session_wal(&copy.state_root), &kill.durable.bytes);
+        copy
     }
 }
 

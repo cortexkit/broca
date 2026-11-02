@@ -395,3 +395,4 @@ async fn account_limit_pause_and_resume_survive_every_record_and_torn_cut_withou
         }
     }
 }
+crate::require_process_kill!();
