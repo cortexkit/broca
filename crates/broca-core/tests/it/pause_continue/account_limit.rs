@@ -175,7 +175,7 @@ async fn account_limit_declines_when_cache_is_lost_or_no_account_response_was_ac
             &wal,
             RunControl {
                 account_limit_pause: true,
-                max_same_account_wait: Some(Arc::new(|| broca_core::SameAccountWait::Max)),
+                max_same_account_wait: broca_core::SameAccountWait::Max,
                 clock: Some(broca_core::Clock::for_state_root(&root).unwrap()),
                 auth_selection: Some(
                     serde_json::from_value(

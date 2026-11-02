@@ -695,9 +695,9 @@ pub struct RunControl {
     pub clock: Option<crate::Clock>,
     /// Operator consent frozen only when a fresh episode is admitted; resumes use its WAL policy.
     pub account_limit_pause: bool,
-    /// Read the live wait cap only when considering a new pause. Committed pauses replay
-    /// their recorded wake time without consulting configuration again.
-    pub max_same_account_wait: Option<Arc<dyn Fn() -> crate::SameAccountWait + Send + Sync>>,
+    /// Boot-loaded wait cap for new pauses. Committed pauses replay their recorded wake
+    /// time without consulting configuration again.
+    pub max_same_account_wait: crate::SameAccountWait,
     /// Immediate cancellation: abort the model stream and stop dispatch, closing the batch
     /// under the existing at-most-once rules before finishing `Cancelled`. `None` disables
     /// this signal. Boundary cancellation uses the shared `steer` inbox instead, so it can
@@ -907,7 +907,7 @@ impl Default for RunControl {
             approval_wait_probe: None,
             clock: None,
             account_limit_pause: false,
-            max_same_account_wait: None,
+            max_same_account_wait: crate::SameAccountWait::default(),
             cancel: None,
             compaction_plane: None,
             compaction_views: None,
@@ -7470,10 +7470,7 @@ where
                                 .unwrap_or_else(|| provider.render_config_blob());
                             let budget = crate::account_limit_pause::PauseBudget {
                                 setting: if account_limit_pause_enabled {
-                                    control
-                                        .max_same_account_wait
-                                        .as_ref()
-                                        .map_or_else(crate::SameAccountWait::default, |read| read())
+                                    control.max_same_account_wait
                                 } else {
                                     crate::SameAccountWait::Minutes(0)
                                 },

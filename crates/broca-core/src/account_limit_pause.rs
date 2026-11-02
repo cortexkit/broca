@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static STALE_RESETS: AtomicU64 = AtomicU64::new(0);
 static DECLINED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-/// Live upper bound on a same-account wait, additionally bounded by prompt-cache expiry.
+/// Boot-configured upper bound on a same-account wait, additionally bounded by cache expiry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SameAccountWait {
     Minutes(u64),

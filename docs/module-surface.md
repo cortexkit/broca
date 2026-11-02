@@ -838,7 +838,8 @@ For each `route.account_for` admission request, broca also sends the top-level i
 `hold_wait_max_s`: the longest wait it permits routing to hold for the session's previous
 run's frozen account. It is `floor(max(0, min(setting, cache_expiry - now)) / 1 second)`,
 with `max_same_account_wait` converted from minutes to duration and `"max"` omitting that
-setting bound. The shared cache-expiry computation uses that account's last accepted 2xx
+setting bound. The setting is loaded once at boot; changes take effect at the next restart.
+The shared cache-expiry computation uses that account's last accepted 2xx
 attempt send time plus the previous run's frozen TTL (explicit 5 minutes or 1 hour; unknown
 means 5 minutes). Setting `0`, no previous run/account, or no accepted attempt sends `0`.
 Admission reads only the existing frozen snapshot and in-memory account evidence, never the
@@ -1408,8 +1409,10 @@ keep their existing behavior and omit this diagnostic.
   `15`. A non-negative integer caps the wait in minutes; `0` never pauses, and `"max"` removes
   the cap but still respects cache expiry. Other values refuse boot by name. The obsolete
   `account_limit_pause` key is ignored with one boot warning naming the replacement.
-  Each fresh run freezes only consent (`setting != 0`) in its existing WAL boolean; the cap
-  is read live when deciding a new pause. For a source-classified transient account limit,
+  The setting is loaded once at boot; changes take effect at the next restart, like other
+  `broca.jsonc` settings. Each fresh run freezes only consent (`setting != 0`) in its existing
+  WAL boolean; a new pause uses the executor's in-memory cap. For a source-classified transient
+  account limit,
   `wake` is the latest blocking reset/retry floor (including any scheduling jitter),
   `cache_expiry` is the last 2xx attempt's send time on that account in this session plus the
   run's frozen cache TTL (explicit 5 minutes or 1 hour; unknown means 5 minutes), and

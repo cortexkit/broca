@@ -59,7 +59,9 @@ The root `broca.jsonc` setting `max_same_account_wait` does not add a fifth erro
 It defaults to `15`: non-negative integers cap same-account waits in minutes, `0` never
 pauses, and `"max"` waits only up to cache expiry. Other values refuse boot. The obsolete
 `account_limit_pause` key is ignored with one boot warning naming `max_same_account_wait`.
-The existing frozen consent boolean is `setting != 0`; the cap itself is read live.
+The setting is loaded once at boot; changes take effect at the next restart, like other
+`broca.jsonc` settings. The existing frozen consent boolean is `setting != 0`; new pause
+decisions use the executor's in-memory cap.
 The transport's
 positive account-wall classification produces `kind: account_limit, scope: account` beside
 its existing transient error. Consenting runs persist that disposition with the failed attempt;

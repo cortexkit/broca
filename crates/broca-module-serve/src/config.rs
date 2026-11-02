@@ -835,7 +835,7 @@ mod state_format_config_tests {
         );
     }
 }
-/// Root-level same-account wait cap. Consent is frozen at admission; the cap stays live.
+/// Root-level same-account wait cap loaded at boot. Consent is frozen at admission.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AccountLimitPauseConfig {
     pub max_same_account_wait: broca_core::SameAccountWait,
@@ -843,18 +843,6 @@ pub struct AccountLimitPauseConfig {
 }
 
 impl AccountLimitPauseConfig {
-    /// A malformed live edit cannot authorize a wait. Boot validation still rejects malformed
-    /// `max_same_account_wait` values, naming the setting in the error.
-    pub fn live_setting() -> broca_core::SameAccountWait {
-        match Self::load_default() {
-            Ok(config) => config.max_same_account_wait,
-            Err(error) => {
-                tracing::warn!(%error, "invalid live max_same_account_wait; declining same-account waits");
-                broca_core::SameAccountWait::Minutes(0)
-            }
-        }
-    }
-
     pub fn load_default() -> Result<Self, String> {
         use crate::config_home::ConfigHome;
         match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
