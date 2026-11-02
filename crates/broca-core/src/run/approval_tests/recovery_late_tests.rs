@@ -220,32 +220,116 @@ async fn completed_origin_without_a_late_intent_still_executes_once() {
 
 #[tokio::test]
 async fn recovery_cut_late_intent_never_resends_from_completed_origin() {
-    check_cut_late_intent(false, LateDamage::ReadableGap, None).await;
+    check_cut_late_intent(false, LateDamage::ReadableGap, None, false).await;
 }
 
 #[tokio::test]
 async fn recovery_cut_late_intent_keeps_its_prepared_owner_after_a_later_episode() {
-    check_cut_late_intent(true, LateDamage::ReadableGap, None).await;
+    check_cut_late_intent(true, LateDamage::ReadableGap, None, false).await;
 }
 
 #[tokio::test]
 async fn recovery_undecodable_late_intent_never_resends_from_completed_origin() {
-    check_cut_late_intent(false, LateDamage::UndecodableIntent, None).await;
+    check_cut_late_intent(false, LateDamage::UndecodableIntent, None, false).await;
 }
 
 #[tokio::test]
 async fn recovery_destroyed_late_approval_and_intent_never_resends() {
-    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, None).await;
+    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, None, false).await;
+}
+
+#[tokio::test]
+async fn recovery_destroyed_late_approval_reports_after_reconciliation_budget_expires() {
+    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, None, true).await;
 }
 
 #[tokio::test]
 async fn recovery_frozen_question_records_a_later_approval_without_execution() {
-    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, Some("approve")).await;
+    check_cut_late_intent(
+        false,
+        LateDamage::LostApprovalAndIntent,
+        Some("approve"),
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn recovery_frozen_question_records_a_later_decline_without_execution() {
-    check_cut_late_intent(false, LateDamage::LostApprovalAndIntent, Some("decline")).await;
+    check_cut_late_intent(
+        false,
+        LateDamage::LostApprovalAndIntent,
+        Some("decline"),
+        false,
+    )
+    .await;
+}
+
+async fn next_turn_with_exhausted_reconciliation_budget(rig: &Rig) {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *rig.questions.answer_gate.lock().unwrap() = Some(gate);
+    let polls = rig.questions.polls.load(Ordering::SeqCst);
+    let expire_budget = async {
+        broca_test_support::wait_until(
+            "reconciliation to enter the blocked answer feed",
+            || async {
+                let observed = rig.questions.polls.load(Ordering::SeqCst);
+                if observed > polls {
+                    Ok(())
+                } else {
+                    Err(format!("answer polls: {observed}"))
+                }
+            },
+        )
+        .await;
+        // Pause only at the blocked read: file-backed WAL work must not let
+        // Tokio auto-advance the run's hang guard while storage is in flight.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::time::resume();
+    };
+    broca_test_support::wait_for(
+        "next turn after an exhausted reconciliation budget",
+        async {
+            tokio::join!(
+                Box::pin(next_turn(rig, "late-after-recovery")),
+                expire_budget
+            )
+        },
+        || broca_test_support::record_kinds(rig.frames()),
+    )
+    .await;
+    *rig.questions.answer_gate.lock().unwrap() = None;
+    assert!(rig.questions.reports.lock().unwrap().is_empty());
+    assert!(!rig
+        .frames()
+        .iter()
+        .any(|frame| matches!(frame.record, WalRecord::LateApprovalRecorded { .. })));
+}
+
+async fn drive_recovered_late_report(rig: &Rig) {
+    // The admission budget includes answer-feed reads and WAL sync. Expiry
+    // leaves intake for the next admission, not a background reporting task.
+    broca_test_support::wait_for(
+        "recovered late approval execution report",
+        async {
+            let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
+            while rig.questions.reports.lock().unwrap().is_empty() {
+                approval_gate::admission(
+                    &mut history,
+                    &rig.writer,
+                    &rig.bind,
+                    &rig.control,
+                    &rig.tools,
+                )
+                .await
+                .unwrap();
+                tokio::task::yield_now().await;
+            }
+        },
+        || broca_test_support::record_kinds(rig.frames()),
+    )
+    .await;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -259,6 +343,7 @@ async fn check_cut_late_intent(
     later_episode: bool,
     damage: LateDamage,
     later_answer: Option<&'static str>,
+    exhaust_reconciliation_budget: bool,
 ) {
     let (mut rig, key) = expired_overhaul().await;
     let lost_approval = damage == LateDamage::LostApprovalAndIntent;
@@ -406,7 +491,11 @@ async fn check_cut_late_intent(
 
     // The next-turn request enters the actual run loop with fresh routing counters.
     // Its only late work belongs to the already Completed origin episode.
-    next_turn(&rig, "late-after-recovery").await;
+    if exhaust_reconciliation_budget {
+        Box::pin(next_turn_with_exhausted_reconciliation_budget(&rig)).await;
+    } else {
+        Box::pin(next_turn(&rig, "late-after-recovery")).await;
+    }
     assert!(
         rig.tools.sent.lock().unwrap().is_empty(),
         "a cut late intent must never be sent again"
@@ -469,6 +558,7 @@ async fn check_cut_late_intent(
         "Completed origin must not authorize a recovery-tombstoned call"
     );
     if later_answer.is_none() {
+        drive_recovered_late_report(&rig).await;
         assert!(rig
             .questions
             .reports
@@ -476,6 +566,9 @@ async fn check_cut_late_intent(
             .unwrap()
             .iter()
             .any(|(_, outcome)| matches!(outcome, ApprovalExecution::OutcomeUnknown)));
+        // Later admissions may idempotently re-report the durable outcome, but
+        // the first successful intake must produce exactly one report.
+        assert_eq!(rig.questions.reports.lock().unwrap().len(), 1);
     }
     if let Some(answer) = later_answer {
         assert!(!rig.frames().iter().any(|frame| matches!(&frame.record,
