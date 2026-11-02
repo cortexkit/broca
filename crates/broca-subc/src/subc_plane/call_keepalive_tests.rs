@@ -641,41 +641,32 @@ mod call_keepalive {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn run_cancel_and_shutdown_cancel_every_outstanding_request() {
+    async fn run_cancel_cancels_every_outstanding_request() {
         for keepalive in [false, true] {
-            for shutdown in [false, true] {
-                let (plane, mut module) = rig();
-                let signal = CancellationToken::new();
-                let control = if shutdown {
-                    RunControl {
-                        stop_requested: Some(signal.clone()),
-                        ..RunControl::default()
-                    }
-                } else {
-                    RunControl {
-                        cancel: Some(signal.clone()),
-                        ..RunControl::default()
-                    }
-                };
-                let provider = async {
-                    let (request, declared) = bound_request(&mut module).await;
-                    assert_eq!(declared, keepalive);
-                    signal.cancel();
-                    request
-                };
-                let (run, request) = tokio::join!(
-                    run("stopped", &plane, control, frozen_manifest(keepalive, None)),
-                    provider,
-                );
-                // A sent call without an answer is ambiguous even when cancellation ended
-                // the wait. Core preserves that outcome rather than claiming it never ran.
-                assert_eq!(run.0.reason, RunFinishReason::Interrupted);
-                let recorded = results(&run.1);
-                assert_eq!(recorded.len(), 1);
-                assert!(recorded[0].is_error);
-                assert!(format!("{recorded:?}").contains("run cancelled or stopped"));
-                assert_cancel_and_ignore_late(&mut module, &request);
-            }
+            let (plane, mut module) = rig();
+            let signal = CancellationToken::new();
+            let control = RunControl {
+                cancel: Some(signal.clone()),
+                ..RunControl::default()
+            };
+            let provider = async {
+                let (request, declared) = bound_request(&mut module).await;
+                assert_eq!(declared, keepalive);
+                signal.cancel();
+                request
+            };
+            let (run, request) = tokio::join!(
+                run("stopped", &plane, control, frozen_manifest(keepalive, None)),
+                provider,
+            );
+            // A sent call without an answer is ambiguous even when cancellation ended
+            // the wait. Core preserves that outcome rather than claiming it never ran.
+            assert_eq!(run.0.reason, RunFinishReason::Interrupted);
+            let recorded = results(&run.1);
+            assert_eq!(recorded.len(), 1);
+            assert!(recorded[0].is_error);
+            assert!(format!("{recorded:?}").contains("run cancelled or stopped"));
+            assert_cancel_and_ignore_late(&mut module, &request);
         }
     }
 }

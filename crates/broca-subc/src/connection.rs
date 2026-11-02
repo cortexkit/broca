@@ -2288,7 +2288,7 @@ impl SubcConnection {
             biased;
             _ = async {
                 match signals {
-                    Some(signals) => signals.cancelled().await,
+                    Some(signals) => signals.caller_cancelled().await,
                     None => std::future::pending().await,
                 }
             } => Err(ConnError::Transport("tool call abandoned: run cancelled or stopped".into())),

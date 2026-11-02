@@ -279,6 +279,16 @@ impl DispatchSignals {
             _ = wait(self.stop.as_ref()) => {}
         }
     }
+
+    /// Cancel an already-enqueued call only for an explicit caller decision.
+    /// Graceful stop prevents new dispatches but lets in-flight work finish within grace;
+    /// the run actor aborts the dispatch task if that grace expires.
+    pub async fn caller_cancelled(&self) {
+        match &self.cancel {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 impl From<&DispatchSignals> for ToolOpenGuard {

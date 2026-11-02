@@ -1,6 +1,62 @@
 mod call_keepalive {
     use super::*;
 
+    #[tokio::test]
+    async fn graceful_stop_after_enqueue_keeps_awaiting_the_tool_reply() {
+        for keepalive in [false, true] {
+            let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+            let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::from([(7, 1)])));
+            let (write_tx, mut writes) = mpsc::channel(16);
+            let conn = test_connection(write_tx, pending.clone(), routes, ConnToken(1), 1);
+            let mut route = RouteHandle::new(7, 1, ConnToken(1));
+            route.call_keepalive = keepalive;
+            let stop = CancellationToken::new();
+            let signals = broca_core::tool_plane::DispatchSignals::new(None, Some(&stop));
+            let call = conn.tool_call_raw_guarded(
+                &route,
+                "read",
+                "{}",
+                Some("draining"),
+                Duration::from_secs(120),
+                false,
+                None,
+                None,
+                None,
+                &signals,
+            );
+            tokio::pin!(call);
+            assert!(futures::poll!(&mut call).is_pending());
+            let request = writes.try_recv().unwrap();
+            assert_eq!(request.header.ty, FrameType::Request);
+            stop.cancel();
+            assert!(
+                futures::poll!(&mut call).is_pending(),
+                "graceful stop must not abandon an enqueued call"
+            );
+            assert!(writes.try_recv().is_err(), "no CANCEL or re-send during grace");
+            let sender = match pending.lock().unwrap().get(&(7, 1, request.header.corr)) {
+                Some(PendingEntry::Live { sender, .. }) => sender.clone(),
+                _ => panic!("the reply registration must survive graceful stop"),
+            };
+            sender
+                .send(
+                    Frame::build(
+                        FrameType::Response,
+                        data_flags(),
+                        7,
+                        1,
+                        request.header.corr,
+                        br#"{"content":[{"type":"text","text":"done"}]}"#.to_vec(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(call.await.unwrap()["content"][0]["text"], "done");
+            assert!(pending.lock().unwrap().is_empty());
+            assert!(writes.try_recv().is_err(), "a completed call needs no CANCEL");
+        }
+    }
+
     #[derive(Default)]
     struct WakeCounter(std::sync::atomic::AtomicUsize);
     impl futures::task::ArcWake for WakeCounter {
