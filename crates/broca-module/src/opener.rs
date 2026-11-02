@@ -429,6 +429,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             }
         }
 
+        registry.check_session_log(key).await?;
         let service = registry.retention_service();
         let store = self.materialized_store.clone();
         let wal = self.wal_store.clone();

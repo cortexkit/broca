@@ -84,18 +84,31 @@ pub struct OverhaulDb {
     conn: Mutex<Connection>,
     root: std::path::PathBuf,
     raw_fallback_notices: Mutex<std::collections::HashSet<String>>,
+    #[cfg(feature = "test-conformance")]
+    snapshot_reads: std::sync::atomic::AtomicU64,
 }
 
 pub type SessionGateFactory =
     dyn Fn(&broca_protocol::BindIdentity) -> std::sync::Arc<std::sync::Mutex<()>> + Send + Sync;
 
 impl OverhaulDb {
+    /// Counts snapshot requests before opening SQLite so tests can verify that
+    /// filesystem-only admission does not enter the database reader at all.
+    #[cfg(feature = "test-conformance")]
+    pub fn snapshot_reads_for_conformance(&self) -> u64 {
+        self.snapshot_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Read a consistent index snapshot. SQLite's query-only guard prevents an
     /// accidental write from bypassing the transaction durability policy.
     pub fn read_snapshot<T>(
         &self,
         read: impl FnOnce(&Transaction<'_>) -> Result<T, DbError>,
     ) -> Result<T, DbError> {
+        #[cfg(feature = "test-conformance")]
+        self.snapshot_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // WAL-mode readers must not queue behind another session's index rebuild.
         let mut conn = Connection::open_with_flags(
             self.root.join("broca.db"),
@@ -131,6 +144,8 @@ impl OverhaulDb {
             conn: Mutex::new(conn),
             root: root.to_path_buf(),
             raw_fallback_notices: Mutex::new(Default::default()),
+            #[cfg(feature = "test-conformance")]
+            snapshot_reads: Default::default(),
         };
         db.authoritative_transaction(|tx| {
             schema::initialize(tx)?;
@@ -162,6 +177,8 @@ impl OverhaulDb {
             conn: Mutex::new(conn),
             root: root.to_path_buf(),
             raw_fallback_notices: Mutex::new(Default::default()),
+            #[cfg(feature = "test-conformance")]
+            snapshot_reads: Default::default(),
         })
     }
 

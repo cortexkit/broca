@@ -69,6 +69,7 @@ pub(super) fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             last_step_off INTEGER, terminal_off INTEGER, submission_id TEXT,
             request_identity_digest TEXT
         );
+        CREATE INDEX IF NOT EXISTS run_sid ON run(sid);
         CREATE TABLE IF NOT EXISTS setup (
             sid TEXT NOT NULL REFERENCES session(sid) ON DELETE CASCADE,
             digest TEXT NOT NULL, off INTEGER NOT NULL, PRIMARY KEY(sid,digest)

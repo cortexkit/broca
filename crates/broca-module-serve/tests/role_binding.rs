@@ -91,6 +91,10 @@ impl LineageOpener for NoLineages {
 struct PoisonWal(AtomicUsize);
 
 impl broca_core::WalStore for PoisonWal {
+    fn wal_present(&self, _: &BindIdentity) -> Option<bool> {
+        // The log exists; only decoding its contents is poisoned.
+        Some(true)
+    }
     fn open(
         &self,
         _: &BindIdentity,
