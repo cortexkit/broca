@@ -192,7 +192,7 @@ pub(super) fn index_in_tx(
     let mut last_off = cp.as_ref().map_or(0, |cp| cp.off);
     let mut last_seq = cp.as_ref().and_then(|cp| cp.seq);
     let mut identity = cp.as_ref().and_then(|cp| cp.identity.clone());
-    let mut seed = cp.and_then(|cp| cp.seed).unwrap_or_default();
+    let mut seed = cp.and_then(|cp| cp.seed).unwrap_or_else(OffsetSeed::empty);
     let boundary_lineage = lineage_id.clone();
     tx.execute("INSERT INTO session (sid,project_root,harness,session_key,session_ref,lineage_id,location,indexed_off,indexed_end,head_ord,tail_seed,admission_seed)
         VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,'','') ON CONFLICT(sid) DO UPDATE SET session_ref=excluded.session_ref,location=excluded.location",
@@ -474,6 +474,75 @@ mod tests {
             db,
             _scratch: Scratch(root),
         }
+    }
+
+    #[test]
+    fn every_published_locator_cut_roundtrips_including_empty_and_zero_step() {
+        use broca_wal::Wal;
+        assert!(OffsetSeed::decode(&OffsetSeed::empty().encode().unwrap(), None).is_some());
+        let mut cuts = 0;
+        let mut cases = boundary_cases();
+        let start = cases
+            .iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap()
+            .1[0]
+            .clone();
+        let terminal = cases
+            .iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap()
+            .1[3]
+            .clone();
+        cases.push(("ordinary_zero_step", vec![start, terminal], vec![1]));
+        for (_, records, _) in cases {
+            let bind = bind(&encode_records(&records));
+            let published = database();
+            let indexed = database();
+            let path = published._scratch.0.join("locator-cuts.wal");
+            let mut wal = broca_wal::FileWal::open(&path)
+                .unwrap()
+                .with_feature_floor(published._scratch.0.join(broca_wal::FEATURE_FLOOR_FILENAME));
+            for cut in 0..=records.len() {
+                if cut != 0 {
+                    wal.append(1, &records[cut - 1], false).unwrap();
+                }
+                wal.sync().unwrap();
+                let proof = wal.durable_publication().unwrap();
+                published
+                    .db
+                    .publish(&bind, "locator-cuts", LogLocation::Live, &proof)
+                    .unwrap();
+                let bytes = std::fs::read(&path).unwrap();
+                indexed.db.index(&publication(&bind, &bytes)).unwrap();
+                // Both fresh constructors and their restored continuations must
+                // pass the production decoder at every possible published cut.
+                for db in [&published.db, &indexed.db] {
+                    let encoded = db
+                        .read_snapshot(|tx| {
+                            Ok(tx.query_row("SELECT locator_seed FROM session", [], |row| {
+                                row.get::<_, String>(0)
+                            })?)
+                        })
+                        .unwrap();
+                    let budget = records[..cut]
+                        .iter()
+                        .rev()
+                        .find_map(|record| match record {
+                            WalRecord::RunStarted { config, .. } => Some(config.budget.clone()),
+                            _ => None,
+                        })
+                        .flatten();
+                    assert!(
+                        OffsetSeed::decode(&encoded, budget).is_some(),
+                        "undecodable cut {cut}: {encoded}"
+                    );
+                    cuts += 1;
+                }
+            }
+        }
+        assert!(cuts > 2);
+        println!("{cuts} published/indexed locator cuts round-tripped");
     }
     fn fixture(name: &str) -> Vec<u8> {
         std::fs::read(
@@ -1935,6 +2004,7 @@ mod tests {
                 ReadClass::Validation(ValidationRead::BoundaryFrame),
             ),
             header,
+            frame("authenticated Setup", setup),
         ];
         let mut expected = vec![
             header,
@@ -1957,7 +2027,7 @@ mod tests {
         expected.extend(common);
         expected.extend([terminal_header, terminal_source, state]);
         let op = counter.snapshot().remove(0);
-        assert_eq!((op.reads.len(), op.frames_decoded), (22, 30));
+        assert_eq!((op.reads.len(), op.frames_decoded), (24, 32));
         for (read, (name, off, len, class)) in op.reads.iter().zip(expected) {
             assert_eq!(
                 (read.offset, read.length, read.class),

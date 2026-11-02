@@ -2282,6 +2282,22 @@ pub fn replay_projection_tail(
     seed: &ProjectionSeed,
     frames: &[FramedRecord],
 ) -> Result<ProjectionDelta, ReplayError> {
+    replay_projection_tail_with(seed, frames, LeadingInterrupted::TreatAsOrphan)
+}
+
+pub(crate) enum LeadingInterrupted {
+    TreatAsOrphan,
+    RetainKnownEpisode,
+}
+
+/// Only validated continuation callers may retain a known episode across its
+/// zero-step interruption. Legacy materialization still drops its prior prefix
+/// when a tail starts with an interruption and its seed has no completed steps.
+pub(crate) fn replay_projection_tail_with(
+    seed: &ProjectionSeed,
+    frames: &[FramedRecord],
+    leading_interrupted: LeadingInterrupted,
+) -> Result<ProjectionDelta, ReplayError> {
     if !seed.admission_checkpoint.recovery_cuts.is_empty() {
         return Err(ReplayError::CorruptLineage {
             episode_run_id: seed
@@ -2364,7 +2380,11 @@ pub fn replay_projection_tail(
             )
         };
 
-    let truncate_prefix_to = (seed.completed_steps == 0
+    let retain_known_episode =
+        matches!(leading_interrupted, LeadingInterrupted::RetainKnownEpisode)
+            && seeded_episode.is_some();
+    let truncate_prefix_to = (!retain_known_episode
+        && seed.completed_steps == 0
         && first_session_record_is_interrupted(frames.iter().map(|frame| &frame.record)))
     .then_some(0);
     let mut admission_checkpoint = seed.admission_checkpoint.clone();
@@ -5780,6 +5800,34 @@ pub(crate) mod projection_boundary_tests {
             "a default-looking state that claims a firing must not seed a double-fire-prone replay"
         );
         assert!(replay_projection_tail(&seed, &[]).is_err());
+    }
+
+    #[test]
+    fn legacy_projection_still_resets_a_leading_interruption_with_zero_steps() {
+        use super::{replay_projection_tail_with, LeadingInterrupted};
+        let mut seed = projection_seed();
+        seed.completed_steps = 0;
+        let mut terminal = run_finished(9);
+        if let WalRecord::RunFinished { reason, .. } = &mut terminal.record {
+            *reason = RunFinishReason::Interrupted;
+        }
+        let legacy = replay_projection_tail(&seed, &[terminal.clone()]).unwrap();
+        assert_eq!(legacy.truncate_prefix_to, Some(0));
+        let retained = replay_projection_tail_with(
+            &seed,
+            &[terminal.clone()],
+            LeadingInterrupted::RetainKnownEpisode,
+        )
+        .unwrap();
+        assert_eq!(retained.truncate_prefix_to, None);
+        assert_eq!(retained.episodes, seed.projection_episodes);
+        let unproven = replay_projection_tail_with(
+            &ProjectionSeed::empty(),
+            &[terminal],
+            LeadingInterrupted::RetainKnownEpisode,
+        )
+        .unwrap();
+        assert_eq!(unproven.truncate_prefix_to, Some(0));
     }
 
     #[test]

@@ -260,6 +260,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
     STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
     TOOL_REPLY_FEATURE,
+    TOOL_NAME_ALIASES_FEATURE,
     TOOL_TIMES_FEATURE,
     MESSAGE_TIMES_FEATURE,
 ];
@@ -409,6 +410,8 @@ pub const STRUCTURED_OUTPUT_PARAGRAPH_FEATURE: &str = "structured-output-paragra
 /// such a WAL: decoding the tool would silently drop the deadline, and the resumed or drained
 /// run would cut that tool's long calls at the default wait and end the run interrupted.
 pub const TOOL_REPLY_FEATURE: &str = "tool-reply/v1";
+/// Frozen operator aliases change request identity and must not be dropped by an older reader.
+pub const TOOL_NAME_ALIASES_FEATURE: &str = "tool-name-aliases/v1";
 
 /// Preserve the tool timestamps subscriptions replay after a restart; older readers refuse
 /// these frames rather than silently discarding the observations.
@@ -1646,6 +1649,7 @@ mod tests {
                 STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
                 STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
                 TOOL_REPLY_FEATURE,
+                TOOL_NAME_ALIASES_FEATURE,
                 TOOL_TIMES_FEATURE,
                 MESSAGE_TIMES_FEATURE,
             ]
@@ -1800,6 +1804,44 @@ mod tests {
                 }
                 let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
                 assert_eq!(record.required_features(), &[STRUCTURED_OUTPUT_FEATURE]);
+            }
+        }
+    }
+
+    #[test]
+    fn tool_name_aliases_feature_is_required_only_for_nonempty_frozen_maps() {
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != TOOL_NAME_ALIASES_FEATURE)
+            .collect();
+        for aliases in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"bash":"client_bash"})),
+        ] {
+            let mut frozen = serde_json::json!({"family_id":"openai_responses"});
+            if let Some(aliases) = &aliases {
+                frozen["tool_name_aliases"] = aliases.clone();
+            }
+            let run = serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":frozen},"input":[],"origin":{"kind":"fresh"}});
+            let refrozen = serde_json::json!({"type":"run_config_refrozen","renderer_version":1,"frozen_render_config":frozen});
+            for value in [run, refrozen] {
+                let record: WalRecord = serde_json::from_value(value).unwrap();
+                let bytes = encode(1, 1, &record).unwrap();
+                if aliases
+                    .as_ref()
+                    .is_some_and(|map| !map.as_object().unwrap().is_empty())
+                {
+                    assert_eq!(record.required_features(), &[TOOL_NAME_ALIASES_FEATURE]);
+                    assert!(
+                        matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [TOOL_NAME_ALIASES_FEATURE])
+                    );
+                } else {
+                    assert!(record.required_features().is_empty());
+                    assert_eq!(bytes[4], FRAMING_VERSION);
+                }
+                assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
             }
         }
     }

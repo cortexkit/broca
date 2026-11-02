@@ -12,6 +12,17 @@
 
 use super::*;
 
+#[test]
+fn run_started_before_tool_name_aliases_keeps_exact_bytes() {
+    let pinned = r#"{"type":"run_started","run_id":"r","session":{"project_root":"/project","harness":"runner","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[{"name":"bash","description":"run","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":{"family_id":"openai_responses","max_output_tokens":2048,"reasoning":{"mode":"none"},"renderer_version":1,"system_prompt":{"mode":"instructions_field"},"token_limit_field":"max_tokens","tool_id":"passthrough","usage":"open_ai_usage","wire_model_id":"synthetic"}},"input":[],"origin":{"kind":"fresh"}}"#;
+    let record: WalRecord = serde_json::from_str(pinned).unwrap();
+    assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+    assert!(record.required_features().is_empty());
+    let frame = crate::framing::encode(7, 3, &record).unwrap();
+    assert_eq!(frame[4], crate::framing::FRAMING_VERSION);
+    assert_eq!(&frame[crate::framing::HEADER_LEN..], pinned.as_bytes());
+}
+
 // Pin scoped execution identities and evidence whose run cannot be recovered.
 // An unowned entry's bare ID is evidence, not an executable identity.
 const RECOVERY_PINNED: &[&str] = &[

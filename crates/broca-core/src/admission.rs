@@ -2285,8 +2285,14 @@ impl AdmissionContinuation {
     /// A full WAL read preserves unanswered deferred calls, late results and
     /// requests to withdraw outstanding approval questions when the raw prefix
     /// cannot reconstruct those actions.
-    pub fn raw_read_ownership(&self) -> Result<SessionOwnershipV1, crate::replay::SeedFallback> {
-        if self.compaction.is_some() {
+    pub fn raw_read_ownership(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<SessionOwnershipV1, crate::replay::SeedFallback> {
+        // Compaction payloads stay in the log. Authenticate the continuation's
+        // dependencies before deciding whether its pending actions need replay.
+        let compaction = self.hydrate_compaction_fold(read_at)?;
+        if compaction.session && compaction.checkpoint.state().is_none() {
             return Err(crate::replay::SeedFallback::new(
                 "raw page requires compaction source hydration",
             ));
@@ -2296,19 +2302,12 @@ impl AdmissionContinuation {
                 "raw page deferred prefix state",
             ));
         }
-        if self
-            .seed
-            .scalars
-            .compaction
-            .as_ref()
-            .and_then(|c| c.state())
-            .is_some_and(|state| {
-                matches!(
-                    state.ceiling_check,
-                    Some(crate::compaction::CeilingCheck::Waiting { .. })
-                ) || state.ride_wait.is_some()
-            })
-        {
+        if compaction.checkpoint.state().is_some_and(|state| {
+            matches!(
+                state.ceiling_check,
+                Some(crate::compaction::CeilingCheck::Waiting { .. })
+            ) || state.ride_wait.is_some()
+        }) {
             return Err(crate::replay::SeedFallback::new(
                 "raw page compaction wait prefix state",
             ));

@@ -70,9 +70,7 @@ pub fn reconstruct_from_offsets(
     snapshot: OffsetResumeSnapshot,
     safe_head: u64,
 ) -> Result<OffsetResumeState, crate::replay::SeedFallback> {
-    use crate::replay::{
-        replay_projection_tail, replay_seeded_at_validated_boundary, SeedFallback,
-    };
+    use crate::replay::{replay_seeded_at_validated_boundary, SeedFallback};
     let bad = |reason| SeedFallback::new(reason);
     let mut seed = snapshot.projection;
     if !seed.admission_checkpoint.recovery_cuts.is_empty() {
@@ -169,8 +167,12 @@ pub fn reconstruct_from_offsets(
     }
     // Projection composition retains the existing counter/reset and episode-coordinate rules.
     // Only the checked WAL tail is folded; the hydrated request-message prefix is reused.
-    let delta = replay_projection_tail(&seed, &frames)
-        .map_err(|_| bad("offset resume projection composition failed"))?;
+    let delta = crate::replay::replay_projection_tail_with(
+        &seed,
+        &frames,
+        crate::replay::LeadingInterrupted::RetainKnownEpisode,
+    )
+    .map_err(|_| bad("offset resume projection composition failed"))?;
     let checkpoint = delta.admission_checkpoint;
     // A tail can introduce the first media capture into a previously media-free prefix.
     // Recheck its folded state: a valid selected window is not a media-state completeness proof.

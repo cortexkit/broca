@@ -14,6 +14,13 @@ use serde_json::{json, Value};
 const PRE_CACHE_FROZEN_CONFIG: &str =
     include_str!("../fixtures/frozen_render_config_pre_cache.json");
 
+#[test]
+fn frozen_config_before_tool_name_aliases_keeps_exact_bytes() {
+    let pinned = r#"{"family_id":"openai_responses","renderer_version":1,"wire_model_id":"synthetic","max_output_tokens":2048,"reasoning":{"mode":"none"},"tool_id":"passthrough","system_prompt":{"mode":"instructions_field"},"usage":"open_ai_usage","token_limit_field":"max_tokens"}"#;
+    let frozen: FrozenRenderConfig = serde_json::from_str(pinned).unwrap();
+    assert_eq!(serde_json::to_string(&frozen).unwrap(), pinned);
+}
+
 fn marker_policy() -> CachePolicy {
     CachePolicy {
         version: 1,

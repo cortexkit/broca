@@ -105,6 +105,9 @@ mod request_gzip_tests;
 /// with redirects disabled: a redirect must not re-POST under the original reservation.
 #[derive(Clone, Debug)]
 pub struct ProviderHttpClient {
+    // A run-local clone also sends prompt-cache warm requests reconstructed from a saved
+    // render config; those requests do not pass through the ordinary attempt loop.
+    warm_quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     /// Every host except `api.anthropic.com`. No response decoding and no `accept-encoding`.
     identity: reqwest::Client,
     /// `api.anthropic.com` only. Decodes gzip, deflate, brotli and zstd responses as they stream.
@@ -149,12 +152,24 @@ fn build_http_pool(builder: reqwest::ClientBuilder, decode: bool) -> reqwest::Cl
 }
 
 impl ProviderHttpClient {
+    /// Read accepted-attempt evidence without loading a session or reading its WAL.
+    /// `None` means not loaded in this process; `Some(None)` means loaded with no accepted
+    /// send on this account. This distinction lets admission count conservative cold starts.
+    pub fn session_last_accepted_at_ms(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        account: &str,
+    ) -> Option<Option<u64>> {
+        self.cache_sessions.accepted_at_ms(session, account)
+    }
+
     fn build(
         builder: impl Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
         request_gzip: request_gzip::RequestGzipPolicy,
     ) -> Self {
         Self {
             identity: build_http_pool(builder(), false),
+            warm_quota_observer: None,
             decoding: build_http_pool(builder(), true),
             journaled: Arc::new(JournaledHttpClients {
                 clients: OnceLock::new(),
@@ -256,6 +271,7 @@ impl From<reqwest::Client> for ProviderHttpClient {
     fn from(client: reqwest::Client) -> Self {
         Self {
             identity: client.clone(),
+            warm_quota_observer: None,
             decoding: client,
             journaled: Arc::new(JournaledHttpClients {
                 clients: OnceLock::new(),
@@ -282,6 +298,7 @@ const ROUTE_FALLBACK: u8 = 1;
 /// loop runs every grammar.
 /// Media rendering is installed only when the immutable boot setting enables it.
 pub struct LiveProvider<F: WireFamily + 'static> {
+    quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     pub(crate) client: ProviderHttpClient,
     clock: Clock,
     pub(crate) family: Arc<F>,
@@ -317,6 +334,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
 /// Owns the rendered body behind a reference count so retry requests do not copy the prompt.
 #[derive(Clone)]
 struct PreparedHttpRequest {
+    quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     cache_session: Option<(Arc<cache_runtime::Session>, Arc<FrozenRenderConfig>)>,
     cache_model: Option<String>,
     cache_provenance: Option<Arc<broca_protocol::render_provenance::RenderProvenance>>,
@@ -353,6 +371,7 @@ type CompletedOutputRenderer =
 impl From<HttpRequest> for PreparedHttpRequest {
     fn from(request: HttpRequest) -> Self {
         Self {
+            quota_observer: None,
             attempt_hook: None,
             cache_session: None,
             cache_model: None,
@@ -380,6 +399,7 @@ impl From<HttpRequest> for PreparedHttpRequest {
 /// Immutable, whole-request input for one blocking render. All expensive input stays behind
 /// shared handles; the closure is the sole owner that releases its prompt snapshot.
 struct RenderJob<F: WireFamily + 'static> {
+    quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     cache_session: Option<Arc<cache_runtime::Session>>,
     cache_provider: Option<String>,
     subscription_auth: bool,
@@ -444,6 +464,7 @@ struct ChunkWarning {
 /// SSE adaptation, not compressed frames or control-frame payloads.
 #[derive(Clone, Default)]
 struct AttemptTrace {
+    quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     cache_work: cache_runtime::Pending,
     cache_evidence: Option<Box<Value>>,
     attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
@@ -653,9 +674,10 @@ impl<F: WireFamily + 'static> RenderJob<F> {
         let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
         // This scan is deliberately in the same blocking job as rendering: it walks the entire
         // prompt to preserve aliases from historical tool calls on every resumed step.
-        let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build(
+        let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build_with_aliases(
             &self.opts.tools,
             &self.opts.prompt,
+            &self.frozen.tool_name_aliases,
         ));
         let body = if let Some(renderer) = &self.media_renderer {
             renderer(
@@ -672,6 +694,7 @@ impl<F: WireFamily + 'static> RenderJob<F> {
         let mut request =
             PreparedHttpRequest::from(self.family.endpoint(&self.frozen, &self.auth, body));
         request.ephemeral_session = self.opts.ephemeral_session;
+        request.quota_observer = self.quota_observer;
         request.cache_provenance = Some(Arc::new(provenance));
         request.cache_session = self
             .cache_session
@@ -741,6 +764,9 @@ impl ToolNameRestoringNormalizer {
 }
 
 impl StreamNormalizer for ToolNameRestoringNormalizer {
+    fn set_raw_sse_observer(&mut self, observer: crate::wire::RawSseObserver) {
+        self.inner.set_raw_sse_observer(observer);
+    }
     fn observe_error_response(&mut self, response: &Value) {
         self.inner.observe_error_response(response);
     }
@@ -1014,6 +1040,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
     ) -> Self {
         Self {
             client,
+            quota_observer: None,
             clock,
             family: Arc::new(family),
             fallback: frozen
@@ -1051,6 +1078,15 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
     /// Use the module's shared clock for relative provider reset deadlines.
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    pub fn with_quota_observer(
+        mut self,
+        observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
+    ) -> Self {
+        self.client.warm_quota_observer = observer.clone();
+        self.quota_observer = observer;
         self
     }
 
@@ -1154,6 +1190,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             return rx;
         }
         let render_job = RenderJob {
+            quota_observer: self.quota_observer.clone(),
             cache_session: self.cache_session.lock().unwrap().clone(),
             cache_provider: if self.routed_fallback().is_some() {
                 self.frozen
@@ -1312,6 +1349,14 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         if let Some(session) = self.cache_session.lock().unwrap().as_ref() {
             session.recorded(locator);
         }
+    }
+
+    fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {
+        self.cache_session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|session| session.last_accepted_at_ms(account))
     }
 
     fn reasoning_is_prefix_bound(&self) -> bool {
@@ -1643,7 +1688,12 @@ async fn send_warm_legacy(
             .map_err(|error| failed(format!("warm request failed: {error}")))?;
             let status = response.status();
             let header_map = response.headers().clone();
-            let body = read_warm_body_legacy(response, &failed).await?;
+            if let Some(observer) = &client.warm_quota_observer {
+                observer.headers(&header_map, now_millis());
+            }
+            let body =
+                read_warm_body_legacy(response, &failed, client.warm_quota_observer.as_deref())
+                    .await?;
             if gzip.is_some() {
                 if let Some(rejection) = request_gzip::classify_rejection(
                     status.as_u16(),
@@ -1727,15 +1777,24 @@ async fn send_warm_legacy(
 async fn read_warm_body_legacy(
     response: reqwest::Response,
     failed: &impl Fn(String) -> broca_core::WarmFailure,
+    observer: Option<&dyn crate::quota::QuotaObserver>,
 ) -> Result<Vec<u8>, broca_core::WarmFailure> {
+    let mut quota_sse = crate::quota::SseTap::new(observer);
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| failed(format!("warm answer unreadable: {error}")))?;
+        let received_at = quota_sse.as_ref().map(|_| now_millis());
         if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
             return Err(failed("warm answer exceeded its size limit".into()));
         }
         body.extend_from_slice(&chunk);
+        if let Some(tap) = &mut quota_sse {
+            tap.push(&body, received_at.expect("quota tap timestamp"));
+        }
+    }
+    if let Some(tap) = &mut quota_sse {
+        tap.finish(&body);
     }
     Ok(body)
 }
@@ -1847,7 +1906,16 @@ async fn send_warm_journaled(
             envelope.http_status = Some(status.as_u16());
             envelope.vendor_request_id = vendor_request_id(response.headers());
             let header_map = response.headers().clone();
-            let body = read_warm_body(response, &failed, &mut envelope).await?;
+            if let Some(observer) = &client.warm_quota_observer {
+                observer.headers(&header_map, now_millis());
+            }
+            let body = read_warm_body(
+                response,
+                &failed,
+                &mut envelope,
+                client.warm_quota_observer.as_deref(),
+            )
+            .await?;
             warm_billing_usage(&body, family, &mut envelope);
             if gzip.is_some() {
                 if let Some(rejection) = request_gzip::classify_rejection(
@@ -2026,7 +2094,9 @@ async fn read_warm_body(
     response: reqwest::Response,
     failed: &impl Fn(String) -> broca_core::WarmFailure,
     envelope: &mut broca_wal::record::AttemptEnvelope,
+    observer: Option<&dyn crate::quota::QuotaObserver>,
 ) -> Result<Vec<u8>, broca_core::WarmFailure> {
+    let mut quota_sse = crate::quota::SseTap::new(observer);
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -2035,11 +2105,18 @@ async fn read_warm_body(
             failed(format!("warm answer unreadable: {error}"))
         })?;
         envelope.response_bytes += chunk.len() as u64;
+        let received_at = quota_sse.as_ref().map(|_| now_millis());
         if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
             envelope.outcome = broca_wal::record::BillingAttemptOutcome::ByteLimit;
             return Err(failed("warm answer exceeded its size limit".into()));
         }
         body.extend_from_slice(&chunk);
+        if let Some(tap) = &mut quota_sse {
+            tap.push(&body, received_at.expect("quota tap timestamp"));
+        }
+    }
+    if let Some(tap) = &mut quota_sse {
+        tap.finish(&body);
     }
     Ok(body)
 }
@@ -2722,7 +2799,7 @@ fn dump_files_to_delete(
 use crate::request_dump::is_request_dump_filename;
 pub use crate::request_dump::request_dump_filename;
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     system_time_millis(SystemTime::now())
 }
 
@@ -2890,6 +2967,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
         let rebuild = |auth: &AuthHandle, sent: &PreparedHttpRequest| {
             let fresh = family.endpoint(frozen.as_ref(), auth, sent.body.to_vec());
             PreparedHttpRequest {
+                quota_observer: sent.quota_observer.clone(),
                 cache_session: sent.cache_session.clone(),
                 cache_model: sent.cache_model.clone(),
                 cache_provenance: sent.cache_provenance.clone(),
@@ -3119,6 +3197,7 @@ where
         step_seal.note_sent(&request.body, request_digest);
         let mut trace = AttemptTrace {
             attempt_hook: request.attempt_hook.clone(),
+            quota_observer: request.quota_observer.clone(),
             auth_refreshed: request.attempt_hook.is_some()
                 && auth_recovery.as_ref().is_some_and(|recovery| {
                     recovery
@@ -4127,6 +4206,9 @@ async fn send_attempt(
     if trace.attempt_hook.is_some() {
         trace.vendor_request_id = vendor_request_id(response.headers());
     }
+    if let Some(observer) = &trace.quota_observer {
+        observer.headers(response.headers(), now_millis());
+    }
     Ok(response)
 }
 
@@ -4516,6 +4598,16 @@ where
     tokio::pin!(content);
     let mut completion = Vec::new();
     let mut rate_window = stream_floor_from_env().map(StreamRateWindow::new);
+    // Socket frames are tapped by the receive pump. SSE borrows the normalizer's decoded
+    // payloads so ordinary deltas incur no second decoder or per-record allocation.
+    if let Some(observer) = trace.quota_observer.as_ref().filter(|observer| {
+        observer.wants_frames() && trace.transport.as_deref() != Some("websocket")
+    }) {
+        let observer = observer.clone();
+        normalizer.set_raw_sse_observer(Arc::new(move |frame| {
+            crate::quota::observe_frame(observer.as_ref(), frame);
+        }));
+    }
 
     loop {
         let next = tokio::select! {
@@ -6090,6 +6182,8 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
+    include!("transport_quota_tests.rs");
+
     use super::{
         build_provider_http_client, classify_account_limit_exhausted, classify_http_error,
         collect_error_body, drive_attempt, drive_body_stream, drive_body_stream_with_limit,
@@ -6154,6 +6248,7 @@ mod tests {
     {
         let direct = family.render(&frozen, &opts);
         let job = super::RenderJob {
+            quota_observer: None,
             cache_session: None,
             cache_provider: None,
             subscription_auth: false,
@@ -7185,6 +7280,7 @@ mod tests {
         let mut frozen = crate::families::anthropic_frozen_config("m");
         frozen.speed = Some("fast".into());
         let rendered = super::RenderJob {
+            quota_observer: None,
             cache_session: None,
             cache_provider: None,
             subscription_auth: false,

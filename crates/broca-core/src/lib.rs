@@ -174,7 +174,10 @@ pub use wal_writer::{
 };
 
 mod account_limit_pause;
-pub use account_limit_pause::account_limit_stale_resets;
+pub use account_limit_pause::{
+    account_limit_pause_declined, account_limit_stale_resets, session_account_cache_expiry_ms,
+    SameAccountWait,
+};
 pub mod keep_warm;
 pub mod keep_warm_wait;
 mod plan_system;

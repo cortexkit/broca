@@ -231,7 +231,11 @@ fn render_prepared_body_with_provenance(
 ) -> Value {
     let view = crate::families::compaction_view(frozen.family_id, prepared);
     let opts = view.as_ref();
-    let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
+    let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
+        &opts.tools,
+        &opts.prompt,
+        &frozen.tool_name_aliases,
+    );
     let input = convert_input_items_with_provenance(
         &opts.prompt,
         frozen.system_prompt.clone(),
@@ -871,6 +875,7 @@ struct ResponsesOutputTokenDetails {
 }
 
 pub struct OpenAiResponsesNormalizer {
+    raw_sse_observer: Option<crate::wire::RawSseObserver>,
     response_evidence: Option<crate::normalize::SharedResponseEvidence>,
     display_parts: crate::display_parts::DisplayParts,
     arguments_guard: crate::wire::ToolArgsGuard,
@@ -927,6 +932,7 @@ impl OpenAiResponsesNormalizer {
     ) -> Self {
         Self {
             response_evidence: None,
+            raw_sse_observer: None,
             display_parts: Default::default(),
             arguments_guard: Default::default(),
             completed_items: Default::default(),
@@ -1675,6 +1681,9 @@ impl OpenAiResponsesNormalizer {
 }
 
 impl StreamNormalizer for OpenAiResponsesNormalizer {
+    fn set_raw_sse_observer(&mut self, observer: crate::wire::RawSseObserver) {
+        self.raw_sse_observer = Some(observer);
+    }
     fn observe_error_response(&mut self, response: &Value) {
         let response = response.get("response").unwrap_or(response);
         if let Some(usage) = response.get("usage") {
@@ -1699,6 +1708,9 @@ impl StreamNormalizer for OpenAiResponsesNormalizer {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
         for payload in self.sse.push(chunk)? {
+            if let Some(observer) = &self.raw_sse_observer {
+                observer(&payload);
+            }
             self.handle_event(&payload, &mut out)?;
         }
         Ok(out)
@@ -1727,6 +1739,9 @@ impl StreamNormalizer for OpenAiResponsesNormalizer {
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
         for payload in self.sse.flush()? {
+            if let Some(observer) = &self.raw_sse_observer {
+                observer(&payload);
+            }
             self.handle_event(&payload, &mut out)?;
         }
         Ok(out)

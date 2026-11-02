@@ -78,6 +78,7 @@ pub fn live_provider_with_clock_and_refresher(
 /// Runtime credential context, kept separate from the byte-affecting render configuration.
 #[derive(Default)]
 pub struct ProviderOptions {
+    pub quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     pub clock: broca_core::clock::Clock,
     pub refresher: Option<Arc<dyn CredentialRefresher>>,
     pub frozen_account_ref: Option<String>,
@@ -123,6 +124,7 @@ fn boxed_provider<F: WireFamily + 'static>(
     options: ProviderOptions,
 ) -> Box<dyn Provider> {
     let ProviderOptions {
+        quota_observer,
         clock,
         refresher,
         frozen_account_ref,
@@ -134,6 +136,7 @@ fn boxed_provider<F: WireFamily + 'static>(
         None => LiveProvider::new_with_clock(family, frozen, auth, clock),
     };
     let provider = provider
+        .with_quota_observer(quota_observer)
         .with_account_refs(frozen_account_ref, served_account_ref)
         .with_auth_method(auth_method.as_deref());
     match refresher {

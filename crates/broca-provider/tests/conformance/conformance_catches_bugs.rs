@@ -15,6 +15,7 @@ use broca_provider::wire::{
 
 fn frozen() -> FrozenRenderConfig {
     FrozenRenderConfig {
+        tool_name_aliases: Default::default(),
         image_notice_labels: false,
         anthropic_turn_system: false,
         family_id: WireFamilyId::OpenAiChat,

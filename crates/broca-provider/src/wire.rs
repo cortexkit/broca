@@ -115,6 +115,9 @@ pub struct FrozenRenderConfig {
     /// The family render ABI version. A change means a resume can't reproduce the
     /// original bytes, so resume must stop for review rather than re-render.
     pub renderer_version: u32,
+    /// Concrete operator aliases frozen at admission. Empty maps retain legacy request and WAL bytes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tool_name_aliases: std::collections::BTreeMap<String, String>,
     /// New episodes label multipart image notices; absent in recorded configurations,
     /// whose literal text projection must remain byte-identical on resume.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -726,6 +729,9 @@ pub trait WireFamily: Send + Sync {
 /// returns any newly-complete events; the wire framing is the implementor's
 /// concern, so this stays grammar-generic.
 pub trait StreamNormalizer: Send {
+    /// Observe borrowed, already-decoded SSE payloads without changing normalized events.
+    /// Wrappers forward the callback; absent observers add no decoding or allocation.
+    fn set_raw_sse_observer(&mut self, _observer: RawSseObserver) {}
     /// Enable envelope-only response facts for a journaled attempt. Wrappers forward
     /// the shared sink; without it no additional usage objects are cloned or parsed.
     fn set_response_evidence(&mut self, _evidence: crate::normalize::SharedResponseEvidence) {}
@@ -820,6 +826,8 @@ pub trait StreamNormalizer: Send {
         false
     }
 }
+
+pub type RawSseObserver = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Response headers as the transport received them, reduced to what a normalizer can read:
 /// lowercase names and the values that are valid UTF-8. Kept free of the HTTP client's types

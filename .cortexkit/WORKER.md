@@ -6,8 +6,19 @@ them. Start with `CONTRIBUTING.md` and the public contracts under `docs/`.
 ## Build and test remotely
 
 - Run builds, tests and lint on the build server (`runon: "linux,8c"`, or `linux,16c` for
-  whole-workspace jobs). On this Mac, run only what needs macOS, at `nice -n 10`.
+  whole-workspace jobs). Any job that runs `broca-crash-harness` tests also takes `linux,16c`:
+  the harness keeps every crash image in memory, and one filtered run used 16.5 GiB at 8c,
+  over the build server's coming limit of 2 GiB per vCPU. Never go below 8c for the commit
+  check (`scripts/linux-quickcheck-attest.sh`). On the local machine, run only what needs it,
+  at `nice -n 10`.
 - Remote jobs that write logs start with `mkdir -p target/scratch &&`.
+- A remote Linux job can't change files git tracks. Its writes fail with "Operation not
+  permitted", and before that rule they were silently lost when the next job reset the tree.
+  So edit tracked files locally with the edit tools, never inside a job: no `python3`, `sed -i`
+  or `perl -pi` edits, no `cargo fmt` (the commit check runs `--check`), and no `git show` or
+  `git checkout` restores. For a red-first proof, revert the fix locally, run the test remotely,
+  then reapply it. To regenerate goldens, captures or fixtures remotely, name every file the job
+  rewrites in `return_paths` so they come back to your checkout, or regenerate locally.
 - Never run the native kill-conformance, real-daemon or crash-harness release lanes yourself. The
   integrating agent runs them once per merged batch. List the native tests your change needs.
 

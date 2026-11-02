@@ -159,6 +159,7 @@ pub(crate) struct Request<'a> {
     pub run_id: Option<&'a RunId>,
     pub state: &'a str,
     pub model: Option<&'a HeadModel>,
+    pub stored: Option<&'a broca_store::db::RawHeadMedia>,
 }
 
 pub(crate) struct Facts {
@@ -252,6 +253,27 @@ impl LineageRegistry {
             return Ok(Facts {
                 input: self.quoted_media_head(request.model).await,
                 interrupt_reason: None,
+            });
+        }
+        if let Some(stored) = request.stored {
+            if Some(&stored.run_id) != request.run_id {
+                return Err(OpenError::Classified {
+                    reason: "session.head media episode differs from the page".into(),
+                    class: broca_protocol::ErrorClass::Transient,
+                });
+            }
+            return Ok(Facts {
+                input: stored
+                    .media
+                    .as_ref()
+                    .map_or_else(broca_wire::head_input, |value| {
+                        serde_json::from_value(value.clone())
+                            .ok()
+                            .as_ref()
+                            .map(input)
+                            .unwrap_or_else(|| HeadInput::new("unknown"))
+                    }),
+                interrupt_reason: stored.interrupt_reason.clone(),
             });
         }
         let resident = {

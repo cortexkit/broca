@@ -1,6 +1,104 @@
 //! Operator policy for model tools. Missing configuration is deliberately conservative:
 //! private content stays within the explicitly trusted provider set.
 
+/// Operator-selected wire names, keyed by credential routing key rather than account identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolNameAliasesConfig(pub std::collections::BTreeMap<String, ToolAliasRoute>);
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ToolAliasRoute {
+    Names {
+        names: std::collections::BTreeMap<String, String>,
+    },
+    Prefix {
+        prefix_all: String,
+    },
+}
+
+impl ToolNameAliasesConfig {
+    pub fn load_default() -> Result<Self, String> {
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
+            crate::config_home::ConfigHome::Resolved { path, .. } => {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => Self::parse(&text),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(Self::default())
+                    }
+                    Err(error) => Err(format!(
+                        "read tool_name_aliases from {}: {error}",
+                        path.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let mut file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|error| format!("parse tool_name_aliases: {error}"))?;
+        match file.remove("tool_name_aliases") {
+            None => Ok(Self::default()),
+            Some(value) => serde_json::from_value(value)
+                .map(Self)
+                .map_err(|error| format!("tool_name_aliases: {error}")),
+        }
+    }
+
+    pub fn for_tools(
+        &self,
+        route: &str,
+        tools: &[broca_protocol::request::Tool],
+    ) -> std::collections::BTreeMap<String, String> {
+        tools
+            .iter()
+            .filter_map(|tool| match self.0.get(route)? {
+                ToolAliasRoute::Names { names } => names
+                    .get(&tool.name)
+                    .map(|alias| (tool.name.clone(), alias.clone())),
+                ToolAliasRoute::Prefix { prefix_all } => {
+                    Some((tool.name.clone(), format!("{prefix_all}{}", tool.name)))
+                }
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tool_name_aliases_config_tests {
+    use super::*;
+
+    #[test]
+    fn tool_name_aliases_config_shape_is_strict() {
+        assert!(ToolNameAliasesConfig::parse("{}").unwrap().0.is_empty());
+        for text in [
+            r#"{"tool_name_aliases":null}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"bash":"client_bash"}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"names":{},"prefix_all":"client_"}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"prefix_all":"client_","unknown":true}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"names":{"bash":1}}}}"#,
+        ] {
+            assert!(
+                ToolNameAliasesConfig::parse(text)
+                    .unwrap_err()
+                    .contains("tool_name_aliases"),
+                "{text}"
+            );
+        }
+        for text in [
+            r#"{"tool_name_aliases":{"oauth:p":{"names":{"bash":"client_bash"}}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"prefix_all":"client_"}}}"#,
+        ] {
+            assert_eq!(ToolNameAliasesConfig::parse(text).unwrap().0.len(), 1);
+        }
+    }
+}
+
 /// Opt-in writer policy for the `service-tier-queue/v1` representation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -737,11 +835,11 @@ mod state_format_config_tests {
         );
     }
 }
-/// Root-level consent for writing timed account-limit recovery records. Absence keeps the
-/// legacy terminal-error path and does not raise the WAL reader floor.
+/// Root-level same-account wait cap loaded at boot. Consent is frozen at admission.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AccountLimitPauseConfig {
-    pub enabled: bool,
+    pub max_same_account_wait: broca_core::SameAccountWait,
+    pub obsolete_account_limit_pause: bool,
 }
 
 impl AccountLimitPauseConfig {
@@ -755,7 +853,7 @@ impl AccountLimitPauseConfig {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
                 Err(error) => Err(format!(
-                    "read account_limit_pause from {}: {error}",
+                    "read max_same_account_wait from {}: {error}",
                     path.display()
                 )),
             },
@@ -764,18 +862,27 @@ impl AccountLimitPauseConfig {
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
-        #[derive(serde::Deserialize)]
-        struct File {
-            #[serde(default)]
-            account_limit_pause: bool,
-        }
         let text = crate::cache_routing::strip_trailing_commas(
             &crate::cache_routing::strip_jsonc_comments(text),
         );
-        let file: File = serde_json::from_str(&text)
-            .map_err(|error| format!("parse account_limit_pause: {error}"))?;
+        let file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|error| format!("parse max_same_account_wait: {error}"))?;
+        let setting = match file.get("max_same_account_wait") {
+            None => broca_core::SameAccountWait::default(),
+            Some(serde_json::Value::String(value)) if value == "max" => {
+                broca_core::SameAccountWait::Max
+            }
+            Some(value) if value.as_u64().is_some() => {
+                broca_core::SameAccountWait::Minutes(value.as_u64().unwrap())
+            }
+            Some(_) => return Err(
+                "max_same_account_wait must be a non-negative integer number of minutes or \"max\""
+                    .into(),
+            ),
+        };
         Ok(Self {
-            enabled: file.account_limit_pause,
+            max_same_account_wait: setting,
+            obsolete_account_limit_pause: file.contains_key("account_limit_pause"),
         })
     }
 }
@@ -785,25 +892,63 @@ mod account_limit_pause_config_tests {
     use super::AccountLimitPauseConfig;
 
     #[test]
-    fn account_limit_pause_requires_explicit_boolean_consent() {
+    fn max_same_account_wait_defaults_and_typed_values() {
         for text in [
             "{}",
             r#"{"account_limit_pause":false}"#,
             r#"{"other":true}"#,
         ] {
-            assert!(!AccountLimitPauseConfig::parse(text).unwrap().enabled);
+            assert_eq!(
+                AccountLimitPauseConfig::parse(text)
+                    .unwrap()
+                    .max_same_account_wait,
+                broca_core::SameAccountWait::Minutes(15)
+            );
         }
-        assert!(
-            AccountLimitPauseConfig::parse(r#"{"account_limit_pause":true}"#)
-                .unwrap()
-                .enabled
-        );
-        for value in ["null", "1", "\"true\"", "{}", "[]"] {
+        for (value, expected) in [
+            ("0", broca_core::SameAccountWait::Minutes(0)),
+            ("42", broca_core::SameAccountWait::Minutes(42)),
+            ("\"max\"", broca_core::SameAccountWait::Max),
+        ] {
+            assert_eq!(
+                AccountLimitPauseConfig::parse(&format!(r#"{{"max_same_account_wait":{value}}}"#))
+                    .unwrap()
+                    .max_same_account_wait,
+                expected
+            );
+        }
+        for value in [
+            "null", "true", "false", "-1", "1.5", "1.0", "\"15\"", "\"MAX\"", "{}", "[]",
+        ] {
             assert!(AccountLimitPauseConfig::parse(&format!(
-                r#"{{"account_limit_pause":{value}}}"#
+                r#"{{"max_same_account_wait":{value}}}"#
             ))
             .unwrap_err()
-            .contains("account_limit_pause"));
+            .contains("max_same_account_wait"));
         }
+    }
+
+    #[test]
+    fn obsolete_account_limit_pause_is_ignored_without_parsing_its_value() {
+        assert!(
+            !AccountLimitPauseConfig::parse("{}")
+                .unwrap()
+                .obsolete_account_limit_pause
+        );
+        for value in ["true", "false", "null", "1", "{}", "[]", "\"bad\""] {
+            let config =
+                AccountLimitPauseConfig::parse(&format!(r#"{{"account_limit_pause":{value}}}"#))
+                    .unwrap();
+            assert!(config.obsolete_account_limit_pause);
+            assert_eq!(
+                config.max_same_account_wait,
+                broca_core::SameAccountWait::Minutes(15)
+            );
+        }
+        let config = AccountLimitPauseConfig::parse(
+            r#"{"account_limit_pause":true,"max_same_account_wait":0}"#,
+        )
+        .unwrap();
+        assert!(!config.max_same_account_wait.enabled());
     }
 }

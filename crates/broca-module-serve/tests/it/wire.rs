@@ -129,6 +129,7 @@ impl Provider for ResolvedStubProvider {
 
 fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
     ResolveOptions {
+        tool_name_aliases: None,
         media: false,
         media_profile: None,
         claude_code_persona: None,
@@ -148,6 +149,7 @@ fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
         frozen_account_ref: None,
         clock: None,
         refusal_fallback_model: None,
+        quota_observer: None,
     }
 }
 
@@ -2246,6 +2248,8 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // Refusals ended because their computed reset/retry deadline was already before
         // broca's pause time. This healthy daemon has seen none; assert zero below.
         "account_limit_stale_resets",
+        "account_limit_pause_declined",
+        "account_limit_hold_cap_unknown",
         "stall_watchdog",
         // Retained sessions whose expiry could not be confirmed because their log is unreadable
         // and the index is not provably current, so deletion keeps them. Present at zero.
@@ -2281,6 +2285,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // Cached tool routes and the route Goodbyes sent when sessions close. Asserted below:
         // no route outlives its session, and no Goodbye failed, was dropped or is still owed.
         "tool_routes",
+        // Quota readings forwarded to insula. This probe makes no subscription model call, so
+        // asserted below: nothing sent, failed or dropped, and no reading insula ignored.
+        "usage_observe",
     ]
     .into_iter()
     .collect();
@@ -2311,6 +2318,17 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         serde_json::json!({}),
         "a process with no refused scoped role opens has an empty refusal-code map"
     );
+    assert_eq!(
+        metrics["usage_observe"],
+        serde_json::json!({
+            "rows_sent": 0,
+            "batches_sent": 0,
+            "transport_failures": 0,
+            "rows_dropped": 0,
+            "ignored": {},
+        }),
+        "a process that made no subscription call forwards no quota reading and loses none"
+    );
     let readers = metrics["session_readers"]
         .as_object()
         .expect("reader census is present");
@@ -2330,6 +2348,16 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         metrics["account_limit_stale_resets"],
         serde_json::json!(0),
         "the isolated healthy daemon has not ended a refusal for stale account timing"
+    );
+    assert_eq!(
+        metrics["account_limit_hold_cap_unknown"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        metrics["account_limit_pause_declined"],
+        serde_json::json!({
+            "disabled":0, "no_accepted_response":0, "cache_expires_first":0, "beyond_cap":0
+        })
     );
     // This in-process adapter has no daemon bootstrap or watchdog file. The real
     // binary enables the witness during boot; a library-only connection says so.

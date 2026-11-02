@@ -165,6 +165,7 @@ async fn choose(
     choose_account(
         client,
         ChoiceInputs {
+            hold_cap: Default::default(),
             conversation_key: None,
             inherited_conversation_key: None,
             static_credential: &static_credential,
@@ -186,6 +187,160 @@ fn path_of(choice: &AccountChoice) -> &str {
 }
 
 // ---- admission ------------------------------------------------------------------------------
+
+#[test]
+fn account_for_hold_cap_params_preserve_legacy_members_and_bound_the_previous_account() {
+    use broca_core::SameAccountWait::{Max, Minutes};
+    let previous = |frozen: Value| -> broca_wal::RunConfig {
+        serde_json::from_value(json!({
+            "model":{"provider_module_id":"anthropic","model_id":"previous-model"},
+            "tools":[], "tool_choice":{"type":"auto"}, "generation":{},
+            "response_format":{"type":"text"}, "context_epoch":0, "renderer_version":1,
+            "auth_selection":{"credential_id":"oauth:anthropic:previous","account_ref":"previous-account"},
+            "frozen_render_config": frozen
+        })).unwrap()
+    };
+    let five = previous(json!({"cache":{"class":"markers","ttl":"5m"}}));
+    let hour = previous(json!({"cache":{"class":"markers","ttl":"1h"}}));
+    let unknown = previous(Value::Null);
+    let legacy = json!({
+        "provider":"anthropic", "model":"new-model", "affinity_model":"new-model",
+        "conversation_key":"conversation", "caller":{"runner":"broca"},
+        "admission_id":"run-1", "mode":"admit", "initial_input_bytes":42,
+        "initial_input_estimated":true,
+        "candidates":{"view_digest":"vault-view-1","accounts":[
+            {"account_id":"acct-a","credential_id":"oauth:anthropic"},
+            {"account_id":"acct-b","credential_id":"oauth:anthropic:acct-b"}
+        ]}
+    });
+    let candidates = Candidates::from_listing(&two_accounts(), AuthMethod::Oauth, "anthropic");
+    for (name, setting, previous, accepted, seconds, unknown_evidence) in [
+        (
+            "default 15 bounded by cache",
+            Minutes(15),
+            Some(&five),
+            Some(Some(900_000)),
+            199,
+            false,
+        ),
+        (
+            "minute cap",
+            Minutes(1),
+            Some(&five),
+            Some(Some(900_000)),
+            60,
+            false,
+        ),
+        (
+            "max one hour",
+            Max,
+            Some(&hour),
+            Some(Some(900_000)),
+            3499,
+            false,
+        ),
+        (
+            "unknown TTL five minutes",
+            Max,
+            Some(&unknown),
+            Some(Some(900_000)),
+            199,
+            false,
+        ),
+        ("disabled", Minutes(0), Some(&hour), None, 0, false),
+        ("no previous run", Minutes(15), None, None, 0, false),
+        (
+            "no accepted response on previous account",
+            Minutes(15),
+            Some(&five),
+            Some(None),
+            0,
+            false,
+        ),
+        ("expired", Max, Some(&five), Some(Some(0)), 0, false),
+        (
+            "subsecond floors to zero",
+            Max,
+            Some(&five),
+            Some(Some(700_999)),
+            0,
+            false,
+        ),
+        ("unloaded", Minutes(15), Some(&five), None, 0, true),
+    ] {
+        let cap = account_hold_cap(setting, previous, 1_000_500, |account| {
+            assert_eq!(account, "previous-account");
+            accepted
+        });
+        assert_eq!(
+            cap,
+            AccountHoldCap {
+                max_s: seconds,
+                evidence_unknown: unknown_evidence
+            },
+            "{name}"
+        );
+        let mut params = account_for_params(&AccountForRequest {
+            provider: "anthropic",
+            model: "new-model",
+            conversation_key: "conversation",
+            admission_id: "run-1",
+            initial_input_bytes: 42,
+            candidates: &candidates,
+            hold_cap: cap,
+        });
+        let mut expected = legacy.clone();
+        expected["hold_wait_max_s"] = json!(seconds);
+        assert_eq!(params, expected, "{name}");
+        assert_eq!(
+            params.as_object_mut().unwrap().remove("hold_wait_max_s"),
+            Some(json!(seconds))
+        );
+        assert_eq!(
+            params, legacy,
+            "the new hold member must not alter existing params: {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn account_for_counts_only_sent_unknown_hold_caps_not_real_zero_or_static_choices() {
+    let before = account_limit_hold_cap_unknown();
+    let credential = CredentialId::parse("oauth:anthropic").unwrap();
+    for (unknown, pinned, expected) in [(false, false, 0), (true, true, 0), (true, false, 1)] {
+        let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
+        let client = client(&routing);
+        choose_account(
+            &client,
+            ChoiceInputs {
+                hold_cap: AccountHoldCap {
+                    max_s: 0,
+                    evidence_unknown: unknown,
+                },
+                conversation_key: None,
+                inherited_conversation_key: None,
+                static_credential: &credential,
+                caller_named_account: pinned,
+                model: "claude-opus-5-5",
+                session: &session(),
+                send_id: None,
+                run_id: "run-1",
+                initial_input_bytes: 42,
+            },
+            async { Some(two_accounts()) },
+            tokio::time::Instant::now() + ADMISSION_BUDGET,
+        )
+        .await
+        .unwrap();
+        assert_eq!(account_limit_hold_cap_unknown(), before + expected);
+        if !pinned {
+            assert_eq!(
+                routing.requests.lock().unwrap()[0]["params"]["hold_wait_max_s"],
+                0
+            );
+        }
+    }
+}
 
 #[tokio::test]
 async fn account_selection_disabled_keeps_the_static_credential() {
@@ -276,6 +431,7 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
     let (choice, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
+            hold_cap: Default::default(),
             conversation_key: None,
             inherited_conversation_key: None,
             static_credential: &static_credential,
@@ -328,6 +484,7 @@ async fn a_slow_listing_shares_the_admission_budget() {
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            hold_cap: Default::default(),
             conversation_key: None,
             inherited_conversation_key: None,
             static_credential: &static_credential,
@@ -426,6 +583,7 @@ async fn a_routing_answer_names_the_credential_and_the_decision() {
             "admission_id": "run-1",
             "mode": "admit",
             "initial_input_bytes": 42,
+            "hold_wait_max_s": 0,
             "initial_input_estimated": true,
             "candidates": {
                 "view_digest": "vault-view-1",
@@ -451,6 +609,7 @@ async fn caller_affinity_changes_only_the_conversation_key_in_the_routing_body()
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            hold_cap: Default::default(),
             conversation_key: Some("consult:42:subject:phase"),
             inherited_conversation_key: None,
             static_credential: &credential,
@@ -778,6 +937,7 @@ async fn refusal_log_names_send_and_routing_decision() {
     let (result, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
+            hold_cap: Default::default(),
             conversation_key: None,
             inherited_conversation_key: None,
             static_credential: &credential,

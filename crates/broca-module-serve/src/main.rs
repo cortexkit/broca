@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use broca_core::{FileLeaseStore, FileWalStore};
-use broca_module::{DefaultOpener, LineageRegistry};
+use broca_module::LineageRegistry;
 use broca_module_serve::{
     spawn_catalog_poll, CatalogPoller, ChargeBasisTable, ConsumerRoutes, ServeEnd, ServeIoError,
 };
@@ -23,6 +23,7 @@ use subc_transport::{authenticate_client, connection_file};
 use tokio::net::TcpStream;
 
 mod composition;
+use composition::opener_for_state_root;
 mod state_format;
 use state_format::BackgroundTask;
 
@@ -243,8 +244,24 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // block refuses boot by name, like the sections above; without one, both stay off.
     let anthropic_fallbacks = broca_module_serve::config::AnthropicFallbackConfig::load_default()
         .map_err(ServeIoError)?;
+    let tool_name_aliases =
+        broca_module_serve::config::ToolNameAliasesConfig::load_default().map_err(ServeIoError)?;
+    for (route, aliases) in &tool_name_aliases.0 {
+        match aliases {
+            broca_module_serve::config::ToolAliasRoute::Names { names } if !names.is_empty() => {
+                tracing::info!(credential_route = %route, alias_count = names.len(), "tool name aliases configured");
+            }
+            broca_module_serve::config::ToolAliasRoute::Prefix { prefix_all } => {
+                tracing::info!(credential_route = %route, alias_count = "all", prefix = %prefix_all, "tool name aliases configured; concrete count resolved at admission");
+            }
+            _ => {}
+        }
+    }
     let account_limit_pause = broca_module_serve::config::AccountLimitPauseConfig::load_default()
         .map_err(ServeIoError)?;
+    if account_limit_pause.obsolete_account_limit_pause {
+        tracing::warn!(target: "config", "broca.jsonc key 'account_limit_pause' is obsolete and ignored; use 'max_same_account_wait' instead");
+    }
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
@@ -326,43 +343,15 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .flatten();
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
     let bus_hints = Arc::new(broca_module_serve::bus_events::Hints::default());
-    let mut stores = match state_format {
-        state_format::StateFormat::Legacy => composition::Stores::deferred_legacy(),
-        state_format::StateFormat::Overhaul => {
-            composition::Stores::open_overhaul(&state_root).map_err(ServeIoError)?
-        }
-    };
     let mut wal_store = FileWalStore::with_config(state_root.join("wal"), wal_config)
         .with_backup_classes(backup_classes.0);
     if bus_event_config.enabled {
         wal_store = wal_store.with_durable_observer(bus_hints.observer());
     }
-    if let Some(overhaul) = &stores.overhaul {
-        let publications = overhaul.publications.clone();
-        wal_store = wal_store.with_session_guard(Arc::new(move |session| {
-            publications.ensure_available(session)
-        }));
-        wal_store = wal_store.with_publication_observer(overhaul.publications.observer());
-        wal_store.set_session_ref_index(overhaul.db.clone());
-    }
-    let wal_store = Arc::new(wal_store);
-    // The state-root lock is held. Reap temporary names before WAL recovery.
-    broca_module::actor::writer_reclaim::reap_temporary_markers_at_boot(wal_store.clone())
+    let (mut stores, wal_store) = composition::Stores::boot(state_format, &state_root, wal_store)
         .await
         .map_err(ServeIoError)?;
-    if let Some(overhaul) = &mut stores.overhaul {
-        let wal = wal_store.clone();
-        let publications = overhaul.publications.clone();
-        // All writers are stopped under the root lock. No recovery or service
-        // reader is constructed until the index has caught up from every live WAL.
-        spawn_blocking(
-            JobKind::Recovery,
-            broca_wal::access_counter::inherit(move || publications.reconcile(&wal)),
-        )
-        .await
-        .map_err(|error| ServeIoError(format!("join boot index reconciliation: {error}")))?
-        .map_err(ServeIoError)?;
-        overhaul.start().map_err(ServeIoError)?;
+    if stores.overhaul.is_some() {
         start_media_sweep(&state_root);
     }
     let crash_orphan_wal = wal_store.clone();
@@ -505,7 +494,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Both content-filter fallback switches, read above with the other early config so the
     // refusal mapping can take its own switch from the same block.
     executor_impl = executor_impl.with_anthropic_fallbacks(anthropic_fallbacks);
-    executor_impl = executor_impl.with_account_limit_pause(account_limit_pause.enabled);
+    executor_impl = executor_impl.with_tool_name_aliases(tool_name_aliases);
+    executor_impl =
+        executor_impl.with_max_same_account_wait(account_limit_pause.max_same_account_wait);
     let charge_basis_table = Arc::new(ChargeBasisTable::load_default_path().map_err(ServeIoError)?);
     if let Some(notice) = charge_basis_table.ignored_version_notice() {
         tracing::warn!(target: "billing", "{notice}");
@@ -666,6 +657,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             account_selection,
         ));
         broca_module_serve::account_routing::publish_counters(routing.counters());
+        broca_module_serve::usage_observe::start(
+            Arc::clone(&vault_conn),
+            broca_protocol::BindIdentity::new(
+                state_root.to_string_lossy().to_string(),
+                "broca",
+                "quota",
+            ),
+        );
         // System One reads its provider keys by grant like a run does, on a vault route of its
         // own so its credential reads never queue behind a session's. Both providers share it.
         let system_one_vault = Arc::new(broca_subc::VaultClient::new(
@@ -1357,26 +1356,6 @@ mod runtime_shutdown_tests {
         release_unrelated.send(()).unwrap();
         process.join().unwrap();
         result.expect("an unrelated blocking job delayed runtime exit");
-    }
-}
-
-/// Select the writer-lease ownership policy for the state format.
-fn opener_for_state_root(
-    leases: Arc<FileLeaseStore>,
-    wal: Arc<FileWalStore>,
-    executor: Arc<dyn broca_module::executor::RunExecutor>,
-    format: state_format::StateFormat,
-    root: &Path,
-) -> Result<DefaultOpener<FileLeaseStore, FileWalStore>, ServeIoError> {
-    match format {
-        state_format::StateFormat::Legacy => Ok(DefaultOpener::new(leases, wal, executor)),
-        state_format::StateFormat::Overhaul => {
-            // Record the actual lease root before attaching its owned domain. The
-            // writer, not the actor, must retain authority if an extra Arc survives.
-            DefaultOpener::with_file_leases(root.join("leases"), wal, executor)
-                .with_lease_domain(broca_core::lease::WalLeaseDomain::new(root.join("leases")))
-                .map_err(|error| ServeIoError(error.to_string()))
-        }
     }
 }
 
@@ -3076,7 +3055,9 @@ mod executor {
         /// The operator switches and refusal-resend model mapping for Anthropic OAuth runs.
         /// Consulted only at admission; a resume keeps its recorded policy. Both switches default off.
         anthropic_fallbacks: broca_module_serve::config::AnthropicFallbackConfig,
-        account_limit_pause: bool,
+        tool_name_aliases: broca_module_serve::config::ToolNameAliasesConfig,
+        /// Boot-loaded wait bound shared by routing admission and new account-limit pauses.
+        max_same_account_wait: broca_core::SameAccountWait,
         /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
         /// its WAL could not be read), so the WAL is read for it at most once per session.
         cc_suffix_memo: Arc<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
@@ -3190,7 +3171,8 @@ mod executor {
                 routing: None,
                 claude_code_install_id: None,
                 anthropic_fallbacks: Default::default(),
-                account_limit_pause: false,
+                tool_name_aliases: Default::default(),
+                max_same_account_wait: Default::default(),
                 cc_suffix_memo: Default::default(),
                 cc_suffix_wal_bytes: Default::default(),
                 cc_prompt_memo: Default::default(),
@@ -3330,6 +3312,14 @@ mod executor {
         }
 
         /// Install the operator switches for Anthropic content-filter fallback.
+        pub fn with_tool_name_aliases(
+            mut self,
+            config: broca_module_serve::config::ToolNameAliasesConfig,
+        ) -> Self {
+            self.tool_name_aliases = config;
+            self
+        }
+
         pub fn with_anthropic_fallbacks(
             mut self,
             config: broca_module_serve::config::AnthropicFallbackConfig,
@@ -3338,8 +3328,8 @@ mod executor {
             self
         }
 
-        pub fn with_account_limit_pause(mut self, enabled: bool) -> Self {
-            self.account_limit_pause = enabled;
+        pub fn with_max_same_account_wait(mut self, setting: broca_core::SameAccountWait) -> Self {
+            self.max_same_account_wait = setting;
             self
         }
 
@@ -3406,10 +3396,10 @@ mod executor {
             &self,
             req: &broca_core::RunRequest,
             fresh_episode: bool,
-            pinned_method: Option<AuthMethod>,
-            pinned_account: Option<&str>,
+            pinned: (Option<AuthMethod>, Option<&str>),
             conversation_key: Option<&str>,
             inherited_conversation_key: Option<&str>,
+            hold_cap: broca_module_serve::account_routing::AccountHoldCap,
         ) -> Result<AccountChoice, broca_module_serve::account_routing::ChoiceRefusal> {
             if !fresh_episode || self.provider_base_url.is_some() {
                 return Ok(AccountChoice::NotApplicable);
@@ -3417,6 +3407,7 @@ mod executor {
             let (Some(vault), Some(routing)) = (self.vault.as_ref(), self.routing.as_ref()) else {
                 return Ok(AccountChoice::NotApplicable);
             };
+            let (pinned_method, pinned_account) = pinned;
             let static_credential = broca_module_serve::auth_routing::resolve_credential_id(
                 req.model.provider_module_id.as_str(),
                 pinned_method,
@@ -3441,6 +3432,7 @@ mod executor {
                     send_id: req.send_id.as_deref(),
                     run_id: &req.run_id.0,
                     initial_input_bytes,
+                    hold_cap,
                 },
                 latest_listing(Arc::clone(vault)),
                 deadline,
@@ -4133,7 +4125,7 @@ mod executor {
                     pause.message
                 )));
             }
-            let provider = broca_catalog::live::provider_for_recorded_config(
+            let provider = broca_catalog::live::provider_for_recorded_config_with_quota_observer(
                 provider_id,
                 &config.model.model_id,
                 frozen,
@@ -4143,6 +4135,11 @@ mod executor {
                 resolution.account_id.as_deref(),
                 self.provider_client.clone(),
                 &self.clock,
+                broca_module_serve::usage_observe::observer(
+                    provider_id,
+                    resolution.method.map(|method| method.as_token()),
+                    selection,
+                ),
             )
             .map_err(WarmError::Unavailable)?;
             broca_module::executor::send_warm_with_hook(
@@ -4286,10 +4283,25 @@ mod executor {
                 .choose_account_for_episode(
                     &job.req,
                     fresh_episode,
-                    pinned_method,
-                    pinned_account,
+                    (pinned_method, pinned_account),
                     job.conversation_key.as_deref(),
                     inherited_key,
+                    broca_module_serve::account_routing::account_hold_cap(
+                        self.max_same_account_wait,
+                        prior_snapshot
+                            .checkpoint_at_head
+                            .last_episode
+                            .as_ref()
+                            .map(|episode| &episode.config),
+                        job.control
+                            .clock
+                            .as_ref()
+                            .map_or_else(|| epoch_millis().max(0) as u64, |clock| clock.now_ms()),
+                        |account| {
+                            self.provider_client
+                                .session_last_accepted_at_ms(&job.req.session, account)
+                        },
+                    ),
                 )
                 .await
             {
@@ -4488,7 +4500,33 @@ mod executor {
             } else {
                 None
             };
+            let alias_route = resolution.method.map(|method| {
+                format!("{}:{}", method.as_token(), job.req.model.provider_module_id)
+            });
+            let admitted_tools: Vec<_> = job
+                .req
+                .tools
+                .iter()
+                .filter(|tool| job.req.policy_allowed.contains(&tool.name))
+                .cloned()
+                .collect();
+            let aliases = alias_route
+                .as_deref()
+                .map(|route| self.tool_name_aliases.for_tools(route, &admitted_tools))
+                .unwrap_or_default();
             let resolve_options = broca_catalog::live::ResolveOptions {
+                quota_observer: broca_module_serve::usage_observe::observer(
+                    job.req.model.provider_module_id.as_str(),
+                    resolution.method.map(|method| method.as_token()),
+                    if fresh_episode {
+                        resolution.selection.as_ref()
+                    } else {
+                        prior_run
+                            .as_ref()
+                            .and_then(|prior| prior.config.auth_selection.as_ref())
+                    },
+                ),
+                tool_name_aliases: fresh_episode.then_some((&admitted_tools, &aliases)),
                 media: fresh_episode,
                 media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
                 claude_code_persona: fresh_persona.as_ref(),
@@ -4836,7 +4874,8 @@ mod executor {
             // method-qualified vault credential id.
             let mut control = job.control;
             control.compaction_signals = self.compaction_signals;
-            control.account_limit_pause = self.account_limit_pause;
+            control.max_same_account_wait = self.max_same_account_wait;
+            control.account_limit_pause = self.max_same_account_wait.enabled();
             control.hook_plane = self.hook_plane();
             // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
             // the durable WAL projector. The actor's live-output task discards those same units,
@@ -5037,6 +5076,7 @@ mod executor {
         use super::*;
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
+        include!("tool_name_alias_tests.rs");
         include!("queued_service_tier_tests.rs");
         include!("service_tier_writer_tests.rs");
         include!("vault_request_tests.rs");
@@ -5692,6 +5732,7 @@ mod executor {
                         .into(),
                 ),
                 &broca_catalog::live::ResolveOptions {
+                    tool_name_aliases: None,
                     media: false,
                     media_profile: None,
                     claude_code_persona: None,
@@ -5711,6 +5752,7 @@ mod executor {
                     frozen_account_ref: None,
                     clock: None,
                     refusal_fallback_model: None,
+                    quota_observer: None,
                 },
             );
             match result {
@@ -5723,6 +5765,7 @@ mod executor {
         fn chatgpt_pause_only_construction_is_gated_and_repaired_resume_is_strict() {
             install_test_catalog();
             let options = broca_catalog::live::ResolveOptions {
+                tool_name_aliases: None,
                 media: false,
                 media_profile: None,
                 claude_code_persona: None,
@@ -5742,6 +5785,7 @@ mod executor {
                 frozen_account_ref: None,
                 clock: None,
                 refusal_fallback_model: None,
+                quota_observer: None,
             };
             let paused = AuthResolution {
                 mode: AuthMode::None,
