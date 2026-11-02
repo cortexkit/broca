@@ -712,14 +712,7 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
             #[cfg(test)]
             PREPARED_COPIES.with(|copies| copies.set(copies.get() + 1));
             let mut tools = Vec::clone(&opts.tools);
-            tools.push(Tool {
-                name: SUBMIT_RESULT_TOOL.to_owned(),
-                description: SUBMIT_RESULT_DESCRIPTION.to_owned(),
-                input_schema: so.schema(),
-                module: None,
-                execution_mode: Default::default(),
-                reply: None,
-            });
+            tools.push(submit_tool(so.schema()));
             view.tools = Arc::new(tools);
             Cow::Owned(view)
         }
@@ -756,6 +749,18 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
             Cow::Owned(view)
         }
         _ => Cow::Borrowed(opts),
+    }
+}
+
+/// The runner-owned declaration shared by admission, rendering and reply-name restoration.
+pub fn submit_tool(schema: Value) -> Tool {
+    Tool {
+        name: SUBMIT_RESULT_TOOL.to_owned(),
+        description: SUBMIT_RESULT_DESCRIPTION.to_owned(),
+        input_schema: schema,
+        module: None,
+        execution_mode: Default::default(),
+        reply: None,
     }
 }
 

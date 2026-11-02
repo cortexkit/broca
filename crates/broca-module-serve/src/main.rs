@@ -4504,13 +4504,22 @@ mod executor {
             let alias_route = resolution.method.map(|method| {
                 format!("{}:{}", method.as_token(), job.req.model.provider_module_id)
             });
-            let admitted_tools: Vec<_> = job
+            let mut admitted_tools: Vec<_> = job
                 .req
                 .tools
                 .iter()
                 .filter(|tool| job.req.policy_allowed.contains(&tool.name))
                 .cloned()
                 .collect();
+            // Operator aliases cover every declaration the model sees, including runner-owned
+            // tools. Only fresh episodes freeze this map; resumes keep their recorded names.
+            if let Some(so) = &job.req.structured_output {
+                if so.mode == broca_protocol::structured_output::Mode::SubmitTool {
+                    admitted_tools.push(broca_provider::structured_output::submit_tool(
+                        so.schema.clone(),
+                    ));
+                }
+            }
             let aliases = alias_route
                 .as_deref()
                 .map(|route| self.tool_name_aliases.for_tools(route, &admitted_tools))
