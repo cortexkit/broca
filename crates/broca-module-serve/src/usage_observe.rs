@@ -220,9 +220,19 @@ impl QuotaObserver for Observer {
         }
     }
     fn frame(&self, frame: &str, observed_at_ms: u64) {
-        if self.provider != Provider::Codex {
+        if self.provider != Provider::Codex
+            || !broca_provider::quota::frame_candidate(frame.as_bytes())
+        {
             return;
         }
+        self.observe_candidate(frame, observed_at_ms);
+    }
+    fn wants_frames(&self) -> bool {
+        self.provider == Provider::Codex
+    }
+}
+impl Observer {
+    fn observe_candidate(&self, frame: &str, observed_at_ms: u64) {
         let receive_order = self.queue.receive_order.fetch_add(1, Relaxed);
         #[derive(Deserialize)]
         struct Event<'a> {
@@ -241,11 +251,6 @@ impl QuotaObserver for Observer {
             );
         }
     }
-    fn wants_frames(&self) -> bool {
-        self.provider == Provider::Codex
-    }
-}
-impl Observer {
     fn row<'a>(
         &'a self,
         observed_at_ms: u64,

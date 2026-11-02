@@ -86,7 +86,7 @@ fn record_lines(record: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-fn record_data(record: &str) -> Option<String> {
+pub(crate) fn record_data(record: &str) -> Option<String> {
     let mut data_lines: Vec<&str> = Vec::new();
     for line in record_lines(record) {
         if line.is_empty() || line.starts_with(':') {
@@ -424,7 +424,7 @@ fn record_has_comment(record: &str) -> bool {
     record_lines(record).any(|line| line.starts_with(':'))
 }
 
-fn record_separator_len(bytes: &[u8], is_eof: bool) -> Option<usize> {
+pub(crate) fn record_separator_len(bytes: &[u8], is_eof: bool) -> Option<usize> {
     let first = eol_len(bytes, is_eof)?;
     let second = eol_len(&bytes[first..], is_eof)?;
     Some(first + second)

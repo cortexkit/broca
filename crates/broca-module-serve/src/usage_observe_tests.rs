@@ -212,8 +212,7 @@ fn quota_allowlist_includes_other_families_but_never_turn_state() {
 fn quota_raw_frame_keeps_number_and_whitespace_spelling() {
     let queue = Arc::new(Queue::default());
     let observer = tap(&queue, "openai", "chatgpt", "record", None);
-    let frame =
-        r#"{ "type": "codex.\u0072ate_limits", "rate_limits": {"used_percent":1.000e+00} }"#;
+    let frame = r#"{ "type": "codex.rate_limits", "rate_limits": {"used_percent":1.000e+00}, "raw":"\u0072" }"#;
     observer.frame(frame, 3);
     let locked = queue.pending.lock().unwrap();
     let row = locked.values().next().unwrap().row.get();
@@ -347,4 +346,85 @@ fn quota_equal_timestamp_uses_receipt_order_not_builder_completion_order() {
         pending(&queue)[0]["headers"]["x-codex-plan-type"],
         "latest-received"
     );
+}
+
+#[test]
+fn quota_frame_gate_skips_parse_and_atomic_for_ordinary_output() {
+    let queue = Arc::new(Queue::default());
+    let observer = tap(&queue, "openai", "chatgpt", "record", None);
+    for frame in [
+        r#"{"type":"response.output_text.delta","delta":"ordinary"}"#,
+        r#"{"type":"response.completed","response":{"output":[]}}"#,
+        "not JSON",
+    ] {
+        observer.frame(frame, 1);
+    }
+    assert_eq!(queue.receive_order.load(Relaxed), 0);
+    assert!(pending(&queue).is_empty());
+}
+
+#[test]
+fn quota_marker_in_text_delta_is_parsed_but_not_forwarded() {
+    let queue = Arc::new(Queue::default());
+    let observer = tap(&queue, "openai", "chatgpt", "record", None);
+    observer.frame(
+        r#"{"type":"response.output_text.delta","delta":"codex.rate_limits"}"#,
+        1,
+    );
+    assert_eq!(queue.receive_order.load(Relaxed), 1);
+    assert!(pending(&queue).is_empty());
+}
+
+#[test]
+#[ignore = "one-off optimized-build quota frame timing; run with --release --ignored --nocapture"]
+fn quota_frame_hot_path_release_timing() {
+    use std::{hint::black_box, time::Instant};
+    assert!(!black_box(cfg!(debug_assertions)), "measure with --release");
+    let observer = Observer {
+        queue: Arc::new(Queue::default()),
+        provider: Provider::Codex,
+        credential_id: "record".into(),
+        account: None,
+    };
+    let mut delta = json!({"type":"response.output_text.delta","delta":""});
+    let padding = 200 - delta.to_string().len();
+    delta["delta"] = json!("x".repeat(padding));
+    let delta = delta.to_string();
+    let mut completed = json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":""}]}]}});
+    let padding = 100 * 1024 - completed.to_string().len();
+    completed["response"]["output"][0]["content"][0]["text"] = json!("x".repeat(padding));
+    let completed = completed.to_string();
+    assert_eq!(delta.len(), 200);
+    assert_eq!(completed.len(), 100 * 1024);
+    fn elapsed_ns(iterations: u32, mut run: impl FnMut()) -> f64 {
+        let start = Instant::now();
+        for _ in 0..iterations {
+            run();
+        }
+        start.elapsed().as_nanos() as f64 / f64::from(iterations)
+    }
+    for (label, frame, iterations) in [
+        ("delta", &delta, 100_000),
+        ("completed", &completed, 10_000),
+    ] {
+        for _ in 0..1000 {
+            observer.observe_candidate(black_box(frame), 0);
+            observer.frame(black_box(frame), 0);
+        }
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for _ in 0..9 {
+            // Bypass only the new gate to reproduce the prior atomic plus full envelope parse.
+            before.push(elapsed_ns(iterations, || {
+                observer.observe_candidate(black_box(frame), 0)
+            }));
+            after.push(elapsed_ns(iterations, || {
+                observer.frame(black_box(frame), 0)
+            }));
+        }
+        before.sort_by(f64::total_cmp);
+        after.sort_by(f64::total_cmp);
+        println!("quota frame timing: {label} bytes={} samples=9 iterations_per_sample={iterations} before_ns={:.2} after_ns={:.2}", frame.len(), before[4], after[4]);
+    }
+    assert!(pending(&observer.queue).is_empty());
 }

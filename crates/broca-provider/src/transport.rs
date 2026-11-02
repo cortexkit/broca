@@ -753,6 +753,9 @@ impl ToolNameRestoringNormalizer {
 }
 
 impl StreamNormalizer for ToolNameRestoringNormalizer {
+    fn set_raw_sse_observer(&mut self, observer: crate::wire::RawSseObserver) {
+        self.inner.set_raw_sse_observer(observer);
+    }
     fn observe_error_response(&mut self, response: &Value) {
         self.inner.observe_error_response(response);
     }
@@ -1762,16 +1765,17 @@ async fn read_warm_body_legacy(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| failed(format!("warm answer unreadable: {error}")))?;
-        if let Some(tap) = &mut quota_sse {
-            tap.push(&chunk, now_millis());
-        }
+        let received_at = quota_sse.as_ref().map(|_| now_millis());
         if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
             return Err(failed("warm answer exceeded its size limit".into()));
         }
         body.extend_from_slice(&chunk);
+        if let Some(tap) = &mut quota_sse {
+            tap.push(&body, received_at.expect("quota tap timestamp"));
+        }
     }
     if let Some(tap) = &mut quota_sse {
-        tap.finish();
+        tap.finish(&body);
     }
     Ok(body)
 }
@@ -2082,17 +2086,18 @@ async fn read_warm_body(
             failed(format!("warm answer unreadable: {error}"))
         })?;
         envelope.response_bytes += chunk.len() as u64;
-        if let Some(tap) = &mut quota_sse {
-            tap.push(&chunk, now_millis());
-        }
+        let received_at = quota_sse.as_ref().map(|_| now_millis());
         if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
             envelope.outcome = broca_wal::record::BillingAttemptOutcome::ByteLimit;
             return Err(failed("warm answer exceeded its size limit".into()));
         }
         body.extend_from_slice(&chunk);
+        if let Some(tap) = &mut quota_sse {
+            tap.push(&body, received_at.expect("quota tap timestamp"));
+        }
     }
     if let Some(tap) = &mut quota_sse {
-        tap.finish();
+        tap.finish(&body);
     }
     Ok(body)
 }
@@ -2775,7 +2780,7 @@ fn dump_files_to_delete(
 use crate::request_dump::is_request_dump_filename;
 pub use crate::request_dump::request_dump_filename;
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     system_time_millis(SystemTime::now())
 }
 
@@ -4574,14 +4579,16 @@ where
     tokio::pin!(content);
     let mut completion = Vec::new();
     let mut rate_window = stream_floor_from_env().map(StreamRateWindow::new);
-    // Socket frames are tapped by the receive pump, before its bounded channel. SSE needs
-    // its own decoder so the normalizer's event surface remains untouched.
-    let quota_observer = trace.quota_observer.clone();
-    let mut quota_sse = crate::quota::SseTap::new(
-        quota_observer
-            .as_deref()
-            .filter(|_| trace.transport.as_deref() != Some("websocket")),
-    );
+    // Socket frames are tapped by the receive pump. SSE borrows the normalizer's decoded
+    // payloads so ordinary deltas incur no second decoder or per-record allocation.
+    if let Some(observer) = trace.quota_observer.as_ref().filter(|observer| {
+        observer.wants_frames() && trace.transport.as_deref() != Some("websocket")
+    }) {
+        let observer = observer.clone();
+        normalizer.set_raw_sse_observer(Arc::new(move |frame| {
+            crate::quota::observe_frame(observer.as_ref(), frame);
+        }));
+    }
 
     loop {
         let next = tokio::select! {
@@ -4625,9 +4632,6 @@ where
             failure
         })?;
         let chunk = bytes.as_ref();
-        if let Some(tap) = &mut quota_sse {
-            tap.push(chunk, now_millis());
-        }
         // Digest the raw chunk as received, before any limit or parse decision, so the record
         // covers every byte that arrived even when this chunk ends the attempt.
         trace.observe(chunk);
@@ -4727,9 +4731,6 @@ where
         }
     }
 
-    if let Some(tap) = &mut quota_sse {
-        tap.finish();
-    }
     // `finish` runs only at a clean end of body, and fails when the grammar cannot close the
     // step from what arrived (OpenAI Chat and Gemini report a missing terminal chunk here,
     // where Anthropic reports nothing and the completion check below catches it). Recording

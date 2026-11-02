@@ -159,3 +159,33 @@ async fn quota_recorded_warm_headers_and_sse_are_tapped() {
         );
     }
 }
+
+#[test]
+fn quota_normalizer_borrows_records_and_forwards_two_chunk_quota_once() {
+    for family in [
+        WireFamilyId::OpenAiResponses,
+        WireFamilyId::OpenAiResponsesChatgpt,
+    ] {
+        let frozen = frozen_config_for_family(family, "m");
+        let mut normalizer: Box<dyn StreamNormalizer> = match family {
+            WireFamilyId::OpenAiResponses => OpenAiResponses.normalizer(&frozen, StepId(1)),
+            _ => OpenAiResponsesChatgpt.normalizer(&frozen, StepId(1)),
+        };
+        let capture = Arc::new(crate::quota::tests::Capture::default());
+        let observed = capture.clone();
+        normalizer.set_raw_sse_observer(Arc::new(move |frame| {
+            crate::quota::observe_frame(observed.as_ref(), frame)
+        }));
+        normalizer.push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ordinary\"}\n\n").unwrap();
+        assert_eq!(capture.frame_calls.load(Ordering::Relaxed), 0);
+        let payload = r#"{ "type": "codex.rate_limits", "rate_limits": null }"#;
+        let wire = format!("data: {payload}\n\n");
+        let split = wire.find("rate_limits").unwrap() + 4;
+        normalizer.push(&wire.as_bytes()[..split]).unwrap();
+        assert_eq!(capture.frame_calls.load(Ordering::Relaxed), 0);
+        normalizer.push(&wire.as_bytes()[split..]).unwrap();
+        normalizer.finish().unwrap();
+        assert_eq!(capture.frame_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(capture.frames.lock().unwrap()[0].0, payload);
+    }
+}

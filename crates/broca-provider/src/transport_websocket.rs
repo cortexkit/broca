@@ -913,7 +913,7 @@ where
                 let record = match message {
                     Some(Ok(Message::Text(text))) => {
                         if let Some(observer) = &quota_observer {
-                            observer.frame(&text, super::now_millis());
+                            crate::quota::observe_frame(observer.as_ref(), &text);
                         }
                         frames.text_received.fetch_add(1, Ordering::Relaxed);
                         Ok(text.as_bytes().to_vec())

@@ -313,6 +313,9 @@ struct ChatgptNormalizer {
 }
 
 impl StreamNormalizer for ChatgptNormalizer {
+    fn set_raw_sse_observer(&mut self, observer: crate::wire::RawSseObserver) {
+        self.inner.set_raw_sse_observer(observer);
+    }
     fn observe_error_response(&mut self, response: &serde_json::Value) {
         self.inner.observe_error_response(response);
     }
