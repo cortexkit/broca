@@ -162,7 +162,7 @@ broca specifics:
   | `variant_unsupported` | `permanent` | `{model, variant, defined}` |
   | `wal_newer_writer` | `permanent` | `{kind: "newer_writer", missing: [<feature names>]}` |
   | `agent_run_scopes_unsupported` | `permanent` | `{<session scope>}` |
-  | `session_log_missing` | `detail.class: permanent` | `{class, session, harness}`; historical content exists but no log or deliberate-removal proof is reachable; stop broca and inspect `store-maintenance repair-session-root` |
+  | `session_log_missing` | `detail.class: permanent` | `{class, session, harness}`; a writer would recreate historical content or a read would falsely report empty history; existing named refusals and valid index answers keep precedence; stop broca and inspect `store-maintenance repair-session-root` |
 
 - Principal-specific admission refusals `flow_scope_required` and `sender_not_owner` carry a
   top-level `class: "permanent"` beside `code`, `message`, and `detail: {kind, principal}`.

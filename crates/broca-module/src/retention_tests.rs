@@ -5366,6 +5366,12 @@ async fn cold_forever_status_uses_bounded_wal_without_opening_actor() {
         fn wal_present(&self, key: &BindIdentity) -> Option<bool> {
             self.inner.wal_present(key)
         }
+        fn wal_present_checked(
+            &self,
+            key: &BindIdentity,
+        ) -> Result<Option<bool>, broca_wal::WalError> {
+            self.inner.wal_present_checked(key)
+        }
     }
     let rig = Rig::new();
     let mut wal = rig.service.wal.open(&rig.key).unwrap();

@@ -596,6 +596,9 @@ impl WalStore for StatusCostWal {
     fn wal_present(&self, key: &BindIdentity) -> Option<bool> {
         self.inner.wal_present(key)
     }
+    fn wal_present_checked(&self, key: &BindIdentity) -> Result<Option<bool>, broca_wal::WalError> {
+        self.inner.wal_present_checked(key)
+    }
     fn file_identity(&self, key: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
         self.inner.file_identity(key)
     }

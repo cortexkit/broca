@@ -24,10 +24,14 @@ An identity reservation alone remains a new session, including after an interrup
 first bind. Subscribe-before-send may create its first lineage, preserving the
 subscriber's cursor origin. Historical content is different: any run-index row,
 materialized projection/meta row, covered log census entry, or deletion
-ledger/tombstone for the exact key is content evidence. When that evidence exists
-but neither a live log nor an archive member is available, reads and actor-opening
-operations refuse `session_log_missing` (`detail.class: "permanent"`) unless removal
-is proven deliberate. A verified lineage-only log cannot cover any recorded run:
+ledger/tombstone for the exact key is content evidence. Before a new writer open,
+or an otherwise empty transcript, head, baseline or ownership answer, unexplained
+missing history refuses `session_log_missing` (`detail.class: "permanent"`).
+Existing named refusals retain precedence: materialized-history reads still use
+`history_unreachable`, and cursor refusals retain their established bytes. Correct
+terminal-index `run.status`/`run.result` answers and non-opening idle status remain
+available; missing final text keeps its original unreadable-start refusal. A
+verified lineage-only log cannot cover any recorded run:
 if run-index rows exist for the identity, their run IDs are absent from its
 `run_started` records, so it receives the same refusal even when lineage is NULL
 on either side. Metadata-only imports without run rows retain their existing
@@ -46,7 +50,10 @@ roots, OverhaulDb loads its own indexed session/run observations and independent
 retention, removal and imported-run evidence from `broca.db`; its identity-only
 `session_identity` rows remain reservations, not content. SQL or schema failures,
 or content hints without a usable run/lineage proof, return errors rather than
-certifying an available or new session. Older removal proof cannot excuse a
+certifying an available or new session. A fallible presence probe retains typed
+WAL errors, so temporary I/O keeps its original cause and transient class rather
+than becoming an opaque `open_failed`. Reader errors run before the extra empty-
+history refusal. Older removal proof cannot excuse a
 different current lineage or unidentified imported history.
 
 Status polling for large sessions or runs left active by a crash may still recover

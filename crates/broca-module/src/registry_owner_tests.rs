@@ -2081,3 +2081,30 @@ async fn session_log_guard_available_fast_path_measurement() {
     eprintln!("CHECK_SESSION_LOG_END iterations={ITERATIONS} total_ns={elapsed} mean_ns={} p50_ns={} p99_ns={}",
         elapsed / ITERATIONS as u128, samples[ITERATIONS / 2], samples[ITERATIONS * 99 / 100 - 1]);
 }
+
+#[test]
+fn log_state_inventory_io_keeps_proven_transient_class_and_cause() {
+    for error in [
+        broca_store::session_log_evidence::SessionLogError::Inventory(Box::new(
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "temporary inventory read"),
+        )),
+        broca_store::session_log_evidence::SessionLogError::Inventory(Box::new(
+            broca_store::db::DbError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "temporary inventory read",
+            )),
+        )),
+    ] {
+        let result = OpenError::from_log_state(error);
+        assert!(
+            matches!(result, OpenError::Classified { ref reason, class: broca_protocol::ErrorClass::Transient } if reason.contains("temporary inventory read")),
+            "{result:?}"
+        );
+    }
+    let opaque = OpenError::from_log_state(
+        broca_store::session_log_evidence::SessionLogError::Inventory(Box::new(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "opaque inventory failure"),
+        )),
+    );
+    assert!(matches!(opaque, OpenError::Open(_)), "{opaque:?}");
+}

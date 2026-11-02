@@ -307,6 +307,9 @@ impl WalStore for ObservedWalStore {
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
         WalStore::wal_present(&self.inner, session)
     }
+    fn wal_present_checked(&self, session: &BindIdentity) -> Result<Option<bool>, WalError> {
+        WalStore::wal_present_checked(&self.inner, session)
+    }
 
     fn live_wal_last_write(
         &self,

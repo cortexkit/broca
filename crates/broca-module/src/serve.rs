@@ -1654,12 +1654,42 @@ pub enum ServeError {
     },
 }
 
+impl ServeError {
+    fn from_history_read(
+        error: OpenError,
+        requested: Option<&str>,
+        after: Option<(Option<u64>, &str)>,
+    ) -> Self {
+        if let OpenError::SessionLogMissing {
+            read: Some(read), ..
+        } = &error
+        {
+            if let Some(requested) = requested {
+                if read.lineage_id.as_deref() != Some(requested) {
+                    return Self::LineageChanged {
+                        requested: requested.into(),
+                    };
+                }
+            }
+            if read.tags_await_setup {
+                return Self::TagsAwaitSetup;
+            }
+            if let (Some(prompt_len), Some((after, mid))) = (read.prompt_len, after) {
+                if !after.is_some_and(|ordinal| ordinal < prompt_len) {
+                    return Self::UnknownMid(mid.into());
+                }
+            }
+        }
+        Self::from(error)
+    }
+}
+
 impl From<OpenError> for ServeError {
     fn from(e: OpenError) -> Self {
         match e {
-            OpenError::SessionLogMissing { session, harness } => {
-                Self::SessionLogMissing { session, harness }
-            }
+            OpenError::SessionLogMissing {
+                session, harness, ..
+            } => Self::SessionLogMissing { session, harness },
             OpenError::SessionMoving { cut_id } => Self::SessionMoving { cut_id },
             OpenError::SessionMoved { holder } => Self::SessionMoved { holder },
             OpenError::Expired { expired_at_ms } => ServeError::Expired { expired_at_ms },
@@ -1689,7 +1719,7 @@ impl From<OpenError> for ServeError {
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ServeError::SessionLogMissing { session, harness } => OpenError::SessionLogMissing { session: session.clone(), harness: harness.clone() }.fmt(f),
+            ServeError::SessionLogMissing { session, harness } => OpenError::SessionLogMissing { session: session.clone(), harness: harness.clone(), read: None }.fmt(f),
             Self::Upload(error) => error.fmt(f),
             ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
             ServeError::SessionMoving { cut_id } => write!(f, "session is moving under cut {cut_id}"),
@@ -2509,7 +2539,10 @@ impl ServeHandler for crate::LineageRegistry {
                     max_bytes: req.max_bytes,
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                ServeError::from_history_read(error, req.lineage_id.as_deref(), None)
+            })?;
         if req
             .lineage_id
             .as_ref()
@@ -3022,9 +3055,6 @@ impl ServeHandler for crate::LineageRegistry {
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::BindScope,
     ) -> Result<Option<broca_core::AdoptionRefusal>, ServeError> {
-        // A missing log must not look unwritten to adoption, or become an
-        // opaque, transient ownership-read failure instead of a named refusal.
-        self.check_session_log(session).await?;
         let ownership = match self.bind_ownership(session).await {
             crate::registry::BindOwnership::Known(ownership) => ownership,
             crate::registry::BindOwnership::NoHistorySource => return Ok(None),
@@ -3037,6 +3067,11 @@ impl ServeHandler for crate::LineageRegistry {
                 ));
             }
         };
+        if ownership.episodes == 0 {
+            // Only a successful empty ownership read needs the extra fence;
+            // existing unreadable-history refusals keep their code and cause.
+            self.check_session_log(session).await?;
+        }
         match broca_core::decide_scope(
             &ownership,
             principal,
@@ -3154,32 +3189,36 @@ impl ServeHandler for crate::LineageRegistry {
             Some(None) => Some(u64::MAX),
             None => req.from_ordinal,
         };
-        let crate::registry::RouteReadPage {
-            mut page,
-            tools,
-            dispatches,
-            open_batch,
-            ..
-        } = self
+        let read = self
             .route_read_page(
                 &req.session,
                 if late_only { Some(0) } else { from_ordinal },
                 if late_only { Some(0) } else { req.limit },
                 req.include_tools && !late_only,
             )
-            .await
-            .map_err(|error| {
-                if late_only && matches!(error, crate::registry::OpenError::Expired { .. }) {
-                    let refusal =
-                        broca_wire::InvalidLateCursor::new(req.late_after.as_deref().unwrap());
-                    ServeError::InvalidParams {
-                        field: refusal.detail.field,
-                        message: refusal.message,
-                    }
-                } else {
-                    ServeError::from(error)
+            .await;
+        let crate::registry::RouteReadPage {
+            mut page,
+            tools,
+            dispatches,
+            open_batch,
+            ..
+        } = read.map_err(|error| {
+            if late_only && matches!(error, crate::registry::OpenError::Expired { .. }) {
+                let refusal =
+                    broca_wire::InvalidLateCursor::new(req.late_after.as_deref().unwrap());
+                ServeError::InvalidParams {
+                    field: refusal.detail.field,
+                    message: refusal.message,
                 }
-            })?;
+            } else {
+                ServeError::from_history_read(
+                    error,
+                    req.lineage_id.as_deref(),
+                    after.zip(req.after_mid.as_deref()),
+                )
+            }
+        })?;
         if let Some(requested) = &req.lineage_id {
             let current = page.lineage_id.map(|lineage_id| lineage_id.to_string());
             if current.as_deref() != Some(requested.as_str()) {
@@ -3879,6 +3918,8 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<broca_wire::BaselineReply, ServeError> {
         let (records, _) = self.read_durable_wal(session).await?;
         let Some(start) = first_run_started(&records) else {
+            // Missing history must not be reported as a never-written baseline.
+            self.check_session_log(session).await?;
             return Ok(broca_wire::BaselineReply::not_yet());
         };
         if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {

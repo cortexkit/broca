@@ -1216,6 +1216,52 @@ async fn run_status_falls_back_to_the_terminal_index_when_the_wal_is_absent() {
     rig.finish().await;
 }
 
+#[tokio::test]
+async fn cancelled_run_result_keeps_the_terminal_index_answer_without_a_wal() {
+    let mut rig =
+        Rig::start_with_idle_ttl("cancelled-result-absent", Duration::from_millis(100)).await;
+    rig.script.hold_model(true);
+    rig.script.push(&[Step::Text("not delivered")]);
+    let sent = rig.send("turn-0", "go", None).await;
+    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_entered().await;
+    rig.cancel(&run_id).await;
+    rig.script.hold_model(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig.wait_closed().await;
+    std::fs::remove_file(&rig.wal_path).unwrap();
+    let answer = result(&call(&mut rig, "run.result", serde_json::json!({"run_id":run_id})).await);
+    assert_eq!(answer["state"], "cancelled");
+    assert!(answer["final_message"].is_null());
+    assert!(!rig.wal_path.exists());
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn completed_run_result_without_a_wal_keeps_its_unreadable_start_refusal() {
+    let mut rig =
+        Rig::start_with_idle_ttl("completed-result-absent", Duration::from_millis(100)).await;
+    rig.script.push(&[Step::Text("answer")]);
+    let sent = rig.send("turn-0", "go", None).await;
+    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig.wait_closed().await;
+    std::fs::remove_file(&rig.wal_path).unwrap();
+    let reply = call(&mut rig, "run.result", serde_json::json!({"run_id":run_id})).await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+    let error: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(error["code"], "open_failed");
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("has no readable RunStarted"));
+    assert!(error.get("detail").is_none());
+    assert!(!rig.wal_path.exists());
+    rig.finish().await;
+}
+
 /// A durable pause retains its reason after folding, without recreating the live WAL.
 #[tokio::test]
 async fn paused_run_answers_from_an_archived_session_without_restoring_it() {
