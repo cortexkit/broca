@@ -6373,8 +6373,20 @@ where
                 crate::compaction_v2::host::frozen(&frames).map_err(RunError::Wal)?;
             let chained = provider.history_edit_cost()
                 == Some(crate::compaction_provider::notice::HistoryEditCost::FullResend);
-            let conditions =
-                crate::compaction_v2::host::conditions(&config, chained).map_err(RunError::Wal)?;
+            // A missing frozen limit ends the run as `compaction_unavailable` before any model
+            // I/O, the same way the step boundary does; it is never a WAL error.
+            let conditions = match crate::compaction_v2::host::conditions(&config, chained) {
+                Ok(conditions) => conditions,
+                Err(message) => {
+                    terminal_error = Some(crate::compaction::runtime::error(
+                        None,
+                        &message,
+                        Some("compaction_unavailable".into()),
+                        false,
+                    ));
+                    break RunFinishReason::Error;
+                }
+            };
             let current = crate::compaction_v2::host::context(&config, manifest);
             let previous = crate::compaction_v2::host::previous(&frames);
             let now = control.now_ms().unwrap_or_else(crate::compaction::now);

@@ -172,6 +172,12 @@ pub async fn notice(
         return Ok(());
     };
     let preset = preset.ok_or("mode-3 compaction preset must be a string")?;
+    // Without a frozen window no conditions can be stated, so nothing is announced. Admission
+    // never lets such a run start; if one is resumed anyway, its next step boundary ends it
+    // as `compaction_unavailable` before any model I/O.
+    if config.context_limit.is_none() {
+        return Ok(());
+    }
     let lineage = writer
         .lineage_id()
         .ok_or("mode-3 compaction requires a WAL lineage")?
