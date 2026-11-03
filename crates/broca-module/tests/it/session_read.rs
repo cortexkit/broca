@@ -4810,12 +4810,12 @@ async fn an_imported_message_never_takes_a_real_steps_attribution() {
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert_eq!(
             (calls[0].0, calls[0].2.as_deref(), calls[0].3.as_deref()),
-            (1, None, None),
+            (2, None, None),
             "the imported call: {calls:?}"
         );
         assert_eq!(
             (calls[1].0, calls[1].3.as_deref()),
-            (4, Some("aft")),
+            (5, Some("aft")),
             "{calls:?}"
         );
         assert!(calls[1].2.is_some(), "the real call has a key: {calls:?}");

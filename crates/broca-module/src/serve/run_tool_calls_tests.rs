@@ -564,14 +564,14 @@ async fn run_tool_calls_ordinals_match_session_read_across_a_materialized_prefix
     assert_eq!(
         transcript_calls,
         vec![
-            (0, "first-call".into()),
-            (0, "second-call".into()),
-            (0, "third-call".into()),
-            (3, "open-call".into()),
+            (1, "first-call".into()),
+            (1, "second-call".into()),
+            (1, "third-call".into()),
+            (4, "open-call".into()),
         ]
     );
     assert!(transcript.messages.iter().any(|message| {
-        message.ordinal == 2
+        message.ordinal == 3
             && message.message.role == Role::User
             && message.message.content.iter().any(
                 |block| matches!(block, ContentBlock::Text { text } if text == "between turns"),

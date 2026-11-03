@@ -1036,8 +1036,8 @@ mod tests {
     #[test]
     fn attach_puts_each_descriptor_on_its_row_or_call() {
         let refs = MessageOutputRefs {
-            reply: set("l/m3", None),
-            calls: vec![("call-b".into(), set("l/m3/c2", Some("l:9")))],
+            reply: set("h1.bA.1/m3", None),
+            calls: vec![("call-b".into(), set("h1.bA.1/m3/c2", Some("l:9")))],
         };
         let row = DisplayRow::new(
             "assistant",
@@ -1060,7 +1060,7 @@ mod tests {
             ],
         );
         let row = refs.attach(row);
-        assert_eq!(row.output_refs.as_ref().unwrap().set_id, "l/m3");
+        assert_eq!(row.output_refs.as_ref().unwrap().set_id, "h1.bA.1/m3");
         let calls: Vec<_> = row
             .parts
             .iter()
@@ -1071,7 +1071,7 @@ mod tests {
             .collect();
         assert_eq!(calls[0], None);
         let attached = calls[1].as_ref().unwrap();
-        assert_eq!(attached.set_id, "l/m3/c2");
+        assert_eq!(attached.set_id, "h1.bA.1/m3/c2");
         assert_eq!(attached.call_key.as_deref(), Some("l:9"));
     }
 
@@ -1090,7 +1090,7 @@ mod tests {
         ]}})).unwrap();
         let target = target_of(&results, 1, Some(&calls)).unwrap();
         let set = resolve_set(
-            "l/m3".into(),
+            "h1.bA.1/m3".into(),
             "m3",
             None,
             &BTreeMap::from([(1, target)]),

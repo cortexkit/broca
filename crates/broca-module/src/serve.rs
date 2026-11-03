@@ -5179,9 +5179,14 @@ mod raw_database_composition_tests {
             .run_future(raw.head(&key))
             .await
             .unwrap();
+        // Each store allocates its own history version when it first serves the session; every
+        // other byte must match.
+        let mut legacy_head = legacy.head(&key).await.unwrap();
+        assert!(raw_head.history_version > 0 && legacy_head.history_version > 0);
+        legacy_head.history_version = raw_head.history_version;
         assert_eq!(
             serde_json::to_vec(&raw_head).unwrap(),
-            serde_json::to_vec(&legacy.head(&key).await.unwrap()).unwrap()
+            serde_json::to_vec(&legacy_head).unwrap()
         );
         for from in [None, Some(0), Some(1), Some(500)] {
             let request = SessionReadRequest::new(key.clone(), from, Some(1));
@@ -5190,9 +5195,11 @@ mod raw_database_composition_tests {
                 .run_future(raw.read(request.clone()))
                 .await
                 .unwrap();
+            let mut expected = legacy.read(request).await.unwrap();
+            expected.history_version = actual.history_version;
             assert_eq!(
-                serde_json::to_vec(&actual).unwrap(),
-                serde_json::to_vec(&legacy.read(request).await.unwrap()).unwrap()
+                String::from_utf8(serde_json::to_vec(&actual).unwrap()).unwrap(),
+                String::from_utf8(serde_json::to_vec(&expected).unwrap()).unwrap()
             );
         }
         let mut request = SessionReadRequest::new(key.clone(), None, Some(1));
@@ -5264,9 +5271,11 @@ mod raw_database_composition_tests {
                 .run_future(raw.read(request.clone()))
                 .await
                 .unwrap();
+            let mut expected = legacy.read(request).await.unwrap();
+            expected.history_version = actual.history_version;
             assert_eq!(
-                serde_json::to_vec(&actual).unwrap(),
-                serde_json::to_vec(&legacy.read(request).await.unwrap()).unwrap()
+                String::from_utf8(serde_json::to_vec(&actual).unwrap()).unwrap(),
+                String::from_utf8(serde_json::to_vec(&expected).unwrap()).unwrap()
             );
         }
         assert!(!root.join("run-index.db").exists());

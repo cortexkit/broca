@@ -2695,7 +2695,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 self.prior_snapshot = None;
                 let result = if matches!(self.state, RunState::Idle) {
                     async {
-                        self.refresh_admission_view().await?;
+                        Box::pin(self.refresh_admission_view()).await?;
                         self.drain_queue_one().await
                     }
                     .await
@@ -3011,7 +3011,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Ok(outcome) => {
                 self.registry.invalidate_history_caches(&self.key);
                 self.prior_snapshot = None;
-                if let Err(error) = self.refresh_admission_view().await {
+                if let Err(error) = Box::pin(self.refresh_admission_view()).await {
                     tracing::warn!(
                         target: "admission",
                         "admission view refresh after import failed: {error}"
@@ -3178,11 +3178,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if !self.pending_cancels.is_empty() && matches!(self.state, RunState::Idle) {
             return self.retry_pending_cancels().await;
         }
-        self.refresh_admission_view().await?;
+        Box::pin(self.refresh_admission_view()).await?;
         if self.seal_crash_orphan().await? {
             // The episode now ends in a durable terminal; recover from that view, which
             // backfills its usage export and drains any queued turn exactly as after a seal.
-            self.refresh_admission_view().await?;
+            Box::pin(self.refresh_admission_view()).await?;
         }
         let snapshot = self
             .prior_snapshot
@@ -3205,7 +3205,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if broca_core::resume::provider_held_closing_reason(&tail_prior, tail.iter()).is_some() {
             self.write_interrupted_seal(None, SealCause::CrashOrphan)
                 .await?;
-            self.refresh_admission_view().await?;
+            Box::pin(self.refresh_admission_view()).await?;
             return self.drain_queue_one().await;
         }
         let tail_resolution = tail_prior.resolution;
@@ -3219,7 +3219,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         {
             self.write_interrupted_seal(None, SealCause::CrashOrphan)
                 .await?;
-            self.refresh_admission_view().await?;
+            Box::pin(self.refresh_admission_view()).await?;
             return self.drain_queue_one().await;
         }
 
@@ -3281,7 +3281,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     episode_pause_reason == Some(broca_protocol::PauseReason::ToolHeld),
                 )
                 .await?;
-                self.refresh_admission_view().await?;
+                Box::pin(self.refresh_admission_view()).await?;
                 return Ok(());
             }
             // Approval cards stay live; a delivered batch with no open held call owes its barrier.
@@ -3334,7 +3334,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         Some(refusal),
                     )
                     .await?;
-                    self.refresh_admission_view().await?;
+                    Box::pin(self.refresh_admission_view()).await?;
                     self.drain_queue_one().await
                 }
                 Err(error) => Err(error.to_string()),
@@ -3420,7 +3420,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                             Some(refusal),
                         )
                         .await?;
-                        self.refresh_admission_view().await
+                        Box::pin(self.refresh_admission_view()).await
                     }
                     .await;
                     if let Err(seal_error) = sealed {
@@ -3448,7 +3448,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .write_interrupted_seal(None, SealCause::CrashOrphan)
                 .await?
             {
-                self.refresh_admission_view().await?;
+                Box::pin(self.refresh_admission_view()).await?;
             }
             return self.drain_queue_one().await;
         }
@@ -3479,7 +3479,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             {
                 self.write_interrupted_seal(None, SealCause::CrashOrphan)
                     .await?;
-                self.refresh_admission_view().await?;
+                Box::pin(self.refresh_admission_view()).await?;
                 return self.drain_queue_one().await;
             }
             // The cache preference is resolved during admission but is not stored in LastEpisodeV1.
@@ -3941,7 +3941,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // rather than reading the log on every send; only a send while a run is live loads it.
         let checkpoint = match self.prior_snapshot.as_ref() {
             Some(snapshot) => snapshot.checkpoint_at_head.clone(),
-            None => match self.load_checkpoint_at_head().await {
+            // Boxed: the send future runs on small worker stacks under restart admission.
+            None => match Box::pin(self.load_checkpoint_at_head()).await {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => return SendOutcome::Transient(error),
             },
@@ -4593,7 +4594,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// session from one with no run at all.
     async fn paused_run(&mut self) -> Result<Option<(RunId, broca_protocol::PauseReason)>, String> {
         if self.prior_snapshot.is_none() {
-            self.refresh_admission_view().await?;
+            Box::pin(self.refresh_admission_view()).await?;
         }
         Ok(self
             .prior_snapshot
@@ -5225,7 +5226,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // A command can queue/cancel work and start its successor in the same actor turn.
         self.discard_stale_admission_view();
         if self.prior_snapshot.is_none() {
-            if let Err(error) = self.refresh_admission_view().await {
+            if let Err(error) = Box::pin(self.refresh_admission_view()).await {
                 return Err(StartRunFailure::Infrastructure(error));
             }
         }
@@ -7817,7 +7818,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
         // Rebuild the original episode from the durable admission view. This works both after a
         // same-process pause and after the actor has closed and reopened with no in-memory request.
-        self.refresh_admission_view().await?;
+        Box::pin(self.refresh_admission_view()).await?;
         if self
             .prior_snapshot
             .as_ref()
@@ -8253,7 +8254,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 );
             }
         } else {
-            match self.refresh_admission_view().await {
+            match Box::pin(self.refresh_admission_view()).await {
                 Ok(()) => {
                     if summary.paused == Some(broca_protocol::PauseReason::AccountLimit) {
                         if let Err(error) = self.arm_account_limit().await {

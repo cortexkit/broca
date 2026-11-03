@@ -18,10 +18,13 @@ async fn responses(rig: &Rig, key: &BindIdentity) -> Vec<Value> {
     let mut page = serde_json::to_value(page).unwrap();
     // Control cursors name physical WAL sequences, which interleaved frames necessarily move.
     page.as_object_mut().unwrap().remove("head");
+    // A mode-3 log's message ids carry its lineage prefix, so read history from the session's
+    // own first message id.
+    let first_mid = page["messages"][0]["mid"].clone();
     let mut responses = vec![page];
     for form in ["raw", "display"] {
         let request =
-            serde_json::from_value(json!({"from_mid":"m0","limit":100,"form":form})).unwrap();
+            serde_json::from_value(json!({"from_mid":first_mid,"limit":100,"form":form})).unwrap();
         let mut history = broca_module::history::read(&rig.registry, key, &request)
             .await
             .unwrap();
@@ -53,7 +56,34 @@ async fn responses(rig: &Rig, key: &BindIdentity) -> Vec<Value> {
         None,
         "reads never start an executor"
     );
+    // The two logs differ only in their message-id form (`m<prefix>.N` in mode 3, `mN` in a
+    // legacy log); compare everything else.
     responses
+        .into_iter()
+        .map(|response| {
+            let text = serde_json::to_string(&response).unwrap();
+            let mut out = String::with_capacity(text.len());
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find("\"m") {
+                out.push_str(&rest[..at + 2]);
+                rest = &rest[at + 2..];
+                let prefix = rest.as_bytes();
+                if prefix.len() > 9
+                    && prefix[..8].iter().all(u8::is_ascii_hexdigit)
+                    && prefix[8] == b'.'
+                {
+                    rest = &rest[9..];
+                }
+            }
+            out.push_str(rest);
+            let mut value: Value = serde_json::from_str(&out).unwrap();
+            // Each session allocates its own history version from its first served read.
+            if let Some(version) = value.get_mut("history_version") {
+                *version = json!("@HISTORY_VERSION@");
+            }
+            value
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -143,7 +173,8 @@ async fn compaction_v2_is_invisible_to_read_history_status_result_and_store_proj
             let messages = expected[0]["messages"].as_array().unwrap();
             assert!(!messages.is_empty());
             for (i, message) in messages.iter().enumerate() {
-                assert_eq!(message["ordinal"], i as u64);
+                // Public ordinals start at 1; message ids keep the stored position.
+                assert_eq!(message["ordinal"], i as u64 + 1);
                 assert_eq!(message["mid"], format!("m{i}"));
             }
         }

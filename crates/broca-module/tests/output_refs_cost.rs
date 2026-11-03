@@ -366,18 +366,25 @@ fn seed(rig: &Rig, episodes: u64, compacts: bool) {
 async fn final_reply(rig: &Rig, episodes: u64, label: &str) -> Vec<serde_json::Value> {
     let key = rig.key();
     let last = 4 * episodes - 1;
-    let lineage = rig
+    let page = rig
         .registry
         .read(broca_module::serve::SessionReadRequest::new(
             key.clone(),
-            Some(last),
+            Some(last + 1),
             Some(1),
         ))
         .await
-        .unwrap()
-        .lineage_id
         .unwrap();
-    let set = format!("{lineage}/m{last}");
+    // A reply's set id is scoped to the history snapshot it was served from and names the
+    // message by its stored position.
+    let set = {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        format!(
+            "h1.{}.{}/m{last}",
+            URL_SAFE_NO_PAD.encode(page.incarnation.as_bytes()),
+            page.history_version
+        )
+    };
     // The frozen plan comes from the session's ownership fold, which a route bind computes and
     // caches before any request on it. Measured apart, so the operations below show their own
     // cost on a bound route.
@@ -390,7 +397,7 @@ async fn final_reply(rig: &Rig, episodes: u64, label: &str) -> Vec<serde_json::V
         rig.registry
             .read(broca_module::serve::SessionReadRequest::new(
                 key.clone(),
-                Some(last),
+                Some(last + 1),
                 Some(1),
             ))
             .await
@@ -607,7 +614,7 @@ async fn history_never_invents_creation_times_for_legacy_records() {
         matches!(
             reply,
             Err(broca_module::history::HistoryError::Unrepresentable {
-                ordinal: 0,
+                ordinal: 1,
                 field: "written_at"
             })
         ),
@@ -721,7 +728,7 @@ async fn pre_message_times_history_uses_legacy_clocks_and_reports_remaining_gaps
         matches!(
             reply,
             Err(broca_module::history::HistoryError::Unrepresentable {
-                ordinal: 6,
+                ordinal: 7,
                 field: "written_at"
             })
         ),

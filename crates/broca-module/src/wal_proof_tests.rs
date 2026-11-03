@@ -1137,8 +1137,6 @@ impl Fixture {
     }
 }
 
-
-
 #[tokio::test]
 async fn live_actor_status_reads_the_ceiling_wait_and_clears_it_after_the_decision() {
     let mut fixture = Fixture::with_ceiling(100).await;

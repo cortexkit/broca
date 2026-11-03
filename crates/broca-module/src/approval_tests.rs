@@ -2076,7 +2076,8 @@ async fn late_read_pages_are_atomic_bounded_and_nonrepeating() {
     assert!(last.next_late_after.is_none());
     let ordinary = rig
         .registry
-        .read(SessionReadRequest::new(rig.key.clone(), Some(1), Some(1)))
+        // Ordinals start at 1 (0 and 1 both name the first page), so 2 is a continuation.
+        .read(SessionReadRequest::new(rig.key.clone(), Some(2), Some(1)))
         .await
         .unwrap();
     assert!(
