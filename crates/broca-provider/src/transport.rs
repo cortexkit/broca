@@ -66,8 +66,12 @@ use crate::{
 };
 
 #[cfg(test)]
-#[path = "transport_websocket_tests.rs"]
-mod websocket_tests;
+mod websocket_tests {
+    include!("transport_websocket_tests.rs");
+    mod codex_error_code_regressions {
+        include!("transport/codex_error_code_regressions.rs");
+    }
+}
 
 #[cfg(test)]
 #[path = "transport_retention_tests.rs"]
