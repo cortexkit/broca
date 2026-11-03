@@ -27,7 +27,7 @@ impl subc_client_rs::ModuleHandler for RetirementRoleProvider {
         let answer = match request["method"].as_str() {
             Some("role.describe") => serde_json::json!({
                 "majors":[
-                    {"version":"step-transform-provider/v1", "ops":["role.describe","transform.declare","transform.hook"], "stability":"alpha"},
+                    {"version":"step-transform-provider/v2", "ops":["role.describe","transform.declare","transform.hook"], "stability":"alpha"},
                     {"version":"compaction-provider/v1", "ops":["role.describe","compaction.setup","view.get","compaction.ride"], "stability":"alpha"}
                 ],
                 "implementation_version":"0.0.0-test", "capabilities":[]

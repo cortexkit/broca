@@ -794,13 +794,15 @@ async fn move_and_move_back_replays_and_rejoins_only_a_prefix() {
     assert_eq!(receiver.bytes(&session), original);
     let mut receiver_reader = Wire::new(&receiver, Value::Null, false).await;
     receiver_reader.bind_session(&session).await;
-    assert_eq!(
-        receiver_reader
-            .management("session.read", json!({"include_tools":true}))
-            .await
-            .unwrap(),
-        transcript
-    );
+    let mut received = receiver_reader
+        .management("session.read", json!({"include_tools":true}))
+        .await
+        .unwrap();
+    // The receiver serves the same incarnation under a history version above any the source
+    // served, so clients reload; every other byte of the page is the source's.
+    assert!(received["history_version"].as_u64() > transcript["history_version"].as_u64());
+    received["history_version"] = transcript["history_version"].clone();
+    assert_eq!(received, transcript);
     receiver
         .index
         .emit_run(

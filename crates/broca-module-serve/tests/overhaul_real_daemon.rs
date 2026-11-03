@@ -1430,9 +1430,16 @@ impl Sources {
                 .unwrap(),
         )
         .unwrap();
-        fields(&value, &["lineage", "boundary", "backward"]);
-        assert_eq!(value["lineage"], self.lineage);
-        value["lineage"] = json!("@LINEAGE@");
+        // llm-runner 0.8 cursors carry the history snapshot they were served from in place of
+        // the lineage: the session's incarnation and the store's own history version.
+        fields(
+            &value,
+            &["incarnation", "history_version", "boundary", "backward"],
+        );
+        assert_eq!(value["incarnation"], self.lineage);
+        assert!(value["history_version"].as_u64().is_some_and(|n| n > 0));
+        value["incarnation"] = json!("@LINEAGE@");
+        value["history_version"] = json!("@HISTORY_VERSION@");
         value
     }
 
@@ -1643,6 +1650,15 @@ impl Sources {
                             json!("@LINEAGE@")
                         }
                         "wal_seq" => json!(self.position(value.as_u64().unwrap())),
+                        // Each store allocates its own history version for a session (a
+                        // per-store high-water mark), so only its form is comparable.
+                        "history_version" if !value.is_null() => {
+                            assert!(
+                                value.as_u64().is_some_and(|n| n > 0),
+                                "invalid history_version: {value}"
+                            );
+                            json!("@HISTORY_VERSION@")
+                        }
                         "call_key" | "event_id" if !value.is_null() => {
                             let (lineage, seq) = value.as_str().unwrap().rsplit_once(':').unwrap();
                             assert_eq!(lineage, self.lineage);

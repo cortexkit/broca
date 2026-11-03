@@ -644,7 +644,7 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1", "scope-workdir/v1", "bind-no-project/v1"],
+                "provides": ["llm-runner/v1", "compaction-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1", "scope-workdir/v1", "bind-no-project/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),

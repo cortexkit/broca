@@ -119,6 +119,8 @@ impl ModuleHandler for Compactor {
                     "initial":{"compaction_id":"empty", "version":1,
                     "range":{"from":0,"to":0}, "replacement":[]}})
             }
+            // A mode-3 session reports its first conditions as a notice before the step.
+            Some("compaction.notice") => json!({"answer":"received"}),
             Some("compaction.ride") => json!({"answer":"nothing"}),
             _ => panic!("unexpected compaction request: {request}"),
         };
@@ -157,6 +159,8 @@ async fn scoped_worker_send_stamps_compaction_setup_with_scope_workdir() {
     let reply = owner.route_request(&route, serde_json::to_vec(&json!({
         "method":"session.send", "params":{
             "prompt":"hi", "send_id":"scoped-compaction", "model":{"provider":"mock","model":"mock-model"},
+            // Mode-3 compaction needs a frozen context limit; the mock model has none in the catalog.
+            "context_limit": 32000,
             "plan":compaction_plan()
         }
     })).unwrap()).await.unwrap();
@@ -177,10 +181,13 @@ async fn scoped_worker_send_stamps_compaction_setup_with_scope_workdir() {
     assert_eq!(bind["scope"]["ref"], SCOPE_REF);
     assert_eq!(bind["scope"]["scope_epoch"], SCOPE_EPOCH);
     assert_eq!(bind["scope"]["workdir"], json!(checkout));
-    assert_eq!(bind["roles"], json!({"compaction-provider":"v1"}));
+    assert_eq!(bind["roles"], json!({"compaction-provider":"v2"}));
+    // Under compaction v2 the route's bind identity names the session; Setup itself carries
+    // no session fields.
     assert_eq!(bind["identity"]["harness"], identity.harness);
-    assert_eq!(setup["params"]["harness"], identity.harness);
-    assert_eq!(setup["params"]["session"], identity.session);
+    assert_eq!(bind["identity"]["session"], identity.session);
+    assert_eq!(setup["params"]["preset"], "head");
+    assert!(setup["params"].get("session").is_none());
     let mut stored = identity.clone();
     stored.project_root = checkout;
     let records =
