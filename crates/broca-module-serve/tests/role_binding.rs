@@ -524,6 +524,16 @@ fn manifest_does_not_advertise_unimplemented_roles_or_operations() {
             "missing implemented operation: {name}"
         );
     }
+    for name in ["send.status", "session.send_status"] {
+        let operation = operations
+            .iter()
+            .find(|operation| operation.name == name)
+            .unwrap_or_else(|| panic!("missing implemented operation: {name}"));
+        assert!(matches!(
+            operation.kind,
+            subc_protocol::manifest::ManagementOperationKind::Query
+        ));
+    }
     assert!(
         !operations
             .iter()

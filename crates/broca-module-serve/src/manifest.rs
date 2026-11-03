@@ -21,6 +21,7 @@ use subc_protocol::PROTOCOL_VERSION;
 
 /// The request/response ops, classified Query vs Mutate.
 pub const OP_SEND_STATUS: &str = broca_wire::OP_SEND_STATUS;
+pub const OP_SESSION_SEND_STATUS: &str = broca_wire::OP_SESSION_SEND_STATUS;
 pub const OP_SEND: &str = "session.send";
 pub const OP_IMPORT: &str = "session.import";
 pub const OP_RETRACT: &str = "session.retract";
@@ -177,6 +178,11 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
         },
         ManagementOperation {
             name: OP_SEND_STATUS.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read the durable fate of a send_id without admitting or delivering work.".into()),
+        },
+        ManagementOperation {
+            name: OP_SESSION_SEND_STATUS.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some("Read the durable fate of a send_id without admitting or delivering work.".into()),
         },

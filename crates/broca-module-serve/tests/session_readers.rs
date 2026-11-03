@@ -77,20 +77,23 @@ async fn serve_counts_attested_readers_and_keeps_cold_ownership_unknown() {
         "run.result",
         "run.tool_calls",
         "send.status",
+        "session.send_status",
         "session.media_read",
     ];
     for channel in [7, 8] {
         for op in ops {
             let params = match op {
                 "run.status" | "run.result" | "run.tool_calls" => json!({"run_id":run}),
-                "send.status" => json!({"send_id":"reader-send"}),
+                "send.status" | "session.send_status" => json!({"send_id":"reader-send"}),
                 _ => json!({}),
             };
             let reply = rig
                 .request(channel, json!({"method":op,"params":params}))
                 .await;
             // A media id is deliberately absent; send status is private to its original caller.
-            let expected = if op == "session.media_read" || (op == "send.status" && channel == 8) {
+            let expected = if op == "session.media_read"
+                || (matches!(op, "send.status" | "session.send_status") && channel == 8)
+            {
                 FrameType::Error
             } else {
                 FrameType::Response

@@ -59,7 +59,8 @@ use tokio_util::sync::CancellationToken;
 use crate::manifest::{
     OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_READ, OP_REFRESH,
     OP_REFRESH_POLICY, OP_RESOLVE, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT,
-    OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
+    OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE,
+    OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
     CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
@@ -2850,7 +2851,7 @@ where
                 Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
             }
         }
-        OP_SEND_STATUS => {
+        OP_SEND_STATUS | OP_SESSION_SEND_STATUS => {
             let params: broca_wire::SendStatusRequest =
                 match serde_json::from_value(req.params.clone()) {
                     Ok(params) => params,
