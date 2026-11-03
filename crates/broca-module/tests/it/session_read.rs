@@ -1719,6 +1719,7 @@ fn min_config() -> RunConfig {
 
 fn started(key: &BindIdentity, run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,
@@ -3203,6 +3204,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
     let batch_id = BatchId("batch-1".into());
     let records = vec![
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -3651,6 +3653,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
         &key,
         &[
             WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -3791,6 +3794,7 @@ async fn torn_import_is_publicly_interrupted_for_read_and_run_status() {
         &rig.wal_store,
         &key,
         &[WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

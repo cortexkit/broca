@@ -4025,6 +4025,9 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::WriterOpened { .. }
             | WalRecord::WriterClosed { .. }
             | WalRecord::VisibilityLate { .. }
+            | WalRecord::CompactionViewV2 { .. }
+            | WalRecord::CompactionMarker { .. }
+            | WalRecord::CompactionViewAppliedV2 { .. }
             | WalRecord::Unknown => {}
             // Compaction is folded separately above; the transcript remains append-only.
             WalRecord::CompactionRequest { .. }
@@ -5573,6 +5576,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -6985,6 +6989,7 @@ mod offset_tail_tests {
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

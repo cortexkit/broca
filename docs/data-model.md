@@ -157,6 +157,13 @@ The encoder adds a record's own requirements itself, so a `run_started` with a `
 `steered` record, can only be written as `ver = 3`.
 Builds before the gate refuse `ver = 3` as "unsupported WAL framing version 3".
 
+`compaction-v2/v1` covers `compaction_view_v2`, `compaction_marker`,
+`compaction_view_applied_v2` and the optional
+`run_started.compaction_plan_version`. Each requires a gated frame; a reader missing the
+feature refuses the WAL by that name. Reader support ships before any production writer.
+The reader release decodes these shapes but ignores them in replay and every session/run
+projection, including reads, history, status and results.
+
 **The feature floor.** Before the first frame that requires a feature, the writer adds the
 feature to `wal-feature-floor` in the state root (next to `wal/`): one name per line, sorted,
 written to a temporary file and renamed over the old one, and only ever grown. If the floor
@@ -232,6 +239,7 @@ pause) does **not** write a new `run_started`; it continues under the same `run_
 | `input` | array of `Message` | required | The user input for this run. |
 | `origin` | object tagged by `kind` | defaulted `{"kind":"fresh"}` | `fresh`, or `seeded_from` (import/fork) with `origin_kind` (`import`/`fork`), `source_ref`, optional `origin_device_pseudonym` (16 bytes), optional `base_seq`. |
 | `submission_id` | string | absent | Set when the run consumed a queued submission. |
+| `compaction_plan_version` | u32 | absent | **Must-understand, feature `compaction-v2/v1`.** The compaction render-plan version frozen for a mode-3 run. Omitted when unset, so existing `run_started` bytes are unchanged. A record carrying it requires a `ver = 3` frame. This reader release ignores the value; no production path writes it yet. |
 | `title` | string | absent | The human-readable title the `session.send` that opened this run carried (for a drained queued send, the title its `queued` record carried): 1-200 Unicode scalar values, not blank, no control characters. Informational only and ungated: never rendered into a provider request and not part of routing, cache keys or the request identity digest. Absent when the send carried none and on records written before it existed. |
 | `scope` | `{owner, ref, scope_epoch}` | absent | **Must-understand, feature `scope/v1`.** The scope the session was admitted under, as the subc daemon stamped it on the bind: `owner` is a principal object (`{"kind":"reserved","module_id":…}`), `ref` a string, `scope_epoch` a u64. Frozen at the session's first scoped episode and repeated on every later one. A record carrying it is written only in a `ver = 3` frame requiring `scope/v1`; an unscoped record stays `ver = 1`. Written by admission after its owner check (the scope a send freezes or adopts, or the one the session already froze); the broca release before the one that first writes it already reads it, so rolling back one release still reads the session. |
 | `manifest` | object | absent | **Must-understand, feature `plan-manifest/v1`.** What a session's first send fetched from its tool providers, frozen so every later episode and resume renders from it without fetching again: `plan` (the first `session.send`'s `plan` member exactly as received, opaque), `plan_identity` (SHA-256 of the plan's RFC 8785 (JCS) bytes, 64 lowercase hex), `composition_digest` (64 lowercase hex, the digest the plan stated and the writer verified), `fetches` (array, one per provider fetched, sorted by provider id bytewise; each is flat: an answered fetch is `{provider, catalog_digest, tools, text}` with `tools` exactly as the provider answered (empty for a provider asked only for system text) and `text` the system text it answered, omitted when no system-text item was asked of it and `""` when present and empty; an absent fetch is `{provider, absent}`, an optional text-only item that did not answer, with `absent` an open reason string such as `timeout`, `unknown_module` or `refused:<code>`; a fetch with both `catalog_digest` and `absent` does not decode, and one with neither decodes as a state from a later build and is never written), `tools` (array of `Tool`, as in `RunConfig.tools`, in the order offered to the model), `system_text` (the joined system text), `system_digest`, `join_version` (u32) and `role_versions` (object, role name to version string). The plan's own layout is never WAL schema, so the plan can grow without a WAL change. `plan` is opaque JSON stored as a JSON **string** holding the JSON text, so its key order, number spellings and escapes survive a decode exactly (an embedded value would not: `run_started` is decoded through serde's internally tagged buffer, which re-sorts keys and re-spells numbers). A record carrying it is written only in a `ver = 3` frame requiring `plan-manifest/v1`. Written on the `run_started` of every episode of a session whose first send carried a fetch plan (the first episode freezes it; later ones repeat it, so episodes left after a fold still carry it); the WAL raises its feature floor to `plan-manifest/v1` before the first such frame. The system texts are joined in plan order with `"\n\n"` under `join_version` 1, an empty text adding neither bytes nor a separator. |
@@ -520,6 +528,59 @@ Several records documented above also become must-understand when they carry cer
 (for example `run_started` with a scope, a plan manifest or retention, `run_started` and
 `run_auth_refrozen` whose `auth_selection` carries `auth_method`, and `run_paused` with
 reason `restart`). `WalRecord::required_features` in the same file lists every case.
+
+#### Mode-3 compaction (reader support)
+
+**`compaction_view_v2`**: a delta for a complete mode-3 view. **Must-understand, feature
+`compaction-v2/v1`**. This reader release decodes it without rebuilding or applying the view,
+checking the checksum or changing the transcript. No production path writes it yet.
+An accepted view's content alone never selects what renders for a step; the later writer
+records that selection separately in `compaction_view_applied_v2`.
+
+| Field | Type | Rule | Meaning |
+|---|---|---|---|
+| `version` | u64 | required | The view version. |
+| `checksum` | string | required | The view's provider-defined checksum, exactly as the provider gave it. |
+| `edits` | array of `StoredViewEdit` | required | The complete edit order. `{"kind":"full","edit": JSON}` keeps the edit object exactly as received, including unknown members, key order and number spellings. `{"kind":"previous","index": u32}` references that position in the previous view's rebuilt edit list. |
+
+The previous view is the latest earlier accepted `compaction_view_v2` in the log, whether or
+not it was applied. A first view contains only full edits. The later writer uses a previous
+reference only for a byte-identical edit; every changed edit is full. `broca-wal` exports
+`CompactionViewV2 {version, checksum, edits}` and `StoredViewEdit`; a full edit is a JSON
+`RawValue`, not a string or a dependency on the view library. This reader does not rebuild
+the list, check indexes or recompute checksums; the later writer owns that validation.
+
+**`compaction_marker`**: a mode-3 cut marker. **Must-understand, feature `compaction-v2/v1`**.
+This reader release treats it as a no-op: it never cuts or renumbers the transcript, changes
+run state or emits a control unit. No production path writes it yet.
+
+| Field | Type | Rule | Meaning |
+|---|---|---|---|
+| `harness` | string | required | The session's harness. |
+| `session` | string | required | The session name. |
+| `view_version` | u64 | required | The view that supplied the cut. |
+| `first_kept_mid` | string | required | The first kept message's id. |
+| `first_kept_ordinal` | u64 | required | The first kept message's ordinal. |
+| `checkpoint` | u64 | required | The marker's checkpoint. |
+
+**`compaction_view_applied_v2`**: the mode-3 view selected at a step boundary, before that
+step's request, whenever the view in force changes. This includes a view the compaction provider returns for
+that very request. **Must-understand, feature `compaction-v2/v1`**. In the later writer,
+the latest applied record at or before a step selects the accepted view that step renders;
+`compaction_view_v2` only stores content. This reader release decodes and ignores the
+selection and never writes it. The shipping v1 `compaction_view_applied` remains a separate
+record with its original bytes and meaning.
+
+| Field | Type | Rule | Meaning |
+|---|---|---|---|
+| `step_id` | u64 | required | The step whose request first uses this view. |
+| `version` | u64 | required | The selected accepted view's version. |
+| `checksum` | string | required | The selected view's provider-defined checksum, as provided. |
+
+All three records are ignored by full replay, admission and continuation checkpoints, store
+projection, `session.read`, `session.history`, `run.status` and `run.result`. Interleaving
+them changes WAL sequence numbers and offsets, but not message numbering, transcript or
+run state. Their rendering semantics will be implemented by a later writer release.
 
 #### Unknown record types
 

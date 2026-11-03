@@ -58,6 +58,7 @@ fn run_config(max_tokens: u32) -> RunConfig {
 /// distinguished by `max_tokens` (so a per-episode-config test can tell them apart).
 fn start(run: &str, text: &str, max_tokens: u32) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,

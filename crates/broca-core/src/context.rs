@@ -3017,6 +3017,7 @@ mod tests {
     fn sample_wal() -> Vec<WalRecord> {
         vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -3391,6 +3392,7 @@ mod tests {
         };
         records.extend([
             WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -4113,6 +4115,7 @@ mod episode_merge_regression {
 
     fn start(run: &str, model: &str, text: &str) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

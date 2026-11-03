@@ -6463,6 +6463,7 @@ mod executor {
             framed(
                 seq,
                 broca_wal::WalRecord::RunStarted {
+                    compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
                     tags: None,

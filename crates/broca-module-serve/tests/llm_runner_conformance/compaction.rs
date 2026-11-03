@@ -571,6 +571,7 @@ fn settlement_records() -> Vec<broca_wal::FramedRecord> {
     use broca_protocol::{BindIdentity, ModelHandle, RunFinishReason, RunId};
     use broca_wal::{FramedRecord, WalRecord as R};
     let started = |id: &str| R::RunStarted {
+        compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
         run_id: RunId(id.into()),

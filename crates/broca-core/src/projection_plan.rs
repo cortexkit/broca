@@ -740,6 +740,9 @@ impl ProjectionBoundaryState {
             WalRecord::WriterOpened { .. }
                 | WalRecord::WriterClosed { .. }
                 | WalRecord::VisibilityLate { .. }
+                | WalRecord::CompactionViewV2 { .. }
+                | WalRecord::CompactionMarker { .. }
+                | WalRecord::CompactionViewAppliedV2 { .. }
         ) {
             return Vec::new();
         }

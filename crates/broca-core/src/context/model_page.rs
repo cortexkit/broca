@@ -988,6 +988,7 @@ mod episode_page_tests {
     /// tag checkpoint can renumber.
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

@@ -355,6 +355,7 @@ pub async fn run_import_with_store<W: WalStore>(
 
     let session = request.session.clone();
     writer.record(WalRecord::RunStarted {
+        compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,
@@ -479,6 +480,9 @@ fn repairable_import_prefix(
             WalRecord::WriterOpened { .. }
             | WalRecord::WriterClosed { .. }
             | WalRecord::VisibilityLate { .. }
+            | WalRecord::CompactionViewV2 { .. }
+            | WalRecord::CompactionMarker { .. }
+            | WalRecord::CompactionViewAppliedV2 { .. }
             | WalRecord::Unknown => {}
             // This reader release decodes compaction records but does not act on them yet.
             WalRecord::CompactionRequest { .. }
@@ -720,6 +724,60 @@ mod tests {
             output: ToolOutput::Text { text: label.into() },
             is_error: false,
         })
+    }
+
+    #[test]
+    fn compaction_v2_does_not_change_import_prefix_repairability() {
+        let mut shapes: Vec<WalRecord> =
+            include_str!("../../broca-wal/tests/fixtures/compaction_v2_records.jsonl")
+                .lines()
+                .map(|bytes| serde_json::from_str(bytes).unwrap())
+                .collect();
+        let mut start = shapes.pop().unwrap();
+        if let WalRecord::RunStarted { origin, .. } = &mut start {
+            *origin = RunOrigin::SeededFrom {
+                origin_kind: SeedOriginKind::Import,
+                source_ref: "source".into(),
+                origin_device_pseudonym: None,
+                base_seq: None,
+            };
+        }
+        let mut plain = vec![start.clone()];
+        let mut with = vec![start];
+        with.extend(shapes);
+        let frames = |records: &[WalRecord]| {
+            records
+                .iter()
+                .enumerate()
+                .map(|(i, record)| broca_wal::FramedRecord {
+                    seq: i as u64 + 1,
+                    fence: 1,
+                    record: record.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            repairable_import_prefix(&frames(&plain)).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            repairable_import_prefix(&frames(&with)).unwrap(),
+            Some(true)
+        );
+        let terminal: WalRecord = serde_json::from_str(
+            r#"{"type":"run_finished","reason":"interrupted","usage":{},"retries_used":0}"#,
+        )
+        .unwrap();
+        plain.push(terminal.clone());
+        with.push(terminal);
+        assert_eq!(
+            repairable_import_prefix(&frames(&plain)).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            repairable_import_prefix(&frames(&with)).unwrap(),
+            Some(false)
+        );
     }
 
     #[test]
