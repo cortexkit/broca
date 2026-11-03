@@ -737,7 +737,7 @@ fn extraction_preserves_lineage_identity_and_sequence_and_runs_once() {
 }
 
 #[test]
-fn compaction_v2_writer_refusal_never_extracts_an_archived_member() {
+fn an_archived_mode3_session_restores_and_opens_for_writing() {
     let f = Fixture::new();
     f.live();
     let path = f.store.wal_path(&f.session);
@@ -755,15 +755,11 @@ fn compaction_v2_writer_refusal_never_extracts_an_archived_member() {
     let container = std::fs::read(&archive).unwrap();
     std::fs::remove_file(&path).unwrap();
     assert_eq!(f.store.read_records(&f.session).unwrap().len(), 4);
-    match f.store.open(&f.session) {
-        Err(error @ WalError::NewerWriter { .. }) => {
-            assert!(error.to_string().contains("compaction-v2/v1"));
-            assert!(error.to_string().contains("needs a newer build to run"));
-        }
-        _ => panic!("archived mode-3 session must refuse writer open"),
-    }
-    assert!(!path.exists(), "refusal never publishes a live copy");
-    assert_eq!(std::fs::read(&archive).unwrap(), container);
+    // This build runs mode-3 sessions, so an archived one restores to a live log and opens
+    // for writing like any other. (The 0.3.306 reader release refused here instead.)
+    let _ = &container;
+    drop(f.store.open(&f.session).expect("an archived mode-3 session opens for writing"));
+    assert!(path.exists(), "the open restored a live copy");
     assert_eq!(f.store.read_records(&f.session).unwrap().len(), 4);
 }
 
