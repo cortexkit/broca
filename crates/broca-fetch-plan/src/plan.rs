@@ -536,12 +536,9 @@ pub fn parse_plan_with(
         return Err(Refusal::invalid("plan.composition"));
     }
 
-    if object
-        .get("compaction_item")
-        .is_some_and(|item| !item.is_null() && item.get("preset").and_then(Value::as_str).is_none())
-    {
-        return Err(Refusal::invalid("plan.compaction_item.preset"));
-    }
+    // A missing compaction preset is refused at admission of a new plan
+    // (`require_compaction_preset`), not here: frozen legacy plans without one must keep
+    // decoding when their sessions are read or resumed.
     // Reader releases can replay compaction records but cannot serve the writer surface.
     // Refuse before admission starts any provider fetch or declaration.
     if compaction == CompactionSupport::Unsupported && compaction_item.is_some() {

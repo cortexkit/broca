@@ -840,6 +840,9 @@ struct BindCompletion {
     bind: BindObservation,
     cancel: CancellationToken,
     refusal: Result<Option<broca_core::AdoptionRefusal>, ServeError>,
+    /// A `compaction-runner/v1` route's `bind` refusal (its encoded error body). The route is
+    /// acknowledged only after the runner accepts the caller as the session's provider.
+    role_refusal: Option<Vec<u8>>,
 }
 
 impl SubscriptionSlot {
@@ -1608,6 +1611,66 @@ where
                 );
                 return Ok(true);
             }
+            if bind.role == RouteRole::CompactionRunner {
+                let handler = handler.clone();
+                let writer = writer.clone();
+                request_tasks.spawn(reply_on_panic(
+                    writer.clone(),
+                    (ver, channel, epoch, corr),
+                    async move {
+                        let operation = request_operation(&frame.body);
+                        let caller = caller_module(&bind).map(str::to_owned);
+                        let logged_session = session.clone();
+                        log_served_request(
+                            &operation,
+                            &logged_session,
+                            caller.clone().as_deref(),
+                            "reply",
+                            async move {
+                                let answer = match broca_core::compaction_v2::protocol::wire::decode(
+                                    &frame.body,
+                                ) {
+                                    Ok((method, params)) => {
+                                        let params = serde_json::value::to_raw_value(&params)
+                                            .expect("decoded params re-encode");
+                                        handler
+                                            .compaction_runner(&session, caller, method, params)
+                                            .await
+                                    }
+                                    Err(refusal) => Err(refusal),
+                                };
+                                match answer {
+                                    Ok(body) => {
+                                        send_response_bytes(
+                                            &writer,
+                                            ver,
+                                            channel,
+                                            epoch,
+                                            corr,
+                                            body.get().as_bytes().to_vec(),
+                                        )
+                                        .await
+                                    }
+                                    Err(refusal) => {
+                                        send_error_bytes(
+                                            &writer,
+                                            ver,
+                                            channel,
+                                            epoch,
+                                            corr,
+                                            serde_json::to_vec(&refusal)
+                                                .expect("refusals encode"),
+                                        )
+                                        .await
+                                    }
+                                }
+                            },
+                        )
+                        .await
+                    },
+                ));
+                return Ok(true);
+            }
             if matches!(bind.role, RouteRole::ToolProvider | RouteRole::Permissions) {
                 let service = routes.llm_tools.clone();
                 let writer = writer.clone();
@@ -1942,6 +2005,7 @@ async fn handle_control_request(
                 bind,
                 cancel,
                 refusal: Ok(None),
+                role_refusal: None,
             };
             // Keep the bind unacknowledged until its history authorizes the stamp. The read
             // runs off ingress so a slow WAL/store cannot hide health probes or GOODBYE.
@@ -2409,6 +2473,22 @@ async fn authorize_bind(
         };
         completed.refusal = refusal;
     }
+    if completed.bind.role == RouteRole::CompactionRunner
+        && matches!(completed.refusal, Ok(None))
+    {
+        // The runner checks that the attested caller is this session's compaction provider
+        // before the route is acknowledged; the caller id is the daemon's, never a body field.
+        let caller = caller_module(&completed.bind).map(str::to_owned);
+        let params = serde_json::value::RawValue::from_string("{}".into())
+            .expect("an empty object is valid JSON");
+        if let Err(refusal) = registry
+            .route_compaction_v2(&completed.identity, caller, "bind".into(), params)
+            .await
+        {
+            completed.role_refusal =
+                Some(serde_json::to_vec(&refusal).expect("refusals encode"));
+        }
+    }
     completed
 }
 
@@ -2446,6 +2526,10 @@ async fn finish_bind(
             body,
         )
         .await;
+    }
+    if let Some(body) = completed.role_refusal {
+        return send_error_bytes(writer, completed.header.ver, 0, 0, completed.header.corr, body)
+            .await;
     }
     let refusal = match completed.refusal {
         Ok(refusal) => refusal,
@@ -5152,6 +5236,9 @@ enum RouteRole {
     Classifier,
     ToolProvider,
     Permissions,
+    /// A session's compaction provider reading entries and pushing views. Session-bound like
+    /// llm-runner, but with its own operation namespace and caller check.
+    CompactionRunner,
 }
 
 /// Adding model tools admits only the matching tool-provider role, not arbitrary new route
@@ -5168,7 +5255,7 @@ fn serves_bind_target(target: &subc_protocol::RouteTarget, role: RouteRole, tool
 
 impl RouteRole {
     fn is_sessionless(self) -> bool {
-        self != Self::LlmRunner
+        !matches!(self, Self::LlmRunner | Self::CompactionRunner)
     }
 }
 
@@ -5206,6 +5293,7 @@ fn bind_role(
         ("llm-runner", "v1", RouteRole::LlmRunner),
         ("tool-provider", "v1", RouteRole::ToolProvider),
         ("permissions", "v1", RouteRole::Permissions),
+        ("compaction-runner", "v1", RouteRole::CompactionRunner),
     ];
     let mut declared_roles = supported
         .into_iter()
@@ -8368,6 +8456,7 @@ mod tests {
             .header;
         finish_bind(
             BindCompletion {
+                role_refusal: None,
                 address_refusal: None,
                 header,
                 channel: 7,

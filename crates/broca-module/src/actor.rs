@@ -5628,7 +5628,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 plane: self.executor.compaction_plane(),
             })),
             display_sent_by,
-
+            // A brand-new log starts under the mode-3 compaction contract with the view
+            // library's current plan version. An existing log keeps the mode its first run
+            // recorded: the run loop reads that before looking at this field, so a legacy
+            // session is never upgraded here.
+            new_log_compaction_plan_version: Some(broca_core::compaction_v2::PLAN_VERSION),
             emit_display_context: true,
             step_progress: Some(Arc::clone(&step_progress)),
             clock: self

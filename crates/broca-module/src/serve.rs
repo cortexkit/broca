@@ -1796,6 +1796,27 @@ pub trait ServeHandler: Send + Sync {
         false
     }
 
+    /// Serve one `compaction-runner/v1` operation (`bind`, `session.entries`,
+    /// `session.apply_view`, `session.applied_view`) for the session a route is bound to.
+    /// `caller` is the daemon-attested module id, never a body field. Handlers without
+    /// mode-3 sessions refuse every operation as `unknown_method`.
+    async fn compaction_runner(
+        &self,
+        _session: &LineageKey,
+        _caller: Option<String>,
+        method: String,
+        _params: Box<serde_json::value::RawValue>,
+    ) -> Result<
+        Box<serde_json::value::RawValue>,
+        broca_core::compaction_v2::protocol::wire::Refusal,
+    > {
+        Err(broca_core::compaction_v2::protocol::wire::Refusal::new(
+            "unknown_method",
+            format!("{method} is not served by this handler"),
+            None,
+        ))
+    }
+
     /// Authorize the daemon-attested caller before any session operation has an effect.
     /// Handlers without history (such as protocol test doubles) have nothing to freeze.
     async fn authorize_session(
@@ -2367,6 +2388,20 @@ impl ServeHandler for crate::LineageRegistry {
     }
     fn compaction_supported(&self) -> bool {
         crate::LineageRegistry::compaction_supported(self)
+    }
+
+    async fn compaction_runner(
+        &self,
+        session: &LineageKey,
+        caller: Option<String>,
+        method: String,
+        params: Box<serde_json::value::RawValue>,
+    ) -> Result<
+        Box<serde_json::value::RawValue>,
+        broca_core::compaction_v2::protocol::wire::Refusal,
+    > {
+        self.route_compaction_v2(session, caller, method, params)
+            .await
     }
 
     async fn tag_location(
