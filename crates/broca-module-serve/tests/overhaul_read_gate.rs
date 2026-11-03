@@ -1147,6 +1147,124 @@ async fn installed_raw_and_head_bytes_equal_full_replay_with_compaction_and_medi
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn installed_compacted_raw_pages_and_head_use_bounded_reads() {
+    isolated_idle_clock(compacted_raw_read_cost).await;
+}
+
+async fn isolated_idle_clock<F, Work>(test: F)
+where
+    F: FnOnce() -> Work + Send + 'static,
+    Work: std::future::Future<Output = ()>,
+{
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(test());
+    })
+    .await
+    .unwrap();
+}
+
+struct FrozenIdleClock(tokio::task::JoinHandle<()>);
+
+impl FrozenIdleClock {
+    fn new() -> Self {
+        // The idle TTL can append WriterClosed mid-comparison on a slow runner.
+        tokio::time::pause();
+        // Prevent automatic time advancement while the OS writer/publisher threads work.
+        Self(tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }))
+    }
+}
+
+impl Drop for FrozenIdleClock {
+    fn drop(&mut self) {
+        self.0.abort();
+        tokio::time::resume();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_writer_close_advances_head_updated_at() {
+    isolated_idle_clock(idle_close_head_time).await;
+}
+
+async fn idle_close_head_time() {
+    let root = root("idle-close-head-time");
+    let bind = BindIdentity::new("/installed", "runner", "idle-close");
+    let access = WalAccessCounter::default();
+    let daemon = OverhaulDaemon::boot(&root, access.clone()).await;
+    let (seq, writer) = write_turn(
+        &daemon,
+        &access,
+        &bind,
+        "idle-run",
+        &partial_turn().await,
+        false,
+    )
+    .await;
+    published(&daemon, &bind, seq).await;
+    writer.shutdown().await.unwrap();
+    published(&daemon, &bind, seq + 1).await;
+    resume(&daemon, &bind, "idle-run").await;
+    let idle_clock = FrozenIdleClock::new();
+    assert_eq!(daemon.registry.slot_state(&bind), Some("open"));
+
+    // A past mtime makes a subsequent durable write observable without sleeping
+    // for the filesystem's timestamp resolution.
+    let old_ms = 1_600_000_000_000;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(daemon.wal.wal_path(&bind))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(old_ms))
+        .unwrap();
+    let before = daemon.registry.head(&bind).await.unwrap();
+    assert_eq!(before.updated_at, Some(old_ms));
+    let frames_before = daemon.wal.read_records(&bind).unwrap();
+
+    tokio::time::advance(broca_module::actor::IDLE_TTL + std::time::Duration::from_millis(1)).await;
+    let registry = daemon.registry.clone();
+    let closing = bind.clone();
+    tokio::task::spawn_blocking(move || {
+        broca_test_support::wait_until_sync("idle writer closed", || {
+            if registry.slot_state(&closing).is_none() {
+                Ok(())
+            } else {
+                Err("the idle actor still owns its writer".to_owned())
+            }
+        });
+    })
+    .await
+    .unwrap();
+    let frames_after = daemon.wal.read_records(&bind).unwrap();
+    let suffix = &frames_after[frames_before.len()..];
+    assert_eq!(suffix.len(), 1, "only the idle writer close was appended");
+    assert!(matches!(suffix[0].record, WalRecord::WriterClosed { .. }));
+    published(&daemon, &bind, suffix[0].seq).await;
+    let after = daemon.registry.head(&bind).await.unwrap();
+    let modified_ms = std::fs::metadata(daemon.wal.wal_path(&bind))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert_eq!(after.updated_at, Some(modified_ms));
+    assert!(modified_ms > old_ms);
+    assert_eq!(before.lineage_id, after.lineage_id);
+    assert_eq!(before.head, after.head);
+    println!("idle WriterClosed: before_ms={old_ms} after_ms={modified_ms}");
+    drop(idle_clock);
+    daemon.shutdown().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+async fn compacted_raw_read_cost() {
     let template = partial_turn().await;
     let mut measurements = Vec::new();
     for messages in [1_000, 150_000] {
@@ -1237,6 +1355,7 @@ async fn installed_compacted_raw_pages_and_head_use_bounded_reads() {
         }
         assert_head_and_raw_equal_full_replay(&daemon, &bind).await;
         resume(&daemon, &bind, "raw-run").await;
+        let idle_clock = FrozenIdleClock::new();
         let counter = WalAccessCounter::default();
         let started = std::time::Instant::now();
         counter
@@ -1251,6 +1370,7 @@ async fn installed_compacted_raw_pages_and_head_use_bounded_reads() {
             measured.reads.iter().filter(|read| read.class == ReadClass::Origin).count(), fallbacks(&measured).values().sum::<usize>());
         measurements.push(measured);
         assert_head_and_raw_equal_full_replay(&daemon, &bind).await;
+        drop(idle_clock);
         no_legacy_index(&root);
         daemon.shutdown().await;
         std::fs::remove_dir_all(root).unwrap();
