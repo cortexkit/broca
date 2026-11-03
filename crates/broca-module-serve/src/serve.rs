@@ -4175,7 +4175,7 @@ where
             "close",
             async {
                 let mut next_seq = cortexkit_role_llm_runner::live::FIRST_SEQ;
-                let mut message_identity: Option<broca_wire::HeadResponse> = None;
+                let mut message_identity: Option<(bool, Option<String>)> = None;
                 loop {
                     let delivery = tokio::select! {
                         _ = cancel.cancelled() => { record_request_outcome("cancelled"); break },
@@ -4225,9 +4225,9 @@ where
                     if message_identity.is_none() && delivery_has_mid(&delivery) {
                         match tokio::select! {
                             _ = cancel.cancelled() => break,
-                            head = handler.head(&session) => head,
+                            identity = handler.message_identity(&session) => identity,
                         } {
-                            Ok(head) => message_identity = Some(head),
+                            Ok(identity) => message_identity = Some(identity),
                             Err(error) => {
                                 let _ = send_subscribe_error_body(&writer, (ver, channel, epoch, corr), next_seq,
                                     ErrorBody::new("subscribe_replay_failed", error.to_string())).await;
@@ -4235,8 +4235,8 @@ where
                             }
                         }
                     }
-                    if let Some(head) = &message_identity {
-                        if let Err(error) = public_delivery_mids(&mut delivery, head.mode3, head.lineage_id.as_deref()) {
+                    if let Some((mode3, lineage)) = &message_identity {
+                        if let Err(error) = public_delivery_mids(&mut delivery, *mode3, lineage.as_deref()) {
                             let _ = send_subscribe_error_body(&writer, (ver, channel, epoch, corr), next_seq,
                                 ErrorBody::new("subscribe_replay_failed", error)).await;
                             return;
@@ -5163,6 +5163,12 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     };
     match handler.plan_state(session).await {
         broca_module::serve::PlanState::Admitted { frozen } => {
+            // A plan that differs from the frozen one is checked for its own shape first, so a
+            // compaction item without a preset is named before any drift or tool refusal. Re-sends
+            // of the frozen plan itself, including a legacy plan whose item has no preset, pass.
+            if frozen.as_deref() != Some(parsed.identity.as_str()) {
+                broca_fetch_plan::require_compaction_preset(&parsed)?;
+            }
             // While a change is pending, a send whose plan is the effective plan or the latest
             // accepted one is not drift. That replaces today's plain different-plan refusal for
             // sessions with session_change state. Sessions that never received a refresh keep

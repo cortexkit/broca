@@ -126,11 +126,30 @@ fn version_at(
     }
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(|error| error.to_string())?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+    let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        Ok(tx) => tx,
+        // A busy index must not fail a read. Serve the version this write would have recorded,
+        // unrecorded: allocation takes the larger of the next version and the wall clock, so a
+        // later recorded version is never below one served now. The cost is that a client may
+        // see the version move and reload.
+        Err(error) if is_busy(&error) => return Ok(snapshot(&next_row(prior, lineage, now)?)),
+        Err(error) => return Err(error.to_string()),
+    };
     let prior = checked_row(&tx, address, expected_version)?;
-    let current = match prior {
+    let current = next_row(prior, lineage, now)?;
+    tx.execute(
+        "INSERT INTO served_history(session,incarnation,lineage_id,version) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(session) DO UPDATE SET incarnation=excluded.incarnation,lineage_id=excluded.lineage_id,version=excluded.version",
+        params![address, current.incarnation, current.lineage, current.version.to_string()],
+    ).map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(snapshot(&current))
+}
+
+/// The row a served read records for `lineage`: the prior row when it already names this log,
+/// otherwise a new incarnation under the next allocated version.
+fn next_row(prior: Option<Row>, lineage: Option<&str>, now: u64) -> Result<Row, String> {
+    Ok(match prior {
         Some(row) if row.lineage.as_deref() == lineage => row,
         // The first appended lineage frame identifies the same previously unframed legacy log.
         Some(mut row) if row.lineage.is_none() && lineage.is_some() => {
@@ -150,14 +169,14 @@ fn version_at(
             )?,
             rewriting_session: None,
         },
-    };
-    tx.execute(
-        "INSERT INTO served_history(session,incarnation,lineage_id,version) VALUES(?1,?2,?3,?4)
-         ON CONFLICT(session) DO UPDATE SET incarnation=excluded.incarnation,lineage_id=excluded.lineage_id,version=excluded.version",
-        params![address, current.incarnation, current.lineage, current.version.to_string()],
-    ).map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())?;
-    Ok(snapshot(&current))
+    })
+}
+
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 pub(crate) fn version(

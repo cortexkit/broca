@@ -2064,6 +2064,18 @@ pub trait ServeHandler: Send + Sync {
         self.run_status(session, run_id).await.map(Into::into)
     }
 
+    /// The two facts that spell a live event's public message ids: whether the log is a mode-3
+    /// log, and its lineage. A live subscription asks for these once, so it reads only the
+    /// newest page and the log's first run, never the head's media, run or spend facts.
+    async fn message_identity(
+        &self,
+        session: &LineageKey,
+    ) -> Result<(bool, Option<String>), ServeError> {
+        self.head(session)
+            .await
+            .map(|head| (head.mode3, head.lineage_id))
+    }
+
     /// `session.head` — the session's head without message bodies. For retained sessions,
     /// `updated_at` is the durable activity timestamp that sets expiry, not the WAL mtime.
     async fn head(&self, _session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {
@@ -3298,6 +3310,23 @@ impl ServeHandler for crate::LineageRegistry {
     async fn head(&self, session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {
         self.head_for(session, None, &broca_protocol::SendScope::default())
             .await
+    }
+
+    async fn message_identity(
+        &self,
+        session: &LineageKey,
+    ) -> Result<(bool, Option<String>), ServeError> {
+        if let Some(identity) = self.message_identity_from_log(session).await? {
+            return Ok(identity);
+        }
+        let crate::registry::RouteReadPage {
+            page, head_facts, ..
+        } = self.route_read_page(session, None, Some(1), false).await?;
+        let lineage = page.lineage_id.map(|id| id.to_string());
+        let mode3 = self
+            .mode3_for_page(session, lineage.clone(), &head_facts)
+            .await?;
+        Ok((mode3, lineage))
     }
 
     async fn head_for(

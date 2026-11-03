@@ -1705,6 +1705,35 @@ impl LineageRegistry {
         Ok(recovered)
     }
 
+    /// Whether `session`'s log is a mode-3 log, and its lineage, read from the log alone. A live
+    /// subscription needs only these to spell public message ids, so it never waits on the
+    /// index (`None` when this registry reads no log directly).
+    pub(crate) async fn message_identity_from_log(
+        &self,
+        session: &LineageKey,
+    ) -> Result<Option<(bool, Option<String>)>, OpenError> {
+        let Some(reader) = &self.inner.reader else {
+            return Ok(None);
+        };
+        let wal = reader.wal_store.clone();
+        let key = session.clone();
+        let lineage = spawn_blocking(JobKind::WalRead, move || {
+            wal.read_records_range(&key, 0, Some(1), None)
+                .map(|range| range.lineage_id.map(|id| id.to_string()))
+                .map_err(|error| OpenError::Open(error.to_string()))
+        })
+        .await
+        .map_err(|error| OpenError::Open(error.to_string()))??;
+        let mode3 = self
+            .mode3_for_page(
+                session,
+                lineage.clone(),
+                &broca_core::head::HeadProjection::default(),
+            )
+            .await?;
+        Ok(Some((mode3, lineage)))
+    }
+
     pub(crate) async fn mode3_for_page(
         &self,
         session: &LineageKey,
@@ -1731,10 +1760,12 @@ impl LineageRegistry {
             spawn_blocking(JobKind::StoreRead, move || {
                 let mode3 = broca_core::mode3_log_from_wal(wal.as_ref(), &key)
                     .map_err(|error| OpenError::Open(error.to_string()))?;
+                // The cached mode only saves the next read this log scan. A read must not fail
+                // because the index is busy, so a failed cache write is logged and skipped.
                 if let Some(store) = store {
-                    store
-                        .cache_history_mode(&key, mode3)
-                        .map_err(OpenError::Open)?;
+                    if let Err(error) = store.cache_history_mode(&key, mode3) {
+                        tracing::debug!(target: "store", %error, "history mode not cached");
+                    }
                 }
                 Ok::<_, OpenError>(mode3)
             })

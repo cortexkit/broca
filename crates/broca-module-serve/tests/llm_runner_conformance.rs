@@ -3379,7 +3379,9 @@ impl LlmRunnerSubject for BrocaSubject {
         )
         .map_err(|e| HarnessError::new(e.to_string()))?
         .prompt
-        .len() as u64;
+        .len() as u64
+            // The imported message lands at that stored position; public ordinals start at 1.
+            + 1;
         let mut wal = wal_store
             .open(&identity)
             .map_err(|e| HarnessError::new(e.to_string()))?;
@@ -4857,13 +4859,15 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
         .contains(&json!(
             cortexkit_role_llm_runner::capabilities::ORDERED_HOOK_PHASES
         )));
+    // llm-runner 0.8 retired these groups: compaction moved to the compaction-runner role,
+    // which the module manifest declares, so role.describe must no longer name them.
     for group in ["compaction", "model_view"] {
         assert!(
-            describe["capabilities"]
+            !describe["capabilities"]
                 .as_array()
                 .unwrap()
                 .contains(&json!(group)),
-            "the bus-enabled runner must declare the {group} group"
+            "the 0.8 runner must not declare the retired {group} group"
         );
     }
     assert!(!describe["majors"][0]["ops"]
@@ -4936,9 +4940,12 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
             .into_iter()
             .collect()
     );
+    // Step-transform v2 hooks name no session in the body; the per-session route does.
     for call in state.hooks() {
-        assert_eq!(call["harness"], HARNESS);
-        assert_eq!(call["session"], session);
+        assert!(
+            call.get("harness").is_none() && call.get("session").is_none(),
+            "{call}"
+        );
     }
     state.clear();
     response(route.request("session.send", params).await.unwrap());
@@ -5482,10 +5489,11 @@ mod held_call_tests {
             .await
             .unwrap());
         let fields = subject.send_fields(session, true);
-        assert!(fields.get("plan").is_some());
+        // Tier sessions carry no plan: the v1 compaction ride they once fed is retired.
+        assert!(fields.get("plan").is_none());
         assert!(
             fields.get("system").is_none(),
-            "plan fixture identity must not alter system text"
+            "fixture identity must not alter system text"
         );
         let key =
             broca_provider::hash::clamp_prompt_cache_key(fields["cache"]["key"].as_str().unwrap());
@@ -5824,11 +5832,9 @@ mod held_call_tests {
             .all(|tool| tool["result_format"] == "tool-result/v1"));
         for route in [(12, 1), (13, 1), (11, 2), (14, 1)] {
             let catalog = provider.catalog_for_route(route, &request);
-            assert!(catalog["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|tool| tool.get("result_format").is_none()));
+            // Every catalog declares tool-result/v1 results; only the held session's adds
+            // late-result capabilities.
+            assert!(catalog.get("capabilities").is_none(), "{catalog}");
             assert_eq!(
                 serde_json::to_vec(&catalog).unwrap(),
                 before,

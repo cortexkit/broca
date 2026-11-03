@@ -3766,6 +3766,9 @@ async fn a_read_after_a_refused_first_send_answers_unwritten() {
     )
     .await
     .expect("a read after a refused first send must not hang");
-    assert!(page.messages.is_empty(), "a refused send wrote messages: {page:?}");
+    assert!(
+        page.messages.is_empty(),
+        "a refused send wrote messages: {page:?}"
+    );
     rig.finish().await;
 }
