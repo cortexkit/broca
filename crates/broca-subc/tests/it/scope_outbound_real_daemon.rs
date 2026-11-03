@@ -44,7 +44,7 @@ use broca_protocol::{
     request::{ExecutionMode, Tool},
     BatchId, BindIdentity, BindPrincipal, RunId, SessionScope, ToolCall, ToolCallId,
 };
-use broca_subc::{ModuleScopeDescriber, SubcConnection, SubcToolPlane};
+use broca_subc::{ModuleScopeDescriber, ScopeDescriber, SubcConnection, SubcToolPlane};
 use subc_control::ConsumerIdentity;
 use tokio::process::Child;
 use tokio::time::{sleep, Instant};
@@ -241,6 +241,15 @@ impl Rig {
 
     /// The tool plane broca runs, on a connection attested as the carrier.
     async fn carrier_plane(&self, hold: Duration) -> SubcToolPlane {
+        self.carrier_plane_with_describer(hold, self.describer().await)
+            .await
+    }
+
+    async fn carrier_plane_with_describer(
+        &self,
+        hold: Duration,
+        describer: Arc<ModuleScopeDescriber>,
+    ) -> SubcToolPlane {
         let nonce = wait_until("the carrier's launch nonce", || {
             std::fs::read_to_string(&self.carrier_nonce)
                 .ok()
@@ -256,7 +265,7 @@ impl Rig {
                 .await
                 .expect("connect as the carrier");
         let plane = SubcToolPlane::new(conn, PROVIDER).with_scope_sync_hold_for_test(hold);
-        plane.set_scope_describer(self.describer().await);
+        plane.set_scope_describer(describer);
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let registered = plane.catalog().await.ok().is_some_and(|catalog| {
@@ -466,7 +475,27 @@ async fn project_identity_tool_routes_take_project_only_from_scope() {
     record["workdir"] = serde_json::json!(workdir);
     record["project_id"] = serde_json::json!("scope-project");
     rig.sync(&[record]).await;
-    let plane = rig.carrier_plane(Duration::from_secs(2)).await;
+    let describer = rig.describer().await;
+    let stamped = describer
+        .describe(
+            &subc_protocol::Principal::Reserved {
+                module_id: OWNER.into(),
+            },
+            "project-head",
+        )
+        .await
+        .unwrap()
+        .stamp
+        .expect("the daemon stamped the live project scope");
+    let stamped_workdir = stamped.workdir.expect("the scope has a workdir");
+    assert_eq!(std::fs::canonicalize(&stamped_workdir).unwrap(), workdir);
+    eprintln!(
+        "scope workdir: owner={} daemon={stamped_workdir}",
+        workdir.display()
+    );
+    let plane = rig
+        .carrier_plane_with_describer(Duration::from_secs(2), describer)
+        .await;
     let frozen = scope(OWNER, "project-head");
     for scoped in [false, true] {
         let name = if scoped {
@@ -501,7 +530,11 @@ async fn project_identity_tool_routes_take_project_only_from_scope() {
             "{attach}"
         );
         if scoped {
-            assert_eq!(attach["scope"]["workdir"], serde_json::json!(workdir));
+            // Compare bytes to the daemon's stamp, not the owner's pre-normalized record.
+            assert_eq!(
+                attach["scope"]["workdir"],
+                serde_json::json!(stamped_workdir)
+            );
             assert_eq!(attach["scope"]["project_id"], "scope-project");
         } else {
             assert!(attach["scope"].is_null(), "{attach}");

@@ -222,7 +222,7 @@ fn mint_run_id(session: &str) -> RunId {
 async fn main() {
     let args = Args::parse();
     let json = args.json_events;
-    std::process::exit(match run(args).await {
+    std::process::exit(match run_task_result(tokio::spawn(run(args)).await) {
         Ok(code) => code,
         Err(e) => {
             // A startup failure (couldn't connect / no tools / bind timed out) is a
@@ -235,6 +235,16 @@ async fn main() {
             1
         }
     });
+}
+
+fn run_task_result(
+    joined: Result<Result<i32, String>, tokio::task::JoinError>,
+) -> Result<i32, String> {
+    match joined {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(format!("run task cancelled: {error}")),
+    }
 }
 
 /// Where this CLI keeps its fusiform last-known-good catalog.
@@ -250,7 +260,12 @@ fn catalog_lkg_path(args: &Args) -> Result<std::path::PathBuf, String> {
     Ok(state_root.path.join("catalog/fusiform-lkg.json"))
 }
 
-async fn run(args: Args) -> Result<i32, String> {
+// Keep the run task's entry future small, as the daemon's actor does for deeply awaited work.
+fn run(args: Args) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<i32, String>>>> {
+    Box::pin(run_inner(args))
+}
+
+async fn run_inner(args: Args) -> Result<i32, String> {
     let json = args.json_events;
     let bind = BindIdentity::new(&args.project_root, &args.harness, &args.session);
     bind.validate_keyable()
@@ -623,6 +638,41 @@ async fn run(args: Args) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_entry_future_is_boxed() {
+        // The run is spawned because Windows' 1 MiB main thread overflowed at the first tool call; this only guards future growth.
+        let future = run(args(&[]));
+        let bytes = std::mem::size_of_val(&future);
+        assert!(
+            bytes <= 4096,
+            "CLI entry future is {bytes} bytes; keep the run future off the Windows main-thread frame"
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "run task panic payload")]
+    async fn run_task_panic_is_resumed() {
+        let joined = tokio::spawn(async { panic!("run task panic payload") }).await;
+        let _ = run_task_result(joined);
+    }
+
+    #[tokio::test]
+    async fn run_task_cancellation_is_an_error() {
+        let task = tokio::spawn(std::future::pending::<Result<i32, String>>());
+        task.abort();
+        let error = run_task_result(task.await).unwrap_err();
+        assert!(error.starts_with("run task cancelled:"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn run_task_preserves_errors_and_exit_codes() {
+        assert_eq!(run_task_result(tokio::spawn(async { Ok(7) }).await), Ok(7));
+        assert_eq!(
+            run_task_result(tokio::spawn(async { Err("startup failed".into()) }).await),
+            Err("startup failed".into())
+        );
+    }
+
     #[test]
     fn scope_help_names_private_stdin_and_unscoped_services() {
         use clap::CommandFactory;

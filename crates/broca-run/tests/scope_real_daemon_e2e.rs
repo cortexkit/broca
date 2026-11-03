@@ -99,6 +99,9 @@ impl Rig {
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&root).unwrap();
+        // Windows scratch paths are already absolute; canonicalize would add a
+        // verbatim prefix absent from the daemon's stamp. Unix needs symlink resolution.
+        #[cfg(not(windows))]
         let root = root.canonicalize().unwrap();
         let config = root.join("config/cortexkit/subc.jsonc");
         let runtime = root.join("runtime");

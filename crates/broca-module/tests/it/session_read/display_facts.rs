@@ -3,6 +3,7 @@ use super::*;
 #[tokio::test]
 async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_and_150k() {
     for size in [1_000, 150_000] {
+        let fixture_started = std::time::Instant::now();
         let (rig, zero_ranges) = Rig::with_counting_zero_ranges("display-fact-cost");
         let key = rig.key("facts");
         let mut records = vec![started(&key, "prefix", "start")];
@@ -19,8 +20,27 @@ async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_an
             }
         }
         records.extend(tool);
-        append_seed(&rig.wal_store, &key, &records);
+        let records_ms = fixture_started.elapsed().as_secs_f64() * 1000.0;
+        let append_started = std::time::Instant::now();
+        // This setup does not test sync behavior. Batch syncs so fixture writes do
+        // not dominate the page-read measurements on Windows filesystems.
+        {
+            let mut wal = FileWal::open(rig.wal_store.wal_path(&key))
+                .expect("open display-facts fixture WAL")
+                .with_feature_floor(rig.wal_store.feature_floor_path());
+            for batch in records.chunks(1_000) {
+                for (index, record) in batch.iter().enumerate() {
+                    wal.append(1, record, index + 1 == batch.len())
+                        .expect("append fixture record");
+                }
+            }
+        }
+        let append_ms = append_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("display-facts fixture messages={size} records_ms={records_ms:.3} append_ms={append_ms:.3}");
+        let materialize_started = std::time::Instant::now();
         materialize_all(&rig, &key);
+        let materialize_ms = materialize_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("display-facts fixture messages={size} materialize_ms={materialize_ms:.3}");
         zero_ranges.store(0, Ordering::SeqCst);
         let now = std::time::Instant::now();
         let plain = rig
