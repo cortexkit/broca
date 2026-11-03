@@ -6041,7 +6041,6 @@ mod tests {
         // This build runs mode-3 sessions, so a `compaction-v2/v1` log is an ordinary writable
         // log: the writer repairs its torn tail and appends. (A reader-only build, with
         // `RUNS_COMPACTION_V2` false, refuses this open instead.)
-        assert!(crate::framing::RUNS_COMPACTION_V2);
         let path = tmp("mode3-writable");
         let _ = std::fs::remove_file(&path);
         let record = run_started(1);

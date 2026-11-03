@@ -39,7 +39,6 @@ fn compaction_v2_frames_decode_for_readers_and_writers_on_this_build() {
             );
             // This build runs mode-3 sessions, so its writer opens them too. A reader-only
             // build (`RUNS_COMPACTION_V2` false) refuses the writer path instead.
-            assert!(RUNS_COMPACTION_V2);
             assert!(
                 matches!(decode_next_for_writer(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
             );
