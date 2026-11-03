@@ -750,12 +750,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         .map_err(|error| ServeIoError(format!("retention clock: {error}")))?,
     );
-    if bus_event_config.enabled {
-        executor_impl = executor_impl.with_compaction_plane(Arc::new(
-            broca_subc::SubcCompactionPlane::new(plan_conn.clone()),
-        ));
-    }
-    let compaction_inbox = executor_impl.compaction_inbox();
+    executor_impl = executor_impl.with_compaction_plane(Arc::new(
+        broca_subc::SubcCompactionPlane::new(plan_conn.clone()),
+    ));
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
     let move_wal = wal_store.clone();
     let mut opener_builder =
@@ -983,31 +980,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let _bus_stop_guard = bus_stop.clone().drop_guard();
     let bus_connector: Arc<dyn broca_module_serve::bus_events::BusConnector> =
         Arc::new(broca_module_serve::bus_events_nats::NatsConnector::new(
-            // The process's one ck-bus credential holder: the run event publisher and the
-            // compaction consumer below both use this connector.
+            // The process's one ck-bus credential holder for run event publication.
             broca_module_serve::bus_events_nats::CredentialHolder::new(plan_conn.clone()),
         ));
-    let _compaction_bus = if bus_event_config.enabled {
-        let receipts: Arc<dyn broca_store::compaction_receipts::CompactionReceiptStore> =
-            if let Some(legacy) = &run_index {
-                legacy.clone()
-            } else {
-                let overhaul = stores.overhaul.as_ref().unwrap();
-                overhaul.compaction_receipts()
-            };
-        let service = broca_module_serve::compaction_bus::Service::new(
-            receipts,
-            registry.as_ref().clone(),
-            crash_orphan_wal.clone(),
-            compaction_inbox,
-            bus_connector.clone(),
-            bus_stop.clone(),
-        );
-        service.restore().await.map_err(ServeIoError)?;
-        Some(service.spawn())
-    } else {
-        None
-    };
+    // Compaction v2 uses session-bound calls. Legacy sessions no longer consume
+    // provider announcements or replay the retired compaction bus outbox.
     let event_store: Arc<dyn broca_store::bus_events::RunEventStore> =
         if let Some(legacy) = &run_index {
             legacy.clone()
@@ -3346,10 +3323,6 @@ mod executor {
             self
         }
 
-        pub fn compaction_inbox(&self) -> Arc<broca_core::ViewReadyInbox> {
-            self.compaction_views.clone()
-        }
-
         pub fn with_compaction_signals(mut self, enabled: bool) -> Self {
             self.compaction_signals = enabled;
             self
@@ -5289,6 +5262,7 @@ mod executor {
             frozen.prompt_cache_key = Some("frozen-key".into());
             let mut req = drift_request(std::path::Path::new("/inherit-cache"));
             let config = broca_wal::RunConfig {
+                global_system: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
@@ -6486,6 +6460,7 @@ mod executor {
                     session: BindIdentity::new("/tmp/project", "harness", "session"),
                     ts_ms: None,
                     config: Box::new(broca_wal::RunConfig {
+                        global_system: None,
                         account_limit_pause: false,
                         turn_directives_v1: None,
                         render_tags: false,

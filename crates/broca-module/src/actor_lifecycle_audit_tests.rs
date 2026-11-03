@@ -457,6 +457,7 @@ impl Fixture {
             account_limit_timer: None,
             ceiling_drain_held: false,
             compaction_watch: Default::default(),
+            compaction_session: Arc::default(),
             admitting_session_class: None,
             agent_run_scope: None,
             #[cfg(all(test, feature = "test-clock"))]

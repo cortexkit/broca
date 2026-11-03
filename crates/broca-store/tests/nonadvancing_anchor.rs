@@ -33,6 +33,7 @@ fn run_started(session: &BindIdentity) -> WalRecord {
         run_id: RunId("anchor-run".into()),
         session: session.clone(),
         config: Box::new(RunConfig {
+            global_system: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,

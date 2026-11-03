@@ -130,6 +130,7 @@ impl Fixture {
                 run_id: RunId(format!("run-{}", shape.label)),
                 session,
                 config: Box::new(RunConfig {
+                    global_system: None,
                     account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,

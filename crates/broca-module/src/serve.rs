@@ -4222,6 +4222,11 @@ impl ServeHandler for crate::LineageRegistry {
             }
             session_change::RefreshOrder::New => {}
         }
+        broca_fetch_plan::session_change::check_compaction_item(
+            change.current_manifest.as_deref(),
+            &plan_value,
+        )
+        .map_err(SessionChangeError::FetchRefused)?;
         // Fetch with the same admission code as a first send, never a second copy: parse
         // the plan, then admit its providers under the deadline. Refusals write nothing.
         let output_refs = if self
@@ -5034,6 +5039,7 @@ mod offset_head_tests {
             run_id: RunId("r1".into()),
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
+                global_system: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,

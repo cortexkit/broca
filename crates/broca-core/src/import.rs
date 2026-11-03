@@ -422,6 +422,7 @@ pub async fn run_import_with_store<W: WalStore>(
 
 fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig {
     RunConfig {
+        global_system: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
@@ -437,7 +438,7 @@ fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig 
         cache_tiers: serde_json::Value::Null,
         context_epoch: 0,
         renderer_version: 0,
-        // Null is deliberate: the W3-B frozen-render guard refuses to resume this marker as
+        // Null is deliberate: the frozen-render guard refuses to resume this marker as
         // a provider run. Replay classifies a dangling zero-step SeededFrom episode as
         // Interrupted before any provider can be selected.
         frozen_render_config: serde_json::Value::Null,
@@ -449,8 +450,8 @@ fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig 
         variant: None,
         service_tier: None,
         stop_when: Vec::new(),
-        // An import seed chooses no context management: the first harness episode after it is
-        // the session's first real admission, and binds the value then.
+        // An import seed leaves context management unset; the session's first
+        // real admission binds the value.
         context_management: None,
     }
 }

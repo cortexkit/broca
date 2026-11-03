@@ -43,11 +43,13 @@ fn current_reference(bind: &BindIdentity, supplied: &str) -> Result<String, Comp
 /// consume the call's budget; failed calls invalidate the route before another request uses it.
 pub struct SubcCompactionPlane {
     route: RoleRoute,
+    v2_route: RoleRoute,
 }
 
 impl SubcCompactionPlane {
     pub fn new(conn: Arc<SubcConnection>) -> Self {
         Self {
+            v2_route: RoleRoute::without_discovery(conn.clone(), "compaction-provider", "v2"),
             route: RoleRoute::new(conn, ROLE, VERSION, |describe| {
                 check_describe(describe)
                     .map(|_| ())
@@ -88,6 +90,7 @@ impl SubcCompactionPlane {
 
     pub async fn close_session_routes(&self, bind: &BindIdentity) {
         self.route.close_session_routes(bind).await;
+        self.v2_route.close_session_routes(bind).await;
     }
 
     /// `provider`'s answer to `role.describe`, asked on a fresh `compaction-provider: v1`
@@ -155,6 +158,38 @@ fn bounded(deadline: Instant) -> Instant {
 
 #[async_trait]
 impl CompactionPlane for SubcCompactionPlane {
+    async fn call_v2(
+        &self,
+        provider: &str,
+        bind: &BindIdentity,
+        scope: Option<&SessionScope>,
+        method: &str,
+        params: serde_json::Value,
+        deadline_ms: u64,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
+    {
+        use broca_core::compaction_v2::{protocol::wire::Refusal, runtime::CallError};
+        self.v2_route
+            .call(
+                provider,
+                bind,
+                scope,
+                &serde_json::json!({"method": method, "params": params}),
+                Instant::now() + Duration::from_millis(deadline_ms),
+                false,
+            )
+            .await
+            .map_err(|error| match error {
+                FetchError::ProviderRefused {
+                    code,
+                    detail,
+                    message,
+                    ..
+                } => CallError::Refused(Refusal::new(&code, message, detail)),
+                _ => CallError::Unavailable,
+            })
+    }
+
     async fn setup(
         &self,
         provider: &str,

@@ -1693,6 +1693,7 @@ async fn idle_read_flush_failure_hides_the_unproven_tail() {
 
 fn min_config() -> RunConfig {
     RunConfig {
+        global_system: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,

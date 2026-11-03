@@ -142,6 +142,7 @@ async fn ceiling_run_with_control(
     let model = crate::StubProvider::new(vec![model_events()]);
     let (out, _events) = tokio::sync::mpsc::channel(256);
     let control = crate::RunControl {
+        legacy_compaction_fixture: true,
         manifest: Some(manifest()),
         compaction_plane: Some(plane.clone()),
         compaction_views: Some(plane),
@@ -371,6 +372,7 @@ async fn cancellation_and_shutdown_stop_a_ceiling_ride_without_sending() {
         let plane = Arc::new(CeilingPlane::new(CeilingAnswer::Late));
         let signal = tokio_util::sync::CancellationToken::new();
         let control = crate::RunControl {
+            legacy_compaction_fixture: true,
             cancel: cancel.then(|| signal.clone()),
             stop_requested: (!cancel).then(|| signal.clone()),
             ..Default::default()

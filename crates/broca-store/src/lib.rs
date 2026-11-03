@@ -30,6 +30,8 @@ use broca_wal::{
 };
 use rusqlite::{config::DbConfig, Connection, OptionalExtension};
 
+mod history_mode;
+
 const STORE_SCHEMA_VERSION: i64 = 1;
 
 mod busy;
@@ -530,6 +532,7 @@ impl ProjectionPlan {
     }
 }
 
+mod compaction_v2;
 #[cfg(test)]
 mod refusal_materialized_tests;
 
@@ -554,6 +557,9 @@ struct PreparedProjection {
     message_json: Vec<String>,
     message_run_json: Vec<String>,
     message_tags_json: Vec<Option<String>>,
+    message_compaction_json: Vec<Option<String>>,
+    message_compaction_compact_json: Vec<Option<String>>,
+    compaction_delivery_updates: Vec<broca_core::compaction_v2::metadata::DeliveryUpdate>,
     final_run_json: Vec<(i64, String)>,
     completed_steps: i64,
     usage_json: String,
@@ -1435,6 +1441,16 @@ impl SqliteStore {
         if !message_columns.contains("written_at_ms") {
             conn.execute("ALTER TABLE message ADD COLUMN written_at_ms INTEGER", [])?;
         }
+        if !message_columns.contains("compaction_json") {
+            conn.execute("ALTER TABLE message ADD COLUMN compaction_json TEXT", [])?;
+        }
+        if !message_columns.contains("compaction_compact_json") {
+            conn.execute(
+                "ALTER TABLE message ADD COLUMN compaction_compact_json TEXT",
+                [],
+            )?;
+        }
+        conn.execute("CREATE INDEX IF NOT EXISTS message_compaction_mid_idx ON message(session,json_extract(compaction_compact_json,'$.mid')) WHERE compaction_compact_json IS NOT NULL", [])?;
         // The one-time index build scans existing messages during upgrade. Thereafter
         // completeness probes visit only this session's unattributed rows, not its bodies.
         conn.execute("CREATE INDEX IF NOT EXISTS message_unattributed_session_idx ON message(session) WHERE run_json IS NULL", [])?;
@@ -1885,6 +1901,9 @@ impl SqliteStore {
                         message_json: prepared.message_json,
                         message_run_json: prepared.message_run_json,
                         message_tags_json: prepared.message_tags_json,
+                        message_compaction_json: prepared.message_compaction_json,
+                        message_compaction_compact_json: prepared.message_compaction_compact_json,
+                        compaction_delivery_updates: prepared.compaction_delivery_updates,
                         final_run_json: prepared.final_run_json,
                         completed_steps: prepared.completed_steps,
                         usage_json: prepared.usage_json,
@@ -2071,6 +2090,8 @@ impl SqliteStore {
         }
         let mut tags_json = prepared.message_tags_json.into_iter();
         let mut message_times = prepared.message_times.into_iter();
+        let mut compaction_json = prepared.message_compaction_json.into_iter();
+        let mut compaction_compact_json = prepared.message_compaction_compact_json.into_iter();
         for (json, run_json) in prepared
             .message_json
             .into_iter()
@@ -2092,11 +2113,12 @@ impl SqliteStore {
                 }
             }
             tx.execute(
-                "INSERT OR REPLACE INTO message (session, ord, json, run_json, tags_json, written_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![key, next_ord, json, run_json, tags_json, message_times.next().flatten().map(broca_core::projection_plan::u64_to_i64).transpose()?],
+                "INSERT OR REPLACE INTO message (session, ord, json, run_json, tags_json, written_at_ms, compaction_json, compaction_compact_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![key, next_ord, json, run_json, tags_json, message_times.next().flatten().map(broca_core::projection_plan::u64_to_i64).transpose()?, compaction_json.next().flatten(), compaction_compact_json.next().flatten()],
             )?;
             next_ord += 1;
         }
+        compaction_v2::apply_deliveries(tx, key, prepared.compaction_delivery_updates)?;
         for (ordinal, run_json) in prepared.final_run_json {
             let run: broca_core::RunAttribution = serde_json::from_str(&run_json)?;
             // A terminal-only tail knows the final ordinal, but not the stored row's delivery
@@ -2265,6 +2287,18 @@ impl SqliteStore {
 }
 
 impl MaterializedStore for SqliteStore {
+    fn cache_history_mode(&self, session: &BindIdentity, mode3: bool) -> Result<(), String> {
+        crate::history_mode::cache(&mut self.conn.lock().unwrap(), &Self::key(session), mode3)
+    }
+
+    fn read_compaction_page(
+        &self,
+        session: &BindIdentity,
+        request: &broca_core::compaction_v2::protocol::read::ReadRequest,
+    ) -> Result<Option<broca_core::context::CompactionStorePage>, String> {
+        compaction_v2::read_page(self, session, request).map(Some)
+    }
+
     fn read_display_facts_cache(
         &self,
         session: &BindIdentity,
@@ -7019,3 +7053,6 @@ mod windows_acl_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod message_time_tests;

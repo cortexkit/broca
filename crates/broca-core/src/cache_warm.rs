@@ -294,7 +294,10 @@ pub(crate) fn warm_reached_the_cache(
 /// (`eof_before_completion`, `chunk_error`, `idle_timeout`, `content_timeout`, `byte_limit`,
 /// `decode_error`, `rate_floor`, `cancelled`, `sealed_in_flight`). Leaving out a doubtful attempt
 /// only falls back to an earlier send, which errs early.
-fn attempt_reached_the_cache(http_status: Option<u16>, outcome: &AttemptOutcome) -> bool {
+pub(crate) fn attempt_reached_the_cache(
+    http_status: Option<u16>,
+    outcome: &AttemptOutcome,
+) -> bool {
     http_status.is_some_and(|status| (200..300).contains(&status))
         && !matches!(
             outcome,
@@ -857,22 +860,26 @@ fn effective_config(records: &[WalRecord], start: usize, end: usize) -> Option<(
     };
     let mut config = (**config).clone();
     for record in &records[start..end] {
-        match record {
-            WalRecord::RunConfigRefrozen {
-                renderer_version,
-                frozen_render_config,
-                ..
-            } => {
-                config.renderer_version = *renderer_version;
-                config.frozen_render_config = frozen_render_config.clone();
-            }
-            WalRecord::RunAuthRefrozen { auth_selection, .. } => {
-                config.auth_selection = Some(auth_selection.clone());
-            }
-            _ => {}
-        }
+        fold_refreeze(&mut config, record);
     }
     Some((run_id.clone(), config))
+}
+
+pub(crate) fn fold_refreeze(config: &mut RunConfig, record: &WalRecord) {
+    match record {
+        WalRecord::RunConfigRefrozen {
+            renderer_version,
+            frozen_render_config,
+            ..
+        } => {
+            config.renderer_version = *renderer_version;
+            config.frozen_render_config = frozen_render_config.clone();
+        }
+        WalRecord::RunAuthRefrozen { auth_selection, .. } => {
+            config.auth_selection = Some(auth_selection.clone())
+        }
+        _ => {}
+    }
 }
 
 /// When the session's most recent outcome was an exhausted provider account whose reset is still
@@ -905,6 +912,14 @@ pub fn account_wall(records: &[WalRecord], now_ms: u64) -> Option<u64> {
 pub fn last_recorded_request(
     records: &[WalRecord],
 ) -> Result<RecordedRequest, RecordedRequestError> {
+    last_recorded_request_with_lineage(records, None)
+}
+
+pub fn last_recorded_request_with_lineage(
+    records: &[WalRecord],
+    lineage: Option<&str>,
+) -> Result<RecordedRequest, RecordedRequestError> {
+    let mode3 = crate::is_mode3_log(records.iter());
     let Some(attempt_at) = records
         .iter()
         .rposition(|record| matches!(record, WalRecord::ModelAttemptFinished { .. }))
@@ -1017,12 +1032,12 @@ pub fn last_recorded_request(
     // A run frozen with `render_tags` sent its tagged user and tool-result text with the tag
     // prefix, after the guidance above; the rebuilt request must carry the same bytes. Any run
     // sent the model's text cleaned where an earlier run under the computed rules cleans it.
-    if config.render_tags {
+    if !mode3 && config.render_tags {
         broca_protocol::tags::render_tags_into(
             &mut prompt,
             broca_protocol::tags::TagRendering::for_render_config(&config.frozen_render_config),
         );
-    } else {
+    } else if !mode3 {
         broca_protocol::tags::clean_computed_into(&mut prompt);
     }
     // The one turn a budget allows after its finalize message renders with tool calls disabled.
@@ -1062,12 +1077,68 @@ pub fn last_recorded_request(
     };
     // Compaction may apply after StepStarted and before the attempt. Recover the view
     // through the attempt boundary, not just the prompt boundary used for steers.
-    let compaction = crate::replay::replay(&records[..attempt_at])
-        .map_err(|error| RecordedRequestError::Unavailable(format!("replay compaction: {error}")))?
-        .compaction;
-    if let Some(state) = compaction.state() {
-        opts = crate::compaction::model_options(&opts, state)
-            .map_err(|error| RecordedRequestError::Unavailable(error.to_string()))?;
+    if mode3 {
+        let lineage = lineage.ok_or_else(|| {
+            RecordedRequestError::Unavailable(
+                "mode-3 request reconstruction requires the WAL lineage".into(),
+            )
+        })?;
+        let frames: Vec<_> = records[..attempt_at]
+            .iter()
+            .enumerate()
+            .map(|(index, record)| broca_wal::FramedRecord {
+                seq: index as u64 + 1,
+                fence: 0,
+                record: record.clone(),
+            })
+            .collect();
+        let session = frames
+            .iter()
+            .find_map(|frame| match &frame.record {
+                WalRecord::RunStarted { session, .. } => Some(session),
+                _ => None,
+            })
+            .expect("run found above");
+        let state = crate::compaction_v2::session::load(session, &frames)
+            .map_err(RecordedRequestError::Unavailable)?;
+        let transcript = crate::compaction_v2::transcript::project(&frames, lineage)
+            .map_err(RecordedRequestError::Unavailable)?;
+        let manifest = match &records[start] {
+            WalRecord::RunStarted { manifest, .. } => manifest.as_deref(),
+            _ => None,
+        };
+        let edits = state
+            .view_for_step(step_id.0)
+            .map_or(&[][..], |view| view.edits.as_slice());
+        let prompt = if manifest.is_some_and(crate::compaction::has_compaction) {
+            crate::compaction_v2::render::prompt(
+                &opts.prompt,
+                &transcript.entries,
+                edits,
+                crate::compaction_v2::host::image_reference,
+            )
+        } else {
+            crate::compaction_v2::render::deliveries_only(&opts.prompt, &transcript.entries)
+        }
+        .map_err(RecordedRequestError::Unavailable)?;
+        opts = crate::compaction_v2::render::options(&opts, prompt);
+        let global = crate::compaction_v2::systems::frozen(true, &config, manifest)
+            .map_err(RecordedRequestError::Unavailable)?;
+        if let Some(view) = crate::compaction_v2::systems::view(&opts, &global)
+            .map_err(RecordedRequestError::Unavailable)?
+        {
+            opts = view;
+        }
+    } else {
+        let compaction = crate::replay::replay(&records[..attempt_at])
+            .map_err(|error| {
+                RecordedRequestError::Unavailable(format!("replay compaction: {error}"))
+            })?
+            .compaction;
+        if let Some(state) = compaction.state() {
+            opts = crate::compaction::model_options(&opts, state)
+                .map_err(|error| RecordedRequestError::Unavailable(error.to_string()))?;
+        }
     }
     Ok(RecordedRequest {
         run_id,

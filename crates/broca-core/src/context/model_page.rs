@@ -171,7 +171,7 @@ pub fn read_session_model_page(
         None,
         snapshot.prefix_len,
         false,
-        snapshot.tag_seed,
+        crate::replay::TranscriptSeed::for_page(&snapshot, tail),
     )?;
     let history = snapshot.model_history.as_ref();
     if snapshot.watermark_seq == 0 && compaction.is_none() {
@@ -1009,6 +1009,7 @@ mod episode_page_tests {
             run_id: RunId(run_id.into()),
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
+                global_system: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: true,

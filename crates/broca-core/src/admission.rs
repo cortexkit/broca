@@ -3112,6 +3112,7 @@ mod tests {
 
     fn config(model: &str) -> RunConfig {
         RunConfig {
+            global_system: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
@@ -4031,8 +4032,18 @@ mod tests {
     }
 
     #[test]
-    fn compaction_v2_is_a_noop_for_replay_admission_projection_and_continuations() {
-        let plain = offset_corpus();
+    fn compaction_v2_metadata_records_do_not_change_replay_admission_or_continuations() {
+        let mut plain = offset_corpus();
+        // Hold the log's first-run mode constant while checking that metadata is informational.
+        for source in &mut plain {
+            if let WalRecord::RunStarted {
+                compaction_plan_version,
+                ..
+            } = &mut source.record
+            {
+                *compaction_plan_version = Some(u32::MAX);
+            }
+        }
         let metadata: Vec<WalRecord> =
             include_str!("../../broca-wal/tests/fixtures/compaction_v2_records.jsonl")
                 .lines()
@@ -4042,14 +4053,7 @@ mod tests {
         assert!(metadata.iter().all(WalRecord::is_informational));
         let mut with = Vec::new();
         for source in &plain {
-            let mut record = source.record.clone();
-            if let WalRecord::RunStarted {
-                compaction_plan_version,
-                ..
-            } = &mut record
-            {
-                *compaction_plan_version = Some(u32::MAX);
-            }
+            let record = source.record.clone();
             for record in std::iter::once(record).chain(metadata.iter().cloned()) {
                 with.push(frame(with.len() as u64 + 1, record));
             }

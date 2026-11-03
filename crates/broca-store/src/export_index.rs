@@ -729,6 +729,7 @@ pub(crate) mod tests {
 
     pub(crate) fn config(usage_policy: &str) -> RunConfig {
         RunConfig {
+            global_system: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,

@@ -156,6 +156,7 @@ impl Fixture {
                 session: session.clone(),
                 ts_ms: ts,
                 config: Box::new(RunConfig {
+                    global_system: None,
                     account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,

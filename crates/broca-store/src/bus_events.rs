@@ -905,7 +905,7 @@ impl EventStore<'_> {
         let mut oversize = 0;
         let mut dropped = 0;
         let mut inserted = 0;
-        let mut inserted_notices = 0;
+        let inserted_notices = 0;
         for frame in records.iter().filter(|r| r.seq > seq).collect::<Vec<_>>() {
             if frame.seq != seq + 1 {
                 return Err(StoreError::BusEvent(
@@ -997,18 +997,9 @@ impl EventStore<'_> {
                         pause_reason: *reason,
                     })
                 }
-                // Notices are not run lifecycle work, so they stay out of the outbox depth.
-                WalRecord::CompactionNotice { headers, .. } => {
-                    inserted_notices += u64::from(insert_notice(
-                        tx,
-                        &account,
-                        session,
-                        headers,
-                        state.last_at_ms,
-                        now_ms,
-                    )?);
-                    None
-                }
+                // Frozen legacy notices remain readable WAL facts. V2 notices
+                // are in-memory calls, so neither mode creates bus outbox work.
+                WalRecord::CompactionNotice { .. } => None,
                 WalRecord::RunFinished {
                     reason,
                     ts_ms,
@@ -1155,13 +1146,11 @@ impl EventStore<'_> {
                 Ok(Publication { event_key:r.get(0)?, headers, subject, body, digest: None })
             },
         ).optional()?;
-        match lifecycle {
-            Some(event) => Ok(Some(event)),
-            None => self.pending_compaction_notice(),
-        }
+        Ok(lifecycle)
     }
 
     /// The oldest compaction advance notice not yet published, once no run event is pending.
+    #[cfg(test)]
     fn pending_compaction_notice(&self) -> Result<Option<Publication>, StoreError> {
         let row: Option<(String, String, String, String)> = self
             .conn
@@ -1424,6 +1413,7 @@ impl EventStore<'_> {
 /// notice projected again (a republish after a crash) has the same message id and is ignored.
 /// A notice the role would refuse is dropped: the provider would drop it too, and the next
 /// well-formed notice wakes it. Returns whether a row was added.
+#[cfg(test)]
 fn insert_notice(
     conn: &Connection,
     account: &AccountNames,
@@ -1527,9 +1517,7 @@ mod tests {
             },
         ];
         if operation != "enqueue" {
-            store
-                .project_bus_events(&session(), "epoch", &frames, 1000)
-                .unwrap();
+            seed_historical_notice(&store, &notice, 1000);
         }
         let observations = Arc::new(Mutex::new(Vec::new()));
         let captured = observations.clone();
@@ -1569,7 +1557,7 @@ mod tests {
             _ => unreachable!(),
         }
         *store.bus_events.before_write_unlock.lock().unwrap() = None;
-        let expected = if operation == "enqueue" { 1 } else { 0 };
+        let expected = 0;
         assert_eq!(
             *observations.lock().unwrap(),
             [(expected, expected)],
@@ -1578,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_notice_enqueue_gauge_precedes_unlock() {
+    fn legacy_notice_projection_stays_empty_before_unlock() {
         notice_gauge_precedes_unlock("enqueue");
     }
     #[test]
@@ -1588,6 +1576,22 @@ mod tests {
     #[test]
     fn legacy_notice_prune_gauge_precedes_unlock() {
         notice_gauge_precedes_unlock("prune");
+    }
+    fn seed_historical_notice(
+        store: &SqliteStore,
+        notice: &broca_core::compaction_provider::notice::AdvanceNotice,
+        at: u64,
+    ) {
+        assert!(insert_notice(
+            &store.conn.lock().unwrap(),
+            &AccountNames::derive("box_test").unwrap(),
+            &session(),
+            &notice.to_headers(),
+            at,
+            at
+        )
+        .unwrap());
+        store.resync_bus_depth().unwrap();
     }
     use broca_core::{RunIndex, RunIndexState};
     use broca_protocol::{request::ModelHandle, RunFinishReason, StepId, Usage};
@@ -1887,20 +1891,19 @@ mod tests {
         );
     }
 
-    /// A recorded advance notice is published from the durable WAL with the contract's bus
-    /// identity: its subject, the message id naming the session and sequence number, the notice
-    /// digest and exactly its headers, no body. Projecting the same records again (a republish
-    /// after a crash) adds no second publication, and a published notice is not sent again.
     #[tokio::test]
-    async fn compaction_notices_publish_from_the_wal_once_with_their_bus_identity() {
-        use broca_core::compaction_provider::notice::{AdvanceNotice, ADVANCED_EVENT};
+    async fn compaction_legacy_notices_create_no_outbox_and_existing_rows_are_not_published() {
+        use broca_core::compaction_provider::notice::AdvanceNotice;
         let store = Arc::new(enabled());
-        let session_ref = agent_session_ref(&session());
-        let notice =
-            AdvanceNotice::new(&session_ref, 1, "lineage", 0, "ab".repeat(32), 12, "model");
-        let mut refused = notice.clone();
-        refused.session_ref = "f".repeat(32);
-        refused.seq = 2;
+        let notice = AdvanceNotice::new(
+            agent_session_ref(&session()),
+            1,
+            "lineage",
+            0,
+            "ab".repeat(32),
+            12,
+            "model",
+        );
         let records = [
             start(),
             FramedRecord {
@@ -1911,95 +1914,61 @@ mod tests {
                     headers: notice.to_headers(),
                 },
             },
-            FramedRecord {
-                seq: 3,
-                fence: 1,
-                record: WalRecord::CompactionNotice {
-                    seq: 2,
-                    headers: refused.to_headers(),
-                },
-            },
         ];
         store
             .project_bus_events(&session(), "epoch", &records, 1000)
             .unwrap();
-        store
-            .project_bus_events(&session(), "other-epoch", &records, 1100)
+        assert_eq!(
+            store
+                .bus_metrics()
+                .compaction_notice_outbox_pending
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(store
+            .event_store()
+            .pending_compaction_notice()
+            .unwrap()
+            .is_none());
+        // An older writer may already have queued a notice. Its immutable row
+        // remains readable, but the current publisher serves only lifecycle work.
+        assert!(insert_notice(
+            &store.conn.lock().unwrap(),
+            &AccountNames::derive("box_test").unwrap(),
+            &session(),
+            &notice.to_headers(),
+            1000,
+            1000
+        )
+        .unwrap());
+        let historical = store
+            .event_store()
+            .pending_compaction_notice()
+            .unwrap()
             .unwrap();
+        assert_eq!(historical.headers, notice.to_headers());
         let bus = Fake {
             store: store.clone(),
             ack: AtomicBool::new(true),
             seen: Mutex::new(vec![]),
         };
-        // The run's lifecycle event first, then the notice; the notice naming another session
-        // is never published.
-        let mut published = Vec::new();
         assert_eq!(
-            store
-                .bus_metrics()
-                .compaction_notice_outbox_pending
-                .load(Ordering::Relaxed),
-            1
-        );
-        store
-            .bus_metrics()
-            .compaction_notice_outbox_pending
-            .store(99, Ordering::Relaxed);
-        store.resync_bus_depth().unwrap();
-        assert_eq!(
-            store
-                .bus_metrics()
-                .compaction_notice_outbox_pending
-                .load(Ordering::Relaxed),
-            1,
-            "startup restores pending notices from their own outbox"
-        );
-        while let Some(event) = store.pending_bus_event().unwrap() {
-            published.push(event.clone());
-            if event.event_key.contains(":advanced:") {
-                store
-                    .acknowledge_bus_event(&event, PublishReceipt::new(1, false), 1200)
-                    .unwrap();
-            } else {
-                assert_eq!(
-                    store.drain_bus_event(&bus, 1200).await.unwrap(),
-                    DrainResult::Published
-                );
-            }
-        }
-        let notices: Vec<_> = published
-            .iter()
-            .filter(|event| event.body.is_empty())
-            .collect();
-        assert_eq!(notices.len(), 1, "{published:?}");
-        let event = notices[0];
-        assert_eq!(event.event_key, format!("{session_ref}:advanced:1"));
-        assert_eq!(event.event_key, notice.message_id());
-        assert_eq!(
-            event.subject,
-            format!("ck.box_test.event.broca.{ADVANCED_EVENT}.v1")
-        );
-        assert_eq!(event.headers, notice.to_headers());
-        assert_eq!(event.digest().to_string(), notice.digest());
-        assert_eq!(
-            store
-                .bus_metrics()
-                .compaction_notice_outbox_pending
-                .load(Ordering::Relaxed),
-            0,
-            "publication is accounted independently of consumer acknowledgements"
+            store.drain_bus_event(&bus, 1001).await.unwrap(),
+            DrainResult::Published
         );
         assert_eq!(
-            store.pending_bus_event().unwrap().map(|e| e.event_key),
-            None
+            store.drain_bus_event(&bus, 1002).await.unwrap(),
+            DrainResult::Empty
         );
+        assert!(store
+            .event_store()
+            .pending_compaction_notice()
+            .unwrap()
+            .is_some());
     }
 
-    /// A session's next lineage (after retention deleted the last one) numbers its notices on
-    /// from the old lineage's, so its first notice is a new bus message, not a repeat the outbox
-    /// would drop for the old one's 24 hours.
     #[test]
-    fn a_new_lineages_notices_are_queued_after_the_old_lineages() {
+    fn legacy_lineage_recreation_does_not_create_new_compaction_outbox_rows() {
         use broca_core::compaction_provider::notice::AdvanceNotice;
         let store = enabled();
         let session_ref = agent_session_ref(&session());
@@ -2037,12 +2006,7 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(
-            queued,
-            (1..=3)
-                .map(|seq| format!("{session_ref}:advanced:{seq}"))
-                .collect::<Vec<_>>()
-        );
+        assert!(queued.is_empty());
     }
 
     #[test]
@@ -2198,20 +2162,7 @@ mod tests {
             12,
             "model",
         );
-        let records = [
-            start(),
-            FramedRecord {
-                seq: 2,
-                fence: 1,
-                record: WalRecord::CompactionNotice {
-                    seq: 1,
-                    headers: notice.to_headers(),
-                },
-            },
-        ];
-        store
-            .project_bus_events(&session(), "epoch", &records, 1000)
-            .unwrap();
+        seed_historical_notice(&store, &notice, 1000);
         assert_eq!(
             store
                 .bus_metrics()

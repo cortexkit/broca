@@ -2254,6 +2254,74 @@ impl LineageRegistry {
         }
     }
 
+    /// The compaction-runner wire adapter uses `bind` before acknowledging its
+    /// route, then the same session-bound entry point for all three operations.
+    pub async fn route_compaction_v2(
+        &self,
+        key: &LineageKey,
+        caller: Option<String>,
+        method: String,
+        params: Box<serde_json::value::RawValue>,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::protocol::wire::Refusal>
+    {
+        use broca_core::compaction_v2::protocol::wire::Refusal;
+        let internal = |message: String| Refusal::new("internal_error", message, None);
+        self.check_move(key, true)
+            .map_err(|error| internal(error.to_string()))?;
+        self.check_expired(key, None)
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+        let ownership = self
+            .durable_session_ownership(key, true)
+            .await
+            .map_err(|error| internal(error.into_open().to_string()))?;
+        let manifest = ownership
+            .latest_manifest
+            .as_deref()
+            .or_else(|| ownership.first_episode.as_ref()?.manifest.as_deref());
+        let item = manifest
+            .map(broca_core::compaction::item)
+            .transpose()
+            .map_err(internal)?
+            .flatten();
+        let wal = self
+            .inner
+            .reader
+            .as_ref()
+            .ok_or_else(|| internal("compaction session reader is unavailable".into()))?
+            .wal_store
+            .clone();
+        let session = key.clone();
+        let mode3 = spawn_blocking(JobKind::WalRead, move || {
+            broca_core::mode3_log_from_wal(wal.as_ref(), &session)
+        })
+        .await
+        .map_err(|error| internal(error.to_string()))?
+        .map_err(|error| internal(error.to_string()))?;
+        broca_core::compaction_v2::authority::check_bind(
+            mode3,
+            item.as_ref().map(|item| item.0.as_str()),
+            caller.as_deref(),
+        )?;
+        let handle = self
+            .actor_for(key)
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle
+            .send(crate::actor::LineageCmd::CompactionV2 {
+                caller,
+                method,
+                params,
+                reply,
+            })
+            .await
+            .map_err(|_| internal("compaction session actor closed".into()))?;
+        receive
+            .await
+            .map_err(|_| internal("compaction session actor closed".into()))?
+    }
+
     pub async fn route_compaction_ready(
         &self,
         key: &LineageKey,
@@ -5215,6 +5283,22 @@ impl LineageRegistry {
                 .map_or(snapshot.watermark_seq, |frame| frame.seq),
             broca_wal::WalRangeRecords::Absent => snapshot.watermark_seq,
         };
+        if snapshot.prefix_len > 0 && snapshot.head.as_ref().and_then(|head| head.mode3).is_none() {
+            let wal = reader.wal_store.clone();
+            let store = reader.store.clone();
+            let session = key.clone();
+            let mode3 = spawn_blocking(JobKind::StoreRead, move || {
+                let mode3 = broca_core::mode3_log_from_wal(wal.as_ref(), &session).map_err(|error| OpenError::from_wal_read(error.to_string(), &error))?;
+                if let Some(store) = store {
+                    if let Err(error) = store.cache_history_mode(&session, mode3) {
+                        tracing::warn!(target: "store", %error, "first-run mode proof was read but could not be cached");
+                    }
+                }
+                Ok::<_, OpenError>(mode3)
+            }).await.map_err(|error| OpenError::Open(error.to_string()))??;
+            snapshot.head.get_or_insert_with(Default::default).mode3 = Some(mode3);
+            head_facts.mode3 = Some(mode3);
+        }
         let (mut page, dispatches) = broca_core::read_session_page_owned_with_dispatches(
             snapshot,
             match tail.records() {
@@ -7487,6 +7571,7 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                global_system: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
@@ -8161,6 +8246,7 @@ mod offset_page_tests {
 
     fn run_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            global_system: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,

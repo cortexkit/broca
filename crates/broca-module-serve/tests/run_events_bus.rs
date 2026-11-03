@@ -74,6 +74,7 @@ fn started_at(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(ts_ms),
         config: Box::new(RunConfig {
+            global_system: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,

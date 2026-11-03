@@ -4293,6 +4293,7 @@ fn seed_completed_run_with_queue(
 
 fn min_run_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        global_system: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,

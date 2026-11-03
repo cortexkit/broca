@@ -144,6 +144,7 @@ impl Drop for Rig {
 /// A run frozen under the computed tag rules that shows the model its numbers.
 fn tagged_config() -> RunConfig {
     RunConfig {
+        global_system: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: true,

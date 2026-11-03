@@ -12,11 +12,14 @@ test-clock = ["broca-wal/fs-override"]
 test-attachments = ["broca-protocol/test-attachments"]
 
 [dependencies]
+base64 = "=0.22.1"
 broca-owner-only.workspace = true
 broca-diagnostics = { path = "../broca-diagnostics" }
 broca-protocol = { path = "../broca-protocol" }
 broca-wal = { path = "../broca-wal" }
 cortexkit-role-compaction-provider = { workspace = true }
+cortexkit-role-compaction.workspace = true
+cortexkit-compaction-view.workspace = true
 cortexkit-role-step-transform-provider.workspace = true
 cortexkit-role-tool-provider.workspace = true
 cortexkit-role-llm-runner.workspace = true

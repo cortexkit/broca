@@ -40,6 +40,7 @@ fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
         run_id: RunId("r1".into()),
         session: BindIdentity::new("/tmp/project", "runner", "session"),
         config: Box::new(RunConfig {
+            global_system: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
@@ -111,7 +112,7 @@ fn seeded_episode_coordinates_are_absolute_and_a_steer_is_not_the_first_user() {
             None,
             100,
             false,
-            crate::tags::TagSeed::default(),
+            crate::tags::TagSeed::default().into(),
         )
         .unwrap();
         assert_eq!(state.extent, if admitted_user { 103 } else { 102 });

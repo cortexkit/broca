@@ -134,6 +134,121 @@ fn compaction_plan_version_unions_with_other_record_requirements_even_when_zero(
     );
 }
 
+#[test]
+fn reader_path_tolerates_unknown_global_system_configuration_without_a_transcript_entry() {
+    let mut value: serde_json::Value = serde_json::from_str(
+        include_str!("../../tests/fixtures/compaction_v2_records.jsonl")
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    value["compaction_plan_version"] = serde_json::json!(2);
+    value["config"]["global_system"] = serde_json::json!([
+        {"role":"system","content":[{"type":"text","text":"first instructions"}]},
+        {"role":"system","content":[{"type":"text","text":"second instructions"}]}
+    ]);
+    let payload =
+        serde_json::to_vec(&serde_json::json!({"requires":[COMPACTION_V2_FEATURE],"record":value}))
+            .unwrap();
+    let bytes = frame(GATED_FRAMING_VERSION, 1, 1, &payload).unwrap();
+    let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
+        panic!("the reader refused a new optional config member")
+    };
+    let WalRecord::RunStarted { input, .. } = &framed.record else {
+        panic!("the reader lost the run start")
+    };
+    assert!(
+        input.is_empty(),
+        "the global prompt must not enter native history"
+    );
+    // The read-only reader's required config schema predates global_system.
+    // Keep its projection here after the writer learns the optional member.
+    #[derive(serde::Deserialize)]
+    struct ReaderConfig {
+        model: broca_protocol::ModelHandle,
+        tools: Vec<broca_protocol::Tool>,
+        tool_choice: broca_protocol::ToolChoice,
+        generation: broca_protocol::GenerationConfig,
+        response_format: broca_protocol::ResponseFormat,
+        context_epoch: u64,
+        renderer_version: u32,
+    }
+    #[derive(serde::Deserialize)]
+    struct ReaderStart {
+        config: ReaderConfig,
+        input: Vec<broca_protocol::Message>,
+        compaction_plan_version: Option<u32>,
+    }
+    let DecodeStep::Record { framed: reader, .. } = decode_projected(&bytes, |_, _, payload| {
+        serde_json::from_slice::<ReaderStart>(payload)
+    }) else {
+        panic!("the frozen reader config refused an unknown member")
+    };
+    assert!(reader.input.is_empty());
+    assert_eq!(reader.compaction_plan_version, Some(2));
+    assert_eq!(
+        reader.config.model,
+        broca_protocol::ModelHandle::new("p", "m")
+    );
+    assert!(reader.config.tools.is_empty());
+    assert!(matches!(
+        reader.config.tool_choice,
+        broca_protocol::ToolChoice::Auto
+    ));
+    assert_eq!(
+        reader.config.generation,
+        broca_protocol::GenerationConfig::default()
+    );
+    assert!(matches!(
+        reader.config.response_format,
+        broca_protocol::ResponseFormat::Text
+    ));
+    assert_eq!(reader.config.context_epoch, 0);
+    assert_eq!(reader.config.renderer_version, 1);
+}
+
+#[test]
+fn frozen_global_system_uses_the_existing_compaction_reader_feature() {
+    let mut record: WalRecord = serde_json::from_str(
+        include_str!("../../tests/fixtures/compaction_v2_records.jsonl")
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    if let WalRecord::RunStarted {
+        config,
+        compaction_plan_version,
+        input,
+        ..
+    } = &mut record
+    {
+        assert!(config.global_system.is_none());
+        config.global_system = Some(std::sync::Arc::new(vec![broca_protocol::Message::new(
+            broca_protocol::Role::System,
+            vec![broca_protocol::ContentBlock::Text {
+                text: "instructions".into(),
+            }],
+        )]));
+        *compaction_plan_version = Some(2);
+        assert!(input.is_empty());
+    }
+    assert_eq!(record.required_features(), [COMPACTION_V2_FEATURE]);
+    let bytes = encode(1, 1, &record).unwrap();
+    assert!(
+        matches!(decode_next(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
+    );
+    let older: Vec<_> = KNOWN_FEATURES
+        .iter()
+        .copied()
+        .filter(|feature| *feature != COMPACTION_V2_FEATURE)
+        .collect();
+    assert!(
+        matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [COMPACTION_V2_FEATURE])
+    );
+}
+
 /// A `RunStarted` whose plan manifest froze the catalog's schema pin for `read`, as the build
 /// that writes `tool-schema-pins/v1` serializes it: the pins follow the provider's other
 /// declarations inside `declarations_frozen`, keyed by tool name.

@@ -1578,7 +1578,7 @@ pub fn replay_from_episode_start(
                 None,
                 0,
                 false,
-                crate::tags::TagSeed::default(),
+                crate::tags::TagSeed::default().into(),
             )
             .map_err(|_| SeedFallback::new("replay refused the frames"))?;
             (state, 0)

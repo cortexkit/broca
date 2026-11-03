@@ -270,6 +270,7 @@ mod gated {
             .open(&request.session)
             .expect("open WAL for resumable seed");
         let config = RunConfig {
+            global_system: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags,

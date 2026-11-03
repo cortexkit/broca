@@ -108,16 +108,18 @@ impl std::error::Error for ReplayError {}
 /// The result of replaying a session's WAL — a LINEAGE of one or more episodes.
 #[derive(Debug, Clone)]
 pub struct ReplayState {
+    /// First-run mode proof from a complete log or its cached head. A bare tail
+    /// cannot establish this value and leaves it unknown.
+    pub mode3: Option<bool>,
     /// Timed recovery evidence from the current pause, never inferred from an error code.
     pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     /// Session-scoped recovery tombstones survive episode boundaries.
     pub recovered_calls: Vec<broca_wal::recovery::RecoveryRun>,
     /// Next absolute transcript ordinal, including messages not held in the prompt.
     pub extent: u64,
-    /// The last episode renders tags under the computed rules on a compaction-managed session,
-    /// is still running, and no Setup answer is recorded yet: the answer may carry a tag
-    /// checkpoint that renumbers the run's parts from its cut (llm-runner §9.6), so no read
-    /// may expose those numbers until it is durable.
+    /// Retained read-side field from the v1 provider-owned numbering protocol.
+    /// The current writer leaves it false: legacy numbers are frozen and mode-3
+    /// numbering is anchored by host markers, never a Setup answer.
     pub tags_await_setup: bool,
     pub input_budget: crate::input_budget::InputTokenBudget,
     pub cancel_at: Option<broca_wal::record::RunCancelAt>,
@@ -222,6 +224,35 @@ pub struct ReplayState {
     /// the whole transcript: `prompt` then holds only those messages, already in prompt form,
     /// and this carries what the run loop would otherwise derive from the whole prompt.
     pub(crate) held: Option<Box<crate::run::held_prompt::HeldResume>>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TranscriptSeed {
+    pub tags: crate::tags::TagSeed,
+    pub mode3: Option<bool>,
+}
+
+impl From<crate::tags::TagSeed> for TranscriptSeed {
+    fn from(tags: crate::tags::TagSeed) -> Self {
+        Self { tags, mode3: None }
+    }
+}
+
+impl TranscriptSeed {
+    pub fn for_page(snapshot: &crate::StorePageSnapshot, records: &[FramedRecord]) -> Self {
+        let mode3 = snapshot
+            .head
+            .as_ref()
+            .and_then(|head| head.mode3)
+            .or_else(|| {
+                (snapshot.watermark_seq == 0)
+                    .then(|| crate::is_mode3_log(records.iter().map(|frame| &frame.record)))
+            });
+        Self {
+            tags: snapshot.tag_seed,
+            mode3,
+        }
+    }
 }
 
 /// An opened, uncommitted tool batch as the WAL left it.
@@ -2189,6 +2220,10 @@ impl Episode {
 /// the last episode is a resume/continue target. Fails with [`ReplayError`] on a
 /// corrupt lineage (a new episode opened over an unfinished prior one).
 pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
+    let mode3 = records
+        .iter()
+        .any(|record| matches!(record, WalRecord::RunStarted { .. }))
+        .then(|| crate::is_mode3_log(records));
     replay_seeded(
         records,
         None,
@@ -2197,7 +2232,10 @@ pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
         None,
         0,
         false,
-        crate::tags::TagSeed::default(),
+        TranscriptSeed {
+            tags: crate::tags::TagSeed::default(),
+            mode3,
+        },
     )
 }
 
@@ -2332,7 +2370,14 @@ pub(crate) fn replay_projection_tail_with(
         seeded_budget_state,
         (seed.prefix_len, seed.prefix_len > 0),
         seed.admission_checkpoint.compaction.as_ref(),
-        seed.tag_seed,
+        TranscriptSeed {
+            tags: seed.tag_seed,
+            mode3: seed
+                .admission_checkpoint
+                .head
+                .as_ref()
+                .and_then(|head| head.mode3),
+        },
         Vec::new(),
         seed.refusal.clone(),
     )?;
@@ -2699,7 +2744,7 @@ pub(crate) fn replay_seeded<'a>(
     seed_budget_state: Option<crate::BudgetReplayStateV1>,
     ordinal_base: u64,
     require_caller_text: bool,
-    tag_seed: crate::tags::TagSeed,
+    tag_seed: TranscriptSeed,
 ) -> Result<ReplayState, ReplayError> {
     replay_seeded_with_refusal(
         records,
@@ -2724,7 +2769,7 @@ pub(crate) fn replay_seeded_with_refusal<'a>(
     seed_budget_state: Option<crate::BudgetReplayStateV1>,
     ordinal_base: u64,
     require_caller_text: bool,
-    tag_seed: crate::tags::TagSeed,
+    tag_seed: TranscriptSeed,
     refusal: crate::refusal_fallback::RefusalReplayState,
 ) -> Result<ReplayState, ReplayError> {
     replay_seeded_with_compaction(
@@ -2759,7 +2804,7 @@ pub(crate) fn replay_seeded_with_held_steers<'a>(
     seed_budget_state: Option<crate::BudgetReplayStateV1>,
     ordinal_base: u64,
     require_caller_text: bool,
-    tag_seed: crate::tags::TagSeed,
+    tag_seed: TranscriptSeed,
     held_steers: Vec<Message>,
 ) -> Result<ReplayState, ReplayError> {
     replay_seeded_with_compaction(
@@ -2966,7 +3011,7 @@ pub fn replay_seeded_at_validated_boundary(
         seed_budget_state,
         ordinal_base,
         require_caller_text,
-        tag_seed,
+        tag_seed.into(),
         held_steers,
     )
     .map_err(|_| SeedFallback::new("tail replay refused the seeded records"))
@@ -3140,7 +3185,7 @@ fn replay_seeded_with_compaction<'a>(
     seed_budget_state: Option<crate::BudgetReplayStateV1>,
     position: (u64, bool),
     seed_compaction: Option<&crate::compaction::CompactionCheckpoint>,
-    tag_seed: crate::tags::TagSeed,
+    tag_seed: TranscriptSeed,
     held_steers: Vec<Message>,
     refusal: crate::refusal_fallback::RefusalReplayState,
 ) -> Result<ReplayState, ReplayError> {
@@ -3182,7 +3227,8 @@ fn replay_seeded_with_compaction<'a>(
     }
     // Tag numbers under the computed rules, given in the order the transcript renders: each
     // message as it is placed in the prompt, a run's rules from its `RunStarted` on.
-    let mut numbering = crate::tags::TagNumbering::new(tag_seed, 0);
+    let mode3 = tag_seed.mode3;
+    let mut numbering = crate::tags::TagNumbering::new(tag_seed.tags, 0);
     // Lineage-cumulative: the conversation prefix across ALL episodes. The ONLY state
     // that survives an episode boundary.
     let mut prompt: Vec<Message> = Vec::new();
@@ -3851,7 +3897,9 @@ fn replay_seeded_with_compaction<'a>(
                         ));
                 }
                 if let (Some(tool_call_id), Some(text)) = (tool_call_id, appended_text) {
-                    crate::delivery_order::apply_to_prompt(&mut prompt, tool_call_id, text);
+                    if mode3 != Some(true) {
+                        crate::delivery_order::apply_to_prompt(&mut prompt, tool_call_id, text);
+                    }
                     if let Some(index) = prompt.iter().rposition(|message| {
                         message.content.iter().any(|block| matches!(block,
                             ContentBlock::ToolResult(result) if &result.tool_call_id == tool_call_id))
@@ -4370,14 +4418,11 @@ fn replay_seeded_with_compaction<'a>(
     }
     // A torn import's repair truncates the prompt; a turn past the end no longer exists.
     committed_tool_turns.retain(|(prompt_index, _)| *prompt_index < prompt.len());
-    let tags_await_setup = saw_run_started
-        && !run_finished_durable
-        && compaction_session
-        && compaction.state().is_none()
-        && run_config
-            .as_ref()
-            .is_some_and(|config| config.render_tags && config.computed_tags.is_some());
+    // No shipping session waits for a provider-owned numbering checkpoint:
+    // mode-3 uses host markers, while legacy sessions keep their frozen numbers.
+    let tags_await_setup = false;
     Ok(ReplayState {
+        mode3,
         account_limit_pause,
         recovered_calls,
         extent: placement.next_ordinal(),
@@ -5597,6 +5642,7 @@ pub(crate) mod projection_boundary_tests {
                 run_id: RunId(run_id.into()),
                 session: BindIdentity::new("/tmp/project", "runner", "session"),
                 config: Box::new(RunConfig {
+                    global_system: None,
                     account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,
@@ -6961,6 +7007,7 @@ mod offset_tail_tests {
 
     fn run_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            global_system: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
@@ -7255,7 +7302,7 @@ mod offset_tail_tests {
             None,
             prefix.prompt.len() as u64,
             false,
-            crate::tags::TagSeed::default(),
+            crate::tags::TagSeed::default().into(),
             held.clone(),
         )
         .unwrap();
@@ -7299,7 +7346,7 @@ mod offset_tail_tests {
             None,
             prefix.prompt.len() as u64,
             false,
-            crate::tags::TagSeed::default(),
+            crate::tags::TagSeed::default().into(),
             prefix.pending_steers.clone(),
         )
         .unwrap();
@@ -7316,7 +7363,7 @@ mod offset_tail_tests {
             None,
             prefix.prompt.len() as u64,
             false,
-            crate::tags::TagSeed::default(),
+            crate::tags::TagSeed::default().into(),
         )
         .unwrap();
         assert_ne!(prompt_shape(&unseeded.prompt), prompt_shape(&seeded.prompt));

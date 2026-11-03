@@ -413,6 +413,7 @@ impl Overhaul {
                 })),
         )
     }
+    #[cfg(test)]
     pub fn compaction_receipts(
         &self,
     ) -> Arc<dyn broca_store::compaction_receipts::CompactionReceiptStore> {
@@ -1505,6 +1506,7 @@ mod tests {
             session: session.clone(),
             ts_ms: None,
             config: Box::new(RunConfig {
+                global_system: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,

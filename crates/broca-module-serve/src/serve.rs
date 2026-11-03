@@ -5093,6 +5093,7 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
             })
         }
         broca_module::serve::PlanState::NotAdmitted | broca_module::serve::PlanState::Unknown => {
+            broca_fetch_plan::require_compaction_preset(&parsed)?;
             let Some(admitter) = handler.plan_admitter() else {
                 return Err(broca_fetch_plan::Refusal::InvalidParams {
                     detail: serde_json::json!({"field": "plan"}),
@@ -7204,6 +7205,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_preset_is_required_before_provider_fetch_or_actor_open() {
+        struct AdmissionOnly;
+        #[async_trait::async_trait]
+        impl ServeHandler for AdmissionOnly {
+            fn compaction_supported(&self) -> bool {
+                true
+            }
+            async fn send(&self, _: SendRequest) -> Result<SendResponse, ServeError> {
+                panic!("refused plan must not open an actor")
+            }
+            async fn retract(
+                &self,
+                _: &BrocaBindIdentity,
+                _: broca_protocol::SubmissionId,
+            ) -> Result<RetractResponse, ServeError> {
+                unreachable!()
+            }
+            async fn subscribe(
+                &self,
+                _: &BrocaBindIdentity,
+                _: SubscribeFrom,
+                _: mpsc::Sender<Delivery>,
+            ) -> Result<(), ServeError> {
+                unreachable!()
+            }
+            async fn read(&self, _: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
+                unreachable!()
+            }
+            async fn cancel(
+                &self,
+                _: &BrocaBindIdentity,
+                _: broca_protocol::RunId,
+            ) -> Result<CancelResponse, ServeError> {
+                unreachable!()
+            }
+            async fn status(&self, _: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
+                unreachable!()
+            }
+            async fn run_status(
+                &self,
+                _: &BrocaBindIdentity,
+                _: broca_protocol::RunId,
+            ) -> Result<RunStatusResponse, ServeError> {
+                unreachable!()
+            }
+        }
+        let composition = serde_json::json!({"providers":[{"provider":"ck-mc","tools":[]}],"step_transform_items":[],"compaction":{"provider":"ck-mc"}});
+        let plan = serde_json::json!({"tool_items":[],"system_text_items":[],"step_transform_items":[],"compaction_item":{"provider":"ck-mc","params":{}},"composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),"composition":composition});
+        let session = BrocaBindIdentity::new("/synthetic/compaction-preset", "runner", "preset");
+        let result = admit_send_plan(
+            &AdmissionOnly,
+            &session,
+            &serde_json::json!({"plan":plan}),
+            &plan,
+            None,
+            None,
+        )
+        .await;
+        let Err(refusal) = result else {
+            panic!("missing compaction preset was admitted")
+        };
+        let body = refusal.wire_body();
+        assert_eq!(body.code, "invalid_params");
+        assert_eq!(
+            body.detail,
+            Some(serde_json::json!({"field":"plan.compaction_item.preset"}))
+        );
+    }
+
+    #[tokio::test]
     async fn pre_user_unavailable_wire_names_only_the_refusing_provider() {
         let (tx, mut rx) = broca_diagnostics::channel(1, Arc::default());
         send_serve_error(
@@ -8184,6 +8255,7 @@ mod tests {
             run_id: broca_protocol::RunId("legacy".into()),
             session,
             config: Box::new(broca_wal::RunConfig {
+                global_system: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
