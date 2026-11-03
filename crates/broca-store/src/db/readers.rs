@@ -659,6 +659,9 @@ fn page(
     if rows.len() as u64 != end.min(session.count).saturating_sub(start) {
         return Err(invalid("raw page ordinal gap"));
     }
+    let mode3 = head
+        .mode3
+        .unwrap_or_else(|| broca_core::is_mode3_log(first.iter().map(|frame| &frame.record)));
     let mut messages = Vec::new();
     let mut dispatches = BTreeMap::new();
     for (ordinal, source) in rows {
@@ -686,7 +689,8 @@ fn page(
             .2
             .map(|off| sources.indexed_frame(tx, key, off))
             .transpose()?;
-        let (mut message, written_at, turn) = hydrate_message(&frames, &source, started.as_ref())?;
+        let (mut message, written_at, turn) =
+            hydrate_message(&frames, &source, started.as_ref(), mode3)?;
         if source.flags & 2 != 0 {
             let mut high = source
                 .tag_base
@@ -732,10 +736,20 @@ fn page(
     if session.count >= start && session.count < end {
         if let Some((mut message, step)) = replayed.open_tool_turn {
             message.ordinal = Some(session.count);
-            let times = broca_core::message_times::written_times(
-                tail_frames.iter().map(|f| &f.record),
-                broca_core::placement::Placement::new(ordinal_base),
-            )
+            let times = if mode3 {
+                broca_core::message_times::mode3_written_times(
+                    tail_frames.iter().map(|f| &f.record),
+                    broca_core::placement::Placement::new(ordinal_base),
+                    Default::default(),
+                    Default::default(),
+                )
+                .map(|fold| fold.times)
+            } else {
+                broca_core::message_times::written_times(
+                    tail_frames.iter().map(|f| &f.record),
+                    broca_core::placement::Placement::new(ordinal_base),
+                )
+            }
             .map_err(invalid)?;
             dispatches.extend(broca_core::dispatches_of_turns(
                 &tail_frames,
@@ -872,10 +886,16 @@ fn hydrate_message(
     frames: &[FramedRecord],
     source: &OffsetSource,
     started: Option<&FramedRecord>,
+    mode3: bool,
 ) -> Result<(Message, Option<u64>, Option<usize>), DbError> {
     let first = frames
         .first()
         .ok_or_else(|| invalid("empty raw message source"))?;
+    if mode3 && matches!(first.record, WalRecord::BudgetFired { .. }) {
+        return Err(DbError::SeedFallback(SeedFallback::new(
+            "mode3 budget timestamp source",
+        )));
+    }
     let input = match &first.record {
         WalRecord::RunStarted { input, .. }
         | WalRecord::Steered { input, .. }
@@ -923,6 +943,11 @@ fn hydrate_message(
             _ => None,
         }
         .filter(|time| *time != 0);
+        if mode3 && time.is_none() {
+            return Err(DbError::SeedFallback(SeedFallback::new(
+                "mode3 historical timestamp source",
+            )));
+        }
         return Ok((message, time, None));
     }
     if frames.iter().any(|f| {
@@ -953,10 +978,20 @@ fn hydrate_message(
     }
     // The turn range includes all result/no-dispatch frames, so timestamps and
     // dispatch ordering use the same folds as a full transcript read.
-    let times = broca_core::message_times::written_times(
-        frames.iter().map(|f| &f.record),
-        broca_core::placement::Placement::default(),
-    )
+    let times = if mode3 {
+        broca_core::message_times::mode3_written_times(
+            frames.iter().map(|f| &f.record),
+            broca_core::placement::Placement::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .map(|fold| fold.times)
+    } else {
+        broca_core::message_times::written_times(
+            frames.iter().map(|f| &f.record),
+            broca_core::placement::Placement::default(),
+        )
+    }
     .map_err(invalid)?;
     let turn = (source.input_start == 0)
         .then(|| replay.committed_tool_turns.first().map(|(_, index)| *index))

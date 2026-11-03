@@ -5,6 +5,65 @@ use broca_wal::WalRecord;
 use cortexkit_role_llm_runner::{read::HeadModel, usage::SessionUsage};
 use serde::{Deserialize, Serialize};
 
+/// A log uses mode-3 semantics exactly when its first RunStarted has a plan version.
+/// Later runs cannot change that choice. HeadProjection caches this predicate, with None
+/// meaning unknown rather than legacy.
+pub fn is_mode3_log<'a>(records: impl IntoIterator<Item = &'a WalRecord>) -> bool {
+    records
+        .into_iter()
+        .find_map(|record| match record {
+            WalRecord::RunStarted {
+                compaction_plan_version,
+                ..
+            } => Some(compaction_plan_version.is_some()),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// Learn an old cache's missing mode from bounded first-run records, without replaying its
+/// transcript or recomputing any materialized legacy message times.
+pub fn mode3_log_from_wal(
+    wal: &dyn crate::WalStore,
+    session: &broca_protocol::BindIdentity,
+) -> Result<bool, broca_wal::WalError> {
+    let mut after = 0_u64;
+    let mut anchor = None;
+    loop {
+        let through = after.saturating_add(64);
+        let range = wal.read_records_range(session, after, Some(through), anchor.as_ref())?;
+        let records = match range.records() {
+            broca_wal::WalRangeRecords::Complete(records)
+            | broca_wal::WalRangeRecords::Unknown(records) => records,
+            broca_wal::WalRangeRecords::Absent => return Ok(false),
+            broca_wal::WalRangeRecords::Partial(_) => {
+                return Err(broca_wal::WalError::Io(std::io::Error::other(
+                    "cannot establish the log's first run from incomplete history",
+                )))
+            }
+        };
+        if records
+            .iter()
+            .any(|record| matches!(record.record, WalRecord::RunStarted { .. }))
+        {
+            return Ok(is_mode3_log(records.iter().map(|record| &record.record)));
+        }
+        if range.complete_byte_end.is_some()
+            || matches!(range.records(), broca_wal::WalRangeRecords::Unknown(records) if records.is_empty())
+            || through == u64::MAX
+        {
+            return Ok(false);
+        }
+        if records.last().is_some_and(|record| record.seq <= after) {
+            return Err(broca_wal::WalError::Io(std::io::Error::other(
+                "history reader did not advance while locating its first run",
+            )));
+        }
+        after = through;
+        anchor = range.next_anchor;
+    }
+}
+
 /// A content-free retained summary with a watermark separate from transcript projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetainedHeadCheckpoint {
@@ -15,6 +74,12 @@ pub struct RetainedHeadCheckpoint {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeadProjection {
+    /// Set once from the first RunStarted. None is unknown, never evidence of a legacy log;
+    /// callers must obtain the shared is_mode3_log predicate's answer before choosing semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode3: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode3_times: Option<crate::message_times::MessageTimeSeed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_rich_ui: Option<broca_protocol::RichUiStamp>,
     pub model: Option<HeadModel>,
@@ -29,6 +94,8 @@ pub struct HeadProjection {
 impl Default for HeadProjection {
     fn default() -> Self {
         Self {
+            mode3: None,
+            mode3_times: None,
             last_run_rich_ui: None,
             model: None,
             usage: None,
@@ -116,6 +183,9 @@ impl HeadProjection {
                 submission_id,
                 ..
             } => {
+                if self.run_id.is_none() {
+                    self.mode3 = Some(crate::is_mode3_log(std::iter::once(record)));
+                }
                 if let Some(id) = submission_id {
                     self.queued_times.remove(&id.0);
                 }
@@ -199,6 +269,14 @@ impl HeadProjection {
                 );
             }
             _ => {}
+        }
+        if self.mode3 == Some(true) {
+            let seed = self.mode3_times.get_or_insert_with(Default::default);
+            if matches!(record, WalRecord::RunStarted { .. }) {
+                seed.last_record_ms = None;
+            }
+            seed.last_record_ms =
+                crate::message_times::record_written_ms(record).or(seed.last_record_ms);
         }
     }
 
@@ -371,6 +449,30 @@ mod tests {
         serde_json::from_value(json!({"type":"model_step_finished", "step_id":1,
             "assistant_message":{"message_id":"m","content":[]},"usage":usage,"retries_used":0}))
         .unwrap()
+    }
+
+    #[test]
+    fn history_mode_is_fixed_by_the_first_run_not_a_later_writer() {
+        let legacy = start("legacy", None);
+        let mut mode3 = start("mode3", None);
+        if let WalRecord::RunStarted {
+            compaction_plan_version,
+            ..
+        } = &mut mode3
+        {
+            *compaction_plan_version = Some(2);
+        }
+        assert!(!is_mode3_log([&legacy, &mode3]));
+        assert!(is_mode3_log([&mode3, &legacy]));
+        let mut head = HeadProjection::default();
+        assert_eq!(head.mode3, None);
+        head.observe(&legacy);
+        head.observe(&mode3);
+        assert_eq!(head.mode3, Some(false));
+        let mut head = HeadProjection::default();
+        head.observe(&mode3);
+        head.observe(&legacy);
+        assert_eq!(head.mode3, Some(true));
     }
 
     #[test]

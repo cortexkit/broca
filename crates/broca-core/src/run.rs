@@ -8119,10 +8119,42 @@ pub(crate) async fn project_committed<W: WalStore>(
 ) {
     // Older rows and third-party persisters may not have a complete projection seed. In that
     // case reading after zero preserves the full-prefix correctness fallback.
-    let seed = read_projection_seed_blocking(store.clone(), session.clone())
+    let mut seed = read_projection_seed_blocking(store.clone(), session.clone())
         .await
         .ok()
         .flatten();
+    // A valid head without a model has not folded a RunStarted yet; the incoming prefix
+    // supplies its first-run mode instead of requiring a separate origin probe.
+    if seed.as_ref().is_some_and(|seed| {
+        seed.admission_checkpoint
+            .head
+            .as_ref()
+            .is_some_and(|head| head.mode3.is_none() && head.model.is_some())
+    }) {
+        match crate::mode3_log_from_wal(wal_store, session) {
+            Ok(mode3) => {
+                let cache = store.clone();
+                let key = session.clone();
+                if spawn_blocking(JobKind::Projection, move || {
+                    cache.cache_history_mode(&key, mode3)
+                })
+                .await
+                .is_ok_and(|result| result.is_ok())
+                {
+                    seed = read_projection_seed_blocking(store.clone(), session.clone())
+                        .await
+                        .ok()
+                        .flatten();
+                }
+            }
+            Err(error) => {
+                tracing::warn!(target: "store", %error, "cannot establish first-run mode for projection");
+                PROJECTION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::projection_health::record_failure(session);
+                return;
+            }
+        }
+    }
     let prior_policy = seed
         .as_ref()
         .and_then(|seed| seed.admission_checkpoint.lineage_retention);

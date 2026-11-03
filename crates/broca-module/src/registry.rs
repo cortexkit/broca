@@ -4883,6 +4883,22 @@ impl LineageRegistry {
                 .map_or(snapshot.watermark_seq, |frame| frame.seq),
             broca_wal::WalRangeRecords::Absent => snapshot.watermark_seq,
         };
+        if snapshot.prefix_len > 0 && snapshot.head.as_ref().and_then(|head| head.mode3).is_none() {
+            let wal = reader.wal_store.clone();
+            let store = reader.store.clone();
+            let session = key.clone();
+            let mode3 = spawn_blocking(JobKind::StoreRead, move || {
+                let mode3 = broca_core::mode3_log_from_wal(wal.as_ref(), &session).map_err(|error| OpenError::from_wal_read(error.to_string(), &error))?;
+                if let Some(store) = store {
+                    if let Err(error) = store.cache_history_mode(&session, mode3) {
+                        tracing::warn!(target: "store", %error, "first-run mode proof was read but could not be cached");
+                    }
+                }
+                Ok::<_, OpenError>(mode3)
+            }).await.map_err(|error| OpenError::Open(error.to_string()))??;
+            snapshot.head.get_or_insert_with(Default::default).mode3 = Some(mode3);
+            head_facts.mode3 = Some(mode3);
+        }
         let (mut page, dispatches) = broca_core::read_session_page_owned_with_dispatches(
             snapshot,
             match tail.records() {

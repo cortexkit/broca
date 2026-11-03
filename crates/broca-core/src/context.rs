@@ -751,6 +751,11 @@ pub struct TagLocation {
 
 /// The materialized store read seam. The loop depends only on this trait.
 pub trait MaterializedStore: Send + Sync {
+    /// Cache only the first-run mode proof, never rebuilding legacy message timestamps.
+    fn cache_history_mode(&self, _session: &BindIdentity, _mode3: bool) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Display facts are an opt-in, per-lineage cache. A missing seed requires one lazy
     /// backfill for this session only; default transcript reads never call this seam.
     fn read_display_facts_cache(
@@ -1790,15 +1795,51 @@ fn read_session_page_from_rows(
     let capped_limit = limit
         .unwrap_or(SESSION_READ_DEFAULT_LIMIT)
         .clamp(1, SESSION_READ_MAX_LIMIT);
-    let times = crate::message_times::written_times_with_queued(
-        framed_tail.iter().map(|frame| &frame.record),
-        crate::placement::Placement::new(snapshot.prefix_len),
-        snapshot
-            .head
-            .as_ref()
-            .map(|head| head.queued_times().clone())
-            .unwrap_or_default(),
-    )
+    let discard_materialized_seed = snapshot.completed_steps == 0
+        && crate::replay::first_session_record_is_interrupted(
+            framed_tail.iter().map(|frame| &frame.record),
+        );
+    let mode3 = snapshot
+        .head
+        .as_ref()
+        .and_then(|head| head.mode3)
+        .or_else(|| {
+            (snapshot.prefix_len == 0)
+                .then(|| crate::is_mode3_log(framed_tail.iter().map(|frame| &frame.record)))
+        })
+        .ok_or_else(|| crate::ReplayError::CorruptLineage {
+            episode_run_id: snapshot
+                .last_run_id
+                .clone()
+                .unwrap_or_else(|| RunId(String::new())),
+            reason: "first-run history mode is not known".into(),
+        })?;
+    let queued = snapshot
+        .head
+        .as_ref()
+        .map(|head| head.queued_times().clone())
+        .unwrap_or_default();
+    let records = framed_tail.iter().map(|frame| &frame.record);
+    let placement = crate::placement::Placement::new(if mode3 && discard_materialized_seed {
+        0
+    } else {
+        snapshot.prefix_len
+    });
+    let times = if mode3 {
+        let seed = if discard_materialized_seed {
+            Default::default()
+        } else {
+            snapshot
+                .head
+                .as_ref()
+                .and_then(|head| head.mode3_times.clone())
+                .unwrap_or_default()
+        };
+        crate::message_times::mode3_written_times(records, placement, queued, seed)
+            .map(|fold| fold.times)
+    } else {
+        crate::message_times::written_times_with_queued(records, placement, queued)
+    }
     .map_err(|reason| crate::ReplayError::CorruptLineage {
         episode_run_id: snapshot
             .last_run_id
@@ -1806,10 +1847,6 @@ fn read_session_page_from_rows(
             .unwrap_or_else(|| RunId(String::new())),
         reason,
     })?;
-    let discard_materialized_seed = snapshot.completed_steps == 0
-        && crate::replay::first_session_record_is_interrupted(
-            framed_tail.iter().map(|framed| &framed.record),
-        );
     let mut tail_state = crate::replay::replay_seeded(
         framed_tail.iter().map(|framed| &framed.record),
         snapshot.trailing_origin.clone(),
@@ -3561,7 +3598,11 @@ mod tests {
             })
             .collect();
         StorePageSnapshot {
-            head: None,
+            head: Some({
+                let mut head = crate::head::HeadProjection::default();
+                head.mode3 = Some(false);
+                head
+            }),
             model_history: None,
             last_title: None,
             deferred_calls: None,
@@ -3740,6 +3781,11 @@ mod tests {
             })
             .collect();
         let clamped_snapshot = StorePageSnapshot {
+            head: Some({
+                let mut head = crate::head::HeadProjection::default();
+                head.mode3 = Some(false);
+                head
+            }),
             prefix_len: SESSION_READ_MAX_LIMIT + 1,
             completed_steps: 1,
             rows,
