@@ -421,6 +421,8 @@ async fn run_case(steps: usize, media: bool) {
     })
     .await
     .unwrap();
+    // The reader retains the SQLite connection independently of the daemon.
+    drop(admission);
     measure(
         &access,
         media,
