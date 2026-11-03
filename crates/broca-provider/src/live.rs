@@ -40,6 +40,13 @@ impl LiveAnthropicProvider {
 
 #[async_trait]
 impl Provider for LiveAnthropicProvider {
+    fn turn_system_possible(
+        &self,
+        preceding: Option<&broca_protocol::Message>,
+        followed_by_user: bool,
+    ) -> bool {
+        self.inner.turn_system_possible(preceding, followed_by_user)
+    }
     fn history_edit_cost(
         &self,
     ) -> Option<broca_core::compaction_provider::notice::HistoryEditCost> {

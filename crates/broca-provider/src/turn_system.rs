@@ -33,15 +33,24 @@ pub fn supported(frozen: &FrozenRenderConfig) -> bool {
 
 /// Whether a newly delivered template can end this request at system authority.
 pub fn possible(frozen: &FrozenRenderConfig, prompt: &[broca_protocol::Message]) -> bool {
+    possible_after(frozen, prompt.last(), false)
+}
+
+pub(crate) fn possible_after(
+    frozen: &FrozenRenderConfig,
+    preceding: Option<&broca_protocol::Message>,
+    followed_by_user: bool,
+) -> bool {
     if !supported(frozen) {
         return false;
     }
     if frozen.family_id != WireFamilyId::AnthropicMessages {
         return true;
     }
-    prompt.last().is_some_and(|message| {
-        !message.turn_system && matches!(message.role, Role::User | Role::Tool)
-    })
+    !followed_by_user
+        && preceding.is_some_and(|message| {
+            !message.turn_system && matches!(message.role, Role::User | Role::Tool)
+        })
 }
 
 /// Downgrade only the rendered copy: history retains its bytes, role and delivery mode.
