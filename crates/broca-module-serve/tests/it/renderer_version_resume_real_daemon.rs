@@ -415,7 +415,9 @@ async fn wait_send_finished(rig: &Rig, session: &str, send_id: &str) -> Vec<WalR
                 .read_records_range(&identity, 0, Some(cursor.wal_seq), None)
                 .map_err(|error| format!("read durable assertion prefix: {error}"))?;
             // A log with a lineage frame serves that lineage as its incarnation.
-            if range.lineage_id.map(|id| id.to_string()).as_deref() != Some(head.incarnation.as_str()) {
+            if range.lineage_id.map(|id| id.to_string()).as_deref()
+                != Some(head.incarnation.as_str())
+            {
                 return Err("session head and assertion WAL have different lineages".into());
             }
             let broca_wal::WalRangeRecords::Complete(frames) = range.records() else {

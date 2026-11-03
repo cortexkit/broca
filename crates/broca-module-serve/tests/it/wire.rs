@@ -3377,9 +3377,10 @@ async fn read_route_manifest_and_page_roundtrip() {
     let result: broca_module_serve::wire::ReadResult =
         serde_json::from_value(v["result"].clone()).unwrap();
     assert_eq!(result.messages.len(), 2);
-    assert_eq!(result.messages[0].ordinal, 0);
+    // llm-runner 0.8 ordinals start at 1.
+    assert_eq!(result.messages[0].ordinal, 1);
     assert_eq!(result.messages[0].message.role, Role::User);
-    assert_eq!(result.messages[1].ordinal, 1);
+    assert_eq!(result.messages[1].ordinal, 2);
     assert_eq!(result.messages[1].message.role, Role::Assistant);
     assert_eq!(result.lineage_state.state, "completed");
     assert_eq!(result.lineage_state.reason.as_deref(), Some("completed"));
@@ -4988,7 +4989,8 @@ async fn project_observation_wire(import: bool) {
         assert_eq!(page.header.ty, FrameType::Response);
         let page: serde_json::Value = serde_json::from_slice(&page.body).unwrap();
         assert_eq!(
-            page["result"]["lineage_id"],
+            // A framed log serves its lineage as the incarnation.
+            page["result"]["incarnation"],
             lineage_id.unwrap().to_string()
         );
         assert!(!page.to_string().contains("project_id"));

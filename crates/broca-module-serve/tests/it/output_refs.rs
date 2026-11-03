@@ -706,10 +706,8 @@ async fn a_reply_set_resolves_against_the_writing_request() {
         derived.reply.descriptor.check(&parsed),
         "the descriptor's count and digest match the served records"
     );
-    assert_eq!(
-        derived.reply.descriptor.mid,
-        format!("m{}.3", &lineage[..8])
-    );
+    // A session without a compaction provider keeps the established positional message ids.
+    assert_eq!(derived.reply.descriptor.mid, "m3");
     assert_eq!(derived.reply.descriptor.dialect, "rich-ui/1");
     check_golden(
         &normalized(&page.body, &run_id, &lineage),

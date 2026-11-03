@@ -3234,10 +3234,8 @@ async fn live_display_mid_after_reopen_comes_from_seeded_placement() {
         .unwrap();
     assert_eq!(delta["event"]["mid"], stored.mid);
     assert_eq!(stored.ordinal, 4);
-    assert_eq!(
-        delta["event"]["mid"],
-        format!("m{}.3", &page.incarnation[..8])
-    );
+    // A session without a compaction provider keeps the established positional message ids.
+    assert_eq!(delta["event"]["mid"], "m3");
     rig.finish().await;
 }
 
@@ -3374,10 +3372,8 @@ async fn live_display_after_steer_uses_the_next_step_placement() {
         .unwrap();
     let page = read(&mut rig, serde_json::json!({})).await;
     assert_eq!(page.messages.last().unwrap().ordinal, 5);
-    assert_eq!(
-        page.messages.last().unwrap().mid,
-        format!("m{}.4", &page.incarnation[..8])
-    );
+    // A session without a compaction provider keeps the established positional message ids.
+    assert_eq!(page.messages.last().unwrap().mid, "m4");
     assert_eq!(delta["event"]["mid"], page.messages.last().unwrap().mid);
     rig.finish().await;
 }

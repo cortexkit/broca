@@ -67,7 +67,10 @@ fn capture_known_with_run(frame: &subc_protocol::Frame, name: &str, run: Option<
     }
     // A served history's version is allocated above every earlier one, so it is not stable
     // across runs; 0 (never served) stays literal.
-    if let Some(version) = answer["history_version"].as_u64().filter(|version| *version > 0) {
+    if let Some(version) = answer["history_version"]
+        .as_u64()
+        .filter(|version| *version > 0)
+    {
         bytes = bytes.replace(
             &format!("\"history_version\":{version}"),
             "\"history_version\":\"@HISTORY_VERSION@\"",
@@ -328,7 +331,10 @@ async fn recorded_read_times_and_caller_head_grants_match_serve_goldens() {
             "by_model":[{"provider":"p","model":"m","steps":1,"unreported_steps":0,"input_tokens":7,"output_tokens":3}]})
         );
         assert!(answer["incarnation"].is_string());
-        assert!(answer.get("lineage_id").is_none(), "llm-runner 0.8 heads carry no lineage_id");
+        assert!(
+            answer.get("lineage_id").is_none(),
+            "llm-runner 0.8 heads carry no lineage_id"
+        );
         if expected_modes.is_empty() {
             assert!(answer.get("sender").is_none());
         } else {

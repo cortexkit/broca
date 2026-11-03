@@ -95,7 +95,10 @@ async fn populated_head_preserves_pre_addition_reply_bytes() {
         "\"updated_at\":\"@UPDATED_AT@\"",
     );
     bytes = bytes.replace(
-        &format!("\"history_version\":{}", answer["history_version"].as_u64().unwrap()),
+        &format!(
+            "\"history_version\":{}",
+            answer["history_version"].as_u64().unwrap()
+        ),
         "\"history_version\":\"@HISTORY_VERSION@\"",
     );
     bytes = bytes.replace("legacy-run", "@RUN_ID@");

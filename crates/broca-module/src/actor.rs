@@ -3062,9 +3062,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             _ => false,
         };
         if rewriting {
-            self.refresh_admission_view().await?;
-            if let Some(run_id) = self
-                .recovery_records()
+            // Boxed for the same reason as the recovery body below: these replay futures are
+            // large, and recovery runs beneath command handling on small worker stacks.
+            Box::pin(self.refresh_admission_view()).await?;
+            if let Some(run_id) = Box::pin(self.recovery_records())
                 .await?
                 .iter()
                 .rev()

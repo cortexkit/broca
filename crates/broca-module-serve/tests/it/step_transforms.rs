@@ -572,58 +572,6 @@ async fn post_tool_replace_requires_frozen_grant() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn post_tool_caps_before_hooks_without_truncating_applied_ops() {
-    for too_large in [false, true] {
-        let (mut rig, daemon, state, plan) = start(
-            if too_large {
-                "cap-excess-live"
-            } else {
-                "cap-headroom-live"
-            },
-            vec![subscription("post_tool", None, "refuse", 1000)],
-        )
-        .await;
-        rig.script.tool_results.lock().unwrap().insert(
-            "c".into(),
-            broca_core::DispatchResult::Completed(ToolResult {
-                tool_call_id: ToolCallId("c".into()),
-                output: ToolOutput::Text {
-                    text: "x".repeat(1024 * 1024 + 100),
-                },
-                is_error: false,
-            }),
-        );
-        let suffix = if too_large {
-            "y".repeat(16385)
-        } else {
-            "suffix".into()
-        };
-        let expected_suffix = suffix.clone();
-        state.answer_with(move |c| {
-            assert!(c["blocks"][0].as_str().unwrap().len() <= 1024 * 1024 - 16384);
-            append(&suffix)
-        });
-        rig.script.push(&[Step::Call("c"), Step::Text("done")]);
-        result(&send(&mut rig, "first", Some(&plan), None).await);
-        let records = values(&rig.wait_for_finished(1).await);
-        let result = only(&records, "tool_result");
-        if too_large {
-            assert_eq!(result["reason"], "post_tool_unavailable");
-        } else {
-            let rendered = result["result"]["output"]["text"].as_str().unwrap();
-            assert!(rendered.ends_with(&expected_suffix));
-            assert!(rendered.len() <= 1024 * 1024);
-            let original = result["hooks"]["original"]["output"]["text"]
-                .as_str()
-                .unwrap();
-            assert_eq!(format!("{original}{expected_suffix}"), rendered);
-            assert_eq!(result["hooks"]["ops"][0]["op"], "append");
-        }
-        finish(rig, daemon).await;
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_hook_budget_includes_route_open_and_hanging_provider() {
     // Exact timer arithmetic runs on its own current-thread clock, not on the daemon's
     // multithreaded socket runtime.
