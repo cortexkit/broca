@@ -3633,3 +3633,6 @@ async fn codex_cancel_during_a_long_retry_after_wait_ends_the_run_cancelled() {
     assert!(seen.http_bodies.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+mod generated_streams {
+    include!("transport_websocket_generated_tests.rs");
+}
