@@ -48,10 +48,9 @@ pub fn mode3_log_from_wal(
         {
             return Ok(is_mode3_log(records.iter().map(|record| &record.record)));
         }
-        if range.complete_byte_end.is_some()
-            || matches!(range.records(), broca_wal::WalRangeRecords::Unknown(records) if records.is_empty())
-            || through == u64::MAX
-        {
+        // No record past `after` means the log ends here without a run (a writer that opened
+        // and wrote only its lineage frame); keep reading and the loop would never end.
+        if range.complete_byte_end.is_some() || records.is_empty() || through == u64::MAX {
             return Ok(false);
         }
         if records.last().is_some_and(|record| record.seq <= after) {

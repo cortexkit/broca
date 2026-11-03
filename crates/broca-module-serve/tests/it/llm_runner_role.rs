@@ -3741,3 +3741,31 @@ async fn debug_pdf_send_is_refused_before_any_session_write() {
     assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
     rig.finish().await;
 }
+
+/// A refused first send can leave a log holding only its lineage frame (the actor opened its
+/// writer). Locating that log's first run must end at the log's end, so the read answers at
+/// once with no messages instead of scanning forward forever.
+#[tokio::test]
+async fn a_read_after_a_refused_first_send_answers_unwritten() {
+    let mut rig = Rig::start("refused-then-read").await;
+    let refused = call(
+        &mut rig,
+        "session.send",
+        serde_json::json!({
+            "prompt": "x", "send_id": "refused",
+            "model": {"provider": "fake", "model": "fake"},
+            "structured_output": {"mode": "submit_tool", "schema": {"type": "object"}},
+            "tools": [{"name": "submit_result", "description": "d", "input_schema": {"type": "object"}}]
+        }),
+    )
+    .await;
+    assert_eq!(refusal(&refused)["code"], "invalid_params");
+    let page = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read(&mut rig, serde_json::json!({})),
+    )
+    .await
+    .expect("a read after a refused first send must not hang");
+    assert!(page.messages.is_empty(), "a refused send wrote messages: {page:?}");
+    rig.finish().await;
+}

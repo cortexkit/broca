@@ -877,12 +877,3 @@ async fn finalize_answer_is_committed_to_durable_history() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
-
-
-
-
-
-
-
-
-
