@@ -104,7 +104,7 @@ impl ModuleHandler for Tools {
         self.0.log(json!({"event":method, "params":params}));
         match method {
             "role.describe" => response(json!({"majors":[
-                {"version":"step-transform-provider/v1", "ops":["role.describe","transform.declare","transform.hook"], "stability":"alpha"},
+                {"version":"step-transform-provider/v2", "ops":["role.describe","transform.declare","transform.hook"], "stability":"alpha"},
                 {"version":"tool-provider/v1", "ops":["role.describe","tool.catalog"], "stability":"alpha"}
             ], "implementation_version":"test", "capabilities":[]})),
             "transform.declare" => response(json!({"subscriptions":subscriptions()})),

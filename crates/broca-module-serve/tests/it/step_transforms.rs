@@ -320,11 +320,9 @@ async fn post_assistant_routes_text_only_and_publishes_final_values() {
     );
     let calls = state.hooks();
     assert_eq!(calls[0]["blocks"], json!(["first", "second"]));
-    assert_eq!(calls[0]["harness"], "hook-caller");
-    assert_ne!(
-        calls[0]["harness"],
-        state.binds.lock().unwrap()[0]["harness"]
-    );
+    // step-transform v2 carries caller and session identity in route metadata only.
+    assert!(calls[0].get("harness").is_none(), "{}", calls[0]);
+    assert!(calls[0].get("session").is_none(), "{}", calls[0]);
     assert_eq!(calls[0]["preset"], "worker");
     assert_eq!(calls[0]["params"], json!({"verbatim":[null,{"x":1}]}));
     let prompts = rig.script.prompts.lock().unwrap().clone();

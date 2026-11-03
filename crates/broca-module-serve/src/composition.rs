@@ -414,16 +414,6 @@ impl Overhaul {
                 })),
         )
     }
-    #[cfg(test)]
-    pub fn compaction_receipts(
-        &self,
-    ) -> Arc<dyn broca_store::compaction_receipts::CompactionReceiptStore> {
-        let publications = self.publications.clone();
-        self.db.compaction_receipt_store_serialized(
-            move |session| publications.witness_locked(session, None),
-            self.publications.gate_factory(),
-        )
-    }
     pub fn inventory(&self) -> Arc<dyn SessionInventory> {
         Arc::new(Inventory {
             db: self.db.clone(),

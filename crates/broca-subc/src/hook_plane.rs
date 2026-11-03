@@ -1,4 +1,4 @@
-//! The module-level `step-transform-provider/v1` route, shared by hooks and declarations.
+//! The module-level `step-transform-provider/v2` route, shared by hooks and declarations.
 //! Routes carry the session's frozen scope; operations have no tool-call envelope.
 
 use std::sync::Arc;
