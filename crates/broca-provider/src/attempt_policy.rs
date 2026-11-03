@@ -1,5 +1,5 @@
-//! Pure retry decisions, not yet used by the transport.
-//! Transport trace tests verify this model against the unchanged driver before wiring it in.
+//! Pure retry decisions for the transport's attempt loop.
+//! The driver supplies measured facts and performs the effects returned by this model.
 
 use std::time::Duration;
 
@@ -13,8 +13,12 @@ use crate::transport::{
     AttemptCause,
 };
 
-const MAX_ATTEMPTS: usize = 6;
-const RETRY_WALL_BUDGET: Duration = Duration::from_secs(240);
+pub(crate) const MAX_ATTEMPTS: usize = 6;
+pub(crate) const RETRY_WALL_BUDGET: Duration = Duration::from_secs(240);
+const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
+const MAX_BACKOFF_DELAY: Duration = Duration::from_secs(30);
+pub(crate) const BACKOFF_JITTER: f64 = 0.2;
+pub(crate) const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(120);
 
 pub(crate) struct AttemptFacts<'a> {
     pub error: &'a ProviderError,
@@ -27,15 +31,14 @@ pub(crate) struct AttemptFacts<'a> {
     pub can_refresh: bool,
 }
 
-pub(crate) struct AttemptInputs {
-    pub until_deadline: Option<Duration>,
-    /// The factor already drawn by the driver: generic 0.8..=1.2, Codex 0.9..1.1.
-    pub jitter: f64,
-    /// Whether the driver's lazy switch callback would successfully switch the session.
-    pub can_switch_to_https: bool,
+pub(crate) struct AttemptInputs<J, D> {
+    /// Sampled only at a deadline veto, after delay computation and preceding effects.
+    pub until_deadline: D,
+    /// Drawn only by backoff computation: generic 0.8..=1.2, Codex 0.9..1.1.
+    pub jitter: J,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttemptState {
     /// Zero-based index of the attempt whose failure is being decided.
     attempt_index: usize,
@@ -58,6 +61,10 @@ impl AttemptState {
     /// Success returns the current index, including a rejected-token re-send.
     pub(crate) fn retries_used(&self) -> u32 {
         self.attempt_index as u32
+    }
+
+    pub(crate) fn attempt_index(&self) -> usize {
+        self.attempt_index
     }
 
     fn end(&self, reason: EndReason) -> AttemptDecision {
@@ -108,6 +115,7 @@ pub(crate) enum EndReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AttemptDecision {
     RefreshAndResend,
+    SwitchToHttps(PendingHttpsSwitch),
     Resend {
         delay: Duration,
         server_advised: bool,
@@ -123,11 +131,24 @@ pub(crate) enum AttemptDecision {
     },
 }
 
-pub(crate) fn decide_attempt(
+/// Staged state is committed only after the driver's actual HTTPS-switch result is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingHttpsSwitch {
+    state: AttemptState,
+    delay: Duration,
+    server_advised: bool,
+}
+
+pub(crate) fn decide_attempt<J, D>(
     state: &mut AttemptState,
     facts: &AttemptFacts<'_>,
-    inputs: &AttemptInputs,
-) -> AttemptDecision {
+    inputs: &mut AttemptInputs<J, D>,
+) -> AttemptDecision
+where
+    J: FnMut() -> f64,
+    D: FnMut() -> Option<Duration>,
+{
+    let original = *state;
     if !facts.got_response_bytes {
         state.retry_wait_spent += facts.attempt_elapsed;
     }
@@ -160,16 +181,27 @@ pub(crate) fn decide_attempt(
         if facts.cause == Some(AttemptCause::DeterministicDecode) {
             state.decode_retries += 1;
         }
-        let decision = codex.decide_with_jitter(
+        let decision = codex.decide_before_switch(
             &CodexFailure {
                 error: facts.error,
                 outcome: &facts.outcome,
                 https: facts.over_https,
             },
-            || inputs.can_switch_to_https,
-            || inputs.jitter,
+            &mut inputs.jitter,
         );
         let (delay, server_advised, switch_to_https, reason) = match decision {
+            CodexDecision::SwitchToHttps {
+                delay,
+                server_advised,
+            } => {
+                let pending = PendingHttpsSwitch {
+                    state: *state,
+                    delay,
+                    server_advised,
+                };
+                *state = original;
+                return AttemptDecision::SwitchToHttps(pending);
+            }
             CodexDecision::Terminal { reason } => {
                 return state.end(match reason {
                     "attempt_limit" => EndReason::AttemptLimit,
@@ -189,7 +221,7 @@ pub(crate) fn decide_attempt(
                 server_advised,
             } => (delay, server_advised, true, "socket_attempt_limit"),
         };
-        if server_advised && inputs.until_deadline.is_some_and(|left| delay >= left) {
+        if server_advised && (inputs.until_deadline)().is_some_and(|left| delay >= left) {
             return AttemptDecision::EndStep {
                 reason: EndReason::RetryAfterExceedsDeadline,
                 retries_used: state.retries_used(),
@@ -209,11 +241,11 @@ pub(crate) fn decide_attempt(
     let delay = generic_delay(
         facts.error,
         state.attempt_index - state.refreshes,
-        inputs.jitter,
+        &mut inputs.jitter,
     );
     if facts.error.status == Some(429)
         && facts.error.retry_after_secs.is_some()
-        && inputs.until_deadline.is_some_and(|left| delay >= left)
+        && (inputs.until_deadline)().is_some_and(|left| delay >= left)
     {
         return state.end(EndReason::RetryAfterExceedsDeadline);
     }
@@ -229,21 +261,59 @@ pub(crate) fn decide_attempt(
     )
 }
 
-fn generic_delay(error: &ProviderError, ordinary_index: usize, jitter: f64) -> Duration {
+pub(crate) fn generic_delay(
+    error: &ProviderError,
+    ordinary_index: usize,
+    mut jitter: impl FnMut() -> f64,
+) -> Duration {
     if let Some(seconds) = error.retry_after_secs {
-        // The transport's max/min turns NaN into zero; clamp alone would preserve NaN.
+        // Preserve the retry schedule's NaN-to-zero conversion; clamp alone preserves NaN.
         let capped = if seconds.is_nan() {
             0.0
         } else {
-            seconds.clamp(0.0, 120.0)
+            seconds.clamp(0.0, MAX_RETRY_AFTER_DELAY.as_secs_f64())
         };
         return Duration::from_secs_f64(capped);
     }
     let doublings = u32::try_from(ordinary_index).unwrap_or(u32::MAX).min(16);
-    Duration::from_secs(2)
+    BASE_RETRY_DELAY
         .saturating_mul(1u32 << doublings)
-        .min(Duration::from_secs(30))
-        .mul_f64(jitter)
+        .min(MAX_BACKOFF_DELAY)
+        .mul_f64(jitter())
+}
+
+pub(crate) fn resolve_https_switch(
+    state: &mut AttemptState,
+    facts: &AttemptFacts<'_>,
+    pending: PendingHttpsSwitch,
+    switched: bool,
+    until_deadline: impl FnOnce() -> Option<Duration>,
+) -> AttemptDecision {
+    *state = pending.state;
+    let decision = state
+        .codex
+        .as_mut()
+        .expect("only Codex requests an HTTPS switch")
+        .resolve_switch(switched, pending.delay, pending.server_advised);
+    match decision {
+        CodexDecision::Terminal { .. } => state.end(EndReason::AttemptLimit),
+        CodexDecision::FallBackToHttps {
+            delay,
+            server_advised,
+        } => {
+            if server_advised && until_deadline().is_some_and(|left| delay >= left) {
+                AttemptDecision::EndStep {
+                    reason: EndReason::RetryAfterExceedsDeadline,
+                    retries_used: state.retries_used(),
+                    switch_to_https: true,
+                    note_unrecovered_rejection: false,
+                }
+            } else {
+                state.resend(facts, delay, server_advised, true, "socket_attempt_limit")
+            }
+        }
+        _ => unreachable!("a switch resolves to fallback or terminal"),
+    }
 }
 
 /// Only a successful rejected-token refresh is charged here. Failed or unchanged refreshes

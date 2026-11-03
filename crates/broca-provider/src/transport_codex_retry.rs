@@ -70,7 +70,9 @@ pub(super) fn applies(family: Option<crate::spec::WireFamilyId>) -> bool {
 
 /// The jitter factor both Codex backoffs draw: uniform in `0.9..1.1`
 /// (`async-utils/src/backoff.rs:15`, `codex-client/src/retry.rs:50`).
-fn jitter() -> f64 {
+pub(super) fn jitter() -> f64 {
+    #[cfg(test)]
+    super::attempt_effect_hooks::at(super::attempt_effect_hooks::Boundary::Jitter);
     #[cfg(test)]
     if let Some(factor) = attempt_test_hooks::jitter(true) {
         return factor;
@@ -105,9 +107,8 @@ pub(super) fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<f
     crate::codex_retry_after::retry_after_value(value, SystemTime::now())
 }
 
-/// What one failed attempt tells the decision. Everything else about the failure (its class,
-/// `x-should-retry`, a repeated decode failure, the response deadline) has already been through
-/// the transport's vetoes, which end the step before this decision is asked.
+/// What one failed attempt tells the decision. The attempt policy applies class, explicit retry
+/// and repeated-decode vetoes before this decision, and deadline vetoes after its effects.
 pub(crate) struct CodexFailure<'a> {
     pub(crate) error: &'a ProviderError,
     pub(crate) outcome: &'a AttemptOutcome,
@@ -119,6 +120,11 @@ pub(crate) struct CodexFailure<'a> {
 /// What to do after a failed attempt.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CodexDecision {
+    /// Request the actual switch result before resetting the stream retry counter.
+    SwitchToHttps {
+        delay: Duration,
+        server_advised: bool,
+    },
     /// Send the same request again after `delay`. `server_advised` says `delay` is the time
     /// the server asked for rather than a local backoff.
     Retry {
@@ -206,7 +212,7 @@ fn request_layer_retries(failure: &CodexFailure<'_>) -> bool {
 
 /// The retry counters for one step, Codex's `ResponsesStreamRetryState` plus the request
 /// layer's attempt counter.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CodexRetryState {
     retries: u64,
     request_retries: u64,
@@ -226,21 +232,25 @@ impl Default for CodexRetryState {
 }
 
 impl CodexRetryState {
-    /// Decide what follows `failure`. `try_switch_to_https` is asked only when the stream
-    /// retries are spent; it switches the run to HTTPS and answers whether this call made the
-    /// switch, as Codex's `try_switch_fallback_transport` does (`core/src/client.rs:2454-2464`).
-    pub(super) fn decide(
-        &mut self,
-        failure: &CodexFailure<'_>,
-        try_switch_to_https: impl FnOnce() -> bool,
-    ) -> CodexDecision {
-        self.decide_with_jitter(failure, try_switch_to_https, jitter)
-    }
-
+    #[cfg(test)]
     pub(crate) fn decide_with_jitter(
         &mut self,
         failure: &CodexFailure<'_>,
         try_switch_to_https: impl FnOnce() -> bool,
+        jitter: impl FnMut() -> f64,
+    ) -> CodexDecision {
+        match self.decide_before_switch(failure, jitter) {
+            CodexDecision::SwitchToHttps {
+                delay,
+                server_advised,
+            } => self.resolve_switch(try_switch_to_https(), delay, server_advised),
+            decision => decision,
+        }
+    }
+
+    pub(crate) fn decide_before_switch(
+        &mut self,
+        failure: &CodexFailure<'_>,
         mut jitter: impl FnMut() -> f64,
     ) -> CodexDecision {
         // Count actual failed connects, not stream-layer rounds: HTTPS request retries also
@@ -308,26 +318,38 @@ impl CodexRetryState {
         }
 
         // `core/src/responses_retry.rs:120-139`.
-        if self.retries >= STREAM_MAX_RETRIES && try_switch_to_https() {
-            self.retries = 0;
-            return CodexDecision::FallBackToHttps {
+        if self.retries >= STREAM_MAX_RETRIES {
+            return CodexDecision::SwitchToHttps {
                 delay: server.unwrap_or_default(),
                 server_advised: server.is_some(),
             };
         }
 
         // `core/src/responses_retry.rs:141-167`.
-        if self.retries < STREAM_MAX_RETRIES {
-            self.retries = retry_count;
-            return CodexDecision::Retry {
+        self.retries = retry_count;
+        CodexDecision::Retry {
+            delay,
+            server_advised,
+            reason: "transient_failure",
+        }
+    }
+
+    pub(crate) fn resolve_switch(
+        &mut self,
+        switched: bool,
+        delay: Duration,
+        server_advised: bool,
+    ) -> CodexDecision {
+        if switched {
+            self.retries = 0;
+            CodexDecision::FallBackToHttps {
                 delay,
                 server_advised,
-                reason: "transient_failure",
-            };
-        }
-
-        CodexDecision::Terminal {
-            reason: "attempt_limit",
+            }
+        } else {
+            CodexDecision::Terminal {
+                reason: "attempt_limit",
+            }
         }
     }
 }

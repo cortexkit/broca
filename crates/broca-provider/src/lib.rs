@@ -10,7 +10,6 @@
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "live")]
-#[allow(dead_code)]
 pub(crate) mod attempt_policy;
 
 pub mod cache_evidence;

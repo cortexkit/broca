@@ -173,16 +173,16 @@ fn simulate(scenario: &Scenario) -> Simulation {
 
         let error = script.error();
         let facts = script.facts(&error, https);
-        let inputs = AttemptInputs {
+        let inputs = TestInputs {
             until_deadline: deadline.map(|deadline| deadline.saturating_sub(simulation.now)),
             jitter: if scenario.codex {
                 0.9 + f64::from(script.jitter) / 1000.0
             } else {
                 0.8 + f64::from(script.jitter) / 500.0
             },
-            can_switch_to_https: !https && !switched,
+            switch_succeeds: !https && !switched,
         };
-        let mut decision = decide_attempt(&mut state, &facts, &inputs);
+        let mut decision = decide_for_test(&mut state, &facts, &inputs);
         simulation.decisions.push(decision.clone());
 
         if facts.outcome == AttemptOutcome::ConnectFailed {
@@ -313,7 +313,9 @@ fn simulate(scenario: &Scenario) -> Simulation {
                 total_waited += delay;
                 note_waited(&mut state, delay);
             }
-            AttemptDecision::RefreshAndResend => unreachable!("refresh result was not decided"),
+            AttemptDecision::RefreshAndResend | AttemptDecision::SwitchToHttps(_) => {
+                unreachable!("pending effects were not resolved")
+            }
         }
     }
     panic!("A1: repeating script did not terminate: {scenario:?}");
