@@ -3553,6 +3553,10 @@ impl LlmRunnerSubject for BrocaSubject {
             // A tag the expired session's first part held: resolve reads through the same
             // transcript path as session.read, so an expired session serves none of it.
             "session.resolve" => Ok(Some(vec![json!({"tag": "§1§"})])),
+            // llm-runner 0.8's name for `send.status`, served by the same handler. The kit
+            // treats `send.status` as a role op that serves no stored content, and this name
+            // answers the same receipt, so it is classified the same way.
+            "session.send_status" => Ok(None),
             _ => Err(HarnessError::new(format!(
                 "unclassified retention probe op: {method}"
             ))),
