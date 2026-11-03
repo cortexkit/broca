@@ -34,6 +34,8 @@ class StageClientsTests(unittest.TestCase):
             scripts.mkdir()
             for name in ("stage-release.sh", "dsym.sh", "wal-floor.sh", "running-image.sh", "signing-posture.sh", "nonshipping-markers.sh"):
                 shutil.copy2(ROOT / "scripts" / name, scripts / name)
+            (scripts / "lib").mkdir()
+            shutil.copy2(ROOT / "scripts/lib/artifact-probe.sh", scripts / "lib/artifact-probe.sh")
             script = scripts / "stage-release.sh"
             source = script.read_text()
             anchor = "BUILD_SCRATCH=/tmp/broca-release-staging"
