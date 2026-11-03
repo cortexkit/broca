@@ -129,6 +129,152 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
         .join("../..")
         .canonicalize()
         .unwrap();
+
+    let now_ms = || {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+    };
+    let restart_observed_at_ms = now_ms();
+    let placement_report = rig.dir.join("placement.json");
+    std::fs::write(
+        &placement_report,
+        serde_json::to_vec(&serde_json::json!({
+            "restart_observed_at_ms": restart_observed_at_ms,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    broca_test_support::wait_until(
+        "an admission timestamp after the restart boundary",
+        || async {
+            if now_ms() > restart_observed_at_ms {
+                Ok(())
+            } else {
+                Err("the clock is still at the restart boundary".into())
+            }
+        },
+    )
+    .await;
+
+    // The rig's authenticated owner registers a scope with a real checkout.
+    // The acceptance script only observes the worker the owner admits below.
+    let checkout = rig.dir.join("acceptance-checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let checkout = checkout.canonicalize().unwrap();
+    rig.sync_scopes(
+        serde_json::json!([{
+            "ref": SCOPE_REF, "scope_epoch": SCOPE_EPOCH, "kind": "head",
+            "workdir": checkout, "attributes": {}, "carriers": [],
+        }]),
+        1,
+    )
+    .await;
+    let owner = std::sync::Arc::new(rig.connect_as(OWNER, &rig.owner_nonce).await);
+    let session = rig.session("worker-admission-acceptance");
+    let route = open_scoped(&owner, &session).await.unwrap();
+    let scope = broca_protocol::SessionScope {
+        owner: broca_protocol::BindPrincipal::Reserved {
+            module_id: OWNER.into(),
+        },
+        scope_ref: SCOPE_REF.into(),
+        scope_epoch: SCOPE_EPOCH,
+        flow_id: None,
+        sender: None,
+        agent_id: None,
+        run_id: None,
+    };
+    // The daemon validates the same registered scope on catalog and management routes.
+    let fetcher =
+        broca_subc::SubcPlanFetcher::new(owner.clone(), session.clone(), Some(scope.clone()));
+    let items = serde_json::from_slice(
+        &std::fs::read(root.join("scripts/fixtures/acceptance-reader-plan.json")).unwrap(),
+    )
+    .unwrap();
+    let plan = broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE)
+        .await
+        .expect("compose through the owner's real scoped AFT route");
+    fetcher.close().await;
+    let mut params = serde_json::json!({
+        "prompt": "Reply only OK. Do not call tools.",
+        "model": {"provider": "mock", "model": "mock-model"},
+        "session_class": "mason", "plan": plan,
+    });
+    let stale = scope_request(&owner, &route, "session.send", params.clone())
+        .await
+        .expect_err("the changed AFT catalog refuses the stale composition before admission");
+    assert!(stale.to_string().contains("plan_stale"), "{stale}");
+    params["plan"] =
+        broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE)
+            .await
+            .expect("recompose once after the catalog change");
+    fetcher.close().await;
+    let admitted = scope_request(&owner, &route, "session.send", params)
+        .await
+        .expect("admit the scoped worker with the refreshed AFT composition");
+    assert_eq!(admitted["result"]["state"], "active");
+    let run = admitted["result"]["run_id"].as_str().unwrap();
+    completed_run(&owner, &route, run).await;
+
+    let mut storage = session.clone();
+    storage.project_root = checkout;
+    let wal = std::fs::read(rig.wal_path(&storage)).unwrap();
+    let starts = run_started_frame_requires(&wal);
+    assert_eq!(starts.len(), 1, "only the refreshed plan was admitted");
+    let requires = starts[0].as_ref().expect("RunStarted is feature-gated");
+    for feature in ["session-class/v1", "provider-declarations/v1", "scope/v1"] {
+        assert!(
+            requires.iter().any(|name| name == feature),
+            "missing {feature}"
+        );
+    }
+    let records = broca_wal::replay_file(rig.wal_path(&storage), broca_wal::DEFAULT_MAX_READ_BYTES)
+        .expect("read the daemon-written worker WAL");
+    let (frozen_scope, class, manifest) = records
+        .iter()
+        .find_map(|framed| match &framed.record {
+            broca_wal::WalRecord::RunStarted {
+                scope,
+                session_class,
+                manifest,
+                ..
+            } => Some((scope, session_class, manifest)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(frozen_scope.as_ref(), Some(&scope));
+    assert_eq!(class.as_deref(), Some("mason"));
+    let aft = manifest
+        .as_ref()
+        .unwrap()
+        .fetches
+        .iter()
+        .find(|fetch| fetch.provider == "aft")
+        .expect("admission froze the AFT fetch");
+    let broca_wal::FetchOutcome::Answered {
+        declarations_frozen: Some(declarations),
+        ..
+    } = &aft.outcome
+    else {
+        panic!("the admitted AFT fetch has no frozen declarations");
+    };
+    assert_eq!(declarations.late_results, Some(true));
+    assert!(declarations
+        .result_formats
+        .as_ref()
+        .is_some_and(|formats| !formats.is_empty()));
+    assert!(records.iter().any(|framed| matches!(
+        framed.record,
+        broca_wal::WalRecord::RunFinished {
+            reason: broca_protocol::RunFinishReason::Completed,
+            ..
+        }
+    )));
+
     let output = Command::new("python3")
         .arg(root.join("scripts/acceptance-worker-turn.py"))
         .arg("--session-bin")
@@ -139,7 +285,10 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
         .arg(&rig.state_root)
         .arg("--project-root")
         .arg(&rig.dir)
-        .args(["--model", "mock/mock-model", "--timeout", "30"])
+        .arg("--placement-report")
+        .arg(&placement_report)
+        .args(["--timeout", "30"])
+        .env("BROCA_BIN", env!("CARGO_BIN_EXE_ck-broca"))
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
         .await
@@ -167,7 +316,12 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
         output.status.success(),
         "worker admission acceptance failed"
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("recomposing once"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PASS -- admitted, completed"));
+    assert!(stdout.contains("class=mason"));
+    assert!(stdout.contains("candidates=1"));
+    assert!(stdout.contains("terminal_counts=completed:1"));
+    assert!(!stdout.contains("scope answer"));
 }
 
 fn sibling_bin(name: &str, env_key: &str) -> PathBuf {

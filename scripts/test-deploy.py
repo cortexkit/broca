@@ -155,7 +155,7 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
             'import runpy, sys\nsys.argv[1:] = ["metadata", *sys.argv[1:]]\n'
             'runpy.run_path(__file__.replace("check-credential-metadata.py", "stub.py"), run_name="__main__")\n')
         (self.scripts / "acceptance-worker-turn.py").write_text(
-            'import runpy, sys\nsys.argv[1:] = ["worker-accept"]\n'
+            'import runpy, sys\nsys.argv[1:] = ["worker-accept", *sys.argv[1:]]\n'
             'runpy.run_path(__file__.replace("acceptance-worker-turn.py", "stub.py"), run_name="__main__")\n')
         (self.scripts / "lib").mkdir()
         (self.scripts / "lib/acceptance_scoped.py").write_text(
