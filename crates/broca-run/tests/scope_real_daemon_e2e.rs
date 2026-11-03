@@ -99,10 +99,16 @@ impl Rig {
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&root).unwrap();
-        // Windows scratch paths are already absolute; canonicalize would add a
-        // verbatim prefix absent from the daemon's stamp. Unix needs symlink resolution.
-        #[cfg(not(windows))]
+        // The daemon stamps the scope folder in its canonical long form, so the fixture
+        // spells it the same way: Unix resolves temporary-directory symlinks, and Windows
+        // expands 8.3 short names such as `RUNNER~1` from TMP. On Windows, canonicalize also
+        // adds a `\\?\` prefix that the daemon's stamp doesn't carry, so it's removed again.
         let root = root.canonicalize().unwrap();
+        #[cfg(windows)]
+        let root = {
+            let spelled = root.to_str().expect("scratch root is UTF-8");
+            PathBuf::from(spelled.strip_prefix(r"\\?\").unwrap_or(spelled))
+        };
         let config = root.join("config/cortexkit/subc.jsonc");
         let runtime = root.join("runtime");
         let workdir = root.join("scope-workdir");

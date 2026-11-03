@@ -352,7 +352,10 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         self.assertIn("--live-approved", records["place"])
         self.assertIn(hashlib.sha256(b"signed release").hexdigest(), records["verify"])
         self.assertEqual(records["accept"], ["0.0.2"])
-        self.assertEqual(records["worker-accept"], [])
+        # Both acceptance legs read the same restart report; its contents are pinned in
+        # tests/test-acceptance-turns.py.
+        self.assertEqual(records["worker-accept"][0], "--placement-report")
+        self.assertEqual(records["worker-accept"], records["scoped-accept"])
         self.assertEqual(records["publish"], [self.sha, "0.0.2"])
         self.assert_metadata_log(result, 0)
         self.assertIn("pid        4321", result.stdout)
