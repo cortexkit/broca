@@ -14,16 +14,24 @@
 
 use std::sync::Arc;
 
+// Recorded v1 requests keep the exact tag-rendering bytes of their original contract.
+
 use serde::{Deserialize, Serialize};
 
-pub use cortexkit_role_llm_runner::tags::NumberingOverflow;
-use cortexkit_role_llm_runner::tags::{PartKind, RenderedPart, TextWriter};
+pub mod v1 {
+    pub use cortexkit_role_llm_runner_v1::tags::{
+        anchor, parse_tag, truncate_part, Anchor, Marker, MarkerCheckpoint, PartContainer,
+        PartKind, SetupCheckpoint, TruncateMode,
+    };
+}
+pub use cortexkit_role_llm_runner_v1::tags::NumberingOverflow;
+use cortexkit_role_llm_runner_v1::tags::{PartKind, RenderedPart, TextWriter};
 
 use crate::content::{ContentBlock, Message, Role, ToolOutput};
 
 /// The contract spelling of tag `tag`: `§N§`.
 pub fn tag_mark(tag: u64) -> String {
-    cortexkit_role_llm_runner::tags::format_tag(tag).expect("stored tag numbers are positive")
+    cortexkit_role_llm_runner_v1::tags::format_tag(tag).expect("stored tag numbers are positive")
 }
 
 /// The tags of one message: one tag per content block, in block order. Serialized as a bare
@@ -426,7 +434,7 @@ fn parts_numbering(
     parts: &[crate::ToolOutputPart],
     notice_labels: bool,
 ) -> (PartKind, Option<usize>) {
-    use cortexkit_role_llm_runner::tags::{
+    use cortexkit_role_llm_runner_v1::tags::{
         numbered_block_index, tool_result_kind, ToolResultBlock,
     };
     // A capture failure is text in storage. Use the shared image-only rule only when
@@ -466,7 +474,7 @@ pub fn exposed_model_text(clean: bool, text: &str) -> std::borrow::Cow<'_, str> 
     } else {
         TextWriter::UntaggedRun
     };
-    cortexkit_role_llm_runner::tags::exposed_model_text(writer, text)
+    cortexkit_role_llm_runner_v1::tags::exposed_model_text(writer, text)
 }
 
 /// Number `message`, written under `rules`, after `high`, the highest number shown before it,
@@ -489,12 +497,12 @@ pub fn number_message(
         .enumerate()
         .filter_map(|(index, block)| {
             let kind = part_kind(message.role, block, clean)?;
-            (rules.render && cortexkit_role_llm_runner::tags::counts(kind))
+            (rules.render && cortexkit_role_llm_runner_v1::tags::counts(kind))
                 .then(|| (index, RenderedPart::new(kind, index as u64)))
         })
         .collect();
     let rendered: Vec<RenderedPart> = counted.iter().map(|(_, part)| *part).collect();
-    let numbers = cortexkit_role_llm_runner::tags::try_number_parts(base, &rendered)?;
+    let numbers = cortexkit_role_llm_runner_v1::tags::try_number_parts(base, &rendered)?;
     let mut parts = vec![None; message.content.len()];
     for ((index, _), number) in counted.iter().zip(numbers) {
         parts[*index] = number;
@@ -575,14 +583,14 @@ fn render_computed(
                 let exposed = exposed_model_text(computed.clean, text).into_owned();
                 *text = match number {
                     Some(number) => {
-                        cortexkit_role_llm_runner::tags::render_counted_text(number, &exposed)
+                        cortexkit_role_llm_runner_v1::tags::render_counted_text(number, &exposed)
                     }
                     None => exposed,
                 };
             }
             (Role::User, ContentBlock::Text { text }) => {
                 if let Some(number) = number {
-                    *text = cortexkit_role_llm_runner::tags::render_counted_text(number, text);
+                    *text = cortexkit_role_llm_runner_v1::tags::render_counted_text(number, text);
                 }
             }
             (Role::User | Role::Tool, ContentBlock::ToolResult(result)) => {
@@ -591,38 +599,39 @@ fn render_computed(
                     ToolOutput::Text { text }
                         if crate::content::is_image_only_placeholder(text) =>
                     {
-                        *text = cortexkit_role_llm_runner::tags::image_label(number);
+                        *text = cortexkit_role_llm_runner_v1::tags::image_label(number);
                     }
                     // The label carries the number; the notice lines after it keep telling the
                     // model that the images were not shown.
                     ToolOutput::Text { text } if crate::content::is_image_only_notice(text) => {
                         *text = format!(
                             "{}\n{text}",
-                            cortexkit_role_llm_runner::tags::image_label(number)
+                            cortexkit_role_llm_runner_v1::tags::image_label(number)
                         );
                     }
                     ToolOutput::Text { text: message }
                     | ToolOutput::Error { message, .. }
                     | ToolOutput::Denied { reason: message } => {
-                        *message =
-                            cortexkit_role_llm_runner::tags::render_counted_text(number, message);
+                        *message = cortexkit_role_llm_runner_v1::tags::render_counted_text(
+                            number, message,
+                        );
                     }
                     ToolOutput::Json { .. } => {}
                     ToolOutput::Parts { parts } => {
                         let (kind, index) = parts_numbering(parts, notice_labels);
                         if let Some(index) = index {
                             if let crate::ToolOutputPart::Text { text } = &mut parts[index] {
-                                *text = cortexkit_role_llm_runner::tags::render_counted_text(
+                                *text = cortexkit_role_llm_runner_v1::tags::render_counted_text(
                                     number, text,
                                 );
                             }
                         } else {
                             let label = match kind {
                                 PartKind::ToolResultImageOnly => {
-                                    Some(cortexkit_role_llm_runner::tags::image_label(number))
+                                    Some(cortexkit_role_llm_runner_v1::tags::image_label(number))
                                 }
                                 PartKind::ToolResultMediaOnly => {
-                                    Some(cortexkit_role_llm_runner::tags::media_label(number))
+                                    Some(cortexkit_role_llm_runner_v1::tags::media_label(number))
                                 }
                                 _ => None,
                             };

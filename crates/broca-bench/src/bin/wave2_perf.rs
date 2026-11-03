@@ -493,6 +493,7 @@ async fn append_projection_episode(fixture: &Fixture, episodes: usize, iteration
 
 fn request(session: &BindIdentity, episode: usize) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,

@@ -24,6 +24,7 @@ broca-protocol = { path = "../broca-protocol" }
 # Fetch-plan admission: the fetcher here carries its provider calls over subc.
 broca-fetch-plan = { path = "../broca-fetch-plan" }
 cortexkit-role-tool-provider = { workspace = true }
+cortexkit-role-llm-runner = { workspace = true }
 cortexkit-role-step-transform-provider = { workspace = true }
 # Share the exact registry releases with the daemon adapter and benchmark.
 subc-protocol = { workspace = true }

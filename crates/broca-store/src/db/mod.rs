@@ -151,6 +151,7 @@ impl OverhaulDb {
         };
         db.authoritative_transaction(|tx| {
             schema::initialize(tx)?;
+            crate::served_history::initialize(tx)?;
             inventory::initialize(tx)?;
             retention::initialize(tx)?;
             operational::initialize(tx)?;
@@ -213,5 +214,44 @@ impl OverhaulDb {
         let result = write(&tx)?;
         tx.commit()?;
         Ok(result)
+    }
+}
+
+impl broca_core::ServedHistory for OverhaulDb {
+    fn history_read_version(&self, address: &str) -> Result<Option<u64>, String> {
+        crate::served_history::read_version(&self.conn.lock().unwrap(), address)
+    }
+
+    fn served_snapshot(
+        &self,
+        address: &str,
+        has_log: bool,
+        lineage: Option<&str>,
+        expected_version: Option<Option<u64>>,
+    ) -> Result<broca_core::served_history::ServedSnapshot, String> {
+        crate::served_history::version(
+            &mut self.conn.lock().unwrap(),
+            address,
+            has_log,
+            lineage,
+            expected_version,
+        )
+    }
+
+    fn history_rewritten(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        lineage: Option<&str>,
+    ) -> Result<(), String> {
+        crate::served_history::rewritten(&mut self.conn.lock().unwrap(), session, lineage)
+    }
+    fn history_rewrite_finished(
+        &self,
+        session: &broca_protocol::BindIdentity,
+    ) -> Result<(), String> {
+        crate::served_history::rewrite_finished(&mut self.conn.lock().unwrap(), session)
+    }
+    fn rewriting_sessions(&self) -> Result<Vec<broca_protocol::BindIdentity>, String> {
+        crate::served_history::rewriting_sessions(&self.conn.lock().unwrap())
     }
 }

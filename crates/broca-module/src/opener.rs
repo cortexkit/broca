@@ -512,9 +512,26 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                         }
                     }
                 } else if let Some(service) = service {
-                    service
-                        .delete_expired_for_run(&session, service.clock.now_ms())
-                        .map_err(OpenError::from_retention)?;
+                    let attached_history = wal.served_history();
+                    let history = attached_history
+                        .as_deref()
+                        .or_else(|| store.as_ref().and_then(|store| store.served_history()));
+                    let rewriting = match history.map(|history| {
+                        history.history_read_version(&broca_core::session_addr(&session))
+                    }) {
+                        Some(Err(error))
+                            if error == broca_core::served_history::HISTORY_REWRITING =>
+                        {
+                            true
+                        }
+                        Some(Err(error)) => return Err(OpenError::Open(error)),
+                        _ => false,
+                    };
+                    if !rewriting {
+                        service
+                            .delete_expired_for_run(&session, service.clock.now_ms())
+                            .map_err(OpenError::from_retention)?;
+                    }
                 } else if retention.is_some() {
                     return Err(OpenError::Open(
                         "retention service is not configured".into(),

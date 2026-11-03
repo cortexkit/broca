@@ -1698,6 +1698,7 @@ mod tests {
             session: session.clone(),
             config: Box::new(RunConfig {
                 global_system: None,
+                route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
@@ -3387,6 +3388,7 @@ mod tests {
                     session: BindIdentity::new("/tmp/project-a", "runner", "restart"),
                     config: Box::new(RunConfig {
                         global_system: None,
+                        route_decision_id: None,
                         account_limit_pause: false,
                         turn_directives_v1: None,
                         render_tags: false,
@@ -3724,6 +3726,7 @@ mod episode_attach_tests {
             session: broca_protocol::BindIdentity::new("/tmp/project", "runner", "attach"),
             config: Box::new(RunConfig {
                 global_system: None,
+                route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,

@@ -162,6 +162,7 @@ fn request(project_root: &Path) -> RunRequest {
     }];
     let policy_allowed = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,

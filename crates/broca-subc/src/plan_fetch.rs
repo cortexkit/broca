@@ -1,7 +1,7 @@
 //! Fetch-plan admission's calls to providers over subc.
 //!
 //! Catalogs use scoped `tool-provider: v1` routes and tool envelopes. Declarations use
-//! unscoped `step-transform-provider: v1` role routes and method/params envelopes, just like
+//! scoped `step-transform-provider: v2` role routes and method/params envelopes, just like
 //! runtime hooks. A plan's compaction provider is asked only `role.describe`, on an unscoped
 //! `compaction-provider: v1` role route like the one Setup later uses. All admission routes
 //! close afterwards; no answer is shared across sessions.

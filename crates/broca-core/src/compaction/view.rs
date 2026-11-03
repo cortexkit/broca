@@ -211,9 +211,9 @@ fn assemble_judged(
                         let selected = mine.iter().find(|edit| edit.part == key);
                         let source = stored_at(ordinal).unwrap_or(message);
                         let container = if source.role == Role::Tool {
-                            cortexkit_role_llm_runner::tags::PartContainer::ToolResult
+                            broca_protocol::tags::v1::PartContainer::ToolResult
                         } else {
-                            cortexkit_role_llm_runner::tags::PartContainer::Other
+                            broca_protocol::tags::v1::PartContainer::Other
                         };
                         if let Some(edit) = selected {
                             edit.check_container(container)
@@ -240,7 +240,7 @@ fn assemble_judged(
                                         source.content.get(index).unwrap_or(block),
                                     )
                                     .expect("stored content JSON");
-                                    let part = cortexkit_role_llm_runner::tags::truncate_part(
+                                    let part = broca_protocol::tags::v1::truncate_part(
                                         "owned-broca",
                                         &part,
                                         container,
@@ -963,7 +963,7 @@ pub(crate) fn notice_at(
         .filter(|level| *level != "standard")
     {
         notice = notice.with_service_tier(
-            cortexkit_role_llm_runner::service_tier::ServiceTier::parse(level)
+            serde_json::from_value(serde_json::json!(level))
                 .expect("current tier comes from the frozen applied level"),
         );
     }

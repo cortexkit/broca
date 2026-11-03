@@ -711,6 +711,7 @@ pub fn conversation_key(session: &BindIdentity) -> String {
 
 /// One admission's request to routing.
 pub struct AccountForRequest<'a> {
+    pub decision_id: Option<&'a str>,
     pub provider: &'a str,
     pub model: &'a str,
     pub conversation_key: &'a str,
@@ -780,7 +781,7 @@ pub fn account_hold_cap(
 
 /// The `route.account_for` params, in routing's field names.
 pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
-    json!({
+    let mut params = json!({
         "provider": request.provider,
         "model": request.model,
         "affinity_model": request.model,
@@ -803,7 +804,11 @@ pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
                 }))
                 .collect::<Vec<_>>(),
         },
-    })
+    });
+    if let Some(decision_id) = request.decision_id {
+        params["decision_id"] = decision_id.into();
+    }
+    params
 }
 
 // ------------------------------------------------------------------------------------------
@@ -973,6 +978,7 @@ impl AccountChoice {
 
 /// Everything [`choose_account`] needs about one fresh run.
 pub struct ChoiceInputs<'a> {
+    pub decision_id: Option<&'a str>,
     /// Caller affinity for this admission; an explicit key always wins.
     pub conversation_key: Option<&'a str>,
     /// Affinity frozen by the latest episode in the durable admission snapshot.
@@ -1047,7 +1053,17 @@ where
         .or(inputs.inherited_conversation_key)
         .unwrap_or(&derived);
     let decision = |path: &str, admission_id, decision_id| {
-        let mut result = decision(path, admission_id, decision_id);
+        // The caller owns reports for an explicit decision; only runner allocations have
+        // an admission id that enables broca's normal and sealed-run reporters.
+        let mut result = decision(
+            path,
+            if inputs.decision_id.is_some() {
+                None
+            } else {
+                admission_id
+            },
+            decision_id,
+        );
         result.conversation_key = Some(conversation.to_owned());
         result.conversation_key_source = Some(if inputs.conversation_key.is_some() {
             broca_wal::ConversationKeySource::Caller
@@ -1064,7 +1080,7 @@ where
         return Ok(AccountChoice::NotApplicable);
     }
     let admission = admission_id(inputs.run_id);
-    if inputs.caller_named_account {
+    if inputs.caller_named_account && inputs.decision_id.is_none() {
         client.counters.bump("pinned");
         return Ok(AccountChoice::Static(decision(
             broca_wal::ACCOUNT_DECISION_PINNED,
@@ -1073,6 +1089,9 @@ where
         )));
     }
     let Ok(Some(listing)) = tokio::time::timeout_at(deadline, listing).await else {
+        if inputs.decision_id.is_some() {
+            return Err(ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable()));
+        }
         client.counters.bump("candidates_unknown");
         tracing::warn!(
             target: "accounts",
@@ -1087,7 +1106,7 @@ where
         )));
     };
     let candidates = Candidates::from_listing(&listing, method, provider);
-    if candidates.distinct_accounts() <= 1 {
+    if candidates.distinct_accounts() <= 1 && inputs.decision_id.is_none() {
         client.counters.bump("single_candidate");
         return Ok(AccountChoice::Static(decision(
             broca_wal::ACCOUNT_DECISION_SINGLE_CANDIDATE,
@@ -1096,6 +1115,7 @@ where
         )));
     }
     let params = account_for_params(&AccountForRequest {
+        decision_id: inputs.decision_id,
         provider,
         model: inputs.model,
         conversation_key: conversation,

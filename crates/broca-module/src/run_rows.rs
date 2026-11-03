@@ -53,6 +53,10 @@ struct Row {
 }
 
 impl OverhaulRunSource {
+    pub(super) fn history_db(&self) -> Arc<OverhaulDb> {
+        self.db.clone()
+    }
+
     pub fn new(db: Arc<OverhaulDb>, wal: Arc<FileWalStore>) -> Self {
         Self {
             db,

@@ -17,9 +17,22 @@ use serde_json::{json, Value};
 /// `body` with the run id and lineage id it names replaced by placeholders: both are minted per
 /// run from a per-process scratch directory.
 fn normalized(body: &[u8], run_id: &str, lineage_id: &str) -> String {
-    String::from_utf8_lossy(body)
-        .replace(run_id, "@RUN_ID@")
-        .replace(lineage_id, "@LINEAGE_ID@")
+    normalize_snapshot_bytes(body, run_id, lineage_id)
+}
+
+fn snapshot_scope(page: &Value) -> String {
+    use base64::Engine;
+    format!(
+        "h1.{}.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(page["incarnation"].as_str().unwrap()),
+        page["history_version"].as_u64().unwrap()
+    )
+}
+
+async fn reference_scope(rig: &mut Rig) -> String {
+    let head = call(rig, 7, "session.head", json!({})).await;
+    snapshot_scope(&result(&head))
 }
 
 /// The pinned text of `file`, without its trailing newline.
@@ -90,22 +103,25 @@ async fn a_reply_naming_tool_outputs_keeps_its_default_read_bytes() {
         .request(7, json!({"method": "session.read", "params": {}}))
         .await;
     let page = result(&read);
-    let lineage_id = page["lineage_id"].as_str().unwrap().to_owned();
-    let tags: Vec<Value> = page["messages"]
+    let lineage_id = page["incarnation"].as_str().unwrap().to_owned();
+    let keys: Vec<Value> = page["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|entry| entry["tags"].clone())
+        .map(|entry| {
+            assert!(entry.get("tags").is_none());
+            entry["part_keys"].clone()
+        })
         .collect();
     assert_eq!(
-        tags,
+        keys,
         [
-            json!([{"part": "m0#0", "tag": "§1§"}]),
-            json!([{"part": "m1#0"}]),
-            json!([{"part": "m2#0", "tag": "§2§"}]),
-            json!([{"part": "m3#0", "tag": "§3§"}]),
+            json!(["m0#0"]),
+            json!(["m1#0"]),
+            json!(["m2#0"]),
+            json!(["m3#0"]),
         ],
-        "the reply names the tool result's number"
+        "part identity does not depend on rendered tag numbers"
     );
     let mut body = normalized(&read.body, &run_id, &lineage_id);
     // Entry times are pinned elsewhere (session_read.written_at.json); drop each recorded time.
@@ -154,7 +170,7 @@ async fn declared_slots_without_opt_in_keep_the_manifest_bytes() {
 
 /// A finished tagged session: the user's `hi` (§1§), a `work` call answering `worked` (§2§),
 /// and a final reply (§3§) whose text is `reply`. Returns the rig, the run id and the lineage id.
-async fn referencing_session(tag: &str, reply: &'static str) -> (Rig, String, String) {
+async fn referencing_session(tag: &str, reply: &'static str) -> (Rig, String, String, String) {
     let (mut rig, _) = plan_rig(tag).await;
     rig.script.push(&[Step::Call("call-1"), Step::Text(reply)]);
     let run_id = send_plan(&mut rig, "turn-1", "hi", &tagged_plan(json!({}))).await;
@@ -163,13 +179,75 @@ async fn referencing_session(tag: &str, reply: &'static str) -> (Rig, String, St
     let head = rig
         .request(7, json!({"method": "session.head", "params": {}}))
         .await;
-    let lineage = result(&head)["lineage_id"].as_str().unwrap().to_owned();
-    (rig, run_id, lineage)
+    let lineage = result(&head)["incarnation"].as_str().unwrap().to_owned();
+    (rig, run_id, lineage, snapshot_scope(&result(&head)))
+}
+
+#[tokio::test]
+async fn output_reference_ids_never_resolve_across_a_history_rewrite() {
+    use broca_core::ServedHistory;
+    let (mut rig, _, incarnation, old_scope) =
+        referencing_session("refs-history-scope", "see $$tc(2)").await;
+    let old_set = format!("{old_scope}/m3");
+    let before = call(
+        &mut rig,
+        7,
+        "session.output_refs",
+        json!({"set_id":old_set}),
+    )
+    .await;
+    assert_eq!(result(&before)["records"][0]["state"], "resolved");
+    let before = call(
+        &mut rig,
+        7,
+        "session.output_ref_read",
+        json!({"ref_id":format!("{old_set}/r0"), "offset":0, "length":6}),
+    )
+    .await;
+    assert_eq!(result(&before)["data"], "d29ya2Vk");
+
+    rig.store
+        .history_rewritten(&rig.session, Some(&incarnation))
+        .unwrap();
+    rig.store.history_rewrite_finished(&rig.session).unwrap();
+    let new_scope = reference_scope(&mut rig).await;
+    assert_ne!(old_scope, new_scope);
+    let wal = rig.wal_bytes();
+    for set in [old_set, format!("{incarnation}/m3")] {
+        let listed = call(&mut rig, 7, "session.output_refs", json!({"set_id":set})).await;
+        assert_eq!(refusal(&listed)["code"], "unknown_ref");
+        let read = call(
+            &mut rig,
+            7,
+            "session.output_ref_read",
+            json!({"ref_id":format!("{set}/r0"), "offset":0, "length":6}),
+        )
+        .await;
+        assert_eq!(refusal(&read)["code"], "unknown_ref");
+    }
+    let current = call(
+        &mut rig,
+        7,
+        "session.output_ref_read",
+        json!({"ref_id":format!("{new_scope}/m3/r0"), "offset":0, "length":6}),
+    )
+    .await;
+    assert_eq!(
+        result(&current)["data"],
+        "d29ya2Vk",
+        "fresh references still read retained bytes"
+    );
+    assert_eq!(
+        rig.wal_bytes(),
+        wal,
+        "reference reads never append to the log"
+    );
+    rig.finish().await;
 }
 
 #[tokio::test]
 async fn history_pages_seek_both_ways_without_gaps_and_expire_foreign_cursors() {
-    let (mut rig, _, _) = referencing_session("history-pages", "answer").await;
+    let (mut rig, run_id, incarnation, _) = referencing_session("history-pages", "answer").await;
     let newest = call(&mut rig, 7, "session.history", json!({"limit": 2})).await;
     let newest = result(&newest);
     assert_eq!(
@@ -179,7 +257,7 @@ async fn history_pages_seek_both_ways_without_gaps_and_expire_foreign_cursors() 
             .iter()
             .map(|entry| entry["ordinal"].clone())
             .collect::<Vec<_>>(),
-        [json!(2), json!(3)]
+        [json!(3), json!(4)]
     );
     assert!(newest.get("newer").is_none());
     let zero = call(&mut rig, 7, "session.history", json!({"limit":0})).await;
@@ -201,7 +279,7 @@ async fn history_pages_seek_both_ways_without_gaps_and_expire_foreign_cursors() 
             .iter()
             .map(|entry| entry["ordinal"].clone())
             .collect::<Vec<_>>(),
-        [json!(0), json!(1)]
+        [json!(1), json!(2)]
     );
     assert!(older.get("older").is_none());
     let newer = call(
@@ -223,11 +301,26 @@ async fn history_pages_seek_both_ways_without_gaps_and_expire_foreign_cursors() 
         &mut rig,
         7,
         "session.history",
-        json!({"from_mid": "m0", "limit": 100}),
+        json!({"from_mid": result(&raw)["messages"][0]["mid"], "limit": 100}),
     )
     .await;
     assert_eq!(result(&all)["messages"], result(&raw)["messages"]);
-    for params in [json!({"before_mid":"m2"}), json!({"before_ordinal":2})] {
+    let default = call(&mut rig, 7, "session.history", json!({})).await;
+    assert_eq!(result(&default), result(&all));
+    let mut bytes = normalized(&default.body, &run_id, &incarnation);
+    for entry in result(&default)["messages"].as_array().unwrap() {
+        if let Some(at) = entry["written_at"].as_u64() {
+            bytes = bytes.replace(
+                &format!("\"written_at\":{at}"),
+                "\"written_at\":\"@RECORDED_TIME@\"",
+            );
+        }
+    }
+    check_golden(&bytes, "session_history.default.json");
+    for params in [
+        json!({"before_mid":result(&raw)["messages"][2]["mid"]}),
+        json!({"before_ordinal":3}),
+    ] {
         let page = call(&mut rig, 7, "session.history", params).await;
         assert_eq!(result(&page)["messages"], older["messages"]);
     }
@@ -266,7 +359,7 @@ async fn history_pages_seek_both_ways_without_gaps_and_expire_foreign_cursors() 
             assert_eq!(error["detail"]["field"], field, "{error}");
         }
     }
-    let (mut other, _, _) = referencing_session("history-foreign", "answer").await;
+    let (mut other, _, _, _) = referencing_session("history-foreign", "answer").await;
     let foreign = call(
         &mut other,
         7,
@@ -279,7 +372,10 @@ async fn history_pages_seek_both_ways_without_gaps_and_expire_foreign_cursors() 
     let (mut empty, _) = plan_rig("history-empty").await;
     for params in [json!({}), json!({"form":"display"})] {
         let page = call(&mut empty, 7, "session.history", params).await;
-        assert_eq!(result(&page), json!({"messages":[]}));
+        assert_eq!(
+            result(&page),
+            json!({"messages":[], "incarnation":"unwritten", "history_version":0})
+        );
     }
     for (params, code) in [
         (json!({"cursor":newest["older"]}), "cursor_expired"),
@@ -295,7 +391,7 @@ async fn history_pages_seek_both_ways_without_gaps_and_expire_foreign_cursors() 
 
 #[tokio::test]
 async fn history_display_limits_and_page_budgets_keep_the_requested_end() {
-    let (mut rig, _, _) = referencing_session("history-limits", "answer").await;
+    let (mut rig, _, _, _) = referencing_session("history-limits", "answer").await;
     let display = call(&mut rig, 7, "session.history", json!({"form":"display", "limits":{"arguments_bytes":1,"result_bytes":3,"error_result_bytes":5}})).await;
     let page = result(&display);
     assert_eq!(page["messages"][1]["row"]["parts"][0]["arguments"], "{");
@@ -320,7 +416,7 @@ async fn history_display_limits_and_page_budgets_keep_the_requested_end() {
     )
     .await;
     assert_eq!(result(&newest)["messages"].as_array().unwrap().len(), 1);
-    assert_eq!(result(&newest)["messages"][0]["ordinal"], 3);
+    assert_eq!(result(&newest)["messages"][0]["ordinal"], 4);
     let first = call(
         &mut rig,
         7,
@@ -329,7 +425,7 @@ async fn history_display_limits_and_page_budgets_keep_the_requested_end() {
     )
     .await;
     assert_eq!(result(&first)["messages"].as_array().unwrap().len(), 1);
-    assert_eq!(result(&first)["messages"][0]["ordinal"], 0);
+    assert_eq!(result(&first)["messages"][0]["ordinal"], 1);
     rig.finish().await;
 }
 
@@ -464,14 +560,14 @@ async fn repeated_ids_within_a_message_keep_unknown_dispatch_metadata_null() {
     );
     let raw = call(&mut rig, 7, "session.read", json!({})).await;
     let raw = result(&raw);
-    let lineage = raw["lineage_id"].as_str().unwrap();
+    let scope = snapshot_scope(&raw);
     let first_key = raw["messages"][1]["tool_calls"][0]["call_key"].clone();
     assert!(first_key.is_string());
     let refs = call(
         &mut rig,
         7,
         "session.output_refs",
-        json!({"set_id":format!("{lineage}/m3")}),
+        json!({"set_id":format!("{scope}/m3")}),
     )
     .await;
     let refs = result(&refs);
@@ -486,10 +582,7 @@ async fn repeated_ids_within_a_message_keep_unknown_dispatch_metadata_null() {
     let parts = &display["messages"][1]["row"]["parts"];
     assert_eq!(parts[0]["output_refs"]["call_key"], first_key);
     assert!(parts[1]["output_refs"]["call_key"].is_null());
-    assert_eq!(
-        parts[1]["output_refs"]["set_id"],
-        format!("{lineage}/m1/c1")
-    );
+    assert_eq!(parts[1]["output_refs"]["set_id"], format!("{scope}/m1/c1"));
     rig.finish().await;
 }
 
@@ -514,7 +607,7 @@ async fn repeated_ids_across_messages_keep_each_messages_own_dispatch() {
     rig.wait_idle().await;
     let raw = call(&mut rig, 7, "session.read", json!({})).await;
     let raw = result(&raw);
-    let lineage = raw["lineage_id"].as_str().unwrap();
+    let scope = snapshot_scope(&raw);
     let keys = [
         raw["messages"][1]["tool_calls"][0]["call_key"].clone(),
         raw["messages"][3]["tool_calls"][0]["call_key"].clone(),
@@ -525,7 +618,7 @@ async fn repeated_ids_across_messages_keep_each_messages_own_dispatch() {
         &mut rig,
         7,
         "session.output_refs",
-        json!({"set_id":format!("{lineage}/m5")}),
+        json!({"set_id":format!("{scope}/m5")}),
     )
     .await;
     let refs = result(&refs);
@@ -578,9 +671,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// of the tool-call message included.
 #[tokio::test]
 async fn a_reply_set_resolves_against_the_writing_request() {
-    let (mut rig, run_id, lineage) =
+    let (mut rig, run_id, lineage, scope) =
         referencing_session("refs-reply-set", "see $$tc(2), $$tc(1) and $$tc(99)").await;
-    let set = format!("{lineage}/m3");
+    let set = format!("{scope}/m3");
     let page = call(&mut rig, 7, "session.output_refs", json!({"set_id": set})).await;
     let records = result(&page)["records"].clone();
     assert_eq!(
@@ -613,7 +706,10 @@ async fn a_reply_set_resolves_against_the_writing_request() {
         derived.reply.descriptor.check(&parsed),
         "the descriptor's count and digest match the served records"
     );
-    assert_eq!(derived.reply.descriptor.mid, "m3");
+    assert_eq!(
+        derived.reply.descriptor.mid,
+        format!("m{}.3", &lineage[..8])
+    );
     assert_eq!(derived.reply.descriptor.dialect, "rich-ui/1");
     check_golden(
         &normalized(&page.body, &run_id, &lineage),
@@ -679,7 +775,7 @@ async fn a_reply_set_resolves_against_the_writing_request() {
         &mut rig,
         7,
         "session.output_refs",
-        json!({"set_id": format!("{lineage}/m1")}),
+        json!({"set_id": format!("{scope}/m1")}),
     )
     .await;
     assert_eq!(result(&empty), json!({"records": []}));
@@ -694,23 +790,23 @@ async fn a_reply_set_resolves_against_the_writing_request() {
 /// stays unknown even though a part holds it now.
 #[tokio::test]
 async fn a_number_assigned_after_the_reply_is_not_in_its_request() {
-    let (mut rig, _, lineage) =
+    let (mut rig, _, _lineage, scope) =
         referencing_session("refs-later-number", "see $$tc(2) and $$tc(4)").await;
     rig.script.push(&[Step::Text("again")]);
     send_plan(&mut rig, "turn-2", "more", &tagged_plan(json!({}))).await;
     rig.wait_for_finished(2).await;
     rig.wait_idle().await;
-    let read = call(&mut rig, 7, "session.read", json!({"from_ordinal": 4})).await;
+    let read = call(&mut rig, 7, "session.read", json!({"from_ordinal": 5})).await;
     assert_eq!(
-        result(&read)["messages"][0]["tags"],
-        json!([{"part": "m4#0", "tag": "§4§"}]),
-        "the second prompt holds §4§ now"
+        result(&read)["messages"][0]["part_keys"],
+        json!(["m4#0"]),
+        "the later prompt has its own stored part"
     );
     let page = call(
         &mut rig,
         7,
         "session.output_refs",
-        json!({"set_id": format!("{lineage}/m3")}),
+        json!({"set_id": format!("{scope}/m3")}),
     )
     .await;
     let records = result(&page)["records"].clone();
@@ -728,9 +824,9 @@ async fn a_number_assigned_after_the_reply_is_not_in_its_request() {
 /// `invalid_params` naming `offset` or `length`.
 #[tokio::test]
 async fn refusals_carry_the_contract_codes_and_write_nothing() {
-    let (mut rig, run_id, lineage) =
+    let (mut rig, run_id, lineage, scope) =
         referencing_session("refs-refusals", "see $$tc(2), $$tc(1) and $$tc(99)").await;
-    let set = format!("{lineage}/m3");
+    let set = format!("{scope}/m3");
     let foreign = "00000000-0000-4000-8000-000000000000";
     let wal = rig.wal_bytes();
     let cases = [
@@ -741,7 +837,7 @@ async fn refusals_carry_the_contract_codes_and_write_nothing() {
         ),
         (
             "session.output_refs",
-            json!({"set_id": format!("{lineage}/m0")}),
+            json!({"set_id": format!("{scope}/m0")}),
             "output_refs.unknown_ref.no_set.json",
         ),
         (
@@ -798,8 +894,8 @@ async fn refusals_carry_the_contract_codes_and_write_nothing() {
     }
     // An id spelled differently from the one minted names nothing, even when it parses.
     for alias in [
-        format!("{lineage}/m03"),
-        format!("{lineage}/m3/"),
+        format!("{scope}/m03"),
+        format!("{scope}/m3/"),
         format!("{set}/c"),
     ] {
         let frame = call(&mut rig, 7, "session.output_refs", json!({"set_id": alias})).await;
@@ -813,8 +909,8 @@ async fn refusals_carry_the_contract_codes_and_write_nothing() {
 /// that may not read the session is refused as `session.read` refuses it, before anything else.
 #[tokio::test]
 async fn ids_are_session_bound_and_access_follows_session_read() {
-    let (mut rig, run_id, lineage) = referencing_session("refs-access", "see $$tc(2)").await;
-    let set = format!("{lineage}/m3");
+    let (mut rig, run_id, lineage, scope) = referencing_session("refs-access", "see $$tc(2)").await;
+    let set = format!("{scope}/m3");
     rig.bind_session(9, "another").await;
     for (method, params) in [
         ("session.output_refs", json!({"set_id": set})),
@@ -865,7 +961,7 @@ async fn ids_are_session_bound_and_access_follows_session_read() {
 /// wrote the message is in effect for it; one applied after that step is not.
 #[tokio::test]
 async fn the_view_in_effect_is_the_last_one_applied_before_the_writing_step() {
-    let (rig, _, _) = referencing_session("refs-view-step", "see $$tc(2)").await;
+    let (rig, _, _, _) = referencing_session("refs-view-step", "see $$tc(2)").await;
     let records = rig.records();
     let last_step = records
         .iter()
@@ -997,19 +1093,20 @@ async fn an_opted_in_call_scans_only_its_declared_slots() {
     let head = rig
         .request(7, json!({"method": "session.head", "params": {}}))
         .await;
-    let lineage = result(&head)["lineage_id"].as_str().unwrap().to_owned();
+    let lineage = result(&head)["incarnation"].as_str().unwrap().to_owned();
+    let scope = snapshot_scope(&result(&head));
     let reply = call(
         &mut rig,
         7,
         "session.output_refs",
-        json!({"set_id": format!("{lineage}/m3")}),
+        json!({"set_id": format!("{scope}/m3")}),
     )
     .await;
     let reply = result(&reply)["records"].clone();
     assert_eq!(reply.as_array().unwrap().len(), 1, "{reply}");
     assert_eq!(reply[0]["state"], "resolved");
 
-    let set = format!("{lineage}/m3/c1");
+    let set = format!("{scope}/m3/c1");
     let page = call(&mut rig, 7, "session.output_refs", json!({"set_id": set})).await;
     let records = result(&page)["records"].clone();
     assert_eq!(records.as_array().unwrap().len(), 2, "{records}");
@@ -1064,7 +1161,7 @@ async fn an_opted_in_call_scans_only_its_declared_slots() {
     );
     assert_eq!(row["parts"][1]["tool_call_id"], "call-2");
     assert_eq!(row["parts"][1]["part"], "m3#1");
-    let dispatched = call(&mut rig, 7, "session.read", json!({"from_ordinal": 3})).await;
+    let dispatched = call(&mut rig, 7, "session.read", json!({"from_ordinal": 4})).await;
     assert_eq!(
         call_set.descriptor.call_key.as_deref(),
         result(&dispatched)["messages"][0]["tool_calls"][0]["call_key"].as_str(),
@@ -1106,12 +1203,12 @@ async fn a_call_without_opt_in_has_no_set() {
     let head = rig
         .request(7, json!({"method": "session.head", "params": {}}))
         .await;
-    let lineage = result(&head)["lineage_id"].as_str().unwrap().to_owned();
+    let scope = snapshot_scope(&result(&head));
     let frame = call(
         &mut rig,
         7,
         "session.output_refs",
-        json!({"set_id": format!("{lineage}/m3/c0")}),
+        json!({"set_id": format!("{scope}/m3/c0")}),
     )
     .await;
     assert_eq!(refusal(&frame)["code"], "unknown_ref");
@@ -1119,7 +1216,7 @@ async fn a_call_without_opt_in_has_no_set() {
         &mut rig,
         7,
         "session.output_refs",
-        json!({"set_id": format!("{lineage}/m3")}),
+        json!({"set_id": format!("{scope}/m3")}),
     )
     .await;
     assert_eq!(result(&reply), json!({"records": []}));

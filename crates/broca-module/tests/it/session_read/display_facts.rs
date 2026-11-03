@@ -50,7 +50,7 @@ async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_an
             .unwrap();
         let default_ms = now.elapsed().as_secs_f64() * 1000.0;
         let default_full = zero_ranges.swap(0, Ordering::SeqCst);
-        assert_eq!(plain.messages.last().unwrap().ordinal + 1, size);
+        assert_eq!(plain.messages.last().unwrap().ordinal, size);
         let lineage = plain.lineage_id.as_ref().unwrap();
         assert!(
             rig.store

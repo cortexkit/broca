@@ -520,6 +520,7 @@ mod tests {
     fn episode_config(context_management: Option<ContextManagement>) -> broca_wal::RunConfig {
         broca_wal::RunConfig {
             global_system: None,
+            route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
@@ -593,6 +594,7 @@ mod tests {
     fn an_import_seed_is_not_a_binding_admission() {
         let mut config = broca_wal::RunConfig {
             global_system: None,
+            route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,

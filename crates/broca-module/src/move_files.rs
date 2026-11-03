@@ -1009,11 +1009,32 @@ impl CutArtifacts for FileCutArtifacts {
                     &self.installations(&locked.plans, &paths),
                     self.export.as_ref(),
                     |session| {
+                        self.registry.handle().invalidate_history_caches(session);
+                        if let Some(history) =
+                            broca_core::WalStore::served_history(self.wal.as_ref())
+                        {
+                            let lineage = locked
+                                .plans
+                                .iter()
+                                .find(|plan| &plan.session == session)
+                                .map(|plan| plan.lineage_id.as_str());
+                            history.history_rewritten(session, lineage)?;
+                        }
+                        Ok(())
+                    },
+                    |session| {
                         // Ownership sidecars retain the canonical wal/ address so every
                         // transcript tree shares one move refusal and one writer lease.
                         migration::unlink(&self.wal.wal_path(session).with_extension("moved"))
                             .map_err(|error| error.to_string())?;
-                        self.driver.drop_projection(session)
+                        self.driver.drop_projection(session)?;
+                        self.registry.handle().invalidate_history_caches(session);
+                        if let Some(history) =
+                            broca_core::WalStore::served_history(self.wal.as_ref())
+                        {
+                            history.history_rewrite_finished(session)?;
+                        }
+                        Ok(())
                     },
                 )
                 .map_err(|e| self.install_error(&cut_id, _state, &locked, e))?;

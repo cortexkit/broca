@@ -1204,3 +1204,46 @@ async fn the_stop_grace_waits_for_batches_but_never_past_its_end() {
         "a batch that outlives the grace held the stop open: {waited:?}"
     );
 }
+
+#[tokio::test]
+async fn route_decision_is_run_fixed_and_omitted_joining_sends_inherit_without_rewriting() {
+    let f = Fixture::new(Hold::UntilReleased, vec![edit_step()]);
+    let mut first = f.edit_req("decision-run");
+    first.route_decision_id = Some("decision-a".into());
+    assert!(matches!(
+        f.registry
+            .route_send(&f.key, first, RunKind::FreshOrResume)
+            .await
+            .unwrap(),
+        SendOutcome::Active { .. }
+    ));
+    tokio::time::timeout(Duration::from_secs(10), f.plane.entered.notified())
+        .await
+        .unwrap();
+    let before = f.records();
+    assert!(before.iter().any(|record| matches!(record, WalRecord::RunStarted { config, .. } if config.route_decision_id.as_deref() == Some("decision-a"))));
+    let mut different = text_req(&f.key, "different-decision");
+    different.route_decision_id = Some("decision-b".into());
+    assert_eq!(
+        f.registry
+            .route_send(&f.key, different, RunKind::FreshOrResume)
+            .await
+            .unwrap(),
+        SendOutcome::RouteDecisionFixed
+    );
+    assert_eq!(
+        f.records(),
+        before,
+        "a different decision must refuse before any WAL record"
+    );
+    let omitted = text_req(&f.key, "inherited-decision");
+    assert!(matches!(
+        f.registry
+            .route_send(&f.key, omitted, RunKind::FreshOrResume)
+            .await
+            .unwrap(),
+        SendOutcome::Pending { .. }
+    ));
+    assert!(f.records().iter().any(|record| matches!(record, WalRecord::Queued { request, .. } if request.route_decision_id.as_deref() == Some("decision-a"))));
+    let _ = f.stop_releasing_the_call(GRACE).await;
+}

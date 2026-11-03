@@ -1034,6 +1034,7 @@ fn request(session: &BindIdentity, run: &str, inputs: usize) -> RunRequest {
         reply: None,
     };
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -1057,8 +1058,8 @@ fn request(session: &BindIdentity, run: &str, inputs: usize) -> RunRequest {
                 )
             })
             .collect(),
-        // `read` is a read-only tool, so its repeated identical results draw repetition
-        // guidance; `lookup` is not, so it never does.
+        // Repeated identical results from the read-only `read` tool add model-facing
+        // guidance to stop repeating the call. `lookup` does not opt into that guidance.
         tools: vec![tool("lookup"), tool("read")],
         policy_allowed: HashSet::from(["lookup".to_owned(), "read".to_owned()]),
         tool_choice: ToolChoice::Auto,

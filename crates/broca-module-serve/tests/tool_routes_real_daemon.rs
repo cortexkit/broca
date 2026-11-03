@@ -128,6 +128,7 @@ impl RunExecutor for Executor {
 fn config() -> RunConfig {
     RunConfig {
         global_system: None,
+        route_decision_id: None,
         account_limit_pause: false,
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         generation: Default::default(),

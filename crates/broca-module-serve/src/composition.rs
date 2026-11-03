@@ -104,6 +104,7 @@ impl Stores {
             }));
             wal = wal.with_publication_observer(overhaul.publications.observer());
             wal.set_session_ref_index(overhaul.db.clone());
+            wal.set_served_history(overhaul.db.clone());
         }
         let wal = Arc::new(wal);
         broca_module::actor::writer_reclaim::reap_temporary_markers_at_boot(wal.clone()).await?;
@@ -1507,6 +1508,7 @@ mod tests {
             ts_ms: None,
             config: Box::new(RunConfig {
                 global_system: None,
+                route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
@@ -1591,6 +1593,7 @@ mod tests {
 
     fn request(bind: &BindIdentity) -> broca_core::RunRequest {
         broca_core::RunRequest {
+            route_decision_id: None,
             input_written_at_ms: None,
             directives: None,
             session_class: None,

@@ -18,15 +18,7 @@ pub(super) fn wall_ms() -> u128 {
         .map_or(0, |elapsed| elapsed.as_millis())
 }
 
-impl Shared {
-    /// Record one adapter event, in order, with its wall-clock time.
-    pub(super) fn note(&self, session: &str, event: impl std::fmt::Display) {
-        self.evidence
-            .lock()
-            .unwrap()
-            .push(format!("wall_ms={} session={session} {event}", wall_ms()));
-    }
-}
+impl Shared {}
 
 /// The `cortexkit` directory under the rig's `XDG_DATA_HOME`. [`BrocaSubject::start`] puts the
 /// state root and `data-home` side by side in the rig directory.
@@ -107,8 +99,7 @@ impl BrocaRoute {
 }
 
 impl BrocaSubject {
-    /// The adapter's view of one session: its rig's clock file, the adapter's own clock value
-    /// for that rig, every provider call it received and, with `events`, its recorded events.
+    /// One session's rig clock and, when requested, its recorded adapter events.
     pub(super) fn session_evidence(&self, session: &str, events: bool) -> String {
         let mut output = format!("--- adapter view of session {session} ---\n");
         let root = self
@@ -120,14 +111,10 @@ impl BrocaSubject {
             .cloned();
         if let Some(root) = &root {
             output.push_str(&format!(
-                "state root {}: test-clock file {}; adapter clock {:?}\n",
+                "state root {}: test-clock file {}\n",
                 root.display(),
                 clock_file(root),
-                self.shared.compaction_clocks.lock().unwrap().get(root),
             ));
-        }
-        if let Some(state) = self.shared.compaction.lock().unwrap().get(session) {
-            output.push_str(&state.describe());
         }
         if events {
             let marker = format!(" session={session} ");
@@ -141,12 +128,11 @@ impl BrocaSubject {
         output
     }
 
-    /// Everything this rig can say about a failed suite: the adapter's events, the snapshots of
-    /// runs that stayed non-terminal for [`STALL_POLLS`] polls, each rig's clock file and logs, and
-    /// each compaction session's provider calls and decoded WAL.
+    /// Everything the rig retained for a failed suite: events, stalled runs, clocks, logs
+    /// and the decoded WALs of its sessions.
     pub(super) fn failure_evidence(&self) -> String {
         let mut output = String::from("=== llm-runner conformance failure evidence ===\n");
-        output.push_str("--- adapter events: clock writes and settle outcomes ---\n");
+        output.push_str("--- adapter events ---\n");
         for event in self.shared.evidence.lock().unwrap().iter() {
             output.push_str(event);
             output.push('\n');
@@ -180,7 +166,7 @@ impl BrocaSubject {
         }
         let mut sessions: Vec<String> = self
             .shared
-            .compaction
+            .session_roots
             .lock()
             .unwrap()
             .keys()

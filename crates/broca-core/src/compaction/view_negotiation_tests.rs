@@ -250,7 +250,7 @@ fn tagged_prompt() -> (Vec<Message>, Vec<Message>) {
 
 #[test]
 fn assistant_part_edits_preserve_runner_authored_tag_references() {
-    use cortexkit_role_llm_runner::tags::TruncateMode;
+    use broca_protocol::tags::v1::TruncateMode;
     let mut stored = stamped(vec![text(Role::Assistant, "model-authored text")]);
     broca_protocol::tags::number_message(
         &mut stored[0],
@@ -309,7 +309,7 @@ fn assistant_part_edits_preserve_runner_authored_tag_references() {
 
 #[test]
 fn negotiated_part_edits_use_the_parts_own_tags_and_replay_old_bytes_verbatim() {
-    use cortexkit_role_llm_runner::tags::TruncateMode;
+    use broca_protocol::tags::v1::TruncateMode;
     let (stored, prompt) = tagged_prompt();
     for (edit, expected) in [
         (
@@ -399,7 +399,7 @@ fn negotiated_part_edits_use_the_parts_own_tags_and_replay_old_bytes_verbatim() 
 
 #[test]
 fn truncate_checks_stored_container_negotiation_and_shared_renderer_refusals() {
-    use cortexkit_role_llm_runner::tags::TruncateMode;
+    use broca_protocol::tags::v1::TruncateMode;
     let (stored, prompt) = tagged_prompt();
     let mut state = CompactionState::default();
     state.fold(&negotiated_setup(None));
@@ -508,7 +508,7 @@ fn negotiated_replace_ranges_remain_final_and_never_inherit_part_tags() {
 
 #[test]
 fn runner_truncate_edit_marker_preserves_a_stored_tool_calls_signature() {
-    use cortexkit_role_llm_runner::tags::TruncateMode;
+    use broca_protocol::tags::v1::TruncateMode;
     let mut call = call("signed");
     let ContentBlock::ToolCall(tool) = &mut call else {
         unreachable!()

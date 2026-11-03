@@ -180,6 +180,7 @@ mod tests {
             session: session.clone(),
             config: Box::new(RunConfig {
                 global_system: None,
+                route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,

@@ -10,8 +10,6 @@ pub mod role;
 pub use role::*;
 pub mod warm;
 pub use warm::*;
-pub mod model_view;
-pub use model_view::*;
 
 use broca_protocol::caller::SharedProviderError;
 use broca_protocol::request::{
@@ -27,6 +25,13 @@ pub const SUBC_MAX_FRAME_BYTES: u64 = 4_194_304;
 /// transport limit; otherwise a body can fit the limit before framing and exceed it afterward.
 /// This matches `subc_protocol::HEADER_LEN`, defined in `subc-protocol/src/lib.rs:417`.
 pub const SUBC_FRAME_HEADER_BYTES: u64 = 21;
+
+fn discard_legacy_lineage<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let _ = Option::<String>::deserialize(deserializer)?;
+    Ok(None)
+}
 
 #[derive(Serialize)]
 struct ResultEnvelope<'a, T: Serialize> {
@@ -65,6 +70,8 @@ fn deserialize_session_class<'de, D: serde::Deserializer<'de>>(
 /// `session.send` params. The session comes from the bound route identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SendParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_decision_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<cortexkit_role_llm_runner::attachments::ContentPart>,
     #[serde(
@@ -943,16 +950,16 @@ pub struct ReadParams {
     /// Opt in to stored client identity and per-call timing beside each message, never in it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_display_facts: bool,
-    /// Read strictly after the message with this `mid`, taken from an earlier page of the
-    /// lineage `lineage_id` names. Refused `unknown_mid` when that lineage has no such message,
-    /// never answered with the newest page instead. Requires `lineage_id`, and cannot be combined
-    /// with `from_ordinal`.
+    /// Continue strictly after a stable mid at the supplied history version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_mid: Option<String>,
-    /// The lineage the caller's cursor belongs to. A read naming any other lineage than the
-    /// session's current one is refused `lineage_changed`, whatever its mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_version: Option<u64>,
+    /// Input-only migration field; never used to select a history or serialized.
+    #[serde(default, skip_serializing, deserialize_with = "discard_legacy_lineage")]
     pub lineage_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<cortexkit_role_llm_runner::read::ReadView>,
     /// A byte cap on the page. Transcript reads budget the complete serialized reply body,
     /// with a default and maximum of 3 MiB (3,145,728 bytes); larger requests are capped to
     /// [`READ_MAXIMUM_MAX_BYTES`]. Messages and late approvals share that budget, including all
@@ -1123,10 +1130,9 @@ pub struct SessionReadMessage {
     /// each call's dispatch. Absent on a message with no tool call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<SessionReadToolCall>,
-    /// One row per exposed part, in block order. A row has a number only when that part has
-    /// been counted by a tag-rendering session; legacy and not-yet-counted parts still have keys.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<SessionReadTag>,
+    /// Stable opaque keys for stored parts; numbers belong only to model rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_keys: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_as: Option<cortexkit_role_llm_runner::delivery_order::EntryDelivery>,
     /// The content identity of the whole stored message, before read-time media markers
@@ -1172,8 +1178,8 @@ impl Serialize for SessionReadMessage {
             run: &'a Option<broca_core::RunAttribution>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             tool_calls: &'a [SessionReadToolCall],
-            #[serde(skip_serializing_if = "<[_]>::is_empty")]
-            tags: &'a [SessionReadTag],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            part_keys: &'a Option<Vec<String>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             delivered_as: &'a Option<cortexkit_role_llm_runner::delivery_order::EntryDelivery>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -1194,7 +1200,7 @@ impl Serialize for SessionReadMessage {
             message: Body(&self.message, self.described.as_ref()),
             run: &self.run,
             tool_calls: &self.tool_calls,
-            tags: &self.tags,
+            part_keys: &self.part_keys,
             delivered_as: &self.delivered_as,
             digest: &self.digest,
             part_digests: &self.part_digests,
@@ -1248,7 +1254,10 @@ impl SessionReadMessage {
                 .flatten()
                 .enumerate()
                 .map(|(index, part)| {
-                    PartDigest::new(broca_protocol::tags::part_key(self.ordinal, index), part)
+                    PartDigest::new(
+                        broca_protocol::tags::part_key(self.ordinal.saturating_sub(1), index),
+                        part,
+                    )
                 })
                 .collect(),
         );
@@ -1283,7 +1292,10 @@ impl SessionReadMessage {
                     format!("/content/{index}"),
                     media_reference(
                         part,
-                        Some(broca_protocol::tags::part_key(self.ordinal, index)),
+                        Some(broca_protocol::tags::part_key(
+                            self.ordinal.saturating_sub(1),
+                            index,
+                        )),
                     ),
                 )),
                 Some("text") => {
@@ -1393,70 +1405,6 @@ fn media_reference(
     }
 }
 
-/// The exposed content of part `index` of `message` as a descriptors `session.resolve` serves
-/// it, `range` already applied to `text` (a text part's exposed text): text over the inline
-/// threshold becomes a `text_ref` keyed by the part; any other part is served as its stored
-/// structure with large payloads replaced by refs.
-pub fn describe_resolved_part(
-    message: &broca_protocol::Message,
-    ordinal: u64,
-    index: usize,
-    text: String,
-) -> serde_json::Value {
-    use cortexkit_role_llm_runner::read::descriptors::{Reference, PART_INLINE_MAX};
-    let part = broca_protocol::tags::part_key(ordinal, index);
-    let is_text = matches!(
-        message.content.get(index),
-        Some(
-            broca_protocol::ContentBlock::Text { .. }
-                | broca_protocol::ContentBlock::TextWithState { .. }
-        )
-    );
-    if is_text {
-        return if text.len() > PART_INLINE_MAX {
-            serde_json::to_value(Reference::text(Some(part), &text)).expect("JSON")
-        } else {
-            serde_json::Value::String(text)
-        };
-    }
-    // A single-part message holding only this part, described as a read describes it, then
-    // its one part taken back out.
-    let single = broca_protocol::Message::new(
-        message.role,
-        message.content.get(index).cloned().into_iter().collect(),
-    );
-    let mut entry = SessionReadMessage {
-        client_message_id: None,
-        tool_times: Vec::new(),
-        rich_ui: None,
-        written_at: None,
-        ordinal,
-        mid: format!("m{ordinal}"),
-        message: single,
-        run: None,
-        tool_calls: Vec::new(),
-        tags: Vec::new(),
-        delivered_as: None,
-        digest: None,
-        part_digests: None,
-        described: None,
-    };
-    let _ = entry.describe();
-    let body = entry.described.unwrap_or_else(|| {
-        serde_json::to_value(CallerMessage(&entry.message, true)).expect("JSON")
-    });
-    let mut content = body
-        .get("content")
-        .and_then(|content| content.get(0))
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    if content.get("type").and_then(serde_json::Value::as_str) == Some("media_ref") {
-        // The temporary single-part message used index zero; resolution keeps the original key.
-        content["part"] = serde_json::Value::String(part);
-    }
-    content
-}
-
 fn serialized_json_len(value: &impl Serialize) -> usize {
     serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
 }
@@ -1474,27 +1422,13 @@ fn serialize_run_attribution<S: serde::Serializer>(
         .serialize(serializer)
 }
 
-pub use cortexkit_role_llm_runner::tags::PartTag as SessionReadTag;
-
-/// One row per exposed part, in content order. A message can be read before its parts are
-/// counted, so missing ledger entries omit only the number, never the stable part key.
-pub fn tag_rows(ordinal: u64, message: &broca_protocol::Message) -> Vec<SessionReadTag> {
+/// Stable part identities are derived from immutable stored positions, not tag numbers.
+pub fn part_keys(ordinal: u64, message: &broca_protocol::Message) -> Vec<String> {
     message
         .content
         .iter()
         .enumerate()
-        .map(|(index, _)| {
-            let part = broca_protocol::tags::part_key(ordinal, index);
-            match message
-                .part_tags()
-                .and_then(|tags| tags.parts.get(index))
-                .copied()
-                .flatten()
-            {
-                Some(tag) => SessionReadTag::tagged(part, broca_protocol::tags::tag_mark(tag)),
-                None => SessionReadTag::untagged(part),
-            }
-        })
+        .map(|(index, _)| broca_protocol::tags::part_key(ordinal, index))
         .collect()
 }
 
@@ -1538,8 +1472,10 @@ pub struct SessionReadResponse {
     pub next_from_ordinal: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<CursorWire>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub lineage_id: Option<String>,
+    pub history_version: u64,
+    pub incarnation: String,
     pub lineage_state: SessionReadLineageState,
     /// Present only when the request set `include_tools` and the session has an episode: the
     /// tool list frozen on the durable `RunStarted` of the session's LATEST episode, in its
@@ -3646,6 +3582,26 @@ pub(crate) mod scope_refusal_golden {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/golden")
             .join(file);
+        if std::env::var_os("BROCA_REGENERATE_ROLE_REPLIES").is_some()
+            && matches!(
+                file,
+                "session_head.json"
+                    | "session_head.title.json"
+                    | "session_head.lineage.json"
+                    | "session_head.cache.json"
+                    | "role_describe.json"
+                    | "role_describe_reader.json"
+            )
+        {
+            let serialized = serde_json::to_vec(&body).unwrap();
+            std::fs::write(&path, &serialized).unwrap();
+            println!(
+                "regenerated {} sha256 {:x}",
+                file,
+                Sha256::digest(&serialized)
+            );
+            return;
+        }
         let golden = std::fs::read(&path)
             .unwrap_or_else(|error| panic!("read golden {}: {error}", path.display()));
         let digest = format!("{:x}", Sha256::digest(&golden));
@@ -6028,8 +5984,8 @@ mod caller_message_tests {
             rich_ui: None,
             written_at: None,
             delivered_as: None,
-            tags: Vec::new(),
-            ordinal: 3,
+            part_keys: None,
+            ordinal: 4,
             mid: "m3".into(),
             message: broca_protocol::Message::new(Role::Assistant, content),
             run: None,
@@ -6149,7 +6105,7 @@ mod caller_message_tests {
         let mut entry = computed(read_message(content.clone()), true);
         entry.message.origin = Some(broca_protocol::ModelHandle::new("p", "m"));
         let body = serde_json::to_value(&entry).unwrap();
-        assert_eq!(members(&body), ["message", "mid", "ordinal", "tags"]);
+        assert_eq!(members(&body), ["message", "mid", "ordinal", "part_keys"]);
         assert_eq!(members(&body["message"]), ["content", "origin", "role"]);
         let blocks: Vec<Vec<String>> = body["message"]["content"]
             .as_array()
@@ -6194,11 +6150,8 @@ mod caller_message_tests {
             members(&plain["message"]["content"][0]),
             members(&body["message"]["content"][0])
         );
-        // The rows carry only the key and, on a counted part, the number.
-        for row in body["tags"].as_array().unwrap() {
-            let names = members(row);
-            assert!(names == ["part"] || names == ["part", "tag"], "{names:?}");
-        }
+        assert!(body.get("tags").is_none());
+        assert_eq!(body["part_keys"].as_array().unwrap().len(), blocks.len());
     }
 
     /// Number `entry`'s message under the computed rules of a tag-rendering run, cleaning the
@@ -6214,7 +6167,7 @@ mod caller_message_tests {
             &mut high,
         )
         .unwrap();
-        entry.tags = tag_rows(entry.ordinal, &entry.message);
+        entry.part_keys = Some(part_keys(entry.ordinal - 1, &entry.message));
         entry
     }
 
@@ -6244,9 +6197,10 @@ mod caller_message_tests {
                 body["message"]["content"][1],
                 json!({"type": "provider_fallback", "from_model": "claude-opus-5-5", "to_model": "claude-opus-4-8"})
             );
-            if let Some(rows) = body["tags"].as_array().filter(|rows| !rows.is_empty()) {
-                assert_eq!(rows.len(), 3);
-                assert_eq!(members(&rows[1]), ["part"]);
+            assert!(body.get("tags").is_none());
+            if let Some(keys) = body["part_keys"].as_array() {
+                assert_eq!(keys.len(), 3);
+                assert_eq!(keys[1], "m3#1");
             }
         }
     }
@@ -6261,7 +6215,8 @@ mod caller_message_tests {
         let cleaned = computed(read_message(content.clone()), true);
         let body = serde_json::to_value(&cleaned).unwrap();
         assert_eq!(body["message"]["content"][0]["text"], "hi as  says");
-        assert_eq!(body["tags"], json!([{"part": "m3#0", "tag": "§1§"}]));
+        assert_eq!(body["part_keys"], json!(["m3#0"]));
+        assert!(body.get("tags").is_none());
         assert_eq!(cleaned.message.content, content, "stored text stays raw");
         let raw_kept = computed(read_message(content.clone()), false);
         let body = serde_json::to_value(&raw_kept).unwrap();
@@ -6312,10 +6267,9 @@ mod caller_message_tests {
         assert_eq!(serde_json::to_value(&again).unwrap(), inline);
     }
 
-    /// Part rows sit beside the unchanged message. A complete ledger keeps its byte spelling;
-    /// a missing ledger still exposes the same keys without inventing numbers.
+    /// Opaque keys sit beside the unchanged message; the legacy tag ledger is not a read row.
     #[test]
-    fn tagged_entries_carry_part_tag_rows_beside_an_unchanged_message() {
+    fn tagged_entries_expose_opaque_keys_without_legacy_tag_rows() {
         let content = vec![
             ContentBlock::Text {
                 text: "first".into(),
@@ -6325,30 +6279,27 @@ mod caller_message_tests {
             },
         ];
         let mut plain = read_message(content.clone());
-        plain.tags = tag_rows(plain.ordinal, &plain.message);
+        plain.part_keys = Some(part_keys(plain.ordinal - 1, &plain.message));
         let mut tagged = read_message(content);
         tagged.message.set_tags(Some(std::sync::Arc::new(
             broca_protocol::tags::PartTags::all([7, 8]),
         )));
-        tagged.tags = tag_rows(tagged.ordinal, &tagged.message);
+        tagged.part_keys = Some(part_keys(tagged.ordinal - 1, &tagged.message));
 
         let plain_json = serde_json::to_value(&plain).unwrap();
         let tagged_json = serde_json::to_value(&tagged).unwrap();
-        assert_eq!(
-            plain_json["tags"],
-            json!([{"part": "m3#0"}, {"part": "m3#1"}])
-        );
+        assert_eq!(plain_json["part_keys"], json!(["m3#0", "m3#1"]));
         assert_eq!(tagged_json["message"], plain_json["message"]);
         assert_eq!(
             serde_json::to_string(&tagged).unwrap(),
-            r#"{"ordinal":3,"mid":"m3","message":{"role":"assistant","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},"tags":[{"part":"m3#0","tag":"§7§"},{"part":"m3#1","tag":"§8§"}]}"#
+            r#"{"ordinal":4,"mid":"m3","message":{"role":"assistant","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},"part_keys":["m3#0","m3#1"]}"#
         );
         let decoded: SessionReadMessage = serde_json::from_value(tagged_json).unwrap();
-        assert_eq!(decoded.tags, tagged.tags);
+        assert_eq!(decoded.part_keys, tagged.part_keys);
     }
 
     #[test]
-    fn part_rows_cover_short_ledgers_without_using_surplus_numbers() {
+    fn part_keys_do_not_depend_on_tag_ledger_length() {
         let mut entry = read_message(vec![
             ContentBlock::Text {
                 text: "first".into(),
@@ -6358,20 +6309,14 @@ mod caller_message_tests {
             },
         ]);
         for (parts, expected) in [
-            (
-                vec![Some(7)],
-                json!([{"part": "m3#0", "tag": "§7§"}, {"part": "m3#1"}]),
-            ),
-            (
-                vec![Some(7), None, Some(9)],
-                json!([{"part": "m3#0", "tag": "§7§"}, {"part": "m3#1"}]),
-            ),
+            (vec![Some(7)], json!(["m3#0", "m3#1"])),
+            (vec![Some(7), None, Some(9)], json!(["m3#0", "m3#1"])),
         ] {
             entry.message.set_tags(Some(std::sync::Arc::new(
                 broca_protocol::tags::PartTags::new(parts),
             )));
             assert_eq!(
-                serde_json::to_value(tag_rows(entry.ordinal, &entry.message)).unwrap(),
+                serde_json::to_value(part_keys(entry.ordinal - 1, &entry.message)).unwrap(),
                 expected
             );
         }
@@ -6425,7 +6370,7 @@ mod caller_message_tests {
             rich_ui: None,
             written_at: None,
             delivered_as: None,
-            tags: Vec::new(),
+            part_keys: None,
             ordinal: 0,
             mid: "m0".into(),
             message,

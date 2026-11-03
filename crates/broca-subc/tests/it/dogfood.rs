@@ -83,6 +83,7 @@ fn text_step(text: &str) -> Vec<NormalizedEvent> {
 fn request(session: &str, project_root: &std::path::Path, tools: Vec<Tool>) -> RunRequest {
     let policy_allowed = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,

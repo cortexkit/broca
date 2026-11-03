@@ -764,6 +764,11 @@ pub struct TagLocation {
 
 /// The materialized store read seam. The loop depends only on this trait.
 pub trait MaterializedStore: Send + Sync {
+    /// Durable snapshot identity is separate from rebuildable transcript rows.
+    fn served_history(&self) -> Option<&dyn crate::ServedHistory> {
+        None
+    }
+
     /// Cache only the first-run mode proof, never rebuilding legacy message timestamps.
     fn cache_history_mode(&self, _session: &BindIdentity, _mode3: bool) -> Result<(), String> {
         Ok(())
@@ -3126,6 +3131,7 @@ mod tests {
                 ts_ms: None,
                 config: Box::new(RunConfig {
                     global_system: None,
+                    route_decision_id: None,
                     account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,
@@ -4185,6 +4191,7 @@ mod episode_merge_regression {
     fn config(model: &str) -> RunConfig {
         RunConfig {
             global_system: None,
+            route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,

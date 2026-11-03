@@ -376,6 +376,7 @@ pub enum ImportOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SendOutcome {
+    RouteDecisionFixed,
     SessionMoving {
         cut_id: String,
     },
@@ -1313,6 +1314,7 @@ fn submission_from_config(
 ) -> SubmissionRequest {
     let policy_allowed = config.tools.iter().map(|tool| tool.name.clone()).collect();
     SubmissionRequest {
+        route_decision_id: config.route_decision_id,
         service_tier_level: None,
         staged_uploads: None,
         content: Vec::new(),
@@ -1330,7 +1332,7 @@ fn submission_from_config(
         generation: config.generation,
         cache: None,
         budget: config.budget,
-        // A resumed episode must reuse the frozen credential id rather than reconstructing a pin.
+        // A resumed episode must reuse the frozen credential id.
         auth: None,
         context_limit: config.context_limit,
         work_class: config.work_class,
@@ -2997,6 +2999,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             request
         };
+        self.registry.invalidate_history_caches(&self.key);
         match broca_core::run_import_with_store(
             request,
             &writer,
@@ -3006,6 +3009,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         .await
         {
             Ok(outcome) => {
+                self.registry.invalidate_history_caches(&self.key);
                 self.prior_snapshot = None;
                 if let Err(error) = self.refresh_admission_view().await {
                     tracing::warn!(
@@ -3044,6 +3048,36 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(error) => Err(format!("session move check failed: {error}")),
             };
         }
+        let history_store = self.materialized_store.clone();
+        let wal_history = self.wal_store.served_history();
+        let history = history_store
+            .as_ref()
+            .and_then(|store| store.served_history())
+            .or(wal_history.as_deref());
+        let rewriting = match history
+            .map(|history| history.history_read_version(&broca_core::session_addr(&self.key)))
+        {
+            Some(Err(error)) if error == broca_core::served_history::HISTORY_REWRITING => true,
+            Some(Err(error)) => return Err(error),
+            _ => false,
+        };
+        if rewriting {
+            self.refresh_admission_view().await?;
+            if let Some(run_id) = self
+                .recovery_records()
+                .await?
+                .iter()
+                .rev()
+                .find_map(|record| match record {
+                    WalRecord::RunStarted { run_id, .. } => Some(run_id.clone()),
+                    _ => None,
+                })
+            {
+                self.crash_orphan_candidates
+                    .get_or_insert_with(HashSet::new)
+                    .insert(run_id);
+            }
+        }
         // Recovery can be polled beneath command/admission handling on a worker's
         // small stack. Keep its large replay/admission future off those caller frames.
         Box::pin(self.recover_durable_work_inner()).await?;
@@ -3057,6 +3091,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .await
                 .map_err(|error| error.to_string())?;
             self.registry.report_recovered(&self.key);
+        }
+        if rewriting {
+            self.writer
+                .as_ref()
+                .expect("writer live during recovery")
+                .sync()
+                .await
+                .map_err(|error| error.to_string())?;
+            self.registry.invalidate_history_caches(&self.key);
+            history
+                .expect("a rewrite fence has a history store")
+                .history_rewrite_finished(&self.key)?;
         }
         Ok(())
     }
@@ -3890,6 +3936,28 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // saves a WAL reconcile, and its digest stands in only for an episode recorded before
         // `RunStarted` carried one. A lost or stale index row therefore cannot change the
         // answer. Only a send whose run id has no started episode follows the ordinary admission path.
+        let checkpoint = match self.load_checkpoint_at_head().await {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return SendOutcome::Transient(error),
+        };
+        let running = match &self.state {
+            RunState::Active { run_id, .. } => self.durable_finish_of_active(run_id).is_none(),
+            RunState::Idle => checkpoint
+                .last_episode
+                .as_ref()
+                .is_some_and(|episode| episode.disposition == EpisodeDisposition::Paused),
+        };
+        let fixed_route_decision = checkpoint
+            .last_episode
+            .as_ref()
+            .filter(|_| running)
+            .map(|episode| episode.config.route_decision_id.clone());
+        if let (Some(requested), Some(fixed)) = (&request.route_decision_id, &fixed_route_decision)
+        {
+            if Some(requested) != fixed.as_ref() {
+                return SendOutcome::RouteDecisionFixed;
+            }
+        }
         let request_identity_digest = key
             .is_keyed()
             .then(|| send_identity_digest(&request, delivery, conversation_key.as_deref()));
@@ -4195,6 +4263,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
 
+        if let Some(fixed) = fixed_route_decision {
+            request.route_decision_id = fixed;
+        }
         if broca_protocol::service_tier_enabled() && !resume_indexed_run {
             let checkpoint = match self.load_checkpoint_at_head().await {
                 Ok(checkpoint) => checkpoint,
@@ -4685,7 +4756,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         Err(outcome) => return outcome,
                     };
                     let prepared = match self
-                        .prepare_input(input, broca_protocol::Delivery::Steer, manifest, None)
+                        .prepare_input(
+                            input,
+                            broca_protocol::Delivery::Steer,
+                            manifest,
+                            None,
+                            self.message_timestamp(),
+                        )
                         .await
                     {
                         Ok(prepared) => prepared,
@@ -4709,7 +4786,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     }
                     writer.record(WalRecord::Steered {
                         sent_by: identity.display_sent_by,
-                        written_at_ms: self.message_timestamp(),
+                        written_at_ms: prepared.at_ms,
                         tags: None,
                         retention: self.admitting_retention,
                         ts_ms: self.retention_timestamp(),
@@ -4826,7 +4903,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Err(outcome) => return outcome,
         };
         let prepared = match self
-            .prepare_input(input, broca_protocol::Delivery::Steer, manifest, None)
+            .prepare_input(
+                input,
+                broca_protocol::Delivery::Steer,
+                manifest,
+                None,
+                self.message_timestamp(),
+            )
             .await
         {
             Ok(prepared) => prepared,
@@ -4846,7 +4929,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let writer = Arc::clone(self.writer.as_ref().expect("writer live while open"));
         let record = WalRecord::Steered {
             sent_by: identity.display_sent_by.clone(),
-            written_at_ms: self.message_timestamp(),
+            written_at_ms: prepared.at_ms,
             tags: None,
             retention: self.admitting_retention,
             ts_ms: self.retention_timestamp(),
@@ -5360,8 +5443,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .and_then(|profile| serde_json::from_value(profile).ok());
         // A consumed queue entry is already transformed, even if every provider passed or
         // the entry predates hooks. Never ask pre_user again when draining it.
+        let new_input_at_ms = self.message_timestamp();
         let mut input_hooks = None;
-        let mut pre_user_error = None;
+        let mut pre_model_error = None;
         if let Some(submission_id) = &submission_id {
             input_hooks = self
                 .pending_fifo
@@ -5388,6 +5472,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     input_delivery,
                     manifest.clone(),
                     episode_scope.as_ref(),
+                    new_input_at_ms,
                 )
                 .await
                 .map_err(|outcome| {
@@ -5396,7 +5481,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     ))
                 })?;
             if let Some(provider) = prepared.refused {
-                pre_user_error = Some(serde_json::from_value(serde_json::json!({
+                pre_model_error = Some(serde_json::from_value(serde_json::json!({
                     "class": "permanent", "provider_code": cortexkit_role_llm_runner::errors::PRE_USER_UNAVAILABLE,
                     "message": format!("pre_user unavailable: {provider}"),
                 })).expect("input refusal error JSON"));
@@ -5427,7 +5512,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .iter()
                 .find(|pending| &pending.submission_id == id)
                 .and_then(|pending| pending.admitted_at_ms),
-            None => self.message_timestamp(),
+            None => new_input_at_ms,
         };
         // Core writes both on the episode's `RunStarted` when it opens one, so the WAL alone
         // can answer a later retry with the same key.
@@ -5543,6 +5628,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 plane: self.executor.compaction_plane(),
             })),
             display_sent_by,
+
             emit_display_context: true,
             step_progress: Some(Arc::clone(&step_progress)),
             clock: self
@@ -5562,7 +5648,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             manifest_system_override: self.session_change.applied_generation > 0
                 || (!resuming && self.pending_for_model(&req.model).is_some()),
             input_hooks,
-            pre_user_error,
+            pre_model_error,
             hook_plane: self.executor.hook_plane(),
             elicitation_plane: self.executor.elicitation_plane(),
             provider_held_lifecycle: self.executor.provider_held_lifecycle(),
@@ -5972,6 +6058,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // The title is deliberately not compared: it labels the send without being part of
             // its identity, so a retry carrying another title is answered `Pending` and the
             // queued record keeps the title it was written with.
+            if request.route_decision_id.is_none()
+                && request_identity_digest.is_some()
+                && existing.request_identity_digest == request_identity_digest
+            {
+                request
+                    .route_decision_id
+                    .clone_from(&existing.request.route_decision_id);
+            }
             if broca_protocol::service_tier_enabled()
                 && request.service_tier_level.is_none()
                 && request_identity_digest.is_some()
@@ -6024,7 +6118,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Err(outcome) => return outcome,
                 };
                 match self
-                    .prepare_input(request.input.clone(), hook_delivery, manifest, None)
+                    .prepare_input(
+                        request.input.clone(),
+                        hook_delivery,
+                        manifest,
+                        None,
+                        self.message_timestamp(),
+                    )
                     .await
                 {
                     Ok(prepared) => prepared,
@@ -6047,7 +6147,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let principal = request.principal.clone();
         let pending = PendingSubmission {
             display_sent_by: display_sent_by.clone(),
-            admitted_at_ms: self.message_timestamp(),
+            admitted_at_ms: prepared.at_ms,
             hooks: hooks.clone(),
             conversation_key: conversation_key.clone(),
             delivery,
@@ -6496,6 +6596,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 broca_protocol::Delivery::Queue,
                 manifest,
                 None,
+                self.message_timestamp(),
             )
             .await
         {
@@ -6523,7 +6624,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let hooks = prepared.queued_hooks();
         let principal = request.principal.clone();
         let pending = PendingSubmission {
-            admitted_at_ms: self.message_timestamp(),
+            admitted_at_ms: prepared.at_ms,
             display_sent_by: display_sent_by.clone(),
             hooks: hooks.clone(),
             conversation_key: conversation_key.clone(),
@@ -12722,6 +12823,7 @@ mod tests {
     pub(super) fn min_config() -> broca_wal::RunConfig {
         broca_wal::RunConfig {
             global_system: None,
+            route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
@@ -12812,6 +12914,7 @@ mod tests {
     pub(super) fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
         use broca_protocol::content::{ContentBlock, Message, Role};
         RunRequest {
+            route_decision_id: None,
             input_written_at_ms: None,
             directives: None,
             session_class: None,

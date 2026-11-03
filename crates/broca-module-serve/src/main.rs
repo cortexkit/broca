@@ -399,6 +399,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(ServeIoError)?;
         let index = stores.legacy.as_ref().unwrap().clone();
         wal_store.set_session_ref_index(index.clone());
+        wal_store.set_served_history(index.clone());
         broca_core::WalStore::bind_recovery_projection(wal_store.as_ref(), None, index);
     }
     let run_index = stores.legacy.clone();
@@ -964,6 +965,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .reconcile_boot()
         .await
         .map_err(|error| ServeIoError(format!("agent-data boot recovery: {}", error.message)))?;
+    let _history_rewrites = registry
+        .finish_history_rewrites_at_boot()
+        .await
+        .map_err(|error| ServeIoError(format!("finish fenced history recovery: {error}")))?;
     registry
         .boot_retention()
         .await
@@ -3396,6 +3401,7 @@ mod executor {
             broca_module_serve::account_routing::choose_account(
                 routing,
                 broca_module_serve::account_routing::ChoiceInputs {
+                    decision_id: req.route_decision_id.as_deref(),
                     conversation_key,
                     inherited_conversation_key,
                     static_credential: &static_credential,
@@ -4252,6 +4258,7 @@ mod executor {
                 .and_then(|episode| episode.config.auth_selection.as_ref())
                 .and_then(|selection| selection.account_decision.as_ref())
                 .and_then(|decision| decision.conversation_key.as_deref());
+            let mut routing_decision_error = None;
             let account_choice = match self
                 .choose_account_for_episode(
                     &job.req,
@@ -4279,6 +4286,17 @@ mod executor {
                 .await
             {
                 Ok(choice) => choice,
+                Err(broca_module_serve::account_routing::ChoiceRefusal::Refused(refusal))
+                    if job.req.route_decision_id.is_some()
+                        && refusal.routing_code == "unknown_decision" =>
+                {
+                    routing_decision_error = Some(serde_json::from_value::<ProviderError>(serde_json::json!({
+                        "class":"permanent", "provider_code":"routing_decision_refused",
+                        "provider": self.routing.as_ref().map(|routing| routing.config().routing_module.as_str()).unwrap_or("routing"),
+                        "reason":"unknown_decision", "message":"Routing refused the caller's unknown or expired decision; no model request was sent."
+                    })).expect("routing refusal is a provider error"));
+                    AccountChoice::NotApplicable
+                }
                 Err(refusal) => {
                     let error = RunError::from(refusal);
                     if let Some(ack) = job.on_admitted {
@@ -4295,28 +4313,41 @@ mod executor {
                     .and_then(|prior| prior.config.auth_selection.as_ref())
                     .and_then(|selection| selection.account_decision.clone())
             };
-            let mut resolution = match self
-                .decide_auth_with_account(
-                    job.req.model.provider_module_id.as_str(),
-                    frozen_credential_id.as_deref(),
-                    frozen_auth_method.as_deref(),
-                    fresh_episode,
-                    pinned_method,
-                    pinned_account,
-                    &account_choice,
-                    frozen_decision.as_ref(),
-                )
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    self.provider_client
-                        .chatgpt_connections()
-                        .retire_session(&job.req.session);
-                    if let Some(ack) = job.on_admitted {
-                        let _ = ack.send(Err(e.clone()));
+            let mut resolution = if let Some(error) = &routing_decision_error {
+                AuthResolution {
+                    mode: AuthMode::None,
+                    pause: Some(error.clone()),
+                    selection: None,
+                    method: pinned_method,
+                    project_id: None,
+                    account_id: None,
+                    record_version: None,
+                    in_run_refresh: None,
+                }
+            } else {
+                match self
+                    .decide_auth_with_account(
+                        job.req.model.provider_module_id.as_str(),
+                        frozen_credential_id.as_deref(),
+                        frozen_auth_method.as_deref(),
+                        fresh_episode,
+                        pinned_method,
+                        pinned_account,
+                        &account_choice,
+                        frozen_decision.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.provider_client
+                            .chatgpt_connections()
+                            .retire_session(&job.req.session);
+                        if let Some(ack) = job.on_admitted {
+                            let _ = ack.send(Err(e.clone()));
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
             };
             // A resolve supplies today's token evidence, not a replacement for frozen billing facts.
@@ -4864,7 +4895,12 @@ mod executor {
             // so suppress their payload clones while retaining display, lifecycle, pause, and
             // error controls needed by the actor and direct loop consumers.
             control.emit_control_payloads = false;
-            control.pause_for_auth_at_start = resolution.pause.clone();
+            control.pause_for_auth_at_start = if routing_decision_error.is_some() {
+                None
+            } else {
+                resolution.pause.clone()
+            };
+            control.pre_model_error = routing_decision_error.or(control.pre_model_error);
             control.auth_selection = resolution.selection.clone();
             // Report this run's account evidence to routing when it has an admission id there:
             // every decision path except the `legacy_static` one older builds wrote (the removed
@@ -5263,6 +5299,7 @@ mod executor {
             let mut req = drift_request(std::path::Path::new("/inherit-cache"));
             let config = broca_wal::RunConfig {
                 global_system: None,
+                route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
@@ -6461,6 +6498,7 @@ mod executor {
                     ts_ms: None,
                     config: Box::new(broca_wal::RunConfig {
                         global_system: None,
+                        route_decision_id: None,
                         account_limit_pause: false,
                         turn_directives_v1: None,
                         render_tags: false,

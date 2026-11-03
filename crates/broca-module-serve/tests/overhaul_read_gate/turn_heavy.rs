@@ -404,14 +404,19 @@ async fn run_case(steps: usize, media: bool) {
     )
     .await
     .unwrap();
+    // This measures the retained native projection, not the removed public model-view op.
     measure(
         &access,
         media,
         steps,
         "model_page",
-        daemon
-            .registry
-            .read_model(SessionReadRequest::new(bind.clone(), None, Some(2))),
+        daemon.registry.route_read_model_page(
+            &bind,
+            &broca_core::ModelPageRequest {
+                limit: Some(2),
+                ..Default::default()
+            },
+        ),
     )
     .await
     .unwrap();

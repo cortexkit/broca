@@ -425,6 +425,8 @@ async fn an_imported_session_cannot_enroll_in_compaction() {
     rig.close().await;
 }
 
+/// A frozen legacy session never calls the retired v1 Setup, so reads never wait for its
+/// numbering checkpoint; public reads expose immutable history with no renderer tag rows.
 #[tokio::test]
 async fn legacy_reads_never_wait_for_a_retired_provider_numbering_checkpoint() {
     let held = Arc::new(HeldCompactor {
@@ -442,18 +444,16 @@ async fn legacy_reads_never_wait_for_a_retired_provider_numbering_checkpoint() {
     let request = SessionReadRequest::new(rig.key.clone(), Some(0), Some(100));
     let before = rig.registry.read(request.clone()).await.unwrap();
     let after = rig.registry.read(request).await.unwrap();
-    let before_tags: Vec<_> = before
-        .messages
+    assert_eq!(before.messages[0].ordinal, 1);
+    assert!(serde_json::to_value(&before).unwrap()["messages"]
+        .as_array()
+        .unwrap()
         .iter()
-        .flat_map(|entry| entry.tags.iter().filter_map(|row| row.tag.clone()))
-        .collect();
-    let after_tags: Vec<_> = after
-        .messages
-        .iter()
-        .flat_map(|entry| entry.tags.iter().filter_map(|row| row.tag.clone()))
-        .collect();
-    assert_eq!(before_tags, vec!["§1§".to_owned()]);
-    assert_eq!(after_tags, before_tags);
+        .all(|entry| entry.get("tags").is_none()));
+    assert_eq!(after.messages[0].message, before.messages[0].message);
+    assert_eq!(after.messages[0].mid, before.messages[0].mid);
+    assert_eq!(after.messages[0].part_keys, before.messages[0].part_keys);
+    assert_eq!(after.history_version, before.history_version);
     rig.close().await;
 }
 
@@ -525,13 +525,10 @@ async fn legacy_reads_do_not_wait_after_projection_or_in_a_later_run() {
     );
     let read = read.unwrap();
     assert_eq!(read.messages.len(), 1);
+    assert_eq!(read.messages[0].part_keys, Some(vec!["m0#0".into()]));
     assert_eq!(
-        read.messages[0]
-            .tags
-            .iter()
-            .filter_map(|row| row.tag.as_deref())
-            .collect::<Vec<_>>(),
-        vec!["§1§"]
+        read.messages[0].message.part_tags().unwrap().parts,
+        vec![Some(1)]
     );
     let closed = LineageRegistry::new_with_reader(
         rig.opener.clone(),

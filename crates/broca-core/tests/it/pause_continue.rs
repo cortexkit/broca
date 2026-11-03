@@ -85,6 +85,7 @@ async fn legacy_restart_pause_keeps_its_existing_auth_refreeze_behavior() {
 
 fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -179,6 +180,7 @@ fn edit_tool() -> Tool {
 
 fn tool_req(run_id: &str, session: &BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -253,6 +255,7 @@ fn seed_resume_without_terminal(
             ts_ms: None,
             config: Box::new(RunConfig {
                 global_system: None,
+                route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,

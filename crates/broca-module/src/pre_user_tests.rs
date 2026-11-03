@@ -442,6 +442,31 @@ async fn pre_user_first_send_and_steer_carry_the_frozen_session_scope() {
         *f.hooks.scopes.lock().unwrap(),
         vec![Some(scope.clone()), Some(scope)]
     );
+    let recorded_times: Vec<_> = f
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::RunStarted { written_at_ms, .. }
+            | WalRecord::Steered { written_at_ms, .. } => Some(*written_at_ms),
+            _ => None,
+        })
+        .collect();
+    let hook_times: Vec<_> = f
+        .hooks
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, call)| match &call.subject {
+            cortexkit_role_step_transform_provider::hook::Subject::PreUser { at_ms, .. } => *at_ms,
+            _ => panic!("only pre_user hooks are subscribed"),
+        })
+        .collect();
+    assert!(hook_times.iter().all(Option::is_some));
+    assert_eq!(
+        hook_times, recorded_times,
+        "hooks and stored messages must share one admission stamp"
+    );
     f.stop().await;
 }
 fn text(input: &[Message]) -> String {
@@ -517,9 +542,12 @@ async fn steer_transforms_each_user_once_and_keyed_retry_reads_original_digest()
         Some(broca_core::send_identity_digest(&request, Delivery::Steer).as_str())
     );
     let calls = f.hooks.calls.lock().unwrap().clone();
-    assert_eq!(calls[0].1.harness, f.key.harness);
-    assert_eq!(calls[0].1.lineage_id, None);
-    assert!(calls[1].1.lineage_id.is_some());
+    for (_, call) in &calls {
+        let body = serde_json::to_value(call).unwrap();
+        for field in ["session", "harness", "lineage_id", "descends_from"] {
+            assert!(body.get(field).is_none(), "v2 body leaked {field}");
+        }
+    }
     f.stop().await;
 }
 

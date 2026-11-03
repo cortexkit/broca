@@ -501,6 +501,9 @@ pub enum KeepWarm {
 /// as the identical request sent when idle).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubmissionRequest {
+    /// Caller-owned routing decision, distinct from routing's allocated account decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_decision_id: Option<String>,
     /// Held by the server after read-only preflight; never supplied by a client or persisted.
     #[serde(skip)]
     pub staged_uploads: Option<Arc<StagedUploads>>,
@@ -847,6 +850,7 @@ mod tests {
     #[test]
     fn submission_request_tool_module_round_trips_when_present() {
         let request = SubmissionRequest {
+            route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
@@ -940,6 +944,7 @@ mod budget_compat_tests {
     #[test]
     fn absent_submission_budget_is_omitted_and_defaults_to_none() {
         let request = SubmissionRequest {
+            route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),

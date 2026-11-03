@@ -313,10 +313,6 @@ fn media_on_append_replay_is_offset_mismatch() {
     child_case("strict-append");
 }
 #[test]
-fn media_on_model_view_defaults_to_safe_markers() {
-    child_case("model-media");
-}
-#[test]
 fn media_on_head_mime_facts_match_admission() {
     child_case("head-mime");
 }
@@ -332,10 +328,6 @@ fn measure_active_media_head_cost() {
 #[test]
 fn media_on_active_head_avoids_replay() {
     child_case("head-bounded");
-}
-#[test]
-fn media_free_model_view_bytes_match_master() {
-    child_case("model-free");
 }
 
 #[tokio::test]

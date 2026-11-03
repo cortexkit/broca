@@ -215,25 +215,25 @@ either gets the ordinary `unknown_method` refusal and writes nothing. Budget enf
 across sessions is not built (see SECURITY.md).
 
 ```
-session.read { from_ordinal?, limit?, include_tools?, after_mid?, lineage_id?, max_bytes?,
+session.read { from_ordinal?, limit?, include_tools?, after_mid?, history_version?, max_bytes?,
                  include_originals?, include_rich_ui? }
     → { messages: [{ ordinal, mid, message, written_at?, rich_ui?,
                      tool_calls?: [{ tool_call_id, call_key?, dispatched_to?, indeterminate }] }],
-        next_from_ordinal?, head?, lineage_id?, lineage_state,
+        next_from_ordinal?, head?, incarnation, history_version, lineage_state,
         tools?: [{ name, description, input_schema, module? }], tools_run_id? }
                                                                       (OBSERVER; §15)
 
 session.history { cursor?, from_mid?, before_mid?, from_ordinal?, before_ordinal?,
                   limit?, max_bytes?, media?, include_originals?, view?, form?, limits? }
-    → { messages: [{ ordinal, mid, written_at, message | row, tags?, ... }],
-        lineage_id?, history_version?, older?, newer? }
+    → { messages: [{ ordinal, mid, written_at, message | row, part_keys?, ... }],
+        incarnation, history_version, older?, newer? }
 session.output_refs { set_id, after? } → { records, next? }
 session.output_ref_read { ref_id, offset, length } → { format, size, data }
 
-session.head {} → { lineage_id?, last_ordinal?, head?, last_run_state?, updated_at?,
+session.head {} → { incarnation, history_version, first_ordinal?, last_ordinal?, head?, last_run_state?, updated_at?,
                        cache?: { last_sent_at_ms, ttl_ms?, expires_at_ms?, expiry_basis },
                        title?, model?: { provider, model, variant? }, usage?,
-                       sender?: { modes, interrupt, owner?: true }, incarnation?, last_run_rich_ui? }
+                       sender?: { modes, interrupt, owner?: true }, last_run_rich_ui? }
 session.warm { lineage_id? }
     → { request_body_sha256, warm_body_sha256, cache_read_tokens?, cache_write_tokens?,
         input_tokens?, ttl_ms, expires_at_ms, expiry_basis: "estimated" } (§4a)
@@ -265,12 +265,14 @@ send.status { send_id }
 absent `form` serves raw entries; `form: "display"` serves canonical rows with optional
 UTF-8 tool-payload `limits`. Newest pages and `before_*` seeks page backward; `from_*`
 seeks page forward. Entries are always oldest first, and opaque `older`/`newer` cursors
-are session-lineage bound. Broca has no unnumbered host history or history rewrites;
-its surviving history is the full append-only lineage and its history version is zero.
-If the shared `session.read` timestamp derivation has no creation time, history refuses the whole page with
+are bound to the session's incarnation and history version. Ordinals start at one;
+normal appends keep the version, while destructive recovery advances it before serving history.
+If the legacy `session.read` timestamp derivation has no creation time, history refuses the whole page with
 `history_unrepresentable`, class `permanent`, and `detail: {ordinal, field}` naming
 the first unrepresentable row and `written_at`. It never substitutes an
 invented value or returns a partial page. Raw `session.read` remains the recovery path.
+Mode-3 logs materialize creation times using the preceding entry's time, or zero for an
+untimed prefix; later appends cannot change a time already served.
 Under llm-runner 0.6.13 §4.7, assistant rows carry their recorded producing model.
 Imported or adopted messages without one omit `model` (unknown); the projection
 never guesses or copies the session's current model. Messages written by a run keep theirs.
@@ -432,9 +434,10 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
 `session.baseline`) and the newer `session.read` members follow commons
 `cortexkit-role-llm-runner/CONTRACT.md`. In broca's terms:
 
-- `after_mid` reads strictly after the message `m<ordinal>` of the lineage `lineage_id` names;
-  a read naming another lineage is refused `lineage_changed` whatever its mode, an unknown mid
-  `unknown_mid`, and misuse `invalid_params` with `detail.field`. Every refusal writes nothing.
+- `after_mid` continues at the supplied `history_version`. A mismatching version refuses
+  `history_changed`; an unknown mid at the current version refuses `unknown_mid`. The old
+  `lineage_id` input is accepted and discarded, not used to select history. Other unknown
+  members and cursor misuse refuse `invalid_params` with `detail.field`.
 - A transcript page is also capped by bytes, measured over the complete serialized reply body
   (default and maximum **3 MiB / 3,145,728 bytes**). Larger `max_bytes` requests are capped to
   that maximum. Messages and late approvals share the budget, including tools, attribution,
@@ -1581,12 +1584,10 @@ contains `class` and `session_ref`, never filesystem paths, so callers can class
 history without parsing the message. The served bytes are pinned by
 `crates/broca-wire/tests/golden/session_read.history_unreachable.json`.
 
-Paging uses message ordinals, independently of the control cursor. With no arguments, read
-returns the **newest** page: `start = prompt_len - limit` (saturating at zero). An explicit
-`from_ordinal` returns the forward range `[from_ordinal, from_ordinal + limit)`, capped at
-`prompt_len`. `next_from_ordinal` is present only when the returned range ends before
-`prompt_len`. To walk backward, first fetch the newest page, take its first ordinal `s`,
-then request `from_ordinal = max(0, s - limit)` and repeat from each page's first ordinal.
+An explicit `from_ordinal` is one-based (`0` aliases `1`) and returns the forward range
+`[from_ordinal, from_ordinal + limit)`, capped at the transcript's end. With no cursor the newest
+page is returned. `next_from_ordinal` is present only when more entries follow. To walk backward,
+request `from_ordinal = max(1, first_ordinal - limit)`.
 There is no direction field, and `session.read` refuses one with `invalid_params`.
 
 **Leniency is per-operation, not a property of the surface.** `run.status` and
@@ -1600,9 +1601,14 @@ naming the key and the caller's harness, once per key per process. `model.varian
 is never reported as unknown. Before making an operation strict, verify that its
 callers do not send unsupported fields and check compatibility tests.
 
-Each item carries both `ordinal` and `mid: "m<ordinal>"`; `mid` is the MC-coordinate
-spelling used by consumers. Chunking is required for large transcripts because subc has a
-per-frame cap and closes a full egress queue.
+Each entry's `ordinal` is its stored position plus one. Legacy log mids stay `m<position>`;
+logs whose first `RunStarted` has `compaction_plan_version` use `m<lineage-prefix>.<position>`,
+where the prefix is the lineage's first eight hex characters. Never derive a mid from an ordinal.
+Every head/read/history page, even empty, carries `history_version` and `incarnation`. A durable
+address-keyed high-water row survives log retention and recreation. An absent log reads as
+`unwritten`, without creating a log, lease or history row. Destructive same-lineage recovery
+fences reads with retryable `history_rewriting` until its writer has durably finished.
+`session.resolve`, tag rows and model-view read pages are not served in llm-runner 0.8.
 
 **Display facts (opt-in).** Broca declares `read_display_facts`. On transcript reads,
 `include_display_facts: true` adds a stored `client_message_id` to its user entry and

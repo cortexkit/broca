@@ -425,12 +425,19 @@ async fn service_reads(
             })
             .await;
     }
+    // The public model view is gone; retain the native v1 projection's read-cost coverage.
     access
         .operation(format!("model page {id}"))
         .run_future(async {
             daemon
                 .registry
-                .read_model(SessionReadRequest::new(bind.clone(), None, Some(2)))
+                .route_read_model_page(
+                    bind,
+                    &broca_core::ModelPageRequest {
+                        limit: Some(2),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
         })

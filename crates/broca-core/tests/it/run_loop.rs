@@ -257,6 +257,7 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     let mut wal = store.open(&request.session).expect("open WAL for seed");
     let config = RunConfig {
         global_system: None,
+        route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
@@ -330,6 +331,7 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
 fn resumable_frozen_config(request: &RunRequest, stop_when: Vec<StopCondition>) -> RunConfig {
     RunConfig {
         global_system: None,
+        route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
@@ -370,6 +372,7 @@ fn tool(name: &str, mode: ExecutionMode) -> Tool {
 fn req(name: &str, tools: Vec<Tool>, stop_when: Vec<StopCondition>) -> RunRequest {
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,

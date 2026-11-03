@@ -42,6 +42,7 @@ fn queued(id: &str) -> WalRecord {
         delivery: None,
         submission_id: SubmissionId(id.into()),
         request: Box::new(SubmissionRequest {
+            route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
@@ -106,6 +107,7 @@ fn consume(run: &str, sub: &str) -> WalRecord {
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(RunConfig {
             global_system: None,
+            route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,

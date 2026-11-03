@@ -26,6 +26,7 @@ use broca_wal::{PauseReason, RunConfig, RunOrigin, WalRecord};
 fn run_config(max_tokens: u32) -> RunConfig {
     RunConfig {
         global_system: None,
+        route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,

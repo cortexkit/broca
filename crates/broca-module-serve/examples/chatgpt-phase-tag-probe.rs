@@ -215,7 +215,7 @@ fn clean_marks(text: &str) -> String {
         let digits = after.bytes().take_while(u8::is_ascii_digit).count();
         let mark_len = 2 * SIGIL.len_utf8() + digits;
         if after[digits..].starts_with(SIGIL)
-            && cortexkit_role_llm_runner::tags::parse_tag(&rest[start..start + mark_len]).is_some()
+            && broca_protocol::tags::v1::parse_tag(&rest[start..start + mark_len]).is_some()
         {
             rest = &rest[start + mark_len..];
         } else {

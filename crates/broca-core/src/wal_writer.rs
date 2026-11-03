@@ -65,6 +65,10 @@ pub type WriterAndLease = (Box<dyn Wal + Send>, Box<dyn LeaseHandle>);
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).
 pub trait WalStore: Send + Sync {
+    fn served_history(&self) -> Option<Arc<dyn crate::ServedHistory>> {
+        None
+    }
+
     fn bind_recovery_projection(
         &self,
         _session: Option<&BindIdentity>,
@@ -399,6 +403,7 @@ pub trait WalStore: Send + Sync {
 /// deterministic hash of the session's bind identity so the same session always maps
 /// to the same log across processes and restarts.
 pub struct FileWalStore {
+    served_history: Mutex<Option<Arc<dyn crate::ServedHistory>>>,
     recovery_views: Mutex<RecoveryViews>,
     root: PathBuf,
     /// The frame format every log this store opens writes, decided once at boot (see
@@ -457,6 +462,7 @@ impl RecoveryViews {
 }
 
 struct ProjectionRecovery {
+    history: Option<Arc<dyn crate::ServedHistory>>,
     session: BindIdentity,
     views: Vec<Arc<dyn crate::SessionStore>>,
     max_bytes: u64,
@@ -477,6 +483,28 @@ impl ProjectionRecovery {
 
 impl broca_wal::recovery::RecoveryHooks for ProjectionRecovery {
     fn before_cut(&self, cut: &broca_wal::recovery::RecoveryCut) -> Result<(), WalError> {
+        self.before_cut_with_lineage(cut, None)
+    }
+
+    fn before_cut_with_lineage(
+        &self,
+        cut: &broca_wal::recovery::RecoveryCut,
+        lineage: Option<broca_wal::WalLineageId>,
+    ) -> Result<(), WalError> {
+        let lineage = lineage.map(|id| id.to_string());
+        if let Some(history) = &self.history {
+            history
+                .history_rewritten(&self.session, lineage.as_deref())
+                .map_err(|error| self.failed("history fence refused before cut", error))?;
+        } else {
+            for view in &self.views {
+                if let Some(history) = view.served_history() {
+                    history
+                        .history_rewritten(&self.session, lineage.as_deref())
+                        .map_err(|error| self.failed("history fence refused before cut", error))?;
+                }
+            }
+        }
         for view in &self.views {
             view.invalidate_wal_recovery(&self.session, cut)
                 .map_err(|e| self.failed("invalidation refused before cut", e))?;
@@ -633,6 +661,10 @@ fn same_wal_file(_left: &Path, _right: &Path) -> Result<bool, WalError> {
 }
 
 impl FileWalStore {
+    pub fn set_served_history(&self, history: Arc<dyn crate::ServedHistory>) {
+        *self.served_history.lock().unwrap() = Some(history);
+    }
+
     /// Count human prompts when an older episode has no recorded count, bounded by this
     /// store's byte limit and admission's durable head sequence. An earlier count includes
     /// its file identity and end offset, so only subsequently appended records need reading.
@@ -935,6 +967,7 @@ impl FileWalStore {
         refusal: Option<broca_wal::StateRootError>,
     ) -> Self {
         Self {
+            served_history: Mutex::new(None),
             recovery_views: Mutex::new(RecoveryViews::default()),
             root,
             config,
@@ -2145,8 +2178,10 @@ impl FileWalStore {
             return None;
         }
         let views = self.recovery_views.lock().unwrap().snapshot(session);
-        (!views.is_empty()).then(|| {
+        let history = self.served_history.lock().unwrap().clone();
+        (!views.is_empty() || history.is_some()).then(|| {
             Arc::new(ProjectionRecovery {
+                history,
                 session: session.clone(),
                 views,
                 max_bytes: self.max_read_bytes,
@@ -2232,6 +2267,10 @@ pub fn session_addr(session: &BindIdentity) -> String {
 }
 
 impl WalStore for FileWalStore {
+    fn served_history(&self) -> Option<Arc<dyn crate::ServedHistory>> {
+        self.served_history.lock().unwrap().clone()
+    }
+
     fn bind_recovery_projection(
         &self,
         session: Option<&BindIdentity>,

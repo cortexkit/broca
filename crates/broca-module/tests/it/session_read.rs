@@ -593,6 +593,7 @@ fn req(key: &BindIdentity, run: &str, text: &str) -> RunRequest {
     let tools = vec![tool("lookup")];
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -1694,6 +1695,7 @@ async fn idle_read_flush_failure_hides_the_unproven_tail() {
 fn min_config() -> RunConfig {
     RunConfig {
         global_system: None,
+        route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
@@ -1778,15 +1780,17 @@ fn assistant_text_with_usage(step: u64, text: &str, step_usage: Usage) -> WalRec
     }
 }
 
+// These fixtures describe native stored positions; the public request starts at position + 1.
 fn read_request(
     key: &BindIdentity,
-    from_ordinal: Option<u64>,
+    from_position: Option<u64>,
     limit: Option<u64>,
 ) -> SessionReadRequest {
     SessionReadRequest {
+        history_version: None,
         session: key.clone(),
         late_after: None,
-        from_ordinal,
+        from_ordinal: from_position.map(|position| position.saturating_add(1)),
         limit,
         include_tools: false,
         include_rich_ui: false,
@@ -2034,6 +2038,7 @@ fn read_request_with_tools(
     limit: Option<u64>,
 ) -> SessionReadRequest {
     SessionReadRequest {
+        history_version: None,
         include_tools: true,
         ..read_request(key, from_ordinal, limit)
     }
@@ -2464,7 +2469,7 @@ async fn read_pages_match_replay_and_subscribe_projection_for_multi_episode_erro
             );
             break;
         }
-        page_from = page.next_from_ordinal;
+        page_from = page.next_from_ordinal.map(|ordinal| ordinal - 1);
     }
 
     let framed = rig.wal_store.read_records(&key).expect("read wal");
@@ -2530,7 +2535,7 @@ async fn read_all_pages(rig: &Rig, key: &BindIdentity) -> (Vec<u8>, Vec<u8>) {
                 serde_json::to_vec(&page.lineage_state).unwrap(),
             );
         }
-        from = page.next_from_ordinal;
+        from = page.next_from_ordinal.map(|ordinal| ordinal - 1);
     }
 }
 
@@ -3315,7 +3320,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
         let Some(next) = page.next_from_ordinal else {
             break;
         };
-        from = Some(next);
+        from = Some(next - 1);
     }
 
     let replayed = replay(&records).expect("full replay").prompt;
@@ -3367,7 +3372,7 @@ async fn read_paging_defaults_and_no_actor_invariant() {
         .await
         .expect("read newest page");
     assert_eq!(page.messages.len(), 1);
-    assert_eq!(page.messages[0].ordinal, 1);
+    assert_eq!(page.messages[0].ordinal, 2);
     assert_eq!(page.messages[0].mid, "m1");
     assert_eq!(page.next_from_ordinal, None);
     assert_eq!(page.lineage_state.state, "completed");
@@ -3436,8 +3441,8 @@ async fn read_head_resumes_subscribe_without_gaps_or_duplicates() {
     assert!(
         page.messages
             .iter()
-            .all(|message| message.mid == format!("m{}", message.ordinal)),
-        "wire message ids use the MC ordinal coordinate"
+            .all(|message| message.mid == format!("m{}", message.ordinal - 1)),
+        "wire message ids retain native stored positions"
     );
 
     // The read implementation derives both the page and `head` from one store snapshot plus one
@@ -4163,6 +4168,24 @@ fn two_episode_pinned_bytes() -> String {
         .to_owned()
 }
 
+fn pinned_read_bytes(page: &broca_wire::SessionReadResponse) -> String {
+    // Unframed legacy logs mint an incarnation on first serve; version allocation uses wall time.
+    // Normalize only those two snapshot members, not transcript, attribution or cursor bytes.
+    serde_json::to_string(page)
+        .unwrap()
+        .replace(
+            &format!(
+                "\"incarnation\":{}",
+                serde_json::to_string(&page.incarnation).unwrap()
+            ),
+            "\"incarnation\":\"@INCARNATION@\"",
+        )
+        .replace(
+            &format!("\"history_version\":{}", page.history_version),
+            "\"history_version\":1",
+        )
+}
+
 /// The provider's raw reasoning item, as an OpenAI Responses step stores it: two summary parts
 /// beside the encrypted reasoning.
 const SUMMARY_REASONING_ITEM: &str = r#"{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"**Planning** I will check the inputs."},{"type":"summary_text","text":"**Answering** The inputs are fine."}],"encrypted_content":"synthetic-cipher"}"#;
@@ -4217,11 +4240,10 @@ async fn responses_reasoning_summary_reads_back_as_the_stored_blocks() {
         )
         .await
         .expect("model view read");
-    let model = serde_json::to_value(
-        broca_wire::ModelPage::try_from(model).expect("model page reaches the wire"),
-    )
-    .unwrap();
-    assert_eq!(model["messages"][1]["message"]["content"], stored_wire);
+    assert_eq!(
+        serde_json::to_value(&model.messages[1].message.content).unwrap(),
+        stored_wire
+    );
 
     let records = rig.wal_store.read_records(&key).expect("read WAL");
     let durable = records
@@ -4247,7 +4269,7 @@ async fn two_episode_read_response_bytes_are_pinned() {
     let request = read_request(&key, Some(0), Some(10));
     assert!(!request.include_tools);
     let page = rig.registry.read(request).await.expect("session.read");
-    let bytes = serde_json::to_string(&page).expect("serialize session.read response");
+    let bytes = pinned_read_bytes(&page);
     if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
         std::fs::write(two_episode_golden_path(), format!("{bytes}\n")).unwrap();
     }
@@ -4279,7 +4301,7 @@ async fn no_media_inline_and_descriptors_response_bytes_are_pinned() {
         let mut request = read_request(&key, Some(0), Some(10));
         request.media = media;
         let page = rig.registry.read(request).await.expect("session.read");
-        let bytes = serde_json::to_string(&page).expect("serialize session.read response");
+        let bytes = pinned_read_bytes(&page);
         if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
             std::fs::write(&fixture, format!("{bytes}\n")).unwrap();
         }
@@ -4371,7 +4393,7 @@ async fn include_tools_returns_the_latest_episodes_tools_and_run_id() {
             .collect();
         assert_eq!(names, ["lookup", "web_search"], "{key:?}");
         assert_eq!(
-            serde_json::to_string(&page).unwrap(),
+            pinned_read_bytes(&page),
             pinned_bytes_with_latest_tools(),
             "{key:?}"
         );
@@ -4524,7 +4546,7 @@ async fn session_read_renders_a_steered_message_at_its_wal_position() {
             .iter()
             .map(|entry| entry.ordinal)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2, 3]
+        vec![1, 2, 3, 4]
     );
 }
 
@@ -4612,7 +4634,7 @@ async fn session_head_reads_no_whole_wal() {
     let head = rig.registry.head(&key).await.expect("head answers");
     assert_eq!(whole_wal_reads.load(Ordering::SeqCst), 0, "{head:?}");
     assert_eq!(head.lineage_id, page.lineage_id);
-    assert_eq!(head.last_ordinal, Some(page.messages.len() as u64 - 1));
+    assert_eq!(head.last_ordinal, Some(page.messages.len() as u64));
     assert_eq!(
         head.last_run_state
             .as_ref()
@@ -4879,83 +4901,17 @@ async fn transcript_reply_body_budget_applies_to_tail_range_and_large_requests()
             assert!(serde_json::to_vec(&response).unwrap().len() < cap);
             assert_eq!(response.messages.len(), 1);
             let ordinal = u64::from(tail);
-            assert_eq!(response.messages[0].ordinal, ordinal);
+            assert_eq!(response.messages[0].ordinal, ordinal + 1);
             assert_eq!(
                 serde_json::to_value(&response.messages[0].message).unwrap(),
                 serde_json::to_value(&messages[ordinal as usize]).unwrap()
             );
             assert_eq!(
                 response.next_from_ordinal,
-                if tail { None } else { Some(1) }
+                if tail { None } else { Some(2) }
             );
         }
     }
-}
-
-#[tokio::test]
-async fn model_view_pages_fit_the_serialized_wire_reply_and_continue_exactly() {
-    let rig = crate::common::Rig::new(
-        "model-read-reply-budget",
-        crate::common::FakeExecutor::auto(),
-        Duration::from_secs(3600),
-    );
-    let key = rig.key("session");
-    let messages: Vec<_> = (0..3)
-        .map(|_| {
-            Message::new(
-                Role::User,
-                vec![ContentBlock::Text {
-                    text: "x".repeat(1_250_000),
-                }],
-            )
-        })
-        .collect();
-    rig.registry
-        .import(SessionImportRequest {
-            project_id: None,
-            principal: None,
-            session: key.clone(),
-            run_id: RunId("import-model-budget".into()),
-            messages: messages.clone(),
-            source_ref: "fixture:model-read-budget".into(),
-        })
-        .await
-        .unwrap();
-
-    let first = rig
-        .registry
-        .read_model(SessionReadRequest::new(key.clone(), Some(0), Some(100)))
-        .await
-        .unwrap();
-    assert_eq!(first.messages.len(), 2);
-    assert_eq!(first.next_from_ordinal, Some(2));
-    assert!(serde_json::to_vec(&first).unwrap().len() < 3 * 1024 * 1024);
-    for (entry, ordinal) in first.messages.iter().zip(0..2) {
-        assert_eq!(entry.source.from_ordinal(), ordinal);
-        assert_eq!(
-            serde_json::to_value(&entry.message).unwrap(),
-            serde_json::to_value(&messages[ordinal as usize]).unwrap()
-        );
-    }
-
-    let second = rig
-        .registry
-        .read_model(SessionReadRequest::new(
-            key,
-            first.next_from_ordinal,
-            Some(100),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(second.messages.len(), 1);
-    assert_eq!(second.messages[0].source.from_ordinal(), 2);
-    assert_eq!(
-        serde_json::to_value(&second.messages[0].message).unwrap(),
-        serde_json::to_value(&messages[2]).unwrap()
-    );
-    assert_eq!(second.next_from_ordinal, None);
-    assert!(serde_json::to_vec(&second).unwrap().len() < 3 * 1024 * 1024);
-    drop(rig);
 }
 
 #[tokio::test]
@@ -5038,14 +4994,14 @@ async fn imported_message_over_frame_limit_is_refused_with_identity() {
         detail.subject,
         cortexkit_role_llm_runner::errors::ReplyTooLargeSubject::Message {
             session,
-            ordinal: 0
+            ordinal: 1
         } if session == key.session
     ));
     drop(rig);
 }
 
 #[tokio::test]
-async fn missing_history_keeps_an_explicit_lineage_changed_refusal() {
+async fn missing_history_is_not_bypassed_by_a_legacy_lineage_argument() {
     for forked_stub in [false, true] {
         let (rig, resolved, real, real_bytes) = stale_inventory_fixture().await;
         let history = rig
@@ -5064,7 +5020,10 @@ async fn missing_history_keeps_an_explicit_lineage_changed_refusal() {
         request.lineage_id = Some(requested.clone());
         let error = rig.registry.read(request).await.unwrap_err();
         assert!(
-            matches!(error, broca_module::serve::ServeError::LineageChanged { requested: ref id } if id == &requested),
+            matches!(
+                error,
+                broca_module::serve::ServeError::SessionLogMissing { .. }
+            ),
             "{error:?}"
         );
         assert_eq!(std::fs::read(path).ok(), before);

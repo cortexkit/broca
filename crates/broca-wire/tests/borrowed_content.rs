@@ -68,7 +68,7 @@ fn stateful_caller_message_serializer_uses_borrowed_content() {
         ),
         run: None,
         tool_calls: Vec::new(),
-        tags: Vec::new(),
+        part_keys: None,
         delivered_as: None,
         digest: None,
         part_digests: None,

@@ -658,6 +658,8 @@ impl<'de> Deserialize<'de> for StoredViewEdit {
 // cost it would save is the full enum size held per record during a whole-log replay, which
 // predates this allow and belongs to the replay redesign, not to a field-by-field patch.
 #[allow(clippy::large_enum_variant)]
+// cost it would save is the full enum size held per record during a whole-log replay. That
+// memory tradeoff needs a replay-wide change, not a field-by-field patch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(remote = "Self", tag = "type", rename_all = "snake_case")]
 pub enum WalRecord {
@@ -3930,6 +3932,9 @@ pub enum SeedOriginKind {
 /// across a run and its resume.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunConfig {
+    /// Caller-owned decision fixed for the run; AuthSelection holds routing's own decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_decision_id: Option<String>,
     /// Frozen operator consent to automatic same-selection recovery. Omitted on legacy runs.
     #[serde(default, skip_serializing_if = "is_false")]
     pub account_limit_pause: bool,
@@ -4500,6 +4505,7 @@ mod schema_tests {
     fn run_config_tools_arc_keeps_existing_wal_bytes() {
         let config = RunConfig {
             global_system: None,
+            route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
@@ -4615,6 +4621,7 @@ mod schema_tests {
     fn min_config() -> Box<RunConfig> {
         Box::new(RunConfig {
             global_system: None,
+            route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
@@ -5548,6 +5555,7 @@ mod schema_tests {
                 delivery: None,
                 submission_id: SubmissionId("sub2".into()),
                 request: Box::new(SubmissionRequest {
+                    route_decision_id: None,
                     service_tier_level: None,
                     staged_uploads: None,
                     content: Vec::new(),

@@ -179,11 +179,8 @@ async fn start_with_scope(
     }
 }
 
-fn call(bind: &BindIdentity) -> HookCall {
-    let mut params = fixture("hook-requests.json")["requests"][0]["request"].clone();
-    params["session"] = json!(bind.session);
-    params["harness"] = json!(bind.harness);
-    serde_json::from_value(params).unwrap()
+fn call(_bind: &BindIdentity) -> HookCall {
+    serde_json::from_value(fixture("hook-requests.json")["requests"][0]["request"].clone()).unwrap()
 }
 
 async fn hook(serving: &Serving) -> bool {
@@ -298,10 +295,10 @@ async fn hook_and_declaration_vectors(scoped: bool) {
     assert_eq!(op_count(&serving, "role.describe"), 1);
     {
         let binds = serving.script.binds.lock().unwrap();
-        assert_eq!(binds[0]["identity"]["harness"], "runner");
+        assert_eq!(binds[0]["identity"]["harness"], serving.bind.harness);
         assert_eq!(
             binds[0]["role_versions"],
-            json!({"step-transform-provider": "v1"})
+            json!({"step-transform-provider": "v2"})
         );
         if let Some(scope) = &serving.scope {
             assert_eq!(binds[0]["scope"]["owner"], json!(scope.owner));
@@ -466,32 +463,14 @@ async fn missing_required_op_is_named_before_hooks_or_declarations() {
     assert_eq!(op_count(&serving, "transform.hook"), 0);
 }
 
-#[tokio::test]
-async fn mismatched_caller_identity_never_opens_a_route() {
-    let serving = start(
-        "hook-mismatch",
-        vec![
-            Reply::Json(json!({"answer": "pass"})),
-            Reply::Json(json!({"answer": "pass"})),
-        ],
-        describe(),
-        false,
-    )
-    .await;
-    for field in ["harness", "session"] {
-        let mut call = call(&serving.bind);
-        if field == "harness" {
-            call.harness = "runner".into();
-        } else {
-            call.session = "other".into();
-        }
-        assert!(serving
-            .plane
-            .hook("transform-test", &serving.bind, None, call)
-            .await
-            .is_err());
+#[test]
+fn v2_hook_bodies_take_identity_only_from_the_bound_route() {
+    let bind = BindIdentity::new("/project", "caller", "session");
+    let body = serde_json::to_value(call(&bind)).unwrap();
+    for field in ["session", "harness", "lineage_id", "descends_from"] {
+        assert!(body.get(field).is_none(), "v2 hook body leaked {field}");
     }
-    assert_eq!(bind_count(&serving), 0);
+    assert_eq!(cortexkit_role_step_transform_provider::VERSION, "v2");
 }
 
 #[tokio::test]

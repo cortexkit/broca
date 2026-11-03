@@ -67,6 +67,7 @@ async fn import_then_read_returns_the_canonical_transcript() {
     let page = rig
         .registry
         .read(SessionReadRequest {
+            history_version: None,
             late_after: None,
             session: key,
             from_ordinal: Some(0),

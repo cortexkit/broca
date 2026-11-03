@@ -337,7 +337,7 @@ impl TagNumbering {
         &mut self,
         prompt: &mut [broca_protocol::Message],
         ordinal_base: u64,
-        markers: &[cortexkit_role_llm_runner::tags::Marker],
+        markers: &[broca_protocol::tags::v1::Marker],
         session: &str,
         checkpoint: &broca_wal::SetupTagCheckpoint,
     ) -> Result<bool, broca_protocol::tags::NumberingOverflow> {
@@ -349,19 +349,16 @@ impl TagNumbering {
                 .and_then(|index| usize::try_from(index).ok())
                 .filter(|index| *index < numbered)
         };
-        let setup = cortexkit_role_llm_runner::tags::SetupCheckpoint::new(
+        let setup = broca_protocol::tags::v1::SetupCheckpoint::new(
             checkpoint.tag_checkpoint,
             checkpoint.cut.clone(),
         );
-        let anchor =
-            cortexkit_role_llm_runner::tags::anchor(session, markers, Some(&setup), |cut| {
-                index_of(cut).is_some()
-            });
+        let anchor = broca_protocol::tags::v1::anchor(session, markers, Some(&setup), |cut| {
+            index_of(cut).is_some()
+        });
         let (anchor, cut) = match anchor {
-            Ok(cortexkit_role_llm_runner::tags::Anchor::Marker { checkpoint, cut })
-            | Ok(cortexkit_role_llm_runner::tags::Anchor::Setup { checkpoint, cut }) => {
-                (checkpoint, cut)
-            }
+            Ok(broca_protocol::tags::v1::Anchor::Marker { checkpoint, cut })
+            | Ok(broca_protocol::tags::v1::Anchor::Setup { checkpoint, cut }) => (checkpoint, cut),
             // The cut message is not in this stretch of the transcript, or the session is a
             // fork: nothing to re-anchor here.
             _ => return Ok(false),
@@ -652,7 +649,7 @@ mod tests {
     /// checkpoint (llm-runner §9.6), at the marker's own cut.
     #[test]
     fn an_in_effect_marker_checkpoint_wins_over_the_setup_checkpoint() {
-        use cortexkit_role_llm_runner::tags::{Marker, MarkerCheckpoint};
+        use broca_protocol::tags::v1::{Marker, MarkerCheckpoint};
         let mut prompt = vec![user("a"), user("b"), user("c")];
         let mut numbering = TagNumbering::new(TagSeed::default(), 0);
         numbering.rules = Some(RENDER);

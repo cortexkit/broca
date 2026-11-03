@@ -397,6 +397,7 @@ async fn run_inner(args: Args) -> Result<i32, String> {
     let wal = FileWalStore::new(args.project_root.join(".broca").join("wal"));
     let policy_allowed = tools.iter().map(|t| t.name.clone()).collect();
     let req = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,

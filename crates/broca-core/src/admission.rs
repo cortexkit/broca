@@ -71,6 +71,7 @@ pub fn submission_difference(
     requested: &SubmissionRequest,
 ) -> Option<&'static str> {
     let SubmissionRequest {
+        route_decision_id: existing_route_decision_id,
         staged_uploads: _,
         content: existing_content,
         directives: existing_directives,
@@ -102,6 +103,7 @@ pub fn submission_difference(
         client_message_id: _,
     } = existing;
     let SubmissionRequest {
+        route_decision_id: requested_route_decision_id,
         staged_uploads: _,
         content: requested_content,
         directives: requested_directives,
@@ -132,6 +134,10 @@ pub fn submission_difference(
     } = requested;
 
     [
+        (
+            existing_route_decision_id != requested_route_decision_id,
+            "route_decision_id",
+        ),
         (existing_content != requested_content, "content"),
         (existing_directives != requested_directives, "directives"),
         (
@@ -198,6 +204,8 @@ fn inherited_difference(
 
 #[derive(Serialize, Deserialize)]
 struct SubmissionIdentityDigestV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route_decision_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     directives: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,6 +313,7 @@ fn identity_digest_v1(
     conversation_key: Option<&str>,
 ) -> SubmissionIdentityDigestV1 {
     let SubmissionRequest {
+        route_decision_id,
         staged_uploads: _,
         content,
         directives,
@@ -336,6 +345,7 @@ fn identity_digest_v1(
     let mut policy_allowed: Vec<&str> = policy_allowed.iter().map(String::as_str).collect();
     policy_allowed.sort_unstable();
     SubmissionIdentityDigestV1 {
+        route_decision_id: route_decision_id.clone(),
         content: (!content.is_empty()).then(|| digest_json(serde_json::json!(content))),
         directives: directives
             .as_ref()
@@ -411,6 +421,10 @@ pub fn send_identity_difference_with_conversation_key(
     }
     let requested = identity_digest_v1(requested, delivery, conversation_key);
     [
+        (
+            stored.route_decision_id != requested.route_decision_id,
+            "route_decision_id",
+        ),
         (
             stored.client_message_id != requested.client_message_id,
             "client_message_id",
@@ -3113,6 +3127,7 @@ mod tests {
     fn config(model: &str) -> RunConfig {
         RunConfig {
             global_system: None,
+            route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
@@ -3301,6 +3316,7 @@ mod tests {
 
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
+            route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),

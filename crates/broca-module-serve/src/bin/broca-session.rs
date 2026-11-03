@@ -2618,6 +2618,8 @@ mod tests {
     #[test]
     fn read_page_event_carries_every_response_field() {
         let page = broca_wire::SessionReadResponse {
+            history_version: 1,
+            incarnation: "11111111-2222-4333-8444-555555555555".into(),
             next_late_after: None,
             deferred_calls: None,
             late_approvals: None,

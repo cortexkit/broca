@@ -53,6 +53,9 @@ pub mod recovery_close_out;
 pub mod refusal_fallback;
 pub mod render;
 pub mod replay;
+pub mod served_history;
+pub use served_history::ServedHistory;
+
 pub use context::StorePageReadError;
 pub use replay::RunAttribution;
 pub mod resume;

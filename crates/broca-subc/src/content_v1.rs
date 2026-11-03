@@ -36,10 +36,17 @@ pub fn map_content_v1_result(
     id: &ToolCallId,
     reply: &result::ToolResult,
 ) -> Result<ToolResult, MapError> {
-    result::validate(reply).map_err(MapError::Invalid)?;
     if reply.held().is_some() {
         return Err(MapError::ProviderHeld);
     }
+    let bytes = result::model_visible_bytes(reply);
+    if bytes > result::MAX_MODEL_VISIBLE_BYTES {
+        return Ok(size_error_result(
+            id,
+            cortexkit_role_llm_runner::tool_result_limit::SizeError::new(bytes),
+        ));
+    }
+    result::validate(reply).map_err(MapError::Invalid)?;
     for part in &reply.content {
         if let ContentPart::Image(image) = part {
             STANDARD.decode(&image.data).map_err(MapError::ImageData)?;
@@ -47,6 +54,41 @@ pub fn map_content_v1_result(
     }
     let raw = serde_json::to_value(reply).expect("tool results serialize as JSON");
     Ok(crate::subc_plane::map_legacy_call_tool_result(id, &raw))
+}
+
+/// Refusal accounting preserves the refusal code and never implies execution.
+pub(crate) fn oversized_refusal(code: &str, message: &str) -> Option<broca_protocol::ToolOutput> {
+    let error = cortexkit_role_llm_runner::tool_result_limit::refusal_size_error(message)?;
+    let mut output = broca_protocol::ToolOutput::error("The provider refused the tool call, but its refusal message exceeded 64 KiB and was discarded. Do not repeat the call just to see that message.");
+    if let broca_protocol::ToolOutput::Error {
+        code: stored_code,
+        detail,
+        ..
+    } = &mut output
+    {
+        *stored_code = (!code.is_empty()).then(|| code.to_owned());
+        *detail = Some(serde_json::to_string(&error).expect("size metadata serializes"));
+    }
+    Some(output)
+}
+
+/// Discard the entire completed output at intake, before any stored result or media capture.
+pub(crate) fn size_error_result(
+    id: &ToolCallId,
+    error: cortexkit_role_llm_runner::tool_result_limit::SizeError,
+) -> ToolResult {
+    let mut output = broca_protocol::ToolOutput::error(
+        cortexkit_role_llm_runner::tool_result_limit::OUTPUT_DISCARDED,
+    );
+    if let broca_protocol::ToolOutput::Error { code, detail, .. } = &mut output {
+        *code = Some(error.reason.clone());
+        *detail = Some(serde_json::to_string(&error).expect("size metadata serializes"));
+    }
+    ToolResult {
+        tool_call_id: id.clone(),
+        output,
+        is_error: true,
+    }
 }
 
 #[cfg(test)]
@@ -358,5 +400,80 @@ pub(crate) mod tests {
             "held": {"reason": "running"}
         });
         assert!(matches!(map(raw), Err(MapError::ProviderHeld)));
+    }
+}
+
+#[cfg(test)]
+mod size_limit_tests {
+    #[test]
+    fn oversized_refusal_retains_its_code_without_claiming_execution() {
+        use broca_protocol::ToolOutput;
+        assert!(super::oversized_refusal("permission_denied", &"x".repeat(65_536)).is_none());
+        let ToolOutput::Error {
+            code,
+            message,
+            detail,
+            ..
+        } = super::oversized_refusal("permission_denied", &"x".repeat(65_537)).unwrap()
+        else {
+            panic!("expected refusal")
+        };
+        assert_eq!(code.as_deref(), Some("permission_denied"));
+        assert!(!message.contains("tool ran"));
+        assert!(message.contains("refused") && message.contains("discarded"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(detail.as_deref().unwrap()).unwrap()["bytes"],
+            65_537
+        );
+    }
+
+    use super::*;
+    use broca_protocol::ToolOutput;
+    use serde_json::json;
+
+    #[test]
+    fn negotiated_limit_is_inclusive_and_discards_the_entire_completed_result() {
+        let id = ToolCallId("call".into());
+        for (bytes, oversized) in [(65_536, false), (65_537, true)] {
+            let reply = result::ToolResult::new(vec![ContentPart::text("x".repeat(bytes))]);
+            let stored = map_content_v1_result(&id, &reply).unwrap();
+            assert_eq!(stored.is_error, oversized);
+            if oversized {
+                let ToolOutput::Error {
+                    message,
+                    code,
+                    detail,
+                    ..
+                } = stored.output
+                else {
+                    panic!("oversized success must become an error")
+                };
+                assert_eq!(code.as_deref(), Some("tool_result_too_large"));
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(detail.as_deref().unwrap()).unwrap(),
+                    json!({"reason":"tool_result_too_large","bytes":65_537,"limit":65_536})
+                );
+                assert!(
+                    message.contains("tool ran")
+                        && message.contains("discarded")
+                        && message.contains("not be repeated")
+                );
+                assert!(!message.contains(&"x".repeat(100)));
+            } else {
+                assert!(matches!(stored.output, ToolOutput::Text { text } if text.len() == bytes));
+            }
+        }
+    }
+
+    #[test]
+    fn negotiated_structured_content_does_not_count_toward_the_text_limit() {
+        let reply: result::ToolResult = serde_json::from_value(json!({
+            "content":[{"type":"text","text":"short"}],
+            "structuredContent":{"large":"x".repeat(65_537)}
+        }))
+        .unwrap();
+        let stored = map_content_v1_result(&ToolCallId("call".into()), &reply).unwrap();
+        assert!(!stored.is_error);
+        assert!(matches!(stored.output, ToolOutput::Text { text } if text == "short"));
     }
 }

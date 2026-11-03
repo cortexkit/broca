@@ -58,7 +58,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
     OP_BASELINE, OP_CANCEL, OP_FLUSH_PREFIX, OP_HEAD, OP_IMPORT, OP_READ, OP_REFRESH,
-    OP_REFRESH_POLICY, OP_RESOLVE, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT,
+    OP_REFRESH_POLICY, OP_RETRACT, OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT,
     OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_SESSION_SEND_STATUS, OP_STATUS, OP_SUBSCRIBE,
     OP_VAULT_AUDIT, OP_WARM,
 };
@@ -2689,7 +2689,7 @@ where
             OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT | OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX
         );
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
-        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
+        let session_read = matches!(method, OP_READ | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ)
             || method == cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ;
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
@@ -3603,57 +3603,19 @@ where
             }
         }
         OP_READ => {
-            if !handler.compaction_supported() {
-                if let Err((field, message)) = decode_params::<broca_wire::ReadParams>(&req.params)
-                {
-                    return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
-                        .await;
-                }
-            }
-            let params: broca_wire::WriterReadParams = match decode_params(&req.params) {
+            let params: broca_wire::ReadParams = match decode_params(&req.params) {
                 Ok(p) => p,
                 Err((field, message)) => {
                     return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
                         .await
                 }
             };
-            if params.view == Some(broca_wire::ReadView::Model) && params.read.after_mid.is_some() {
-                return send_invalid_params(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    Some("view".into()),
-                    "model view cannot use after_mid",
-                )
-                .await;
-            }
-            let model_view = params.view == Some(broca_wire::ReadView::Model);
-            // Descriptors are offered on raw transcript reads only, refused before any read
-            // work.
-            let media = params.read.media.unwrap_or_default();
-            if model_view && media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
-                return send_invalid_params(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    Some("media".into()),
-                    "descriptors are not offered on a model-view read",
-                )
-                .await;
-            }
-            let params = params.read;
+            let media = params.media.unwrap_or_default();
             if params.after_mid.is_some() {
-                // A read after a message is defined only within the lineage it came from, and
-                // `after_mid` is a cursor in its own right, so it cannot be combined with
-                // `from_ordinal`.
-                let refusal = if params.lineage_id.is_none() {
+                let refusal = if params.history_version.is_none() {
                     Some((
-                        "lineage_id",
-                        "after_mid needs the lineage_id it was read under",
+                        "history_version",
+                        "after_mid needs the history_version it was read under",
                     ))
                 } else if params.from_ordinal.is_some() {
                     Some((
@@ -3685,16 +3647,11 @@ where
                 include_rich_ui: params.include_rich_ui,
                 include_display_facts: params.include_display_facts,
                 after_mid: params.after_mid,
-                lineage_id: params.lineage_id,
+                history_version: params.history_version,
+                lineage_id: None,
                 max_bytes: params.max_bytes,
                 media,
             };
-            if model_view {
-                return match handler.read_model(read_req).await {
-                    Ok(page) => send_json_response(writer, ver, channel, epoch, corr, &page).await,
-                    Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
-                };
-            }
             match handler.read(read_req).await {
                 Ok(resp) => send_json_response(writer, ver, channel, epoch, corr, &resp).await,
                 Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
@@ -3719,59 +3676,6 @@ where
                 trace_describe("response_queued", channel, epoch, corr);
             }
             sent
-        }
-        OP_RESOLVE => {
-            let params: broca_wire::ResolveParams = match serde_json::from_value(req.params.clone())
-            {
-                Ok(params) => params,
-                Err(error) => {
-                    let field =
-                        broca_wire::failing_field::<broca_wire::ResolveParams>(&req.params, &error);
-                    return send_invalid_params(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        field,
-                        &error.to_string(),
-                    )
-                    .await;
-                }
-            };
-            if let Err(field) = params.number() {
-                return send_invalid_params(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    Some(field.into()),
-                    "tag must have the form §N§ for a positive integer N",
-                )
-                .await;
-            }
-            match handler.resolve(session, &params).await {
-                Ok(Ok(reply)) => {
-                    send_json_response(writer, ver, channel, epoch, corr, &reply).await
-                }
-                Ok(Err((code, message))) => {
-                    if code == broca_wire::INVALID_PARAMS {
-                        return send_invalid_params(
-                            writer,
-                            ver,
-                            channel,
-                            epoch,
-                            corr,
-                            Some(broca_wire::RANGE_FIELD.into()),
-                            &message,
-                        )
-                        .await;
-                    }
-                    send_error(writer, ver, channel, epoch, corr, code, &message).await
-                }
-                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
-            }
         }
         OP_HEAD => {
             if let Err((field, message)) = decode_params::<broca_wire::HeadParams>(&req.params) {
@@ -4183,6 +4087,7 @@ where
             "close",
             async {
                 let mut next_seq = cortexkit_role_llm_runner::live::FIRST_SEQ;
+                let mut message_identity: Option<broca_wire::HeadResponse> = None;
                 loop {
                     let delivery = tokio::select! {
                         _ = cancel.cancelled() => { record_request_outcome("cancelled"); break },
@@ -4224,6 +4129,30 @@ where
                         )
                         .await;
                         return;
+                    }
+                    let mut delivery = delivery;
+                    // Projection and provider display keep native stored positions. Resolve the
+                    // public vocabulary only when a message exists, including subscriptions
+                    // opened before the first send, and use it for both replay and live lanes.
+                    if message_identity.is_none() && delivery_has_mid(&delivery) {
+                        match tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            head = handler.head(&session) => head,
+                        } {
+                            Ok(head) => message_identity = Some(head),
+                            Err(error) => {
+                                let _ = send_subscribe_error_body(&writer, (ver, channel, epoch, corr), next_seq,
+                                    ErrorBody::new("subscribe_replay_failed", error.to_string())).await;
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(head) = &message_identity {
+                        if let Err(error) = public_delivery_mids(&mut delivery, head.mode3, head.lineage_id.as_deref()) {
+                            let _ = send_subscribe_error_body(&writer, (ver, channel, epoch, corr), next_seq,
+                                ErrorBody::new("subscribe_replay_failed", error)).await;
+                            return;
+                        }
                     }
                     let delivery = limit_live_arguments(delivery, limits.as_ref());
                     let (priority, body) = match encode_delivery(&delivery, next_seq) {
@@ -4323,6 +4252,78 @@ where
         }
         .with_current_subscriber(),
     );
+    Ok(())
+}
+
+fn delivery_has_mid(delivery: &Delivery) -> bool {
+    use cortexkit_role_llm_runner::live::LiveEvent;
+    match delivery {
+        Delivery::Control(event) => {
+            matches!(
+                &event.1,
+                broca_protocol::caller::ControlUnit::MessageBoundary { .. }
+            ) || matches!(
+                &event.2,
+                LiveEvent::MessageStarted(_)
+                    | LiveEvent::MessageFinished(_)
+                    | LiveEvent::ToolStarted(_)
+                    | LiveEvent::ToolFinished(_)
+            )
+        }
+        Delivery::Display(event) => match event.as_ref() {
+            broca_protocol::display::DisplayEvent::TextDelta { mid, .. }
+            | broca_protocol::display::DisplayEvent::ReasoningDelta { mid, .. }
+            | broca_protocol::display::DisplayEvent::ToolInputDelta { mid, .. } => mid.is_some(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Translate native control/display coordinates at the wire boundary, never in stored messages
+/// or provider requests. Legacy subscriptions retain their original bytes.
+fn public_delivery_mids(
+    delivery: &mut Delivery,
+    mode3: bool,
+    lineage: Option<&str>,
+) -> Result<(), String> {
+    use cortexkit_role_llm_runner::live::LiveEvent;
+    if !mode3 {
+        return Ok(());
+    }
+    let translate = |mid: &mut String| -> Result<(), String> {
+        if let Some(position) = broca_core::position_of_mid(mid, false, None) {
+            *mid = broca_core::message_mid(true, lineage, position)?;
+        } else if broca_core::position_of_mid(mid, true, lineage).is_none() {
+            return Err("subscription message id does not name this log".into());
+        }
+        Ok(())
+    };
+    match delivery {
+        Delivery::Control(event) => {
+            let (_, unit, live) = Arc::make_mut(event);
+            if let broca_protocol::caller::ControlUnit::MessageBoundary { mid } = unit {
+                translate(mid)?;
+            }
+            match live {
+                LiveEvent::MessageStarted(event) | LiveEvent::MessageFinished(event) => {
+                    translate(&mut event.mid)?
+                }
+                LiveEvent::ToolStarted(event) => translate(&mut event.mid)?,
+                LiveEvent::ToolFinished(event) => translate(&mut event.mid)?,
+                _ => {}
+            }
+        }
+        Delivery::Display(event) => match Arc::make_mut(event) {
+            broca_protocol::display::DisplayEvent::TextDelta { mid: Some(mid), .. }
+            | broca_protocol::display::DisplayEvent::ReasoningDelta { mid: Some(mid), .. }
+            | broca_protocol::display::DisplayEvent::ToolInputDelta { mid: Some(mid), .. } => {
+                translate(mid)?
+            }
+            _ => {}
+        },
+        _ => {}
+    }
     Ok(())
 }
 
@@ -4646,7 +4647,8 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::Import(_) => "import_rejected".into(),
         ServeError::ImportIdReuse => "import_id_reuse".into(),
         ServeError::ImportBusy => "import_busy".into(),
-        ServeError::LineageChanged { .. } => broca_wire::LINEAGE_CHANGED.into(),
+        ServeError::HistoryRewriting => broca_core::served_history::HISTORY_REWRITING.into(),
+        ServeError::HistoryChanged => broca_wire::HISTORY_CHANGED.into(),
         ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID.into(),
         ServeError::UnknownRun(_) => broca_wire::UNKNOWN_RUN.into(),
         ServeError::ScopeRefused(_) | ServeError::ScopeFreezeBusy { .. } => {
@@ -4849,7 +4851,8 @@ async fn send_serve_error(
         ServeError::ImportIdReuse => "import_id_reuse",
         ServeError::ImportBusy => "import_busy",
         ServeError::InvalidParams { .. } => broca_wire::INVALID_PARAMS,
-        ServeError::LineageChanged { .. } => broca_wire::LINEAGE_CHANGED,
+        ServeError::HistoryRewriting => broca_core::served_history::HISTORY_REWRITING,
+        ServeError::HistoryChanged => broca_wire::HISTORY_CHANGED,
         ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID,
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND,
         ServeError::UnknownRun(_) => broca_wire::UNKNOWN_RUN,
@@ -4908,6 +4911,9 @@ async fn send_serve_error(
         }
     };
     let mut body = ErrorBody::new(code, err.to_string());
+    if matches!(err, ServeError::HistoryRewriting) {
+        body = body.with_detail(serde_json::json!({"class":"transient"}));
+    }
     if let ServeError::Open(_, Some(class)) = err {
         body = body.with_detail(serde_json::json!({"class": class.shared_class()}));
     }
@@ -5783,7 +5789,6 @@ fn method_code(method: &str) -> u8 {
         // They are not reused, so a code in an older stall report keeps its meaning.
         OP_RUN_RESULT => 16,
         OP_WARM => 17,
-        OP_RESOLVE => 18,
         OP_RUN_TOOL_CALLS => 19,
         _ => 255,
     }
@@ -6197,7 +6202,6 @@ mod tests {
         let handler = Arc::new(MockSubscribeHandler {
             sink_tx,
             refuse_session: std::sync::atomic::AtomicBool::new(false),
-            model_reply_too_large: None,
         });
         let (writer, mut frames) = broca_diagnostics::channel(8, Arc::default());
         let identity = BrocaBindIdentity::new("/private/project", "runner", "subscribe");
@@ -6587,6 +6591,8 @@ mod tests {
         use broca_wire::{CursorWire, SessionReadLineageState, SessionReadMessage};
 
         let response = SessionReadResponse {
+            history_version: 1,
+            incarnation: "00112233445566778899aabbccddeeff".into(),
             next_late_after: None,
             deferred_calls: None,
             late_approvals: None,
@@ -6611,7 +6617,7 @@ mod tests {
                         }],
                     ),
                     tool_calls: Vec::new(),
-                    tags: Vec::new(),
+                    part_keys: None,
                     described: None,
                     digest: None,
                     part_digests: None,
@@ -6632,7 +6638,7 @@ mod tests {
                         }],
                     ),
                     tool_calls: Vec::new(),
-                    tags: Vec::new(),
+                    part_keys: None,
                     described: None,
                     digest: None,
                     part_digests: None,
@@ -7041,25 +7047,12 @@ mod tests {
                 "{}",
                 case["name"]
             );
-            if case["name"] == "model-view atomic group exceeds the transport frame limit" {
-                let route_frame = model_group_reply_too_large_vector_through_route(refusal).await;
-                assert_eq!(route_frame.header.ty, FrameType::Error);
-                assert_eq!(route_frame.body, expected, "{}", case["name"]);
-            }
         }
     }
 
     #[tokio::test]
-    async fn source_less_model_metadata_and_run_result_use_generic_frame_limit_error() {
+    async fn a_source_less_run_result_uses_the_generic_frame_limit_error() {
         let oversized = "x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize);
-        let model_page = broca_wire::ModelPage {
-            messages: Vec::new(),
-            lineage_id: Some(oversized.clone()),
-            next_from_ordinal: None,
-            head: None,
-            compaction_id: None,
-            version: None,
-        };
         let run_result = broca_wire::RunResultResponse {
             finish: None,
             auth_selection: None,
@@ -7077,71 +7070,12 @@ mod tests {
         let expected =
             br#"{"code":"response_too_large","message":"response exceeds the transport frame limit"}"#;
         let (writer, mut rx) = broca_diagnostics::channel(2, Arc::default());
-        send_json_response(&writer, PROTOCOL_VERSION, 7, 3, 11, &model_page)
-            .await
-            .unwrap();
-        let frame = rx.recv().await.unwrap();
-        assert_eq!(frame.header.ty, FrameType::Error);
-        assert_eq!(frame.body, expected);
         send_json_response(&writer, PROTOCOL_VERSION, 7, 3, 12, &run_result)
             .await
             .unwrap();
         let frame = rx.recv().await.unwrap();
         assert_eq!(frame.header.ty, FrameType::Error);
         assert_eq!(frame.body, expected);
-    }
-
-    async fn model_group_reply_too_large_vector_through_route(
-        refusal: &serde_json::Value,
-    ) -> Frame {
-        let source_json = refusal["detail"]["subject"]["source"].clone();
-        let compaction_id = source_json["compaction_id"].as_str().unwrap().to_owned();
-        let version = source_json["version"].as_u64().unwrap();
-        let source: cortexkit_role_llm_runner::read::EntrySource =
-            serde_json::from_value(source_json).unwrap();
-        let page = broca_wire::ModelPage {
-            messages: vec![broca_wire::ModelEntry {
-                source: source.clone(),
-                message: broca_protocol::Message::new(broca_protocol::Role::Assistant, Vec::new()),
-                tags: Vec::new(),
-            }],
-            lineage_id: None,
-            next_from_ordinal: None,
-            head: None,
-            compaction_id: Some(compaction_id),
-            version: Some(version),
-        };
-        let detail = broca_module::serve::ReplyTooLargeDetail::new(
-            refusal["detail"]["bytes"].as_u64().unwrap(),
-            refusal["detail"]["limit"].as_u64().unwrap(),
-            broca_module::serve::ReplyTooLargeSubject::ModelGroup {
-                source: page.messages[0].source.clone(),
-            },
-        );
-        let (sink_tx, _) = mpsc::channel(1);
-        let handler = Arc::new(MockSubscribeHandler {
-            sink_tx,
-            refuse_session: std::sync::atomic::AtomicBool::new(false),
-            model_reply_too_large: Some(detail.clone()),
-        });
-        let (writer, mut rx) = broca_diagnostics::channel(1, Arc::default());
-        execute_route_request(
-            crate::wire::RouteRequest {
-                method: OP_READ.into(),
-                params: serde_json::json!({"view":"model"}),
-            },
-            &writer,
-            PROTOCOL_VERSION,
-            7,
-            3,
-            11,
-            &BrocaBindIdentity::new("/tmp/vector-project", "runner", "session"),
-            &BindObservation::default(),
-            &handler,
-        )
-        .await
-        .unwrap();
-        rx.recv().await.unwrap()
     }
 
     #[tokio::test]
@@ -7365,242 +7299,13 @@ mod tests {
         assert!(a1.0.starts_with("run-iid-"));
     }
 
-    /// A transcript served two messages per page, so `session.resolve` has to page.
-    struct PagedTranscript {
-        messages: Vec<broca_protocol::Message>,
-        tag_location: Option<broca_core::TagLocation>,
-    }
-
-    #[async_trait::async_trait]
-    impl ServeHandler for PagedTranscript {
-        async fn tag_location(
-            &self,
-            _session: &BrocaBindIdentity,
-            _tag: u64,
-        ) -> Result<Option<broca_core::TagLocation>, ServeError> {
-            Ok(self.tag_location)
-        }
-        async fn send(&self, _req: SendRequest) -> Result<SendResponse, ServeError> {
-            unimplemented!()
-        }
-        async fn retract(
-            &self,
-            _session: &BrocaBindIdentity,
-            _submission_id: broca_protocol::SubmissionId,
-        ) -> Result<RetractResponse, ServeError> {
-            unimplemented!()
-        }
-        async fn subscribe(
-            &self,
-            _session: &BrocaBindIdentity,
-            _from: SubscribeFrom,
-            _sink: mpsc::Sender<Delivery>,
-        ) -> Result<(), ServeError> {
-            unimplemented!()
-        }
-        async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
-            assert!(
-                req.from_ordinal.is_some(),
-                "resolve pages from the oldest message"
-            );
-            let from = req.from_ordinal.unwrap() as usize;
-            let end = (from + 2).min(self.messages.len());
-            let messages = (from..end)
-                .map(|ordinal| broca_wire::SessionReadMessage {
-                    client_message_id: None,
-                    tool_times: Vec::new(),
-                    rich_ui: None,
-                    written_at: None,
-                    delivered_as: None,
-                    ordinal: ordinal as u64,
-                    mid: format!("m{ordinal}"),
-                    tags: broca_wire::tag_rows(ordinal as u64, &self.messages[ordinal]),
-                    message: self.messages[ordinal].clone(),
-                    run: None,
-                    tool_calls: Vec::new(),
-                    described: None,
-                    digest: None,
-                    part_digests: None,
-                })
-                .collect();
-            Ok(SessionReadResponse {
-                next_late_after: None,
-                deferred_calls: None,
-                late_approvals: None,
-                open_batch: None,
-                lineage_id: Some("lineage".into()),
-                messages,
-                next_from_ordinal: (end < self.messages.len()).then_some(end as u64),
-                head: None,
-                lineage_state: broca_wire::SessionReadLineageState {
-                    last_run_id: None,
-                    state: "idle".into(),
-                    reason: None,
-                    error: None,
-                    usage: None,
-                },
-                tools: None,
-                tools_run_id: None,
-            })
-        }
-        async fn cancel(
-            &self,
-            _session: &BrocaBindIdentity,
-            _run_id: broca_protocol::RunId,
-        ) -> Result<CancelResponse, ServeError> {
-            unimplemented!()
-        }
-        async fn status(&self, _session: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
-            unimplemented!()
-        }
-        async fn run_status(
-            &self,
-            _session: &BrocaBindIdentity,
-            _run_id: broca_protocol::RunId,
-        ) -> Result<RunStatusResponse, ServeError> {
-            unimplemented!()
-        }
-    }
-
-    fn tagged_text(
-        role: broca_protocol::Role,
-        texts: &[&str],
-        tags: &[u64],
-    ) -> broca_protocol::Message {
-        let mut message = broca_protocol::Message::new(
-            role,
-            texts
-                .iter()
-                .map(|text| broca_protocol::ContentBlock::Text {
-                    text: (*text).into(),
-                })
-                .collect(),
-        );
-        message.set_tags(Some(Arc::new(broca_protocol::tags::PartTags::all(
-            tags.iter().copied(),
-        ))));
-        message
-    }
-
-    #[tokio::test]
-    async fn resolve_answers_a_parts_stored_text_whole_or_by_character_range() {
-        use broca_protocol::Role;
-        let handler = PagedTranscript {
-            tag_location: None,
-            messages: vec![
-                tagged_text(Role::User, &["first"], &[1]),
-                tagged_text(Role::Assistant, &["answer"], &[2]),
-                broca_protocol::Message::new(Role::User, vec![]),
-                tagged_text(Role::User, &["héllo, 世界", "tail"], &[5, 6]),
-            ],
-        };
-        let session = BrocaBindIdentity::new("/tmp/project", "runner", "s1");
-        let resolve = |tag, range| {
-            let handler = &handler;
-            let session = session.clone();
-            async move {
-                handler
-                    .resolve(&session, &{
-                        let mut params =
-                            broca_wire::ResolveParams::new(broca_protocol::tags::tag_mark(tag));
-                        params.range = range;
-                        params
-                    })
-                    .await
-            }
-        };
-
-        let whole = resolve(5, None).await.unwrap().unwrap();
-        assert_eq!(
-            serde_json::to_value(&whole).unwrap(),
-            serde_json::json!({"tag":"§5§","ordinal":3,"mid":"m3","part":"m3#0","content":"héllo, 世界"})
-        );
-        let second_part = resolve(6, None).await.unwrap().unwrap();
-        assert_eq!(second_part.part, "m3#1");
-        assert_eq!(second_part.content, "tail");
-
-        // A range counts characters, not bytes.
-        let range = broca_wire::CharRange::new(1, 9);
-        let ranged = resolve(5, Some(range)).await.unwrap().unwrap();
-        assert_eq!(ranged.content, "éllo, 世界");
-        assert_eq!(ranged.range, Some(range));
-        let empty = broca_wire::CharRange::new(9, 9);
-        assert_eq!(resolve(5, Some(empty)).await.unwrap().unwrap().content, "");
-
-        for bad in [
-            broca_wire::CharRange::new(0, 10),
-            broca_wire::CharRange::new(4, 3),
-        ] {
-            let refusal = resolve(5, Some(bad)).await.unwrap().unwrap_err();
-            assert_eq!(refusal.0, broca_wire::INVALID_PARAMS, "{bad:?}");
-        }
-        let unknown = resolve(4, None).await.unwrap().unwrap_err();
-        assert_eq!(unknown.0, broca_wire::UNKNOWN_TAG);
-    }
-
-    #[tokio::test]
-    async fn resolve_uses_current_lineage_locations_and_refuses_left_tags() {
-        let handler = PagedTranscript {
-            messages: vec![tagged_text(
-                broca_protocol::Role::User,
-                &["carried", "new"],
-                &[2, 5],
-            )],
-            // A lookup made before the read repaired an old lineage's projection.
-            tag_location: Some(broca_core::TagLocation {
-                found: Some((3, 0)),
-                indexed_through: 4,
-            }),
-        };
-        let session = BrocaBindIdentity::new("/tmp/project", "runner", "current-lineage");
-        let carried = handler
-            .resolve(&session, &broca_wire::ResolveParams::new("§2§"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(carried.content, "carried");
-        assert_eq!(carried.ordinal, 0);
-        assert_eq!(carried.mid, "m0");
-        let absent = handler
-            .resolve(&session, &broca_wire::ResolveParams::new("§3§"))
-            .await
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(absent.0, broca_wire::UNKNOWN_TAG);
-    }
-
-    #[test]
-    fn resolve_params_are_strict() {
-        assert!(serde_json::from_value::<broca_wire::ResolveParams>(
-            serde_json::json!({"tag":"§1§","range":{"start":0,"end":1}})
-        )
-        .is_ok());
-        for bad in [
-            serde_json::json!({}),
-            serde_json::json!({"tag":"§1§","origin":"owner"}),
-            serde_json::json!({"tag":"§1§","range":{"start":0}}),
-            serde_json::json!({"tag":1}),
-            serde_json::json!({"tag":-1}),
-        ] {
-            assert!(
-                serde_json::from_value::<broca_wire::ResolveParams>(bad.clone()).is_err(),
-                "{bad}"
-            );
-        }
-    }
-
     struct MockSubscribeHandler {
         sink_tx: mpsc::Sender<mpsc::Sender<Delivery>>,
         refuse_session: std::sync::atomic::AtomicBool,
-        model_reply_too_large: Option<broca_module::serve::ReplyTooLargeDetail>,
     }
 
     #[async_trait::async_trait]
     impl ServeHandler for MockSubscribeHandler {
-        fn compaction_supported(&self) -> bool {
-            self.model_reply_too_large.is_some()
-        }
-
         async fn authorize_session(
             &self,
             _session: &BrocaBindIdentity,
@@ -7637,16 +7342,6 @@ mod tests {
         async fn read(&self, _req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
             unimplemented!()
         }
-        async fn read_model(
-            &self,
-            _req: SessionReadRequest,
-        ) -> Result<broca_wire::ModelPage, ServeError> {
-            Err(ServeError::ReplyTooLarge(
-                self.model_reply_too_large
-                    .clone()
-                    .expect("model-page test supplies a reply-too-large detail"),
-            ))
-        }
         async fn cancel(
             &self,
             _session: &BrocaBindIdentity,
@@ -7680,7 +7375,6 @@ mod tests {
             let handler = Arc::new(MockSubscribeHandler {
                 sink_tx,
                 refuse_session: std::sync::atomic::AtomicBool::new(false),
-                model_reply_too_large: None,
             });
             let (writer, mut written) = broca_diagnostics::channel::<Frame>(8, Arc::default());
             start_subscribe_stream(
@@ -7739,7 +7433,6 @@ mod tests {
         let handler = Arc::new(MockSubscribeHandler {
             sink_tx,
             refuse_session: std::sync::atomic::AtomicBool::new(false),
-            model_reply_too_large: None,
         });
 
         // Bounded channel of size 1 for the writer.
@@ -7964,7 +7657,6 @@ mod tests {
                 handler: Arc::new(MockSubscribeHandler {
                     sink_tx,
                     refuse_session: std::sync::atomic::AtomicBool::new(false),
-                    model_reply_too_large: None,
                 }),
                 writer,
                 written,
@@ -8256,6 +7948,7 @@ mod tests {
             session,
             config: Box::new(broca_wal::RunConfig {
                 global_system: None,
+                route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,

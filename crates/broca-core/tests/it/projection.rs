@@ -41,6 +41,7 @@ fn framed(seq: u64, record: WalRecord) -> FramedRecord {
 fn run_config() -> RunConfig {
     RunConfig {
         global_system: None,
+        route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
@@ -1053,6 +1054,7 @@ fn budget_firing_projects_to_control_stream() {
 /// Multi-unit records deliberately include two calls and a typed terminal error.
 fn all_projection_record_variants() -> Vec<FramedRecord> {
     let queued_request = SubmissionRequest {
+        route_decision_id: None,
         service_tier_level: None,
         staged_uploads: None,
         content: Vec::new(),

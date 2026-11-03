@@ -528,6 +528,7 @@ impl RunExecutor for ReauthCoreExec {
 fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
         global_system: None,
+        route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
@@ -668,6 +669,7 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
         run_id: RunId(run_id.into()),
         send_id: Some(format!("send-{run_id}")),
         request: Box::new(SubmissionRequest {
+            route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),

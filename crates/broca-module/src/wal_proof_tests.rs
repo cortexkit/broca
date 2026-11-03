@@ -508,6 +508,7 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
             true,
             broca_protocol::Delivery::Queue,
             Some(pre_user::PreparedInput {
+                at_ms: None,
                 input: queue.request.input.clone(),
                 hooks: None,
                 refused: None,
@@ -554,6 +555,7 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
             true,
             broca_protocol::Delivery::Queue,
             Some(pre_user::PreparedInput {
+                at_ms: None,
                 input: retract.request.input.clone(),
                 hooks: None,
                 refused: None,

@@ -130,6 +130,7 @@ async fn controlled_hook_deadlines() {
                 blocks: vec!["input".into()],
                 mark: None,
                 delivery: None,
+                at_ms: None,
             },
             Trace::default(),
             |_| true,

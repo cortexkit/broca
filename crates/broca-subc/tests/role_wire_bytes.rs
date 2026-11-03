@@ -54,20 +54,17 @@ fn transform_declare_request_bytes_are_pinned() {
 
 #[test]
 fn transform_hook_request_bytes_are_pinned() {
-    let request = HookCall::new(
-        "session-1",
-        "broca",
-        Subject::PreUser {
-            blocks: vec!["hello".into()],
-            mark: None,
-            delivery: None,
-        },
-    )
+    let request = HookCall::new(Subject::PreUser {
+        blocks: vec!["hello".into()],
+        mark: None,
+        delivery: None,
+        at_ms: None,
+    })
     .with_item(Some("default".into()), map(json!({"mode": "safe"})));
     let bytes = serde_json::to_vec(&TransformOpRequest::new("transform.hook", &request)).unwrap();
     assert_eq!(
         bytes,
-        br#"{"method":"transform.hook","params":{"session":"session-1","harness":"broca","preset":"default","params":{"mode":"safe"},"hook":"pre_user","blocks":["hello"]}}"#
+        br#"{"method":"transform.hook","params":{"preset":"default","params":{"mode":"safe"},"hook":"pre_user","blocks":["hello"]}}"#
     );
 }
 

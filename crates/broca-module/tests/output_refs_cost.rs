@@ -145,6 +145,7 @@ impl Drop for Rig {
 fn tagged_config() -> RunConfig {
     RunConfig {
         global_system: None,
+        route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: true,
@@ -559,7 +560,7 @@ async fn a_display_page_reads_each_shared_target_and_manifest_once() {
     let entries: Vec<_> = page
         .messages
         .into_iter()
-        .filter(|entry| entry.ordinal % 4 == 3)
+        .filter(|entry| (entry.ordinal - 1) % 4 == 3)
         .collect();
     let counted = CountedReads {
         registry: &rig.registry,
@@ -570,7 +571,8 @@ async fn a_display_page_reads_each_shared_target_and_manifest_once() {
     let sets = broca_module::output_refs::page_output_refs(
         &counted,
         &rig.key(),
-        page.lineage_id.as_deref().unwrap(),
+        &page.incarnation,
+        page.history_version,
         &entries,
         None,
     )

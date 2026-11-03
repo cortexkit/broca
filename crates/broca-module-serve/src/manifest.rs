@@ -40,7 +40,6 @@ pub const OP_HEAD: &str = broca_wire::OP_SESSION_HEAD;
 pub const OP_RUN_RESULT: &str = broca_wire::OP_RUN_RESULT;
 pub const OP_RUN_TOOL_CALLS: &str = broca_wire::OP_RUN_TOOL_CALLS;
 pub const OP_BASELINE: &str = broca_wire::OP_SESSION_BASELINE;
-pub const OP_RESOLVE: &str = broca_wire::OP_SESSION_RESOLVE;
 pub const OP_REFRESH: &str = cortexkit_role_llm_runner::ops::SESSION_REFRESH;
 pub const OP_REFRESH_POLICY: &str = cortexkit_role_llm_runner::ops::SESSION_REFRESH_POLICY;
 pub const OP_FLUSH_PREFIX: &str = cortexkit_role_llm_runner::ops::SESSION_FLUSH_PREFIX;
@@ -281,14 +280,6 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             name: "permissions.revoke".into(),
             kind: ManagementOperationKind::Mutate,
             description: Some("Permissions routes only: revoke one private-content grant for the operator.".into()),
-        },
-        ManagementOperation {
-            name: OP_RESOLVE.to_string(),
-            kind: ManagementOperationKind::Query,
-            description: Some(
-                "Answer the stored text of one runner-tagged part, or a character range of it."
-                    .to_string(),
-            ),
         },
         ManagementOperation {
             name: OP_HEAD.to_string(),

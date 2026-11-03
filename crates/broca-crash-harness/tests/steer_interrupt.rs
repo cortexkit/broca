@@ -330,6 +330,7 @@ impl Session {
         order: Option<broca_protocol::DeliveryOrder>,
     ) -> SendResponse {
         let request = RunRequest {
+            route_decision_id: None,
             input_written_at_ms: None,
             directives: None,
             session_class: None,

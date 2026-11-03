@@ -376,6 +376,7 @@ mod tests {
             send_id: None,
             submission_id: SubmissionId(id.into()),
             request: Box::new(SubmissionRequest {
+                route_decision_id: None,
                 service_tier_level: None,
                 staged_uploads: None,
                 content: Vec::new(),
@@ -480,6 +481,7 @@ mod tests {
             session: BindIdentity::new("/tmp/p", "h", "s"),
             config: Box::new(RunConfig {
                 global_system: None,
+                route_decision_id: None,
                 account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,

@@ -584,6 +584,7 @@ mod tests {
                     ts_ms: Some(100),
                     config: Box::new(broca_wal::RunConfig {
                         global_system: None,
+                        route_decision_id: None,
                         account_limit_pause: false,
                         turn_directives_v1: None,
                         render_tags: false,

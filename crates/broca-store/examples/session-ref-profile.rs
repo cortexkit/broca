@@ -42,6 +42,7 @@ fn record(session: &BindIdentity) -> WalRecord {
         ts_ms: Some(1),
         config: Box::new(RunConfig {
             global_system: None,
+            route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,

@@ -1149,7 +1149,7 @@ impl Runtime<'_> {
         if request.cause == RideCause::ServiceTierChange {
             if let Some(level) = &state.current_service_tier {
                 request = request.with_service_tier(
-                    cortexkit_role_llm_runner::service_tier::ServiceTier::parse(level)
+                    serde_json::from_value(serde_json::json!(level))
                         .expect("current tier comes from the frozen applied level"),
                 );
             }

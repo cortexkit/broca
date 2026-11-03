@@ -99,6 +99,7 @@ pub enum OutputEvent {
 /// The caller's request to start a run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunRequest {
+    pub route_decision_id: Option<String>,
     pub input_written_at_ms: Option<u64>,
     pub directives: Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>,
     pub session_class: Option<String>,
@@ -198,6 +199,7 @@ impl RunRequest {
     /// [`from_submission`]: RunRequest::from_submission
     pub fn to_submission(&self) -> SubmissionRequest {
         SubmissionRequest {
+            route_decision_id: self.route_decision_id.clone(),
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
@@ -246,6 +248,7 @@ impl RunRequest {
         submission_id: broca_protocol::SubmissionId,
     ) -> Self {
         RunRequest {
+            route_decision_id: req.route_decision_id,
             input_written_at_ms: None,
             directives: req.directives,
             session_class: None,
@@ -802,9 +805,9 @@ pub struct RunControl {
     /// Input transforms computed by the lineage actor. A queue drain carries its recorded
     /// final input here; core only renders and records it, never calls pre_user.
     pub input_hooks: Option<Box<broca_wal::Hooks>>,
-    /// An input hook refused the session's first send. Admission is durable before this
+    /// An input hook or routing decision refused execution. Admission is durable before this
     /// terminal error is written; no model step or tool dispatch may follow it.
-    pub pre_user_error: Option<ProviderError>,
+    pub pre_model_error: Option<ProviderError>,
     /// Optional driver that refreshes the provider's prompt cache during tool waits. The
     /// loop uses it only when this episode's keep_warm policy is auto.
     pub keep_warm: Option<Arc<dyn crate::keep_warm_wait::KeepWarmDriver>>,
@@ -952,7 +955,7 @@ impl Default for RunControl {
             elicitation_plane: None,
             hook_plane: None,
             input_hooks: None,
-            pre_user_error: None,
+            pre_model_error: None,
         }
     }
 }
@@ -5562,6 +5565,7 @@ where
                 RunConfig {
                     global_system: (mode3 && frozen_plan.is_none() && !v2_globals.is_empty())
                         .then(|| Arc::new(v2_globals.clone())),
+                    route_decision_id: req.route_decision_id.clone(),
                     account_limit_pause: account_limit_pause_enabled,
                     turn_directives_v1: req.directives.clone(),
                     render_tags,
@@ -5683,7 +5687,7 @@ where
     admit(&mut on_admitted, Ok(resolved_run_id.clone()));
 
     if !is_resume || append_episode {
-        if let Some(error) = control.pre_user_error.clone() {
+        if let Some(error) = control.pre_model_error.clone() {
             control.close_steers();
             let (summary, last_fsynced_seq) = finish_run(
                 writer,
@@ -8508,8 +8512,8 @@ pub(crate) async fn project_committed<W: WalStore>(
         .await
         .ok()
         .flatten();
-    // A valid head without a model has not folded a RunStarted yet; the incoming prefix
-    // supplies its first-run mode instead of requiring a separate origin probe.
+    // Older materialized heads can have model metadata without a cached log mode.
+    // Read the first RunStarted before folding a suffix that could otherwise promote a legacy log.
     if seed.as_ref().is_some_and(|seed| {
         seed.admission_checkpoint
             .head
@@ -11640,118 +11644,6 @@ fn apply_ordered_appends(results: &mut [ToolResult], appends: &[(ToolCallId, Str
     }
 }
 
-/// UTF-8 bytes bound the character count, so this sits far below the smallest known
-/// per-item provider limit (OpenAI Responses: 10,485,760 characters). A result this size
-/// already overflows most context windows.
-pub const TOOL_RESULT_MAX_BYTES: usize = 1_048_576;
-/// Reserve space only for subscribed text subjects; structured JSON retains the full ceiling.
-pub const POST_TOOL_HEADROOM: usize = 16_384;
-
-/// Cap once before persistence so live execution and replay use the same stored bytes.
-fn cap_tool_result(result: &mut ToolResult, run_id: &RunId, tool_name: &str, headroom: bool) {
-    let limit = if headroom {
-        TOOL_RESULT_MAX_BYTES - POST_TOOL_HEADROOM
-    } else {
-        TOOL_RESULT_MAX_BYTES
-    };
-    // ToolOutput has no image/content-block variant. JSON is measured as serialized model
-    // text, and oversized structured results become text rather than invalid partial JSON.
-    // Denied's provider-facing prefix is included; small outputs retain their original variant.
-    let serialized;
-    let text = match &result.output {
-        // Cap text parts only; capture-time media validation owns size limits for stored objects.
-        ToolOutput::Parts { .. } => {
-            if let ToolOutput::Parts { parts } = &mut result.output {
-                let mut remaining = limit;
-                for part in parts.iter_mut() {
-                    if let broca_protocol::ToolOutputPart::Text { text } = part {
-                        let mut end = text.len().min(remaining);
-                        while !text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        text.truncate(end);
-                        remaining -= end;
-                    }
-                }
-            }
-            return;
-        }
-        ToolOutput::Text { text } => text.as_str(),
-        ToolOutput::Error {
-            message,
-            module,
-            code,
-            detail,
-            nothing_sent,
-            retry,
-        } => {
-            // Measure (and cap below) the text the model actually reads, including any
-            // module-outage attribution.
-            serialized = ToolOutput::error_model_text(
-                message,
-                module.as_deref(),
-                code.as_deref(),
-                detail.as_deref(),
-                *nothing_sent,
-                retry.as_deref(),
-            );
-            &serialized
-        }
-        ToolOutput::Denied { reason } => {
-            serialized = format!("denied: {reason}");
-            &serialized
-        }
-        ToolOutput::Json { value } => {
-            serialized = value.to_string();
-            &serialized
-        }
-    };
-    let original_bytes = text.len();
-    if headroom {
-        if original_bytes <= limit {
-            return;
-        }
-    } else if original_bytes <= TOOL_RESULT_MAX_BYTES {
-        return;
-    }
-    // Tool names are unbounded; shorten only the diagnostic label so it cannot consume
-    // the entire result budget. The warning below retains the full name, never result content.
-    let shortened_name;
-    let marker_name = if tool_name.len() > 256 {
-        let mut end = 256;
-        while !tool_name.is_char_boundary(end) {
-            end -= 1;
-        }
-        shortened_name = format!("{}…", &tool_name[..end]);
-        shortened_name.as_str()
-    } else {
-        tool_name
-    };
-    let marker = |kept| {
-        if headroom {
-            format!("\n[broca: tool result truncated: {marker_name} returned {original_bytes} bytes, over the {limit} byte limit; POST_TOOL_HEADROOM reserves {POST_TOOL_HEADROOM} bytes; the first {kept} bytes are shown. Narrow the request (a smaller range, a filter, or a more specific query).]")
-        } else {
-            // Keep the hookless marker byte-identical for existing sessions.
-            format!("\n[broca: tool result truncated: {marker_name} returned {original_bytes} bytes, over the {TOOL_RESULT_MAX_BYTES} byte limit; the first {kept} bytes are shown. Narrow the request (a smaller range, a filter, or a more specific query).]")
-        }
-    };
-    let mut kept_bytes = limit.saturating_sub(marker(0).len());
-    // Account for the kept count's own decimal digits, then find the last complete character.
-    while kept_bytes + marker(kept_bytes).len() > limit || !text.is_char_boundary(kept_bytes) {
-        kept_bytes = kept_bytes.saturating_sub(1);
-    }
-    let capped = format!("{}{}", &text[..kept_bytes], marker(kept_bytes));
-    result.output = ToolOutput::Text { text: capped };
-    tracing::warn!(
-        target: "tool_results",
-        run_id = %run_id.0,
-        tool_name,
-        original_bytes,
-        kept_bytes,
-        "tool result truncated"
-    );
-}
-
 /// A synthetic `interrupted` resolution for a call abandoned because an earlier
 /// sequential call was ambiguous. It WAS planned dispatchable (its intent was
 /// written), so it gets a `tool_result{Interrupted}` terminal.
@@ -14215,6 +14107,7 @@ mod tests {
         prior.render_episodes = None;
         prior.run_config = Some(RunConfig {
             global_system: None,
+            route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
@@ -14346,6 +14239,7 @@ mod tests {
             reply: None,
         };
         let mut req = RunRequest {
+            route_decision_id: None,
             input_written_at_ms: None,
             directives: None,
             session_class: None,
@@ -16240,6 +16134,7 @@ mod tests {
 
         let config = RunConfig {
             global_system: None,
+            route_decision_id: None,
             account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
