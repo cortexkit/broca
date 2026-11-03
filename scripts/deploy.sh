@@ -177,7 +177,12 @@ if [ ! -x "${CARGO_TARGET_DIR:-./target}/release/broca-session" ] || ! acceptanc
   rollback_command >&2
   exit 1
 fi
-if ! python3 scripts/acceptance-worker-turn.py >"$logdir/acceptance-worker.log" 2>&1; then
+# Project-free builds observe a real post-restart worker admission and completion;
+# older builds compose and send an acceptance turn with their project folder.
+# Observation sends nothing and reports metadata only; it never creates a
+# daemon-authenticated project scope. It waits at most ten minutes for completion.
+if ! python3 scripts/acceptance-worker-turn.py --placement-report "$report" \
+    >"$logdir/acceptance-worker.log" 2>&1; then
   cat "$logdir/acceptance-worker.log" >&2
   echo "deploy: WORKER ADMISSION ACCEPTANCE FAILED; not publishing." >&2
   rollback_command >&2

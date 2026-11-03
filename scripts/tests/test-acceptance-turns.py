@@ -176,6 +176,7 @@ class DeployScopedTests(unittest.TestCase):
         self.assertEqual(args[0], "--placement-report")
         report = json.loads(Path(args[1]).read_text())
         self.assertGreater(report["restart_observed_at_ms"], 0)
+        self.assertEqual(records["worker-accept"], args)
 
     def test_scoped_leg_failure_blocks_publication_and_reports_rollback(self):
         result = self.fixture.deploy(FAIL_STEP="scoped-accept")
@@ -259,6 +260,142 @@ else:
         self.assertFalse(contract.tool_results_pass(output, True))
 
 
+class WorkerTrafficTests(unittest.TestCase):
+    def setUp(self):
+        self.worker = load("worker_traffic_fixture", "scripts/acceptance-worker-turn.py")
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=scratch)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.address = "1234567890abcdef"
+        self.start = {"type": "run_started", "run_id": "DO-NOT-PRINT-RUN-ID", "ts_ms": 101,
+                      "session_class": "mason",
+                      "manifest": {"fetches": [{"declarations_frozen": {"late_results": True}}]}}
+        self.finish = {"type": "run_finished", "reason": "completed"}
+
+    def write(self, records=None, folder="wal", address=None, requires=None):
+        path = self.root / folder / ((address or self.address) + ".wal")
+        path.parent.mkdir(exist_ok=True)
+        records = records if records is not None else [self.start, self.finish]
+        requires = self.worker.REQUIRED if requires is None else requires
+        path.write_bytes(b"".join(frame(seq, record, list(requires) if record["type"] == "run_started" else None)
+                                  for seq, record in enumerate(records, 1)))
+        return path
+
+    def wait(self, timeout=0):
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(out):
+            status = self.worker.wait_for_worker(self.root, 100, timeout, poll=1)
+        self.assertNotIn("DO-NOT-PRINT", out.getvalue())
+        return status, out.getvalue()
+
+    def test_completed_declaring_worker_in_every_live_folder_passes(self):
+        for folder in ("wal", "wal-durable", "wal-ephemeral"):
+            for declaration in ({"late_results": True}, {"result_formats": {"read": "text"}}):
+                with self.subTest(folder=folder, declaration=declaration):
+                    start = dict(self.start, manifest={"fetches": [{"declarations_frozen": declaration}]})
+                    path = self.write([start, {"type": "message", "text": "DO-NOT-PRINT-CONTENT"}, self.finish],
+                                      folder=folder)
+                    status, output = self.wait()
+                    self.assertEqual(status, 0, output)
+                    self.assertIn(f"session={self.address} class=mason", output)
+                    self.assertIn("admitted, completed", output)
+                    path.unlink()
+
+    def test_no_candidate_is_a_named_failure_with_the_worker_label(self):
+        status, output = self.wait()
+        self.assertEqual(status, 1)
+        self.assertIn("no_worker_candidate", output)
+        self.assertIn("session_class=mason", output)
+
+    def test_pre_restart_and_non_worker_starts_are_not_candidates(self):
+        starts = [dict(self.start, ts_ms=value) for value in (99, 100, True, "101")]
+        starts += [dict(self.start, session_class=value) for value in (None, "head", "sidekick", "consult", "worker")]
+        for start in starts:
+            with self.subTest(start=start):
+                self.write([start, self.finish])
+                status, output = self.wait()
+                self.assertEqual(status, 1, output)
+                self.assertIn("no_worker_candidate", output)
+
+    def test_declaration_less_worker_fails_even_with_a_later_declaring_completion(self):
+        for manifest in (None, {}, {"fetches": []},
+                         {"fetches": [{"declarations_frozen": {"late_results": False, "result_formats": {}}}]}):
+            with self.subTest(manifest=manifest):
+                self.write([dict(self.start, manifest=manifest), self.finish,
+                            dict(self.start, ts_ms=102), self.finish])
+                status, output = self.wait()
+                self.assertEqual(status, 1, output)
+                self.assertIn("no frozen result formats or late_results declaration", output)
+
+    def test_both_required_features_are_checked_on_the_worker_start(self):
+        for missing in self.worker.REQUIRED:
+            with self.subTest(missing=missing):
+                self.write(requires=[feature for feature in self.worker.REQUIRED if feature != missing])
+                status, output = self.wait()
+                self.assertEqual(status, 1, output)
+                self.assertIn("missing required WAL feature(s): " + missing, output)
+
+    def test_error_or_missing_terminal_cannot_borrow_a_later_runs_completion(self):
+        for records in ([self.start],
+                        [self.start, dict(self.finish, reason="error", error={"message": "DO-NOT-PRINT-ERROR"})],
+                        [self.start, dict(self.finish, reason="max_steps")],
+                        [self.start, dict(self.start, ts_ms=102), self.finish],
+                        [self.finish, self.start],
+                        [self.start, self.finish, self.finish]):
+            with self.subTest(records=records):
+                self.write(records)
+                status, output = self.wait()
+                self.assertEqual(status, 1, output)
+                self.assertIn("FAILED", output)
+
+    def test_earliest_worker_across_sessions_is_selected_and_pinned_until_terminal(self):
+        path = self.write([self.start])
+        self.write([dict(self.start, ts_ms=102), self.finish], address="0000000000000000")
+        with patch.object(self.worker.time, "monotonic", side_effect=[0, 0, 120]), \
+                patch.object(self.worker.time, "sleep") as sleep:
+            status, output = self.wait(timeout=120)
+        self.assertEqual(status, 1, output)
+        self.assertIn("worker_terminal_timeout", output)
+        self.assertIn(f"session={self.address}", output)
+        sleep.assert_called_once_with(1)
+        with patch.object(self.worker.time, "monotonic", side_effect=[0, 0]), \
+                patch.object(self.worker.time, "sleep", side_effect=lambda _: self.write()) as sleep:
+            status, output = self.wait(timeout=120)
+        self.assertEqual(status, 0, output)
+        self.assertIn(f"session={path.stem}", output)
+        sleep.assert_called_once_with(1)
+
+    def test_no_candidate_wait_is_bounded_and_observes_new_admissions(self):
+        with patch.object(self.worker.time, "monotonic", side_effect=[0, 0, 120]), \
+                patch.object(self.worker.time, "sleep") as sleep:
+            status, output = self.wait(timeout=120)
+        self.assertEqual(status, 1, output)
+        self.assertIn("no_worker_candidate", output)
+        sleep.assert_called_once_with(1)
+        with patch.object(self.worker.time, "monotonic", side_effect=[0, 0]), \
+                patch.object(self.worker.time, "sleep", side_effect=lambda _: self.write()) as sleep:
+            status, output = self.wait(timeout=120)
+        self.assertEqual(status, 0, output)
+        sleep.assert_called_once_with(1)
+
+    def test_unverified_snapshots_are_retried_and_never_partially_certified(self):
+        path = self.write()
+        raw = path.read_bytes()
+        for bad in (raw + b"torn", raw[:-1] + bytes([raw[-1] ^ 1]),
+                    raw + frame(3, {"type": "DO-NOT-PRINT"}, ["unknown-feature/v1"])):
+            with self.subTest(size=len(bad)):
+                path.write_bytes(bad)
+                status, output = self.wait()
+                self.assertEqual(status, 1, output)
+                self.assertIn("unverified_wal", output)
+        with patch.object(self.worker.time, "monotonic", side_effect=[0, 0]), \
+                patch.object(self.worker.time, "sleep", side_effect=lambda _: path.write_bytes(raw)):
+            status, output = self.wait(timeout=120)
+        self.assertEqual(status, 0, output)
+
+
 class WorkerAddressTests(unittest.TestCase):
     def setUp(self):
         suite = load("worker_address_fixture", "scripts/test-acceptance-worker-turn.py")
@@ -267,34 +404,88 @@ class WorkerAddressTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.acceptance = suite.acceptance
 
-    def check_address(self, no_project):
+    def test_legacy_build_keeps_callers_folder_wal(self):
         result, output, invoke, check = self.fixture.run_main([
             '{"result":{"session_class":{"backup_classes":[]}}}',
             '{"event":"send","state":"active","run_id":"new-run"}',
-        ], no_project=no_project)
+        ])
         self.assertEqual(result, 0, output)
         command = invoke.call_args.args[0]
         session = command[command.index("--session") + 1]
-        root = "broca-unscoped-v1" if no_project else str(Path(self.fixture.tmp.name).resolve())
+        root = str(Path(self.fixture.tmp.name).resolve())
         expected = self.acceptance.wal_name(root, "broca", session)
         self.assertEqual(check.call_args.args[0], Path(self.fixture.tmp.name) / "wal" / expected)
 
-    def test_declared_unscoped_build_uses_fixed_namespace_wal(self):
-        self.check_address(True)
-
-    def test_legacy_build_keeps_callers_folder_wal(self):
-        self.check_address(False)
-
-    def test_declared_build_checks_provider_error_at_namespace_wal_too(self):
+    def test_project_free_build_observes_real_worker_without_compose_or_send(self):
+        report = Path(self.fixture.tmp.name) / "placement.json"
+        report.write_text('{"restart_observed_at_ms":100}')
+        state_root = Path(self.fixture.tmp.name)
+        path = state_root / "wal-durable/1234567890abcdef.wal"
+        path.parent.mkdir()
+        start = dict(self.fixture.start, session_class="mason", ts_ms=101)
+        path.write_bytes(frame(1, start, list(self.acceptance.REQUIRED))
+                         + frame(2, {"type": "run_finished", "reason": "completed"}))
+        refused_fetch = self.acceptance.ClientFailure(self.acceptance.subprocess.CompletedProcess(
+            [], 1, "", "compose-plan: fetch_unavailable: provider aft refused the fetch: invalid_request"))
         result, output, invoke, check = self.fixture.run_main([
-            '{"result":{"session_class":{"backup_classes":[]}}}', self.fixture.provider_failure(),
-        ], no_project=True, extra_args=("--model", "fixture/model"))
-        self.assertEqual(result, 2, output)
-        command = invoke.call_args.args[0]
-        session = command[command.index("--session") + 1]
-        expected = self.acceptance.wal_name("broca-unscoped-v1", "broca", session)
-        self.assertEqual(check.call_args.args[0], Path(self.fixture.tmp.name) / "wal" / expected)
-        self.assertEqual(check.call_args.kwargs, {"finish_reason": "error"})
+            '{"result":{"session_class":{"backup_classes":["head","mason"]}}}',
+        ], no_project=True, extra_args=("--placement-report", str(report), "--timeout", "0"),
+            compose_answers=[refused_fetch])
+        self.assertEqual(result, 0, output)
+        self.assertIn("class=mason", output)
+        self.assertEqual(invoke.call_count, 1)
+        self.assertIn("describe", invoke.call_args.args[0])
+        check.assert_not_called()
+
+    def test_project_free_build_requires_valid_restart_boundary_and_bounded_wait(self):
+        report = Path(self.fixture.tmp.name) / "placement.json"
+        cases = [({"other": "DO-NOT-PRINT"}, "0"),
+                 ({"restart_observed_at_ms": "DO-NOT-PRINT"}, "0"),
+                 ({"restart_observed_at_ms": True}, "0"), ({"restart_observed_at_ms": 0}, "0")]
+        cases += [({"restart_observed_at_ms": 100}, timeout) for timeout in ("601", "-1", "nan", "inf")]
+        for boundary, timeout in cases:
+            with self.subTest(boundary=boundary, timeout=timeout):
+                report.write_text(json.dumps(boundary))
+                result, output, invoke, check = self.fixture.run_main(['{"result":{}}'], no_project=True,
+                    extra_args=("--placement-report", str(report), "--timeout", timeout))
+                self.assertEqual(result, 1, output)
+                self.assertIn("valid placement report restart boundary", output)
+                self.assertNotIn("DO-NOT-PRINT", output)
+                self.assertEqual(invoke.call_count, 1)
+                check.assert_not_called()
+        result, output, invoke, check = self.fixture.run_main(['{"result":{}}'], no_project=True)
+        self.assertEqual(result, 1, output)
+        self.assertIn("valid placement report restart boundary", output)
+        self.assertEqual(invoke.call_count, 1)
+        check.assert_not_called()
+
+    def test_project_free_no_candidate_fails_without_compose_or_send(self):
+        report = Path(self.fixture.tmp.name) / "placement.json"
+        report.write_text('{"restart_observed_at_ms":100}')
+        result, output, invoke, check = self.fixture.run_main(['{"result":{}}'], no_project=True,
+            extra_args=("--placement-report", str(report), "--timeout", "0"))
+        self.assertEqual(result, 1, output)
+        self.assertIn("no_worker_candidate", output)
+        self.assertIn("session_class=mason", output)
+        self.assertEqual(invoke.call_count, 1)
+        check.assert_not_called()
+
+    def test_project_free_compose_only_refuses_without_fetching(self):
+        result, output, invoke, _ = self.fixture.run_main(['{"result":{}}'], no_project=True,
+                                                       extra_args=("--compose-only",))
+        self.assertEqual(result, 1, output)
+        self.assertIn("compose-only requires a project-bearing build", output)
+        self.assertEqual(invoke.call_count, 1)
+
+    def test_project_free_observation_defaults_to_ten_minutes(self):
+        report = Path(self.fixture.tmp.name) / "placement.json"
+        report.write_text('{"restart_observed_at_ms":100}')
+        with patch.object(self.acceptance, "wait_for_worker", return_value=1) as wait:
+            result, output, invoke, _ = self.fixture.run_main(['{"result":{}}'], no_project=True,
+                extra_args=("--placement-report", str(report)))
+        self.assertEqual(result, 1, output)
+        wait.assert_called_once_with(Path(self.fixture.tmp.name), 100, 600)
+        self.assertEqual(invoke.call_args.args[1], 120)
 
 
 class ScopedCommandTests(unittest.TestCase):
