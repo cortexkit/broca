@@ -439,19 +439,34 @@ impl Session {
     /// it does not count as this switch: Codex has no such threshold, so in its terms the
     /// WebSocket is still enabled and the retry count may still fall back once.
     pub(super) fn try_switch_to_https(&self) -> bool {
-        let policy = Arc::clone(&self.policy.read().unwrap());
-        if policy() {
+        let Some(mut state) = self.https_switch_eligible() else {
             return false;
-        }
-        let mut state = self.state.lock().unwrap();
-        if state.force_https {
-            return false;
-        }
+        };
         state.force_https = true;
         if let Some(socket) = state.socket.take() {
             socket.shutdown.cancel();
         }
         true
+    }
+
+    #[cfg(test)]
+    pub(super) fn can_switch_to_https(&self) -> bool {
+        self.https_switch_eligible().is_some()
+    }
+
+    // Keep the lock through the switch so a read-only query and a mutating switch use the
+    // same eligibility rules without introducing a check-then-lock race in the switch.
+    #[inline(always)]
+    fn https_switch_eligible(&self) -> Option<std::sync::MutexGuard<'_, State>> {
+        let policy = Arc::clone(&self.policy.read().unwrap());
+        if policy() {
+            return None;
+        }
+        let state = self.state.lock().unwrap();
+        if state.force_https {
+            return None;
+        }
+        Some(state)
     }
 
     fn now(&self) -> Instant {

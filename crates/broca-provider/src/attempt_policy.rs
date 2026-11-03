@@ -1,5 +1,5 @@
 //! Pure retry decisions, not yet used by the transport.
-//! A later trace test will verify this model against the unchanged driver before wiring it in.
+//! Transport trace tests verify this model against the unchanged driver before wiring it in.
 
 use std::time::Duration;
 
@@ -285,4 +285,4 @@ pub(crate) fn decide_rejected_refresh(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

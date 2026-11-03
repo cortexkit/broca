@@ -555,4 +555,4 @@ fn codex_server_advised_wait_is_uncapped_and_ignores_generic_wait_budget() {
     );
 }
 
-mod simulation;
+pub(crate) mod simulation;

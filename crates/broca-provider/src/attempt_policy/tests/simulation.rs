@@ -1,6 +1,7 @@
 use super::*;
 use proptest::{
     prelude::*,
+    strategy::ValueTree,
     test_runner::{Config, RngAlgorithm, TestRng, TestRunner},
 };
 
@@ -14,6 +15,23 @@ struct ScriptedAttempt {
     server_seconds: Option<f64>,
     jitter: u8,
     pre_send_account_changed: bool,
+}
+
+/// Draw the same attempt generator for the wire oracle without running a property callback.
+/// Wire tests project arbitrary facts onto responses a real local server can produce.
+pub(crate) fn wire_samples(seed: u8, count: usize) -> Vec<(u8, u32, Option<f64>, u8)> {
+    let mut runner = runner(seed);
+    (0..count)
+        .map(|_| {
+            let sample = attempt_strategy().new_tree(&mut runner).unwrap().current();
+            (
+                sample.kind,
+                sample.attempt_ms,
+                sample.server_seconds,
+                sample.jitter,
+            )
+        })
+        .collect()
 }
 
 impl ScriptedAttempt {
