@@ -71,7 +71,7 @@ fn terminal() -> WalRecord {
 #[test]
 fn compaction_v2_metadata_reserves_pending_assistant_across_restart_and_held_steer() {
     let assistant = assistant();
-    let records = vec![
+    let records = [
         frame(1, started(vec![text("question")])),
         frame(2, serde_json::from_value(json!({"type":"step_started","step_id":0})).unwrap()),
         frame(3, model_step(&assistant)),

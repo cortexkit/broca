@@ -171,7 +171,7 @@ pub fn read_session_model_page(
         None,
         snapshot.prefix_len,
         false,
-        crate::replay::TranscriptSeed::for_page(&snapshot, tail),
+        crate::replay::TranscriptSeed::for_page(snapshot, tail),
     )?;
     let history = snapshot.model_history.as_ref();
     if snapshot.watermark_seq == 0 && compaction.is_none() {

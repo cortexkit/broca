@@ -253,10 +253,8 @@ impl Runtime {
     ) {
         let mut restarted = false;
         loop {
-            if !lane.ready {
-                if !lane.setup_due || !setup(lane, plane, setup_request).await {
-                    return;
-                }
+            if !lane.ready && (!lane.setup_due || !setup(lane, plane, setup_request).await) {
+                return;
             }
             let batch = {
                 let mut pending = self
