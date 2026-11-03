@@ -3,6 +3,7 @@
 
 pub use cortexkit_role_compaction as protocol;
 
+pub mod conditions;
 pub mod entries;
 pub mod render;
 pub mod runtime;

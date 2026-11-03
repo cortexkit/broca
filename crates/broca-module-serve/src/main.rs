@@ -750,11 +750,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         .map_err(|error| ServeIoError(format!("retention clock: {error}")))?,
     );
-    if bus_event_config.enabled {
-        executor_impl = executor_impl.with_compaction_plane(Arc::new(
-            broca_subc::SubcCompactionPlane::new(plan_conn.clone()),
-        ));
-    }
+    executor_impl = executor_impl.with_compaction_plane(Arc::new(
+        broca_subc::SubcCompactionPlane::new(plan_conn.clone()),
+    ));
     let compaction_inbox = executor_impl.compaction_inbox();
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
     let move_wal = wal_store.clone();

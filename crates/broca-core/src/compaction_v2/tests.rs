@@ -8,6 +8,7 @@ use cortexkit_role_compaction::{
 use serde_json::json;
 
 use super::{
+    conditions as session_conditions,
     entries::{project, Deliveries, EntryFacts},
     render, runtime, state, views,
 };
@@ -584,4 +585,168 @@ fn compaction_v2_restore_checks_checksum_and_applied_identity() {
         .restore_applied(&identity)
         .unwrap_err()
         .contains("no matching stored view"));
+}
+
+#[test]
+fn compaction_v2_rides_include_every_simultaneous_cause() {
+    use cortexkit_role_compaction::{ride::RideCause, setup::ModelRef};
+    let previous = session_conditions::SendContext {
+        model: ModelRef::new("openai", "old"),
+        account: Some("a".into()),
+        surface: "old".into(),
+    };
+    let current = session_conditions::SendContext {
+        model: ModelRef::new("anthropic", "new").with_service_tier("priority"),
+        account: Some("b".into()),
+        surface: "new".into(),
+    };
+    let conditions = session_conditions::conditions(current.model.clone(), 1000, 100, true);
+    assert_eq!(
+        session_conditions::ride_causes(Some(&previous), &current, false, true, 901, &conditions),
+        [
+            RideCause::CacheExpired,
+            RideCause::ChainReset,
+            RideCause::ModelChange,
+            RideCause::TierChange,
+            RideCause::AccountChange,
+            RideCause::SurfaceChange,
+            RideCause::OverLimit
+        ]
+    );
+    assert!(session_conditions::ride_causes(
+        Some(&current),
+        &current,
+        true,
+        false,
+        900,
+        &conditions
+    )
+    .is_empty());
+    let setup = session_conditions::setup_request("unchanged-preset", &conditions, 100);
+    assert_eq!(setup.preset, "unchanged-preset");
+    assert_eq!(setup.model, current.model);
+    assert_eq!(setup.detects.len(), 7);
+    assert_eq!(
+        setup.rules.history_edit_cost,
+        cortexkit_role_compaction::rules::EditCost::FullResend
+    );
+}
+
+#[test]
+fn compaction_v2_plan_version_mismatch_refuses_by_name() {
+    assert!(
+        session_conditions::check_plan_version(cortexkit_compaction_view::PLAN_VERSION).is_ok()
+    );
+    let error = session_conditions::check_plan_version(1).unwrap_err();
+    assert!(error.contains("compaction_plan_version 1"));
+    assert!(error.contains("version 2"));
+}
+
+#[derive(Default)]
+struct HeldNoticePlane {
+    calls: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    held: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl runtime::Plane for HeldNoticePlane {
+    async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, runtime::CallError> {
+        self.calls.lock().unwrap().push((method.into(), params));
+        if method == "compaction.notice"
+            && !self.held.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(match method {
+            "compaction.setup" => json!({"answer":"ready"}),
+            "compaction.notice" => json!({"answer":"received"}),
+            "compaction.ride" => json!({"answer":"nothing"}),
+            _ => panic!("unexpected method"),
+        })
+    }
+}
+
+#[tokio::test]
+async fn compaction_v2_ride_waits_for_inflight_notice_and_coalesced_pending_changes() {
+    use cortexkit_role_compaction::ride::{RideCause, RideRequest};
+    use std::sync::Arc;
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
+        let runtime = Arc::new(runtime::Runtime::default());
+        let plane = Arc::new(HeldNoticePlane::default());
+        runtime.observe(&project(
+            &[text(Role::User, "one")],
+            &facts(1),
+            &Deliveries::new(),
+            true,
+        ));
+        let sending = {
+            let runtime = runtime.clone();
+            let plane = plane.clone();
+            tokio::spawn(async move {
+                runtime
+                    .flush(plane.as_ref(), &setup(), &conditions(), None)
+                    .await
+            })
+        };
+        plane.entered.notified().await;
+        runtime.observe(&project(
+            &[text(Role::User, "one"), text(Role::User, "two")],
+            &facts(2),
+            &Deliveries::new(),
+            true,
+        ));
+        runtime.observe(&project(
+            &[
+                text(Role::User, "one"),
+                text(Role::User, "two"),
+                text(Role::User, "three"),
+            ],
+            &facts(3),
+            &Deliveries::new(),
+            true,
+        ));
+        let riding = {
+            let runtime = runtime.clone();
+            let plane = plane.clone();
+            tokio::spawn(async move {
+                runtime
+                    .ride(
+                        plane.as_ref(),
+                        &setup(),
+                        &RideRequest::new(vec![RideCause::CacheExpired], 1000, conditions()),
+                    )
+                    .await
+            })
+        };
+        assert_eq!(plane.calls.lock().unwrap().len(), 2);
+        plane.release.notify_one();
+        sending.await.unwrap();
+        riding.await.unwrap();
+        let calls = plane.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "compaction.setup",
+                "compaction.notice",
+                "compaction.notice",
+                "compaction.ride"
+            ]
+        );
+        assert_eq!(calls[2].1["seq"], 2);
+        assert_eq!(calls[2].1["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(calls[2].1["entries"][0]["ordinal"], 2);
+        assert_eq!(calls[2].1["entries"][1]["ordinal"], 3);
+    })
+    .await
+    .expect("notice/ride lane must make progress");
 }

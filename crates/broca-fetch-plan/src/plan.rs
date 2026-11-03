@@ -264,6 +264,19 @@ fn item(value: &Value, at: &str, may_be_optional: bool) -> Result<Item, Refusal>
     })
 }
 
+/// New compaction sessions need an explicit provider preset. Keep this separate
+/// from decoding frozen legacy plans, whose optional selector remains replayable.
+pub fn require_compaction_preset(plan: &Plan) -> Result<(), Refusal> {
+    if plan
+        .compaction_item
+        .as_ref()
+        .is_some_and(|item| item.preset.is_none())
+    {
+        return Err(Refusal::invalid("plan.compaction_item.preset"));
+    }
+    Ok(())
+}
+
 pub(crate) fn items(
     plan: &Map<String, Value>,
     list: &str,

@@ -1120,67 +1120,17 @@ impl CatalogFetch<'_> {
     }
 }
 
-/// What a plan's compaction provider said about the role, once its `role.describe` arrived.
-#[derive(Debug)]
-enum CompactionDiscovery {
-    /// It serves `compaction-provider/v1` with every required op.
-    Served,
-    /// It said it does not serve `compaction-provider/v1`. Each problem is an object whose
-    /// `problem` member names it: the role crate's `DescribeProblem::name` for a readable
-    /// describe (`missing_major` with the majors `found`, or `missing_op` with the `op`), or
-    /// [`DESCRIBE_REFUSED`] with the refusal's `code`.
-    NotServed(Vec<Value>),
-}
-
 /// The problem naming a non-retryable refusal of `role.describe` itself.
 pub const DESCRIBE_REFUSED: &str = "describe_refused";
-
-/// Classify a compaction provider's answer to `role.describe`. Proof that the provider does
-/// not serve the role is either a describe that decodes and then lacks the
-/// `compaction-provider/v1` major or a required op, or the provider refusing the describe with
-/// a code that does not clear on retry. An answer that is not a describe at all (not an
-/// object, or missing a required member) is unreadable, so it is a miss like any other
-/// unusable fetch answer: it leaves admission unable to tell what the provider serves, which
-/// is not the same as the provider saying no.
-fn classify_compaction_describe(answer: &DescribeAnswer) -> Result<CompactionDiscovery, FetchMiss> {
-    use cortexkit_role_compaction_provider::describe::{check_describe, DescribeProblem};
-    let raw = match answer {
-        DescribeAnswer::Answered(raw) => raw,
-        DescribeAnswer::Refused { code } => {
-            return Ok(CompactionDiscovery::NotServed(vec![
-                json!({"problem": DESCRIBE_REFUSED, "code": code}),
-            ]));
-        }
-    };
-    let problems = match check_describe(raw) {
-        Ok(_) => return Ok(CompactionDiscovery::Served),
-        Err(problems) => problems,
-    };
-    let mut named = Vec::with_capacity(problems.len());
-    for problem in &problems {
-        named.push(match problem {
-            DescribeProblem::NotAnObject | DescribeProblem::Undecodable(_) => {
-                return Err(FetchMiss::invalid_answer(None));
-            }
-            DescribeProblem::MissingMajor { found } => {
-                json!({"problem": problem.name(), "found": found})
-            }
-            DescribeProblem::MissingOp(op) => json!({"problem": problem.name(), "op": op}),
-        });
-    }
-    Ok(CompactionDiscovery::NotServed(named))
-}
 
 /// Admit `plan`: fetch every provider it names through `fetcher`, all within `deadline` of now,
 /// and check the answers. `session` identifies warning records for unanswered fetches. Returns
 /// the manifest to freeze, or the refusal.
 ///
-/// Refusals, in the order they are decided: `invalid_params` naming `plan.compaction_item` when
-/// the plan's compaction provider answered a describe that does not serve the role (a
-/// permanent answer, so it outranks a miss elsewhere that a retry might clear);
-/// `fetch_unavailable` for the first provider (by id) whose required item, or whose compaction
-/// describe, did not answer; `plan_stale` listing every difference between what was answered
-/// and the plan; `tool_name_collision` for the first model-facing name offered twice.
+/// Refusals, in the order they are decided: `fetch_unavailable` for the first provider (by id)
+/// whose required catalog or declaration did not answer; `plan_stale` listing every difference
+/// between what was answered and the plan; `tool_name_collision` for the first model-facing
+/// name offered twice.
 pub async fn admit(
     plan: &Plan,
     fetcher: &dyn Fetcher,
@@ -1265,18 +1215,9 @@ pub async fn admit(
             }
         }
     }));
-    // Only a plan that names a compaction provider asks one anything; a plan without one opens
-    // no compaction route. Discovery sends `role.describe` alone, never Setup.
-    let compaction = async {
-        let item = plan.compaction_item.as_ref()?;
-        Some(
-            within_deadline(deadline, || fetcher.describe_compaction(&item.provider))
-                .await
-                .map_err(FetchMiss::from_error)
-                .and_then(|answer| classify_compaction_describe(&answer)),
-        )
-    };
-    let (catalogs, declarations, compaction) = futures::join!(catalogs, declarations, compaction);
+    // Compaction availability is established by the session's content-free v2
+    // Setup, not admission-time discovery. Legacy sessions never contact v1.
+    let (catalogs, declarations) = futures::join!(catalogs, declarations);
     let mut raw_answers = BTreeMap::new();
     let mut keepalive_promises = BTreeSet::new();
     let mut outcomes: BTreeMap<&str, Result<Fetched, FetchMiss>> = BTreeMap::new();
@@ -1435,30 +1376,6 @@ pub async fn admit(
             DeclarationOutcome::Answered { .. } => {}
         }
     }
-    let compaction_provider = plan
-        .compaction_item
-        .as_ref()
-        .map(|item| item.provider.as_str());
-    if let (Some(provider), Some(Err(missed))) = (compaction_provider, &compaction) {
-        missed.warn(session, &plan.identity, provider, DESCRIBE_OP);
-    }
-
-    // A compaction provider that said it does not serve the role will say so on every retry.
-    if let (Some(provider), Some(Ok(CompactionDiscovery::NotServed(problems)))) =
-        (compaction_provider, &compaction)
-    {
-        tracing::warn!(
-            target: "admission",
-            "compaction provider does not serve the role session={} provider={} op={}",
-            session.session,
-            provider,
-            DESCRIBE_OP,
-        );
-        return Err(Refusal::CompactionRoleNotServed {
-            provider: provider.to_owned(),
-            problems: problems.clone(),
-        });
-    }
 
     // A required item that did not answer refuses admission; an optional one is absent.
     let mut failures: BTreeMap<&str, (FetchMiss, &'static str)> = BTreeMap::new();
@@ -1477,11 +1394,6 @@ pub async fn admit(
                 .entry(&step.item.provider)
                 .or_insert_with(|| (missed.clone(), DECLARE_OP));
         }
-    }
-    if let (Some(provider), Some(Err(missed))) = (compaction_provider, &compaction) {
-        failures
-            .entry(provider)
-            .or_insert_with(|| (missed.clone(), DESCRIBE_OP));
     }
     if let Some((provider, (missed, op))) = failures.into_iter().next() {
         return Err(Refusal::FetchUnavailable {
@@ -1680,7 +1592,7 @@ pub async fn admit(
     let mut role_versions = BTreeMap::new();
     role_versions.insert("tool-provider".to_owned(), "v1".to_owned());
     if plan.compaction_item.is_some() {
-        role_versions.insert("compaction-provider".to_owned(), "v1".to_owned());
+        role_versions.insert("compaction-provider".to_owned(), "v2".to_owned());
     }
     if !plan.step_items.is_empty() {
         role_versions.insert("step-transform-provider".to_owned(), "v1".to_owned());
