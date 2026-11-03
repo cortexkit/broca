@@ -19,7 +19,8 @@
 # is the most expensive possible confusion during a placement.
 #
 # Usage: scripts/acceptance-turn.sh [expected-version]
-# Exits 0 only if the turn dispatched a tool, got a non-error result, and completed.
+# Exits 0 only if the turn dispatched a tool, got a success or the declared
+# folderless-route refusal, and completed. Scoped success is checked separately.
 
 set -euo pipefail
 
@@ -68,7 +69,8 @@ CONN="$HOME/.local/share/cortexkit/run/subc-connection.json"
 TOOLS='[{"name":"read","module":"aft","description":"Read a file from disk","input_schema":{"type":"object","properties":{"filePath":{"type":"string"}},"required":["filePath"]}}]'
 SID="acceptance-$(date +%s)-$$"
 OUT="$(mktemp)"
-trap 'rm -f "$OUT"' EXIT
+DESCRIPTION="$(mktemp)"
+trap 'rm -f "$OUT" "$DESCRIPTION"' EXIT
 
 # CANDIDATE MODELS, TRIED IN ORDER, AND THE LIST IS THE POINT.
 #
@@ -88,6 +90,14 @@ trap 'rm -f "$OUT"' EXIT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The tool and worker acceptance legs share defaults and the ACCEPTANCE_MODELS override.
 MODELS="${ACCEPTANCE_MODELS:-$(<"$SCRIPT_DIR/lib/acceptance-models.txt")}"
+
+if ! timeout 30 "$BIN" --subc "$CONN" --project-root "$PWD" --session "$SID" \
+    describe >"$DESCRIPTION" 2>"$OUT"; then
+  echo "acceptance-turn: cannot read role.describe" >&2
+  cat "$DESCRIPTION" "$OUT" >&2
+  exit 1
+fi
+NO_PROJECT="$(python3 "$SCRIPT_DIR/lib/acceptance_contract.py" probe "$DESCRIPTION")" || exit 2
 
 served=0
 refused=""
@@ -142,9 +152,14 @@ grep -aE "TOOL_CALL|TOOL_RESULT|RUN_FINISHED|FINAL_TEXT" "$OUT" | cut -c1-100 | 
 # Assert the three things that distinguish a served turn from a bind that went nowhere. A run
 # can reach RUN_FINISHED without ever dispatching, which is why the tool legs are separate.
 fail=0
-grep -aq "TOOL_CALL" "$OUT"              || { echo "acceptance-turn: NO TOOL DISPATCH" >&2; fail=1; }
-grep -aq "is_error=false" "$OUT"         || { echo "acceptance-turn: TOOL RESULT MISSING OR ERRORED" >&2; fail=1; }
-grep -aq "reason=Completed" "$OUT"       || { echo "acceptance-turn: RUN DID NOT COMPLETE" >&2; fail=1; }
+grep -aq '^TOOL_CALL ' "$OUT"            || { echo "acceptance-turn: NO TOOL DISPATCH" >&2; fail=1; }
+# Folderless routes intentionally refuse project tools on bind-no-project builds.
+# Only AFT's exact typed refusal proves the expected result path; other errors fail.
+python3 "$SCRIPT_DIR/lib/acceptance_contract.py" tool-result "$OUT" "$NO_PROJECT" || {
+  echo "acceptance-turn: TOOL RESULT MISSING OR ERRORED (only declared project_required is allowed)" >&2
+  fail=1
+}
+grep -aq '^RUN_FINISHED .*reason=Completed' "$OUT" || { echo "acceptance-turn: RUN DID NOT COMPLETE" >&2; fail=1; }
 
 # NO VERSION CHECK HERE, DELIBERATELY, AND THIS USED TO BE ONE.
 #
