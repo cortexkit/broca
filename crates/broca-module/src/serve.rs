@@ -3634,21 +3634,42 @@ impl ServeHandler for crate::LineageRegistry {
                 && records.first().is_some_and(|frame| frame.seq == 1)
                 && !broca_core::is_mode3_log(records.iter().map(|frame| &frame.record));
             if !complete_legacy {
-                let head = self.head(session).await?;
-                if row_read
-                    .as_ref()
-                    .is_some_and(|read| read.lineage_id.map(|id| id.to_string()) != head.lineage_id)
-                {
-                    return Err(ServeError::UnknownRun(run_id.0));
-                }
-                message.mid = broca_core::message_mid(
-                    head.mode3,
-                    head.lineage_id.as_deref(),
-                    message.ordinal - 1,
-                )
-                .map_err(|error| {
-                    ServeError::Open(error, Some(broca_protocol::ErrorClass::Permanent))
-                })?;
+                // An indexed run row already carries its lineage, validated against the log
+                // when it was read, and its own records start at its RunStarted, whose plan
+                // version says whether the log is mode 3. Only a row without its start reads
+                // the head.
+                let row_identity = row_read.as_ref().and_then(|read| {
+                    read.records
+                        .iter()
+                        .any(|frame| {
+                            matches!(frame.record, broca_wal::WalRecord::RunStarted { .. })
+                        })
+                        .then(|| {
+                            (
+                                broca_core::is_mode3_log(
+                                    read.records.iter().map(|frame| &frame.record),
+                                ),
+                                read.lineage_id.map(|id| id.to_string()),
+                            )
+                        })
+                });
+                let (mode3, lineage) = match row_identity {
+                    Some(identity) => identity,
+                    None => {
+                        let head = self.head(session).await?;
+                        if row_read.as_ref().is_some_and(|read| {
+                            read.lineage_id.map(|id| id.to_string()) != head.lineage_id
+                        }) {
+                            return Err(ServeError::UnknownRun(run_id.0));
+                        }
+                        (head.mode3, head.lineage_id)
+                    }
+                };
+                message.mid =
+                    broca_core::message_mid(mode3, lineage.as_deref(), message.ordinal - 1)
+                        .map_err(|error| {
+                            ServeError::Open(error, Some(broca_protocol::ErrorClass::Permanent))
+                        })?;
             }
             directives = completed_directives(&records, &run_id, &message.text);
             Some(message)

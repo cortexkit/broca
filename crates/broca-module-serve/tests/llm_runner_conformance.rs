@@ -3932,7 +3932,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "retention_honoured",
         "retention_run_status_expired",
         "retention_no_content_served",
-        "retention_shorten_continues_lineage",
+        "retention_shorten_continues_history_version",
         "retention_equal_noop",
         "retention_lengthen_refused",
         "retention_late_opt_in_refused",

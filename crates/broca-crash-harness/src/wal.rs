@@ -185,6 +185,10 @@ impl ObservedWalStore {
 // test in tests/it/observed_wal_fidelity.rs compares these impls with FileWalStore's and
 // FileWal's, so a new production override cannot be missed here silently.
 impl WalStore for ObservedWalStore {
+    fn served_history(&self) -> Option<Arc<dyn broca_core::ServedHistory>> {
+        WalStore::served_history(self.inner.as_ref())
+    }
+
     fn bind_recovery_projection(
         &self,
         session: Option<&BindIdentity>,
