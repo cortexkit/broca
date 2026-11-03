@@ -2,8 +2,6 @@
 mod delivery_rig;
 #[path = "media_runtime/head_cost.rs"]
 mod head_cost;
-#[path = "media_runtime/idle_compaction.rs"]
-mod idle_compaction;
 #[path = "media_runtime/refusals.rs"]
 mod refusals;
 

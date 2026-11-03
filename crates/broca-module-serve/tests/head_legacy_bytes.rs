@@ -49,10 +49,13 @@ async fn populated_head_preserves_pre_addition_reply_bytes() {
     assert_eq!(head.header.ty, subc_protocol::FrameType::Response);
     let answer = result(&head);
     assert!(answer["updated_at"].is_u64());
-    assert!(answer["lineage_id"].is_string());
-    assert_eq!(answer["last_ordinal"], 1);
-    assert_eq!(answer["first_ordinal"], 0);
-    assert_eq!(answer["history_version"], 0);
+    assert!(answer["incarnation"].is_string());
+    assert!(answer.get("lineage_id").is_none());
+    // llm-runner 0.8 ordinals are the stored position plus one, and a history that has been
+    // served gets a version above every version served before.
+    assert_eq!(answer["last_ordinal"], 2);
+    assert_eq!(answer["first_ordinal"], 1);
+    assert!(answer["history_version"].as_u64().unwrap() > 0);
     assert_eq!(answer["head"], json!({"wal_seq":3,"sub_index":0}));
     assert_eq!(
         answer["last_run_state"],
@@ -82,14 +85,18 @@ async fn populated_head_preserves_pre_addition_reply_bytes() {
     );
     bytes = bytes.replace(
         &format!(
-            "\"lineage_id\":\"{}\"",
-            answer["lineage_id"].as_str().unwrap()
+            "\"incarnation\":\"{}\"",
+            answer["incarnation"].as_str().unwrap()
         ),
-        "\"lineage_id\":\"@LOG_ID@\"",
+        "\"incarnation\":\"@LOG_ID@\"",
     );
     bytes = bytes.replace(
         &format!("\"updated_at\":{}", answer["updated_at"].as_u64().unwrap()),
         "\"updated_at\":\"@UPDATED_AT@\"",
+    );
+    bytes = bytes.replace(
+        &format!("\"history_version\":{}", answer["history_version"].as_u64().unwrap()),
+        "\"history_version\":\"@HISTORY_VERSION@\"",
     );
     bytes = bytes.replace("legacy-run", "@RUN_ID@");
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
