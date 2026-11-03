@@ -18,7 +18,7 @@
 //! per-route in-flight to the window via a per-route semaphore (permit held from
 //! send to terminal). A Serial provider therefore serializes instead of erroring.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -712,6 +712,9 @@ pub struct SubcToolPlane {
     default_module_id: Option<String>,
     /// Private routing for a single Direct carrier; never stored in the durable conversation identity.
     direct_carrier_scope: Option<ScopeSelector>,
+    /// Standalone callers select one provider's preset without changing daemon plan admission.
+    direct_tool_item: Option<broca_fetch_plan::plan::Item>,
+    direct_schema_pins: Mutex<BTreeMap<String, broca_core::tool_plane::DispatchSchemaPin>>,
     routes: Mutex<HashMap<RouteKey, RouteState>>,
     batch_routes: Mutex<BatchRouteMap>,
     batch_presets: Mutex<HashMap<BatchRouteKey, ToolManifest>>,
@@ -985,6 +988,23 @@ impl SubcToolPlane {
         plane
     }
 
+    /// Select a standalone caller's default provider preset. Other providers keep their own
+    /// frozen plan presets; the selection never becomes a process-wide default.
+    pub fn with_direct_tool_preset(mut self, preset: impl Into<String>) -> Self {
+        self.direct_schema_pins.get_mut().unwrap().clear();
+        self.direct_tool_item =
+            self.default_module_id
+                .as_ref()
+                .map(|provider| broca_fetch_plan::plan::Item {
+                    provider: provider.clone(),
+                    preset: Some(preset.into()),
+                    params: Default::default(),
+                    optional: false,
+                    output_refs: false,
+                });
+        self
+    }
+
     fn with_connection(conn: Arc<dyn ToolPlaneConnection>, module_id: impl Into<String>) -> Self {
         let module_id = module_id.into();
         let default_module_id = (!module_id.trim().is_empty()).then_some(module_id);
@@ -1000,6 +1020,8 @@ impl SubcToolPlane {
             conn,
             default_module_id,
             direct_carrier_scope: None,
+            direct_tool_item: None,
+            direct_schema_pins: Mutex::new(BTreeMap::new()),
             routes: Mutex::new(HashMap::new()),
             batch_routes: Mutex::new(HashMap::new()),
             batch_presets: Mutex::new(HashMap::new()),
@@ -1078,6 +1100,12 @@ impl SubcToolPlane {
             .unwrap()
             .get(&Self::batch_route_key(ctx))
             .and_then(|manifest| manifest.provider_preset(module_id).map(str::to_owned))
+            .or_else(|| {
+                self.direct_tool_item
+                    .as_ref()
+                    .filter(|item| item.provider == module_id)
+                    .and_then(|item| item.preset.clone())
+            })
     }
 
     /// Override only this runner plane's wait in the test process, not the remote daemon.
@@ -1251,6 +1279,46 @@ impl SubcToolPlane {
                 _ = sleep(warm_bind_backoff(attempt)) => {}
             }
         }
+    }
+
+    /// Discover a standalone preset's tools on its tool route. Without a preset, preserve
+    /// registration-based discovery, which does not require a provider catalog RPC.
+    pub async fn tools_from_catalog_for_bind(
+        &self,
+        bind: &BindIdentity,
+        bind_timeout: Duration,
+    ) -> Result<Vec<broca_protocol::request::Tool>, ToolPlaneError> {
+        let Some(item) = &self.direct_tool_item else {
+            return self.tools_from_catalog().await;
+        };
+        self.warm_bind(bind, bind_timeout).await?;
+        let (route, _) = self
+            .ensure_route(bind, None, &item.provider, &ToolOpenGuard::default())
+            .await?;
+        let request = broca_fetch_plan::admit::tool_catalog_request(Some(item));
+        let arguments = serde_json::to_value(request)
+            .map_err(|error| ToolPlaneError::Unavailable(error.to_string()))?;
+        let answer = self
+            .conn
+            .tool_call(
+                &route,
+                broca_fetch_plan::CATALOG_OP,
+                &arguments,
+                None,
+                broca_fetch_plan::ADMISSION_DEADLINE,
+                item.preset.as_deref(),
+            )
+            .await
+            .map_err(conn_to_plane)?;
+        let catalog = broca_fetch_plan::admit::decode_tool_catalog(&item.provider, answer)
+            .map_err(|error| {
+                ToolPlaneError::Unavailable(format!(
+                    "read {} tool.catalog: {error:?}",
+                    item.provider
+                ))
+            })?;
+        *self.direct_schema_pins.lock().unwrap() = catalog.schema_pins;
+        Ok(catalog.tools)
     }
 
     /// Build the loop's tool set from what the target module ACTUALLY registers in
@@ -3609,18 +3677,22 @@ impl ToolPlane for SubcToolPlane {
         tool: &str,
     ) -> Option<broca_core::tool_plane::DispatchSchemaPin> {
         let module = self.dispatch_target_inner(ctx, id)?;
-        // Only an admitted plan supplies the provider's schema digest and semantics.
-        // Legacy direct tools and old manifests keep an unknown pin; consulting a
-        // later catalog would invent history and add a new refusing RPC to dispatch.
+        // Use the admitted plan or standalone discovery snapshot, never a catalog fetched
+        // during dispatch: a later schema must not change the identity of a composed call.
         self.batch_manifests
             .lock()
             .unwrap()
-            .get(&Self::batch_route_key(ctx))?
-            .provider_declarations(&module)?
-            .schema_pins
-            .as_ref()?
-            .get(tool)
+            .get(&Self::batch_route_key(ctx))
+            .and_then(|manifest| manifest.provider_declarations(&module))
+            .and_then(|declarations| declarations.schema_pins.as_ref())
+            .and_then(|pins| pins.get(tool))
             .cloned()
+            .or_else(|| {
+                self.direct_tool_item
+                    .as_ref()
+                    .filter(|item| item.provider == module)?;
+                self.direct_schema_pins.lock().unwrap().get(tool).cloned()
+            })
     }
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
         self.dispatch_inner(ctx, call, None, &ToolOpenGuard::default())
@@ -4284,6 +4356,7 @@ mod tests {
         /// request counts as sent and its route closes under it.
         close_during_call: Mutex<bool>,
         dispatched_presets: Mutex<Vec<Option<String>>>,
+        dispatched_schema_pins: Mutex<Vec<Option<String>>>,
         dispatched_deadlines: Mutex<Vec<Duration>>,
         dispatched_arguments: Mutex<Vec<serde_json::Value>>,
         /// Real per-module availability gates, installed by tests that prove waiting
@@ -4330,6 +4403,7 @@ mod tests {
                 closed: Mutex::new(Default::default()),
                 close_during_call: Mutex::new(false),
                 dispatched_presets: Mutex::new(Vec::new()),
+                dispatched_schema_pins: Mutex::new(Vec::new()),
                 dispatched_deadlines: Mutex::new(Vec::new()),
                 dispatched_arguments: Mutex::new(Vec::new()),
                 gates: Mutex::new(HashMap::new()),
@@ -4519,6 +4593,37 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("test must script every tool-call response")
+        }
+
+        async fn tool_call_staged(
+            &self,
+            route: &RouteHandle,
+            call: &ToolCall,
+            deadline: crate::connection::ToolReplyDeadline,
+            preset: Option<&str>,
+            _call_key: Option<&str>,
+            schema_pin: Option<&str>,
+            signals: &broca_core::tool_plane::DispatchSignals,
+        ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+            if signals.interrupted() {
+                return Err(crate::connection::ApprovedCallError::BeforePush(
+                    crate::connection::ApprovedSetupError::Interrupted,
+                ));
+            }
+            self.dispatched_schema_pins
+                .lock()
+                .unwrap()
+                .push(schema_pin.map(str::to_owned));
+            self.tool_call(
+                route,
+                &call.tool_name,
+                &call.input,
+                Some(&call.tool_call_id.0),
+                deadline.duration,
+                preset,
+            )
+            .await
+            .map_err(crate::connection::ApprovedCallError::AfterPush)
         }
 
         async fn server_capabilities(&self) -> Result<Vec<String>, ConnError> {

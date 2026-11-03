@@ -45,7 +45,7 @@ fn command(root: &Path, scoped: bool) -> Command {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     if scoped {
-        command.args(["--scope", "rig/run/1"]);
+        command.args(["--scope", "rig/run/1", "--preset", "worker"]);
     }
     command
 }

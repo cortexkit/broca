@@ -212,7 +212,7 @@ impl Rig {
         )
         .unwrap();
         command.args(["--model","mock","--prompt","use echo then finish","--scope"])
-            .arg(format!("{OWNER}/carrier-run/1")).arg("--subc").arg(connection)
+            .arg(format!("{OWNER}/carrier-run/1")).args(["--preset", "worker"]).arg("--subc").arg(connection)
             .arg("--base-url").arg(url).arg("--project-root").arg(&self.local_project)
             .args(["--session","carrier-test","--max-steps","2","--json-events","--tools"])
             .arg(json!([{"name":"echo","description":"echo","input_schema":{"type":"object"},"execution_mode":"parallel"}]).to_string())

@@ -489,7 +489,8 @@ pub fn catalog_request(
     request
 }
 
-fn tool_catalog_request(tool_item: Option<&Item>) -> CatalogRequest {
+/// Build a tool-only catalog request, also used by standalone callers without a composition.
+pub fn tool_catalog_request(tool_item: Option<&Item>) -> CatalogRequest {
     let mut request = CatalogRequest::new(
         tool_item
             .map(|item| item.params.clone())
@@ -822,6 +823,37 @@ fn decode_answer(value: Value, text_asked: bool) -> Result<Fetched, FetchMiss> {
         None
     };
     Ok(Fetched { answer, text })
+}
+
+/// A standalone caller's catalog snapshot. Pins come from the provider's answer, not from
+/// recomputing schema identities locally, just as they do for an admitted session.
+pub struct ToolCatalog {
+    pub tools: Vec<Tool>,
+    pub schema_pins: BTreeMap<String, broca_wal::DispatchSchemaPin>,
+}
+
+/// Decode standalone tool discovery with the same validation and mappings as plan admission.
+pub fn decode_tool_catalog(provider: &str, value: Value) -> Result<ToolCatalog, FetchError> {
+    let fetched = decode_answer(value, false).map_err(|miss| {
+        FetchError::provider_refused(
+            INVALID_ANSWER.into(),
+            miss.provider_detail(CATALOG_OP),
+            "invalid tool.catalog answer",
+            false,
+        )
+    })?;
+    let schema_pins = frozen_provider_declarations(&fetched.answer, false)
+        .and_then(|declarations| declarations.schema_pins)
+        .unwrap_or_default();
+    Ok(ToolCatalog {
+        tools: fetched
+            .answer
+            .tools
+            .iter()
+            .map(|tool| session_tool(provider, tool))
+            .collect(),
+        schema_pins,
+    })
 }
 
 /// Refuse a catalog whose reference slots break the catalog's own rules
