@@ -689,6 +689,7 @@ pub(crate) fn indexed_run_state(
     let use_index_metadata = row.usage.is_some() && row.state != RunIndexState::Interrupted;
     let use_wal_error = !use_index_metadata || row.state == RunIndexState::Error;
     Ok(Some(ReconciledRunState {
+        finish: reconciled.as_ref().and_then(|state| state.finish.clone()),
         account_limit_pause: None,
         context_ceiling: reconciled
             .as_ref()
@@ -1104,6 +1105,7 @@ enum StartRunFailure {
 /// The send key a run or queued submission is admitted under, as its WAL record will carry it.
 #[derive(Debug, Clone, Default)]
 struct SendIdentity {
+    display_sent_by: Option<broca_protocol::BindPrincipal>,
     conversation_key: Option<String>,
     /// The caller's title, written on the record this send writes (`RunStarted`, `Queued` or
     /// `Steered`). Deliberately absent from `request_identity_digest`: a title labels the send
@@ -3187,6 +3189,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     RunKind::FreshOrResume,
                     None,
                     SendIdentity {
+                        display_sent_by: None,
                         title: None,
                         conversation_key: None,
                         send_id: None,
@@ -3234,6 +3237,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     RunKind::FreshOrResume,
                     None,
                     SendIdentity {
+                        display_sent_by: None,
                         title: None,
                         conversation_key: None,
                         send_id: None,
@@ -3301,6 +3305,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     RunKind::FreshOrResume,
                     None,
                     SendIdentity {
+                        display_sent_by: None,
                         title: None,
                         conversation_key: None,
                         send_id: None,
@@ -3443,6 +3448,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     RunKind::FreshOrResume,
                     None,
                     SendIdentity {
+                        display_sent_by: None,
                         title: None,
                         conversation_key: None,
                         send_id: None,
@@ -3594,6 +3600,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // the frozen scope (its tool routes carry the owner's) and never freezes, adopts or
         // reopens one. The sender itself is recorded only on its `DeliveryOrdered` record.
         self.admitting_sent_by = None;
+        let incoming_legacy_delivery = self.admitting_order.is_none();
         // A plan-named sender may also send a legacy string `delivery` (llm-runner 0.5.2 §9.7):
         // `queue` and `steer` stand for the lists `[idle_start]` and `[steer, idle_start]` and
         // are admitted and delivered exactly as those lists, through the ordered path below;
@@ -3625,17 +3632,46 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 request.scope = broca_protocol::SendScope::Internal;
             }
         }
-        let run_id = if let (Some(sender), Some(send_id), true) = (
-            self.admitting_sent_by.clone(),
+        let mut borrowing_legacy_steer = false;
+        let run_id = if let (
+            Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }),
+            Some(send_id),
+        ) = (
+            self.admitting_sent_by
+                .clone()
+                .or_else(|| request.principal.clone()),
             key.send_id(),
-            self.admitting_order.is_some(),
         ) {
             let records = match self.read_wal_records().await {
                 Ok(records) => records,
                 Err(error) => return SendOutcome::Error(error),
             };
-            match crate::send_fate::resolve_sender_run_id(&records, &run_id, send_id, &sender) {
-                Ok(run_id) => run_id,
+            let ownership = match self.load_ownership().await {
+                Ok(ownership) => ownership,
+                Err(error) => return SendOutcome::Error(error),
+            };
+            match crate::send_fate::resolve_retry_run_id(
+                &records,
+                &run_id,
+                send_id,
+                &sender,
+                &ownership.effective_senders(),
+            ) {
+                Ok((run_id, retry_sender)) => {
+                    borrowing_legacy_steer = retry_sender != sender
+                        && crate::send_fate::legacy_steer_sender(&records, &run_id, send_id)
+                            == Some(&retry_sender);
+                    if retry_sender != sender
+                        && incoming_legacy_delivery
+                        && crate::send_fate::legacy_steers_allowed(&records, &run_id)
+                    {
+                        // The send resolved to run_id has no DeliveryOrdered record. Compare
+                        // its retry against the original wire delivery string, not the list
+                        // derived only for named-sender grant checks.
+                        self.admitting_order = None;
+                    }
+                    run_id
+                }
                 Err(error) => return SendOutcome::Error(error),
             }
         } else {
@@ -3861,8 +3897,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // A key already used by a steer is answered from that steer's record: a steer opens no
         // episode of its own, so the run-id lookup below cannot find it. This also refuses a
         // later send of another mode under the same key, naming `delivery`.
+        // `succeeds` names another module whose receipts the latest accepted plan lets this
+        // caller read. A legacy Steered receipt enters this comparison only when
+        // `recorded_send_sender` assigns it to that named module; it cannot be delivered again.
         if let (true, Some(send_id), Some(request_digest)) = (
-            self.admitting_sent_by.is_none(),
+            self.admitting_sent_by.is_none() || borrowing_legacy_steer,
             key.send_id(),
             request_identity_digest.as_deref(),
         ) {
@@ -4111,6 +4150,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
 
         let identity = SendIdentity {
+            display_sent_by: self
+                .admitting_sent_by
+                .clone()
+                .or_else(|| request.principal.clone()),
             conversation_key,
             // A retry that resumes its own unfinished episode writes no `RunStarted`; that episode
             // keeps the title its first send recorded, whatever title the retry carries.
@@ -4679,6 +4722,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         writer.record(WalRecord::InputTokenCapFrozen { limit });
                     }
                     writer.record(WalRecord::Steered {
+                        sent_by: identity.display_sent_by,
                         written_at_ms: self.message_timestamp(),
                         tags: None,
                         retention: self.admitting_retention,
@@ -4815,6 +4859,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let input = prepared.input.clone();
         let writer = Arc::clone(self.writer.as_ref().expect("writer live while open"));
         let record = WalRecord::Steered {
+            sent_by: identity.display_sent_by.clone(),
             written_at_ms: self.message_timestamp(),
             tags: None,
             retention: self.admitting_retention,
@@ -5091,6 +5136,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             input_delivery,
         } = flags;
         let SendIdentity {
+            display_sent_by,
             conversation_key,
             title,
             send_id,
@@ -5485,6 +5531,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         );
         let step_progress = Arc::new(std::sync::Mutex::new(None));
         let control = RunControl {
+            display_sent_by,
             emit_display_context: true,
             step_progress: Some(Arc::clone(&step_progress)),
             clock: self
@@ -5869,6 +5916,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             return SendOutcome::Transient("module is stopping".into());
         }
         let SendIdentity {
+            display_sent_by,
             conversation_key,
             title,
             send_id,
@@ -5987,6 +6035,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         request.staged_uploads = None;
         let principal = request.principal.clone();
         let pending = PendingSubmission {
+            display_sent_by: display_sent_by.clone(),
             admitted_at_ms: self.message_timestamp(),
             hooks: hooks.clone(),
             conversation_key: conversation_key.clone(),
@@ -6006,6 +6055,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // surviving a crash.
         let writer = self.writer.as_ref().expect("writer live while open");
         let queued = writer.record(WalRecord::Queued {
+            sent_by: display_sent_by,
             written_at_ms: pending.admitted_at_ms,
             retention: self.admitting_retention,
             ts_ms: self.retention_timestamp(),
@@ -6058,7 +6108,23 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         let used = self.recorded_send_keys.contains_key(run_id)
             || self.ordered_submissions.contains_key(&submission_id);
-        Ok(used && self.ordered_submissions.get(&submission_id) != self.admitting_order.as_ref())
+        let role_order = |order: &broca_protocol::DeliveryOrder| {
+            let mut published =
+                cortexkit_role_llm_runner::delivery_order::DeliveryOrder::new(order.modes.clone());
+            published.dedupe_key = order.dedupe_key.clone();
+            published.expires_at_ms = order.expires_at_ms;
+            published.template = order.template.clone();
+            published
+        };
+        let same = match (
+            self.ordered_submissions.get(&submission_id),
+            self.admitting_order.as_ref(),
+        ) {
+            (Some(earlier), Some(retry)) => role_order(retry).same_payload(&role_order(earlier)),
+            (None, None) => true,
+            _ => false,
+        };
+        Ok(used && !same)
     }
 
     /// How a send with a legacy string `delivery` is admitted: from the session's owner (or a
@@ -6294,16 +6360,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         let request_scope = request.scope.clone();
         // A retry with the same `send_id` is the same send: answer what became of it.
-        if let Some(existing) = self
+        if self
             .pending_fifo
             .iter()
-            .find(|pending| pending.submission_id == submission_id)
+            .any(|pending| pending.submission_id == submission_id)
         {
-            if existing.order.as_ref() != Some(&order) {
-                return SendOutcome::SendIdReuse {
-                    differing: "delivery",
-                };
-            }
             return SendOutcome::Pending { submission_id };
         }
         if identity.send_id.is_some() {
@@ -6442,6 +6503,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
         request.staged_uploads = None;
         let SendIdentity {
+            display_sent_by,
             conversation_key,
             title,
             send_id,
@@ -6451,6 +6513,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let principal = request.principal.clone();
         let pending = PendingSubmission {
             admitted_at_ms: self.message_timestamp(),
+            display_sent_by: display_sent_by.clone(),
             hooks: hooks.clone(),
             conversation_key: conversation_key.clone(),
             delivery: None,
@@ -6469,6 +6532,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             unreachable!("an ordered pending entry has an order");
         };
         let queued = WalRecord::Queued {
+            sent_by: display_sent_by,
             written_at_ms: pending.admitted_at_ms,
             retention: self.admitting_retention,
             ts_ms: self.retention_timestamp(),
@@ -7667,6 +7731,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             RunKind::FreshOrResume,
             None,
             SendIdentity {
+                display_sent_by: None,
                 title: None,
                 conversation_key: None,
                 send_id: None,
@@ -7769,6 +7834,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                             .unwrap_or_default()
                     };
                 return Ok(Some(ReconciledRunState {
+                    finish: None,
                     account_limit_pause: None,
                     run_usage,
                     held_calls,
@@ -8104,6 +8170,25 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // `queue_submission` derives `sub-<run_id>`, so stripping that coordinator prefix
             // recovers the identity selected by the idle-send path.
             let run_id = run_id_of_queued(&first.submission_id);
+            // Admission checkpoints omit display provenance. Recover it only from sent_by
+            // on the Queued record: principal can name the session owner executing delegated
+            // input, rather than the route that supplied that input.
+            let display_sent_by = match first.display_sent_by.clone() {
+                Some(sender) => Some(sender),
+                None => {
+                    self.read_wal_records()
+                        .await?
+                        .into_iter()
+                        .find_map(|record| match record {
+                            WalRecord::Queued {
+                                submission_id,
+                                sent_by,
+                                ..
+                            } if submission_id == first.submission_id => sent_by,
+                            _ => None,
+                        })
+                }
+            };
             let submission_id = first.submission_id;
             let skip_materialization = self
                 .skip_materialization_submissions
@@ -8137,6 +8222,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     // was queued with, taken from its `Queued` record when the queue was rebuilt
                     // after a restart.
                     SendIdentity {
+                        display_sent_by,
                         conversation_key: first.conversation_key,
                         title: first.title,
                         send_id: first.send_id,
@@ -10277,6 +10363,7 @@ mod tests {
             // normally. The guard's terminal is suppressed by the seam, so this clean
             // return delivers NOTHING to the actor — only the backstop can recover it.
             let _ = job.writer.record(broca_wal::WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -10333,6 +10420,7 @@ mod tests {
         let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
         let mut records = vec![
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -10357,6 +10445,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -10497,6 +10586,7 @@ mod tests {
             let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
             let mut records = vec![
                 WalRecord::RunStarted {
+                    sent_by: None,
                     written_at_ms: None,
                     tags: None,
                     session_class: None,
@@ -10521,6 +10611,7 @@ mod tests {
                     submission_id: None,
                 },
                 WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -11641,6 +11732,7 @@ mod tests {
             .collect();
         let mut records = vec![
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -11667,6 +11759,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -12038,6 +12131,7 @@ mod tests {
         };
         vec![
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -12064,6 +12158,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -12762,6 +12857,7 @@ mod tests {
             let mut config = min_config();
             config.tools_were_omitted = job.control.tools_were_omitted;
             job.writer.record(WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -12823,6 +12919,7 @@ mod tests {
             _out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             let _ = job.writer.record(broca_wal::WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -12889,6 +12986,7 @@ mod tests {
             out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -13117,6 +13215,7 @@ mod tests {
 
             if ordinal == 1 {
                 job.writer.record(WalRecord::RunStarted {
+                    sent_by: None,
                     written_at_ms: None,
                     tags: None,
                     session_class: None,
@@ -13254,6 +13353,7 @@ mod tests {
         ) -> Result<RunSummary, RunError> {
             let ordinal = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
             job.writer.record(WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -13360,6 +13460,7 @@ mod tests {
             // would discard its held-call metadata before status can observe the live wait.
             if !self.preserve_held_prefix {
                 job.writer.record(WalRecord::RunStarted {
+                    sent_by: None,
                     written_at_ms: None,
                     tags: None,
                     session_class: None,
@@ -13578,6 +13679,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -13620,6 +13722,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::Queued {
+                sent_by: None,
                 written_at_ms: None,
                 retention: None,
                 ts_ms: None,
@@ -14182,6 +14285,7 @@ mod tests {
             // The recovery run continues the episode the failed run left open.
             if ordinal <= 2 {
                 job.writer.record(WalRecord::RunStarted {
+                    sent_by: None,
                     written_at_ms: None,
                     tags: None,
                     session_class: None,
@@ -14419,6 +14523,7 @@ mod tests {
             out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -14791,6 +14896,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -14883,6 +14989,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -15210,6 +15317,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::Queued {
+                sent_by: None,
                 written_at_ms: None,
                 retention: None,
                 ts_ms: None,
@@ -15290,6 +15398,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::Queued {
+                sent_by: None,
                 written_at_ms: None,
                 retention: None,
                 ts_ms: None,
@@ -15560,6 +15669,7 @@ mod import_idempotency_tests {
             _out: tokio::sync::mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -15656,6 +15766,7 @@ mod import_idempotency_tests {
         let writer =
             WalHandle::spawn(wal_store.open(&key).expect("open WAL"), 1).expect("spawn WAL writer");
         writer.record(broca_wal::WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -15680,6 +15791,7 @@ mod import_idempotency_tests {
             submission_id: None,
         });
         writer.record(broca_wal::WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -16389,6 +16501,7 @@ mod owned_cut_tests {
             _out: tokio::sync::mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,

@@ -12,6 +12,8 @@
 //! [`refusal::Refusal`]. Nothing in this crate writes.
 
 pub mod admit;
+mod keepalive_discovery;
+pub use keepalive_discovery::health as keepalive_discovery_health;
 pub mod plan;
 pub mod refusal;
 pub mod session_change;

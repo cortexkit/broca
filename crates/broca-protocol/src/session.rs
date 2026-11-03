@@ -1,8 +1,7 @@
 //! The runner's session identity — its OWN type, so the loop stays provider- and
-//! transport-agnostic. It mirrors subc's `BindIdentity` field-for-field
-//! ((project_root, harness, session)), but the loop crate does NOT depend on
-//! subc's wire types; the subc tool-plane adapter maps this onto
-//! `subc_protocol::BindIdentity` at its boundary.
+//! transport-agnostic. Its storage triple is `(project_root, harness, session)`;
+//! unlike subc's wire bind it retains the resolved storage root. The subc adapter
+//! sends only harness/session at its boundary, with project attribution carried by scope.
 
 use std::path::PathBuf;
 

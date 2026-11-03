@@ -42,6 +42,634 @@ async fn one_tool_turn(tag: &str) -> (Rig, String) {
     (rig, run_id)
 }
 
+fn native_finish_events(
+    raw: Option<&str>,
+    legacy: broca_protocol::FinishReason,
+    content: Vec<ContentBlock>,
+) -> Vec<broca_protocol::NormalizedEvent> {
+    use broca_protocol::{AssistantMessage, MessageId, NormalizedEvent, ProviderControl, Usage};
+    vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: AssistantMessage {
+                message_id: MessageId("native-finish".into()),
+                content,
+            },
+        }),
+        NormalizedEvent::Control(
+            serde_json::from_value(serde_json::json!({
+                "type":"step_finished", "step_id":1, "usage":{},
+                "finish_reason":legacy, "raw_finish_reason":raw,
+            }))
+            .unwrap(),
+        ),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: Usage::default(),
+            finish_reason: legacy,
+            retries_used: 0,
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn message_senders_preserve_attested_owner_on_fresh_and_steered_rows() {
+    let mut rig = Rig::start("message-sender-steer").await;
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "actual-route".into(),
+        }),
+    )
+    .await;
+    rig.script
+        .push(&[Step::Call("sender-call"), Step::Text("answer")]);
+    rig.script.hold_tool(true);
+    let started = rig.send("sender-start", "fresh", None).await;
+    assert_eq!(result(&started)["state"], "active");
+    rig.wait_entered().await;
+    let joined = rig.send("sender-join", "steered", Some("steer")).await;
+    assert_eq!(result(&joined)["state"], "active");
+    rig.script.hold_tool(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig = rig.restart().await;
+    let history = call(
+        &mut rig,
+        "session.history",
+        serde_json::json!({"form":"display"}),
+    )
+    .await;
+    let page = result(&history);
+    let users: Vec<_> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["row"]["role"] == "user")
+        .collect();
+    assert_eq!(users.len(), 2);
+    for user in users {
+        assert_eq!(user["row"]["sender"], "actual-route", "{user}");
+    }
+    for entry in page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["row"]["role"] != "user")
+    {
+        assert!(entry["row"].get("sender").is_none());
+    }
+    capture_sender_samples(&rig, &page, "owner-steer");
+    let read = call(&mut rig, "session.read", serde_json::json!({})).await;
+    assert!(!String::from_utf8(read.body).unwrap().contains("\"sender\""));
+    rig.finish().await;
+}
+
+struct DisplaySenderPlan;
+
+#[async_trait::async_trait]
+impl broca_fetch_plan::PlanAdmitter for DisplaySenderPlan {
+    async fn admit(
+        &self,
+        plan: &broca_fetch_plan::Plan,
+        _session: &broca_protocol::BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
+    ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
+        Ok(broca_fetch_plan::Admitted {
+            manifest: broca_wal::PlanManifest {
+                rich_ui: None,
+                plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+                plan_identity: plan.identity.clone(),
+                composition_digest: plan.composition_digest.clone(),
+                fetches: vec![],
+                tools: std::sync::Arc::new(vec![]),
+                system_text: String::new(),
+                system_digest: String::new(),
+                join_version: 1,
+                role_versions: Default::default(),
+                declarations: vec![],
+            },
+        })
+    }
+}
+
+async fn sender_history(rig: &mut Rig) -> serde_json::Value {
+    let frame = call(
+        rig,
+        "session.history",
+        serde_json::json!({"form":"display"}),
+    )
+    .await;
+    result(&frame)
+}
+
+fn assert_display_sender(page: &serde_json::Value, text: &str, sender: &str) {
+    let rows: Vec<_> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["row"]["role"] == "user" && entry["row"]["text"] == text)
+        .collect();
+    assert_eq!(rows.len(), 1, "{text}: {page}");
+    assert_eq!(rows[0]["row"]["sender"], sender, "{text}: {page}");
+}
+
+fn capture_sender_samples(rig: &Rig, page: &serde_json::Value, name: &str) {
+    let Some(root) = std::env::var_os("BROCA_SENDER_SAMPLES") else {
+        return;
+    };
+    use sha2::{Digest, Sha256};
+    let root = std::path::PathBuf::from(root).join(name);
+    std::fs::create_dir_all(&root).unwrap();
+    let bytes = serde_json::to_vec(page).unwrap();
+    std::fs::write(root.join("history.json"), &bytes).unwrap();
+    let mut sums = format!("{:x}  history.json\n", Sha256::digest(&bytes));
+    let mut written = std::collections::BTreeSet::new();
+    for record in rig.records().into_iter().rev() {
+        if name == "matrix"
+            && !matches!(&record,
+            broca_wal::WalRecord::RunStarted { sent_by: Some(broca_protocol::BindPrincipal::Reserved { module_id }), .. }
+            | broca_wal::WalRecord::Queued { sent_by: Some(broca_protocol::BindPrincipal::Reserved { module_id }), .. }
+            if module_id == "named")
+        {
+            continue;
+        }
+        let kind = match &record {
+            broca_wal::WalRecord::RunStarted {
+                sent_by: Some(_), ..
+            } => "run-started",
+            broca_wal::WalRecord::Queued {
+                sent_by: Some(_), ..
+            } => "queued",
+            broca_wal::WalRecord::Steered {
+                sent_by: Some(_), ..
+            } => "steered",
+            _ => continue,
+        };
+        if !written.insert(kind) {
+            continue;
+        }
+        let json = serde_json::to_vec(&record).unwrap();
+        let frame = broca_wal::framing::encode_v4(
+            broca_wal::framing::v4::Metadata {
+                seq: 7,
+                fence: 3,
+                appended_ms: 123,
+                writer_id: [5; 16],
+            },
+            &[],
+            &record,
+        )
+        .unwrap();
+        for (extension, bytes) in [("json", json), ("v4", frame)] {
+            let filename = format!("{kind}.{extension}");
+            std::fs::write(root.join(&filename), &bytes).unwrap();
+            sums.push_str(&format!("{:x}  {filename}\n", Sha256::digest(&bytes)));
+        }
+    }
+    std::fs::write(root.join("SHA256SUMS"), sums).unwrap();
+}
+
+#[tokio::test]
+async fn message_senders_cover_named_start_join_interrupt_template_and_queue_restart() {
+    use cortexkit_role_llm_runner::delivery_order::{template_digest, Template};
+    let mut rig = Rig::start("message-sender-matrix").await;
+    rig.registry()
+        .set_plan_admitter(std::sync::Arc::new(DisplaySenderPlan));
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "owner".into(),
+        }),
+    )
+    .await;
+    rig.bind_as(
+        13,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "named".into(),
+        }),
+    )
+    .await;
+    let template = Template::new("plain", "template text", Default::default());
+    let composition = serde_json::json!({"providers":[]});
+    let digest = cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap();
+    let plan = serde_json::json!({"tool_items":[],"system_text_items":[],"step_transform_items":[],"composition":composition,"composition_digest":digest,"senders":[{"module":"named","idle_start":true,"interrupt":true,"templates":[template]}]});
+    let baseline = call(&mut rig, "session.send", serde_json::json!({"prompt":"baseline","send_id":"baseline","model":{"provider":"fake","model":"fake"},"plan":plan})).await;
+    assert_eq!(result(&baseline)["state"], "active");
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    for (id, prompt, delivery) in [
+        (
+            "named-start",
+            "named fresh",
+            serde_json::json!(["idle_start"]),
+        ),
+        (
+            "idle-interrupt",
+            "idle interrupt",
+            serde_json::json!("interrupt"),
+        ),
+    ] {
+        let sent = rig.request(13, serde_json::json!({"method":"session.send","params":{"send_id":id,"model":{"provider":"fake","model":"fake"},"prompt":prompt,"delivery":delivery}})).await;
+        assert_eq!(result(&sent)["state"], "active", "{sent:?}");
+        rig.wait_for_finished(if id == "named-start" { 2 } else { 3 })
+            .await;
+        rig.wait_idle().await;
+    }
+    rig.script.hold_model(true);
+    let active = call(
+        &mut rig,
+        "session.send",
+        serde_json::json!({"send_id":"owner-active","prompt":"owner active","model":{"provider":"fake","model":"fake"}}),
+    )
+    .await;
+    assert_eq!(result(&active)["state"], "active");
+    rig.wait_entered().await;
+    let joined = rig.request(13, serde_json::json!({"method":"session.send","params":{"send_id":"named-join","prompt":"named join","delivery":["steer"]}})).await;
+    assert!(matches!(
+        result(&joined)["state"].as_str(),
+        Some("pending" | "active")
+    ));
+    rig.script.hold_model(false);
+    rig.wait_for_finished(4).await;
+    rig.wait_idle().await;
+    rig.script.hold_model(true);
+    let active = call(
+        &mut rig,
+        "session.send",
+        serde_json::json!({"send_id":"before-interrupt","prompt":"before interrupt","model":{"provider":"fake","model":"fake"}}),
+    )
+    .await;
+    assert_eq!(result(&active)["state"], "active");
+    rig.wait_entered().await;
+    let interrupted = rig.request(13, serde_json::json!({"method":"session.send","params":{"send_id":"active-interrupt","model":{"provider":"fake","model":"fake"},"prompt":"active interrupt","delivery":"interrupt"}})).await;
+    assert!(matches!(
+        result(&interrupted)["state"].as_str(),
+        Some("pending" | "active")
+    ));
+    rig.script.hold_model(false);
+    rig.wait_for_finished(6).await;
+    rig.wait_idle().await;
+    let templated = rig.request(13, serde_json::json!({"method":"session.send","params":{"send_id":"template","model":{"provider":"fake","model":"fake"},"delivery":["idle_start"],"template":{"id":"plain","digest":template_digest(&template),"slots":{}}}})).await;
+    assert_eq!(result(&templated)["state"], "active");
+    rig.wait_for_finished(7).await;
+    rig.wait_idle().await;
+    rig.script.hold_model(true);
+    let active = call(
+        &mut rig,
+        "session.send",
+        serde_json::json!({"send_id":"before-restart","prompt":"before restart","model":{"provider":"fake","model":"fake"}}),
+    )
+    .await;
+    assert_eq!(result(&active)["state"], "active");
+    rig.wait_entered().await;
+    let queued = rig.request(13, serde_json::json!({"method":"session.send","params":{"send_id":"queued-restart","model":{"provider":"fake","model":"fake"},"prompt":"queued after restart","delivery":["idle_start"]}})).await;
+    assert_eq!(result(&queued)["state"], "pending");
+    let (sealed, ()) = tokio::join!(rig.registry().stop_and_seal(), async {
+        rig.script.hold_model(false);
+    });
+    assert!(sealed);
+    rig = rig.restart().await;
+    rig.registry()
+        .set_plan_admitter(std::sync::Arc::new(DisplaySenderPlan));
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "owner".into(),
+        }),
+    )
+    .await;
+    let wake = call(&mut rig, "session.send", serde_json::json!({"send_id":"reopen","prompt":"reopen","model":{"provider":"fake","model":"fake"}})).await;
+    assert!(matches!(
+        result(&wake)["state"].as_str(),
+        Some("pending" | "active")
+    ));
+    rig.wait_for_finished(10).await;
+    rig.wait_idle().await;
+    let page = sender_history(&mut rig).await;
+    for text in [
+        "named fresh",
+        "named join",
+        "idle interrupt",
+        "active interrupt",
+        "template text",
+        "queued after restart",
+    ] {
+        assert_display_sender(&page, text, "named");
+    }
+    for record in rig.records() {
+        if let broca_wal::WalRecord::RunStarted {
+            input,
+            sent_by,
+            principal,
+            ..
+        } = record
+        {
+            if input.iter().any(|message| message.content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "queued after restart"))) {
+                assert_eq!(sent_by, Some(broca_protocol::BindPrincipal::Reserved { module_id: "named".into() }));
+                assert_eq!(principal, Some(broca_protocol::BindPrincipal::Reserved { module_id: "owner".into() }));
+            }
+        }
+    }
+    capture_sender_samples(&rig, &page, "matrix");
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn finish_reason_reports_provider_limits_without_a_caller_cap_on_every_family() {
+    use broca_provider::spec::WireFamilyId as Family;
+    let mut missing = Vec::new();
+    for (family, raw) in [
+        (Family::AnthropicMessages, "max_tokens"),
+        (Family::OpenAiChat, "length"),
+        (Family::OpenAiResponses, "incomplete:max_output_tokens"),
+        (
+            Family::OpenAiResponsesChatgpt,
+            "incomplete:max_output_tokens",
+        ),
+        (Family::Gemini, "MAX_TOKENS"),
+        (Family::GoogleCodeAssist, "MAX_TOKENS"),
+        (Family::BedrockConverse, "max_tokens"),
+    ] {
+        let mut rig = Rig::start(&format!("native-limit-{family:?}")).await;
+        let mut frozen = broca_provider::families::frozen_config_for_family(family, "fake");
+        frozen.project_id = Some("fixture-project".into());
+        *rig.script.media_frozen.lock().unwrap() = Some(frozen);
+        rig.script
+            .normalized_steps
+            .lock()
+            .unwrap()
+            .push_back(native_finish_events(
+                Some(raw),
+                broca_protocol::FinishReason::Length,
+                vec![ContentBlock::Text {
+                    text: "provider-limited reply".into(),
+                }],
+            ));
+        let sent = rig.send("native-limit", "no caller output cap", None).await;
+        let run = result(&sent)["run_id"].as_str().unwrap().to_owned();
+        rig.wait_for_finished(1).await;
+        rig.wait_idle().await;
+        let output_frame = call(&mut rig, "run.result", serde_json::json!({"run_id":run})).await;
+        let status_frame = call(&mut rig, "run.status", serde_json::json!({"run_id":run})).await;
+        let output = result(&output_frame);
+        let status = result(&status_frame);
+        assert_eq!(
+            status["final_step_finish_reason"], "length",
+            "legacy field: {family:?}"
+        );
+        if output["finish"] != "length" || status["finish"] != "length" {
+            missing.push(format!(
+                "{family:?}: result={} status={}",
+                output["finish"], status["finish"]
+            ));
+        }
+        if let Some(path) = std::env::var_os("BROCA_FINISH_SAMPLES") {
+            use sha2::{Digest, Sha256};
+            let path = std::path::PathBuf::from(path).join(format!("{family:?}"));
+            std::fs::create_dir_all(&path).unwrap();
+            let step = rig
+                .records()
+                .into_iter()
+                .find(|record| matches!(record, broca_wal::WalRecord::ModelStepFinished { .. }))
+                .unwrap();
+            let json = serde_json::to_vec(&step).unwrap();
+            let frame = broca_wal::framing::encode_v4(
+                broca_wal::framing::v4::Metadata {
+                    seq: 7,
+                    fence: 3,
+                    appended_ms: 123,
+                    writer_id: [5; 16],
+                },
+                &[],
+                &step,
+            )
+            .unwrap();
+            let mut sums = String::new();
+            for (name, bytes) in [
+                ("run-result.json", output_frame.body.as_slice()),
+                ("run-status.json", status_frame.body.as_slice()),
+                ("model-step.json", json.as_slice()),
+                ("model-step.v4", frame.as_slice()),
+            ] {
+                std::fs::write(path.join(name), bytes).unwrap();
+                sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(bytes)));
+            }
+            std::fs::write(path.join("SHA256SUMS"), sums).unwrap();
+        }
+        rig.finish().await;
+    }
+    assert!(
+        missing.is_empty(),
+        "provider length evidence was not served: {missing:?}"
+    );
+}
+
+#[tokio::test]
+async fn finish_reason_uses_only_the_last_native_step_and_survives_restart() {
+    use broca_protocol::{FinishReason, ToolCall, ToolCallId};
+    let mut rig = Rig::start("native-finish-absence").await;
+    *rig.script.media_frozen.lock().unwrap() =
+        Some(broca_provider::families::openai_chat_frozen_config("fake"));
+    let tool = ContentBlock::ToolCall(ToolCall {
+        tool_call_id: ToolCallId("native-tool".into()),
+        tool_name: "work".into(),
+        input: serde_json::json!({}),
+        thought_signature: None,
+    });
+    let oversized = "x".repeat(65);
+    let mut receipts = Vec::new();
+    for (index, raw, expected) in [
+        (0, Some("stop"), Some("stop")),
+        (1, None, None),
+        (2, Some("future_reason"), Some("other")),
+        (3, Some(oversized.as_str()), None),
+    ] {
+        if index == 1 {
+            rig.script.hold_tool(true);
+            rig.script
+                .normalized_steps
+                .lock()
+                .unwrap()
+                .push_back(native_finish_events(
+                    Some("tool_calls"),
+                    FinishReason::ToolCalls,
+                    vec![tool.clone()],
+                ));
+        }
+        rig.script
+            .normalized_steps
+            .lock()
+            .unwrap()
+            .push_back(native_finish_events(
+                raw,
+                FinishReason::Stop,
+                vec![ContentBlock::Text {
+                    text: "answer".into(),
+                }],
+            ));
+        let sent = rig.send(&format!("native-{index}"), "answer", None).await;
+        let run = result(&sent)["run_id"].as_str().unwrap().to_owned();
+        if index == 1 {
+            rig.wait_entered().await;
+            for op in ["run.result", "run.status"] {
+                let frame = call(&mut rig, op, serde_json::json!({"run_id":run})).await;
+                assert!(result(&frame).get("finish").is_none(), "active {op}");
+            }
+            rig.script.hold_tool(false);
+        }
+        rig.wait_for_finished(index + 1).await;
+        rig.wait_idle().await;
+        for op in ["run.result", "run.status"] {
+            let frame = call(&mut rig, op, serde_json::json!({"run_id":run})).await;
+            assert_eq!(
+                result(&frame)
+                    .get("finish")
+                    .and_then(serde_json::Value::as_str),
+                expected,
+                "{op}: {index}"
+            );
+        }
+        receipts.push((run, expected));
+    }
+    rig = rig.restart().await;
+    for (run, expected) in receipts {
+        for op in ["run.result", "run.status"] {
+            let frame = call(&mut rig, op, serde_json::json!({"run_id":run})).await;
+            assert_eq!(
+                result(&frame)
+                    .get("finish")
+                    .and_then(serde_json::Value::as_str),
+                expected,
+                "recovered {op}: {run}"
+            );
+        }
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn display_facts_opt_in_preserves_default_and_matches_stored_times() {
+    let mut rig = Rig::start("read-display-facts").await;
+    *rig.script.schema_pin.lock().unwrap() = Some(broca_wal::DispatchSchemaPin {
+        schema_digest: "a".repeat(64),
+        semantics: 7,
+    });
+    rig.script
+        .push(&[Step::Call("facts-call"), Step::Text("answer")]);
+    let active = rig
+        .send_with(
+            "facts-turn",
+            "hi",
+            None,
+            serde_json::json!({"client_message_id":"phone_facts_1"}),
+        )
+        .await;
+    let run = result(&active)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let default = call(&mut rig, "session.read", serde_json::json!({})).await;
+    let plain = result(&default);
+    let lineage = plain["lineage_id"].as_str().unwrap();
+    let mut baseline = normalized(&default.body, &run, lineage);
+    for entry in plain["messages"].as_array().unwrap() {
+        if let Some(at) = entry["written_at"].as_u64() {
+            baseline = baseline.replace(
+                &format!("\"written_at\":{at},"),
+                "\"written_at\":\"@RECORDED_TIME@\",",
+            );
+        }
+        assert!(entry.get("client_message_id").is_none());
+        assert!(entry.get("tool_times").is_none());
+    }
+    if std::env::var_os("BROCA_CAPTURE_DISPLAY_BASELINE").is_some() {
+        std::fs::write(
+            golden_path("session_read.default_display_facts_baseline.json"),
+            &baseline,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        baseline,
+        pinned("session_read.default_display_facts_baseline.json")
+    );
+    let decorated = call(
+        &mut rig,
+        "session.read",
+        serde_json::json!({"include_display_facts":true}),
+    )
+    .await;
+    let facts = result(&decorated);
+    assert_eq!(facts["messages"][0]["client_message_id"], "phone_facts_1");
+    let mut stripped = facts.clone();
+    for entry in stripped["messages"].as_array_mut().unwrap() {
+        let entry = entry.as_object_mut().unwrap();
+        entry.remove("client_message_id");
+        entry.remove("tool_times");
+    }
+    assert_eq!(plain, stripped);
+    let records = rig.records();
+    let started = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::ToolDispatchIntent {
+                tool_call_id,
+                dispatched_at_ms,
+                ..
+            } if tool_call_id.0 == "facts-call" => *dispatched_at_ms,
+            _ => None,
+        })
+        .unwrap();
+    let finished = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::ToolResult {
+                result,
+                finished_at_ms,
+                ..
+            } if result.tool_call_id.0 == "facts-call" => *finished_at_ms,
+            _ => None,
+        })
+        .unwrap();
+    let times = &facts["messages"][1]["tool_times"];
+    assert_eq!(times.as_array().unwrap().len(), 1);
+    assert_eq!(times[0]["tool_call_id"], "facts-call");
+    assert_eq!(times[0]["started_at"], started);
+    assert_eq!(times[0]["finished_at"], finished);
+    let history = call(
+        &mut rig,
+        "session.history",
+        serde_json::json!({"form":"display"}),
+    )
+    .await;
+    let history_page = result(&history);
+    let tool = &history_page["messages"][1]["row"]["parts"][0];
+    assert_eq!(tool["started_at"], started);
+    assert_eq!(tool["finished_at"], finished);
+    assert!(tool.get("unanswered").is_none());
+    assert!(tool["call_key"].is_string());
+    assert!(tool["schema_pin"].is_string());
+    assert_eq!(times[0]["call_key"], tool["call_key"]);
+    assert_eq!(times[0]["schema_pin"], tool["schema_pin"]);
+    if let Some(path) = std::env::var_os("BROCA_DISPLAY_FACTS_SAMPLES") {
+        use sha2::{Digest, Sha256};
+        let path = std::path::PathBuf::from(path);
+        std::fs::create_dir_all(&path).unwrap();
+        let mut sums = String::new();
+        for (name, bytes) in [
+            ("default-read.json", default.body.as_slice()),
+            ("opt-in-read.json", decorated.body.as_slice()),
+            ("history.json", history.body.as_slice()),
+        ] {
+            std::fs::write(path.join(name), bytes).unwrap();
+            sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(bytes)));
+        }
+        let row = serde_json::to_vec(&history_page["messages"][1]).unwrap();
+        std::fs::write(path.join("history-row.json"), &row).unwrap();
+        sums.push_str(&format!("{:x}  history-row.json\n", Sha256::digest(&row)));
+        std::fs::write(path.join("SHA256SUMS"), sums).unwrap();
+    }
+    rig.finish().await;
+}
+
 /// A `session.read` and a `session.subscribe` from the start, each with no params, of a session
 /// whose one run called a tool. Existing member and cursor/unit bytes remain pinned separately
 /// from the default read-entry times, dispatch attribution, live metadata and message boundaries.
@@ -2057,6 +2685,24 @@ async fn unsupported_output_refs_precedes_plan_overrides_and_never_writes() {
     assert!(describe.declares(groups::OUTPUT_REFS));
     // This rig installs no plan admitter. Even though production discovery advertises the
     // reader, a handler without an output-reference admitter must refuse before overrides.
+    // A plan-less send, sent first so the session has a baseline: `session.refresh` below
+    // refuses a session with no baseline before it ever reaches the plan, and this test is
+    // about the plan check's place, not about that refusal.
+    rig.script.push(&[Step::Text("baseline")]);
+    let baseline = call(
+        &mut rig,
+        ops::SESSION_SEND,
+        serde_json::json!({
+            "send_id":"unsupported-baseline","prompt":"baseline",
+            "model":{"provider":"fake","model":"fake"},"tools":[]
+        }),
+    )
+    .await;
+    assert_eq!(result(&baseline)["state"], "active", "baseline send");
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    // The checks below compare against this head and this WAL, so nothing they claim to have
+    // refused may have written.
     for flag in [true, false] {
         let before = result(&call(&mut rig, ops::SESSION_HEAD, serde_json::json!({})).await);
         let wal = rig.wal_bytes();

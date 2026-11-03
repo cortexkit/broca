@@ -176,7 +176,7 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
 async fn bind_route<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     writer: &mut W,
     reader: &mut R,
-    project_root: &Path,
+    _project_root: &Path,
 ) {
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
@@ -184,7 +184,7 @@ async fn bind_route<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(project_root.to_path_buf(), "runner", "operation-counters"),
+        identity: SubcBindIdentity::new("runner", "operation-counters"),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -340,7 +340,7 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
     assert_eq!(
         request_log.session,
         broca_core::session_addr(&BindIdentity::new(
-            dir.join("proj"),
+            "broca-unscoped-v1",
             "runner",
             "operation-counters"
         ))

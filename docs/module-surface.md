@@ -56,7 +56,7 @@ whether the daemon flag appears before or after the subcommand, without binding.
 
 broca is an **orchestration tier**: a subc module that runs agentic LLM loops for
 consumer modules while consuming tools, credentials, and model-routing services.
-Its agentic core is shared with the `broca-run` CLI.
+Its agentic core is shared with the [`broca-run` CLI](broca-run.md).
 
 ### 1a. Runtime precondition: a model catalog must be reachable ONCE
 
@@ -156,8 +156,9 @@ A consumer can be both. The surface is **session-centric**: consumers address
   **WAL**, one **store** partition, keyed `{project_root, harness, session}`.
   The storage root is resolved before acknowledging a session bind: an existing
   `(harness, session)` pair keeps its unique inventory root; a new scoped pair uses
-  stamped `workdir`. On subc-protocol 0.33, a new pair without stamped workdir still
-  uses the route root, including for outgoing transport. A stamp's `project_id` never
+  stamped `workdir`. A new pair without stamped workdir uses the fixed storage namespace
+  `broca-unscoped-v1`, not a directory. WALs still live in the state root's log folders,
+  at the inventory-assigned address. A stamp's `project_id` never
   keys a session. Two inventory roots refuse `session_address_ambiguous` (permanent);
    Known pairs resolve immediately from positive inventory evidence even during repair.
    An absent pair waits on shared discovery readiness for at most 60 seconds; incomplete
@@ -166,6 +167,12 @@ A consumer can be both. The surface is **session-centric**: consumers address
    `gap_marker`. Boot and on-demand repairs are single-flight and do not block serve
    startup. Existing-pair lookups use a read transaction; only absent pairs take the
    write lock, recheck discovery, and reserve a root before any actor or WAL opens.
+  Wire binds carry only `harness` and `session` on subc-protocol 0.34. Broca declares
+  `bind-no-project/v1` and ignores stray legacy bind project members. Project attribution
+  comes only from the daemon's scope stamp (`workdir`, optional `project_id`), never
+  the inbound connection. Scoped outgoing tool/catalog routes select the frozen scope;
+  unscoped routes carry no folder. Compaction, hook and vault module-level routes are
+  unscoped. Neither storage roots nor the namespace are sent as wire bind projects.
 - **Run = one turn's loop execution** — a user message in → the agent loops until its
   response → a terminal. Each run begins with a `RunStarted` **episode marker** (input +
   frozen config + `origin` + `submission_id`). Runs **accumulate** in the lineage WAL:
@@ -929,7 +936,8 @@ queued changed system prompt is.
 With the field omitted on a session's first send, the first match wins:
 
 1. `broca.jsonc` `context_management.projects["<project_root>"]`, keyed by the session's
-   `project_root` as broca receives it (the daemon canonicalises it; a trailing `/` is ignored);
+   resolved storage `project_root` (the inventory's existing root or stamped workdir for
+   a new scoped session; a trailing `/` is ignored);
 2. `broca.jsonc` `context_management.default`;
 3. `"none"`.
 
@@ -1231,6 +1239,9 @@ not by session:
 
 The refusal is a typed `invalid_project_root` naming the exact path. Recreating the
 directory revives the session; nothing about it was destroyed.
+The exact `broca-unscoped-v1` storage namespace is exempt: it is never a filesystem
+directory, even if a directory with that name exists in the process's working directory.
+Legacy directory-root sessions retain the guard.
 
 **This is deliberate.** Writes create durable state under a key derived from the bind
 triple, and appending new state beneath a root that is gone (or running tools there) is
@@ -1281,6 +1292,13 @@ One path keeps its existing code: when the session is already open,
 there, a newer writer's included, ends the stream with `subscribe_replay_failed`, as before.
 
 ## 11. Submission lifecycle + durable queue + retract
+
+Broca declares `sender_succession`. A plan sender's optional `succeeds` names one
+predecessor module. For keyed retries and `send.status`, that predecessor's durable
+send record is checked before the caller's own record, even after a refresh removes
+the predecessor from the plan. A conflicting retry is `send_id_reuse`, never a new
+send. Succession is one hop and grants no delivery, cancellation or withdrawal
+permission. The latest accepted refresh supplies the sender policy immediately.
 
 - **Idle send** → starts a run (active, run_id).
 - **Running send** → durably queued as **`Queued{submission_id, message}`** (a WAL
@@ -1565,6 +1583,30 @@ Each item carries both `ordinal` and `mid: "m<ordinal>"`; `mid` is the MC-coordi
 spelling used by consumers. Chunking is required for large transcripts because subc has a
 per-frame cap and closes a full egress queue.
 
+**Display facts (opt-in).** Broca declares `read_display_facts`. On transcript reads,
+`include_display_facts: true` adds a stored `client_message_id` to its user entry and
+`tool_times` to an assistant entry carrying calls, beside `mid`, never inside `message`.
+Calls remain in message order. `started_at` is the recorded dispatch time;
+`finished_at` is that call's recorded answer time, not the batch's closing time.
+`unanswered` names a recorded closure without an answer (`interrupted`, `cancelled`,
+`denied` or `not_executed`). Missing facts stay absent. Display-history tool parts
+expose the same times and closure reasons. Default transcript reads keep their bytes
+and do not load or build the display cache; raw history does not request these facts.
+Because broca also declares `call_identity`, each call's opt-in timing item copies its
+projected `call_key` and `schema_pin` when known. The key identifies the durable call;
+the pin encodes the tool name, schema digest and semantics version frozen at dispatch.
+Both read envelopes and display rows
+use the same stored strings, not a current tool catalog. A prepared call declined before
+dispatch keeps its key but has no dispatch schema pin.
+
+The first opt-in read lazily backfills only its own session's rebuildable display
+projection. Fact versions and a versioned continuation (the last processed log sequence
+plus pending-message and tool-batch state) commit atomically, so a failed
+backfill remains incomplete and retries on demand. Later reads select only their page's
+rows and fold the bounded WAL suffix since that continuation. No boot-time sweep visits
+historical sessions. Retention expiry removes the cache and prevents a racing reader
+from repopulating an expired lineage.
+
 **Rich UI teaching stamp.** Broca declares `rich_ui_stamp`. A teaching provider's fetched
 `system_text.rich_ui` value (`{dialect, catalog_digest}`) is frozen at admission, never read
 from caller-supplied metadata or fetched again for later runs. Conflicting stamps refuse
@@ -1662,6 +1704,37 @@ Record changes:
 - `RunPaused{run_id, reason, error}` (§17).
 
 ## 19. SubcToolPlane hardening
+
+**Call keepalives.** Dispatch declares `call-keepalive/v1` only when the admitted provider's
+manifest listed that promise. The frozen plan carries the promise across resume; an older
+manifest without it retains legacy waits and unchanged bind bytes. Negotiated calls are hung
+after 90 seconds without a PUSH or terminal frame. Any PUSH resets only that silence timer;
+`{"kind":"keepalive"}` bodies are never displayed, stored as tool output, or sent to the model.
+A tool without `reply` gets the contract's 24-hour ceiling instead of the runner fallback.
+A declared `reply` keeps its existing deadline calculation, never shorter than the runner's
+fallback. It is an absolute terminal deadline on every route, negotiated or not, and PUSH
+frames cannot extend it. The budget starts only after the request enters the writer queue;
+route-open, bind, module-restart and writer-capacity waits do not consume it. Broca does not
+stamp a deadline into the tool request body. Only non-negotiated tools without a declared
+`reply` keep the previous per-frame wait, normally 120 seconds, including the existing
+`aft` provider's shell/watch argument-derived fallback (defined in
+[`tool_deadline.rs`](../crates/broca-subc/src/tool_deadline.rs)). Whenever broca abandons an outstanding tool request,
+including run cancellation and shutdown, its existing abandonment guard sends a best-effort
+CANCEL without waiting for the provider. Late frames find no waiter and cannot produce another
+result; an ambiguous call is never re-sent. A provider-held call (described under
+[Provider-held calls](#provider-held-calls) below) has already ended its original REQUEST with
+an interim held reply. Cancelling its continuing work still uses `tool.withdraw`, not CANCEL.
+
+The manifest promise is read from one admission-local daemon `catalog.list` snapshot, shared
+with the existing presetless system-text capability read when present. `tool.catalog` does
+not publish manifest `provides`, so otherwise one additional control request is needed.
+Optional discovery runs alongside the required provider fetch and is never awaited after
+that fetch finishes. A failed lookup, or one still unfinished when the required reply arrives,
+freezes no promise instead of refusing the send. A warning is limited to once per minute;
+`health.check.metrics.tool_keepalive_discovery` separately counts `lookup_failed` and
+`lookup_unfinished`. Its `probes` and wall-clock `wait_us_total`/`wait_us_max` include cache
+hits and are not production daemon RTT measurements. Required system-text capability checks
+retain their previous fail-closed and retry behavior.
 
 Fence keyed `(session, tool_call_id)` **with eviction** on batch/run terminal; **per-route
 window** resolved from the specific provider at route-open (not memoized once); **route
@@ -1789,6 +1862,8 @@ through exactly the cursor the provider returned. An entry whose call already ha
 no registration names is acked as a no-op. A durable intent with no terminal or held record is
 pending only while its dispatching run is open; an unreadable WAL remains blocked. An answer
 for an indeterminate call in a sealed run never changes that call or enters a later run.
+A `not_started` entry with `reason: "scope_ended"` is the same never-run error result,
+not a request to dispatch the call again.
 Entries are deduplicated on
 `(provider, custodian, call_key, event_id)`, and `cursor_incarnation_changed` re-reads from the
 start. The ack advances only over a settled prefix. An unsettled entry pins the ack: no ack may

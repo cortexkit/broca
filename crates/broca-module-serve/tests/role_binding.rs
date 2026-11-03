@@ -230,9 +230,9 @@ impl Rig {
         // Sessionless binds send an invalid identity to prove they bypass key validation.
         // They also carry a scope stamp, which must not trigger session-history authorization.
         let identity = if sessionless {
-            SubcBindIdentity::new("/role-binding-project", "runner", "not\u{1f}keyable")
+            SubcBindIdentity::new("runner", "not\u{1f}keyable")
         } else {
-            SubcBindIdentity::new("/role-binding-project", "runner", "role-binding")
+            SubcBindIdentity::new("runner", "role-binding")
         };
         let bind = ModuleControlRequest::RouteBind {
             route_channel: channel,

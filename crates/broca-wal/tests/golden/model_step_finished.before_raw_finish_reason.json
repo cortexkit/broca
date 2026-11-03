@@ -1,0 +1,1 @@
+{"type":"model_step_finished","written_at_ms":1234,"step_id":7,"assistant_message":{"message_id":"m7","content":[{"type":"text","text":"done"}]},"usage":{"input_tokens":5,"output_tokens":2},"finish_reason":"stop","retries_used":0}

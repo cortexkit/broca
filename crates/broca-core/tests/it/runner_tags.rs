@@ -40,6 +40,7 @@ fn step(content: Vec<ContentBlock>, reason: FinishReason) -> Vec<NormalizedEvent
             },
         }),
         NormalizedEvent::Control(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id: StepId(0),
             usage: Usage::default(),
             finish_reason: reason,

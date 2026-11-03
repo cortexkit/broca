@@ -198,6 +198,8 @@ impl SqliteStore {
             "message",
             "compaction_facts",
             "retained_head",
+            "display_fact",
+            "display_fact_seed",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE session=?1"), [&key])?;
         }

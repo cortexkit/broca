@@ -181,7 +181,6 @@ struct Rig {
     reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     serve: tokio::task::JoinHandle<Result<ServeEnd, broca_module_serve::serve::ServeIoError>>,
-    session: BindIdentity,
     wal_path: PathBuf,
     gate: Arc<Notify>,
     held: Arc<Notify>,
@@ -275,14 +274,13 @@ impl Rig {
         )
         .unwrap();
         write_frame(&mut writer, &ack).await.unwrap();
-        let session = BindIdentity::new(dir.join("proj"), "runner", "scoped");
+        let session = BindIdentity::new("broca-unscoped-v1", "runner", "scoped");
         let wal_path = wal.wal_path(&session);
         Self {
             dir,
             reader,
             writer,
             serve,
-            session,
             wal_path,
             gate,
             held,
@@ -347,7 +345,7 @@ impl Rig {
             target: RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(self.session.project_root.clone(), "runner", "scoped"),
+            identity: SubcBindIdentity::new("runner", "scoped"),
             principal,
             consumer_capabilities: None,
             admission_facts: None,

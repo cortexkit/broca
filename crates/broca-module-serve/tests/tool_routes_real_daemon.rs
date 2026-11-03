@@ -70,6 +70,7 @@ impl RunExecutor for Executor {
             .await
             .map_err(|e| RunError::Config(e.to_string()))?;
         job.writer.record(WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -309,6 +310,7 @@ async fn sweeper_deleted_session_releases_tool_routes() {
     wal.append(
         1,
         &WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,

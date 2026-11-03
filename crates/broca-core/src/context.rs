@@ -746,6 +746,33 @@ pub struct TagLocation {
 
 /// The materialized store read seam. The loop depends only on this trait.
 pub trait MaterializedStore: Send + Sync {
+    /// Display facts are an opt-in, per-lineage cache. A missing seed requires one lazy
+    /// backfill for this session only; default transcript reads never call this seam.
+    fn read_display_facts_cache(
+        &self,
+        _session: &BindIdentity,
+        _lineage: &str,
+        _at_seq: u64,
+        _ordinals: &[u64],
+    ) -> Result<Option<crate::display_facts::DisplayFactsCache>, String> {
+        Ok(None)
+    }
+
+    /// Publish fact versions and their complete continuation in one transaction. An expected
+    /// sequence mismatch means another reader won, not permission to overwrite its seed.
+    /// Stores with recovery epochs also reject publication from a pre-cut read ticket.
+    fn publish_display_facts(
+        &self,
+        _session: &BindIdentity,
+        _lineage: &str,
+        _expected_seq: Option<u64>,
+        _expected_epoch: Option<i64>,
+        _seed: &crate::display_facts::DisplayFactsSeed,
+        _versions: &[crate::display_facts::DisplayFactVersion],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Invalidate rebuildable views durably before physical WAL recovery cuts.
     /// Usage export facts are independent authority and must not be changed.
     fn invalidate_wal_recovery(
@@ -2976,6 +3003,7 @@ mod tests {
     fn sample_wal() -> Vec<WalRecord> {
         vec![
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -3033,6 +3061,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3094,6 +3123,7 @@ mod tests {
             },
             WalRecord::TurnFinished { step_id: StepId(1) },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3347,6 +3377,7 @@ mod tests {
         };
         records.extend([
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -3377,6 +3408,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3428,6 +3460,7 @@ mod tests {
             // This naturally terminal no-tool step is durable but has no RunFinished, so the
             // corpus ends with a non-empty, not-yet-materialized tail.
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -4064,6 +4097,7 @@ mod episode_merge_regression {
 
     fn start(run: &str, model: &str, text: &str) -> WalRecord {
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4112,6 +4146,7 @@ mod episode_merge_regression {
         let wal = vec![
             start("a", "a-model", "episode a"),
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,

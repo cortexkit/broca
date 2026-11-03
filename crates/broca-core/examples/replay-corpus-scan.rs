@@ -156,6 +156,7 @@ mod tests {
 
     fn started(run: &str, session: &BindIdentity) -> WalRecord {
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -213,6 +214,7 @@ mod tests {
 
     fn step(content: ContentBlock) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

@@ -66,6 +66,7 @@ fn started(session: &BindIdentity) -> WalRecord {
 
 fn started_at(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
     WalRecord::RunStarted {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         run_id: RunId(run_id.into()),
@@ -523,6 +524,7 @@ async fn real_bus_headers_digest_sequence_and_ack_retention() {
         .append(
             1,
             &WalRecord::Steered {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 retention: None,

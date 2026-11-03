@@ -92,7 +92,12 @@ impl TierServeRig {
         subc_transport::write_frame(&mut writer, &ack)
             .await
             .unwrap();
-        let session = BindIdentity::new(root, "tier-test", "session");
+        // The address this rig's route actually reaches: the same resolution a served bind
+        // performs, so a session recorded under another address before 0.34 is still found.
+        let session = registry
+            .resolve_session_address(&BindIdentity::new("", "tier-test", "session"), None)
+            .await
+            .expect("the session address resolves from the inventory, as a served bind does");
         let mut rig = Self {
             reader,
             writer,
@@ -109,7 +114,7 @@ impl TierServeRig {
             target: subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: subc_protocol::BindIdentity::new(root, "tier-test", "session"),
+            identity: subc_protocol::BindIdentity::new("tier-test", "session"),
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,
@@ -328,8 +333,57 @@ fn tier_run(frame: &subc_protocol::Frame) -> String {
         .to_owned()
 }
 
-async fn tier_http_fixture(
-    reports: Vec<Option<&'static str>>,
+/// The queue record a tiered send leaves behind when it waits for a run already in flight: the
+/// same durable bytes the served path writes, taken from the WAL rather than composed by hand.
+async fn served_queue_record(tier: &str, send_id: &str) -> broca_wal::WalRecord {
+    use broca_core::WalStore as _;
+    let root = fresh_vault_root(&format!("tier-served-{tier}"));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let http = tier_http_fixture(vec![None], false, Some(release.clone()), None).await;
+    let mut rig = TierServeRig::start(&root, &http.url).await;
+    let run = tier_run(&rig.send("held", Some(tier)).await);
+    broca_test_support::wait_until("held request reaches HTTP", || {
+        std::future::ready(if http.requests.lock().unwrap().len() == 1 {
+            Ok(())
+        } else {
+            Err("not received".to_owned())
+        })
+    })
+    .await;
+    let queued = rig.send(send_id, None).await;
+    assert_eq!(tier_reply(&queued)["result"]["state"], "pending");
+    broca_test_support::wait_until("served queue record is durable", || {
+        let frames = rig.wal.read_records(&rig.session).unwrap();
+        std::future::ready(
+            if frames
+                .iter()
+                .any(|frame| matches!(&frame.record, broca_wal::WalRecord::Queued { .. }))
+            {
+                Ok(())
+            } else {
+                Err("queued record is not readable yet".to_owned())
+            },
+        )
+    })
+    .await;
+    let record = rig
+        .wal
+        .read_records(&rig.session)
+        .unwrap()
+        .into_iter()
+        .find_map(|frame| match frame.record {
+            record @ broca_wal::WalRecord::Queued { .. } => Some(record),
+            _ => None,
+        })
+        .unwrap();
+    release.notify_one();
+    rig.ended(&run).await;
+    rig.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+    record
+}
+
+async fn tier_http_fixture(reports: Vec<Option<&'static str>>,
     two_steps: bool,
     hold: Option<Arc<tokio::sync::Notify>>,
     plane: Option<Arc<TierCompaction>>,
@@ -499,6 +553,22 @@ async fn service_tier_fixed_run_and_writer_queue_survive_a_restart_cut() {
     );
     let queued = rig.send("queued-ultra", None).await;
     assert_eq!(tier_reply(&queued)["result"]["state"], "pending");
+    // The retry below must find this queue record in the WAL, not in whatever the actor still
+    // holds in memory, so wait for the record itself to be readable.
+    broca_test_support::wait_until("queued record is durable", || {
+        let frames = rig.wal.read_records(&rig.session).unwrap();
+        std::future::ready(
+            if frames
+                .iter()
+                .any(|frame| matches!(&frame.record, broca_wal::WalRecord::Queued { .. }))
+            {
+                Ok(())
+            } else {
+                Err("queued record is not readable yet".to_owned())
+            },
+        )
+    })
+    .await;
     let repeated = rig.send("queued-ultra", None).await;
     assert_eq!(
         queued.body, repeated.body,
@@ -541,14 +611,23 @@ async fn service_tier_fixed_run_and_writer_queue_survive_a_restart_cut() {
     .await;
     rig.close().await;
 
-    // Reopen the exact durable queue record from the enqueue cut, with no actor cache.
+    // Reopen the exact durable queue record from the enqueue cut, with no actor cache. The cut
+    // session is created through the rig's own bind, as a real client creates one: the session
+    // gets the address the bind resolves and its inventory row. A WAL written under a
+    // folder-derived address with no inventory row is a state production never produces, so it
+    // would test the addressing rather than the queue drain.
     let cut_root = fresh_vault_root("tier-queue-cut");
-    let cut_wal = FileWalStore::new(cut_root.join("wal"));
-    let cut_session = BindIdentity::new(&cut_root, "tier-test", "session");
-    let mut writer = cut_wal.open(&cut_session).unwrap();
+    let cut = TierServeRig::start(&cut_root, &http.url).await;
+    let mut writer = cut.wal.open(&cut.session).unwrap();
     writer.append(1, &queued_record, true).unwrap();
     drop(writer);
+    let cut_session = cut.session.clone();
+    cut.close().await;
     let reopened = TierServeRig::start(&cut_root, &http.url).await;
+    assert_eq!(
+        reopened.session, cut_session,
+        "the reopened rig binds the session the cut wrote"
+    );
     reopened
         .registry
         .actor_for(&reopened.session)
@@ -585,6 +664,85 @@ async fn service_tier_fixed_run_and_writer_queue_survive_a_restart_cut() {
     reopened.close().await;
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(cut_root).unwrap();
+}
+
+/// A session written before subc-protocol 0.34 keeps the address it was given then. Its bind
+/// carried a folder, so that address is derived from the folder and its session-ref row records
+/// it. After the upgrade the bind carries no folder at all, so nothing about the bind can name
+/// that address; the row is the only thing that can, and it must.
+#[tokio::test]
+async fn queued_tier_send_drains_after_upgrading_a_legacy_folder_addressed_session() {
+    use broca_core::{SessionRefIndex as _, WalStore as _};
+    if !run_catalog_drift_child(
+        "queued_tier_send_drains_after_upgrading_a_legacy_folder_addressed_session",
+    ) {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+
+    // The pre-0.34 session: a folder-derived address, its WAL, and the session-ref row that
+    // recorded the pair then.
+    let root = fresh_vault_root("tier-legacy-addressed");
+    let legacy = BindIdentity::new(&root, "tier-test", "session");
+    let wal = FileWalStore::new(root.join("wal"));
+    let queued = served_queue_record("ultrafast", "legacy-queued").await;
+    let broca_wal::WalRecord::Queued { .. } = &queued else {
+        unreachable!("a served send records its queue entry")
+    };
+    let mut writer = wal.open(&legacy).unwrap();
+    writer.append(1, &queued, true).unwrap();
+    drop(writer);
+    broca_store::SqliteStore::open(root.join("store.db"))
+        .unwrap()
+        .record_session(&broca_core::session_addr(&legacy), &legacy)
+        .unwrap();
+
+    // The upgrade: a rig on this line binds the same harness and session name with no folder.
+    let http = tier_http_fixture(vec![None], false, None, None).await;
+    let reopened = TierServeRig::start(&root, &http.url).await;
+    assert_eq!(
+        reopened.session, legacy,
+        "the recorded pair resolves to the address the legacy session was written under"
+    );
+    assert_eq!(
+        broca_core::wal_writer::session_addr(&reopened.session),
+        broca_core::wal_writer::session_addr(&legacy)
+    );
+    reopened
+        .registry
+        .actor_for(&reopened.session)
+        .await
+        .unwrap();
+    broca_test_support::wait_until("legacy queued send drains after the upgrade", || {
+        let frames = reopened.wal.read_records(&reopened.session).unwrap();
+        std::future::ready(
+            if frames
+                .iter()
+                .any(|frame| matches!(&frame.record, broca_wal::WalRecord::RunFinished { .. }))
+            {
+                Ok(frames)
+            } else {
+                Err("legacy queued send has not drained".to_owned())
+            },
+        )
+    })
+    .await
+    .into_iter()
+    .find_map(|frame| match frame.record {
+        broca_wal::WalRecord::RunStarted { config, .. } => {
+            assert_eq!(config.frozen_render_config["service_tier"], "ultrafast");
+            Some(())
+        }
+        _ => None,
+    })
+    .expect("the legacy queue entry was consumed into a RunStarted");
+    assert_eq!(http.requests.lock().unwrap().len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&http.requests.lock().unwrap()[0].body)
+        .unwrap();
+    assert_eq!(body["service_tier"], "ultrafast");
+    reopened.close().await;
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -730,6 +888,7 @@ fn service_tier_switch_off_pins_master_log_discovery_usage_and_request_bytes() {
         format!(r#"{{"state":"active","usage":{usage}}}"#)
     );
     let result = broca_wire::RunResultResponse {
+finish: None,
         auth_selection: None,
         directives: None,
         usage: projection.usage,

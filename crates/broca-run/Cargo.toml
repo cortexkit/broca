@@ -28,7 +28,11 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+subc-protocol.workspace = true
 
 [dev-dependencies]
 broca-catalog = { path = "../broca-catalog", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
+broca-test-support = { path = "../broca-test-support" }
+sha2.workspace = true

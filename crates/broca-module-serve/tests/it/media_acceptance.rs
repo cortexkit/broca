@@ -470,7 +470,7 @@ async fn jpeg_and_pdf_reach_claude_from_live_fusiform_and_switch_to_modality_mar
     new_image[scan_byte] = 1;
     let refused_image = upload(&rig, "image/jpeg", &new_image).await;
     let wal = broca_core::FileWalStore::new(rig.wal_dir());
-    let before = std::fs::read(wal.wal_path(&rig.key("media"))).unwrap();
+    let before = std::fs::read(wal.wal_path(&rig.storage_key("media"))).unwrap();
     let state = rig.wal_dir().parent().unwrap().to_owned();
     let stores_before = media_files(&state);
     let error = request(&rig, "media", "session.send", json!({
@@ -481,7 +481,7 @@ async fn jpeg_and_pdf_reach_claude_from_live_fusiform_and_switch_to_modality_mar
         assert!(error.contains(expected), "{error}");
     }
     assert_eq!(
-        std::fs::read(wal.wal_path(&rig.key("media"))).unwrap(),
+        std::fs::read(wal.wal_path(&rig.storage_key("media"))).unwrap(),
         before
     );
     assert_eq!(media_files(&state), stores_before);

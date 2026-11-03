@@ -1487,6 +1487,7 @@ impl BedrockStreamNormalizer {
         events.extend([
             NormalizedEvent::Control(ProviderControl::AssistantMessage { message }),
             NormalizedEvent::Control(ProviderControl::StepFinished {
+                raw_finish_reason: self.stop_reason.take(),
                 step_id: self.step_id,
                 usage: self.usage,
                 finish_reason: self.finish_reason,

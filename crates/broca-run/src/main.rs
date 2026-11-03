@@ -32,6 +32,8 @@ use broca_subc::{SubcConnection, SubcToolPlane};
 use clap::Parser;
 use tokio::sync::mpsc;
 
+mod carrier_scope;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "broca-run",
@@ -88,9 +90,16 @@ struct Args {
     #[arg(long, default_value = "broca-run")]
     session: String,
 
-    /// The project root the run binds to (AFT sandboxes file tools to this root).
+    /// Local lease and write-ahead log (WAL) root. File tools use --scope's
+    /// daemon-stamped workdir, not this path.
     #[arg(long, default_value = ".")]
     project_root: PathBuf,
+
+    /// Owner/ref/epoch for model tool routes. Reads a private 32-byte bind proof as
+    /// 64 hex characters from stdin (optional newline, then EOF), never argv or environment.
+    /// Global catalog and vault routes remain unscoped.
+    #[arg(long, value_name = "OWNER/REF/EPOCH")]
+    scope: Option<carrier_scope::CarrierScope>,
 
     /// Explicit Bearer override. Otherwise catalog models read a vault dev-tools handle;
     /// an explicit --base-url needs no credential (for mock providers).
@@ -237,12 +246,25 @@ async fn run(args: Args) -> Result<i32, String> {
     let bind = BindIdentity::new(&args.project_root, &args.harness, &args.session);
     bind.validate_keyable()
         .map_err(|error| format!("invalid bind identity: {error}"))?;
+    let carrier_scope = match &args.scope {
+        Some(scope) => Some(
+            scope
+                .read_proof(&mut std::io::stdin().lock())
+                .map_err(str::to_owned)?,
+        ),
+        None => None,
+    };
 
     // 1. Connect to the running subc daemon as a consumer.
     let conn = SubcConnection::connect(&args.subc)
         .await
         .map_err(|e| format!("connect subc ({}): {e}", args.subc.display()))?;
-    let plane = SubcToolPlane::new(conn, &args.module_id);
+    let plane = match carrier_scope {
+        Some(selector) => {
+            SubcToolPlane::new_with_direct_carrier_scope(conn, &args.module_id, selector)
+        }
+        None => SubcToolPlane::new(conn, &args.module_id),
+    };
 
     // 1b. Fill the catalog before resolving a model.
     //
@@ -588,6 +610,14 @@ async fn run(args: Args) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scope_help_names_private_stdin_and_unscoped_services() {
+        use clap::CommandFactory;
+        let help = super::Args::command().render_long_help().to_string();
+        assert!(help.contains("--scope <OWNER/REF/EPOCH>"));
+        assert!(help.contains("stdin"));
+        assert!(help.contains("vault routes remain unscoped"));
+    }
     use super::*;
     use broca_protocol::request::CallOptions;
     use broca_provider::families::{openai_chat_frozen_config, OpenAiChat};

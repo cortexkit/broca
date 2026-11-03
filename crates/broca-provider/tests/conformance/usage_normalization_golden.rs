@@ -225,6 +225,10 @@ fn gemini_stream(raw_usage: &Value, wrapped: bool) -> Vec<u8> {
 }
 
 fn bedrock_stream(raw_usage: &Value) -> Vec<u8> {
+    bedrock_stream_with_stop(raw_usage, "end_turn")
+}
+
+fn bedrock_stream_with_stop(raw_usage: &Value, stop: &str) -> Vec<u8> {
     let events = [
         ("messageStart", json!({"role":"assistant"})),
         (
@@ -233,7 +237,7 @@ fn bedrock_stream(raw_usage: &Value) -> Vec<u8> {
         ),
         ("contentBlockStop", json!({"contentBlockIndex":0})),
         ("metadata", json!({"usage":raw_usage})),
-        ("messageStop", json!({"stopReason":"end_turn"})),
+        ("messageStop", json!({"stopReason":stop})),
     ];
     let mut stream = Vec::new();
     for (event_type, payload) in events {
@@ -242,4 +246,67 @@ fn bedrock_stream(raw_usage: &Value) -> Vec<u8> {
         ));
     }
     stream
+}
+
+#[test]
+fn provider_native_finish_tokens_survive_normalization_for_every_family() {
+    for (name, ordinary, limited) in [
+        ("anthropic_messages", "end_turn", "max_tokens"),
+        ("openai_chat_cached_tokens", "stop", "length"),
+        (
+            "openai_responses",
+            "completed",
+            "incomplete:max_output_tokens",
+        ),
+        ("chatgpt_codex", "completed", "incomplete:max_output_tokens"),
+        ("gemini", "STOP", "MAX_TOKENS"),
+        ("code_assist", "STOP", "MAX_TOKENS"),
+        ("bedrock_converse", "end_turn", "max_tokens"),
+    ] {
+        for raw in [ordinary, limited, "future_native_reason"] {
+            let usage = json!({});
+            let bytes = if name == "bedrock_converse" {
+                bedrock_stream_with_stop(&usage, raw)
+            } else if matches!(name, "openai_responses" | "chatgpt_codex") && raw == limited {
+                let mut stream = Vec::new();
+                append_sse_data(
+                    &mut stream,
+                    &json!({"type":"response.incomplete","response":{"id":"raw-finish","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}),
+                );
+                stream
+            } else if matches!(name, "openai_responses" | "chatgpt_codex") {
+                String::from_utf8(recorded_stream(name, &usage))
+                    .unwrap()
+                    .replace(
+                        &format!("\"status\":\"{ordinary}\""),
+                        &format!("\"status\":\"{raw}\""),
+                    )
+                    .into_bytes()
+            } else {
+                String::from_utf8(recorded_stream(name, &usage))
+                    .unwrap()
+                    .replace(ordinary, raw)
+                    .into_bytes()
+            };
+            let id = family_id(name);
+            let frozen = families::frozen_config_for_family(id, "native-finish");
+            let mut decoder = family(id).normalizer(&frozen, StepId(1));
+            let mut events = Vec::new();
+            for bytes in bytes.chunks(11) {
+                events.extend(decoder.push(bytes).unwrap());
+            }
+            events.extend(decoder.finish().unwrap());
+            let reasons: Vec<_> = events
+                .into_iter()
+                .filter_map(|event| match event {
+                    NormalizedEvent::Control(ProviderControl::StepFinished {
+                        raw_finish_reason,
+                        ..
+                    }) => Some(raw_finish_reason),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reasons, vec![Some(raw.to_owned())], "{name}: {raw}");
+        }
+    }
 }

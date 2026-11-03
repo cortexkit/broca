@@ -20,6 +20,22 @@ roots. A refused bind or an
 interrupted first send can therefore leave an identity-only candidate without a WAL.
 Candidates still do not prove that content exists or is locally owned.
 
+With subc-protocol 0.34, wire binds contain only `(harness, session)`. A uniquely
+recorded pair keeps its original storage root byte-for-byte, scoped or unscoped,
+even if the current stamp names a different workdir. For an absent pair whose
+inventory is complete, the first reservation uses the scope's stamped `workdir`,
+or `broca-unscoped-v1` when no workdir is stamped. The namespace is a storage key,
+not a directory; WAL paths remain under the state root's log folders. Public v2
+refs still omit the root, and old v1 aliases remain accepted. No existing WAL is
+re-keyed by this choice.
+
+Broca declares `bind-no-project/v1`; stray legacy `project_root` and `project_id`
+members on inbound binds do not affect addressing or attribution. Only scope
+stamps supply project attribution. Outgoing routes never serialize the storage
+root or namespace as a bind project: tool/catalog routes select the frozen scope
+when present, while unscoped routes (including module-level compaction, hook and
+vault routes) have no folder.
+
 An identity reservation alone remains a new session, including after an interrupted
 first bind. Subscribe-before-send may create its first lineage, preserving the
 subscriber's cursor origin. Historical content is different: any run-index row,
@@ -117,8 +133,9 @@ shared repair. A later bind may start another attempt after a failed repair.
 
 The refusal remains `session_address_unavailable`, with `detail.class: "transient"`
 and `detail.reason` identifying `wait_expired`, `migration_failed`, or a remaining
-`gap_marker`. The code is not in subc-protocol 0.33.4's retryable route-open set;
-callers must not assume the transient class alone enables transport retries.
+`gap_marker` (a durable warning that some WAL identities may be missing from discovery).
+Subc-protocol 0.34.1 classifies this code as retryable on route open;
+the bounded route-open retry policy applies while discovery is unavailable.
 `health.check.session_address_refusals.repairs` counts started, completed and failed
 attempts, and `diagnostics.findings` retains timestamped `session_inventory_repairs`
 evidence. These counts describe repair attempts, not sessions or census rows.
@@ -358,7 +375,7 @@ rebuilds or rewrites the live key itself.
 
 The flat-session-key projection tables checked for cleanup are `meta`, `message`,
 `message_tag`, `episode_span`, `retention_lineage`, `retained_head`,
-`compaction_facts`, `bus_event_projection` and `bus_event_open`. Preview lists
+`compaction_facts`, `display_fact`, `display_fact_seed`, `bus_event_projection` and `bus_event_open`. Preview lists
 every existing table with a `session` column and its exact stale-key row count;
 `remove` identifies the known projections. An unrecognized table with stale-key
 rows refuses rather than risking authoritative data. Tables using JSON identities

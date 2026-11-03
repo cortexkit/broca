@@ -1658,6 +1658,7 @@ fn registration_candidates(
 
 #[cfg(test)]
 mod tests {
+    include!("late_results_puller/abandoned_call_tests.rs");
     use super::*;
     use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall};
     use broca_protocol::{BatchId, MessageId, RunId, StepId};
@@ -1802,6 +1803,7 @@ mod tests {
     fn held_records(call_key: &str, module: &str, bind: &BindIdentity) -> Vec<WalRecord> {
         let mut records = vec![
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -1826,6 +1828,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,

@@ -202,7 +202,12 @@ async fn project_identity_open(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn project_identity_existing_unscoped_and_scoped_resume_on_legacy_addresses() {
-    for scoped in [false, true] {
+    for (scoped, old_folder) in [
+        (false, "legacy-one"),
+        (false, "legacy-two"),
+        (true, "legacy-one"),
+        (true, "legacy-two"),
+    ] {
         let Some(rig) = Rig::start().await else {
             return;
         };
@@ -217,11 +222,24 @@ async fn project_identity_existing_unscoped_and_scoped_resume_on_legacy_addresse
             .await;
         }
         let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
-        let legacy = rig.session(if scoped {
+        let mut legacy = rig.session(if scoped {
             "scoped-resume"
         } else {
             "athena-seat"
         });
+        let old_root = rig.dir.join(old_folder);
+        std::fs::create_dir_all(&old_root).unwrap();
+        legacy.project_root = old_root.canonicalize().unwrap();
+        // Reserve a pre-existing directory-root identity independently of today's wire bind.
+        let inventory =
+            broca_store::SqliteStore::open(rig.state_root.join("run-index.db")).unwrap();
+        broca_core::SessionRefIndex::record_session(
+            &inventory,
+            &broca_core::session_addr(&legacy),
+            &legacy,
+        )
+        .unwrap();
+        drop(inventory);
         let route = project_identity_open(&owner, &legacy, scoped).await;
         let first = send(&owner, &route, "first-consult-round").await.unwrap();
         let run_id = first["result"]["run_id"].as_str().unwrap().to_owned();
@@ -302,6 +320,34 @@ async fn project_identity_new_scoped_session_uses_stamped_workdir() {
     storage.project_root = checkout;
     assert!(rig.wal_path(&storage).exists());
     assert!(!rig.wal_path(&route_identity).exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn project_identity_new_unscoped_session_uses_namespace_under_state_root() {
+    let Some(rig) = Rig::start().await else {
+        return;
+    };
+    let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
+    let mut claimed = rig.session("new-unscoped");
+    claimed.project_root = rig.dir.canonicalize().unwrap();
+    let route = project_identity_open(&owner, &claimed, false).await;
+    send(&owner, &route, "first").await.unwrap();
+    let expected =
+        broca_protocol::BindIdentity::new("broca-unscoped-v1", &claimed.harness, &claimed.session);
+    let path = rig.wal_path(&expected);
+    assert_eq!(path.parent(), Some(rig.state_root.join("wal").as_path()));
+    assert!(path.exists());
+    assert!(!rig.wal_path(&claimed).exists());
+    let inventory =
+        broca_store::SqliteStore::open_read_only(rig.state_root.join("run-index.db")).unwrap();
+    let reference = broca_core::agent_session_ref(&expected);
+    let snapshot = inventory
+        .session_refs(std::iter::once(reference.as_str()))
+        .unwrap();
+    assert_eq!(
+        snapshot.sessions[&reference],
+        (broca_core::session_addr(&expected), expected)
+    );
 }
 
 struct Rig {
@@ -697,9 +743,7 @@ impl Rig {
     }
 
     fn session(&self, name: &str) -> broca_protocol::BindIdentity {
-        // Canonical, as broca keys it: on macOS the scratch root sits under /var, a symlink to
-        // /private/var, and the WAL address is derived from the resolved project root.
-        broca_protocol::BindIdentity::new(self.dir.canonicalize().unwrap(), "scope-e2e", name)
+        broca_protocol::BindIdentity::new("broca-unscoped-v1", "scope-e2e", name)
     }
 
     fn wal_path(&self, session: &broca_protocol::BindIdentity) -> PathBuf {

@@ -58,6 +58,7 @@ fn run_config(max_tokens: u32) -> RunConfig {
 /// distinguished by `max_tokens` (so a per-episode-config test can tell them apart).
 fn start(run: &str, text: &str, max_tokens: u32) -> WalRecord {
     WalRecord::RunStarted {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -95,6 +96,7 @@ fn start(run: &str, text: &str, max_tokens: u32) -> WalRecord {
 /// A terminal (text-only) model step.
 fn step_text(step: u64, text: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,

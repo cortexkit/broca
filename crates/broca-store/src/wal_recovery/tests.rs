@@ -1303,3 +1303,85 @@ fn recovery_completed_receipt_owner_stays_completed_after_reprojection() {
         }
     }
 }
+
+#[test]
+fn wal_recovery_invalidates_display_facts_with_other_rebuildable_views() {
+    use broca_core::display_facts::{DisplayFactVersion, DisplayFacts, DisplayFactsSeed};
+    let f = Fixture::new();
+    let mut seed = DisplayFactsSeed::default();
+    seed.through_seq = 1;
+    let versions = [DisplayFactVersion {
+        ordinal: 0,
+        seq: 1,
+        facts: DisplayFacts {
+            client_message_id: Some("old-source".into()),
+            ..Default::default()
+        },
+    }];
+    let epoch = f
+        .store
+        .display_cache_read(&f.session, "display-lineage", 1, &[0])
+        .unwrap()
+        .publication_epoch;
+    f.store
+        .display_cache_publish(&f.session, "display-lineage", None, epoch, &seed, &versions)
+        .unwrap();
+    assert!(f
+        .store
+        .display_cache_read(&f.session, "display-lineage", 1, &[0])
+        .unwrap()
+        .seed
+        .is_some());
+    stop_after_invalidation(&f);
+    {
+        let conn = f.store.conn.lock().unwrap();
+        for table in ["display_fact", "display_fact_seed"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "recovery must invalidate {table} before the physical cut"
+            );
+        }
+    }
+    assert!(f
+        .store
+        .display_cache_read(&f.session, "display-lineage", 1, &[0])
+        .is_err());
+    assert!(f
+        .store
+        .display_cache_publish(&f.session, "display-lineage", None, epoch, &seed, &versions)
+        .is_err());
+    f.recover().unwrap();
+    assert!(
+        f.store
+            .display_cache_publish(&f.session, "display-lineage", None, epoch, &seed, &versions)
+            .is_err(),
+        "a pre-cut reader cannot republish after recovery has completed"
+    );
+    let fresh = f
+        .store
+        .display_cache_read(&f.session, "display-lineage", 1, &[0])
+        .unwrap();
+    assert!(fresh.seed.is_none() && fresh.rows.is_empty());
+    assert_ne!(fresh.publication_epoch, epoch);
+    f.store
+        .display_cache_publish(
+            &f.session,
+            "display-lineage",
+            None,
+            fresh.publication_epoch,
+            &seed,
+            &versions,
+        )
+        .unwrap();
+    assert!(f
+        .store
+        .display_cache_read(&f.session, "display-lineage", 1, &[0])
+        .unwrap()
+        .seed
+        .is_some());
+}

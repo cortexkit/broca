@@ -578,9 +578,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         let credential_ids =
             broca_module_serve::VaultCredentialIds::load_default_path().map_err(ServeIoError)?;
         let addressing = broca_module_serve::VaultAddressing::new(credential_ids);
-        // A process-global bind for the vault route. The vault ignores the bind identity
-        // (reads are authorized by this module's grant, not by bind), but subc's daemon canonicalizes
-        // and REJECTS a non-existent project_root — so use the state root, which exists.
+        // A process-global identity for broca's vault calls, not a conversation identity.
+        // Only harness/session travel in the wire bind; the local storage-root field is not sent.
         let vault_bind = broca_protocol::BindIdentity::new(
             state_root.to_string_lossy().to_string(),
             "broca",
@@ -4504,13 +4503,22 @@ mod executor {
             let alias_route = resolution.method.map(|method| {
                 format!("{}:{}", method.as_token(), job.req.model.provider_module_id)
             });
-            let admitted_tools: Vec<_> = job
+            let mut admitted_tools: Vec<_> = job
                 .req
                 .tools
                 .iter()
                 .filter(|tool| job.req.policy_allowed.contains(&tool.name))
                 .cloned()
                 .collect();
+            // Operator aliases cover every declaration the model sees, including runner-owned
+            // tools. Only fresh episodes freeze this map; resumes keep their recorded names.
+            if let Some(so) = &job.req.structured_output {
+                if so.mode == broca_protocol::structured_output::Mode::SubmitTool {
+                    admitted_tools.push(broca_provider::structured_output::submit_tool(
+                        so.schema.clone(),
+                    ));
+                }
+            }
             let aliases = alias_route
                 .as_deref()
                 .map(|route| self.tool_name_aliases.for_tools(route, &admitted_tools))
@@ -6457,6 +6465,7 @@ mod executor {
             framed(
                 seq,
                 broca_wal::WalRecord::RunStarted {
+                    sent_by: None,
                     written_at_ms: None,
                     tags: None,
                     session_class: None,

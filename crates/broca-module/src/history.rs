@@ -140,21 +140,25 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, RowMetadat
                 senders.insert(submission_id.0.clone(), sent_by.clone());
             }
             WalRecord::Queued {
+                sent_by,
                 submission_id,
                 request_identity_digest,
                 principal,
                 ..
             } => {
-                let principal = senders
-                    .get(&submission_id.0)
-                    .and_then(Option::as_ref)
-                    .or(principal.as_ref());
+                let principal = sent_by.as_ref().or_else(|| {
+                    senders
+                        .get(&submission_id.0)
+                        .and_then(Option::as_ref)
+                        .or(principal.as_ref())
+                });
                 queued.insert(
                     submission_id.0.clone(),
                     send_metadata(request_identity_digest.as_deref(), principal),
                 );
             }
             WalRecord::RunStarted {
+                sent_by,
                 request_identity_digest,
                 principal,
                 submission_id,
@@ -169,18 +173,22 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, RowMetadat
                         .and_then(|id| queued.get(&id.0))
                         .cloned()
                         .unwrap_or_else(|| {
-                            send_metadata(request_identity_digest.as_deref(), principal.as_ref())
+                            send_metadata(
+                                request_identity_digest.as_deref(),
+                                sent_by.as_ref().or(principal.as_ref()),
+                            )
                         });
                 }
             }
             WalRecord::Steered {
+                sent_by,
                 request_identity_digest,
                 input,
                 ..
             } => {
-                // Legacy steers have no recorded principal; do not guess the session owner's.
+                // Legacy steers have no display stamp; do not guess the session owner's.
                 pending.extend(std::iter::repeat_n(
-                    send_metadata(request_identity_digest.as_deref(), None),
+                    send_metadata(request_identity_digest.as_deref(), sent_by.as_ref()),
                     input.len(),
                 ));
             }
@@ -297,6 +305,17 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
                         .iter()
                         .find(|fact| fact.tool_call_id == call.tool_call_id.0)
                         .and_then(|fact| fact.call_key.clone());
+                    if let Some(time) = entry
+                        .tool_times
+                        .iter()
+                        .find(|time| time.tool_call_id == call.tool_call_id.0)
+                    {
+                        part.call_key = time.call_key.clone();
+                        part.schema_pin = time.schema_pin.clone();
+                        part.started_at = time.started_at;
+                        part.finished_at = time.finished_at;
+                        part.unanswered = time.unanswered.clone();
+                    }
                     DisplayPart::ToolCall(part)
                 }
                 ContentBlock::ToolResult(result) => {
@@ -454,6 +473,7 @@ pub async fn read<H: ServeHandler + ?Sized>(
         let mut read = SessionReadRequest::new(session.clone(), Some(from), Some(stop - from));
         read.lineage_id = Some(lineage.clone());
         read.include_rich_ui = request.form() == HistoryForm::Display;
+        read.include_display_facts = request.form() == HistoryForm::Display;
         read.max_bytes = Some(broca_wire::READ_MAXIMUM_MAX_BYTES);
         // Display needs stored payloads; raw history honors the caller's descriptor choice.
         read.media = if request.form() == HistoryForm::Display {
@@ -515,6 +535,13 @@ pub async fn read<H: ServeHandler + ?Sized>(
             }
             if let Some(metadata) = metadata.get(&entry.ordinal) {
                 for call in row.tool_calls_mut() {
+                    if entry
+                        .tool_times
+                        .iter()
+                        .any(|time| time.tool_call_id == call.tool_call_id)
+                    {
+                        continue;
+                    }
                     call.schema_pin = metadata.tool_pins.get(&call.tool_call_id).and_then(|pin| {
                         cortexkit_role_tool_provider::call::SchemaPin::new(
                             &call.name,

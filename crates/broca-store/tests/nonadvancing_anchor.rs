@@ -12,6 +12,7 @@ use broca_wal::{wal_bytes_read, RunConfig, RunOrigin, WalRecord};
 
 fn run_started(session: &BindIdentity) -> WalRecord {
     WalRecord::RunStarted {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -82,6 +83,7 @@ fn nonadvancing_projection_preserves_anchor_and_tail_read_cost() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

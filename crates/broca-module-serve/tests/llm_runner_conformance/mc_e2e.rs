@@ -416,19 +416,13 @@ async fn scoped_session_route(subject: &BrocaSubject, live: &Live) -> BrocaRoute
     use subc_protocol::{scope::ScopeSelector, Principal};
     let stamp = subject.owner_stamp();
     let connection = subject.connection(live, &stamp).await.unwrap();
-    let identity = subject.bind_identity(SESSION);
+    let identity = subject.raw_bind_identity(SESSION);
     subject
         .shared
         .session_roots
         .lock()
         .unwrap()
         .insert(SESSION.to_owned(), live.state_root.clone());
-    subject
-        .shared
-        .session_bindings
-        .lock()
-        .unwrap()
-        .insert(SESSION.into(), identity.clone());
     let selector = || {
         ScopeSelector::new(
             Principal::Reserved {
@@ -460,6 +454,12 @@ async fn scoped_session_route(subject: &BrocaSubject, live: &Live) -> BrocaRoute
         }
     })
     .await;
+    subject
+        .shared
+        .session_bindings
+        .lock()
+        .unwrap()
+        .insert(SESSION.into(), subject.bind_identity(SESSION));
     BrocaRoute {
         subject: subject.clone(),
         connection,
@@ -745,6 +745,7 @@ async fn real_mc_async_compaction_end_to_end() {
     connection.route_close(&mc_route).await.unwrap();
     note(&root, mc.assert_private_databases(&live));
     let route = scoped_session_route(&subject, &live).await;
+    evidence.identity = subject.bind_identity(SESSION);
 
     // The scripted model's turns, extended run by run. Each run is a tool call and an answer.
     let mut turns: Vec<ScriptedTurn> = Vec::new();

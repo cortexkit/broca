@@ -84,6 +84,11 @@ to this crate.
   `attempt_id`, `kind`, `status`, `copied_in`, `reservation`, `envelope`,
   `correction_id`, and `appended_ms`. Reservation and envelope data are JSON
   values; this crate reports facts, not prices or billing-model decisions.
+- `reservation.session.project_root` is absent when the frozen storage root is
+  exactly `broca-unscoped-v1`. The namespace is not a project; `harness`, `session`,
+  `session_ref` and extensions remain present as recorded. Other roots retain their
+  original JSON. This is an output projection only: WAL `AttemptSession` bytes and
+  checkpoint reservation digests retain the full storage identity.
 - Deduplicate globally on `attempt_id` alone, never on position or checkpoint.
   An attempt id is 128 random bits encoded as 32 lowercase hexadecimal characters,
   durably reserved before sending the request. It is unchanged on the finish and

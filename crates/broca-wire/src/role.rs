@@ -260,6 +260,8 @@ fn deserialize_run_usage_value(
 /// as an open string. A run that has not ended carries no `final_message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResultResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<cortexkit_role_llm_runner::finish::Finish>,
     /// The credential id frozen at admission, as in `run.status`; never an empty string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_selection: Option<String>,
@@ -380,10 +382,12 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::HOST_HISTORY,
         cortexkit_role_llm_runner::capabilities::HISTORY_DISPLAY,
         cortexkit_role_llm_runner::capabilities::RICH_UI_STAMP,
+        cortexkit_role_llm_runner::capabilities::READ_DISPLAY_FACTS,
         cortexkit_role_llm_runner::capabilities::CALL_IDENTITY,
         cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
         cortexkit_role_llm_runner::capabilities::RUN_STATUS,
+        cortexkit_role_llm_runner::capabilities::FINISH_REASON,
         cortexkit_role_llm_runner::capabilities::HELD_CALLS,
         cortexkit_role_llm_runner::capabilities::RUN_USAGE,
         cortexkit_role_llm_runner::capabilities::SESSION_USAGE,
@@ -418,8 +422,10 @@ pub fn broca_role_describe_with_writers(
         // Ordered sends can land beside tool results, at a running step boundary, or when an
         // idle session starts. `turn_system` has no renderer and is deliberately not advertised.
         DELIVERY_ORDER_GROUP,
-        // A send's client_message_id lives beside its body and is exposed only on display rows.
+        cortexkit_role_llm_runner::capabilities::SENDER_SUCCESSION,
+        // Client identity belongs to the display envelope, never to a model-visible message.
         cortexkit_role_llm_runner::capabilities::CLIENT_MESSAGE_ID,
+        cortexkit_role_llm_runner::capabilities::MESSAGE_SENDERS,
     ]
     .map(String::from)
     .to_vec();
@@ -1247,7 +1253,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "1310517fd6b3fe529e7ba833c0acaa7a3711ce3252930b9deb44ea2161ba940b",
+            "46cc6c2ac8970280563c71e9e729ae8f7c63cf0942e1de59c075c5e3eb66b2d4",
         );
     }
 
@@ -1425,7 +1431,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "ae729a7b9a1ca0de45a0b1b087f6caa98167e98c05a2eac903753deaeb794c21";
+        "7389182e5dd09d47447b7887800f58a8e97e2dd6c277cd362e1d2976eb01b17e";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

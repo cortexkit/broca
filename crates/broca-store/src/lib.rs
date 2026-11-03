@@ -40,6 +40,7 @@ pub mod compaction_facts;
 pub mod compaction_receipts;
 pub mod db;
 pub mod diagnostics;
+mod display_facts;
 pub mod export_index;
 mod fold_identities;
 pub mod grants;
@@ -832,6 +833,10 @@ impl SqliteStore {
         let key = Self::key(session);
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM display_fact WHERE session=?1", [&key])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM display_fact_seed WHERE session=?1", [&key])
+            .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM message WHERE session=?1", [&key])
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM message_tag WHERE session=?1", [&key])
@@ -1289,8 +1294,17 @@ impl SqliteStore {
                  session TEXT NOT NULL,
                  ord     INTEGER NOT NULL,
                  json    TEXT NOT NULL,
-                 PRIMARY KEY (session, ord)
-             );
+                  PRIMARY KEY (session, ord)
+              );
+              CREATE TABLE IF NOT EXISTS display_fact_seed (
+                  session TEXT NOT NULL, lineage TEXT NOT NULL, state TEXT NOT NULL,
+                  PRIMARY KEY(session,lineage)
+              );
+              CREATE TABLE IF NOT EXISTS display_fact (
+                  session TEXT NOT NULL, lineage TEXT NOT NULL, ord INTEGER NOT NULL,
+                  seq INTEGER NOT NULL, facts TEXT NOT NULL,
+                  PRIMARY KEY(session,lineage,ord,seq)
+              );
               CREATE TABLE IF NOT EXISTS run_index (
                   run_id                       TEXT PRIMARY KEY,
                    -- SAME NAME AND TYPE AS meta.session, DIFFERENT ENCODING: this one is the
@@ -2243,6 +2257,36 @@ impl SqliteStore {
 }
 
 impl MaterializedStore for SqliteStore {
+    fn read_display_facts_cache(
+        &self,
+        session: &BindIdentity,
+        lineage: &str,
+        at_seq: u64,
+        ordinals: &[u64],
+    ) -> Result<Option<broca_core::display_facts::DisplayFactsCache>, String> {
+        self.display_cache_read(session, lineage, at_seq, ordinals)
+            .map(Some)
+    }
+
+    fn publish_display_facts(
+        &self,
+        session: &BindIdentity,
+        lineage: &str,
+        expected_seq: Option<u64>,
+        expected_epoch: Option<i64>,
+        seed: &broca_core::display_facts::DisplayFactsSeed,
+        versions: &[broca_core::display_facts::DisplayFactVersion],
+    ) -> Result<(), String> {
+        self.display_cache_publish(
+            session,
+            lineage,
+            expected_seq,
+            expected_epoch,
+            seed,
+            versions,
+        )
+    }
+
     fn invalidate_wal_recovery(
         &self,
         session: &BindIdentity,

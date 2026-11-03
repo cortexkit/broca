@@ -90,6 +90,7 @@ impl Provider for Model {
                 },
             },
             ProviderControl::StepFinished {
+                raw_finish_reason: None,
                 step_id: step,
                 usage: Default::default(),
                 finish_reason,

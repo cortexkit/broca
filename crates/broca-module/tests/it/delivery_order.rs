@@ -23,6 +23,239 @@ use common::{req, FakeExecutor, Rig};
 const LONG_TTL: Duration = Duration::from_secs(3600);
 const SHORT_TTL: Duration = Duration::from_millis(100);
 
+#[tokio::test]
+async fn keyed_retry_ignores_deadlines_for_owner_and_named_senders() {
+    for sender in ["owner", "ck-mc"] {
+        let mut rig = Rig::new("retry-deadline", FakeExecutor::auto(), LONG_TTL);
+        let key = session_naming_ck_mc(&rig, "deadline", false).await;
+        let original = DeliveryOrder {
+            expires_at_ms: Some(u64::MAX - 100),
+            ..order(&[DeliveryMode::Steer], Some("deadline-key"))
+        };
+        let mut request = send(&key, "deadline-note", Some(original.clone()));
+        request.request.principal = reserved(sender);
+        let receipt = rig.registry.send(request.clone()).await.unwrap();
+        let before = records(&rig, &key);
+        for restarted in [false, true] {
+            if restarted {
+                restart_registry(&mut rig).await;
+            }
+            for deadline in [Some(u64::MAX), None, Some(1)] {
+                request.order.as_mut().unwrap().expires_at_ms = deadline;
+                let retry = rig.registry.send(request.clone()).await.unwrap();
+                assert_eq!(
+                    serde_json::to_value(retry).unwrap(),
+                    serde_json::to_value(&receipt).unwrap()
+                );
+                assert_eq!(
+                    records(&rig, &key),
+                    before,
+                    "a retry must not rewrite its deadline"
+                );
+            }
+            for changed in [
+                DeliveryOrder {
+                    modes: vec![DeliveryMode::ToolResult],
+                    ..original.clone()
+                },
+                DeliveryOrder {
+                    dedupe_key: Some("other".into()),
+                    ..original.clone()
+                },
+            ] {
+                request.order = Some(changed);
+                assert!(
+                    matches!(rig.registry.send(request.clone()).await, Err(ServeError::SendIdReuse { differing }) if differing == "delivery")
+                );
+            }
+            request.order = Some(original.clone());
+        }
+    }
+}
+
+#[tokio::test]
+async fn successor_prefers_removed_predecessor_receipts_after_refresh_and_restart() {
+    let mut rig = Rig::new("succession", FakeExecutor::auto(), LONG_TTL);
+    let key = session_naming_ck_mc(&rig, "succession", false).await;
+    let predecessor = pending_steer(&rig, &key, "ck-mc", "shared").await;
+    refresh_senders(
+        &rig,
+        &key,
+        1,
+        "on_prefix_rebuild",
+        plan_naming("phone", false),
+    )
+    .await;
+    let mut independent = send(&key, "shared", Some(order(&[DeliveryMode::Steer], None)));
+    independent.request.principal = reserved("phone");
+    independent.request.input[0].content = vec![broca_protocol::ContentBlock::Text {
+        text: "different".into(),
+    }];
+    let own_receipt = rig.registry.send(independent.clone()).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(rig.registry.send(independent).await.unwrap()).unwrap(),
+        serde_json::to_value(&own_receipt).unwrap()
+    );
+    let mut plan = plan_naming("phone", false);
+    let manifest = std::sync::Arc::make_mut(plan.manifest.as_mut().unwrap());
+    let mut value: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+    value["senders"][0]["succeeds"] = serde_json::json!("ck-mc");
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap();
+    refresh_senders(&rig, &key, 2, "on_prefix_rebuild", plan).await;
+    for restarted in [false, true] {
+        if restarted {
+            restart_registry(&mut rig).await;
+        }
+        let before = records(&rig, &key);
+        assert_eq!(
+            pending_steer(&rig, &key, "phone", "shared").await,
+            predecessor
+        );
+        let status = rig
+            .registry
+            .send_status(
+                &key,
+                broca_protocol::RunId("shared".into()),
+                "send-shared",
+                reserved("phone").as_ref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["submission_id"],
+            predecessor.0
+        );
+        let mut changed = send(&key, "shared", Some(order(&[DeliveryMode::Steer], None)));
+        changed.request.principal = reserved("phone");
+        changed.request.input[0].content = vec![broca_protocol::ContentBlock::Text {
+            text: "different".into(),
+        }];
+        assert!(matches!(
+            rig.registry.send(changed).await,
+            Err(ServeError::SendIdReuse { .. })
+        ));
+        assert_eq!(records(&rig, &key), before);
+        assert!(matches!(
+            retract_as(&rig, &key, reserved("phone"), &predecessor).await,
+            Err(ServeError::ScopeRefused(_))
+        ));
+    }
+    let own = pending_steer(&rig, &key, "owner", "shared").await;
+    assert_ne!(
+        own, predecessor,
+        "the owner's send namespace stays independent"
+    );
+    let fresh = pending_steer(&rig, &key, "phone", "fresh").await;
+    assert_ne!(fresh, predecessor);
+}
+
+#[tokio::test]
+async fn successor_retries_legacy_owner_steers_with_the_original_receipt_without_delivery() {
+    let (exec, gate) = FakeExecutor::gated_with_step_boundary();
+    let mut rig = Rig::new("owner-succession", exec, LONG_TTL);
+    let key = rig.key("owner-steer");
+    let mut first = send(&key, "owner-run", None);
+    first.request.principal = reserved("owner");
+    first.plan = Some(plan_naming("old-module", false));
+    rig.registry.send(first).await.unwrap();
+    let mut legacy = send(&key, "legacy-note", None);
+    legacy.delivery = broca_protocol::Delivery::Steer;
+    legacy.request.principal = reserved("owner");
+    assert!(
+        matches!(rig.registry.send(legacy.clone()).await.unwrap(), SendResponse::Active { ref run_id, .. } if run_id == "owner-run")
+    );
+    gate.release().await;
+    wait_idle(&rig, &key).await;
+    let receipt = serde_json::to_value(rig.registry.send(legacy.clone()).await.unwrap()).unwrap();
+    let mut plan = plan_naming("phone", true);
+    let manifest = std::sync::Arc::make_mut(plan.manifest.as_mut().unwrap());
+    let mut value: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+    value["senders"][0]["succeeds"] = serde_json::json!("owner");
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap();
+    refresh_senders(&rig, &key, 1, "on_prefix_rebuild", plan).await;
+    legacy.request.principal = reserved("phone");
+    for restarted in [false, true] {
+        if restarted {
+            restart_registry(&mut rig).await;
+        }
+        let before = records(&rig, &key);
+        assert_eq!(
+            serde_json::to_value(rig.registry.send(legacy.clone()).await.unwrap()).unwrap(),
+            receipt
+        );
+        let status = rig
+            .registry
+            .send_status(
+                &key,
+                broca_protocol::RunId("legacy-note".into()),
+                "send-legacy-note",
+                reserved("phone").as_ref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_value(status).unwrap(), receipt);
+        let mut conflicting = legacy.clone();
+        conflicting.request.input[0].content = vec![broca_protocol::ContentBlock::Text {
+            text: "different".into(),
+        }];
+        assert!(matches!(
+            rig.registry.send(conflicting).await,
+            Err(ServeError::SendIdReuse { .. })
+        ));
+        assert_eq!(
+            records(&rig, &key),
+            before,
+            "a predecessor receipt never delivers another message"
+        );
+    }
+    assert!(matches!(
+        rig.registry
+            .send_status(
+                &key,
+                broca_protocol::RunId("legacy-note".into()),
+                "send-legacy-note",
+                reserved("stranger").as_ref()
+            )
+            .await,
+        Err(ServeError::UnknownSend)
+    ));
+    assert!(rig
+        .registry
+        .authorize_session_owner(
+            &key,
+            reserved("phone").as_ref(),
+            &broca_protocol::SendScope::Unstamped
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn successor_retries_legacy_owner_started_sends_with_unchanged_receipts() {
+    let rig = Rig::new("owner-start-succession", FakeExecutor::auto(), LONG_TTL);
+    let key = rig.key("owner-start");
+    let mut original = send(&key, "owner-turn", None);
+    original.request.principal = reserved("owner");
+    original.plan = Some(plan_naming("old-module", false));
+    rig.registry.send(original.clone()).await.unwrap();
+    wait_idle(&rig, &key).await;
+    original.plan = None;
+    let receipt = serde_json::to_value(rig.registry.send(original.clone()).await.unwrap()).unwrap();
+    let mut plan = plan_naming("phone", true);
+    let manifest = std::sync::Arc::make_mut(plan.manifest.as_mut().unwrap());
+    let mut value: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+    value["senders"][0]["succeeds"] = serde_json::json!("owner");
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap();
+    refresh_senders(&rig, &key, 1, "on_prefix_rebuild", plan).await;
+    original.request.principal = reserved("phone");
+    let before = records(&rig, &key);
+    assert_eq!(
+        serde_json::to_value(rig.registry.send(original).await.unwrap()).unwrap(),
+        receipt
+    );
+    assert_eq!(records(&rig, &key), before);
+}
+
 async fn retract_as(
     rig: &Rig,
     key: &broca_protocol::BindIdentity,
@@ -306,6 +539,7 @@ async fn retract_own_send_without_recorded_sender_stays_owner_only_after_restart
         .append(
             1,
             &WalRecord::Queued {
+                sent_by: None,
                 written_at_ms: None,
                 retention: None,
                 ts_ms: None,

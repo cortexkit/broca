@@ -186,6 +186,7 @@ impl Rig {
         let mut records = vec![
             started(session, run),
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -342,6 +343,7 @@ impl Rig {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -385,6 +387,7 @@ impl Rig {
 }
 fn started(session: &BindIdentity, run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -2137,6 +2140,7 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
     let session = rig.session("queued");
     rig.seed(&session, "complete", true);
     let queued = WalRecord::Queued {
+        sent_by: None,
         written_at_ms: None,
         retention: None,
         ts_ms: None,

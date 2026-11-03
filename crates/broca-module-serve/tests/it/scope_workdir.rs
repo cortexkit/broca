@@ -54,7 +54,7 @@ async fn bind_at(
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(route_root, rig.session.harness.clone(), name),
+        identity: SubcBindIdentity::new(rig.session.harness.clone(), name),
         principal: Some(scope_owner()),
         consumer_capabilities: None,
         admission_facts: None,
@@ -262,12 +262,24 @@ async fn existing_sessions_keep_their_key_and_new_scoped_sessions_use_workdir() 
     let new_run = send_and_settle(&mut rig, 10, "turn-1").await;
     let new_key = BindIdentity::new(&elsewhere, rig.session.harness.clone(), "new-workdir");
 
-    let old_seat = bind_at(&mut rig, 11, "unscoped-seat", &root, None, 1).await;
+    let old_seat = BindIdentity::new(&root, rig.session.harness.clone(), "unscoped-seat");
+    rig.store
+        .record_session(&broca_core::session_addr(&old_seat), &old_seat)
+        .unwrap();
+    bind_at(&mut rig, 11, "unscoped-seat", &root, None, 1).await;
     let seat_first = send_and_settle(&mut rig, 11, "consult-round-1").await;
     bind_at(&mut rig, 11, "unscoped-seat", &elsewhere, None, 2).await;
     let seat_second = send_and_settle(&mut rig, 11, "consult-round-2").await;
 
-    let new_unscoped = bind_at(&mut rig, 12, "new-unscoped", &elsewhere, None, 1).await;
+    let new_unscoped = bind_at(
+        &mut rig,
+        12,
+        "new-unscoped",
+        Path::new("broca-unscoped-v1"),
+        None,
+        1,
+    )
+    .await;
     let unscoped_run = send_and_settle(&mut rig, 12, "turn-1").await;
 
     let after = workdir_counters(&mut rig).await;
@@ -292,9 +304,64 @@ async fn existing_sessions_keep_their_key_and_new_scoped_sessions_use_workdir() 
         Some(&elsewhere),
     );
     assert_keyed_by_bind(&rig, &new_unscoped, &[unscoped_run], Some(&root));
+    for (label, session) in [("SCOPED", &new_key), ("UNSCOPED", &new_unscoped)] {
+        let wal = broca_core::FileWalStore::new(rig.dir.join("wal"));
+        let records = broca_core::WalStore::read_records(&wal, session).unwrap();
+        let facts = broca_core::compute_segments(
+            &records,
+            "project-attribution-example",
+            &|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1),
+        );
+        assert_eq!(facts.len(), 1);
+        let value = serde_json::to_value(&facts[0]).unwrap();
+        if label == "UNSCOPED" {
+            assert!(value["session"].get("project_root").is_none());
+        } else {
+            assert_eq!(
+                value["session"]["project_root"],
+                json!(new_key.project_root)
+            );
+        }
+        println!(
+            "FACT_SAMPLE_{label}={}",
+            serde_json::to_string(&facts[0]).unwrap()
+        );
+    }
     let resumed_bytes =
         std::fs::read(broca_core::FileWalStore::new(rig.dir.join("wal")).wal_path(&moved)).unwrap();
     assert_eq!(&resumed_bytes[..legacy_bytes.len()], legacy_bytes);
+    for (index, old_root) in [&root, &elsewhere].into_iter().enumerate() {
+        for scoped in [false, true] {
+            let name = format!("legacy-{index}-{scoped}");
+            let legacy = BindIdentity::new(old_root, &rig.session.harness, &name);
+            rig.store
+                .record_session(&broca_core::session_addr(&legacy), &legacy)
+                .unwrap();
+            bind_at(&mut rig, 13, &name, old_root, None, 1).await;
+            let first = send_and_settle(&mut rig, 13, "first").await;
+            let wal = broca_core::FileWalStore::new(rig.dir.join("wal"));
+            let prefix = std::fs::read(wal.wal_path(&legacy)).unwrap();
+            bind_at(
+                &mut rig,
+                13,
+                &name,
+                Path::new("broca-unscoped-v1"),
+                scoped.then_some(elsewhere.as_path()),
+                2,
+            )
+            .await;
+            let second = send_and_settle(&mut rig, 13, "second").await;
+            assert_keyed_by_bind(
+                &rig,
+                &legacy,
+                &[first, second],
+                Some(Path::new("broca-unscoped-v1")),
+            );
+            assert!(std::fs::read(wal.wal_path(&legacy))
+                .unwrap()
+                .starts_with(&prefix));
+        }
+    }
     rig.finish().await;
 }
 
@@ -346,7 +413,7 @@ async fn ambiguous_and_incomplete_addresses_refuse_before_wal_or_lease_creation(
             target: RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(&first.project_root, &first.harness, name),
+            identity: SubcBindIdentity::new(&first.harness, name),
             principal: Some(scope_owner()),
             consumer_capabilities: None,
             admission_facts: None,
@@ -420,11 +487,7 @@ async fn inventory_wait_refusals_keep_the_precise_transient_code_and_reason() {
             target: RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(
-                &rig.session.project_root,
-                &rig.session.harness,
-                "new-after-repair",
-            ),
+            identity: SubcBindIdentity::new(&rig.session.harness, "new-after-repair"),
             principal: Some(scope_owner()),
             consumer_capabilities: None,
             admission_facts: None,

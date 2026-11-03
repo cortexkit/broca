@@ -124,6 +124,7 @@ impl ClosedSession {
             .collect();
         self.append(WalRecord::StepStarted { step_id });
         self.append(WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             step_id,
@@ -190,6 +191,7 @@ impl ClosedSession {
 
     fn steer(&mut self, text: &str) {
         self.append(WalRecord::Steered {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             retention: None,
@@ -245,6 +247,7 @@ impl ClosedSession {
         let step_id = StepId(1);
         let batch_id = BatchId("batch-duplicate-id".into());
         self.append(WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             step_id,
@@ -641,6 +644,7 @@ async fn run_tool_calls_ordinals_match_session_read_across_a_materialized_prefix
 async fn run_tool_calls_returns_empty_for_a_run_without_tool_calls() {
     let mut session = ClosedSession::new("empty");
     session.append(WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         step_id: StepId(1),
@@ -768,6 +772,7 @@ async fn completed_directives_match_all_published_vectors_and_old_run_bytes() {
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolCall(_)));
         session.append(WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             step_id: StepId(1),

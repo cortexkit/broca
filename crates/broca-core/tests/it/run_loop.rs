@@ -71,6 +71,7 @@ fn text_step_with_usage(text: &str, step_usage: Usage) -> Vec<NormalizedEvent> {
             },
         }),
         ctrl(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id: StepId(0),
             usage: step_usage,
             finish_reason: FinishReason::Stop,
@@ -98,6 +99,7 @@ fn length_step(text: &str) -> Vec<NormalizedEvent> {
             },
         }),
         ctrl(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id: StepId(0),
             usage: usage(10, 4096),
             finish_reason: FinishReason::Length,
@@ -136,6 +138,7 @@ fn tool_step(calls: &[(&str, &str, serde_json::Value)]) -> Vec<NormalizedEvent> 
             },
         }),
         ctrl(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id: StepId(0),
             usage: usage(10, 8),
             finish_reason: FinishReason::ToolCalls,
@@ -280,6 +283,7 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     wal.append(
         1,
         &WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -934,6 +938,7 @@ async fn zero_step_count_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -1013,6 +1018,7 @@ async fn zero_context_limit_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -1180,6 +1186,7 @@ async fn volatile_cache_tail_with_tools_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -2973,6 +2980,7 @@ async fn run_usage_accumulates_across_steps() {
                     finish_reason,
                     ..
                 }) => ctrl(ProviderControl::StepFinished {
+                    raw_finish_reason: None,
                     step_id,
                     usage: usage(100, 10),
                     finish_reason,
@@ -3002,6 +3010,7 @@ async fn run_usage_accumulates_across_steps() {
                     finish_reason,
                     ..
                 }) => ctrl(ProviderControl::StepFinished {
+                    raw_finish_reason: None,
                     step_id,
                     usage: usage(7, 3),
                     finish_reason,
@@ -3829,6 +3838,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
                 }],
             )];
             PendingSubmission {
+                display_sent_by: None,
                 admitted_at_ms: None,
                 order: None,
                 sent_by: None,

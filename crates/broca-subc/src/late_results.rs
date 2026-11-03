@@ -615,6 +615,12 @@ mod tests {
             )
         );
         assert_eq!(
+            render(&settled(kinds::NOT_STARTED).with_reason("scope_ended")),
+            Some(
+                json!({"tool_call_id": "tc_1", "output": {"kind": "error", "message": "This call never ran: its provider settled it as not started (scope_ended)."}, "is_error": true})
+            )
+        );
+        assert_eq!(
             render(&settled(kinds::EXPIRED)),
             Some(
                 json!({"tool_call_id": "tc_1", "output": {"kind": "error", "message": "This call's result expired at its provider before it was collected, so the result is lost. The call may have run."}, "is_error": true})

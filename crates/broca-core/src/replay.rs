@@ -3119,6 +3119,7 @@ fn replay_seeded_with_compaction<'a>(
     // delivery or tag state is synthesized.
     for held in &held_steers {
         let synthetic = WalRecord::Steered {
+            sent_by: None,
             written_at_ms: None,
             input: vec![held.clone()].into(),
             tags: None,
@@ -4574,6 +4575,8 @@ pub(crate) fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::u
 /// Not `Eq`: `ProviderError` carries an `f64` retry hint.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReconciledRunState {
+    /// Last completed model step's normalized native reason; display only.
+    pub finish: Option<cortexkit_role_llm_runner::finish::Finish>,
     pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     pub budget_detail: Option<broca_protocol::BudgetExhaustedDetail>,
     pub context_ceiling: Option<broca_protocol::ContextCeilingDetail>,
@@ -4616,6 +4619,7 @@ pub struct ReconciledRunState {
 
 fn interrupted_recovery_state() -> ReconciledRunState {
     ReconciledRunState {
+        finish: None,
         budget_detail: None,
         context_ceiling: None,
         ceiling_deadline_ms: None,
@@ -4662,6 +4666,7 @@ pub fn reconcile_run_state<'a>(
     let mut held_calls = HeldCallsProjection::default();
     // The structured-output settings the target run froze, and the result it recorded.
     let mut frozen_structured_output = None;
+    let mut frozen_finish_config = serde_json::Value::Null;
     let mut structured_output_result = None;
     // A queued send's submission id is `sub-<run id>` (see the coordinator's `queue_submission`),
     // so its `Queued` record can name this run before any `RunStarted` does.
@@ -4684,6 +4689,7 @@ pub fn reconcile_run_state<'a>(
                 ..
             } => {
                 if rid.0 == run_id {
+                    frozen_finish_config = config.frozen_render_config.clone();
                     auth_selection = config.auth_selection.clone();
                     title = started_title.clone();
                     frozen_structured_output =
@@ -4704,6 +4710,7 @@ pub fn reconcile_run_state<'a>(
                 if rid.0 == run_id {
                     // Seen this run start; default to Active until a terminal/pause appears.
                     found = Some(ReconciledRunState {
+                        finish: None,
                         account_limit_pause: None,
                         budget_detail: None,
                         context_ceiling: None,
@@ -4767,6 +4774,9 @@ pub fn reconcile_run_state<'a>(
             WalRecord::ModelStepFinished {
                 finish_reason,
                 retries_used,
+                raw_finish_reason,
+                assistant_message,
+                fallback,
                 ..
             } => {
                 active_zero_step_seed = false;
@@ -4777,6 +4787,32 @@ pub fn reconcile_run_state<'a>(
                 // A step that finished no longer waits for its ride.
                 if active_run.as_deref() == Some(run_id) {
                     if let Some(state) = &mut found {
+                        let config = if fallback.refusal_fallback.is_some() {
+                            frozen_finish_config.pointer("/refusal_fallback/frozen")
+                        } else {
+                            Some(&frozen_finish_config)
+                        };
+                        state.finish = config
+                            .and_then(|config| config.get("family_id"))
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|family| match family {
+                                "anthropic_messages" => Some("anthropic.messages"),
+                                "openai_chat" => Some("openai.chat_completions"),
+                                "openai_responses" => Some("openai.responses"),
+                                "openai_responses_chatgpt" => Some("openai.chatgpt_responses"),
+                                "gemini" => Some("google.generate_content"),
+                                "google_codeassist" => Some("google.code_assist"),
+                                "bedrock_converse" => Some("aws.bedrock_converse"),
+                                _ => None,
+                            })
+                            .and_then(|source| {
+                                cortexkit_role_llm_runner::finish::normalize(
+                                    source,
+                                    raw_finish_reason.as_deref(),
+                                    assistant_message.tool_calls().next().is_some(),
+                                )
+                                .expect("every frozen family has a shared finish source")
+                            });
                         state.ride_wait_deadline_ms = None;
                     }
                 }
@@ -4888,6 +4924,7 @@ pub fn reconcile_run_state<'a>(
                     found = Some(ReconciledRunState {
                         account_limit_pause: None,
                         budget_detail: budget_detail.clone(),
+                        finish: found.as_ref().and_then(|state| state.finish.clone()),
                         context_ceiling: context_ceiling.clone(),
                         ceiling_deadline_ms: None,
                         structured_output,
@@ -4919,6 +4956,7 @@ pub fn reconcile_run_state<'a>(
                 found = Some(ReconciledRunState {
                     account_limit_pause: account_limit.clone(),
                     budget_detail: None,
+                    finish: None,
                     context_ceiling: None,
                     ceiling_deadline_ms: None,
                     structured_output: None,
@@ -4953,6 +4991,7 @@ pub fn reconcile_run_state<'a>(
                     account_limit_pause: None,
                     budget_detail: None,
                     context_ceiling: None,
+                    finish: None,
                     ceiling_deadline_ms: None,
                     structured_output: None,
                     live_step: None,
@@ -4976,6 +5015,7 @@ pub fn reconcile_run_state<'a>(
     }
     if active_run.as_deref() == Some(run_id) && active_zero_step_seed {
         return Some(ReconciledRunState {
+            finish: None,
             account_limit_pause: None,
             budget_detail: None,
             context_ceiling: None,
@@ -5427,6 +5467,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -5489,6 +5530,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::RunStarted {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -6088,6 +6130,7 @@ pub(crate) mod deferred_tests {
         vec![
             super::projection_boundary_tests::run_started(1, "r").record,
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -6898,6 +6941,7 @@ mod offset_tail_tests {
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -6938,6 +6982,7 @@ mod offset_tail_tests {
 
     fn steered(text: &str) -> WalRecord {
         WalRecord::Steered {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             retention: None,
@@ -6959,6 +7004,7 @@ mod offset_tail_tests {
 
     fn text_step(step: u64, text: &str) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -7031,6 +7077,7 @@ mod offset_tail_tests {
         // One model step with two tool calls, planned as [a, b] but arriving as [b, a].
         // The tools message orders results by plan, not by arrival.
         records.push(WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -7671,6 +7718,7 @@ mod offset_tail_tests {
     fn invalid_states_fall_back_to_full_replay() {
         let batch_id = BatchId("r1-b9".into());
         let tool_step = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -7759,6 +7807,7 @@ mod offset_tail_tests {
         );
         // A queued record, and a steered record, held before unfinished tool work.
         let queued = WalRecord::Queued {
+            sent_by: None,
             written_at_ms: None,
             retention: None,
             ts_ms: None,
@@ -7816,6 +7865,7 @@ mod offset_tail_tests {
         ];
         for i in 0..9996u64 {
             small.push(WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
