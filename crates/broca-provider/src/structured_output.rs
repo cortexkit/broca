@@ -721,7 +721,11 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
             #[cfg(test)]
             PREPARED_COPIES.with(|copies| copies.set(copies.get() + 1));
             let raw_ordinals = view.render_episodes.raw_ordinals;
-            match view.prompt.iter_mut().find(|m| m.role == Role::System && (!raw_ordinals || !m.turn_system)) {
+            match view
+                .prompt
+                .iter_mut()
+                .find(|m| m.role == Role::System && (!raw_ordinals || !m.turn_system))
+            {
                 Some(system) => {
                     let text = if so.instructions_paragraph_break {
                         format!("\n\n{}", instructions(so))

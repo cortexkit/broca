@@ -27,6 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod compaction_v2;
+
 use broca_core::{
     send_identity_difference_with_conversation_key as send_identity_difference,
     send_identity_digest_with_conversation_key as send_identity_digest, submission_difference,
@@ -334,6 +336,17 @@ pub enum LineageCmd {
     ApplyCompaction {
         ready: broca_core::compaction_provider::notice::ViewReady,
         reply: oneshot::Sender<Result<bool, String>>,
+    },
+    CompactionV2 {
+        caller: Option<String>,
+        method: String,
+        params: Box<serde_json::value::RawValue>,
+        reply: oneshot::Sender<
+            Result<
+                Box<serde_json::value::RawValue>,
+                broca_core::compaction_v2::protocol::wire::Refusal,
+            >,
+        >,
     },
     /// Test-only: report the entry count and serialized size of the admission identity cache.
     #[cfg(test)]
@@ -1504,6 +1517,7 @@ pub struct LineageActor<W: WalStore> {
     /// Whether this actor has logged its compaction session passing the stored-message watch
     /// threshold; see `crate::compaction_watch`.
     compaction_watch: crate::compaction_watch::CompactionSessionWatch,
+    compaction_session: Arc<broca_core::compaction_v2::session::Session>,
     pending_fifo: Vec<PendingSubmission>,
     /// Observed only during input hooks: dropping the RPC reply cancels this send, not its run.
     send_reply: Option<oneshot::Sender<SendOutcome>>,
@@ -1863,6 +1877,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let approvals = fanout.approval_state();
         let media_head = fanout.media_head();
         let mut actor = LineageActor {
+            compaction_session: Arc::default(),
             agent_run_scope: None,
             #[cfg(all(test, feature = "test-clock"))]
             agent_run_writer_for_test: AGENT_RUN_WRITER_FOR_TEST.get(),
@@ -2689,26 +2704,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 false
             }
             LineageCmd::ApplyCompaction { ready, reply } => {
-                let result = if matches!(self.state, RunState::Idle) {
-                    let store = self.wal_store.clone();
-                    let key = self.key.clone();
-                    match spawn_blocking(JobKind::WalRead, move || store.read_records(&key)).await {
-                        Ok(Ok(records)) => {
-                            self.executor
-                                .apply_idle_compaction(
-                                    &self.key,
-                                    self.writer.as_ref().expect("writer live while open"),
-                                    records.into_iter().map(|framed| framed.record).collect(),
-                                    &ready,
-                                )
-                                .await
-                        }
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(error) => Err(error.to_string()),
-                    }
-                } else {
-                    Ok(false)
-                };
+                // V1 announcements cannot change a frozen legacy view. Mode-3
+                // providers push views through compaction-runner instead of the bus.
+                let _ = ready;
+                let result = Ok(false);
                 // Applying or refusing a view can append a notice too. The next send must
                 // not depend on a separate queue-wake command to observe those durable records.
                 self.discard_stale_admission_view();
@@ -2717,6 +2716,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 if matches!(result, Ok(true)) {
                     self.session_change_rebuild = true;
                 }
+                let _ = reply.send(result);
+                false
+            }
+            LineageCmd::CompactionV2 {
+                caller,
+                method,
+                params,
+                reply,
+            } => {
+                let result = self
+                    .compaction_v2_call(caller.as_deref(), &method, &params)
+                    .await;
                 let _ = reply.send(result);
                 false
             }
@@ -2844,7 +2855,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             LineageCmd::IdleTick
             | LineageCmd::CompactionChanged { .. }
-            | LineageCmd::ApplyCompaction { .. } => {}
+            | LineageCmd::ApplyCompaction { .. }
+            | LineageCmd::CompactionV2 { .. } => {}
             #[cfg(test)]
             LineageCmd::RetainedAdmissionIdentityState { reply } => {
                 let _ = reply.send((usize::MAX, usize::MAX));
@@ -4288,39 +4300,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if has_compaction && self.compaction_watch.pending() {
             self.watch_compaction_session_size().await;
         }
-        if !resume_indexed_run
-            && has_compaction
-            && (matches!(self.state, RunState::Idle) || delivery != broca_protocol::Delivery::Queue)
-        {
-            let checkpoint = match self.load_checkpoint_at_head().await {
-                Ok(checkpoint) => checkpoint,
-                Err(error) => return SendOutcome::Transient(error),
-            };
-            let mut effective = request.clone();
-            if let Some(episode) = &checkpoint.last_episode {
-                inherit_frozen_parameters(&mut effective, &episode.config);
-            }
-            if let Some(detail) = checkpoint
-                .compaction
-                .as_ref()
-                .and_then(|c| c.state())
-                .and_then(|state| {
-                    state.send_ceiling(
-                        &effective.input,
-                        effective.context_limit.or_else(|| {
-                            checkpoint
-                                .last_episode
-                                .as_ref()
-                                .filter(|episode| episode.config.model == effective.model)
-                                .and_then(|episode| episode.config.context_limit)
-                        }),
-                        &effective.model,
-                    )
-                })
-            {
-                return SendOutcome::ContextCeiling(detail);
-            }
-        }
         // A send using the `delivery_order` group is always queued with its order, and delivered
         // at the first request boundary where one of its modes is possible.
         if !resume_indexed_run {
@@ -4490,6 +4469,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(StartRunFailure::Admission(RunError::ToolAliasInvalid(e))) => {
                     SendOutcome::ToolAliasInvalid(e)
                 }
+                Err(StartRunFailure::Admission(
+                    error @ RunError::CompactionContextLimitMissing,
+                )) => SendOutcome::DeliveryRefused {
+                    code: "invalid_params",
+                    field: "context_limit",
+                    message: error.to_string(),
+                },
                 Err(StartRunFailure::Admission(RunError::AccountSelectionRefused(refusal))) => {
                     SendOutcome::AccountSelectionRefused(refusal)
                 }
@@ -5219,7 +5205,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let resuming = checkpoint.last_episode.as_ref().is_some_and(|episode| {
             episode.run_id == run_id && episode.disposition != EpisodeDisposition::Finished
         });
-        if !cancel_before_execute && !resuming {
+        if !cancel_before_execute
+            && !resuming
+            && checkpoint.head.as_ref().and_then(|head| head.mode3) == Some(true)
+        {
             if let Some(detail) = checkpoint
                 .compaction
                 .as_ref()
@@ -5477,7 +5466,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .and_then(|(_, config)| self.registry.cache_declaration(&config))
                 .and_then(|declaration| declaration.ttl_ms);
             clock.seed_if_unknown(&records, ttl);
-            recorded = broca_core::cache_warm::last_recorded_request(&records).ok();
+            let lineage = self
+                .writer
+                .as_ref()
+                .and_then(|writer| writer.lineage_id())
+                .map(|lineage| lineage.to_string());
+            recorded = broca_core::cache_warm::last_recorded_request_with_lineage(
+                &records,
+                lineage.as_deref(),
+            )
+            .ok();
         }
         let registry = self.registry.clone();
         self.retention_lineage = self.admitting_retention.is_some()
@@ -5531,6 +5529,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
         );
         let step_progress = Arc::new(std::sync::Mutex::new(None));
         let control = RunControl {
+            compaction_session: Some(self.compaction_session.clone()),
+            compaction_changes: Some(Arc::new(broca_core::compaction_v2::session::BoundChanges {
+                session: self.compaction_session.clone(),
+                writer: self
+                    .writer
+                    .as_ref()
+                    .expect("writer live while open")
+                    .clone(),
+                wal: self.wal_store.clone(),
+                bind: self.key.clone(),
+                scope: req.scope.clone(),
+                plane: self.executor.compaction_plane(),
+            })),
             display_sent_by,
             emit_display_context: true,
             step_progress: Some(Arc::clone(&step_progress)),
@@ -8568,7 +8579,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 LineageCmd::IdleTick
                 | LineageCmd::CompactionChanged { .. }
-                | LineageCmd::ApplyCompaction { .. } => {}
+                | LineageCmd::ApplyCompaction { .. }
+                | LineageCmd::CompactionV2 { .. } => {}
                 #[cfg(test)]
                 LineageCmd::RetainedAdmissionIdentityState { reply } => {
                     let _ = reply.send((usize::MAX, usize::MAX));
@@ -9526,7 +9538,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             LineageCmd::RunFinished { .. }
             | LineageCmd::IdleTick
             | LineageCmd::CompactionChanged { .. }
-            | LineageCmd::ApplyCompaction { .. } => {}
+            | LineageCmd::ApplyCompaction { .. }
+            | LineageCmd::CompactionV2 { .. } => {}
             #[cfg(test)]
             LineageCmd::RetainedAdmissionIdentityState { reply } => {
                 let _ = reply.send((usize::MAX, usize::MAX));
@@ -12707,29 +12720,32 @@ mod tests {
     }
 
     pub(super) fn min_config() -> broca_wal::RunConfig {
-        broca_wal::RunConfig { global_system: None, account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        model: broca_protocol::request::ModelHandle::new("fake", "fake"),
-        tools: vec![].into(),
-        tool_choice: Default::default(),
-        generation: Default::default(),
-        response_format: Default::default(),
-        provider_options: serde_json::Value::Null,
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: 1,
-        frozen_render_config: serde_json::Value::Null,
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: Vec::new(),
-        context_management: None, }
+        broca_wal::RunConfig {
+            global_system: None,
+            account_limit_pause: false,
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: broca_protocol::request::ModelHandle::new("fake", "fake"),
+            tools: vec![].into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: Vec::new(),
+            context_management: None,
+        }
     }
 
     /// An actor-test opener with a real lease and a selectable WAL backend.

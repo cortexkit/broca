@@ -1086,13 +1086,13 @@ pub fn estimate_tokens(rendered_bytes: usize, previous: Option<(u64, usize)>) ->
     )
 }
 
-pub(crate) type CompactionItem = (
+pub type CompactionItem = (
     String,
     Option<String>,
     Map<String, Value>,
     Map<String, Value>,
 );
-pub(crate) fn item(manifest: &broca_wal::PlanManifest) -> Result<Option<CompactionItem>, String> {
+pub fn item(manifest: &broca_wal::PlanManifest) -> Result<Option<CompactionItem>, String> {
     let plan: Value =
         serde_json::from_str(manifest.plan.as_json_text()).map_err(|e| e.to_string())?;
     let Some(item) = plan.get("compaction_item").filter(|item| !item.is_null()) else {

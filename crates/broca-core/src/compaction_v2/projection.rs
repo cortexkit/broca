@@ -13,7 +13,15 @@ use super::{
 };
 
 pub fn configured(mode3: bool, ownership: Option<&crate::SessionOwnershipV1>) -> bool {
-    mode3 && ownership.and_then(|ownership| ownership.latest_manifest.as_deref().or_else(|| ownership.first_episode.as_ref()?.manifest.as_deref())).is_some_and(crate::compaction::has_compaction)
+    mode3
+        && ownership
+            .and_then(|ownership| {
+                ownership
+                    .latest_manifest
+                    .as_deref()
+                    .or_else(|| ownership.first_episode.as_ref()?.manifest.as_deref())
+            })
+            .is_some_and(crate::compaction::has_compaction)
 }
 
 pub struct Prepared {

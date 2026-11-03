@@ -87,29 +87,32 @@ fn start(input: Vec<Message>) -> WalRecord {
         ts_ms: None,
         run_id: RunId("compacted-run".into()),
         session: BindIdentity::new("/tmp/p", "h", "s"),
-        config: Box::new(RunConfig { global_system: None, account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        model: ModelHandle::new("anthropic", "claude-opus-5-5"),
-        tools: vec![].into(),
-        tool_choice: Default::default(),
-        generation: Default::default(),
-        response_format: Default::default(),
-        provider_options: Value::Null,
-        cache_tiers: Value::Null,
-        context_epoch: 0,
-        renderer_version: frozen.renderer_version,
-        frozen_render_config: serde_json::to_value(frozen).unwrap(),
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: vec![],
-        context_management: None, }),
+        config: Box::new(RunConfig {
+            global_system: None,
+            account_limit_pause: false,
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: ModelHandle::new("anthropic", "claude-opus-5-5"),
+            tools: vec![].into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: Value::Null,
+            cache_tiers: Value::Null,
+            context_epoch: 0,
+            renderer_version: frozen.renderer_version,
+            frozen_render_config: serde_json::to_value(frozen).unwrap(),
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: vec![],
+            context_management: None,
+        }),
         input: input.into(),
         origin: RunOrigin::Fresh,
         submission_id: None,
@@ -181,6 +184,90 @@ fn bytes(records: &[WalRecord]) -> Vec<u8> {
         &anthropic_frozen_config("claude-opus-5-5"),
         &options(records),
     )
+}
+
+#[test]
+fn compaction_v2_globals_preserve_real_serializer_system_bytes_without_transcript_positions() {
+    use broca_core::compaction_v2::systems;
+    for systems_at in [0, 1, 2] {
+        let mut legacy = vec![text(Role::User, "earlier turn")];
+        legacy.splice(
+            systems_at.min(legacy.len())..systems_at.min(legacy.len()),
+            [
+                text(Role::System, "first instructions"),
+                text(Role::System, "second instructions"),
+            ],
+        );
+        legacy.push(text(Role::User, "next question"));
+        let mut transcript = legacy.clone();
+        let globals = systems::take_globals(&mut transcript);
+        stamp_ordinals(&mut transcript);
+        assert_eq!(transcript[0].ordinal, Some(0));
+        assert_eq!(transcript[1].ordinal, Some(1));
+        let legacy = CallOptions::new(legacy);
+        let mode3 = systems::view(&CallOptions::new(transcript), &globals)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            AnthropicMessages.render(&anthropic_frozen_config("claude-opus-5-5"), &legacy),
+            AnthropicMessages.render(&anthropic_frozen_config("claude-opus-5-5"), &mode3)
+        );
+        assert_eq!(
+            Gemini.render(&gemini_frozen_config("gemini-3-pro"), &legacy),
+            Gemini.render(&gemini_frozen_config("gemini-3-pro"), &mode3)
+        );
+    }
+}
+
+#[test]
+fn compaction_v2_keep_plan_preserves_provider_blocks_cache_markers_and_expected_tag_prefixes() {
+    use broca_core::compaction_v2::{
+        entries::{self, EntryFacts},
+        render,
+    };
+    let mut stored = seed();
+    stamp_ordinals(&mut stored);
+    stored[1].cache_prefix_blocks = Some(2);
+    let facts: Vec<_> = stored
+        .iter()
+        .enumerate()
+        .map(|(index, _)| EntryFacts {
+            mid: format!("m12345678.{index}"),
+            ordinal: index as u64 + 1,
+            written_at: 10,
+            ..Default::default()
+        })
+        .collect();
+    let entries = entries::project(&stored, &facts, &Default::default(), true);
+    let prompt = render::prompt(&stored, &entries, &[], |_| {
+        panic!("a keep plan has no inserted image")
+    })
+    .unwrap();
+    let mut expected = stored.clone();
+    for (position, block, number) in [(0, 0, 1), (1, 2, 2), (2, 0, 3), (3, 2, 4)] {
+        let ContentBlock::Text { text } = &mut expected[position].content[block] else {
+            unreachable!()
+        };
+        text.insert_str(0, &format!("§{number}§ "));
+    }
+    let ContentBlock::ToolResult(result) = &mut expected[4].content[0] else {
+        unreachable!()
+    };
+    let ToolOutput::Text { text } = &mut result.output else {
+        unreachable!()
+    };
+    text.insert_str(0, "§5§ ");
+    let native = CallOptions::new(stored);
+    let before = CallOptions::new(expected);
+    let after = render::options(&native, prompt);
+    assert_eq!(
+        AnthropicMessages.render(&anthropic_frozen_config("claude-opus-5-5"), &before),
+        AnthropicMessages.render(&anthropic_frozen_config("claude-opus-5-5"), &after)
+    );
+    assert_eq!(
+        Gemini.render(&gemini_frozen_config("gemini-3-pro"), &before),
+        Gemini.render(&gemini_frozen_config("gemini-3-pro"), &after)
+    );
 }
 
 fn blocks(records: &[WalRecord]) -> Vec<Value> {

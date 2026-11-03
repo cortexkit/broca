@@ -269,30 +269,33 @@ mod gated {
         let mut wal = wal_store
             .open(&request.session)
             .expect("open WAL for resumable seed");
-        let config = RunConfig { global_system: None, account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags,
-        computed_tags: None,
-        model: request.model.clone(),
-        tools: request.tools.clone().into(),
-        tool_choice: request.tool_choice.clone(),
-        generation: request.generation.clone(),
-        response_format: Default::default(),
-        provider_options: serde_json::Value::Null,
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: frozen.renderer_version,
-        frozen_render_config: serde_json::to_value(frozen)
-            .expect("frozen render config must serialize"),
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: request.budget.clone(),
-        context_limit: request.context_limit,
-        work_class: request.work_class.clone(),
-        variant: request.variant.clone(),
-        service_tier: None,
-        stop_when: request.stop_when.clone(),
-        context_management: None, };
+        let config = RunConfig {
+            global_system: None,
+            account_limit_pause: false,
+            turn_directives_v1: None,
+            render_tags,
+            computed_tags: None,
+            model: request.model.clone(),
+            tools: request.tools.clone().into(),
+            tool_choice: request.tool_choice.clone(),
+            generation: request.generation.clone(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: frozen.renderer_version,
+            frozen_render_config: serde_json::to_value(frozen)
+                .expect("frozen render config must serialize"),
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: request.budget.clone(),
+            context_limit: request.context_limit,
+            work_class: request.work_class.clone(),
+            variant: request.variant.clone(),
+            service_tier: None,
+            stop_when: request.stop_when.clone(),
+            context_management: None,
+        };
         wal.append(
             1,
             &WalRecord::RunStarted {

@@ -57,6 +57,7 @@ fn invalidates_cached_prefix(record: &WalRecord) -> bool {
         record,
         WalRecord::CompactionMessage { .. }
             | WalRecord::CompactionViewApplied { .. }
+            | WalRecord::CompactionViewAppliedV2 { .. }
             | WalRecord::CompactionAnswer {
                 disposition: broca_wal::CompactionDisposition::Wait,
                 ..
@@ -352,7 +353,12 @@ fn rebuild<W: WalStore>(
     } else {
         at + 1
     };
-    let request = broca_core::cache_warm::last_recorded_request(&records[..end]).ok()?;
+    let lineage = writer.lineage_id().map(|lineage| lineage.to_string());
+    let request = broca_core::cache_warm::last_recorded_request_with_lineage(
+        &records[..end],
+        lineage.as_deref(),
+    )
+    .ok()?;
     if request.route.is_some() {
         return None;
     }

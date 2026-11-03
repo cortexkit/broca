@@ -421,36 +421,39 @@ pub async fn run_import_with_store<W: WalStore>(
 }
 
 fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig {
-    RunConfig { global_system: None, account_limit_pause: false,
-    turn_directives_v1: None,
-    render_tags: false,
-    computed_tags: Some(broca_wal::ComputedTagRules {
-        checkpoint: tag_checkpoint,
-    }),
-    model: ModelHandle::new("import", "import"),
-    tools: Vec::new().into(),
-    tool_choice: ToolChoice::None,
-    generation: GenerationConfig::default(),
-    response_format: ResponseFormat::default(),
-    provider_options: serde_json::json!({"import_request_digest": request_digest}),
-    cache_tiers: serde_json::Value::Null,
-    context_epoch: 0,
-    renderer_version: 0,
-    // Null is deliberate: the W3-B frozen-render guard refuses to resume this marker as
-    // a provider run. Replay classifies a dangling zero-step SeededFrom episode as
-    // Interrupted before any provider can be selected.
-    frozen_render_config: serde_json::Value::Null,
-    auth_selection: None,
-    tools_were_omitted: false,
-    budget: None,
-    context_limit: None,
-    work_class: None,
-    variant: None,
-    service_tier: None,
-    stop_when: Vec::new(),
-    // An import seed chooses no context management: the first harness episode after it is
-    // the session's first real admission, and binds the value then.
-    context_management: None, }
+    RunConfig {
+        global_system: None,
+        account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: Some(broca_wal::ComputedTagRules {
+            checkpoint: tag_checkpoint,
+        }),
+        model: ModelHandle::new("import", "import"),
+        tools: Vec::new().into(),
+        tool_choice: ToolChoice::None,
+        generation: GenerationConfig::default(),
+        response_format: ResponseFormat::default(),
+        provider_options: serde_json::json!({"import_request_digest": request_digest}),
+        cache_tiers: serde_json::Value::Null,
+        context_epoch: 0,
+        renderer_version: 0,
+        // Null is deliberate: the frozen-render guard refuses to resume this marker as
+        // a provider run. Replay classifies a dangling zero-step SeededFrom episode as
+        // Interrupted before any provider can be selected.
+        frozen_render_config: serde_json::Value::Null,
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        // An import seed leaves context management unset; the session's first
+        // real admission binds the value.
+        context_management: None,
+    }
 }
 
 fn repairable_import_prefix(

@@ -1,5 +1,11 @@
 //! Setup, the replay of what the removed synchronous client recorded, and the in-memory WAL the
 //! asynchronous view tests share.
+//!
+//! V1 round-trip tests explicitly enable the unit-only historical writer fixture
+//! to generate old WAL prefixes without changing their renderer or expected
+//! results for simulated crashes.
+//! They do not assert that the daemon still calls v1. The mode-3 run-loop tests
+//! also exercise shipping legacy freeze with that fixture disabled.
 
 use super::*;
 use crate::compaction_provider::setup::{SetupAnswer, SetupRequest};
@@ -1080,6 +1086,7 @@ async fn admission_and_model_page_absent_compaction_summary_force_complete_reads
     let model = crate::StubProvider::new(vec![model_events()]);
     let (out, _events) = tokio::sync::mpsc::channel(128);
     let control = crate::RunControl {
+        legacy_compaction_fixture: true,
         manifest: Some(manifest()),
         compaction_plane: Some(scripted.clone()),
         ..Default::default()
@@ -1379,6 +1386,7 @@ fn history_request() -> (crate::RunRequest, crate::RunControl, Arc<OneView>) {
     .unwrap();
     let views = Arc::new(OneView::default());
     let control = crate::RunControl {
+        legacy_compaction_fixture: true,
         manifest: Some(Arc::new(plan)),
         compaction_plane: Some(Arc::new(Scripted {
             answer: ready(),
@@ -1640,6 +1648,7 @@ async fn a_new_lineage_numbers_its_notices_past_the_deleted_lineages() {
         &store,
         None,
         crate::RunControl {
+            legacy_compaction_fixture: true,
             manifest: Some(manifest()),
             compaction_plane: Some(plane.clone()),
             ..Default::default()
@@ -1833,6 +1842,7 @@ async fn a_model_change_rides_for_a_view_and_applies_it() {
         ..Default::default()
     });
     let control = || crate::RunControl {
+        legacy_compaction_fixture: true,
         manifest: Some(manifest()),
         compaction_plane: Some(views.clone()),
         // A call budget above the rewrite deadline: the ride still waits no longer than the
@@ -1984,6 +1994,7 @@ async fn run_with_account(
     let writer = shared.writer();
     *views.wal.lock().unwrap() = Some(shared.clone());
     let control = crate::RunControl {
+        legacy_compaction_fixture: true,
         manifest: Some(manifest()),
         compaction_plane: Some(views.clone()),
         compaction_views: None,
@@ -2250,6 +2261,7 @@ async fn step_boundary_logs_applied_and_superseded_views_with_session_ref() {
     });
     let plane: Arc<dyn CompactionPlane> = racing.clone();
     let control = crate::RunControl {
+        legacy_compaction_fixture: true,
         compaction_views: Some(inbox.clone()),
         ..Default::default()
     };
@@ -2435,6 +2447,7 @@ async fn a_request_over_the_window_is_refused_before_it_is_sent() {
         let model = crate::StubProvider::new(vec![model_events()]);
         let (out, _events) = tokio::sync::mpsc::channel(256);
         let mut control = crate::RunControl {
+            legacy_compaction_fixture: true,
             admitted_context_limit: Some(4),
             ..Default::default()
         };
@@ -2592,6 +2605,7 @@ async fn only_a_compaction_session_reads_the_notice_floor() {
     plain.plan = OpaqueJson::from_json_text(json!({"composition":{}}).to_string()).unwrap();
     assert_eq!(
         floor_reads(crate::RunControl {
+            legacy_compaction_fixture: true,
             manifest: Some(Arc::new(plain)),
             ..Default::default()
         })
@@ -2600,6 +2614,7 @@ async fn only_a_compaction_session_reads_the_notice_floor() {
     );
     assert_eq!(
         floor_reads(crate::RunControl {
+            legacy_compaction_fixture: true,
             manifest: Some(manifest()),
             compaction_plane: Some(Arc::new(Scripted {
                 answer: ready(),
@@ -2703,6 +2718,7 @@ async fn ending_run(
         &shared,
         None,
         crate::RunControl {
+            legacy_compaction_fixture: true,
             manifest: Some(manifest()),
             compaction_plane: Some(Arc::new(Scripted {
                 answer: ready(),
@@ -2836,3 +2852,4 @@ async fn setup_view_negotiation_records_the_claim_and_rejects_malformed_or_unreq
         assert!(records.is_empty());
     }
 }
+mod mode3_run_loop_tests;

@@ -673,6 +673,17 @@ pub(crate) struct ApprovalWaitProbe {
 /// emission defaults to "on" so existing callers retain the complete output stream.
 #[derive(Clone)]
 pub struct RunControl {
+    /// Historical replay fixtures need the retired v1 writer to generate durable
+    /// record prefixes at each simulated crash point. Production cannot enable it.
+    #[cfg(test)]
+    pub(crate) legacy_compaction_fixture: bool,
+    /// Session-owned v2 state shared with compaction-runner pushed-view calls.
+    pub compaction_session: Option<Arc<crate::compaction_v2::session::Session>>,
+    /// Receives durable entry changes without putting v2 notices in the WAL.
+    pub compaction_changes: Option<Arc<dyn crate::compaction_v2::session::Changes>>,
+    /// Wire admission supplies PLAN_VERSION only for a new log.
+    /// Existing logs always take their mode from the first RunStarted.
+    pub new_log_compaction_plan_version: Option<u32>,
     /// Attested input route, kept out of request rendering and admission identity.
     pub display_sent_by: Option<broca_protocol::BindPrincipal>,
     #[cfg(test)]
@@ -896,6 +907,11 @@ impl RunControl {
 impl Default for RunControl {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
+            legacy_compaction_fixture: false,
+            compaction_session: None,
+            compaction_changes: None,
+            new_log_compaction_plan_version: None,
             display_sent_by: None,
             #[cfg(test)]
             held_prompt_probe: None,
@@ -1010,6 +1026,8 @@ pub enum RunError {
     /// error and writes NOTHING durable (no ghost run). Distinct from a mid-run failure
     /// (which is a normal short terminal run).
     Config(String),
+    /// V2 Setup requires the model's real frozen context window.
+    CompactionContextLimitMissing,
     /// Person media failed admission before a record could name it.
     MediaUnsupported(String),
     /// Preserve the upload contract's refusal code and retry class before admission.
@@ -1139,6 +1157,7 @@ impl RunError {
         match self {
             Self::Upload(error) => error.error_class(),
             Self::Config(_)
+            | Self::CompactionContextLimitMissing
             | Self::MediaUnsupported(_)
             | Self::VariantUnsupported(_)
             | Self::ToolAliasInvalid(_)
@@ -1181,6 +1200,7 @@ impl std::fmt::Display for RunError {
             RunError::VariantUnsupported(s) => write!(f, "run resolution failed: {s}"),
             RunError::ToolAliasInvalid(s) => write!(f, "{s}"),
             RunError::Config(s) => write!(f, "run resolution failed: {s}"),
+            RunError::CompactionContextLimitMissing => write!(f, "context_limit is required for mode-3 compaction"),
             RunError::MediaUnsupported(s) => write!(f, "{s}"),
             RunError::Upload(error) => write!(f, "{error}"),
             RunError::Transient(s) => write!(f, "run admission temporarily unavailable: {s}"),
@@ -2113,7 +2133,15 @@ where
     } else {
         control.manifest.as_ref()
     };
-    if frozen_plan.is_some_and(|manifest| crate::compaction::has_compaction(manifest))
+    #[cfg(test)]
+    let historical_notices = control.legacy_compaction_fixture
+        && !prior
+            .mode3
+            .unwrap_or(control.new_log_compaction_plan_version.is_some());
+    #[cfg(not(test))]
+    let historical_notices = false;
+    if historical_notices
+        && frozen_plan.is_some_and(|manifest| crate::compaction::has_compaction(manifest))
         && prior
             .compaction
             .state()
@@ -2261,6 +2289,22 @@ where
         }
     };
 
+    if snapshot.checkpoint_at_head.last_episode.is_some()
+        && snapshot
+            .checkpoint_at_head
+            .head
+            .as_ref()
+            .and_then(|head| head.mode3)
+            .is_none()
+    {
+        let mode3 = crate::mode3_log_from_wal(wal_store, &req.session)
+            .map_err(|error| RunError::Wal(error.to_string()))?;
+        snapshot
+            .checkpoint_at_head
+            .head
+            .get_or_insert_with(Default::default)
+            .mode3 = Some(mode3);
+    }
     require_agent_run_scope_writer(
         snapshot
             .checkpoint_at_head
@@ -2347,6 +2391,11 @@ where
     if let (Some(store), Some(view)) = (store.as_ref(), held_view) {
         if is_resume && (!budgeted || budget_seed_valid) {
             let input = held_resume::HeldInput {
+                mode3: snapshot
+                    .checkpoint_at_head
+                    .head
+                    .as_ref()
+                    .and_then(|head| head.mode3),
                 store: Arc::clone(store),
                 session: req.session.clone(),
                 view,
@@ -2401,12 +2450,17 @@ where
                         .filter(|frame| frame.seq > prefix.watermark_seq)
                         .map(|frame| frame.record.clone())
                         .collect();
-                    match crate::context::resume_state_from_store(
+                    match crate::context::resume_state_from_store_with_mode(
                         &prefix,
                         &tail,
                         run_config.clone(),
                         run_id.clone(),
                         budget_state,
+                        snapshot
+                            .checkpoint_at_head
+                            .head
+                            .as_ref()
+                            .and_then(|head| head.mode3),
                     ) {
                         Ok(mut prior) => {
                             // restore_unchanged_effort creates a placeholder with first_user=None
@@ -2497,6 +2551,12 @@ where
             prior.compaction_history = state.history.clone();
         }
     }
+    prior.mode3 = snapshot
+        .checkpoint_at_head
+        .head
+        .as_ref()
+        .and_then(|head| head.mode3)
+        .or(prior.mode3);
     if is_resume && !append_episode {
         if let Some(boundary) = live_steer_after_seq {
             // The actor made the live inbox from its original admission snapshot. A reload
@@ -3805,6 +3865,41 @@ where
     A: ApprovalPolicy,
 {
     held_prompt::release_read_metadata(&mut prior);
+    let mode3 = prior
+        .mode3
+        .unwrap_or(control.new_log_compaction_plan_version.is_some());
+    if let Some(version) = control.new_log_compaction_plan_version.filter(|_| mode3) {
+        crate::compaction_v2::conditions::check_plan_version(version).map_err(RunError::Wal)?;
+    }
+    let mut normalized_control = control.clone();
+    normalized_control.new_log_compaction_plan_version =
+        mode3.then_some(cortexkit_compaction_view::PLAN_VERSION);
+    let control = &normalized_control;
+    let v2_session = mode3.then(|| control.compaction_session.clone().unwrap_or_default());
+    if let Some(session) = &v2_session {
+        let records = match approval_store.filter(|_| !session.is_initialized()) {
+            Some(store) => store
+                .read_records(&req.session)
+                .map_err(|error| RunError::Wal(error.to_string()))?,
+            None => {
+                if session.is_initialized() {
+                    Vec::new()
+                } else {
+                    approval_frames.as_deref().cloned().unwrap_or_default()
+                }
+            }
+        };
+        session
+            .initialize(&req.session, &records)
+            .await
+            .map_err(RunError::Wal)?;
+        session.claim_serving_start();
+        if !is_resume || append_episode {
+            session.state.lock().await.begin_run();
+        }
+        let has_view = session.state.lock().await.applied().is_some();
+        session.runtime.begin_send(has_view).await;
+    }
     let account_limit_pause_enabled = if is_resume && !append_episode {
         prior
             .run_config
@@ -4310,6 +4405,16 @@ where
     });
     let prior_last_step_finish_reason = prior.last_step_finish_reason;
     let mut compaction_state = prior.compaction.state().cloned();
+    #[cfg(test)]
+    let legacy_fixture = control.legacy_compaction_fixture && !mode3;
+    #[cfg(not(test))]
+    let legacy_fixture = false;
+    // V1 rendering refused requests until a required view_due was fulfilled.
+    // Dropping that outstanding requirement cannot change a previously sent request;
+    // the retired provider can no longer supply the promised view.
+    if let Some(state) = compaction_state.as_mut().filter(|_| !legacy_fixture) {
+        state.view_due = None;
+    }
     let compaction_notice_floor = prior.compaction_notice_floor;
     // What this run remembers about views between its step boundaries: the ones it will not
     // offer again, the ones a notice already reported, and a fetched view it holds to offer
@@ -4328,9 +4433,22 @@ where
         .transpose()
         .map_err(RunError::Wal)?
         .flatten();
+    if mode3 && (!is_resume || append_episode) {
+        if let Err(error) = crate::compaction_v2::admission::check_context_limit(
+            true,
+            frozen_hooks.map(AsRef::as_ref),
+            context_limit,
+        ) {
+            admit(&mut on_admitted, Err(error.clone()));
+            return Err(error);
+        }
+    }
+    // Shipping runs retain the v1 renderer, never its provider protocol. The
+    // retired writer is available only to historical unit-test fixture generation.
     let compaction_runtime =
         compaction_item
             .as_ref()
+            .filter(|_| legacy_fixture)
             .map(|(provider, _, _, _)| crate::compaction::runtime::Runtime {
                 scope: req.scope.as_ref(),
                 provider,
@@ -4493,7 +4611,39 @@ where
                 .map_err(|error| RunError::Wal(format!("invalid recorded input hooks: {error}")))?;
         }
     }
-    if append_episode && first_system_index(&episode_input).is_some() {
+    let v2_globals = if mode3 {
+        let supplied = crate::compaction_v2::systems::take_globals(&mut episode_input);
+        if is_resume && !append_episode {
+            crate::compaction_v2::systems::frozen(
+                true,
+                prior.run_config.as_ref().expect("resumed config"),
+                frozen_plan.map(AsRef::as_ref),
+            )
+            .map_err(RunError::Wal)?
+        } else if let Some(manifest) = frozen_plan {
+            crate::compaction_v2::systems::from_manifest(manifest)
+        } else if supplied.is_empty() {
+            prior
+                .run_config
+                .as_ref()
+                .and_then(|config| config.global_system.as_deref())
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            if prior
+                .run_config
+                .as_ref()
+                .and_then(|config| config.global_system.as_deref())
+                .is_some_and(|old| old != &supplied)
+            {
+                return Err(RunError::SystemPromptChanged);
+            }
+            supplied
+        }
+    } else {
+        Vec::new()
+    };
+    if !mode3 && append_episode && first_system_index(&episode_input).is_some() {
         match first_system_message(lineage_prefix) {
             Some(_) if repeats_prefix_system_messages(lineage_prefix, &episode_input) => {
                 // A client naturally re-sends the session's system prompt on every turn.
@@ -5366,7 +5516,7 @@ where
         let admitted_at_ms = control.now_ms();
         output_history.start_run(&cfg.model);
         let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
-            compaction_plan_version: None,
+            compaction_plan_version: mode3.then_some(cortexkit_compaction_view::PLAN_VERSION),
             sent_by: control.display_sent_by.clone(),
             written_at_ms: req
                 .input_written_at_ms
@@ -5404,36 +5554,40 @@ where
             run_id: resolved_run_id.clone(),
             session: req.session.clone(),
             config: remember_warm_config(
-                RunConfig { global_system: None, account_limit_pause: account_limit_pause_enabled,
-                turn_directives_v1: req.directives.clone(),
-                render_tags,
-                computed_tags,
-                model: cfg.model.clone(),
-                tools: Arc::clone(&tools),
-                tool_choice: cfg.tool_choice.clone(),
-                generation: cfg.generation.clone(),
-                response_format: cfg.response_format.clone(),
-                provider_options: cfg.provider_options.clone(),
-                cache_tiers: serde_json::Value::Null,
-                context_epoch: 0,
-                renderer_version: provider.renderer_version(),
-                frozen_render_config: provider.render_config_blob(),
-                // Freeze the resolved credential id so a resume retrieves the same credential,
-                // never choosing its method again from configuration or account routing.
-                // The frozen credential id is metadata, not a provider render input.
-                auth_selection: control.auth_selection.clone(),
-                tools_were_omitted: control.tools_were_omitted,
-                budget: cfg.budget.clone(),
-                context_limit,
-                work_class,
-                variant: variant.clone(),
-                service_tier,
-                stop_when: cfg.stop_when.clone(),
-                // Before any record is written, accepting the send resolves context management
-                // into req.context_management: the session's inherited mode, or on its
-                // first send the caller's choice, project/global broca.jsonc defaults,
-                // then "none", in that order.
-                context_management: req.context_management.clone(), },
+                RunConfig {
+                    global_system: (mode3 && frozen_plan.is_none() && !v2_globals.is_empty())
+                        .then(|| Arc::new(v2_globals.clone())),
+                    account_limit_pause: account_limit_pause_enabled,
+                    turn_directives_v1: req.directives.clone(),
+                    render_tags,
+                    computed_tags,
+                    model: cfg.model.clone(),
+                    tools: Arc::clone(&tools),
+                    tool_choice: cfg.tool_choice.clone(),
+                    generation: cfg.generation.clone(),
+                    response_format: cfg.response_format.clone(),
+                    provider_options: cfg.provider_options.clone(),
+                    cache_tiers: serde_json::Value::Null,
+                    context_epoch: 0,
+                    renderer_version: provider.renderer_version(),
+                    frozen_render_config: provider.render_config_blob(),
+                    // Freeze the resolved credential id so a resume retrieves the same credential,
+                    // never choosing its method again from configuration or account routing.
+                    // The frozen credential id is metadata, not a provider render input.
+                    auth_selection: control.auth_selection.clone(),
+                    tools_were_omitted: control.tools_were_omitted,
+                    budget: cfg.budget.clone(),
+                    context_limit,
+                    work_class,
+                    variant: variant.clone(),
+                    service_tier,
+                    stop_when: cfg.stop_when.clone(),
+                    // Before any record is written, accepting the send resolves context management
+                    // into req.context_management: the session's inherited mode, or on its
+                    // first send the caller's choice, project/global broca.jsonc defaults,
+                    // then "none", in that order.
+                    context_management: req.context_management.clone(),
+                },
                 &mut warm_config,
                 control.keep_warm.is_some(),
             ),
@@ -5995,6 +6149,51 @@ where
         let step_id = StepId(completed_steps + 1);
         let compaction_step_start_ms = control.now_ms().unwrap_or_else(crate::compaction::now);
 
+        if let (Some(session), Some(_)) = (&v2_session, &compaction_item) {
+            let frames = crate::compaction_v2::host::records(writer, approval_store, &req.session)
+                .await
+                .map_err(RunError::Wal)?;
+            let lineage = writer
+                .lineage_id()
+                .ok_or_else(|| RunError::Wal("mode-3 compaction requires a WAL lineage".into()))?
+                .to_string();
+            let transcript = crate::compaction_v2::transcript::project(&frames, &lineage)
+                .map_err(RunError::Wal)?;
+            let (config, _) = crate::compaction_v2::host::frozen(&frames).map_err(RunError::Wal)?;
+            let conditions = match crate::compaction_v2::host::conditions(&config, false) {
+                Ok(conditions) => conditions,
+                Err(message) => {
+                    terminal_error = Some(crate::compaction::runtime::error(
+                        None,
+                        &message,
+                        Some("compaction_unavailable".into()),
+                        false,
+                    ));
+                    break RunFinishReason::Error;
+                }
+            };
+            let next_mid =
+                crate::message_mid(true, Some(&lineage), transcript.entries.len() as u64)
+                    .map_err(RunError::Wal)?;
+            crate::compaction_v2::request::apply_boundary(
+                &session.state,
+                &session.runtime,
+                &crate::compaction_v2::journal::WalJournal {
+                    writer,
+                    session: &req.session,
+                },
+                crate::compaction_v2::state::Boundary {
+                    step: step_id.0,
+                    entries: &transcript.entries,
+                    rules: &conditions.rules,
+                    accepts_images: conditions.accepts_images == Some(true),
+                    next_mid: &next_mid,
+                },
+            )
+            .await
+            .map_err(RunError::Wal)?;
+        }
+
         // Mark the step boundary durably BEFORE the live StepStarted unit is published
         // (run_step emits it to `out`). Recording first gives the unit a durable cursor,
         // so the control stream is fully projectable from the WAL (a re-subscriber
@@ -6079,7 +6278,7 @@ where
         // at its checkpoint, so nothing of this run renders until Setup has answered (below).
         let setup_pending =
             computed_tags.is_some() && compaction_runtime.is_some() && compaction_state.is_none();
-        if !setup_pending {
+        if !setup_pending && !mode3 {
             render_new_tags(
                 &mut mutable_call_options(&mut opts).prompt,
                 &mut tags_rendered_len,
@@ -6111,7 +6310,7 @@ where
             account_ref: run_account_ref.clone(),
         });
         let mut model_opts = None;
-        if account_limit_replay.is_some() {
+        if !mode3 && compaction_runtime.is_none() {
             if let Some(state) = compaction_state.as_ref() {
                 // Waiting for an account reset must not adopt a newer compaction view or call the
                 // compaction provider again.
@@ -6124,6 +6323,155 @@ where
                 notice_request_bytes = request.bytes;
                 model_opts = Some(Arc::new(request.into_options()));
             }
+            if compaction_item.is_some() {
+                if let Some(window) = context_limit {
+                    let rendered = provider
+                        .try_render_request(model_opts.as_deref().unwrap_or(&opts))
+                        .map_err(|error| RunError::Wal(error.message.clone()))?;
+                    let estimate =
+                        crate::compaction::request_estimate(rendered.len(), &compaction_history).0;
+                    if estimate
+                        > window.saturating_sub(opts.generation.max_output_tokens.unwrap_or(0))
+                    {
+                        writer.record(WalRecord::ContextCeilingDecided {
+                            step_id,
+                            detail: Some(broca_protocol::ContextCeilingDetail::new(
+                                window,
+                                estimate,
+                                "over_window",
+                            )),
+                        });
+                        break RunFinishReason::ContextCeiling;
+                    }
+                }
+            }
+        }
+        if let (Some(session), Some((provider_id, preset, _, _))) = (&v2_session, &compaction_item)
+        {
+            let preset = preset
+                .as_deref()
+                .ok_or_else(|| RunError::Wal("mode-3 compaction preset must be a string".into()))?;
+            let frames = crate::compaction_v2::host::records(writer, approval_store, &req.session)
+                .await
+                .map_err(RunError::Wal)?;
+            let lineage = writer
+                .lineage_id()
+                .ok_or_else(|| RunError::Wal("mode-3 compaction requires a WAL lineage".into()))?
+                .to_string();
+            let transcript = crate::compaction_v2::transcript::project(&frames, &lineage)
+                .map_err(RunError::Wal)?;
+            let (config, manifest) =
+                crate::compaction_v2::host::frozen(&frames).map_err(RunError::Wal)?;
+            let chained = provider.history_edit_cost()
+                == Some(crate::compaction_provider::notice::HistoryEditCost::FullResend);
+            let conditions =
+                crate::compaction_v2::host::conditions(&config, chained).map_err(RunError::Wal)?;
+            let current = crate::compaction_v2::host::context(&config, manifest);
+            let previous = crate::compaction_v2::host::previous(&frames);
+            let now = control.now_ms().unwrap_or_else(crate::compaction::now);
+            let raw: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
+            let cache_warm = control
+                .keep_warm
+                .as_ref()
+                .and_then(|driver| driver.timing(&config).ok())
+                .zip(crate::cache_warm::last_cache_send_at_ms(&raw))
+                .is_some_and(|(timing, sent)| now < sent.saturating_add(timing.ttl_ms));
+            let next_mid =
+                crate::message_mid(true, Some(&lineage), transcript.entries.len() as u64)
+                    .map_err(RunError::Wal)?;
+            let plane = crate::compaction_v2::runtime::BoundPlane {
+                plane: control.compaction_plane.as_deref(),
+                provider: provider_id,
+                bind: &req.session,
+                scope: req.scope.as_ref(),
+            };
+            let prepared = crate::compaction_v2::request::prepare(
+                &session.state,
+                &session.runtime,
+                &crate::compaction_v2::journal::WalJournal {
+                    writer,
+                    session: &req.session,
+                },
+                &plane,
+                crate::compaction_v2::request::At {
+                    step: step_id.0,
+                    preset,
+                    entries: &transcript.entries,
+                    stored: &opts.prompt,
+                    conditions: &conditions,
+                    previous: previous.as_ref(),
+                    current: &current,
+                    cache_warm,
+                    chain_reset: chained && provider.prepare_chain_reset(),
+                    now,
+                    next_mid: &next_mid,
+                },
+                |image| crate::compaction_v2::host::image(writer, image),
+                |prompt| {
+                    let view = crate::compaction_v2::render::options(&opts, prompt.to_vec());
+                    let globals = crate::compaction_v2::systems::view(&view, &v2_globals)?;
+                    provider
+                        .try_render_request(globals.as_ref().unwrap_or(&view))
+                        .map(|bytes| {
+                            crate::compaction::request_estimate(bytes.len(), &compaction_history).0
+                        })
+                        .map_err(|error| error.message.clone())
+                },
+            )
+            .await
+            .map_err(RunError::Wal)?;
+            match prepared {
+                crate::compaction_v2::request::Prepared::CompactionUnavailable => {
+                    terminal_error = Some(crate::compaction::runtime::error(
+                        None,
+                        "compaction provider Setup is unavailable",
+                        Some("compaction_unavailable".into()),
+                        false,
+                    ));
+                    break RunFinishReason::Error;
+                }
+                crate::compaction_v2::request::Prepared::ContextCeiling {
+                    request_tokens,
+                    usable_window,
+                } => {
+                    writer.record(WalRecord::ContextCeilingDecided {
+                        step_id,
+                        detail: Some(broca_protocol::ContextCeilingDetail::new(
+                            usable_window,
+                            request_tokens,
+                            "over_window",
+                        )),
+                    });
+                    break RunFinishReason::ContextCeiling;
+                }
+                crate::compaction_v2::request::Prepared::Ready {
+                    prompt, applied, ..
+                } => {
+                    provider.set_cache_evidence_view(applied.map(|view| view.version));
+                    model_opts = Some(Arc::new(crate::compaction_v2::render::options(
+                        &opts, prompt,
+                    )));
+                }
+            }
+        }
+        if mode3 && compaction_item.is_none() {
+            let frames = crate::compaction_v2::host::records(writer, approval_store, &req.session)
+                .await
+                .map_err(RunError::Wal)?;
+            let lineage = writer
+                .lineage_id()
+                .ok_or_else(|| {
+                    RunError::Wal("mode-3 delivery rendering requires a WAL lineage".into())
+                })?
+                .to_string();
+            let transcript = crate::compaction_v2::transcript::project(&frames, &lineage)
+                .map_err(RunError::Wal)?;
+            let prompt =
+                crate::compaction_v2::render::deliveries_only(&opts.prompt, &transcript.entries)
+                    .map_err(RunError::Wal)?;
+            model_opts = Some(Arc::new(crate::compaction_v2::render::options(
+                &opts, prompt,
+            )));
         }
         if let Some(runtime) = compaction_runtime
             .as_ref()
@@ -6455,10 +6803,20 @@ where
         }
         let sent_opts = model_opts.as_ref().unwrap_or(&opts);
         let system_view = plan_system_text
-            .as_deref()
+            .as_ref()
+            .filter(|_| !mode3)
+            .map(String::as_str)
             .and_then(|text| crate::plan_system::view(sent_opts, &opts.prompt, text))
             .map(Arc::new);
         let sent_opts = system_view.as_ref().unwrap_or(sent_opts);
+        let v2_system_view = if mode3 {
+            crate::compaction_v2::systems::view(sent_opts, &v2_globals)
+                .map_err(RunError::Wal)?
+                .map(Arc::new)
+        } else {
+            None
+        };
+        let sent_opts = v2_system_view.as_ref().unwrap_or(sent_opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
             break RunFinishReason::Cancelled;
         }
@@ -7422,6 +7780,18 @@ where
                 if message_changed {
                     restream_message(&message, out).await;
                 }
+                if let (Some(session), Some(_)) = (&v2_session, &compaction_item) {
+                    crate::compaction_v2::host::notice(
+                        session,
+                        writer,
+                        approval_store,
+                        &req.session,
+                        req.scope.as_ref(),
+                        control.compaction_plane.as_deref(),
+                    )
+                    .await
+                    .map_err(RunError::Wal)?;
+                }
                 if control.emit_control_payloads {
                     let _ = send(
                         out,
@@ -8003,6 +8373,18 @@ where
         &mut mutable_call_options(&mut opts).prompt,
         &mut stamped_len,
     );
+    if let Some(session) = &v2_session {
+        crate::compaction_v2::host::notice(
+            session,
+            writer,
+            approval_store,
+            &req.session,
+            req.scope.as_ref(),
+            control.compaction_plane.as_deref(),
+        )
+        .await
+        .map_err(RunError::Wal)?;
+    }
     // Announce what the run wrote after its last step boundary (its final answer) now, not at
     // the next send's first boundary: the contract owes a notice after each durable write. The
     // notice follows those records in the WAL and its own barrier makes both durable before the
@@ -8410,6 +8792,7 @@ async fn finish_run(
         retries_used,
     });
     let last_fsynced_seq = writer.sync().await?;
+    notify_compaction_change(control).await;
     let closed = std::mem::take(
         &mut *control
             .provider_held_close_out
@@ -9306,6 +9689,16 @@ pub const OUTPUT_RESERVATION_OVERFLOW_CODE: &str = "output_reservation_exceeds_c
 /// Return the durable request only when no blocking renderer can still hold its snapshot.
 /// This intentionally uses `Arc::get_mut`, never `Arc::make_mut`: copying a multi-megabyte
 /// prompt while a render is in flight would move the same head-of-line work back to the actor.
+async fn notify_compaction_change(control: &RunControl) {
+    if control.new_log_compaction_plan_version.is_some() {
+        if let Some(changes) = &control.compaction_changes {
+            if let Err(error) = changes.changed().await {
+                tracing::warn!(%error, "compaction notice projection failed; the next boundary will retry its changes");
+            }
+        }
+    }
+}
+
 fn mutable_call_options(opts: &mut Arc<CallOptions>) -> &mut CallOptions {
     debug_assert_eq!(
         Arc::strong_count(opts),
@@ -11118,13 +11511,11 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
             open: Vec::new(),
         });
     }
-    writer.record(WalRecord::ToolBatchFinished {
-        batch_id: batch_id.clone(),
-    });
     let appends = deliver_ordered_with_results(
         writer,
         ordered,
         run_id,
+        &batch_id,
         resolutions.iter().map(|r| r.result.as_ref()),
     );
     writer.record(WalRecord::TurnFinished { step_id });
@@ -11173,6 +11564,9 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     }
     let mut results = results;
     apply_ordered_appends(&mut results, &appends);
+    if let Some(control) = ordered {
+        notify_compaction_change(control).await;
+    }
     Ok(BatchOutcome {
         results,
         interruption,
@@ -11189,18 +11583,43 @@ fn deliver_ordered_with_results<'a>(
     writer: &WalHandle,
     control: Option<&RunControl>,
     run_id: &RunId,
+    batch_id: &BatchId,
     results: impl IntoIterator<Item = &'a ToolResult>,
 ) -> Vec<(ToolCallId, String)> {
+    let mode3 = control.is_some_and(|control| control.new_log_compaction_plan_version.is_some());
+    if !mode3 {
+        writer.record(WalRecord::ToolBatchFinished {
+            batch_id: batch_id.clone(),
+        });
+    }
     let Some((inbox, control)) =
         control.and_then(|control| Some((control.steer.as_deref()?, control)))
     else {
+        if mode3 {
+            writer.record(WalRecord::ToolBatchFinished {
+                batch_id: batch_id.clone(),
+            });
+        }
         return Vec::new();
     };
-    inbox.deliver_with_tool_results(run_id, control.now_ms().unwrap_or(0), results, |records| {
-        for record in records {
-            writer.record(record);
-        }
-    })
+    inbox.deliver_with_tool_results_mode(
+        mode3,
+        run_id,
+        control.now_ms().unwrap_or(0),
+        results,
+        |records| {
+            // Choosing queued sends and recording the batch boundary share the
+            // inbox lock, so a later admission cannot ride an already-finished batch.
+            if mode3 {
+                writer.record(WalRecord::ToolBatchFinished {
+                    batch_id: batch_id.clone(),
+                });
+            }
+            for record in records {
+                writer.record(record);
+            }
+        },
+    )
 }
 
 /// Append each delivered text to the live copy of the result it rides on, as replay renders it
@@ -11483,6 +11902,7 @@ async fn resolve_provider_held_batch<T: ToolPlane>(
                     // Even on resume, no successor may leave until the held terminal is durable.
                     plane.settled(&result);
                     sync_held_terminal(&mut result, ctx, plane.writer, hooks).await?;
+                    if let Some(control) = plane.control { notify_compaction_change(control).await; }
                     plane.held.complete(&result.result.tool_call_id);
                     plane.terminal_synced(&result.result.tool_call_id).await;
                     plane.delivered(&result);
@@ -12334,7 +12754,17 @@ async fn finalize_hard_stop(
             provider_held: None,
         });
     }
-    writer.record(WalRecord::ToolBatchFinished { batch_id });
+    if control.new_log_compaction_plan_version.is_some() {
+        deliver_ordered_with_results(
+            writer,
+            Some(control),
+            resolved_run_id,
+            &batch_id,
+            results.iter(),
+        );
+    } else {
+        writer.record(WalRecord::ToolBatchFinished { batch_id });
+    }
     writer.record(WalRecord::TurnFinished { step_id });
     record_budget_firings(writer, resolved_run_id, budget_firings);
     if let Some((closing, assistant)) = closing {
@@ -12353,6 +12783,7 @@ async fn finalize_hard_stop(
     // This sole barrier makes the synthetic tool results, ToolBatchFinished, TurnFinished,
     // and RunFinished durable together; TurnFinished must not introduce another crash cut.
     let safe_h = writer.sync().await?;
+    notify_compaction_change(control).await;
     // Emit AFTER fsync so the caller's surface matches the durable WAL.
     for firing in budget_firings {
         let _ = send(
@@ -13777,29 +14208,32 @@ mod tests {
         });
         let mut prior = crate::replay::replay(&[]).unwrap();
         prior.render_episodes = None;
-        prior.run_config = Some(RunConfig { global_system: None, account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        model: broca_protocol::request::ModelHandle::new("chatgpt", "gpt-6.1-sol"),
-        tools: vec![].into(),
-        tool_choice: Default::default(),
-        generation: Default::default(),
-        response_format: Default::default(),
-        provider_options: serde_json::Value::Null,
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: 1,
-        frozen_render_config: frozen.clone(),
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: vec![],
-        context_management: None, });
+        prior.run_config = Some(RunConfig {
+            global_system: None,
+            account_limit_pause: false,
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: broca_protocol::request::ModelHandle::new("chatgpt", "gpt-6.1-sol"),
+            tools: vec![].into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: frozen.clone(),
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: vec![],
+            context_management: None,
+        });
         assert!(
             store_prior_needs_episode_spans(&prior),
             "unknown history cannot use the store seed"
@@ -15799,34 +16233,37 @@ mod tests {
             }
         }
 
-        let config = RunConfig { global_system: None, account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        model: ModelHandle::new("stub", "m"),
-        tools: Vec::new().into(),
-        tool_choice: ToolChoice::Auto,
-        generation: GenerationConfig::default(),
-        response_format: Default::default(),
-        provider_options: serde_json::Value::Null,
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: 1,
-        frozen_render_config: serde_json::Value::Null,
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: Some(BudgetConfig {
-            max_input_tokens: None,
-            nudges: Vec::new(),
-            finalize_at_tool_calls: 99,
-            finalize_text: "finalize".into(),
-        }),
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: Vec::new(),
-        context_management: None, };
+        let config = RunConfig {
+            global_system: None,
+            account_limit_pause: false,
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: ModelHandle::new("stub", "m"),
+            tools: Vec::new().into(),
+            tool_choice: ToolChoice::Auto,
+            generation: GenerationConfig::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: Some(BudgetConfig {
+                max_input_tokens: None,
+                nudges: Vec::new(),
+                finalize_at_tool_calls: 99,
+                finalize_text: "finalize".into(),
+            }),
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: Vec::new(),
+            context_management: None,
+        };
         let seed = crate::ProjectionSeed {
             refusal: Default::default(),
             open_episode_span: Some(1),
@@ -17579,13 +18016,11 @@ mod approval_gate {
                 open,
             });
         }
-        writer.record(WalRecord::ToolBatchFinished {
-            batch_id: ctx.batch_id.clone(),
-        });
         let appends = deliver_ordered_with_results(
             writer,
             Some(control),
             run_id,
+            &ctx.batch_id,
             slots.iter().filter_map(|slot| match slot {
                 Slot::Done(result) => Some(result.result.as_ref()),
                 _ => None,
@@ -18098,6 +18533,7 @@ mod approval_gate {
                             let value = execution(&result);
                             let was_held = plane.held.contains(&result.result.tool_call_id);
                             sync_result(&mut result, ctx, writer, hooks).await?;
+                            notify_compaction_change(control).await;
                             plane.held.complete(&result.result.tool_call_id);
                             if was_held {
                                 plane.settled(&result);
@@ -18146,6 +18582,7 @@ mod approval_gate {
                             if is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref()) { continue }
                             if let Some(mut result) = result {
                                 sync_result(&mut result, ctx, writer, hooks).await?;
+                                notify_compaction_change(control).await;
                                 if let (Some(held), Some(elicitation)) = (approved_calls.remove(&index), control.elicitation_plane.as_ref()) { feedback.push(Box::pin(async move { if let Some(id) = &held.id { crate::consent::report(elicitation.as_ref(), &held.ctx(ctx), id, crate::tool_plane::ApprovalExecution::ApprovedNotExecuted, None).await; } Feedback::Reported })); }
                                 slots[index] = Slot::Done(result);
                             } else {

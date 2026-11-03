@@ -240,7 +240,9 @@ pub fn attach_native_tags(message: &mut Message, metadata: &Metadata) -> Result<
 }
 
 impl Fold {
-    pub fn is_current(&self) -> bool { self.cache_version == 1 }
+    pub fn is_current(&self) -> bool {
+        self.cache_version == 1
+    }
     pub fn high(&self) -> u64 {
         self.high
     }
@@ -668,7 +670,8 @@ pub fn project_entry(
         ordinal: position + 1,
         tag_base: Some(metadata.tag_base),
         written_at,
-        completed_at: (message.role == HostRole::Assistant && metadata.source_input.is_none()).then_some(written_at),
+        completed_at: (message.role == HostRole::Assistant && metadata.source_input.is_none())
+            .then_some(written_at),
         notice: metadata.notice.clone(),
         usage: metadata.usage,
         generated_under: metadata.generated_under.clone(),

@@ -139,8 +139,16 @@ pub(super) fn read_page(
         }
         entry.written_at = written_at;
         if let Some(completed_at) = entry.completed_at {
-            if completed_at != 0 { return Err("compaction cached envelope contains a second completed_at value".into()); }
-            entry.completed_at = broca_core::message_times::completed_at(broca_protocol::Role::Assistant, Some(written_at), true);
+            if completed_at != 0 {
+                return Err(
+                    "compaction cached envelope contains a second completed_at value".into(),
+                );
+            }
+            entry.completed_at = broca_core::message_times::completed_at(
+                broca_protocol::Role::Assistant,
+                Some(written_at),
+                true,
+            );
         }
         bytes += size + u64::from(!entries.is_empty());
         entries.push(entry);
@@ -383,36 +391,97 @@ mod tests {
 
     #[test]
     fn mode3_projection_materializes_entries_with_shared_ids_and_native_time_columns() {
-        use std::sync::Arc;
         use broca_core::Persister;
         use broca_protocol::{ContentBlock, Message};
         use broca_wal::{FramedRecord, WalRangeRead, WalRecord};
+        use std::sync::Arc;
         let store = SqliteStore::open_in_memory().unwrap();
         let session = BindIdentity::new("/synthetic/projected-compaction", "runner", "session");
-        let mut start: WalRecord = serde_json::from_str(include_str!("../../broca-wal/tests/fixtures/compaction_v2_records.jsonl").lines().last().unwrap()).unwrap();
+        let mut start: WalRecord = serde_json::from_str(
+            include_str!("../../broca-wal/tests/fixtures/compaction_v2_records.jsonl")
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
         let plan = json!({"compaction_item":{"provider":"ck-mc","preset":"head","params":{}}});
-        if let WalRecord::RunStarted { session:stored, config, input, manifest, compaction_plan_version, written_at_ms, .. } = &mut start {
+        if let WalRecord::RunStarted {
+            session: stored,
+            config,
+            input,
+            manifest,
+            compaction_plan_version,
+            written_at_ms,
+            ..
+        } = &mut start
+        {
             *stored = session.clone();
             config.global_system = None;
             *compaction_plan_version = Some(2);
             *written_at_ms = Some(10);
-            *input = Arc::new(vec![Message::new(broca_protocol::Role::User, vec![ContentBlock::Text { text:"question".into() }])]);
-            *manifest = Some(Box::new(broca_wal::PlanManifest { rich_ui:None, declarations:Vec::new(), plan:broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(), plan_identity:"plan".into(), composition_digest:"composition".into(), fetches:Vec::new(), tools:Arc::new(Vec::new()), system_text:"instructions outside history".into(), system_digest:"system".into(), join_version:1, role_versions:Default::default() }));
+            *input = Arc::new(vec![Message::new(
+                broca_protocol::Role::User,
+                vec![ContentBlock::Text {
+                    text: "question".into(),
+                }],
+            )]);
+            *manifest = Some(Box::new(broca_wal::PlanManifest {
+                rich_ui: None,
+                declarations: Vec::new(),
+                plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+                plan_identity: "plan".into(),
+                composition_digest: "composition".into(),
+                fetches: Vec::new(),
+                tools: Arc::new(Vec::new()),
+                system_text: "instructions outside history".into(),
+                system_digest: "system".into(),
+                join_version: 1,
+                role_versions: Default::default(),
+            }));
         }
         let records = vec![start, serde_json::from_value(json!({"type":"step_started","step_id":0})).unwrap(), serde_json::from_value(json!({"type":"model_step_finished","step_id":0,"assistant_message":{"message_id":"a","content":[{"type":"text","text":"answer"}]},"usage":{},"written_at_ms":20})).unwrap(), serde_json::from_value(json!({"type":"turn_finished","step_id":0})).unwrap()];
-        let frames = records.into_iter().enumerate().map(|(index,record)| FramedRecord { seq:index as u64 + 1, fence:1, record }).collect();
+        let frames = records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| FramedRecord {
+                seq: index as u64 + 1,
+                fence: 1,
+                record,
+            })
+            .collect();
         let mut range = WalRangeRead::without_anchors(frames);
-        range.lineage_id = Some("1234567890abcdef1234567890abcdef".parse().unwrap());
+        let path = broca_test_support::scratch_root().join(format!(
+            "compaction-entry-projection-{}.wal",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let wal = broca_wal::FileWal::open(&path).unwrap();
+        range.lineage_id = broca_wal::Wal::lineage_id(&wal);
+        let lineage = range.lineage_id.unwrap().to_string();
         store.project_range(&session, &range).unwrap();
-        let request = ReadRequest::new(Select::After { after_ordinal:None, limit:None }, Detail::Full);
-        let page = store.read_compaction_page(&session, &request).unwrap().unwrap();
+        let request = ReadRequest::new(
+            Select::After {
+                after_ordinal: None,
+                limit: None,
+            },
+            Detail::Full,
+        );
+        let page = store
+            .read_compaction_page(&session, &request)
+            .unwrap()
+            .unwrap();
         assert_eq!(page.entries.len(), 2);
-        assert_eq!(page.entries[0].mid, broca_core::message_mid(true, Some("1234567890abcdef1234567890abcdef"), 0).unwrap());
+        assert_eq!(
+            page.entries[0].mid,
+            broca_core::message_mid(true, Some(&lineage), 0).unwrap()
+        );
         assert_eq!(page.entries[0].written_at, 10);
         assert_eq!(page.entries[1].written_at, 20);
         assert_eq!(page.entries[1].completed_at, Some(20));
         assert_eq!(page.entries[0].parts[0].tag, Some(1));
         assert_eq!(page.entries[1].parts[0].tag, Some(2));
         assert!(page.head.unwrap().compaction_metadata.unwrap().is_current());
+        drop(wal);
+        std::fs::remove_file(path).unwrap();
     }
 }

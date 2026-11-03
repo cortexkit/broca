@@ -2147,6 +2147,74 @@ impl LineageRegistry {
         }
     }
 
+    /// The compaction-runner wire adapter uses `bind` before acknowledging its
+    /// route, then the same session-bound entry point for all three operations.
+    pub async fn route_compaction_v2(
+        &self,
+        key: &LineageKey,
+        caller: Option<String>,
+        method: String,
+        params: Box<serde_json::value::RawValue>,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::protocol::wire::Refusal>
+    {
+        use broca_core::compaction_v2::protocol::wire::Refusal;
+        let internal = |message: String| Refusal::new("internal_error", message, None);
+        self.check_move(key, true)
+            .map_err(|error| internal(error.to_string()))?;
+        self.check_expired(key, None)
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+        let ownership = self
+            .durable_session_ownership(key, true)
+            .await
+            .map_err(|error| internal(error.into_open().to_string()))?;
+        let manifest = ownership
+            .latest_manifest
+            .as_deref()
+            .or_else(|| ownership.first_episode.as_ref()?.manifest.as_deref());
+        let item = manifest
+            .map(broca_core::compaction::item)
+            .transpose()
+            .map_err(internal)?
+            .flatten();
+        let wal = self
+            .inner
+            .reader
+            .as_ref()
+            .ok_or_else(|| internal("compaction session reader is unavailable".into()))?
+            .wal_store
+            .clone();
+        let session = key.clone();
+        let mode3 = spawn_blocking(JobKind::WalRead, move || {
+            broca_core::mode3_log_from_wal(wal.as_ref(), &session)
+        })
+        .await
+        .map_err(|error| internal(error.to_string()))?
+        .map_err(|error| internal(error.to_string()))?;
+        broca_core::compaction_v2::authority::check_bind(
+            mode3,
+            item.as_ref().map(|item| item.0.as_str()),
+            caller.as_deref(),
+        )?;
+        let handle = self
+            .actor_for(key)
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle
+            .send(crate::actor::LineageCmd::CompactionV2 {
+                caller,
+                method,
+                params,
+                reply,
+            })
+            .await
+            .map_err(|_| internal("compaction session actor closed".into()))?;
+        receive
+            .await
+            .map_err(|_| internal("compaction session actor closed".into()))?
+    }
+
     pub async fn route_compaction_ready(
         &self,
         key: &LineageKey,
@@ -7170,29 +7238,32 @@ mod tests {
             ts_ms: None,
             run_id: RunId("r1".into()),
             session: session.clone(),
-            config: Box::new(RunConfig { global_system: None, account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("stub", "stub-model"),
-            tools: Vec::new().into(),
-            tool_choice: ToolChoice::Auto,
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: serde_json::Value::Null,
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: serde_json::Value::Null,
-            auth_selection: None,
-            tools_were_omitted: true,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            context_management: None, }),
+            config: Box::new(RunConfig {
+                global_system: None,
+                account_limit_pause: false,
+                turn_directives_v1: None,
+                render_tags: false,
+                computed_tags: None,
+                model: ModelHandle::new("stub", "stub-model"),
+                tools: Vec::new().into(),
+                tool_choice: ToolChoice::Auto,
+                generation: Default::default(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: 1,
+                frozen_render_config: serde_json::Value::Null,
+                auth_selection: None,
+                tools_were_omitted: true,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: Vec::new(),
+                context_management: None,
+            }),
             input: vec![Message::new(
                 Role::User,
                 vec![ContentBlock::Text {
@@ -7841,29 +7912,32 @@ mod offset_page_tests {
     }
 
     fn run_config() -> Box<RunConfig> {
-        Box::new(RunConfig { global_system: None, account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        model: ModelHandle::new("stub", "m"),
-        tools: vec![].into(),
-        tool_choice: Default::default(),
-        generation: Default::default(),
-        response_format: Default::default(),
-        provider_options: serde_json::Value::Null,
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: 1,
-        frozen_render_config: serde_json::Value::Null,
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: Vec::new(),
-        context_management: None, })
+        Box::new(RunConfig {
+            global_system: None,
+            account_limit_pause: false,
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: ModelHandle::new("stub", "m"),
+            tools: vec![].into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: Vec::new(),
+            context_management: None,
+        })
     }
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {

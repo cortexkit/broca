@@ -2128,7 +2128,12 @@ pub fn tool_call_dispatches(
         None,
         0,
         false,
-        crate::replay::TranscriptSeed { tags:crate::tags::TagSeed::default(), mode3:Some(crate::is_mode3_log(framed.iter().map(|frame| &frame.record))) },
+        crate::replay::TranscriptSeed {
+            tags: crate::tags::TagSeed::default(),
+            mode3: Some(crate::is_mode3_log(
+                framed.iter().map(|frame| &frame.record),
+            )),
+        },
     )?;
     Ok(dispatches_of_turns(
         framed,
@@ -2161,7 +2166,12 @@ pub fn replay_transcript(framed: &[FramedRecord]) -> Result<Vec<Message>, crate:
         None,
         0,
         false,
-        crate::replay::TranscriptSeed { tags:crate::tags::TagSeed::default(), mode3:Some(crate::is_mode3_log(framed.iter().map(|frame| &frame.record))) },
+        crate::replay::TranscriptSeed {
+            tags: crate::tags::TagSeed::default(),
+            mode3: Some(crate::is_mode3_log(
+                framed.iter().map(|frame| &frame.record),
+            )),
+        },
     )?
     .prompt)
 }
@@ -2318,7 +2328,19 @@ pub fn resume_state_from_store(
     run_id: Option<crate::RunId>,
     budget_state: Option<crate::BudgetReplayStateV1>,
 ) -> Result<crate::ReplayState, crate::ReplayError> {
+    resume_state_from_store_with_mode(prefix, tail, run_config, run_id, budget_state, None)
+}
+
+pub(crate) fn resume_state_from_store_with_mode(
+    prefix: &StorePrefix,
+    tail: &[WalRecord],
+    run_config: Option<crate::RunConfig>,
+    run_id: Option<crate::RunId>,
+    budget_state: Option<crate::BudgetReplayStateV1>,
+    mode3: Option<bool>,
+) -> Result<crate::ReplayState, crate::ReplayError> {
     let seed = PrefixSeed {
+        mode3,
         refusal: prefix.refusal.clone(),
         prefix_len: prefix.prefix.len() as u64,
         completed_steps: prefix.completed_steps,
@@ -2345,6 +2367,7 @@ pub fn resume_state_from_store(
 /// [`MaterializedStore::read_held_prefix`]) seeds the tail exactly as a merge of all of them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PrefixSeed {
+    pub mode3: Option<bool>,
     pub refusal: Option<crate::refusal_fallback::RefusalReplayState>,
     /// How many transcript messages the prefix holds: the tail's first ordinal.
     pub prefix_len: u64,
@@ -2402,7 +2425,10 @@ pub(crate) fn merge_prefix_and_tail(
         budget_state,
         if abandoned { 0 } else { seed.prefix_len },
         seed.prefix_len > 0,
-        crate::replay::TranscriptSeed { tags:seed.tag_seed, mode3:seed.admission_checkpoint.head.as_ref().and_then(|head| head.mode3) },
+        crate::replay::TranscriptSeed {
+            tags: seed.tag_seed,
+            mode3: seed.mode3,
+        },
         refusal,
     )?;
     // A view the prefix's leading records applied or replaced: a replacement at the transcript's
@@ -2513,6 +2539,7 @@ pub(crate) fn merge_prefix_and_tail(
     };
     tail_episodes.render = tail_state.render_episodes.clone().unwrap_or_default();
     let state = crate::ReplayState {
+        mode3: tail_state.mode3,
         account_limit_pause: None,
         recovered_calls: Vec::new(),
         extent: tail_state.extent,
@@ -3098,6 +3125,7 @@ mod tests {
                 session: BindIdentity::new("/tmp/p", "h", "s"),
                 ts_ms: None,
                 config: Box::new(RunConfig {
+                    global_system: None,
                     account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,
@@ -4155,29 +4183,32 @@ mod episode_merge_regression {
     use broca_wal::{RunConfig, RunOrigin, WalRecord};
 
     fn config(model: &str) -> RunConfig {
-        RunConfig { global_system: None, account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        model: ModelHandle::new("stub", model),
-        tools: Vec::new().into(),
-        tool_choice: Default::default(),
-        generation: Default::default(),
-        response_format: Default::default(),
-        provider_options: serde_json::Value::Null,
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: 1,
-        frozen_render_config: serde_json::json!({"model": model}),
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: Vec::new(),
-        context_management: None, }
+        RunConfig {
+            global_system: None,
+            account_limit_pause: false,
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: ModelHandle::new("stub", model),
+            tools: Vec::new().into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::json!({"model": model}),
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: Vec::new(),
+            context_management: None,
+        }
     }
 
     fn start(run: &str, model: &str, text: &str) -> WalRecord {

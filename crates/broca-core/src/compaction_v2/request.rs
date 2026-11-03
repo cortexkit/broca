@@ -75,10 +75,11 @@ pub async fn prepare(
     mut image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
     mut estimate: impl FnMut(&[Message]) -> Result<u64, String>,
 ) -> Result<Prepared, String> {
-    let mut view = {
+    let (mut view, frozen) = {
         let mut state = state.lock().await;
+        let frozen = state.step_is_frozen(at.step);
         state.start_step(at.step);
-        state.view_for_step(at.step).cloned()
+        (state.view_for_step(at.step).cloned(), frozen)
     };
     let mut setup = conditions::setup_request(at.preset, at.conditions, at.now);
     setup.applied_view = view.as_ref().map(View::applied);
@@ -89,14 +90,18 @@ pub async fn prepare(
     }
     let mut prompt = render::prompt(at.stored, at.entries, edits(&view), &mut image)?;
     let mut tokens = estimate(&prompt)?;
-    let causes = conditions::ride_causes(
-        at.previous,
-        at.current,
-        at.cache_warm,
-        at.chain_reset,
-        tokens,
-        at.conditions,
-    );
+    let causes = if frozen {
+        Vec::new()
+    } else {
+        conditions::ride_causes(
+            at.previous,
+            at.current,
+            at.cache_warm,
+            at.chain_reset,
+            tokens,
+            at.conditions,
+        )
+    };
     let usable = conditions::usable_window(at.conditions);
     let mut rode_over_limit = causes.contains(&RideCause::OverLimit);
     if !causes.is_empty() {
@@ -116,7 +121,7 @@ pub async fn prepare(
     }
     // A cache-rewrite ride can return a larger view. It still owes an over-limit
     // opportunity before refusal, just as a request initially over the limit does.
-    if tokens > usable && !rode_over_limit {
+    if tokens > usable && !rode_over_limit && !frozen {
         ride(
             state,
             runtime,
@@ -141,7 +146,7 @@ pub async fn prepare(
         )
         .await;
     if tokens > usable {
-        debug_assert!(rode_over_limit);
+        debug_assert!(rode_over_limit || frozen);
         return Ok(Prepared::ContextCeiling {
             request_tokens: tokens,
             usable_window: usable,

@@ -753,7 +753,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     executor_impl = executor_impl.with_compaction_plane(Arc::new(
         broca_subc::SubcCompactionPlane::new(plan_conn.clone()),
     ));
-    let compaction_inbox = executor_impl.compaction_inbox();
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
     let move_wal = wal_store.clone();
     let mut opener_builder =
@@ -981,31 +980,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let _bus_stop_guard = bus_stop.clone().drop_guard();
     let bus_connector: Arc<dyn broca_module_serve::bus_events::BusConnector> =
         Arc::new(broca_module_serve::bus_events_nats::NatsConnector::new(
-            // The process's one ck-bus credential holder: the run event publisher and the
-            // compaction consumer below both use this connector.
+            // The process's one ck-bus credential holder for run event publication.
             broca_module_serve::bus_events_nats::CredentialHolder::new(plan_conn.clone()),
         ));
-    let _compaction_bus = if bus_event_config.enabled {
-        let receipts: Arc<dyn broca_store::compaction_receipts::CompactionReceiptStore> =
-            if let Some(legacy) = &run_index {
-                legacy.clone()
-            } else {
-                let overhaul = stores.overhaul.as_ref().unwrap();
-                overhaul.compaction_receipts()
-            };
-        let service = broca_module_serve::compaction_bus::Service::new(
-            receipts,
-            registry.as_ref().clone(),
-            crash_orphan_wal.clone(),
-            compaction_inbox,
-            bus_connector.clone(),
-            bus_stop.clone(),
-        );
-        service.restore().await.map_err(ServeIoError)?;
-        Some(service.spawn())
-    } else {
-        None
-    };
+    // Compaction v2 uses session-bound calls. Legacy sessions no longer consume
+    // provider announcements or replay the retired compaction bus outbox.
     let event_store: Arc<dyn broca_store::bus_events::RunEventStore> =
         if let Some(legacy) = &run_index {
             legacy.clone()
@@ -3344,10 +3323,6 @@ mod executor {
             self
         }
 
-        pub fn compaction_inbox(&self) -> Arc<broca_core::ViewReadyInbox> {
-            self.compaction_views.clone()
-        }
-
         pub fn with_compaction_signals(mut self, enabled: bool) -> Self {
             self.compaction_signals = enabled;
             self
@@ -5286,29 +5261,32 @@ mod executor {
             frozen.cache = Some(policy.clone());
             frozen.prompt_cache_key = Some("frozen-key".into());
             let mut req = drift_request(std::path::Path::new("/inherit-cache"));
-            let config = broca_wal::RunConfig { global_system: None, account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: req.model.clone(),
-            tools: req.tools.clone().into(),
-            tool_choice: req.tool_choice.clone(),
-            generation: req.generation.clone(),
-            response_format: Default::default(),
-            provider_options: serde_json::Value::Null,
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: frozen.renderer_version,
-            frozen_render_config: serde_json::to_value(&frozen).unwrap(),
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: vec![],
-            context_management: None, };
+            let config = broca_wal::RunConfig {
+                global_system: None,
+                account_limit_pause: false,
+                turn_directives_v1: None,
+                render_tags: false,
+                computed_tags: None,
+                model: req.model.clone(),
+                tools: req.tools.clone().into(),
+                tool_choice: req.tool_choice.clone(),
+                generation: req.generation.clone(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: frozen.renderer_version,
+                frozen_render_config: serde_json::to_value(&frozen).unwrap(),
+                auth_selection: None,
+                tools_were_omitted: false,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: vec![],
+                context_management: None,
+            };
             req.inherit_frozen_cache = true;
             assert_eq!(
                 inherited_cache(&req, true, Some(&config)),
@@ -6481,29 +6459,32 @@ mod executor {
                     run_id: broca_protocol::RunId(run_id.into()),
                     session: BindIdentity::new("/tmp/project", "harness", "session"),
                     ts_ms: None,
-                    config: Box::new(broca_wal::RunConfig { global_system: None, account_limit_pause: false,
-                    turn_directives_v1: None,
-                    render_tags: false,
-                    computed_tags: None,
-                    model: broca_protocol::request::ModelHandle::new("openai", "gpt-test"),
-                    tools: Vec::new().into(),
-                    tool_choice: Default::default(),
-                    generation: Default::default(),
-                    response_format: Default::default(),
-                    provider_options: serde_json::Value::Null,
-                    cache_tiers: serde_json::Value::Null,
-                    context_epoch: 0,
-                    renderer_version: 1,
-                    frozen_render_config: serde_json::Value::Null,
-                    auth_selection: None,
-                    tools_were_omitted: false,
-                    budget: None,
-                    context_limit: None,
-                    work_class: None,
-                    variant: None,
-                    service_tier: None,
-                    stop_when: Vec::new(),
-                    context_management: None, }),
+                    config: Box::new(broca_wal::RunConfig {
+                        global_system: None,
+                        account_limit_pause: false,
+                        turn_directives_v1: None,
+                        render_tags: false,
+                        computed_tags: None,
+                        model: broca_protocol::request::ModelHandle::new("openai", "gpt-test"),
+                        tools: Vec::new().into(),
+                        tool_choice: Default::default(),
+                        generation: Default::default(),
+                        response_format: Default::default(),
+                        provider_options: serde_json::Value::Null,
+                        cache_tiers: serde_json::Value::Null,
+                        context_epoch: 0,
+                        renderer_version: 1,
+                        frozen_render_config: serde_json::Value::Null,
+                        auth_selection: None,
+                        tools_were_omitted: false,
+                        budget: None,
+                        context_limit: None,
+                        work_class: None,
+                        variant: None,
+                        service_tier: None,
+                        stop_when: Vec::new(),
+                        context_management: None,
+                    }),
                     input: Vec::new().into(),
                     origin: broca_wal::RunOrigin::Fresh,
                     submission_id: None,

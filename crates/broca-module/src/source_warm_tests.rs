@@ -1184,3 +1184,40 @@ async fn source_review_direct_compaction_message_permanently_stops_the_prefix() 
     assert_eq!(f.warms().len(), 1);
     f.stop().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn compaction_v2_applied_view_clears_warmable_prefix_live_and_after_restart() {
+    for live in [false, true] {
+        let mut fixture = Fixture::new(true, false, 300_000, 1000.0).await;
+        fixture.start().await;
+        fixture.warm(1).await;
+        if !live {
+            fixture.stop().await;
+        }
+        fixture
+            .record(WalRecord::CompactionViewAppliedV2 {
+                step_id: 1,
+                version: 1,
+                checksum: "a".repeat(64),
+            })
+            .await;
+        if !live {
+            fixture = fixture.restart().await;
+            fixture.start().await;
+        }
+        tokio::time::advance(Duration::from_secs(270)).await;
+        fixture.stopped_or_warmed(1).await;
+        assert_eq!(
+            fixture.warms().len(),
+            1,
+            "the old applied-view request must not warm (live={live})"
+        );
+        assert!(!fixture
+            .task
+            .as_ref()
+            .unwrap()
+            .holds_idle
+            .load(Ordering::Acquire));
+        fixture.stop().await;
+    }
+}

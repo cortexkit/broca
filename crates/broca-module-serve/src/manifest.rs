@@ -522,6 +522,7 @@ pub fn manifest_configured(
         // `bind-no-project/v1` promises that only scope supplies project attribution.
         provides: vec![
             broca_wire::LLM_RUNNER_V1.to_string(),
+            "compaction-runner/v1".to_string(),
             broca_wire::agent_data::PROVIDES.to_string(),
             // System One's decision models, on management routes opened declaring the
             // `classifier` role. A caller finds broca by this entry, then picks it for a model

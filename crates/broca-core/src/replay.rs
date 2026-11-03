@@ -117,10 +117,9 @@ pub struct ReplayState {
     pub recovered_calls: Vec<broca_wal::recovery::RecoveryRun>,
     /// Next absolute transcript ordinal, including messages not held in the prompt.
     pub extent: u64,
-    /// The last episode renders tags under the computed rules on a compaction-managed session,
-    /// is still running, and no Setup answer is recorded yet: the answer may carry a tag
-    /// checkpoint that renumbers the run's parts from its cut (llm-runner §9.6), so no read
-    /// may expose those numbers until it is durable.
+    /// Retained read-side field from the v1 provider-owned numbering protocol.
+    /// The current writer leaves it false: legacy numbers are frozen and mode-3
+    /// numbering is anchored by host markers, never a Setup answer.
     pub tags_await_setup: bool,
     pub input_budget: crate::input_budget::InputTokenBudget,
     pub cancel_at: Option<broca_wal::record::RunCancelAt>,
@@ -234,15 +233,25 @@ pub(crate) struct TranscriptSeed {
 }
 
 impl From<crate::tags::TagSeed> for TranscriptSeed {
-    fn from(tags: crate::tags::TagSeed) -> Self { Self { tags, mode3:None } }
+    fn from(tags: crate::tags::TagSeed) -> Self {
+        Self { tags, mode3: None }
+    }
 }
 
 impl TranscriptSeed {
     pub fn for_page(snapshot: &crate::StorePageSnapshot, records: &[FramedRecord]) -> Self {
-        let mode3 = snapshot.head.as_ref().and_then(|head| head.mode3).or_else(|| {
-            (snapshot.watermark_seq == 0).then(|| crate::is_mode3_log(records.iter().map(|frame| &frame.record)))
-        });
-        Self { tags:snapshot.tag_seed, mode3 }
+        let mode3 = snapshot
+            .head
+            .as_ref()
+            .and_then(|head| head.mode3)
+            .or_else(|| {
+                (snapshot.watermark_seq == 0)
+                    .then(|| crate::is_mode3_log(records.iter().map(|frame| &frame.record)))
+            });
+        Self {
+            tags: snapshot.tag_seed,
+            mode3,
+        }
     }
 }
 
@@ -2211,7 +2220,10 @@ impl Episode {
 /// the last episode is a resume/continue target. Fails with [`ReplayError`] on a
 /// corrupt lineage (a new episode opened over an unfinished prior one).
 pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
-    let mode3 = records.iter().any(|record| matches!(record, WalRecord::RunStarted { .. })).then(|| crate::is_mode3_log(records));
+    let mode3 = records
+        .iter()
+        .any(|record| matches!(record, WalRecord::RunStarted { .. }))
+        .then(|| crate::is_mode3_log(records));
     replay_seeded(
         records,
         None,
@@ -2220,7 +2232,10 @@ pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
         None,
         0,
         false,
-        TranscriptSeed { tags:crate::tags::TagSeed::default(), mode3 },
+        TranscriptSeed {
+            tags: crate::tags::TagSeed::default(),
+            mode3,
+        },
     )
 }
 
@@ -2355,7 +2370,14 @@ pub(crate) fn replay_projection_tail_with(
         seeded_budget_state,
         (seed.prefix_len, seed.prefix_len > 0),
         seed.admission_checkpoint.compaction.as_ref(),
-        TranscriptSeed { tags:seed.tag_seed, mode3:seed.admission_checkpoint.head.as_ref().and_then(|head| head.mode3) },
+        TranscriptSeed {
+            tags: seed.tag_seed,
+            mode3: seed
+                .admission_checkpoint
+                .head
+                .as_ref()
+                .and_then(|head| head.mode3),
+        },
         Vec::new(),
         seed.refusal.clone(),
     )?;
@@ -4396,13 +4418,9 @@ fn replay_seeded_with_compaction<'a>(
     }
     // A torn import's repair truncates the prompt; a turn past the end no longer exists.
     committed_tool_turns.retain(|(prompt_index, _)| *prompt_index < prompt.len());
-    let tags_await_setup = saw_run_started
-        && !run_finished_durable
-        && compaction_session
-        && compaction.state().is_none()
-        && run_config
-            .as_ref()
-            .is_some_and(|config| config.render_tags && config.computed_tags.is_some());
+    // No shipping session waits for a provider-owned numbering checkpoint:
+    // mode-3 uses host markers, while legacy sessions keep their frozen numbers.
+    let tags_await_setup = false;
     Ok(ReplayState {
         mode3,
         account_limit_pause,
@@ -5623,29 +5641,32 @@ pub(crate) mod projection_boundary_tests {
                 ts_ms: None,
                 run_id: RunId(run_id.into()),
                 session: BindIdentity::new("/tmp/project", "runner", "session"),
-                config: Box::new(RunConfig { global_system: None, account_limit_pause: false,
-                turn_directives_v1: None,
-                render_tags: false,
-                computed_tags: None,
-                model: ModelHandle::new("stub", "m"),
-                tools: vec![].into(),
-                tool_choice: Default::default(),
-                generation: Default::default(),
-                response_format: Default::default(),
-                provider_options: serde_json::Value::Null,
-                cache_tiers: serde_json::Value::Null,
-                context_epoch: 0,
-                renderer_version: 1,
-                frozen_render_config: serde_json::Value::Null,
-                auth_selection: None,
-                tools_were_omitted: false,
-                budget: None,
-                context_limit: None,
-                work_class: None,
-                variant: None,
-                service_tier: None,
-                stop_when: Vec::new(),
-                context_management: None, }),
+                config: Box::new(RunConfig {
+                    global_system: None,
+                    account_limit_pause: false,
+                    turn_directives_v1: None,
+                    render_tags: false,
+                    computed_tags: None,
+                    model: ModelHandle::new("stub", "m"),
+                    tools: vec![].into(),
+                    tool_choice: Default::default(),
+                    generation: Default::default(),
+                    response_format: Default::default(),
+                    provider_options: serde_json::Value::Null,
+                    cache_tiers: serde_json::Value::Null,
+                    context_epoch: 0,
+                    renderer_version: 1,
+                    frozen_render_config: serde_json::Value::Null,
+                    auth_selection: None,
+                    tools_were_omitted: false,
+                    budget: None,
+                    context_limit: None,
+                    work_class: None,
+                    variant: None,
+                    service_tier: None,
+                    stop_when: Vec::new(),
+                    context_management: None,
+                }),
                 input: vec![].into(),
                 origin: RunOrigin::Fresh,
                 submission_id: None,
@@ -6985,29 +7006,32 @@ mod offset_tail_tests {
     }
 
     fn run_config() -> Box<RunConfig> {
-        Box::new(RunConfig { global_system: None, account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        model: ModelHandle::new("stub", "m"),
-        tools: vec![].into(),
-        tool_choice: Default::default(),
-        generation: Default::default(),
-        response_format: Default::default(),
-        provider_options: serde_json::Value::Null,
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: 1,
-        frozen_render_config: serde_json::Value::Null,
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: Vec::new(),
-        context_management: None, })
+        Box::new(RunConfig {
+            global_system: None,
+            account_limit_pause: false,
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: ModelHandle::new("stub", "m"),
+            tools: vec![].into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: Vec::new(),
+            context_management: None,
+        })
     }
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {

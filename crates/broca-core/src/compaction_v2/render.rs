@@ -224,12 +224,85 @@ pub fn prompt(
 
 /// Keep episode boundaries in native coordinates while translating explicit
 /// marker indices to the rendered prompt. Inserted messages inherit neither.
-pub fn options(opts: &broca_protocol::CallOptions, prompt: Vec<Message>) -> broca_protocol::CallOptions {
-    let positions: HashMap<_, _> = prompt.iter().enumerate().filter_map(|(index, message)| message.ordinal.map(|ordinal| (ordinal, index))).collect();
-    let markers = opts.declared_markers.iter().filter_map(|marker| {
-        let ordinal = opts.prompt.get(marker.message_index)?.ordinal?;
-        Some(broca_protocol::request::DeclaredMessageMarker { message_index:*positions.get(&ordinal)?, rank:marker.rank })
-    }).collect();
+/// Unnumbered sessions still render tool-result deliveries separately from the
+/// stored output. Messages without a delivery remain exact native copies.
+pub fn deliveries_only(stored: &[Message], entries: &[Entry]) -> Result<Vec<Message>, String> {
+    if stored.len() != entries.len() {
+        return Err("compaction delivery projection does not match native message count".into());
+    }
+    let mut prompt = stored.to_vec();
+    for (position, entry) in entries.iter().enumerate() {
+        let mut results: HashMap<&str, VecDeque<usize>> = HashMap::new();
+        if let Some(next) = stored
+            .get(position + 1)
+            .filter(|message| message.role == HostRole::Tool)
+        {
+            for (index, block) in next.content.iter().enumerate() {
+                if let ContentBlock::ToolResult(result) = block {
+                    results
+                        .entry(&result.tool_call_id.0)
+                        .or_default()
+                        .push_back(index);
+                }
+            }
+        }
+        for part in &entry.parts {
+            let PartBody::Tool(tool) = &part.body else {
+                continue;
+            };
+            let block = part
+                .id
+                .parse::<usize>()
+                .map_err(|_| "compaction tool part has no native location")?;
+            let Some(ContentBlock::ToolCall(call)) = stored[position].content.get(block) else {
+                return Err("compaction tool part does not name a native call".into());
+            };
+            let result = results
+                .get_mut(call.tool_call_id.0.as_str())
+                .and_then(VecDeque::pop_front);
+            if tool.delivered.is_empty() {
+                continue;
+            }
+            let result = result.ok_or("compaction delivery has no native tool result")?;
+            let ContentBlock::ToolResult(result) = &mut prompt[position + 1].content[result] else {
+                unreachable!()
+            };
+            let mut text = super::entries::tool_output(&result.output).1;
+            for delivery in &tool.delivered {
+                if let Some(delivery) = &delivery.text {
+                    text.push_str("\n\n");
+                    text.push_str(delivery);
+                }
+            }
+            set_result_text(&mut result.output, text, None);
+            if matches!(tool.status, ToolStatus::Error | ToolStatus::Denied) {
+                result.is_error = true;
+            }
+        }
+    }
+    Ok(prompt)
+}
+
+pub fn options(
+    opts: &broca_protocol::CallOptions,
+    prompt: Vec<Message>,
+) -> broca_protocol::CallOptions {
+    let positions: HashMap<_, _> = prompt
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| message.ordinal.map(|ordinal| (ordinal, index)))
+        .collect();
+    let markers = opts
+        .declared_markers
+        .iter()
+        .filter_map(|marker| {
+            let ordinal = opts.prompt.get(marker.message_index)?.ordinal?;
+            Some(broca_protocol::request::DeclaredMessageMarker {
+                message_index: *positions.get(&ordinal)?,
+                rank: marker.rank,
+            })
+        })
+        .collect();
     let mut view = opts.with_prompt(prompt);
     let mut history = opts.render_episodes.as_ref().clone();
     history.raw_ordinals = true;
@@ -311,6 +384,10 @@ fn render_result(output: &mut ToolOutput, tool: &ToolPart, plan: &PlanPart) {
             }
         }
     }
+    set_result_text(output, text, attachment_ids.as_deref());
+}
+
+fn set_result_text(output: &mut ToolOutput, text: String, attachment_ids: Option<&[String]>) {
     match output {
         ToolOutput::Text { text: target } => *target = text,
         ToolOutput::Error { .. } | ToolOutput::Denied { .. } => *output = ToolOutput::error(text),
@@ -319,9 +396,7 @@ fn render_result(output: &mut ToolOutput, tool: &ToolPart, plan: &PlanPart) {
             let mut kept = vec![ToolOutputPart::Text { text }];
             kept.extend(parts.iter().enumerate().filter_map(|(index, part)| {
                 if matches!(part, ToolOutputPart::Media { .. })
-                    && attachment_ids
-                        .as_ref()
-                        .is_none_or(|ids| ids.contains(&index.to_string()))
+                    && attachment_ids.is_none_or(|ids| ids.contains(&index.to_string()))
                 {
                     Some(part.clone())
                 } else {

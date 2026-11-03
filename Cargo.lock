@@ -311,6 +311,7 @@ name = "broca-core"
 version = "0.3.304"
 dependencies = [
  "async-trait",
+ "base64",
  "broca-crash-harness",
  "broca-diagnostics",
  "broca-owner-only",

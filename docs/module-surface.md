@@ -313,8 +313,10 @@ their pre-existing unrestricted admission: any attested caller is admitted as ow
 reports the full owner grant to those callers too; reporting absence would incorrectly deny the
 permission the next send actually has. This does not tighten or otherwise change legacy admission.
 
-Tool, step-transform and compaction plan items may omit `preset`. Broca preserves the omission
-on catalog, declaration and compaction calls; it never substitutes an empty string. An explicit
+Tool and step-transform plan items may omit `preset`. Broca preserves the omission
+on catalog and declaration calls; it never substitutes an empty string. Mode-3 compaction
+items require a string `preset` at admission, before any write. Frozen legacy compaction
+items may still omit it and make no provider calls. An explicit
 `"worker"` tool preset still requires scope. A runner declaring `system_text_default` also accepts
 a preset-less system-text item, but forwards it only when that provider's daemon catalog entry
 declares `system-text-default/v1`. Otherwise admission refuses `system_text_preset_required`
@@ -593,8 +595,8 @@ With the switch on, `run.status` and `run.result` add optional
 only from provider statements, including an explicitly reported standard. Missing reports do
 not vote; conflicting reports leave served absent, including after restart. Unmapped served
 strings remain verbatim. The existing durable run/step records rebuild this projection;
-there is no new durable usage accumulator. A compaction session sends `compaction.ride` with
-cause `service_tier_change` to its compaction provider before the first changed-tier request,
+there is no new durable usage accumulator. A mode-3 compaction session sends `compaction.ride` with
+cause `tier_change` before the first changed-tier request,
 including a return to standard, and its next notice
 carries the change event and non-standard condition. Unchanged tiers do not ride.
 
@@ -1416,10 +1418,10 @@ A paused run is already at a boundary and is cancelled without another model ste
 submission is not an active run: cancellation answers `"not_active"`; use `session.retract`
 to remove it. An active tool batch awaiting human approval still owns that wait, so boundary
 cancellation waits for the decision/expiry and the batch's results; an immediate cancellation
-can end the wait. A run never waits on its compaction provider between steps: views are applied
-at step boundaries from what was already fetched. A compaction wait the removed synchronous client
-recorded and a crash left open is sealed on recovery with its recorded exit, without calling the
-provider or the model.
+can end the wait. V2 Setup, notices and rides finish within their call budgets before the next model request.
+They do not create durable provider-wait states. A historical compaction wait the removed
+synchronous client recorded and a crash left open is sealed on recovery with its recorded
+exit, without calling the provider or the model.
 
 The provider-call watchdog is separate from caller cancellation. A timed-out provider attempt
 ends `Interrupted`, not `Cancelled`, and releases the lease on legacy-format roots. On an overhaul
@@ -2171,7 +2173,50 @@ Compaction Setup continues to omit `ride_wait_max_ms`, `view_apply` and child-ru
 `session_retention`: broca does not promise provider-chosen ride waits, marked
 next-step view application, or the per-session retention policy group.
 
-## Compaction pricing signals and rollback
+## Mode-3 compaction
+
+A log whose first `RunStarted` carries `compaction_plan_version` uses mode-3 semantics.
+New compaction sessions use one session-scoped `compaction-provider/v2` route. Broca declares
+`compaction-runner/v1`; a route for that role is authorized only for the provider in the
+session's effective plan, not a pending refresh. Provider, preset and params remain fixed for
+the session's lifetime.
+
+Setup is content-free. A mode-3 compaction send must resolve a real context limit before
+admission; otherwise it refuses `invalid_params`, field `context_limit`, without writing.
+Frozen legacy sessions do not acquire that prerequisite. An invalid frozen mode-3 run that
+reaches execution without a limit ends `compaction_unavailable` before model I/O, naming the
+missing limit. Setup reports the frozen model, window, output reserve, library rules,
+all supported ride causes, applied view and newest entry. A refusal, unknown answer or timeout
+without an applied view ends the run `error` with `provider_code: compaction_unavailable`
+before any model call; Setup is retried before the next send. With an applied view, that view
+remains usable.
+
+The provider reads `session.entries`, pushes `session.apply_view` and reads
+`session.applied_view`. Acceptance means the full validated view is durable, not yet applied.
+Application occurs only at a step boundary and is recorded separately, including ride answers
+used for that same request. Notices, applied-view reads and `generated_under` name the applied
+view. Notices are serialized, coalesced in memory, and flushed completely before every ride;
+they create neither `CompactionNotice` records nor bus outbox work. An over-limit ride is
+followed by a fresh estimate and `context_ceiling` if the request still does not fit.
+
+Numbered parts follow the latest host marker's checkpoint. A marker naming another harness or
+session refuses the log on load. Tool-result deliveries are a separate `delivered` list, with
+sender and template attributed by submission id; the render plan edits the stored output before
+appending kept deliveries. Every first-sent result kind can carry a queued tool-result send.
+
+Each run freezes the view library's plan version. An unfinished run cannot resume under a
+different version. A new run after completed older-version history freezes the current version
+and renders history under the new plan, with one prompt-cache rewrite rather than a permanent
+session freeze.
+
+Legacy logs never enroll in v2. They render their last applied v1 view, or raw history if they
+never applied one, and drop an outstanding v1 `view_due`. They make no v1 provider calls or new
+notice/outbox work, and decide an over-window request themselves without waiting.
+
+## Historical compaction pricing signals and rollback
+
+The following v1 metadata remains readable for historical replay. The current writer does not
+send these v1 signals or publish old compaction notice outbox rows.
 
 `broca.jsonc` accepts the boot-only boolean `compaction_signals` (default `true`).
 A config change takes effect after restarting broca; it is not frozen into a session.

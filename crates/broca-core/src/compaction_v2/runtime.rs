@@ -173,15 +173,22 @@ impl Runtime {
             .pending
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Event::MarkerWritten { version } = &event { pending.known_marker = Some(*version); }
+        if let Event::MarkerWritten { version } = &event {
+            pending.known_marker = Some(*version);
+        }
         if !pending.events.contains(&event) {
             pending.events.push(event);
         }
     }
 
     pub fn restore_marker(&self, version: Option<u64>) {
-        let Some(version) = version else { return; };
-        let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(version) = version else {
+            return;
+        };
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if pending.known_marker != Some(version) {
             pending.known_marker = Some(version);
             pending.events.push(Event::MarkerWritten { version });

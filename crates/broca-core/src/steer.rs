@@ -493,14 +493,33 @@ impl SteerInbox {
         results: impl IntoIterator<Item = &'a broca_protocol::content::ToolResult>,
         record: impl FnOnce(Vec<broca_wal::WalRecord>),
     ) -> Vec<(broca_protocol::ToolCallId, String)> {
+        self.deliver_with_tool_results_mode(false, run_id, now_ms, results, record)
+    }
+
+    pub fn deliver_with_tool_results_mode<'a>(
+        &self,
+        mode3: bool,
+        run_id: &broca_protocol::RunId,
+        now_ms: u64,
+        results: impl IntoIterator<Item = &'a broca_protocol::content::ToolResult>,
+        record: impl FnOnce(Vec<broca_wal::WalRecord>),
+    ) -> Vec<(broca_protocol::ToolCallId, String)> {
         use crate::delivery_order::{
             appended_text, carrier, choose_mode, ended, with_tool_result, Boundary,
         };
         let mut state = self.lock();
         if state.closed || state.ordered.is_empty() {
+            if mode3 {
+                record(Vec::new());
+            }
             return Vec::new();
         }
-        let carrier = carrier(results).cloned();
+        let carrier = if mode3 {
+            crate::delivery_order::carrier_mode3(results)
+        } else {
+            carrier(results)
+        }
+        .cloned();
         let boundary = Boundary {
             turn_system: state.system_after_tool_result,
             ..Boundary::tool_batch(carrier.is_some())
@@ -525,14 +544,16 @@ impl SteerInbox {
             ) {
                 (Some(broca_protocol::DeliveryMode::ToolResult), Some(carrier), Some(text)) => {
                     records.push(with_tool_result(&send, run_id, carrier, text.clone()));
-                    appends.push((carrier.clone(), text));
+                    if !mode3 {
+                        appends.push((carrier.clone(), text));
+                    }
                     state.consumed.push(send.submission_id);
                 }
                 _ => kept.push(send),
             }
         }
         state.ordered = kept;
-        if !records.is_empty() {
+        if mode3 || !records.is_empty() {
             record(records);
         }
         appends

@@ -237,7 +237,10 @@ pub fn project(
             parts.push(Part::new(index.to_string(), body).with_seal(seal));
         }
         let final_tools = parts.iter().all(|part| match &part.body {
-            PartBody::Tool(tool) => matches!(tool.status, ToolStatus::Completed | ToolStatus::Error | ToolStatus::Denied),
+            PartBody::Tool(tool) => matches!(
+                tool.status,
+                ToolStatus::Completed | ToolStatus::Error | ToolStatus::Denied
+            ),
             _ => true,
         });
         let mut entry = Entry::new(facts.ordinal, &facts.mid, role, facts.written_at, parts);
@@ -245,7 +248,8 @@ pub fn project(
             entry = entry.with_notice(notice.clone());
         }
         if message.role == HostRole::Assistant && final_tools {
-            entry.completed_at = crate::message_times::completed_at(message.role, facts.completed_at, final_tools);
+            entry.completed_at =
+                crate::message_times::completed_at(message.role, facts.completed_at, final_tools);
         }
         entry.usage = facts.usage;
         entry.generated_under = facts.generated_under.clone();
