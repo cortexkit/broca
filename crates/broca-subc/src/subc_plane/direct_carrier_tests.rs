@@ -62,3 +62,74 @@ async fn direct_carrier_mode_leaves_ordinary_unscoped_opens_unchanged() {
     plane.warm_bind(&bind, Duration::from_secs(1)).await.unwrap();
     assert_eq!(conn.opened_scopes(), vec![("ordinary".into(), None)]);
 }
+
+#[tokio::test]
+async fn direct_preset_reaches_catalog_and_calls_with_catalog_schema_pins() {
+    for scoped in [false, true] {
+        let digest = "1".repeat(64);
+        let schema = serde_json::json!({"type":"object", "properties":{"path":{"type":"string"}}});
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![vec![catalog_entry("aft", &["registration-only"])]; 3],
+            vec![
+                Ok(serde_json::json!({
+                    "generation":"1", "catalog_digest":"preset-catalog", "tools":[{
+                        "name":"echo", "description":"Preset-selected echo", "input_schema":schema,
+                        "schema_digest":digest, "semantics":7, "capabilities":[]
+                    }]
+                })),
+                successful_tool_reply("first"),
+                successful_tool_reply("reopened"),
+            ],
+        );
+        *conn.capabilities.lock().unwrap() = proof_capabilities();
+        let mut plane = SubcToolPlane::with_connection(conn.clone(), "aft")
+            .with_direct_tool_preset("worker");
+        if scoped {
+            plane.direct_carrier_scope = Some(direct_selector());
+        }
+        let ctx = batch_ctx("direct-preset");
+        let tools = plane.tools_from_catalog_for_bind(&ctx.bind, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].description, "Preset-selected echo");
+        assert_eq!(tools[0].input_schema, schema);
+        assert_eq!(tools[0].module.as_deref(), Some("aft"));
+        let manifest = ToolManifest::from_tools(tools);
+        for batch in ["first", "reopened"] {
+            let mut ctx = ctx.clone();
+            ctx.batch_id = BatchId(batch.into());
+            let call = call("echo");
+            plane.batch_started(&ctx, std::slice::from_ref(&call), &manifest).await.unwrap();
+            assert_completed_success(plane.dispatch(&ctx, &call).await);
+            plane.batch_finished(&ctx).await.unwrap();
+            plane.invalidate_route(&ctx.bind);
+        }
+        assert_eq!(*conn.dispatched_presets.lock().unwrap(), [Some("worker".into()), Some("worker".into()), Some("worker".into())]);
+        let arguments = conn.dispatched_arguments.lock().unwrap();
+        assert_eq!(arguments[0], serde_json::json!({"preset":"worker", "params":{}}));
+        let expected_pin = cortexkit_role_tool_provider::call::SchemaPin::new("echo", digest, 7).encode().unwrap();
+        assert_eq!(*conn.dispatched_schema_pins.lock().unwrap(), [Some(expected_pin.clone()), Some(expected_pin)]);
+        let scopes = conn.opened_scopes();
+        assert_eq!(scopes.len(), 2);
+        assert!(scopes.iter().all(|(_, scope)| scope == &scoped.then(direct_selector)));
+    }
+}
+
+#[tokio::test]
+async fn direct_preset_with_explicit_tools_does_not_leak_to_other_providers() {
+    let conn = ScriptedToolPlaneConnection::new(
+        vec![vec![catalog_entry("aft", &["echo"]), catalog_entry("other", &["look"])]; 3],
+        vec![successful_tool_reply("aft"), successful_tool_reply("other")],
+    );
+    let plane = SubcToolPlane::with_connection(conn.clone(), "aft").with_direct_tool_preset("reader");
+    let manifest = ToolManifest::from_tools(vec![request_tool("echo", Some("aft")), request_tool("look", Some("other"))]);
+    let ctx = batch_ctx("explicit-tools-preset");
+    for name in ["echo", "look"] {
+        let call = call(name);
+        plane.batch_started(&ctx, std::slice::from_ref(&call), &manifest).await.unwrap();
+        assert_completed_success(plane.dispatch(&ctx, &call).await);
+        plane.batch_finished(&ctx).await.unwrap();
+    }
+    assert_eq!(*conn.dispatched_presets.lock().unwrap(), [Some("reader".into()), None]);
+    assert_eq!(*conn.dispatched_schema_pins.lock().unwrap(), [None, None]);
+}

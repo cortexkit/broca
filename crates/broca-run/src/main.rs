@@ -67,7 +67,7 @@ struct Args {
 
     /// Optional JSON array of tools to use INSTEAD of catalog discovery — each
     /// `{name, description, input_schema, execution_mode}`. Omit to derive the tool
-    /// set from what the target module registers in subc's catalog.
+    /// set from the provider's --preset catalog, or its subc registration without --preset.
     #[arg(long)]
     tools: Option<String>,
 
@@ -95,11 +95,20 @@ struct Args {
     #[arg(long, default_value = ".")]
     project_root: PathBuf,
 
-    /// Owner/ref/epoch for model tool routes. Reads a private 32-byte bind proof as
+    /// OWNER/REF/EPOCH for model tool routes. For a module-owned scope, OWNER is the
+    /// scope owner's module id (for example, --scope cke2e-scope-owner/rig/1).
+    /// REF names the owner's scope and EPOCH selects its incarnation, preventing ref reuse
+    /// from silently selecting a different scope. Reads the private 32-byte proof that
+    /// authorizes this Direct consumer's tool-route bind as
     /// 64 hex characters from stdin (optional newline, then EOF), never argv or environment.
     /// Global catalog and vault routes remain unscoped.
-    #[arg(long, value_name = "OWNER/REF/EPOCH")]
+    #[arg(long, value_name = "OWNER/REF/EPOCH", requires = "preset")]
     scope: Option<carrier_scope::CarrierScope>,
+
+    /// Tool catalog preset, required with --scope. AFT defines head, worker and reader
+    /// today; the tool provider decides which values are valid.
+    #[arg(long, value_name = "NAME")]
+    preset: Option<String>,
 
     /// Explicit Bearer override. Otherwise catalog models read a vault dev-tools handle;
     /// an explicit --base-url needs no credential (for mock providers).
@@ -265,6 +274,10 @@ async fn run(args: Args) -> Result<i32, String> {
         }
         None => SubcToolPlane::new(conn, &args.module_id),
     };
+    let plane = match &args.preset {
+        Some(preset) => plane.with_direct_tool_preset(preset),
+        None => plane,
+    };
 
     // 1b. Fill the catalog before resolving a model.
     //
@@ -302,7 +315,7 @@ async fn run(args: Args) -> Result<i32, String> {
     let tools: Vec<Tool> = match &args.tools {
         Some(json) => serde_json::from_str(json).map_err(|e| format!("parse --tools json: {e}"))?,
         None => plane
-            .tools_from_catalog()
+            .tools_from_catalog_for_bind(&bind, Duration::from_millis(args.bind_timeout_ms))
             .await
             .map_err(|e| format!("read catalog tools: {e}"))?,
     };
@@ -615,8 +628,13 @@ mod tests {
         use clap::CommandFactory;
         let help = super::Args::command().render_long_help().to_string();
         assert!(help.contains("--scope <OWNER/REF/EPOCH>"));
+        assert!(help.contains("scope owner's module id"));
+        assert!(help.contains("--scope cke2e-scope-owner/rig/1"));
         assert!(help.contains("stdin"));
         assert!(help.contains("vault routes remain unscoped"));
+        assert!(help.contains("--preset <NAME>"));
+        assert!(help.contains("head, worker and reader"));
+        assert!(help.contains("tool provider decides which values are valid"));
     }
     use super::*;
     use broca_protocol::request::CallOptions;
@@ -646,7 +664,7 @@ mod tests {
 
     /// Parse a minimal arg vector into `Args` (exercises the real clap parsing, so a
     /// flag rename or a wrong `required` shows up here). Extra flags are appended.
-    fn args(extra: &[&str]) -> Args {
+    fn try_args(extra: &[&str]) -> Result<Args, clap::Error> {
         let mut v = vec![
             "broca-run",
             "--subc",
@@ -657,7 +675,51 @@ mod tests {
             "hi",
         ];
         v.extend_from_slice(extra);
-        Args::parse_from(v)
+        Args::try_parse_from(v)
+    }
+
+    fn args(extra: &[&str]) -> Args {
+        try_args(extra).expect("valid arguments")
+    }
+
+    #[test]
+    fn scope_requires_explicit_preset() {
+        let error = try_args(&["--scope", "cke2e-scope-owner/rig/1"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let message = error.to_string();
+        assert!(message.contains("--scope"), "{message}");
+        assert!(message.contains("--preset"), "{message}");
+    }
+
+    #[test]
+    fn scope_accepts_explicit_preset() {
+        let parsed = args(&["--scope", "cke2e-scope-owner/rig/1", "--preset", "worker"]);
+        assert!(parsed.scope.is_some());
+        assert_eq!(parsed.preset.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn preset_is_optional_without_scope() {
+        let parsed = args(&[]);
+        assert!(parsed.scope.is_none());
+        assert!(parsed.preset.is_none());
+    }
+
+    #[test]
+    fn preset_accepts_provider_defined_names_without_scope() {
+        for name in ["head", "worker", "reader", "provider-specific"] {
+            let parsed = args(&["--preset", name]);
+            assert!(parsed.scope.is_none());
+            assert_eq!(parsed.preset.as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn preset_requires_a_name() {
+        assert!(try_args(&["--preset"]).is_err());
     }
 
     /// `resolve_provider` Ok-or-panic — `ProviderResolution` holds a `Box<dyn Provider>`
