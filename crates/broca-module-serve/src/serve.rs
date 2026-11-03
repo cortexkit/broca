@@ -2473,9 +2473,7 @@ async fn authorize_bind(
         };
         completed.refusal = refusal;
     }
-    if completed.bind.role == RouteRole::CompactionRunner
-        && matches!(completed.refusal, Ok(None))
-    {
+    if completed.bind.role == RouteRole::CompactionRunner && matches!(completed.refusal, Ok(None)) {
         // The runner checks that the attested caller is this session's compaction provider
         // before the route is acknowledged; the caller id is the daemon's, never a body field.
         let caller = caller_module(&completed.bind).map(str::to_owned);
@@ -2485,8 +2483,7 @@ async fn authorize_bind(
             .route_compaction_v2(&completed.identity, caller, "bind".into(), params)
             .await
         {
-            completed.role_refusal =
-                Some(serde_json::to_vec(&refusal).expect("refusals encode"));
+            completed.role_refusal = Some(serde_json::to_vec(&refusal).expect("refusals encode"));
         }
     }
     completed
@@ -2528,8 +2525,15 @@ async fn finish_bind(
         .await;
     }
     if let Some(body) = completed.role_refusal {
-        return send_error_bytes(writer, completed.header.ver, 0, 0, completed.header.corr, body)
-            .await;
+        return send_error_bytes(
+            writer,
+            completed.header.ver,
+            0,
+            0,
+            completed.header.corr,
+            body,
+        )
+        .await;
     }
     let refusal = match completed.refusal {
         Ok(refusal) => refusal,

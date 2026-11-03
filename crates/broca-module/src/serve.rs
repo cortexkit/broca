@@ -1806,10 +1806,8 @@ pub trait ServeHandler: Send + Sync {
         _caller: Option<String>,
         method: String,
         _params: Box<serde_json::value::RawValue>,
-    ) -> Result<
-        Box<serde_json::value::RawValue>,
-        broca_core::compaction_v2::protocol::wire::Refusal,
-    > {
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::protocol::wire::Refusal>
+    {
         Err(broca_core::compaction_v2::protocol::wire::Refusal::new(
             "unknown_method",
             format!("{method} is not served by this handler"),
@@ -2396,10 +2394,8 @@ impl ServeHandler for crate::LineageRegistry {
         caller: Option<String>,
         method: String,
         params: Box<serde_json::value::RawValue>,
-    ) -> Result<
-        Box<serde_json::value::RawValue>,
-        broca_core::compaction_v2::protocol::wire::Refusal,
-    > {
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::protocol::wire::Refusal>
+    {
         self.route_compaction_v2(session, caller, method, params)
             .await
     }
