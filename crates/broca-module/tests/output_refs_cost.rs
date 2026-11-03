@@ -249,6 +249,7 @@ fn seed(rig: &Rig, episodes: u64, compacts: bool) {
         let first = 4 * episode;
         let mut records = vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,

@@ -10363,6 +10363,7 @@ mod tests {
             // normally. The guard's terminal is suppressed by the seam, so this clean
             // return delivers NOTHING to the actor — only the backstop can recover it.
             let _ = job.writer.record(broca_wal::WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -10420,6 +10421,7 @@ mod tests {
         let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
         let mut records = vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -10586,6 +10588,7 @@ mod tests {
             let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
             let mut records = vec![
                 WalRecord::RunStarted {
+                    compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
                     tags: None,
@@ -11732,6 +11735,7 @@ mod tests {
             .collect();
         let mut records = vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -12131,6 +12135,7 @@ mod tests {
         };
         vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -12857,6 +12862,7 @@ mod tests {
             let mut config = min_config();
             config.tools_were_omitted = job.control.tools_were_omitted;
             job.writer.record(WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -12919,6 +12925,7 @@ mod tests {
             _out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             let _ = job.writer.record(broca_wal::WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -12986,6 +12993,7 @@ mod tests {
             out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -13215,6 +13223,7 @@ mod tests {
 
             if ordinal == 1 {
                 job.writer.record(WalRecord::RunStarted {
+                    compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
                     tags: None,
@@ -13353,6 +13362,7 @@ mod tests {
         ) -> Result<RunSummary, RunError> {
             let ordinal = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
             job.writer.record(WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -13460,6 +13470,7 @@ mod tests {
             // would discard its held-call metadata before status can observe the live wait.
             if !self.preserve_held_prefix {
                 job.writer.record(WalRecord::RunStarted {
+                    compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
                     tags: None,
@@ -13679,6 +13690,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -14285,6 +14297,7 @@ mod tests {
             // The recovery run continues the episode the failed run left open.
             if ordinal <= 2 {
                 job.writer.record(WalRecord::RunStarted {
+                    compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
                     tags: None,
@@ -14523,6 +14536,7 @@ mod tests {
             out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -14896,6 +14910,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -14989,6 +15004,7 @@ mod tests {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -15669,6 +15685,7 @@ mod import_idempotency_tests {
             _out: tokio::sync::mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -15766,6 +15783,7 @@ mod import_idempotency_tests {
         let writer =
             WalHandle::spawn(wal_store.open(&key).expect("open WAL"), 1).expect("spawn WAL writer");
         writer.record(broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -16501,6 +16519,7 @@ mod owned_cut_tests {
             _out: tokio::sync::mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             job.writer.record(broca_wal::WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,

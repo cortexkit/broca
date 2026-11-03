@@ -1280,6 +1280,9 @@ impl AdmissionCheckpointV1 {
             WalRecord::WriterOpened { .. }
             | WalRecord::WriterClosed { .. }
             | WalRecord::VisibilityLate { .. }
+            | WalRecord::CompactionViewV2 { .. }
+            | WalRecord::CompactionMarker { .. }
+            | WalRecord::CompactionViewAppliedV2 { .. }
             | WalRecord::Unknown => {}
             // Compaction state is folded below; it does not change admission's episode counters.
             WalRecord::CompactionRequest { .. }
@@ -2558,6 +2561,9 @@ impl AdmissionContinuation {
             | WalRecord::CompactionWait { .. }
             | WalRecord::CompactionViewApplied { .. }
             | WalRecord::CompactionNotice { .. }
+            | WalRecord::CompactionViewV2 { .. }
+            | WalRecord::CompactionMarker { .. }
+            | WalRecord::CompactionViewAppliedV2 { .. }
             | WalRecord::ToolCallDeferred { .. }
             | WalRecord::ApprovalRecorded { .. }
             | WalRecord::AwaitingApproval { .. }
@@ -3336,6 +3342,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -3916,26 +3923,33 @@ mod tests {
     }
 
     fn continuation_oracle(records: &[FramedRecord]) {
+        continuation_oracle_at(records, &[4, 12]);
+    }
+
+    fn continuation_oracle_at(records: &[FramedRecord], cuts: &[usize]) {
         use crate::projection_plan::ProjectionContinuation;
         let (bytes, positions) = offset_log(records);
         let read_at = offset_reader(&bytes);
+        let first_cut = cuts[0];
         let mut stored = ProjectionContinuation::capture(
             &read_at,
-            &offset_boundary(&bytes, &positions, 4),
-            &positions[..4],
+            &offset_boundary(&bytes, &positions, first_cut),
+            &positions[..first_cut],
         )
         .unwrap();
-        for boundary_cut in [4, 12] {
-            if boundary_cut != 4 {
+        let mut previous_cut = first_cut;
+        for &boundary_cut in cuts {
+            if boundary_cut != first_cut {
                 stored = ProjectionContinuation::decode(&stored.encode().unwrap())
                     .unwrap()
                     .advance(
                         &read_at,
                         &offset_boundary(&bytes, &positions, boundary_cut),
-                        &positions[4..boundary_cut],
+                        &positions[previous_cut..boundary_cut],
                     )
                     .unwrap();
             }
+            previous_cut = boundary_cut;
             let encoded = stored.encode().unwrap();
             assert_content_free_form(&encoded);
             assert_content_free_form(&stored.admission().encode().unwrap());
@@ -4014,6 +4028,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn compaction_v2_is_a_noop_for_replay_admission_projection_and_continuations() {
+        let plain = offset_corpus();
+        let metadata: Vec<WalRecord> =
+            include_str!("../../broca-wal/tests/fixtures/compaction_v2_records.jsonl")
+                .lines()
+                .take(3)
+                .map(|bytes| serde_json::from_str(bytes).unwrap())
+                .collect();
+        assert!(metadata.iter().all(WalRecord::is_informational));
+        let mut with = Vec::new();
+        for source in &plain {
+            let mut record = source.record.clone();
+            if let WalRecord::RunStarted {
+                compaction_plan_version,
+                ..
+            } = &mut record
+            {
+                *compaction_plan_version = Some(u32::MAX);
+            }
+            for record in std::iter::once(record).chain(metadata.iter().cloned()) {
+                with.push(frame(with.len() as u64 + 1, record));
+            }
+            let expected = crate::replay::replay(
+                &plain[..source.seq as usize]
+                    .iter()
+                    .map(|f| f.record.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let actual =
+                crate::replay::replay(&with.iter().map(|f| f.record.clone()).collect::<Vec<_>>())
+                    .unwrap();
+            assert_eq!(
+                format!("{actual:?}"),
+                format!("{expected:?}"),
+                "replay at {}",
+                source.seq
+            );
+            let mut actual = AdmissionCheckpointV1::from_frames(&with).unwrap();
+            let expected =
+                AdmissionCheckpointV1::from_frames(&plain[..source.seq as usize]).unwrap();
+            assert_eq!(actual.at_seq, expected.at_seq * 4);
+            actual.at_seq = expected.at_seq;
+            assert_eq!(actual, expected, "admission at {}", source.seq);
+            let units = |frames: &[FramedRecord]| {
+                crate::project_control(frames)
+                    .into_iter()
+                    .map(|(_, unit)| unit)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(units(&with), units(&plain[..source.seq as usize]));
+        }
+        // Publication cuts still name model-step frames, not the metadata following them.
+        // The oracle checks every crash suffix after capture and after checkpoint advancement.
+        continuation_oracle_at(&with, &[13, 45]);
     }
 
     #[test]

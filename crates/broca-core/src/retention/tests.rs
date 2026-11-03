@@ -13,6 +13,7 @@ pub(crate) const MARKER: &str = "retention-content-must-not-be-projected-5d8e7b"
 
 pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,

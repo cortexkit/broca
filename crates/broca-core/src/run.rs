@@ -5366,6 +5366,7 @@ where
         let admitted_at_ms = control.now_ms();
         output_history.start_run(&cfg.model);
         let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: control.display_sent_by.clone(),
             written_at_ms: req
                 .input_written_at_ms

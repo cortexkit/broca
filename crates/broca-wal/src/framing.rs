@@ -221,6 +221,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     CHATGPT_CODEX_WIRE_FEATURE,
     CLIENT_MESSAGE_ID_FEATURE,
     COMPACTION_RIDE_WAIT_FEATURE,
+    COMPACTION_V2_FEATURE,
     COMPACTION_VIEW_NEGOTIATION_FEATURE,
     COMPACTION_VIEW_FEATURE,
     COMPACTION_WAIT_FEATURE,
@@ -267,6 +268,9 @@ pub const KNOWN_FEATURES: &[&str] = &[
 
 /// A timed account pause must not be mistaken for a terminal error or an authentication pause.
 pub const ACCOUNT_LIMIT_PAUSE_FEATURE: &str = "account-limit-pause/v1";
+
+/// Mode-3 accepted views, applied-view selections, cut markers and the frozen plan version.
+pub const COMPACTION_V2_FEATURE: &str = "compaction-v2/v1";
 
 /// Physical-send reservation and settlement evidence for billing readers.
 pub const BILL_ATTEMPTS_FEATURE: &str = "bill-attempts/v1";
@@ -1610,6 +1614,7 @@ mod tests {
                 CHATGPT_CODEX_WIRE_FEATURE,
                 CLIENT_MESSAGE_ID_FEATURE,
                 COMPACTION_RIDE_WAIT_FEATURE,
+                COMPACTION_V2_FEATURE,
                 COMPACTION_VIEW_NEGOTIATION_FEATURE,
                 COMPACTION_VIEW_FEATURE,
                 COMPACTION_WAIT_FEATURE,
@@ -1662,6 +1667,7 @@ mod tests {
         assert_eq!(RUNNER_TAGS_V2_FEATURE, "runner-tags/v2");
         assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
         assert_eq!(COMPACTION_FEATURE, "compaction/v1");
+        assert_eq!(COMPACTION_V2_FEATURE, "compaction-v2/v1");
         assert_eq!(COMPACTION_WAIT_FEATURE, "compaction-wait/v1");
         assert_eq!(DEFERRED_CALL_FEATURE, "deferred-call/v1");
         assert_eq!(DISPATCH_MODULE_FEATURE, "dispatch-module/v1");

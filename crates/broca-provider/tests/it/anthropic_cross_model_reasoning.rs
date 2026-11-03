@@ -333,6 +333,7 @@ fn imported_seed_replay_strips_foreign_signed_reasoning_on_cross_model_render() 
             title: None,
             on_restart: None,
             keep_warm: None,
+            compaction_plan_version: None,
             marker_order_version: None,
             manifest: None,
             scope: None,

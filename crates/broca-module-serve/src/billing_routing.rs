@@ -571,6 +571,7 @@ mod tests {
                     title: None,
                     on_restart: None,
                     keep_warm: None,
+                    compaction_plan_version: None,
                     marker_order_version: None,
                     manifest: None,
                     scope: None,
