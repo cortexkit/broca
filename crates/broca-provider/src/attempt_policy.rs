@@ -1,5 +1,5 @@
-//! Pure retry decisions, not yet used by the transport.
-//! Transport trace tests verify this model against the unchanged driver before wiring it in.
+//! Pure retry decisions for the transport's attempt loop.
+//! The driver supplies measured facts and performs the effects returned by this model.
 
 use std::time::Duration;
 
@@ -13,8 +13,12 @@ use crate::transport::{
     AttemptCause,
 };
 
-const MAX_ATTEMPTS: usize = 6;
-const RETRY_WALL_BUDGET: Duration = Duration::from_secs(240);
+pub(crate) const MAX_ATTEMPTS: usize = 6;
+pub(crate) const RETRY_WALL_BUDGET: Duration = Duration::from_secs(240);
+const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
+const MAX_BACKOFF_DELAY: Duration = Duration::from_secs(30);
+pub(crate) const BACKOFF_JITTER: f64 = 0.2;
+pub(crate) const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(120);
 
 pub(crate) struct AttemptFacts<'a> {
     pub error: &'a ProviderError,
@@ -58,6 +62,10 @@ impl AttemptState {
     /// Success returns the current index, including a rejected-token re-send.
     pub(crate) fn retries_used(&self) -> u32 {
         self.attempt_index as u32
+    }
+
+    pub(crate) fn attempt_index(&self) -> usize {
+        self.attempt_index
     }
 
     fn end(&self, reason: EndReason) -> AttemptDecision {
@@ -229,20 +237,20 @@ pub(crate) fn decide_attempt(
     )
 }
 
-fn generic_delay(error: &ProviderError, ordinary_index: usize, jitter: f64) -> Duration {
+pub(crate) fn generic_delay(error: &ProviderError, ordinary_index: usize, jitter: f64) -> Duration {
     if let Some(seconds) = error.retry_after_secs {
-        // The transport's max/min turns NaN into zero; clamp alone would preserve NaN.
+        // Preserve the retry schedule's NaN-to-zero conversion; clamp alone preserves NaN.
         let capped = if seconds.is_nan() {
             0.0
         } else {
-            seconds.clamp(0.0, 120.0)
+            seconds.clamp(0.0, MAX_RETRY_AFTER_DELAY.as_secs_f64())
         };
         return Duration::from_secs_f64(capped);
     }
     let doublings = u32::try_from(ordinary_index).unwrap_or(u32::MAX).min(16);
-    Duration::from_secs(2)
+    BASE_RETRY_DELAY
         .saturating_mul(1u32 << doublings)
-        .min(Duration::from_secs(30))
+        .min(MAX_BACKOFF_DELAY)
         .mul_f64(jitter)
 }
 

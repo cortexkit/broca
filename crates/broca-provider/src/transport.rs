@@ -57,6 +57,10 @@ use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    attempt_policy::{
+        self, AttemptDecision, AttemptFacts, AttemptInputs, AttemptState, EndReason,
+        RejectedRefreshResult, BACKOFF_JITTER, MAX_ATTEMPTS,
+    },
     credential_refresh::CredentialRefresher,
     families::fresh_admission_config_error,
     normalize::classify_error_with_status_defaults,
@@ -64,6 +68,9 @@ use crate::{
         AuthHandle, FrozenRenderConfig, HttpRequest, NormalizeError, StreamNormalizer, WireFamily,
     },
 };
+
+#[cfg(test)]
+use crate::attempt_policy::{MAX_RETRY_AFTER_DELAY, RETRY_WALL_BUDGET};
 
 #[cfg(test)]
 mod websocket_tests {
@@ -2393,7 +2400,7 @@ impl StreamRateWindow {
 //
 // One exception adds a send: a 401 answered by a fresh token for the same credential is re-sent
 // once, outside MAX_ATTEMPTS but inside RETRY_WALL_BUDGET.
-// `drive_step_attempts` states the full rule where it applies it.
+// `attempt_policy` owns the counters and decisions; `drive_step_attempts` performs their effects.
 //
 // The two OpenAI Responses families (`openai_responses` and `openai_responses_chatgpt`) do not
 // use this schedule. They take Codex's retry decision instead: see `codex_retry`. For them
@@ -2401,12 +2408,6 @@ impl StreamRateWindow {
 // the server's time or waiting budget. The permanent-class, `x-should-retry: false`,
 // exhausted-account and second-decode-failure vetoes and the 401
 // re-send apply to them unchanged.
-const MAX_ATTEMPTS: usize = 6;
-const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
-const MAX_BACKOFF_DELAY: Duration = Duration::from_secs(30);
-const BACKOFF_JITTER: f64 = 0.2;
-const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(120);
-const RETRY_WALL_BUDGET: Duration = Duration::from_secs(240);
 // All observed ChatGPT response cuts fell in 901.1–901.3 s after send; allow a small
 // timing margin when recognizing the backend's 900 s response deadline.
 const CHATGPT_RESPONSE_DEADLINE_THRESHOLD: Duration = Duration::from_secs(895);
@@ -3150,36 +3151,18 @@ where
     NormalizerFactory: FnMut() -> Normalizer,
     Normalizer: StreamNormalizer + 'static,
 {
-    let mut previous_cause = None;
-    let mut decode_retries = 0usize;
-    let mut escape_used = false;
-    let mut retry_wait_spent = Duration::ZERO;
-    let mut refreshes = 0usize;
-    // How a token-refresh re-send counts (see the retry schedule above MAX_ATTEMPTS):
-    // - Attempts: it is ONE send on top of MAX_ATTEMPTS, so the budget grows by one and a
-    //   transient failure after the re-send still gets the full set of ordinary re-sends.
-    // - Backoff: computed from the ordinal among ordinary attempts, so the curve is the one a
-    //   step without a refresh would follow.
-    // - Waiting: NOT exempt. Asking for a fresh token consumes the waiting allowance.
+    let use_codex = codex_retry::applies(request.family);
+    let mut attempts = AttemptState::new(use_codex);
+    let mut use_escape_client = false;
     // `credential_refresh` is the evidence the next attempt's record carries when it goes out
     // with a token refreshed inside this step, by either the 401 path or the pre-send check.
-    // The OpenAI Responses families count their retries the way Codex does, in `codex_retry`;
-    // for them the loop itself sets no attempt limit; the policy bounds connection failures.
-    let mut codex =
-        codex_retry::applies(request.family).then(codex_retry::CodexRetryState::default);
-    let mut attempt_budget = if codex.is_some() {
-        usize::MAX
-    } else {
-        MAX_ATTEMPTS
-    };
     let mut credential_refresh: Option<CredentialRefresh> = None;
-    // A step recovers from a 401 at most once, so a second 401 (even from the refreshed token)
-    // ends the step. The expiry check before each attempt is not counted against this: it
-    // replaces a token nobody rejected, and it runs at most once per attempt.
-    let mut rejection_recovered = false;
-
-    let mut attempt_index = 0usize;
-    while attempt_index < attempt_budget {
+    // Driver-kept exceptions: the model has no cancellation, receiver-close, shutdown-seal
+    // or top-of-loop deadline outcome. These remain quiet ends with zero retries. Journal
+    // settlement errors also bypass retry policy: a failed durability effect cannot be retried
+    // as a provider failure. The gzip identity re-send stays inside one recorded attempt.
+    loop {
+        let attempt_index = attempts.attempt_index();
         let attempt_started = retry_clock.mark();
         if cancel.is_cancelled() || tx.is_closed() {
             return Ok((Vec::new(), 0));
@@ -3215,7 +3198,8 @@ where
                     .auth_refreshed = true;
                 // The same account check as a 401 refresh: a token for another account is
                 // never sent. Nothing was sent since the previous attempt, so the retries
-                // used are those already spent.
+                // used are those already spent. This pre-send exception is not a rejected-token
+                // recovery in the model, and retains its separate attempt_index - 1 count.
                 if let Some(mut error) = refreshed_account_changed_error(
                     recovery.recovery.frozen_account_ref.as_deref(),
                     &recovery.sent_auth,
@@ -3238,11 +3222,6 @@ where
         }
         let normalizer = Box::new(normalizer_factory()) as Box<dyn StreamNormalizer>;
 
-        let use_escape_client =
-            !escape_used && previous_cause == Some(AttemptCause::TransportTransient);
-        if use_escape_client {
-            escape_used = true;
-        }
         let escape_client = use_escape_client.then(|| {
             #[cfg(test)]
             escape_client_builds.fetch_add(1, Ordering::SeqCst);
@@ -3397,9 +3376,6 @@ where
                 return Err((error, attempt_index as u32));
             }
         }
-        if result.is_err() && trace.response_len == 0 {
-            retry_wait_spent += attempt_elapsed;
-        }
         publish_attempt(
             tx,
             trace.clone().into_attempt(
@@ -3413,248 +3389,223 @@ where
         // then proceeds knowing the record took the ordinary path and is not its to write.
         step_seal.end_attempt();
         match result {
-            Ok(completion) => return Ok((completion, attempt_index as u32)),
+            Ok(completion) => return Ok((completion, attempts.retries_used())),
             Err(mut failure) => {
-                if is_rejected_token(&failure.error) {
-                    let rejected_status = failure.error.status.unwrap_or(401);
-                    let Some(recovery) = auth_recovery.as_mut() else {
-                        warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
-                        return Err((failure.error, attempt_index as u32));
-                    };
-                    // Whatever happens next, a step recovers at most once, so a second rejection
-                    // (of the token the step just refreshed) ends the step. Nothing has reported
-                    // that token to the credential source yet, so hand it the rejection to report.
-                    if rejection_recovered {
-                        recovery
-                            .recovery
-                            .refresher
-                            .note_unrecovered_rejection(rejected_status);
-                        warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
-                        return Err((failure.error, attempt_index as u32));
-                    }
-                    rejection_recovered = true;
+                let facts = AttemptFacts {
+                    error: &failure.error,
+                    cause: failure.cause,
+                    outcome: failure.outcome.clone(),
+                    retry_forbidden: failure.retry_forbidden,
+                    over_https: trace.transport.as_deref() != Some("websocket"),
+                    attempt_elapsed,
+                    got_response_bytes: trace.response_len != 0,
+                    can_refresh: auth_recovery.is_some(),
+                };
+                let inputs = AttemptInputs {
+                    until_deadline: deadline.map(|deadline| {
+                        deadline.saturating_duration_since(attempt_deadline_now!())
+                    }),
+                    jitter: if use_codex {
+                        codex_retry::jitter()
+                    } else {
+                        retry_jitter()
+                    },
+                    can_switch_to_https: request.family
+                        == Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt)
+                        && websocket.is_some_and(|session| session.can_switch_to_https()),
+                };
+                let mut decision = attempt_policy::decide_attempt(&mut attempts, &facts, &inputs);
+                let recovering = matches!(decision, AttemptDecision::RefreshAndResend);
+                let mut account_changed_error = None;
+                if recovering {
+                    let recovery = auth_recovery
+                        .as_mut()
+                        .expect("the policy requires a refresher before requesting recovery");
                     let refresh_started = retry_clock.mark();
                     let refreshed = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
                         _ = tx.closed() => return Ok((Vec::new(), 0)),
-                        refreshed = recovery.recovery.refresher.refresh_rejected(rejected_status) => refreshed,
+                        refreshed = recovery.recovery.refresher.refresh_rejected(
+                            failure.error.status.unwrap_or(401)
+                        ) => refreshed,
                     };
                     #[cfg(test)]
                     attempt_test_hooks::record(attempt_test_hooks::Event::Refresh {
                         rejected: true,
                         credential: refreshed.is_some(),
                     });
-                    let Some(refreshed) = refreshed else {
-                        warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
-                        return Err((failure.error, attempt_index as u32));
-                    };
-                    recovery
-                        .recovery
-                        .current
-                        .write()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .auth_refreshed = true;
-                    if let Some(mut error) = refreshed_account_changed_error(
-                        recovery.recovery.frozen_account_ref.as_deref(),
-                        &recovery.sent_auth,
-                        &refreshed,
-                    ) {
-                        redact_chatgpt_account_error(&mut error, request.family);
-                        warn_attempt_retry(&failure, &trace, "not_retryable", "account_changed");
-                        return Err((error, attempt_index as u32));
-                    }
-                    // The same token again cannot succeed where it was just refused, so the
-                    // 401 stands. Compared as a boolean only; neither side is ever formatted.
-                    if refreshed.auth == *recovery.sent_auth {
-                        warn_attempt_retry(
-                            &failure,
-                            &trace,
-                            "not_retryable",
-                            "unchanged_credential",
-                        );
-                        return Err((failure.error, attempt_index as u32));
-                    }
-                    recovery.adopt(
-                        refreshed.auth,
-                        refreshed.account_ref,
-                        &mut request,
-                        &mut served_account_ref,
-                    );
-                    credential_refresh = Some(refreshed.evidence);
-                    attempt_budget = attempt_budget.saturating_add(1);
-                    refreshes += 1;
-                    retry_wait_spent += retry_clock.elapsed_since(refresh_started);
-                    warn_attempt_retry(&failure, &trace, "retrying", "credential_refresh");
-                    // A new token needs no backoff; only the partial display is reset.
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
-                        result = tx.send(NormalizedEvent::Display(DisplayEvent::DisplayReset)) => {
-                            if result.is_err() {
-                                return Ok((Vec::new(), 0));
+                    let refresh_result = match refreshed.as_ref() {
+                        None => RejectedRefreshResult::NoCredential,
+                        Some(refreshed) => {
+                            recovery
+                                .recovery
+                                .current
+                                .write()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .auth_refreshed = true;
+                            account_changed_error = refreshed_account_changed_error(
+                                recovery.recovery.frozen_account_ref.as_deref(),
+                                &recovery.sent_auth,
+                                refreshed,
+                            );
+                            // Compare accounts before credentials; neither credential is formatted.
+                            if account_changed_error.is_some() {
+                                RejectedRefreshResult::AccountChanged
+                            } else if refreshed.auth == *recovery.sent_auth {
+                                RejectedRefreshResult::UnchangedCredential
+                            } else {
+                                RejectedRefreshResult::Refreshed
                             }
                         }
-                    }
-                    previous_cause = failure.cause;
-                    attempt_index += 1;
-                    continue;
-                }
-                // The ordinal among ordinary attempts, leaving out a token-refresh re-send, so
-                // the backoff curve is the same with or without one.
-                let ordinary_index = attempt_index - refreshes;
-                if !failure.error.class.step_reissuable()
-                    || failure.retry_forbidden
-                    || (failure.cause == Some(AttemptCause::DeterministicDecode)
-                        && decode_retries >= 1)
-                {
-                    warn_attempt_retry(&failure, &trace, "not_retryable", "retry_veto");
-                    return Err((failure.error, attempt_index as u32));
-                }
-
-                let delay = if let Some(codex) = codex.as_mut() {
-                    if failure.cause == Some(AttemptCause::DeterministicDecode) {
-                        decode_retries += 1;
-                    }
-                    let decision = codex.decide(
-                        &codex_retry::CodexFailure {
-                            error: &failure.error,
-                            outcome: &failure.outcome,
-                            https: trace.transport.as_deref() != Some("websocket"),
-                        },
-                        // Codex disables its WebSocket only where the transport could use one.
-                        || {
-                            request.family
-                                == Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt)
-                                && websocket.is_some_and(|session| {
-                                    let switched = session.try_switch_to_https();
-                                    #[cfg(test)]
-                                    if switched {
-                                        attempt_test_hooks::record(
-                                            attempt_test_hooks::Event::SwitchToHttps,
-                                        );
-                                    }
-                                    switched
-                                })
-                        },
-                    );
-                    let (delay, server_advised, decision, reason) = match decision {
-                        codex_retry::CodexDecision::Terminal { reason } => {
-                            let decision =
-                                if matches!(reason, "attempt_limit" | "connection_attempt_limit") {
-                                    "attempts_exhausted"
-                                } else {
-                                    "not_retryable"
-                                };
-                            warn_attempt_retry(&failure, &trace, decision, reason);
-                            if reason == "connection_attempt_limit" {
-                                failure.error.class = ErrorClass::Transient;
-                                failure.error.provider_code = Some("connection_failed".into());
-                                failure.error.message = format!(
-                                    "connection failed after {MAX_ATTEMPTS} failed attempts: {}",
-                                    failure.error.message
-                                );
-                            }
-                            return Err((failure.error, attempt_index as u32));
-                        }
-                        codex_retry::CodexDecision::Retry {
-                            delay,
-                            server_advised,
-                            reason,
-                        } => (delay, server_advised, "retrying", reason),
-                        codex_retry::CodexDecision::FallBackToHttps {
-                            delay,
-                            server_advised,
-                        } => (
-                            delay,
-                            server_advised,
-                            "switching_to_https",
-                            "socket_attempt_limit",
-                        ),
                     };
-                    // The server's time is waited out in full, never cut short, so a deadline
-                    // that comes first ends the step now rather than after a wait that cannot
-                    // lead to a send.
-                    if server_advised
-                        && deadline.is_some_and(|deadline| {
-                            delay >= deadline.saturating_duration_since(attempt_deadline_now!())
-                        })
-                    {
-                        warn_attempt_retry(
-                            &failure,
-                            &trace,
-                            "not_retryable",
-                            "retry_after_exceeds_deadline",
+                    decision = attempt_policy::decide_rejected_refresh(
+                        &mut attempts,
+                        &facts,
+                        refresh_result,
+                    );
+                    if matches!(decision, AttemptDecision::Resend { .. }) {
+                        let refreshed =
+                            refreshed.expect("a resend requires a refreshed credential");
+                        recovery.adopt(
+                            refreshed.auth,
+                            refreshed.account_ref,
+                            &mut request,
+                            &mut served_account_ref,
                         );
-                        return Err((failure.error, attempt_index as u32));
-                    }
-                    warn_attempt_retry(&failure, &trace, decision, reason);
-                    delay
-                } else {
-                    // Only the ChatGPT family, which takes the branch above, uses a socket, so
-                    // every attempt here went out over HTTPS.
-                    if attempt_index + 1 >= attempt_budget {
-                        warn_attempt_retry(&failure, &trace, "attempts_exhausted", "attempt_limit");
-                        return Err((failure.error, attempt_index as u32));
-                    }
-
-                    if failure.cause == Some(AttemptCause::DeterministicDecode) {
-                        decode_retries += 1;
-                    }
-                    let delay = retry_delay(&failure.error, ordinary_index);
-                    if failure.error.status == Some(429)
-                        && failure.error.retry_after_secs.is_some()
-                        && deadline.is_some_and(|deadline| {
-                            delay >= deadline.saturating_duration_since(attempt_deadline_now!())
-                        })
-                    {
-                        warn_attempt_retry(
-                            &failure,
-                            &trace,
-                            "not_retryable",
-                            "retry_after_exceeds_deadline",
+                        credential_refresh = Some(refreshed.evidence);
+                        attempt_policy::note_refresh_elapsed(
+                            &mut attempts,
+                            retry_clock.elapsed_since(refresh_started),
                         );
-                        return Err((failure.error, attempt_index as u32));
                     }
-                    if retry_wait_spent + delay > RETRY_WALL_BUDGET {
-                        warn_attempt_retry(&failure, &trace, "wall_exhausted", "waiting_budget");
-                        return Err((failure.error, attempt_index as u32));
-                    }
+                }
 
-                    warn_attempt_retry(&failure, &trace, "retrying", "transient_failure");
-                    delay
+                let switch_to_https = match &decision {
+                    AttemptDecision::Resend {
+                        switch_to_https, ..
+                    }
+                    | AttemptDecision::EndStep {
+                        switch_to_https, ..
+                    } => *switch_to_https,
+                    AttemptDecision::RefreshAndResend => unreachable!("refresh was resolved above"),
                 };
-
-                let wait_started = retry_clock.mark();
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
-                    _ = tx.closed() => return Ok((Vec::new(), 0)),
-                    // A shutdown during the wait seals the run Interrupted; no attempt is in
-                    // flight, so go quiet exactly as when the seal refuses the next attempt.
-                    _ = step_seal.tripped() => {
-                        tx.closed().await;
-                        return Ok((Vec::new(), 0));
+                // Switching precedes even a deadline-vetoed end, so the next step uses HTTPS.
+                if switch_to_https {
+                    let switched = websocket
+                        .expect("the policy requires a switchable session")
+                        .try_switch_to_https();
+                    #[cfg(test)]
+                    if switched {
+                        attempt_test_hooks::record(attempt_test_hooks::Event::SwitchToHttps);
                     }
-                    _ = retry_clock.sleep(delay) => {}
+                    #[cfg(not(test))]
+                    let _ = switched;
                 }
-                retry_wait_spent += retry_clock.elapsed_since(wait_started);
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
-                    result = tx.send(NormalizedEvent::Display(DisplayEvent::DisplayReset)) => {
-                        if result.is_err() {
-                            return Ok((Vec::new(), 0));
+                match decision {
+                    AttemptDecision::EndStep {
+                        reason,
+                        retries_used,
+                        note_unrecovered_rejection,
+                        ..
+                    } => {
+                        if note_unrecovered_rejection {
+                            auth_recovery
+                                .as_ref()
+                                .expect("the policy requires a refresher to report a rejection")
+                                .recovery
+                                .refresher
+                                .note_unrecovered_rejection(failure.error.status.unwrap_or(401));
+                        }
+                        let (decision, warning_reason) = match reason {
+                            EndReason::Authentication => ("not_retryable", "authentication"),
+                            EndReason::AccountChanged => ("not_retryable", "account_changed"),
+                            EndReason::UnchangedCredential => {
+                                ("not_retryable", "unchanged_credential")
+                            }
+                            EndReason::RetryVeto => ("not_retryable", "retry_veto"),
+                            EndReason::AttemptLimit => ("attempts_exhausted", "attempt_limit"),
+                            EndReason::WaitingBudget => ("wall_exhausted", "waiting_budget"),
+                            EndReason::RetryAfterExceedsDeadline => {
+                                ("not_retryable", "retry_after_exceeds_deadline")
+                            }
+                            EndReason::CodexTerminal => ("not_retryable", "codex_terminal"),
+                            EndReason::NoServerRetryTime => {
+                                ("not_retryable", "no_server_retry_time")
+                            }
+                            EndReason::ConnectionAttemptLimit => {
+                                ("attempts_exhausted", "connection_attempt_limit")
+                            }
+                        };
+                        warn_attempt_retry(&failure, &trace, decision, warning_reason);
+                        if reason == EndReason::AccountChanged {
+                            let mut error = account_changed_error
+                                .expect("an account-change end requires the replacement error");
+                            redact_chatgpt_account_error(&mut error, request.family);
+                            return Err((error, retries_used));
+                        }
+                        if reason == EndReason::ConnectionAttemptLimit {
+                            failure.error.class = ErrorClass::Transient;
+                            failure.error.provider_code = Some("connection_failed".into());
+                            failure.error.message = format!(
+                                "connection failed after {MAX_ATTEMPTS} failed attempts: {}",
+                                failure.error.message
+                            );
+                        }
+                        return Err((failure.error, retries_used));
+                    }
+                    AttemptDecision::Resend {
+                        delay,
+                        escape_client,
+                        reason,
+                        ..
+                    } => {
+                        use_escape_client = escape_client;
+                        warn_attempt_retry(
+                            &failure,
+                            &trace,
+                            if switch_to_https {
+                                "switching_to_https"
+                            } else {
+                                "retrying"
+                            },
+                            reason,
+                        );
+                        // A rejected-token resend resets the display without entering the sleep
+                        // effect, unlike an ordinary retry whose server-advised delay is zero.
+                        if !recovering {
+                            let wait_started = retry_clock.mark();
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
+                                _ = tx.closed() => return Ok((Vec::new(), 0)),
+                                // No attempt is in flight; the seal owns the terminal record.
+                                _ = step_seal.tripped() => {
+                                    tx.closed().await;
+                                    return Ok((Vec::new(), 0));
+                                }
+                                _ = retry_clock.sleep(delay) => {}
+                            }
+                            attempt_policy::note_waited(
+                                &mut attempts,
+                                retry_clock.elapsed_since(wait_started),
+                            );
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
+                            result = tx.send(NormalizedEvent::Display(DisplayEvent::DisplayReset)) => {
+                                if result.is_err() {
+                                    return Ok((Vec::new(), 0));
+                                }
+                            }
                         }
                     }
+                    AttemptDecision::RefreshAndResend => unreachable!("refresh was resolved above"),
                 }
-                previous_cause = failure.cause;
             }
         }
-        attempt_index += 1;
     }
-
-    unreachable!("the fixed attempt set always returns from success or failure")
 }
 
 /// Whether a failed attempt means the provider rejected the token itself: an Auth-class HTTP
@@ -3662,6 +3613,7 @@ where
 /// upgrade, is not: an HTTPS 403 is an entitlement refusal, and a refused upgrade 403 is sent
 /// again over HTTPS before it is classified. A ChatGPT backend 401 about its own upstream API key
 /// is classified Transient before it gets here, so it does not qualify either.
+#[cfg(test)]
 fn is_rejected_token(error: &ProviderError) -> bool {
     error.class == ErrorClass::Auth && error.status == Some(401)
 }
@@ -3850,24 +3802,17 @@ impl StepSeal<'_> {
     }
 }
 
+#[cfg(test)]
 fn retry_delay(error: &ProviderError, failed_attempt_index: usize) -> Duration {
-    if let Some(seconds) = error.retry_after_secs {
-        let capped_seconds = seconds.max(0.0).min(MAX_RETRY_AFTER_DELAY.as_secs_f64());
-        return Duration::from_secs_f64(capped_seconds);
-    }
+    attempt_policy::generic_delay(error, failed_attempt_index, retry_jitter())
+}
 
-    let doublings = u32::try_from(failed_attempt_index)
-        .unwrap_or(u32::MAX)
-        .min(16);
-    let nominal = BASE_RETRY_DELAY
-        .saturating_mul(1u32 << doublings)
-        .min(MAX_BACKOFF_DELAY);
+fn retry_jitter() -> f64 {
     #[cfg(test)]
     if let Some(factor) = attempt_test_hooks::jitter(false) {
-        return nominal.mul_f64(factor);
+        return factor;
     }
-    let factor = rand::rng().random_range((1.0 - BACKOFF_JITTER)..=(1.0 + BACKOFF_JITTER));
-    nominal.mul_f64(factor)
+    rand::rng().random_range((1.0 - BACKOFF_JITTER)..=(1.0 + BACKOFF_JITTER))
 }
 
 fn warn_attempt_retry(

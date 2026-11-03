@@ -70,7 +70,7 @@ pub(super) fn applies(family: Option<crate::spec::WireFamilyId>) -> bool {
 
 /// The jitter factor both Codex backoffs draw: uniform in `0.9..1.1`
 /// (`async-utils/src/backoff.rs:15`, `codex-client/src/retry.rs:50`).
-fn jitter() -> f64 {
+pub(super) fn jitter() -> f64 {
     #[cfg(test)]
     if let Some(factor) = attempt_test_hooks::jitter(true) {
         return factor;
@@ -226,17 +226,6 @@ impl Default for CodexRetryState {
 }
 
 impl CodexRetryState {
-    /// Decide what follows `failure`. `try_switch_to_https` is asked only when the stream
-    /// retries are spent; it switches the run to HTTPS and answers whether this call made the
-    /// switch, as Codex's `try_switch_fallback_transport` does (`core/src/client.rs:2454-2464`).
-    pub(super) fn decide(
-        &mut self,
-        failure: &CodexFailure<'_>,
-        try_switch_to_https: impl FnOnce() -> bool,
-    ) -> CodexDecision {
-        self.decide_with_jitter(failure, try_switch_to_https, jitter)
-    }
-
     pub(crate) fn decide_with_jitter(
         &mut self,
         failure: &CodexFailure<'_>,
