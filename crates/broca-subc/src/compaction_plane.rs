@@ -166,7 +166,8 @@ impl CompactionPlane for SubcCompactionPlane {
         method: &str,
         params: serde_json::Value,
         deadline_ms: u64,
-    ) -> Result<serde_json::Value, broca_core::compaction_v2::runtime::CallError> {
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
+    {
         use broca_core::compaction_v2::{protocol::wire::Refusal, runtime::CallError};
         self.v2_route
             .call(
@@ -185,11 +186,6 @@ impl CompactionPlane for SubcCompactionPlane {
                     message,
                     ..
                 } => CallError::Refused(Refusal::new(&code, message, detail)),
-                FetchError::Refused { code, detail, .. } => CallError::Refused(Refusal::new(
-                    &code,
-                    "compaction provider refused the call",
-                    detail,
-                )),
                 _ => CallError::Unavailable,
             })
     }

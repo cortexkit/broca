@@ -296,6 +296,9 @@ pub struct EpisodeRenderInput {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RenderHistory {
     pub episodes: Vec<EpisodeRenderInput>,
+    /// Mode-3 episode boundaries use native transcript ordinals, excluding global
+    /// instructions and view insertions. Render-only prefixes must not shift them.
+    pub raw_ordinals: bool,
     /// Number of canonical messages present when the compaction view was applied.
     /// Raw messages with smaller ordinals were produced before that view. Absent
     /// means no compaction view; replacement messages have no ordinal.
@@ -306,6 +309,7 @@ impl From<Vec<EpisodeRenderInput>> for RenderHistory {
     fn from(episodes: Vec<EpisodeRenderInput>) -> Self {
         Self {
             episodes,
+            raw_ordinals: false,
             compaction_prefix_len: None,
         }
     }

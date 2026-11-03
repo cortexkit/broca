@@ -415,6 +415,19 @@ pub struct StorePageRow {
     pub run: Option<crate::RunAttribution>,
 }
 
+/// A bounded neutral-entry page and the exact store boundary it came from.
+/// Native messages are not loaded for this read, so compact tool entries stay compact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionStorePage {
+    pub entries: Vec<crate::compaction_v2::protocol::read::Entry>,
+    pub head: Option<crate::head::HeadProjection>,
+    pub watermark_seq: u64,
+    pub lineage_id: Option<String>,
+    pub anchor: Option<WalByteAnchor>,
+    pub prefix_len: u64,
+    pub has_more: bool,
+}
+
 /// One episode's durable render inputs, with the state of every value separated from the value
 /// itself.
 ///
@@ -754,6 +767,16 @@ pub trait MaterializedStore: Send + Sync {
     /// Cache only the first-run mode proof, never rebuilding legacy message timestamps.
     fn cache_history_mode(&self, _session: &BindIdentity, _mode3: bool) -> Result<(), String> {
         Ok(())
+    }
+
+    /// A neutral page from the same transcript projection as native reads. A
+    /// backend without this projection returns None rather than scanning history.
+    fn read_compaction_page(
+        &self,
+        _session: &BindIdentity,
+        _request: &crate::compaction_v2::protocol::read::ReadRequest,
+    ) -> Result<Option<CompactionStorePage>, String> {
+        Ok(None)
     }
 
     /// Display facts are an opt-in, per-lineage cache. A missing seed requires one lazy
@@ -1855,7 +1878,7 @@ fn read_session_page_from_rows(
         None,
         snapshot.prefix_len,
         false,
-        snapshot.tag_seed,
+        crate::replay::TranscriptSeed::for_page(snapshot, framed_tail),
     )?;
     if tail_state.run_id.is_none() {
         tail_state.run_id.clone_from(&snapshot.last_run_id);
@@ -2105,7 +2128,7 @@ pub fn tool_call_dispatches(
         None,
         0,
         false,
-        crate::tags::TagSeed::default(),
+        crate::replay::TranscriptSeed { tags:crate::tags::TagSeed::default(), mode3:Some(crate::is_mode3_log(framed.iter().map(|frame| &frame.record))) },
     )?;
     Ok(dispatches_of_turns(
         framed,
@@ -2138,7 +2161,7 @@ pub fn replay_transcript(framed: &[FramedRecord]) -> Result<Vec<Message>, crate:
         None,
         0,
         false,
-        crate::tags::TagSeed::default(),
+        crate::replay::TranscriptSeed { tags:crate::tags::TagSeed::default(), mode3:Some(crate::is_mode3_log(framed.iter().map(|frame| &frame.record))) },
     )?
     .prompt)
 }
@@ -2252,7 +2275,7 @@ pub fn effective_context(
                 prefix.prefix.len() as u64
             },
             false,
-            crate::tags::TagSeed::from_prefix(&prefix.prefix),
+            crate::tags::TagSeed::from_prefix(&prefix.prefix).into(),
         )?
         .prompt,
     );
@@ -2379,7 +2402,7 @@ pub(crate) fn merge_prefix_and_tail(
         budget_state,
         if abandoned { 0 } else { seed.prefix_len },
         seed.prefix_len > 0,
-        seed.tag_seed,
+        crate::replay::TranscriptSeed { tags:seed.tag_seed, mode3:seed.admission_checkpoint.head.as_ref().and_then(|head| head.mode3) },
         refusal,
     )?;
     // A view the prefix's leading records applied or replaced: a replacement at the transcript's
@@ -4132,31 +4155,29 @@ mod episode_merge_regression {
     use broca_wal::{RunConfig, RunOrigin, WalRecord};
 
     fn config(model: &str) -> RunConfig {
-        RunConfig {
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("stub", model),
-            tools: Vec::new().into(),
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: serde_json::Value::Null,
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: serde_json::json!({"model": model}),
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            context_management: None,
-        }
+        RunConfig { global_system: None, account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: ModelHandle::new("stub", model),
+        tools: Vec::new().into(),
+        tool_choice: Default::default(),
+        generation: Default::default(),
+        response_format: Default::default(),
+        provider_options: serde_json::Value::Null,
+        cache_tiers: serde_json::Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: serde_json::json!({"model": model}),
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None, }
     }
 
     fn start(run: &str, model: &str, text: &str) -> WalRecord {

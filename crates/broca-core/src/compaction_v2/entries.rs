@@ -1,6 +1,6 @@
 //! Projection of native messages into the compaction protocol's neutral model.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use broca_protocol::content::{
     ContentBlock, EncryptedReasoningFormat, MediaRef, Message, Role as HostRole, ToolOutput,
@@ -20,6 +20,8 @@ use cortexkit_role_compaction::{
 #[derive(Clone, Debug, Default)]
 pub struct EntryFacts {
     pub mid: String,
+    pub ordinal: u64,
+    pub tag_base: Option<u64>,
     pub written_at: u64,
     pub completed_at: Option<u64>,
     pub notice: Option<NoticeOrigin>,
@@ -27,29 +29,55 @@ pub struct EntryFacts {
     pub generated_under: Option<AppliedView>,
 }
 
-/// Delivered text is kept apart from the original tool result. The key is the native call id.
-pub type Deliveries = HashMap<String, Vec<Delivered>>;
+/// Delivered text is kept apart from the original tool result. Identity is the
+/// assistant entry's mid and native part index; call ids can repeat in later turns.
+pub type Deliveries = HashMap<(String, String), Vec<Delivered>>;
+
+pub fn compact(entry: &Entry) -> Entry {
+    let mut entry = entry.clone();
+    entry.parts = entry.parts.iter().map(Part::compact).collect();
+    entry
+}
+
+/// Person input has no notice origin. A non-module tool-result send is placed
+/// by the runner, so its required sender names broca rather than a made-up caller.
+pub fn delivery_sender(
+    principal: Option<&broca_protocol::BindPrincipal>,
+    mode: broca_protocol::DeliveryMode,
+) -> Option<String> {
+    match principal {
+        Some(broca_protocol::BindPrincipal::Reserved { module_id }) => Some(module_id.clone()),
+        _ if mode == broca_protocol::DeliveryMode::ToolResult => Some("broca".into()),
+        _ => None,
+    }
+}
 
 /// Recover attribution from admission records, not the current plan or the run
 /// that happened to carry the send. Records are joined by submission identity.
 pub fn delivered_from_records<'a>(
     records: impl IntoIterator<Item = &'a broca_wal::WalRecord>,
+    mut target: impl FnMut(
+        &broca_protocol::RunId,
+        Option<broca_protocol::StepId>,
+        &broca_protocol::ToolCallId,
+    ) -> Option<(String, String)>,
 ) -> Deliveries {
     use broca_protocol::{BindPrincipal, DeliveryMode};
     use broca_wal::WalRecord;
-    let mut origins: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    let mut origins: HashMap<String, (Option<BindPrincipal>, Option<String>)> = HashMap::new();
     let mut deliveries = Deliveries::new();
+    let mut step = None;
     for record in records {
         match record {
+            WalRecord::RunStarted { .. } => step = None,
+            WalRecord::ModelStepFinished { step_id, .. } => step = Some(*step_id),
             WalRecord::DeliveryOrdered {
                 submission_id,
                 order,
                 sent_by,
             } => {
                 let origin = origins.entry(submission_id.0.clone()).or_default();
-                if let Some(BindPrincipal::Reserved { module_id }) = sent_by {
-                    origin.0 = Some(module_id.clone());
-                }
+                origin.0 = sent_by.clone();
                 origin.1 = order.template.as_ref().map(|template| template.id.clone());
             }
             WalRecord::Queued {
@@ -60,11 +88,7 @@ pub fn delivered_from_records<'a>(
             } => {
                 let origin = origins.entry(submission_id.0.clone()).or_default();
                 if origin.0.is_none() {
-                    if let Some(BindPrincipal::Reserved { module_id }) =
-                        sent_by.as_ref().or(principal.as_ref())
-                    {
-                        origin.0 = Some(module_id.clone());
-                    }
+                    origin.0 = sent_by.clone().or_else(|| principal.clone());
                 }
             }
             WalRecord::SendDelivered {
@@ -72,18 +96,20 @@ pub fn delivered_from_records<'a>(
                 mode: DeliveryMode::ToolResult,
                 tool_call_id: Some(call),
                 appended_text: Some(text),
+                run_id,
                 ..
             } => {
-                let Some((Some(sender), template)) = origins.get(&submission_id.0) else {
+                let Some(identity) = target(run_id, step, call) else {
                     continue;
                 };
+                let (principal, template) =
+                    origins.get(&submission_id.0).cloned().unwrap_or_default();
+                let sender = delivery_sender(principal.as_ref(), DeliveryMode::ToolResult)
+                    .expect("tool-result delivery has a sender");
                 let text = text.strip_prefix("\n\n").unwrap_or(text);
                 let mut delivered = Delivered::new(sender, text);
-                delivered.template = template.clone();
-                deliveries
-                    .entry(call.0.clone())
-                    .or_default()
-                    .push(delivered);
+                delivered.template = template;
+                deliveries.entry(identity).or_default().push(delivered);
             }
             _ => {}
         }
@@ -100,16 +126,27 @@ pub fn project(
     accepts_empty_text: bool,
 ) -> Vec<Entry> {
     assert_eq!(messages.len(), facts.len());
-    let results: HashMap<_, _> = messages
-        .iter()
-        .flat_map(|message| &message.content)
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult(result) => Some((result.tool_call_id.0.as_str(), result)),
-            _ => None,
-        })
-        .collect();
     let mut entries = Vec::with_capacity(messages.len());
+    let mut high = 0;
     for (position, (message, facts)) in messages.iter().zip(facts).enumerate() {
+        assert!(
+            facts.ordinal > 0,
+            "compaction entries have one-based native ordinals"
+        );
+        let mut results: HashMap<&str, VecDeque<_>> = HashMap::new();
+        if let Some(next) = messages
+            .get(position + 1)
+            .filter(|next| next.role == HostRole::Tool)
+        {
+            for block in &next.content {
+                if let ContentBlock::ToolResult(result) = block {
+                    results
+                        .entry(&result.tool_call_id.0)
+                        .or_default()
+                        .push_back(result);
+                }
+            }
+        }
         let role = match message.role {
             HostRole::Assistant | HostRole::Tool => Role::Assistant,
             HostRole::User => Role::User,
@@ -163,7 +200,10 @@ pub fn project(
                         call.input.clone(),
                         ToolStatus::Running,
                     );
-                    if let Some(result) = results.get(call.tool_call_id.0.as_str()) {
+                    if let Some(result) = results
+                        .get_mut(call.tool_call_id.0.as_str())
+                        .and_then(VecDeque::pop_front)
+                    {
                         let (status, output, format, attachments) = tool_output(&result.output);
                         tool.status = status;
                         tool.output_bytes = Some(output.len() as u64);
@@ -172,7 +212,7 @@ pub fn project(
                         tool.attachments = attachments;
                     }
                     tool.delivered = deliveries
-                        .get(call.tool_call_id.0.as_str())
+                        .get(&(facts.mid.clone(), index.to_string()))
                         .cloned()
                         .unwrap_or_default();
                     (
@@ -186,35 +226,39 @@ pub fn project(
                 }
                 ContentBlock::ToolResult(_) => continue,
                 ContentBlock::Media(media) => (PartBody::File(file(media)), Seal::None),
-                ContentBlock::ProviderFallback { raw, .. } => (
-                    PartBody::Opaque(
-                        Opaque::new("anthropic.fallback")
-                            .with_size(raw.as_ref().map_or(0, |raw| raw.len() as u64)),
-                    ),
-                    Seal::None,
-                ),
+                ContentBlock::ProviderFallback { raw, .. } => {
+                    let mut opaque = Opaque::new("anthropic.fallback");
+                    if let Some(raw) = raw {
+                        opaque = opaque.with_size(raw.len() as u64);
+                    }
+                    (PartBody::Opaque(opaque), Seal::None)
+                }
             };
             parts.push(Part::new(index.to_string(), body).with_seal(seal));
         }
-        let final_tools = parts.iter().all(|part| !matches!(&part.body, PartBody::Tool(tool) if tool.status == ToolStatus::Running));
-        let mut entry = Entry::new(
-            position as u64 + 1,
-            &facts.mid,
-            role,
-            facts.written_at,
-            parts,
-        );
+        let final_tools = parts.iter().all(|part| match &part.body {
+            PartBody::Tool(tool) => matches!(tool.status, ToolStatus::Completed | ToolStatus::Error | ToolStatus::Denied),
+            _ => true,
+        });
+        let mut entry = Entry::new(facts.ordinal, &facts.mid, role, facts.written_at, parts);
         if let Some(notice) = &facts.notice {
             entry = entry.with_notice(notice.clone());
         }
         if message.role == HostRole::Assistant && final_tools {
-            entry.completed_at = facts.completed_at;
+            entry.completed_at = crate::message_times::completed_at(message.role, facts.completed_at, final_tools);
         }
         entry.usage = facts.usage;
         entry.generated_under = facts.generated_under.clone();
+        let base = facts.tag_base.unwrap_or(high);
+        tags::assign_tags(base, std::slice::from_mut(&mut entry));
+        high = entry
+            .parts
+            .iter()
+            .filter_map(|part| part.tag)
+            .max()
+            .unwrap_or(base);
         entries.push(entry);
     }
-    tags::assign_tags(0, &mut entries);
     entries
 }
 
@@ -250,9 +294,23 @@ pub(super) fn tool_output(
             OutputFormat::Json,
             vec![],
         ),
-        ToolOutput::Error { message, .. } => (
+        ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+        } => (
             ToolStatus::Error,
-            message.clone(),
+            ToolOutput::error_model_text(
+                message,
+                module.as_deref(),
+                code.as_deref(),
+                detail.as_deref(),
+                *nothing_sent,
+                retry.as_deref(),
+            ),
             OutputFormat::Text,
             vec![],
         ),

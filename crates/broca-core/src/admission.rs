@@ -3111,50 +3111,48 @@ mod tests {
     }
 
     fn config(model: &str) -> RunConfig {
-        RunConfig {
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("stub", model),
-            tools: Arc::new(vec![
-                Tool {
-                    name: "second".into(),
-                    description: "second tool".into(),
-                    input_schema: serde_json::json!({"type": "object", "order": 2}),
-                    module: Some("tools-b".into()),
-                    execution_mode: ExecutionMode::Parallel,
-                    reply: None,
-                },
-                Tool {
-                    name: "first".into(),
-                    description: "first tool".into(),
-                    input_schema: serde_json::json!({"type": "object", "order": 1}),
-                    module: Some("tools-a".into()),
-                    execution_mode: ExecutionMode::Sequential,
-                    reply: None,
-                },
-            ]),
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: serde_json::json!({"opaque": [1, 2, 3]}),
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: serde_json::json!({"wire": "old"}),
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: vec![StopCondition::HasToolCall {
-                name: Some("second".into()),
-            }],
-            context_management: None,
-        }
+        RunConfig { global_system: None, account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: ModelHandle::new("stub", model),
+        tools: Arc::new(vec![
+            Tool {
+                name: "second".into(),
+                description: "second tool".into(),
+                input_schema: serde_json::json!({"type": "object", "order": 2}),
+                module: Some("tools-b".into()),
+                execution_mode: ExecutionMode::Parallel,
+                reply: None,
+            },
+            Tool {
+                name: "first".into(),
+                description: "first tool".into(),
+                input_schema: serde_json::json!({"type": "object", "order": 1}),
+                module: Some("tools-a".into()),
+                execution_mode: ExecutionMode::Sequential,
+                reply: None,
+            },
+        ]),
+        tool_choice: Default::default(),
+        generation: Default::default(),
+        response_format: Default::default(),
+        provider_options: serde_json::json!({"opaque": [1, 2, 3]}),
+        cache_tiers: serde_json::Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: serde_json::json!({"wire": "old"}),
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: vec![StopCondition::HasToolCall {
+            name: Some("second".into()),
+        }],
+        context_management: None, }
     }
 
     #[test]

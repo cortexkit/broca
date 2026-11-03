@@ -970,6 +970,7 @@ pub(crate) fn model_options_indexed(
     // The renderer's episode coordinates are indexes, unlike transcript ordinals. Map only
     // retained raw messages; replacement messages must not inherit episode decorations.
     view.render_episodes = Arc::new(broca_protocol::request::RenderHistory {
+        raw_ordinals: false,
         compaction_prefix_len: Some(applied.thinking_prefix_len),
         episodes: retained_episodes(opts, &view.prompt, tail_start),
     });

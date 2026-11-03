@@ -112,6 +112,17 @@ pub fn carrier<'a>(results: impl IntoIterator<Item = &'a ToolResult>) -> Option<
         .map(|result| &result.tool_call_id)
 }
 
+/// Mode-3 renders delivered text after the result, independently of its native
+/// output kind. Called only for the newly completed batch's first placement.
+pub fn carrier_mode3<'a>(
+    results: impl IntoIterator<Item = &'a ToolResult>,
+) -> Option<&'a ToolCallId> {
+    results
+        .into_iter()
+        .last()
+        .map(|result| &result.tool_call_id)
+}
+
 /// Append `text` to the rendered copy of a tool result. Only text and error outputs carry a
 /// delivery (see [`carrier`]); any other output is left unchanged.
 pub fn append_to_result(result: &mut ToolResult, text: &str) {

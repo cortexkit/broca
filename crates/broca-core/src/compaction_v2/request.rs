@@ -1,0 +1,217 @@
+//! Request-boundary orchestration. Applying views, flushing notices, and the
+//! usable-window check all finish before the caller can make a model request.
+
+use broca_protocol::{MediaRef, Message};
+use cortexkit_role_compaction::{
+    notice::{Conditions, Event},
+    read::Entry,
+    ride::{RideCause, RideRequest},
+    view::{AppliedView, InsertedImage, View},
+};
+
+use super::{
+    conditions::{self, SendContext},
+    render,
+    runtime::{Plane, Runtime, CALL_DEADLINE, COLD_RIDE_DEADLINE},
+    state::{Boundary, Journal, State},
+    views,
+};
+
+pub struct At<'a> {
+    pub step: u64,
+    pub preset: &'a str,
+    pub entries: &'a [Entry],
+    pub stored: &'a [Message],
+    pub conditions: &'a Conditions,
+    pub previous: Option<&'a SendContext>,
+    pub current: &'a SendContext,
+    pub cache_warm: bool,
+    pub chain_reset: bool,
+    pub now: u64,
+    pub next_mid: &'a str,
+}
+
+#[derive(Debug)]
+pub enum Prepared {
+    Ready {
+        prompt: Vec<Message>,
+        applied: Option<AppliedView>,
+        request_tokens: u64,
+    },
+    CompactionUnavailable,
+    ContextCeiling {
+        request_tokens: u64,
+        usable_window: u64,
+    },
+}
+
+/// Called before StepStarted. A resumed, already frozen step cannot adopt a
+/// view accepted after that step began; a ride remains the explicit exception.
+pub async fn apply_boundary(
+    state: &tokio::sync::Mutex<State>,
+    runtime: &Runtime,
+    journal: &dyn Journal,
+    boundary: Boundary<'_>,
+) -> Result<(), String> {
+    let mut state = state.lock().await;
+    if !state.step_is_frozen(boundary.step) {
+        for event in state.apply(journal, boundary).await? {
+            runtime.event(event);
+        }
+    } else {
+        for event in state.recover_marker(journal, boundary).await? {
+            runtime.event(event);
+        }
+    }
+    Ok(())
+}
+
+pub async fn prepare(
+    state: &tokio::sync::Mutex<State>,
+    runtime: &Runtime,
+    journal: &dyn Journal,
+    plane: &dyn Plane,
+    at: At<'_>,
+    mut image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
+    mut estimate: impl FnMut(&[Message]) -> Result<u64, String>,
+) -> Result<Prepared, String> {
+    let mut view = {
+        let mut state = state.lock().await;
+        state.start_step(at.step);
+        state.view_for_step(at.step).cloned()
+    };
+    let mut setup = conditions::setup_request(at.preset, at.conditions, at.now);
+    setup.applied_view = view.as_ref().map(View::applied);
+    setup.newest = views::newest(at.entries);
+    runtime.observe(at.entries);
+    if !runtime.ensure_setup(plane, &setup).await && view.is_none() {
+        return Ok(Prepared::CompactionUnavailable);
+    }
+    let mut prompt = render::prompt(at.stored, at.entries, edits(&view), &mut image)?;
+    let mut tokens = estimate(&prompt)?;
+    let causes = conditions::ride_causes(
+        at.previous,
+        at.current,
+        at.cache_warm,
+        at.chain_reset,
+        tokens,
+        at.conditions,
+    );
+    let usable = conditions::usable_window(at.conditions);
+    let mut rode_over_limit = causes.contains(&RideCause::OverLimit);
+    if !causes.is_empty() {
+        ride(
+            state,
+            runtime,
+            journal,
+            plane,
+            &mut setup,
+            &at,
+            (causes, tokens),
+        )
+        .await?;
+        view = state.lock().await.view_for_step(at.step).cloned();
+        prompt = render::prompt(at.stored, at.entries, edits(&view), &mut image)?;
+        tokens = estimate(&prompt)?;
+    }
+    // A cache-rewrite ride can return a larger view. It still owes an over-limit
+    // opportunity before refusal, just as a request initially over the limit does.
+    if tokens > usable && !rode_over_limit {
+        ride(
+            state,
+            runtime,
+            journal,
+            plane,
+            &mut setup,
+            &at,
+            (vec![RideCause::OverLimit], tokens),
+        )
+        .await?;
+        rode_over_limit = true;
+        view = state.lock().await.view_for_step(at.step).cloned();
+        prompt = render::prompt(at.stored, at.entries, edits(&view), &mut image)?;
+        tokens = estimate(&prompt)?;
+    }
+    runtime
+        .flush(
+            plane,
+            &setup,
+            at.conditions,
+            view.as_ref().map(View::applied).as_ref(),
+        )
+        .await;
+    if tokens > usable {
+        debug_assert!(rode_over_limit);
+        return Ok(Prepared::ContextCeiling {
+            request_tokens: tokens,
+            usable_window: usable,
+        });
+    }
+    Ok(Prepared::Ready {
+        prompt,
+        applied: view.as_ref().map(View::applied),
+        request_tokens: tokens,
+    })
+}
+
+fn edits(view: &Option<View>) -> &[cortexkit_role_compaction::view::Edit] {
+    view.as_ref().map_or(&[], |view| view.edits.as_slice())
+}
+
+async fn ride(
+    state: &tokio::sync::Mutex<State>,
+    runtime: &Runtime,
+    journal: &dyn Journal,
+    plane: &dyn Plane,
+    setup: &mut cortexkit_role_compaction::setup::SetupRequest,
+    at: &At<'_>,
+    opportunity: (Vec<RideCause>, u64),
+) -> Result<(), String> {
+    let (causes, tokens) = opportunity;
+    let deadline = if causes.contains(&RideCause::CacheExpired) {
+        COLD_RIDE_DEADLINE
+    } else {
+        CALL_DEADLINE
+    };
+    let mut request = RideRequest::new(causes, deadline.as_millis() as u64, at.conditions.clone());
+    request.applied_view = state.lock().await.view_for_step(at.step).map(View::applied);
+    if request.causes.contains(&RideCause::OverLimit) {
+        request.request_tokens = Some(tokens);
+    }
+    let Some(received) = runtime.ride(plane, setup, &request).await else {
+        return Ok(());
+    };
+    let version = received.view().version;
+    let mut state = state.lock().await;
+    match state
+        .accept(
+            journal,
+            at.entries,
+            received,
+            &at.conditions.rules,
+            at.conditions.accepts_images == Some(true),
+        )
+        .await?
+    {
+        Ok(()) => {
+            for event in state
+                .apply(
+                    journal,
+                    Boundary {
+                        step: at.step,
+                        entries: at.entries,
+                        rules: &at.conditions.rules,
+                        accepts_images: at.conditions.accepts_images == Some(true),
+                        next_mid: at.next_mid,
+                    },
+                )
+                .await?
+            {
+                runtime.event(event);
+            }
+            setup.applied_view = state.applied_identity();
+        }
+        Err(refusal) => runtime.event(Event::ViewRefused { version, refusal }),
+    }
+    Ok(())
+}

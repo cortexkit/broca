@@ -3,12 +3,24 @@
 
 pub use cortexkit_role_compaction as protocol;
 
+pub mod authority;
 pub mod conditions;
 pub mod entries;
+pub mod fold;
+pub mod journal;
+pub mod metadata;
+pub mod projection;
+pub mod received;
 pub mod render;
+pub mod request;
+pub mod session;
 pub mod runtime;
 pub mod state;
+pub mod storage;
+pub mod systems;
 pub mod views;
 
+#[cfg(test)]
+mod metadata_tests;
 #[cfg(test)]
 mod tests;

@@ -653,39 +653,37 @@ async fn drained_run_renders_identical_bytes_to_idle_send() {
 }
 
 fn recovered_stop_config() -> broca_wal::RunConfig {
-    broca_wal::RunConfig {
-        account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        model: ModelHandle::new("anthropic", "claude-opus-4-8"),
-        tools: vec![Tool {
-            name: "edit".into(),
-            description: "edit a file".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-            module: Some("aft".into()),
-            execution_mode: ExecutionMode::Parallel,
-            reply: None,
-        }]
-        .into(),
-        tool_choice: ToolChoice::Auto,
-        generation: GenerationConfig::default(),
-        response_format: Default::default(),
-        provider_options: serde_json::Value::Null,
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: 1,
-        frozen_render_config: serde_json::json!({"render_config": "stateless"}),
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: vec![StopCondition::StepCount { n: 1 }],
-        context_management: None,
-    }
+    broca_wal::RunConfig { global_system: None, account_limit_pause: false,
+    turn_directives_v1: None,
+    render_tags: false,
+    computed_tags: None,
+    model: ModelHandle::new("anthropic", "claude-opus-4-8"),
+    tools: vec![Tool {
+        name: "edit".into(),
+        description: "edit a file".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        module: Some("aft".into()),
+        execution_mode: ExecutionMode::Parallel,
+        reply: None,
+    }]
+    .into(),
+    tool_choice: ToolChoice::Auto,
+    generation: GenerationConfig::default(),
+    response_format: Default::default(),
+    provider_options: serde_json::Value::Null,
+    cache_tiers: serde_json::Value::Null,
+    context_epoch: 0,
+    renderer_version: 1,
+    frozen_render_config: serde_json::json!({"render_config": "stateless"}),
+    auth_selection: None,
+    tools_were_omitted: false,
+    budget: None,
+    context_limit: None,
+    work_class: None,
+    variant: None,
+    service_tier: None,
+    stop_when: vec![StopCondition::StepCount { n: 1 }],
+    context_management: None, }
 }
 
 #[tokio::test]

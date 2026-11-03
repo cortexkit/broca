@@ -168,6 +168,9 @@ pub struct PreparedProjection {
     /// `message_json`: the store keeps them in their own column, since a message's own
     /// serialized form never carries them.
     pub message_tags_json: Vec<Option<String>>,
+    pub message_compaction_json: Vec<Option<String>>,
+    pub message_compaction_compact_json: Vec<Option<String>>,
+    pub compaction_delivery_updates: Vec<crate::compaction_v2::metadata::DeliveryUpdate>,
     pub final_run_json: Vec<(i64, String)>,
     pub completed_steps: i64,
     pub usage_json: String,
@@ -217,7 +220,15 @@ pub fn plan_projection(
             "recovery projection requires the complete post-cut WAL",
         ));
     }
+    let compaction_cache_repair = snapshot.seed.as_ref().is_some_and(|seed| {
+        let head = seed.admission_checkpoint.head.as_ref();
+        matches!(seed.admission_checkpoint.lineage_retention, Some(crate::LineageRetention::Forever))
+            && head.and_then(|head| head.mode3) == Some(true)
+            && crate::compaction_v2::projection::configured(true, seed.admission_checkpoint.ownership.as_ref())
+            && head.and_then(|head| head.compaction_metadata.as_ref()).is_none_or(|metadata| !metadata.is_current())
+    });
     let reset = !snapshot.attribution_complete
+        || compaction_cache_repair
         || !snapshot.required_recovery_cuts.is_empty()
         || !incoming_cuts.is_empty()
         || snapshot
@@ -385,6 +396,8 @@ pub fn plan_projection(
     let timing_head = incremental_seed
         .as_ref()
         .and_then(|seed| seed.admission_checkpoint.head.as_ref());
+    let compaction_metadata = timing_head.and_then(|head| head.compaction_metadata.clone());
+    let compaction_newest = timing_head.and_then(|head| head.compaction_newest.clone());
     let mode3 = match timing_head.and_then(|head| head.mode3) {
         Some(mode3) => mode3,
         None if incremental_seed
@@ -439,7 +452,7 @@ pub fn plan_projection(
     };
     let (
         truncate_prefix_to,
-        new_messages,
+        mut new_messages,
         message_runs,
         completed_steps,
         usage,
@@ -566,6 +579,31 @@ pub fn plan_projection(
     if let Some(truncate_to) = truncate_prefix_to {
         next_ord = truncate_to;
     }
+    let lineage_id = incoming_lineage_id.clone().or_else(|| expected_lineage_id.clone());
+    let mut message_compaction_json = Vec::new();
+    let mut message_compaction_compact_json = Vec::new();
+    let mut compaction_delivery_updates = Vec::new();
+    let mut compaction_tags = None;
+    if crate::compaction_v2::projection::configured(mode3, admission_checkpoint.ownership.as_ref()) {
+        let continuation = match compaction_metadata {
+            Some(metadata) => metadata,
+            None if next_ord == 0 => Default::default(),
+            None => return Err(ProjectionPlanError::InconsistentSnapshot("mode-3 compaction projection requires a complete WAL rebuild")),
+        };
+        let from = if reset || next_ord == 0 { 0 } else { watermark };
+        let compaction_frames: Vec<_> = records.iter().filter(|frame| frame.seq > from && frame.seq <= new_watermark).cloned().collect();
+        let projected = crate::compaction_v2::projection::prepare(continuation, compaction_newest, &compaction_frames, u64::try_from(next_ord)?, &mut new_messages, |position| crate::message_mid(true, lineage_id.as_deref(), position)).map_err(|error| {
+            tracing::warn!(target:"store", %error, "mode-3 compaction projection failed");
+            ProjectionPlanError::InconsistentSnapshot("mode-3 compaction entry projection failed")
+        })?;
+        let head = admission_checkpoint.head.get_or_insert_with(Default::default);
+        head.compaction_metadata = Some(projected.continuation);
+        head.compaction_newest = projected.newest;
+        message_compaction_json = projected.full;
+        message_compaction_compact_json = projected.compact;
+        compaction_delivery_updates = projected.deliveries;
+        compaction_tags = Some(projected.tags);
+    }
     let message_json = new_messages
         .iter()
         .map(serde_json::to_string)
@@ -581,6 +619,7 @@ pub fn plan_projection(
         .iter()
         .map(|message| message.part_tags().map(serde_json::to_string).transpose())
         .collect::<Result<Vec<_>, _>>()?;
+    let message_tags_json = compaction_tags.unwrap_or(message_tags_json);
     // Keep RunFinished beyond the last materialized record: older resume code reads it
     // from the WAL to know the run ended. Replay those unmaterialized records too, persisting
     // their final-message metadata without moving the watermark past that terminal record.
@@ -614,7 +653,7 @@ pub fn plan_projection(
         // metadata is persisted here; the ordinary body projection still validates new firings.
         false,
         // Only run metadata of this replay is persisted, never its messages or their tags.
-        crate::tags::TagSeed::default(),
+        crate::replay::TranscriptSeed { tags:crate::tags::TagSeed::default(), mode3:final_seed.admission_checkpoint.head.as_ref().and_then(|head| head.mode3) },
         final_seed.refusal,
     )?;
     let final_run_json = final_state
@@ -663,7 +702,6 @@ pub fn plan_projection(
     if let Some(cursor) = control_head {
         u64_to_i64(cursor.wal_seq)?;
     }
-    let lineage_id = incoming_lineage_id.or_else(|| expected_lineage_id.clone());
 
     Ok(ProjectionPlan::Write(Box::new(PreparedProjection {
         refusal_json: serde_json::to_string(&crate::refusal_fallback::RefusalReplayCheckpoint {
@@ -682,6 +720,9 @@ pub fn plan_projection(
         new_watermark,
         next_ord,
         truncate_prefix_to,
+        message_compaction_json,
+        message_compaction_compact_json,
+        compaction_delivery_updates,
         message_json,
         message_run_json,
         message_tags_json,

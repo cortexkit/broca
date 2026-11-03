@@ -112,7 +112,7 @@ pub trait CompactionPlane: Send + Sync {
         _method: &str,
         _params: serde_json::Value,
         _deadline_ms: u64,
-    ) -> Result<serde_json::Value, crate::compaction_v2::runtime::CallError> {
+    ) -> Result<Box<serde_json::value::RawValue>, crate::compaction_v2::runtime::CallError> {
         Err(crate::compaction_v2::runtime::CallError::Unavailable)
     }
 

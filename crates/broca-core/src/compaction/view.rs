@@ -826,6 +826,7 @@ pub(crate) fn render(
     // Episode decorations follow the transcript messages the view keeps; the provider's own
     // messages never inherit one.
     view.render_episodes = std::sync::Arc::new(broca_protocol::request::RenderHistory {
+        raw_ordinals: false,
         compaction_prefix_len: state
             .applied
             .as_ref()

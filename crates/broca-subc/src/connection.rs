@@ -5607,10 +5607,12 @@ mod tests {
                 harness: caller_harness.to_string(),
                 session: "s1".to_string(),
             };
-            let compaction = role(broca_core::compaction_provider::ROLE);
-            let outbound = to_subc_bind(&identity, &target, Some(&compaction));
-            assert_eq!(outbound.harness, caller_harness);
-            assert_eq!(outbound.session, identity.session);
+            for version in ["v1", "v2"] {
+                let compaction = BTreeMap::from([(broca_core::compaction_provider::ROLE.to_owned(), version.to_owned())]);
+                let outbound = to_subc_bind(&identity, &target, Some(&compaction));
+                assert_eq!(outbound.harness, caller_harness);
+                assert_eq!(outbound.session, identity.session);
+            }
 
             for other in [
                 Some(role("step-transform-provider")),

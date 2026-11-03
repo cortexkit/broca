@@ -1,7 +1,7 @@
 //! Apply the shared render plan to native blocks. Neutral parts are descriptors,
 //! not replacements for provider-owned signatures, continuation state or item ids.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use broca_protocol::{
     ContentBlock, MediaRef, Message, Role as HostRole, ToolOutput, ToolOutputPart,
@@ -12,7 +12,7 @@ use cortexkit_compaction_view::{
     tags,
 };
 use cortexkit_role_compaction::{
-    part::{PartBody, ToolPart},
+    part::{PartBody, ToolPart, ToolStatus},
     read::{Entry, Role},
     view::{Edit, EditOp, InsertAt, InsertedImage},
 };
@@ -29,28 +29,13 @@ pub fn prompt(
     if stored.len() != entries.len() {
         return Err("compaction transcript projection does not match native message count".into());
     }
-    let plan = render::plan(entries, edits)
+    let edits = render::edits_for_transcript(entries, edits);
+    let plan = render::plan(entries, &edits)
         .map_err(|error| format!("compaction render plan refused: {error:?}"))?;
     let positions: HashMap<_, _> = entries
         .iter()
         .enumerate()
         .map(|(index, entry)| (entry.mid.as_str(), index))
-        .collect();
-    let result_positions: HashMap<_, _> = stored
-        .iter()
-        .enumerate()
-        .flat_map(|(position, message)| {
-            message
-                .content
-                .iter()
-                .enumerate()
-                .filter_map(move |(index, block)| match block {
-                    ContentBlock::ToolResult(result) => {
-                        Some((result.tool_call_id.0.as_str(), (position, index)))
-                    }
-                    _ => None,
-                })
-        })
         .collect();
     let mut result_blocks: HashMap<usize, Vec<(usize, ContentBlock)>> = HashMap::new();
     let mut output = Vec::new();
@@ -86,15 +71,44 @@ pub fn prompt(
                 for inserted in &images {
                     content.push(ContentBlock::Media(image(inserted)?));
                 }
-                output.push((position, 0, order, Message::new(role, content)));
+                let mut message = Message::new(role, content);
+                message.turn_system = message.role == HostRole::System;
+                output.push((position, 0, order, message));
             }
             PlanItem::Entry { mid, parts, .. } => {
                 let position = positions[mid.as_str()];
                 let original = &stored[position];
                 let entry = &entries[position];
+                let mut result_queues: HashMap<&str, VecDeque<usize>> = HashMap::new();
+                if let Some(next) = stored
+                    .get(position + 1)
+                    .filter(|next| next.role == HostRole::Tool)
+                {
+                    for (index, block) in next.content.iter().enumerate() {
+                        if let ContentBlock::ToolResult(result) = block {
+                            result_queues
+                                .entry(&result.tool_call_id.0)
+                                .or_default()
+                                .push_back(index);
+                        }
+                    }
+                }
+                let mut result_positions = HashMap::new();
+                for (index, block) in original.content.iter().enumerate() {
+                    if let ContentBlock::ToolCall(call) = block {
+                        if let Some(result) = result_queues
+                            .get_mut(call.tool_call_id.0.as_str())
+                            .and_then(VecDeque::pop_front)
+                        {
+                            result_positions.insert(index, result);
+                        }
+                    }
+                }
                 let mut message = original.clone();
+                message.ordinal = Some(entry.ordinal - 1);
                 message.tags = Default::default();
                 message.content.clear();
+                let mut kept_indices = Vec::new();
                 let mut kept = HashMap::new();
                 for part in parts {
                     let index = part
@@ -138,15 +152,17 @@ pub fn prompt(
                                     call.input[key] = field.value.clone();
                                 }
                             }
-                            if let Some(&(result_position, result_index)) =
-                                result_positions.get(call.tool_call_id.0.as_str())
-                            {
+                            if let Some(&result_index) = result_positions.get(&index) {
+                                let result_position = position + 1;
                                 let ContentBlock::ToolResult(mut result) =
                                     stored[result_position].content[result_index].clone()
                                 else {
                                     unreachable!()
                                 };
                                 render_result(&mut result.output, tool, &part);
+                                if matches!(tool.status, ToolStatus::Error | ToolStatus::Denied) {
+                                    result.is_error = true;
+                                }
                                 result_blocks
                                     .entry(result_position)
                                     .or_default()
@@ -172,14 +188,17 @@ pub fn prompt(
                 }
                 for (index, source) in original.content.iter().enumerate() {
                     if let Some(block) = kept.remove(&index) {
+                        kept_indices.push(index);
                         message.content.push(block);
                     } else if matches!(source, ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } if text.is_empty())
                     {
                         // Empty native separators have no neutral part or number, but can
                         // carry provider state between the kept signed blocks of a row.
+                        kept_indices.push(index);
                         message.content.push(source.clone());
                     }
                 }
+                message.cache_prefix_blocks = remap_cache_prefix(original, &kept_indices);
                 output.push((position, 1, order, message));
             }
         }
@@ -187,7 +206,12 @@ pub fn prompt(
     for (position, mut blocks) in result_blocks {
         blocks.sort_by_key(|(index, _)| *index);
         let mut message = stored[position].clone();
+        message.ordinal = Some(entries[position].ordinal - 1);
         message.tags = Default::default();
+        message.cache_prefix_blocks = remap_cache_prefix(
+            &stored[position],
+            &blocks.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        );
         message.content = blocks.into_iter().map(|(_, block)| block).collect();
         output.push((position, 1, 0, message));
     }
@@ -196,6 +220,36 @@ pub fn prompt(
         .into_iter()
         .map(|(_, _, _, message)| message)
         .collect())
+}
+
+/// Keep episode boundaries in native coordinates while translating explicit
+/// marker indices to the rendered prompt. Inserted messages inherit neither.
+pub fn options(opts: &broca_protocol::CallOptions, prompt: Vec<Message>) -> broca_protocol::CallOptions {
+    let positions: HashMap<_, _> = prompt.iter().enumerate().filter_map(|(index, message)| message.ordinal.map(|ordinal| (ordinal, index))).collect();
+    let markers = opts.declared_markers.iter().filter_map(|marker| {
+        let ordinal = opts.prompt.get(marker.message_index)?.ordinal?;
+        Some(broca_protocol::request::DeclaredMessageMarker { message_index:*positions.get(&ordinal)?, rank:marker.rank })
+    }).collect();
+    let mut view = opts.with_prompt(prompt);
+    let mut history = opts.render_episodes.as_ref().clone();
+    history.raw_ordinals = true;
+    view.render_episodes = std::sync::Arc::new(history);
+    view.declared_markers = markers;
+    view
+}
+
+fn remap_cache_prefix(original: &Message, kept: &[usize]) -> Option<u32> {
+    // The marker belongs to its original ending block. Removing that block
+    // removes the marker instead of moving it onto another kept part.
+    original.cache_prefix_blocks.map(|count| {
+        let end = (count as usize).min(original.content.len());
+        if end == 0 {
+            return 0;
+        }
+        kept.iter()
+            .position(|index| *index == end - 1)
+            .map_or(0, |position| position as u32 + 1)
+    })
 }
 
 fn numbered_reply(original: &str, neutral: &str, tag: u64, assistant: bool) -> String {
@@ -214,7 +268,9 @@ fn numbered_reply(original: &str, neutral: &str, tag: u64, assistant: bool) -> S
 }
 
 fn render_result(output: &mut ToolOutput, tool: &ToolPart, plan: &PlanPart) {
-    let mut text = tool.output.clone().unwrap_or_default();
+    // The native request may carry frozen model-only guidance. Keep it unless
+    // the view explicitly replaces output; validation still used the stored part.
+    let mut text = super::entries::tool_output(output).1;
     let mut attachment_ids: Option<Vec<String>> = None;
     let mut delivery_indexes: Option<Vec<u64>> = None;
     for field in &plan.replace {
@@ -257,8 +313,7 @@ fn render_result(output: &mut ToolOutput, tool: &ToolPart, plan: &PlanPart) {
     }
     match output {
         ToolOutput::Text { text: target } => *target = text,
-        ToolOutput::Error { message, .. } => *message = text,
-        ToolOutput::Denied { reason } => *reason = text,
+        ToolOutput::Error { .. } | ToolOutput::Denied { .. } => *output = ToolOutput::error(text),
         ToolOutput::Json { .. } => *output = ToolOutput::Text { text },
         ToolOutput::Parts { parts } => {
             let mut kept = vec![ToolOutputPart::Text { text }];

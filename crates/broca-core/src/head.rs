@@ -89,6 +89,11 @@ pub struct HeadProjection {
     senders: Vec<cortexkit_role_llm_runner::delivery_order::PlanSender>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     queued_times: std::collections::BTreeMap<String, u64>,
+    /// Mode-3 placement and provenance continuation; native message bytes stay in rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_metadata: Option<crate::compaction_v2::metadata::Fold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_newest: Option<crate::compaction_v2::protocol::read::Cursor>,
 }
 
 impl Default for HeadProjection {
@@ -103,6 +108,8 @@ impl Default for HeadProjection {
             ownership: crate::SessionOwnershipV1::default().for_owner_access(),
             senders: vec![],
             queued_times: Default::default(),
+            compaction_metadata: None,
+            compaction_newest: None,
         }
     }
 }

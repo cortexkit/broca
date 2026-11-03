@@ -6836,6 +6836,21 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             RefreshOrder::New => {}
         }
+        let next_plan =
+            serde_json::from_str(manifest.plan.as_json_text()).expect("admitted plan is JSON");
+        if broca_fetch_plan::session_change::check_compaction_item(
+            self.session_change.current_manifest.as_deref(),
+            &next_plan,
+        )
+        .is_err()
+        {
+            return SessionRefreshOutcome::Refused(SessionChangeError::InvalidParams {
+                field: "plan.compaction_item".into(),
+                message:
+                    "the session's compaction provider, preset and params are fixed for its life"
+                        .into(),
+            });
+        }
         if let Some(surface) = broca_fetch_plan::session_change::unsupported_surface(
             self.session_change.current_manifest.as_deref(),
             &manifest,
@@ -12692,31 +12707,29 @@ mod tests {
     }
 
     pub(super) fn min_config() -> broca_wal::RunConfig {
-        broca_wal::RunConfig {
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: broca_protocol::request::ModelHandle::new("fake", "fake"),
-            tools: vec![].into(),
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: serde_json::Value::Null,
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: serde_json::Value::Null,
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            context_management: None,
-        }
+        broca_wal::RunConfig { global_system: None, account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: broca_protocol::request::ModelHandle::new("fake", "fake"),
+        tools: vec![].into(),
+        tool_choice: Default::default(),
+        generation: Default::default(),
+        response_format: Default::default(),
+        provider_options: serde_json::Value::Null,
+        cache_tiers: serde_json::Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: serde_json::Value::Null,
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None, }
     }
 
     /// An actor-test opener with a real lease and a selectable WAL backend.

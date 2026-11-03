@@ -2565,9 +2565,10 @@ impl WalRecord {
         let base = if matches!(
             self,
             Self::RunStarted {
-                compaction_plan_version: Some(_),
+                compaction_plan_version,
+                config,
                 ..
-            }
+            } if compaction_plan_version.is_some() || config.global_system.is_some()
         ) {
             with_feature(base, crate::framing::COMPACTION_V2_FEATURE)
         } else {
@@ -4011,6 +4012,12 @@ pub struct RunConfig {
     /// run. Must-understand when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computed_tags: Option<ComputedTagRules>,
+    /// Frozen global instructions for a mode-3 run without a fetch plan. Planned
+    /// runs use their own manifest.system_text; legacy runs keep their input layout.
+    /// The compaction-v2 feature protects rollback execution while older readers
+    /// ignore this optional member and continue to read only transcript input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_system: Option<Arc<Vec<Message>>>,
 }
 
 /// A run's frozen computed tag rules (`runner-tags/v2`).
@@ -4485,38 +4492,36 @@ mod schema_tests {
 
     #[test]
     fn run_config_tools_arc_keeps_existing_wal_bytes() {
-        let config = RunConfig {
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("p", "m"),
-            tools: Arc::new(vec![Tool {
-                name: "edit".into(),
-                description: "edit a file".into(),
-                input_schema: json!({"type": "object"}),
-                module: Some("aft".into()),
-                execution_mode: broca_protocol::request::ExecutionMode::Parallel,
-                reply: None,
-            }]),
-            tool_choice: ToolChoice::Auto,
-            generation: GenerationConfig::default(),
-            response_format: ResponseFormat::default(),
-            provider_options: Value::Null,
-            cache_tiers: Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: Value::Null,
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            context_management: None,
-        };
+        let config = RunConfig { global_system: None, account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: ModelHandle::new("p", "m"),
+        tools: Arc::new(vec![Tool {
+            name: "edit".into(),
+            description: "edit a file".into(),
+            input_schema: json!({"type": "object"}),
+            module: Some("aft".into()),
+            execution_mode: broca_protocol::request::ExecutionMode::Parallel,
+            reply: None,
+        }]),
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig::default(),
+        response_format: ResponseFormat::default(),
+        provider_options: Value::Null,
+        cache_tiers: Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: Value::Null,
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None, };
 
         let bytes = serde_json::to_vec(&config).expect("serialize config with shared tools");
         assert_eq!(
@@ -4599,31 +4604,29 @@ mod schema_tests {
     }
 
     fn min_config() -> Box<RunConfig> {
-        Box::new(RunConfig {
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("p", "m"),
-            tools: vec![].into(),
-            tool_choice: ToolChoice::Auto,
-            generation: GenerationConfig::default(),
-            response_format: ResponseFormat::default(),
-            provider_options: Value::Null,
-            cache_tiers: Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: Value::Null,
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            context_management: None,
-        })
+        Box::new(RunConfig { global_system: None, account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: ModelHandle::new("p", "m"),
+        tools: vec![].into(),
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig::default(),
+        response_format: ResponseFormat::default(),
+        provider_options: Value::Null,
+        cache_tiers: Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: Value::Null,
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None, })
     }
 
     #[test]

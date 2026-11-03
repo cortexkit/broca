@@ -11,6 +11,7 @@ use cortexkit_role_compaction::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SendContext {
     pub model: ModelRef,
+    /// None means the host has no account identity to compare, not an account switch.
     pub account: Option<String>,
     pub surface: String,
 }
@@ -42,7 +43,12 @@ pub fn ride_causes(
         if previous.model.service_tier != current.model.service_tier {
             causes.push(RideCause::TierChange);
         }
-        if previous.account != current.account {
+        if previous
+            .account
+            .as_ref()
+            .zip(current.account.as_ref())
+            .is_some_and(|(previous, current)| previous != current)
+        {
             causes.push(RideCause::AccountChange);
         }
         if previous.surface != current.surface {

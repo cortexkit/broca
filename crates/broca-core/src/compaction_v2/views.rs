@@ -58,13 +58,7 @@ pub fn newest(entries: &[Entry]) -> Option<Cursor> {
 
 /// Size-bounded protocol paging. The caller loads only the selected transcript
 /// projection page; cuts never affect which native entries remain readable.
-pub fn page(entries: &[Entry], request: &ReadRequest, applied: Option<&View>) -> ReadPage {
-    let head = {
-        let mut head = Head::new();
-        head.newest = newest(entries);
-        head.applied_view = applied.map(View::applied);
-        head
-    };
+pub fn page(entries: &[Entry], request: &ReadRequest, head: Head) -> ReadPage {
     let matching = entries.iter().filter(|entry| match &request.select {
         Select::After { after_ordinal, .. } => entry.ordinal > after_ordinal.unwrap_or(0),
         Select::Mids { mids } => mids.contains(&entry.mid),
@@ -84,7 +78,7 @@ pub fn page(entries: &[Entry], request: &ReadRequest, applied: Option<&View>) ->
     for entry in matching {
         let mut entry = entry.clone();
         if request.detail == Detail::Compact {
-            entry.parts = entry.parts.iter().map(|part| part.compact()).collect();
+            entry = super::entries::compact(&entry);
         }
         let size = serde_json::to_vec(&entry)
             .expect("entry is serializable")

@@ -9,20 +9,30 @@ use cortexkit_role_compaction::{
     view::{AppliedView, EditOp, View, ViewRefusal},
 };
 
-use super::views;
+use super::{received::ReceivedView, views};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct State {
-    latest: Option<View>,
-    applied: Option<View>,
+    latest: Option<ReceivedView>,
+    applied: Option<ReceivedView>,
     marked_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) marker: Option<Box<broca_wal::WalRecord>>,
+    #[serde(default)]
+    step_id: Option<u64>,
+    #[serde(default)]
+    step_view: Option<View>,
 }
 
 /// Each method returns only after its record has crossed the durability barrier.
 /// The WAL adapter owns record encoding, including deduplication of stored edits.
 #[async_trait]
 pub trait Journal: Send + Sync {
-    async fn accepted(&self, previous: Option<&View>, view: &View) -> Result<(), String>;
+    async fn accepted(
+        &self,
+        previous: Option<&ReceivedView>,
+        view: &ReceivedView,
+    ) -> Result<(), String>;
     async fn applied(&self, step: u64, view: &View) -> Result<(), String>;
     async fn marker(
         &self,
@@ -35,22 +45,68 @@ pub trait Journal: Send + Sync {
 
 impl State {
     pub fn latest(&self) -> Option<&View> {
+        self.latest.as_ref().map(ReceivedView::view)
+    }
+    pub fn latest_received(&self) -> Option<&ReceivedView> {
         self.latest.as_ref()
     }
     pub fn applied(&self) -> Option<&View> {
+        self.applied.as_ref().map(ReceivedView::view)
+    }
+    pub fn applied_received(&self) -> Option<&ReceivedView> {
         self.applied.as_ref()
     }
     pub fn applied_identity(&self) -> Option<AppliedView> {
-        self.applied.as_ref().map(View::applied)
+        self.applied().map(View::applied)
     }
 
     pub fn restore_marker(&mut self, version: u64) {
         self.marked_version = Some(version);
     }
+    pub fn marker_version(&self) -> Option<u64> {
+        self.marked_version
+    }
+
+    pub fn begin_run(&mut self) {
+        self.step_id = None;
+        self.step_view = None;
+    }
+
+    /// Repeated StepStarted records on resume keep the original request's view.
+    /// Accepting a newer view during a step does not change this frozen snapshot.
+    pub fn start_step(&mut self, step: u64) {
+        if self.step_id != Some(step) {
+            self.step_id = Some(step);
+            self.step_view = self.applied().cloned();
+        }
+    }
+
+    pub fn step_is_frozen(&self, step: u64) -> bool {
+        self.step_id == Some(step)
+    }
+
+    pub fn view_for_step(&self, step: u64) -> Option<&View> {
+        if self.step_id == Some(step) {
+            self.step_view.as_ref()
+        } else {
+            self.applied()
+        }
+    }
+
+    pub fn restore_applied_at(&mut self, step: u64, identity: &AppliedView) -> Result<(), String> {
+        self.restore_applied(identity)?;
+        if self.step_id == Some(step) {
+            self.step_view = self.applied().cloned();
+        }
+        Ok(())
+    }
 
     /// Restore full views only after rebuilding their stored edit references.
     /// Never trust a checksum carried in a record without recomputing it.
-    pub fn restore_accepted(&mut self, view: View) -> Result<(), String> {
+    pub fn restore_accepted(&mut self, received: impl Into<ReceivedView>) -> Result<(), String> {
+        let received = received.into();
+        received.check_size()?;
+        let view = received.view();
         if !view.verify() {
             return Err(format!(
                 "compaction view version {} checksum mismatch",
@@ -60,26 +116,25 @@ impl State {
         if self
             .latest
             .as_ref()
-            .is_some_and(|previous| previous.version >= view.version)
+            .is_some_and(|previous| previous.view().version >= view.version)
         {
             return Err(format!(
                 "compaction view version {} is not newer than the stored view",
                 view.version
             ));
         }
-        self.latest = Some(view);
+        self.latest = Some(received);
         Ok(())
     }
 
     pub fn restore_applied(&mut self, identity: &AppliedView) -> Result<(), String> {
         let view = self
-            .latest
-            .as_ref()
-            .filter(|view| view.applied() == *identity)
+            .latest_received()
+            .filter(|view| view.view().applied() == *identity)
             .or_else(|| {
                 self.applied
                     .as_ref()
-                    .filter(|view| view.applied() == *identity)
+                    .filter(|view| view.view().applied() == *identity)
             })
             .ok_or_else(|| {
                 format!(
@@ -95,15 +150,18 @@ impl State {
         &mut self,
         journal: &dyn Journal,
         entries: &[Entry],
-        view: View,
+        received: impl Into<ReceivedView>,
         rules: &ProviderRules,
         accepts_images: bool,
     ) -> Result<Result<(), ViewRefusal>, String> {
-        if let Err(refusal) = views::check(entries, self.latest(), &view, rules, accepts_images) {
+        let received = received.into();
+        received.check_size()?;
+        let view = received.view();
+        if let Err(refusal) = views::check(entries, self.latest(), view, rules, accepts_images) {
             return Ok(Err(refusal));
         }
-        journal.accepted(self.latest(), &view).await?;
-        self.latest = Some(view);
+        journal.accepted(self.latest.as_ref(), &received).await?;
+        self.latest = Some(received);
         Ok(Ok(()))
     }
 
@@ -115,13 +173,14 @@ impl State {
         journal: &dyn Journal,
         boundary: Boundary<'_>,
     ) -> Result<Vec<Event>, String> {
-        let Some(view) = self.latest.as_ref() else {
+        let Some(received) = self.latest.as_ref() else {
             return Ok(vec![]);
         };
+        let view = received.view();
         let already_applied = self
             .applied
             .as_ref()
-            .is_some_and(|applied| applied.applied() == view.applied());
+            .is_some_and(|applied| applied.view().applied() == view.applied());
         if !already_applied {
             if let Err(refusal) = views::check_boundary(
                 boundary.entries,
@@ -135,8 +194,28 @@ impl State {
                 }]);
             }
             journal.applied(boundary.step, view).await?;
-            self.applied = Some(view.clone());
+            self.applied = Some(received.clone());
+            if self.step_id == Some(boundary.step) {
+                self.step_view = self.applied().cloned();
+            }
         }
+        self.recover_marker(journal, boundary).await
+    }
+
+    /// A crash can leave the applied record durable but not its marker. Finish
+    /// that marker for the frozen step without adopting a newer accepted view.
+    pub async fn recover_marker(
+        &mut self,
+        journal: &dyn Journal,
+        boundary: Boundary<'_>,
+    ) -> Result<Vec<Event>, String> {
+        let Some(view) = self.view_for_step(boundary.step) else {
+            return Ok(vec![]);
+        };
+        if self.marked_version == Some(view.version) {
+            return Ok(vec![]);
+        }
+        let view = view.clone();
         let mut events = Vec::new();
         if let Some(through) = view
             .edits
@@ -165,7 +244,7 @@ impl State {
                 |entry| entry.ordinal,
             );
             journal
-                .marker(view, first_kept_mid, first_kept_ordinal, checkpoint)
+                .marker(&view, first_kept_mid, first_kept_ordinal, checkpoint)
                 .await?;
             self.marked_version = Some(view.version);
             events.push(Event::MarkerWritten {

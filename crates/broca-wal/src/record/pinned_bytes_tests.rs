@@ -16,6 +16,7 @@ use super::*;
 fn run_started_before_compaction_plan_version_keeps_exact_bytes() {
     let pinned = r#"{"type":"run_started","run_id":"r","session":{"project_root":"/project","harness":"runner","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"}}"#;
     let record: WalRecord = serde_json::from_str(pinned).unwrap();
+    assert!(matches!(&record, WalRecord::RunStarted { config, .. } if config.global_system.is_none()));
     assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
     assert!(record.required_features().is_empty());
     let frame = crate::framing::encode(7, 3, &record).unwrap();
