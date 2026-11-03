@@ -324,6 +324,13 @@ message and field; it does not invent a `preset_missing` difference for a nonexi
 
 ### Health counters and per-request diagnostics
 
+`health.check.metrics.refusal_schedule_unrecorded_replays` counts prior reconstructions
+that require complete WAL replay because the legacy materialized prefix has no recorded
+refusal state at its watermark. It is a process-lifetime counter, present at zero. A
+recorded empty schedule needs no extra WAL read and does not increment it. Projection
+writes record the state so later resumes can use the prefix again; an older writer's
+replaced row or stale watermark-bound checkpoint requires replay rather than guessing.
+
 `health.check.metrics.tool_routes` is an in-memory census of the shared tool-provider route
 cache. It reports `open_session_actors`, `cached_routes`, `cached_routes_per_provider`,
 `oldest_route_idle_secs` (null for an empty cache), `routes_for_closed_sessions` (normally zero),

@@ -927,6 +927,7 @@ async fn every_full_replay_fallback_releases_before_the_first_request() {
     let checkpoint =
         crate::AdmissionCheckpointV1::from_frames(&full.frames()[..watermark]).unwrap();
     let prefix = crate::StorePrefix {
+        refusal: Some(Default::default()),
         lineage_id: Some(fixture_lineage_id().to_string()),
         prefix: projected.prompt,
         completed_steps: projected.completed_steps,
@@ -1030,6 +1031,7 @@ async fn admission_only_prefix_and_tail_views_keep_episode_metadata() {
     let projected = crate::replay(&records[..watermark]).unwrap();
     let store = Arc::new(BrokenStore {
         prefix: crate::StorePrefix {
+            refusal: Some(Default::default()),
             lineage_id: Some(fixture_lineage_id().to_string()),
             prefix: projected.prompt,
             completed_steps: projected.completed_steps,

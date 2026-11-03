@@ -50,9 +50,19 @@ fn legacy_summary_and_projection_sql_match_pre_recovery_master() {
     println!("LEGACY_SQL_CAPTURE={actual}");
     let pinned: serde_json::Value =
         serde_json::from_str(include_str!("../tests/fixtures/legacy-master-sql.json")).unwrap();
+    // The refusal checkpoint adds one column to the existing seed read. Keep the
+    // independent capture unchanged so every other query and the read count stay pinned.
+    let mut expected = pinned["statements"].clone();
+    let seed_query = expected["projection"][5].as_str().unwrap();
+    assert!(seed_query.contains("admission_checkpoint_json FROM meta"));
+    expected["projection"][5] = serde_json::Value::String(seed_query.replacen(
+        "admission_checkpoint_json FROM meta",
+        "admission_checkpoint_json, refusal_replay_json FROM meta",
+        1,
+    ));
     assert_eq!(
-        actual, pinned["statements"],
-        "legacy SQL must equal the independently measured pre-recovery master queries"
+        actual, expected,
+        "legacy SQL must keep the measured master queries except for the refusal seed column"
     );
     drop(store);
     std::fs::remove_dir_all(root).unwrap();

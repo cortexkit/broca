@@ -2223,6 +2223,9 @@ async fn handle_control_request(
             metrics["account_limit_pause_declined"] = broca_core::account_limit_pause_declined();
             metrics["account_limit_hold_cap_unknown"] =
                 serde_json::json!(crate::account_routing::account_limit_hold_cap_unknown());
+            metrics["refusal_schedule_unrecorded_replays"] = serde_json::json!(
+                broca_core::refusal_fallback::refusal_schedule_unrecorded_replays()
+            );
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
                 // status Ok. Fusiform reachability is deliberately absent because health never

@@ -298,6 +298,7 @@ async fn materialized_import_prefix_merges_with_a_following_episode_tail() {
     let mut prefix_messages = imported;
     broca_protocol::content::stamp_ordinals(&mut prefix_messages);
     let prefix = StorePrefix {
+        refusal: Some(Default::default()),
         lineage_id: None,
         prefix: prefix_messages,
         completed_steps: 0,
@@ -513,6 +514,7 @@ fn interrupted_import_merge_matches_full_replay_at_every_watermark() {
         let projected = replay(&records[..watermark]).expect("prefix replay");
         let stored = projected.prompt;
         let prefix = StorePrefix {
+            refusal: Some(Default::default()),
             lineage_id: None,
             prefix: stored,
             completed_steps: projected.completed_steps,

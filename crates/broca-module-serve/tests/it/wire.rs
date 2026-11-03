@@ -2250,6 +2250,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         "account_limit_stale_resets",
         "account_limit_pause_declined",
         "account_limit_hold_cap_unknown",
+        "refusal_schedule_unrecorded_replays",
         "stall_watchdog",
         // Retained sessions whose expiry could not be confirmed because their log is unreadable
         // and the index is not provably current, so deletion keeps them. Present at zero.
@@ -2358,6 +2359,11 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         serde_json::json!({
             "disabled":0, "no_accepted_response":0, "cache_expires_first":0, "beyond_cap":0
         })
+    );
+    assert_eq!(
+        metrics["refusal_schedule_unrecorded_replays"],
+        serde_json::json!(0),
+        "the isolated healthy daemon has not reconstructed an old refusal seed"
     );
     // This in-process adapter has no daemon bootstrap or watchdog file. The real
     // binary enables the witness during boot; a library-only connection says so.

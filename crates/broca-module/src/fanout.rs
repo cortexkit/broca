@@ -1955,6 +1955,7 @@ mod tests {
         final_step_finish_reason: Option<FinishReason>,
     ) -> broca_core::ProjectionSeed {
         broca_core::ProjectionSeed {
+            refusal: Default::default(),
             open_episode_span: None,
             open_episode: None,
             earlier_episodes: Vec::new(),

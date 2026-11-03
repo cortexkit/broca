@@ -530,7 +530,11 @@ impl ProjectionPlan {
     }
 }
 
+#[cfg(test)]
+mod refusal_materialized_tests;
+
 struct PreparedProjection {
+    refusal_json: String,
     expected_epoch: i64,
     recovery_epoch: Option<i64>,
     head_json: String,
@@ -1397,6 +1401,9 @@ impl SqliteStore {
             // value is a projection that advanced without recomputing it, so its metadata reads
             // as absent and the session replays from the WAL.
             ("episode_metadata_seq", "INTEGER"),
+            // NULL is an older writer's unknown state; a JSON object records even an empty
+            // schedule. No default or constraints: adding this column never rewrites rows.
+            ("refusal_replay_json", "TEXT"),
         ] {
             if !columns.contains(column) {
                 conn.execute(
@@ -1855,6 +1862,7 @@ impl SqliteStore {
                 },
                 NeutralPlan::Write(prepared) => {
                     ProjectionPlan::Write(Box::new(PreparedProjection {
+                        refusal_json: prepared.refusal_json,
                         expected_epoch,
                         recovery_epoch,
                         message_times: prepared.message_times,
@@ -2148,8 +2156,8 @@ impl SqliteStore {
             ],
         )?;
         tx.execute(
-            "UPDATE meta SET deferred_calls_json=?2, run_attribution_version=?3 WHERE session=?1",
-            rusqlite::params![key, prepared.deferred_calls_json, RUN_ATTRIBUTION_VERSION],
+            "UPDATE meta SET deferred_calls_json=?2, run_attribution_version=?3, refusal_replay_json=?4 WHERE session=?1",
+            rusqlite::params![key, prepared.deferred_calls_json, RUN_ATTRIBUTION_VERSION, prepared.refusal_json],
         )?;
         tx.execute(
             "UPDATE meta SET episode_spans_complete=1, open_episode_span=?2, episode_spans_seq=?3, \
@@ -2364,7 +2372,7 @@ impl MaterializedStore for SqliteStore {
         let meta = tx
             .query_row(
                 "SELECT watermark_seq, context_epoch, completed_steps, usage_json, \
-                  retries_used, last_step_usage_json, last_step_finish_reason_json, lineage_id \
+                  retries_used, last_step_usage_json, last_step_finish_reason_json, lineage_id, refusal_replay_json \
                   FROM meta WHERE session=?1",
                 [&key],
                 |r| {
@@ -2377,6 +2385,7 @@ impl MaterializedStore for SqliteStore {
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, Option<String>>(6)?,
                         r.get::<_, Option<String>>(7)?,
+                        r.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -2400,7 +2409,10 @@ impl MaterializedStore for SqliteStore {
                 last_step_usage_json,
                 last_step_finish_reason_json,
                 lineage_id,
+                refusal_json,
             )) => StorePrefix {
+                refusal: decode_refusal_replay(refusal_json.as_deref(), watermark_seq)
+                    .map_err(|e| e.to_string())?,
                 lineage_id,
                 prefix,
                 completed_steps,
@@ -3464,7 +3476,7 @@ fn projection_seed_from_complete_tx(
         .query_row(
              "SELECT completed_steps, usage_json, COALESCE(retries_used, 0), last_run_id, wal_anchor_file_id, \
               wal_anchor_seq, wal_anchor_byte_end, last_step_usage_json, \
-              last_step_finish_reason_json, admission_checkpoint_json \
+              last_step_finish_reason_json, admission_checkpoint_json, refusal_replay_json \
               FROM meta WHERE session=?1",
             [key],
             |row| {
@@ -3482,6 +3494,7 @@ fn projection_seed_from_complete_tx(
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             },
         )
@@ -3496,10 +3509,17 @@ fn projection_seed_from_complete_tx(
         last_step_usage_json,
         last_step_finish_reason_json,
         admission_checkpoint_json,
+        refusal_json,
     )) = meta
     else {
         return Ok((prefix_len == 0).then(ProjectionSeed::empty));
     };
+    let refusal = decode_refusal_replay(refusal_json.as_deref(), watermark_seq)?;
+    if watermark_seq > 0 && refusal.is_none() {
+        // An older projection never recorded refusal state. Rebuild it from the complete
+        // WAL once rather than writing a tail's empty state over an unknown prefix.
+        return Ok(None);
+    }
     let Some(admission_checkpoint) = admission_checkpoint_json
         .as_deref()
         .and_then(decode_admission_checkpoint)
@@ -3558,6 +3578,7 @@ fn projection_seed_from_complete_tx(
         })
         .unwrap_or_default();
     Ok(Some(ProjectionSeed {
+        refusal: refusal.unwrap_or_default(),
         open_episode_span,
         open_episode,
         earlier_episodes,
@@ -3772,6 +3793,7 @@ fn read_held_prefix(
             None => newest_origin_from_tx(&tx, key)?,
         }
     };
+    let refusal = refusal_replay_from_tx(&tx, key)?;
     let tag_seed = tag_seed_from_tx(&tx, key)?;
     let episodes_json = episode_projection_json(&tx, key)?;
     tx.commit()?;
@@ -3787,6 +3809,7 @@ fn read_held_prefix(
         broca_core::select_held_episodes(&json, rows.iter().filter_map(|message| message.ordinal))
     });
     Ok(broca_core::HeldPrefix {
+        refusal,
         lineage_id,
         watermark_seq,
         prefix_len,
@@ -3807,6 +3830,37 @@ fn read_held_prefix(
         tag_seed,
         episodes,
     })
+}
+
+fn refusal_replay_from_tx(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> Result<Option<broca_core::refusal_fallback::RefusalReplayState>, StoreError> {
+    let meta: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT watermark_seq, refusal_replay_json FROM meta WHERE session=?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match meta {
+        Some((at_seq, encoded)) => {
+            decode_refusal_replay(encoded.as_deref(), at_seq as u64).map_err(StoreError::Json)
+        }
+        None => Ok(None),
+    }
+}
+
+fn decode_refusal_replay(
+    encoded: Option<&str>,
+    watermark_seq: u64,
+) -> Result<Option<broca_core::refusal_fallback::RefusalReplayState>, serde_json::Error> {
+    let checkpoint = encoded
+        .map(serde_json::from_str::<broca_core::refusal_fallback::RefusalReplayCheckpoint>)
+        .transpose()?;
+    Ok(checkpoint
+        .filter(|checkpoint| checkpoint.at_seq == watermark_seq)
+        .map(|checkpoint| checkpoint.state))
 }
 
 /// The origin of the newest materialized message that has one, read back row by row.

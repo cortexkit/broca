@@ -33,6 +33,34 @@ pub enum StepRoute {
     Fallback,
 }
 
+/// Refusal state at a materialized WAL boundary. The outer store value is optional:
+/// absent metadata means an older writer did not record it, not an empty schedule.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefusalReplayState {
+    pub schedule: Option<RefusalFallbackSchedule>,
+    pub refused_steps: std::collections::BTreeSet<broca_protocol::StepId>,
+}
+
+/// Bind legacy refusal metadata to its projection watermark. An older writer may
+/// advance the other columns without clearing a column it does not know about.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefusalReplayCheckpoint {
+    pub at_seq: u64,
+    pub state: RefusalReplayState,
+}
+
+static UNRECORDED_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Prior reconstructions that required complete WAL replay because a legacy prefix
+/// did not record refusal state. Recorded empty schedules do not increment this counter.
+pub fn refusal_schedule_unrecorded_replays() -> u64 {
+    UNRECORDED_REPLAYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn note_unrecorded_replay() {
+    UNRECORDED_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// How a committed step ended, as the schedule needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommittedStep {
