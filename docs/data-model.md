@@ -1146,3 +1146,27 @@ are refused before fetch/WAL admission. The frozen sender must remain Basal;
 Basal still cannot read or affect sessions whose first sender is not Basal.
 Usage-export labels are optional `agent_id` and `agent_run_id`, with ordinary
 bytes and `fact_id` unchanged.
+
+## Mode-3 message creation times
+
+A log is mode-3 exactly when its first `RunStarted` has `compaction_plan_version`.
+Later runs do not change the log's classification. `broca_core::is_mode3_log` owns
+that rule; the small head projection caches it as `mode3`, with `None` meaning
+unknown rather than legacy.
+
+For mode-3 logs the transcript projector stores creation times in the existing
+`message.written_at_ms` column. Approval closures use `ApprovalRecorded.closed_at_ms`;
+a `BudgetFired` message uses its run's last earlier timed record. An entry without
+its own time takes the nearest earlier entry's time, or 0 when there is none. No
+future entry is consulted. The projector's incremental head state keeps both the
+last timed record and the previous entry's time, so tail-only appends compute new
+rows without replaying the prefix. The column and that state commit with the same
+projection watermark. Reads consume the stored column; appending cannot change a
+creation time already stored.
+
+Legacy logs retain their existing fold and stored values, including absent times.
+Learning an older cache's missing log-mode proof updates only its head/checkpoint
+metadata, never its message rows. Mode-3 reads use the same fixed fold for a WAL
+suffix not yet represented by the column. An assistant entry's completion stamp
+is its step-end creation stamp, but is exposed only after every tool part is final,
+including pending approvals and provider-held calls.

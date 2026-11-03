@@ -27,6 +27,7 @@ pub mod delivery_order;
 pub mod display_facts;
 pub mod durability_counters;
 pub mod head;
+pub use head::{is_mode3_log, mode3_log_from_wal};
 pub mod hooks;
 pub mod import;
 pub mod input_budget;

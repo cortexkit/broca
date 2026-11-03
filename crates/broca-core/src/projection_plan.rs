@@ -382,24 +382,61 @@ pub fn plan_projection(
         .and_then(crate::projection::ControlProjectionState::from_projection_seed)
         .map(|state| state.placement().clone())
         .unwrap_or_default();
-    let times = crate::message_times::written_times_with_queued(
-        records
-            .iter()
-            .filter(|frame| {
-                frame.seq <= new_watermark
-                    && incremental_seed
-                        .as_ref()
-                        .is_none_or(|seed| seed.prefix_len == 0 || frame.seq > seed.watermark_seq)
-            })
-            .map(|frame| &frame.record),
-        time_placement,
-        incremental_seed
+    let timing_head = incremental_seed
+        .as_ref()
+        .and_then(|seed| seed.admission_checkpoint.head.as_ref());
+    let mode3 = match timing_head.and_then(|head| head.mode3) {
+        Some(mode3) => mode3,
+        None if incremental_seed
             .as_ref()
-            .and_then(|seed| seed.admission_checkpoint.head.as_ref())
-            .map(|head| head.queued_times().clone())
-            .unwrap_or_default(),
-    )
-    .map_err(|_| ProjectionPlanError::InconsistentSnapshot("message time placement failed"))?;
+            .is_none_or(|seed| seed.prefix_len == 0)
+            || records.first().is_some_and(|frame| frame.seq == 1) =>
+        {
+            crate::is_mode3_log(records.iter().map(|frame| &frame.record))
+        }
+        None => {
+            return Err(ProjectionPlanError::InconsistentSnapshot(
+                "first-run history mode is not known",
+            ))
+        }
+    };
+    let time_records: Vec<_> = records
+        .iter()
+        .filter(|frame| {
+            frame.seq <= new_watermark
+                && incremental_seed
+                    .as_ref()
+                    .is_none_or(|seed| seed.prefix_len == 0 || frame.seq > seed.watermark_seq)
+        })
+        .map(|frame| &frame.record)
+        .collect();
+    let queued_times = timing_head
+        .map(|head| head.queued_times().clone())
+        .unwrap_or_default();
+    let (times, mode3_times) = if mode3 {
+        let folded = crate::message_times::mode3_written_times(
+            time_records,
+            time_placement,
+            queued_times,
+            timing_head
+                .and_then(|head| head.mode3_times.clone())
+                .unwrap_or_default(),
+        )
+        .map_err(|_| ProjectionPlanError::InconsistentSnapshot("message time placement failed"))?;
+        (folded.times, Some(folded.seed))
+    } else {
+        (
+            crate::message_times::written_times_with_queued(
+                time_records,
+                time_placement,
+                queued_times,
+            )
+            .map_err(|_| {
+                ProjectionPlanError::InconsistentSnapshot("message time placement failed")
+            })?,
+            None,
+        )
+    };
     let (
         truncate_prefix_to,
         new_messages,
@@ -410,7 +447,7 @@ pub fn plan_projection(
         last_step_finish_reason,
         retries_used,
         last_run_id,
-        admission_checkpoint,
+        mut admission_checkpoint,
         episode_spans,
         open_episode_span,
         episode_metadata,
@@ -509,6 +546,12 @@ pub fn plan_projection(
         ));
     }
 
+    if let Some(seed) = mode3_times {
+        if let Some(head) = &mut admission_checkpoint.head {
+            head.mode3 = Some(true);
+            head.mode3_times = Some(seed);
+        }
+    }
     // Every record up to the new watermark that this batch carries: the seeded tail and the
     // full-replay prefix both lie inside it, and a record at or below the old watermark repeats
     // a title the store already folded, so including one cannot make the answer older.

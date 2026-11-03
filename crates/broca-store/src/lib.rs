@@ -30,6 +30,8 @@ use broca_wal::{
 };
 use rusqlite::{config::DbConfig, Connection, OptionalExtension};
 
+mod history_mode;
+
 const STORE_SCHEMA_VERSION: i64 = 1;
 
 mod busy;
@@ -2265,6 +2267,10 @@ impl SqliteStore {
 }
 
 impl MaterializedStore for SqliteStore {
+    fn cache_history_mode(&self, session: &BindIdentity, mode3: bool) -> Result<(), String> {
+        crate::history_mode::cache(&mut self.conn.lock().unwrap(), &Self::key(session), mode3)
+    }
+
     fn read_display_facts_cache(
         &self,
         session: &BindIdentity,
@@ -7019,3 +7025,6 @@ mod windows_acl_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod message_time_tests;
