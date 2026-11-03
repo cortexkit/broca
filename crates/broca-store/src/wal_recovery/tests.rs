@@ -330,10 +330,21 @@ fn sqlite_fault_shard(shard: usize) {
     clear_authorizer(&baseline.store);
     baseline.assert_rebuilt();
     let trace = trace.lock().unwrap().clone();
-    let invalidation_commit = trace
+    // Recovery first commits the served-history rewrite fence (readers refuse with
+    // `history_rewriting` until recovery finishes), and only then the store invalidation. The
+    // invalidation commit is the first commit after a write to anything but that fence table.
+    let invalidation_start = trace
         .iter()
-        .position(|s| s.starts_with("Transaction") && !s.contains("Begin"))
+        .position(|s| {
+            (s.starts_with("Insert") || s.starts_with("Update") || s.starts_with("Delete"))
+                && !s.contains("served_history")
+        })
         .unwrap();
+    let invalidation_commit = invalidation_start
+        + trace[invalidation_start..]
+            .iter()
+            .position(|s| s.starts_with("Transaction") && !s.contains("Begin"))
+            .unwrap();
     assert!(trace.iter().any(|s| s.contains("retained_head")));
     assert!(trace.iter().any(|s| s.contains("compaction_view_receipt")));
     let mut checked = 0;
