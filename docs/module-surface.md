@@ -5,22 +5,6 @@ model, and coordinator invariants.
 
 ## Session inspection CLI
 
-`broca-session --scope <owner>/<ref>/<epoch>` carries a scope owned by a module configured
-as reserved in subc, on every broca route, including reads and the dedicated subscription
-used by `run`.
-`compose-plan` uses the same scope for tool catalog fetches. The scope reference is
-an owner's opaque reference, not a Git ref. As with [broca-run](broca-run.md#carry-an-owners-scope),
-the owner privately supplies a 32-byte bind proof as 64 hex characters on stdin
-(optional newline, then EOF); an inherited proof pipe can be connected to stdin.
-Never put the proof in argv, an environment variable or a log. The daemon must advertise
-`scopes/v1` and `scope-bind-proof/v1`; unsupported daemons are refused rather than
-silently falling back to unscoped routing. The owner must list the unsupervised CLI's
-Direct principal (`{"kind":"direct"}`) as a carrier for `broca` (or `--module-id`)
-and any tool providers used by `compose-plan`.
-Tool presets come from the plan's tool items, so there is no `--preset` flag.
-Scope identity is sent only in `route.open`, never in operation request bodies.
-Without `--scope`, the client does not read stdin and routing is unchanged.
-
 `broca-session trajectory <id> [--transcript] [--out FILE]` exports JSONL directly
 from the recorded WAL, without a daemon connection. Without `--out`, JSONL goes
 to stdout. Output files are created owner-only and must not already exist. It uses

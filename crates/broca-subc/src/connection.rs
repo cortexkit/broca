@@ -157,7 +157,7 @@ impl RejectedMessage {
         decode_error_body(body)
     }
 
-    pub(crate) fn structured(code: String, message: String) -> Self {
+    fn structured(code: String, message: String) -> Self {
         let text = format!("{code} — {message}");
         Self {
             code: Some(code),

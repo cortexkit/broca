@@ -72,7 +72,6 @@ mod seal_line_is_filterable_e2e;
 mod send_delivery;
 mod send_tool_reply_real_daemon;
 mod session_client;
-mod session_scope;
 mod single_turn_module_e2e;
 mod state_root_isolation;
 mod state_root_lock;

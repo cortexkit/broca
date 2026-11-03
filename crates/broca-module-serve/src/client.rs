@@ -42,7 +42,6 @@ pub struct SessionClient {
     cmd_route: RouteHandle,
     module_id: String,
     session: BindIdentity,
-    scope: Option<subc_protocol::scope::ScopeSelector>,
 }
 
 /// Arguments for one `session.send` request.
@@ -182,18 +181,6 @@ impl SessionClient {
         session: BindIdentity,
         timeout: std::time::Duration,
     ) -> Result<Self, ConnError> {
-        Self::bind_with_scope_and_timeout(conn, module_id, session, None, timeout).await
-    }
-
-    /// Like [`bind_with_timeout`](Self::bind_with_timeout), carrying the same private Direct
-    /// scope selector on the command route and every dedicated subscription route.
-    pub async fn bind_with_scope_and_timeout(
-        conn: SubcConnection,
-        module_id: &str,
-        session: BindIdentity,
-        scope: Option<subc_protocol::scope::ScopeSelector>,
-        timeout: std::time::Duration,
-    ) -> Result<Self, ConnError> {
         session
             .validate_keyable()
             .map_err(|message| ConnError::Rejected(message.into()))?;
@@ -206,7 +193,10 @@ impl SessionClient {
             max_interval: ROUTE_OPEN_RETRY_INTERVAL,
         };
         let cmd_route = loop {
-            match open_management_route(&conn, module_id, &session, scope.as_ref(), retry()).await {
+            match conn
+                .route_open_management_within(module_id, &session, retry())
+                .await
+            {
                 Ok(ch) => break ch,
                 Err(e) => {
                     if std::time::Instant::now() >= deadline {
@@ -221,7 +211,6 @@ impl SessionClient {
             cmd_route,
             module_id: module_id.to_string(),
             session,
-            scope,
         })
     }
 
@@ -408,14 +397,10 @@ impl SessionClient {
         };
         let body = request_body("session.subscribe", &params)?;
         // A dedicated management route for the stream (same session, own channel).
-        let sub_route = open_management_route(
-            &self.conn,
-            &self.module_id,
-            &self.session,
-            self.scope.as_ref(),
-            RouteOpenRetry::default_patience(),
-        )
-        .await?;
+        let sub_route = self
+            .conn
+            .route_open_management(&self.module_id, &self.session)
+            .await?;
         self.conn.subscribe(&sub_route, body).await
     }
 
@@ -455,29 +440,6 @@ impl SessionClient {
     ) -> Result<Vec<u8>, ConnError> {
         let body = request_body(method, params)?;
         self.conn.route_request_raw(&self.cmd_route, body).await
-    }
-}
-
-async fn open_management_route(
-    conn: &SubcConnection,
-    module_id: &str,
-    session: &BindIdentity,
-    scope: Option<&subc_protocol::scope::ScopeSelector>,
-    retry: RouteOpenRetry,
-) -> Result<RouteHandle, ConnError> {
-    match scope {
-        Some(scope) => {
-            broca_subc::carrier_scope::verify_direct_carrier_scope(conn, scope)
-                .await
-                .map_err(|error| ConnError::Rejected(error.into()))?;
-            conn.route_open_management_scoped_within(module_id, session, scope.clone(), retry)
-                .await
-                .map_err(broca_subc::carrier_scope::private_route_error)
-        }
-        None => {
-            conn.route_open_management_within(module_id, session, retry)
-                .await
-        }
     }
 }
 

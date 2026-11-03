@@ -32,7 +32,7 @@ use broca_subc::{SubcConnection, SubcToolPlane};
 use clap::Parser;
 use tokio::sync::mpsc;
 
-use broca_subc::carrier_scope;
+mod carrier_scope;
 
 #[derive(Parser, Debug)]
 #[command(

@@ -40,8 +40,6 @@ const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 
 #[path = "scope_real_daemon_e2e/compaction_routes.rs"]
 mod compaction_routes;
-#[path = "scope_real_daemon_e2e/session_cli.rs"]
-mod session_cli;
 
 #[derive(Default)]
 struct AcceptanceCatalog {
