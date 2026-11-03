@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 base64 = "=0.22.1"
-subc-protocol = "=0.34.1"
+subc-protocol = "=0.34.3"
 subc-transport = "=0.15.0"
 libc = "0.2"
 serde_json = { version = "1", features = ["raw_value"] }
