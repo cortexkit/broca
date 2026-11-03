@@ -3480,7 +3480,9 @@ async fn first_send_after_import_can_introduce_its_harness_system_prompt() {
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        vec!["imported question", "new harness rules", "next question"]
+        // An imported session is a mode-3 log: the run's system prompt is not a transcript
+        // entry, so it renders ahead of the imported history.
+        vec!["new harness rules", "imported question", "next question"]
     );
 
     let _ = std::fs::remove_dir_all(dir);
