@@ -6037,38 +6037,30 @@ mod tests {
     }
 
     #[test]
-    fn compaction_v2_writer_open_refuses_before_repair_and_reads_still_work() {
-        let path = tmp("mode3-read-only");
+    fn compaction_v2_logs_open_for_writing_on_this_build_and_repair_their_torn_tail() {
+        // This build runs mode-3 sessions, so a `compaction-v2/v1` log is an ordinary writable
+        // log: the writer repairs its torn tail and appends. (A reader-only build, with
+        // `RUNS_COMPACTION_V2` false, refuses this open instead.)
+        assert!(crate::framing::RUNS_COMPACTION_V2);
+        let path = tmp("mode3-writable");
         let _ = std::fs::remove_file(&path);
         let record = run_started(1);
         let mut bytes =
             crate::framing::encode_with_requires(1, 1, &[crate::COMPACTION_V2_FEATURE], &record)
                 .unwrap();
-        // A writer normally repairs a torn tail at open. A reader-only session must not even
-        // perform that repair, much less append recovery records or start a run.
         bytes.extend_from_slice(&[0, 1, 2]);
         std::fs::write(&path, &bytes).unwrap();
+        let range = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 1, None, None).unwrap();
+        range.check_run_compatible().unwrap();
+        let wal = FileWal::open(&path).expect("a mode-3 log opens for writing on this build");
+        drop(wal);
         let frames = replay_file(&path, DEFAULT_MAX_READ_BYTES).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].record, record);
-        let range = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 1, None, None).unwrap();
         assert!(
-            matches!(range.records(), WalRangeRecords::Complete(records) if records.is_empty())
+            std::fs::read(&path).unwrap().len() < bytes.len(),
+            "the writer repaired the torn tail"
         );
-        assert!(
-            matches!(range.check_run_compatible(), Err(WalError::NewerWriter { missing, .. }) if missing == ["compaction-v2/v1"])
-        );
-        match FileWal::open(&path) {
-            Err(error @ WalError::NewerWriter { .. }) => {
-                assert!(error.to_string().contains("compaction-v2/v1"));
-                assert!(error.to_string().contains("needs a newer build to run"));
-                assert!(
-                    matches!(error, WalError::NewerWriter { missing, .. } if missing == ["compaction-v2/v1"])
-                );
-            }
-            _ => panic!("mode-3 writer open must refuse"),
-        }
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let _ = std::fs::remove_file(&path);
     }
 

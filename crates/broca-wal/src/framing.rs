@@ -272,8 +272,13 @@ pub const ACCOUNT_LIMIT_PAUSE_FEATURE: &str = "account-limit-pause/v1";
 /// Mode-3 accepted views, applied-view selections, cut markers and the frozen plan version.
 pub const COMPACTION_V2_FEATURE: &str = "compaction-v2/v1";
 
-/// Writer opens verify the same framing as reads, but cannot run sessions whose frames require
-/// `compaction-v2/v1`: this reader release cannot render those views. Requirements are authoritative.
+/// Whether this build runs `compaction-v2/v1` sessions. A reader-only build sets it false: it
+/// decodes those frames but marks the log read-only, so a rollback never runs a mode-3 session.
+pub const RUNS_COMPACTION_V2: bool = true;
+
+/// Writer opens verify the same framing as reads. This build writes `compaction-v2/v1` sessions,
+/// so a writer accepts every feature a reader knows. (The 0.3.306 reader release refused that
+/// one feature here, which keeps a rollback from running mode-3 sessions.)
 pub(crate) fn decode_next_for_writer(buf: &[u8]) -> DecodeStep {
     decode_projected_for_writer(buf, |seq, fence, payload| {
         let record = serde_json::from_slice(payload)?;
@@ -285,15 +290,7 @@ pub(crate) fn decode_projected_for_writer<T>(
     buf: &[u8],
     project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
 ) -> DecodeStep<T> {
-    static WRITABLE: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    let writable = WRITABLE.get_or_init(|| {
-        KNOWN_FEATURES
-            .iter()
-            .copied()
-            .filter(|name| *name != COMPACTION_V2_FEATURE)
-            .collect()
-    });
-    decode_projected_with(buf, writable, project)
+    decode_projected_with(buf, KNOWN_FEATURES, project)
 }
 
 /// Physical-send reservation and settlement evidence for billing readers.
@@ -1036,10 +1033,11 @@ fn decode_projected_with_requirements<T>(
             Ok(envelope) => envelope,
             Err(e) => return DecodeStep::Corrupt(FrameError::Deserialize(e)),
         };
-        let read_only = envelope
-            .requires
-            .iter()
-            .any(|name| name == COMPACTION_V2_FEATURE);
+        let read_only = !RUNS_COMPACTION_V2
+            && envelope
+                .requires
+                .iter()
+                .any(|name| name == COMPACTION_V2_FEATURE);
         let mut missing: Vec<String> = envelope
             .requires
             .into_iter()
@@ -1089,11 +1087,12 @@ fn decode_v4_projected<T>(
         }
         Ok(V4Step::Frame(frame)) => {
             let metadata = frame.header.metadata;
-            let read_only = frame
-                .header
-                .requires
-                .iter()
-                .any(|name| name == COMPACTION_V2_FEATURE);
+            let read_only = !RUNS_COMPACTION_V2
+                && frame
+                    .header
+                    .requires
+                    .iter()
+                    .any(|name| name == COMPACTION_V2_FEATURE);
             match project(metadata.seq, metadata.fence, frame.payload, read_only) {
                 Ok(record) => DecodeStep::Record {
                     framed: Box::new(record),

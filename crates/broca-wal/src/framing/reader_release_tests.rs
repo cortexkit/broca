@@ -9,13 +9,13 @@
 use super::*;
 
 #[test]
-fn compaction_v2_frame_requirements_allow_reads_but_refuse_writer_open_decoding() {
+fn compaction_v2_frames_decode_for_readers_and_writers_on_this_build() {
     let mut records: Vec<WalRecord> =
         include_str!("../../tests/fixtures/compaction_v2_records.jsonl")
             .lines()
             .map(|bytes| serde_json::from_str(bytes).unwrap())
             .collect();
-    // Even a body with no compaction fields is read-only when its frame requires the feature.
+    // A body with no compaction fields still carries the frame requirement.
     records.push(WalRecord::TurnFinished {
         step_id: broca_protocol::StepId(1),
     });
@@ -37,8 +37,11 @@ fn compaction_v2_frame_requirements_allow_reads_but_refuse_writer_open_decoding(
             assert!(
                 matches!(decode_next(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
             );
+            // This build runs mode-3 sessions, so its writer opens them too. A reader-only
+            // build (`RUNS_COMPACTION_V2` false) refuses the writer path instead.
+            assert!(RUNS_COMPACTION_V2);
             assert!(
-                matches!(decode_next_for_writer(&bytes), DecodeStep::NewerWriter { missing, .. } if missing == [COMPACTION_V2_FEATURE])
+                matches!(decode_next_for_writer(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
             );
         }
     }

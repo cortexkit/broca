@@ -497,7 +497,7 @@ async fn account_pause_serializer_samples_and_live_subscription_continue_togethe
         head.last_run_state.as_ref().unwrap().reason.as_deref(),
         Some("account_limit")
     );
-    assert_eq!(head.last_ordinal, Some(0));
+    assert_eq!(head.last_ordinal, Some(1));
     assert!(serde_json::to_value(&head).unwrap()["last_run_state"]
         .get("resume_not_before_ms")
         .is_none());
@@ -536,7 +536,7 @@ async fn account_pause_serializer_samples_and_live_subscription_continue_togethe
         .is_none());
     assert_eq!(head.last_run_state.as_ref().unwrap().run_id, "timed-run");
     assert_eq!(head.last_run_state.as_ref().unwrap().state, "active");
-    assert_eq!(head.last_ordinal, Some(0));
+    assert_eq!(head.last_ordinal, Some(1));
     sample("run.status.resumed.json", &status);
     sample("session.head.resumed.json", &head);
     sample("subscribe.resumed.json", &resumed);
