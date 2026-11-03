@@ -758,7 +758,11 @@ fn an_archived_mode3_session_restores_and_opens_for_writing() {
     // This build runs mode-3 sessions, so an archived one restores to a live log and opens
     // for writing like any other. (The 0.3.306 reader release refused here instead.)
     let _ = &container;
-    drop(f.store.open(&f.session).expect("an archived mode-3 session opens for writing"));
+    drop(
+        f.store
+            .open(&f.session)
+            .expect("an archived mode-3 session opens for writing"),
+    );
     assert!(path.exists(), "the open restored a live copy");
     assert_eq!(f.store.read_records(&f.session).unwrap().len(), 4);
 }
