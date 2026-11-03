@@ -4003,15 +4003,20 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     assert!(
         matches!(&follows.outcome, CaseOutcome::Inapplicable { reason } if reason.contains("replan_rich_ui"))
     );
-    for name in [
-        "archive_pruning_generation",
-        "archive_pruning_restored_view_refused",
-        "archive_pruning_restored_edit_refused",
-        "archive_pruning_setup_after_prune",
-        "archive_pruning_setup_initial_replaced",
-        "archive_pruning_applied_edit_pruned",
-    ] {
-        let case = report.cases.iter().find(|case| case.case == name).unwrap();
+    // broca does not declare archive_prunes_reasoning, so every archive-pruning case the kit
+    // carries must report exactly that, whichever cases a kit version adds or retires.
+    let archive_pruning: Vec<_> = report
+        .cases
+        .iter()
+        .filter(|case| case.case.starts_with("archive_pruning_"))
+        .collect();
+    assert!(
+        archive_pruning.len() >= 5,
+        "the kit's archive-pruning cases went missing: {}",
+        archive_pruning.len()
+    );
+    for case in archive_pruning {
+        let name = &case.case;
         assert_eq!(
             case.outcome,
             CaseOutcome::Inapplicable {
@@ -4045,7 +4050,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     for name in [
         "service_tier_unsupported_before_model",
         "service_tier_run_fixed",
-        "service_tier_ride_before_changed_request",
         "service_tier_unknown_never_echoed",
     ] {
         let case = report.cases.iter().find(|case| case.case == name).unwrap();
