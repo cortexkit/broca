@@ -382,9 +382,9 @@ wait for the queue lock or insula IO. A failed batch is discarded, not requeued.
 `health.check.metrics.session_readers` is a process-wide, in-memory census of authorized
 read attempts, separate from the legacy numeric `metrics.session_reads`. Its `entries` array
 contains `{principal, op, owner, count, last_ms}` for `session.read`, `session.history`,
-`session.head`, `session.subscribe`, `run.status`, `run.result`, `run.tool_calls`, `send.status`
-and `session.media_read`. Authorization and migration refusals are excluded; later parameter
-or handler errors still count. Subscriptions count once when opened, not once per frame.
+`session.head`, `session.subscribe`, `run.status`, `run.result`, `run.tool_calls`, `send.status`,
+`session.send_status` and `session.media_read`. Authorization and migration refusals are excluded;
+later parameter or handler errors still count. Subscriptions count once when opened, not once per frame.
 The principal is rendered from the daemon's route stamp (`reserved:<module_id>`, `direct`,
 `unverified`, or the existing principal type's other rendering); a bind from an older daemon
 with no stamp is named `unattested`. Request parameters cannot change that attribution.
@@ -710,6 +710,7 @@ when the lineage has no control unit.
 byte-exact text block, delivered role-scoped before the user prompt; absent, empty, or
 whitespace-only means no system message.
 
+Both `send.status` and `session.send_status` are served as names for the same operation.
 `send.status {send_id}` reads that send's durable fate and answers the same reply bytes as
 an identical re-send, including its baseline and final delivery receipt. An auth-paused send
 instead reports its current durable pause and reason; an explicit re-send still re-drives

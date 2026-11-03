@@ -94,6 +94,7 @@ pub(crate) fn operation(method: &str) -> Option<&'static str> {
         "run.result" => Some("run.result"),
         "run.tool_calls" => Some("run.tool_calls"),
         "send.status" => Some("send.status"),
+        "session.send_status" => Some("session.send_status"),
         "session.media_read" => Some("session.media_read"),
         _ => None,
     }

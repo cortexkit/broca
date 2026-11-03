@@ -20,6 +20,10 @@ pub const LLM_RUNNER_V1: &str = "llm-runner/v1";
 pub use cortexkit_role_llm_runner::ops::SEND_STATUS as OP_SEND_STATUS;
 pub use cortexkit_role_llm_runner::send_status::SendStatusRequest;
 
+/// Alias for `send.status`, allowing llm-runner 0.8 callers to use its renamed operation
+/// while broca retains the pinned request and reply contract.
+pub const OP_SESSION_SEND_STATUS: &str = "session.send_status";
+
 pub const OP_ROLE_DESCRIBE: &str = "role.describe";
 pub const OP_SESSION_HEAD: &str = "session.head";
 pub const OP_RUN_RESULT: &str = "run.result";
@@ -372,6 +376,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::ops::SESSION_FLUSH_PREFIX,
         OP_SESSION_RESOLVE,
         OP_SEND_STATUS,
+        OP_SESSION_SEND_STATUS,
     ]
     .map(String::from)
     .to_vec();
@@ -1162,6 +1167,9 @@ mod pinned_reply_bytes {
         use cortexkit_role_llm_runner::{capabilities, describe::check_describe};
         let encoded = serde_json::to_value(broca_role_describe("test")).unwrap();
         let role = check_describe(&encoded).unwrap();
+        for op in [OP_SEND_STATUS, OP_SESSION_SEND_STATUS] {
+            assert!(role.majors[0].ops.iter().any(|name| name == op), "{op}");
+        }
         for group in [
             capabilities::SEND_STATUS,
             capabilities::MAX_STEPS,
@@ -1253,7 +1261,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "46cc6c2ac8970280563c71e9e729ae8f7c63cf0942e1de59c075c5e3eb66b2d4",
+            "57ee36a2dfcdf4a002269949c1a72d32d888ee172d14a7a624fe91b12cbce22e",
         );
     }
 
@@ -1431,7 +1439,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "7389182e5dd09d47447b7887800f58a8e97e2dd6c277cd362e1d2976eb01b17e";
+        "9837325639bc53a7a696cbf983c6054267ad85358f8b16ecd58760490a646309";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =
