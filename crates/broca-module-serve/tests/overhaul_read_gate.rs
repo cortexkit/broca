@@ -1273,6 +1273,108 @@ async fn installed_compacted_raw_pages_and_head_use_bounded_reads() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_mode3_raw_pages_and_head_keep_legacy_read_cost_until_run_status() {
+    async fn observe(
+        daemon: &OverhaulDaemon,
+        bind: &BindIdentity,
+        kind: &str,
+    ) -> (serde_json::Value, OperationAccess) {
+        let access = WalAccessCounter::default();
+        let state = access
+            .operation(format!("pure {kind}"))
+            .run_future(async {
+                if kind == "raw page" {
+                    let page = daemon
+                        .registry
+                        .read(SessionReadRequest::new(bind.clone(), None, Some(2)))
+                        .await
+                        .unwrap();
+                    assert_eq!(page.messages.len(), 2);
+                    serde_json::to_value(page.lineage_state.state).unwrap()
+                } else {
+                    serde_json::to_value(daemon.registry.head(bind).await.unwrap()).unwrap()
+                        ["last_run_state"]["state"]
+                        .clone()
+                }
+            })
+            .await;
+        (state, access.snapshot().remove(0))
+    }
+
+    let template = partial_turn().await;
+    let mut costs = Vec::new();
+    for mode3 in [true, false] {
+        let root = root(if mode3 { "pure-mode3" } else { "pure-legacy" });
+        let bind = BindIdentity::new("/installed", "runner", "pure-read");
+        let access = WalAccessCounter::default();
+        let daemon = OverhaulDaemon::boot(&root, access.clone()).await;
+        let mut records = template.clone();
+        if let WalRecord::RunStarted { input, .. } = &mut records[0] {
+            *input = vec![
+                broca_protocol::Message::new(
+                    broca_protocol::Role::User,
+                    vec![ContentBlock::Text {
+                        text: "prefix".into()
+                    }],
+                );
+                1_000
+            ]
+            .into();
+        }
+        if mode3 {
+            records.insert(
+                1,
+                WalRecord::CompactionMarker {
+                    harness: "runner".into(),
+                    session: "pure-read".into(),
+                    view_version: 1,
+                    first_kept_mid: "m0".into(),
+                    first_kept_ordinal: 0,
+                    checkpoint: 0,
+                },
+            );
+        }
+        let (seq, writer) = write_turn(&daemon, &access, &bind, "pure-run", &records, false).await;
+        published(&daemon, &bind, seq).await;
+        writer.shutdown().await.unwrap();
+        published(&daemon, &bind, seq + 1).await;
+
+        let mut cold = Vec::new();
+        for kind in ["raw page", "head"] {
+            let (state, measured) = observe(&daemon, &bind, kind).await;
+            check_operation(&measured, &[], false);
+            assert_eq!(state, "active", "cold {kind}, mode3={mode3}");
+            cold.push((measured.reads.len(), measured.frames_decoded));
+        }
+        costs.push(cold);
+
+        if mode3 {
+            let status = daemon
+                .registry
+                .run_status(&bind, RunId("pure-run".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(status).unwrap()["state"],
+                "interrupted"
+            );
+            for kind in ["raw page", "head"] {
+                let (state, measured) = observe(&daemon, &bind, kind).await;
+                check_operation(&measured, &[], false);
+                assert_eq!(state, "interrupted", "cached {kind}");
+            }
+        }
+        no_legacy_index(&root);
+        daemon.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    assert_eq!(
+        costs[0], costs[1],
+        "mode-3 metadata must not add pure-read I/O or frame decodes"
+    );
+}
+
 fn assert_locator_roundtrip(daemon: &OverhaulDaemon, bind: &BindIdentity) {
     let encoded = daemon.stores.overhaul.as_ref().unwrap().db.read_snapshot(|tx| {
         tx.query_row("SELECT locator_seed FROM session WHERE project_root=?1 AND harness=?2 AND session_key=?3",

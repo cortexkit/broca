@@ -4562,8 +4562,34 @@ impl LineageRegistry {
         ))
     }
 
-    /// Shared by session.read, run.status and run.result. An actorless reader-only run without
-    /// a terminal or durable pause is interrupted without sealing; a durable pause wins.
+    /// Return an established policy without reading the log. The outer `None` means the
+    /// lineage's compatibility is unknown; `Some(None)` means no state rewrite is needed.
+    fn cached_read_only_run_state(
+        &self,
+        key: &LineageKey,
+        lineage: Option<&str>,
+        run_id: Option<&str>,
+        active: bool,
+    ) -> Option<Option<ReadOnlyRunState>> {
+        if !active
+            || matches!(
+                self.inner.slots.lock().unwrap().get(key),
+                Some(Entry::Open { .. })
+            )
+        {
+            return Some(None);
+        }
+        self.inner
+            .read_only_lineages
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|(stored, _)| stored.as_deref() == lineage)
+            .map(|(_, facts)| facts.state(run_id))
+    }
+
+    /// Establish run-state policy for run.status and run.result. A reader-only run with no live
+    /// session actor, terminal or durable pause is interrupted without sealing; a durable pause wins.
     pub(crate) async fn read_only_run_state(
         &self,
         key: &LineageKey,
@@ -4589,14 +4615,7 @@ impl LineageRegistry {
                 ),
             );
         }
-        let cached = self
-            .inner
-            .read_only_lineages
-            .lock()
-            .unwrap()
-            .get(key)
-            .filter(|(stored, _)| stored == &lineage)
-            .map(|(_, facts)| facts.state(run_id));
+        let cached = self.cached_read_only_run_state(key, lineage.as_deref(), run_id, active);
         match cached {
             Some(state) => Ok(state),
             None => {
@@ -4713,19 +4732,21 @@ impl LineageRegistry {
         {
             RoutedPage::Raw(mut page) => {
                 let lineage = page.page.lineage_id.map(|id| id.to_string());
+                // Pure reads use only facts already held or cached; run-state endpoints establish
+                // the policy. A cold bounded page keeps its existing state instead of reading the
+                // WAL from byte zero.
                 if let Some(state) = self
-                    .read_only_run_state(
+                    .cached_read_only_run_state(
                         key,
-                        lineage,
+                        lineage.as_deref(),
                         page.page
                             .lineage_state
                             .last_run_id
                             .as_ref()
                             .map(|run| run.0.as_str()),
                         page.page.lineage_state.state == broca_core::SessionReadStateKind::Active,
-                        None,
                     )
-                    .await?
+                    .flatten()
                 {
                     match state {
                         ReadOnlyRunState::Interrupted => {
