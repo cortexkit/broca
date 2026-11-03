@@ -344,6 +344,9 @@ impl OpenError {
     }
     pub(crate) fn from_retention(error: crate::retention::RetentionReadError) -> Self {
         match error {
+            crate::retention::RetentionReadError::NewerWriter { missing, reason } => {
+                Self::NewerWriter { missing, reason }
+            }
             crate::retention::RetentionReadError::RelocationIncomplete { reason } => {
                 Self::Classified {
                     reason,
@@ -823,6 +826,93 @@ pub enum CutLockMode {
 
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 
+pub(crate) enum ReadOnlyRunState {
+    Interrupted,
+    Paused {
+        reason: broca_protocol::PauseReason,
+        error: Option<Box<broca_protocol::error::ProviderError>>,
+    },
+}
+
+impl ReadOnlyRunState {
+    fn apply(self, state: &mut broca_core::ReconciledRunState) {
+        match self {
+            Self::Interrupted => state.state = broca_core::RunIndexState::Interrupted,
+            Self::Paused { reason, error } => {
+                state.state = broca_core::RunIndexState::Paused;
+                state.pause_reason = Some(reason);
+                state.error = error.map(|error| *error);
+            }
+        }
+    }
+}
+
+struct ReadOnlyLineage {
+    read_only: bool,
+    unfinished: HashSet<String>,
+    pauses: HashMap<
+        String,
+        (
+            broca_protocol::PauseReason,
+            Option<Box<broca_protocol::error::ProviderError>>,
+        ),
+    >,
+}
+
+impl ReadOnlyLineage {
+    fn from_frames(read_only: bool, records: &[broca_wal::FramedRecord]) -> Self {
+        let mut unfinished = HashSet::new();
+        let mut pauses = HashMap::new();
+        let mut current = None;
+        if read_only {
+            for frame in records {
+                match &frame.record {
+                    broca_wal::WalRecord::RunStarted { run_id, .. } => {
+                        unfinished.insert(run_id.0.clone());
+                        pauses.remove(&run_id.0);
+                        current = Some(run_id.0.clone());
+                    }
+                    broca_wal::WalRecord::RunPaused {
+                        run_id,
+                        reason,
+                        error,
+                        ..
+                    } => {
+                        unfinished.remove(&run_id.0);
+                        pauses.insert(run_id.0.clone(), (*reason, error.clone().map(Box::new)));
+                    }
+                    broca_wal::WalRecord::RunFinished { .. } => {
+                        if let Some(run) = &current {
+                            unfinished.remove(run);
+                            pauses.remove(run);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self {
+            read_only,
+            unfinished,
+            pauses,
+        }
+    }
+
+    fn state(&self, run_id: Option<&str>) -> Option<ReadOnlyRunState> {
+        let run = run_id.filter(|_| self.read_only)?;
+        if let Some((reason, error)) = self.pauses.get(run) {
+            Some(ReadOnlyRunState::Paused {
+                reason: *reason,
+                error: error.clone(),
+            })
+        } else {
+            self.unfinished
+                .contains(run)
+                .then_some(ReadOnlyRunState::Interrupted)
+        }
+    }
+}
+
 struct Inner {
     run_event_reader: std::sync::OnceLock<Arc<RunEventLookup>>,
     session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
@@ -878,6 +968,9 @@ struct Inner {
     #[cfg(test)]
     actor_panics: AtomicU64,
     restart_resume_ready: AtomicBool,
+    /// Frame-derived compatibility and lifecycle facts, bounded and checked against lineage id.
+    /// This build cannot append the reader-only feature, and such logs cannot acquire a writer.
+    read_only_lineages: Mutex<BoundedSessionCache<(Option<String>, ReadOnlyLineage)>>,
     /// Sessions the startup crash-orphan pass marked, each with the run ids the run index
     /// still calls active there. The session's actor takes its mark when it opens, whoever
     /// opened it (the pass or a caller's send), and decides from its own WAL whether to seal.
@@ -1970,6 +2063,7 @@ impl LineageRegistry {
                 #[cfg(test)]
                 actor_panics: AtomicU64::new(0),
                 restart_resume_ready: AtomicBool::new(false),
+                read_only_lineages: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 crash_orphan_marks: Mutex::new(HashMap::new()),
                 crash_orphans_sealed: AtomicU64::new(0),
                 crash_orphans_index_repaired: AtomicU64::new(0),
@@ -2017,6 +2111,19 @@ impl LineageRegistry {
             return Ok(None);
         };
         if read.state.state == broca_core::RunIndexState::Active {
+            if let Some(state) = self
+                .read_only_run_state(
+                    key,
+                    read.lineage_id.map(|id| id.to_string()),
+                    Some(&run_id.0),
+                    true,
+                    None,
+                )
+                .await?
+            {
+                state.apply(&mut read.state);
+                return Ok(Some(read));
+            }
             // An active cold run still needs the existing orphan-recovery policy;
             // an indexed row must not turn a dead writer into a live run.
             let state = self.route_run_state(key, run_id.clone()).await?;
@@ -3792,17 +3899,53 @@ impl LineageRegistry {
         ),
         OpenError,
     > {
+        let (state, records, _) = self.route_run_state_with_reader_policy(key, run_id).await?;
+        Ok((state, records))
+    }
+
+    pub(crate) async fn route_run_state_with_reader_policy(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+    ) -> Result<
+        (
+            Option<broca_core::ReconciledRunState>,
+            Option<Vec<broca_wal::FramedRecord>>,
+            bool,
+        ),
+        OpenError,
+    > {
         self.check_expired(key, Some(&run_id.0)).await?;
         if matches!(
             self.check_move(key, true),
             Err(OpenError::SessionMoving { .. })
         ) {
-            let records = self.read_durable_wal(key).await?.0;
-            let state = broca_core::reconcile_run_state(
+            let (records, lineage, read_only) = self
+                .read_durable_wal_with_compatibility(key, ReadPurpose::Session)
+                .await?;
+            let mut state = broca_core::reconcile_run_state(
                 records.iter().map(|frame| &frame.record),
                 &run_id.0,
             );
-            return Ok((state, Some(records)));
+            let policy = self
+                .read_only_run_state(
+                    key,
+                    lineage.map(|id| id.to_string()),
+                    Some(&run_id.0),
+                    state.as_ref().is_some_and(|state| {
+                        matches!(
+                            state.state,
+                            broca_core::RunIndexState::Active | broca_core::RunIndexState::Paused
+                        )
+                    }),
+                    Some((read_only, &records)),
+                )
+                .await?;
+            let preserve_pause = matches!(policy, Some(ReadOnlyRunState::Paused { .. }));
+            if let Some(policy) = policy {
+                policy.apply(state.as_mut().expect("known run state"));
+            }
+            return Ok((state, Some(records), preserve_pause));
         }
         use crate::actor::LineageCmd;
         loop {
@@ -3829,13 +3972,35 @@ impl LineageRegistry {
                     }
                     None => None,
                 };
-                let records = self.read_durable_wal(key).await?.0;
+                let (records, lineage, read_only) = self
+                    .read_durable_wal_with_compatibility(key, ReadPurpose::Session)
+                    .await?;
                 let reconciled = broca_core::reconcile_run_state(
                     records.iter().map(|frame| &frame.record),
                     &run_id.0,
                 );
-                let state = crate::actor::indexed_run_state(indexed, reconciled)
+                let mut state = crate::actor::indexed_run_state(indexed, reconciled)
                     .map_err(OpenError::Open)?;
+                if let Some(read_only_state) = self
+                    .read_only_run_state(
+                        key,
+                        lineage.map(|id| id.to_string()),
+                        Some(&run_id.0),
+                        state.as_ref().is_some_and(|state| {
+                            matches!(
+                                state.state,
+                                broca_core::RunIndexState::Active
+                                    | broca_core::RunIndexState::Paused
+                            )
+                        }),
+                        Some((read_only, &records)),
+                    )
+                    .await?
+                {
+                    let preserve_pause = matches!(read_only_state, ReadOnlyRunState::Paused { .. });
+                    read_only_state.apply(state.as_mut().expect("active state exists"));
+                    return Ok((state, Some(records), preserve_pause));
+                }
                 if state
                     .as_ref()
                     .is_some_and(|state| state.state == broca_core::RunIndexState::Active)
@@ -3850,7 +4015,7 @@ impl LineageRegistry {
                     self.recover_status_orphan(key, &run_id).await?;
                     continue;
                 }
-                return Ok((state, Some(records)));
+                return Ok((state, Some(records), false));
             };
             let (reply, rx) = tokio::sync::oneshot::channel();
             let cmd = LineageCmd::RunState {
@@ -3863,7 +4028,7 @@ impl LineageRegistry {
             match rx.await {
                 // A STORAGE failure resolving the run is surfaced as an error (so the wire
                 // reports it), never collapsed into "unknown run".
-                Ok(Ok(state)) => return Ok((state, None)),
+                Ok(Ok(state)) => return Ok((state, None, false)),
                 Ok(Err(e)) => {
                     self.check_expired(key, Some(&run_id.0)).await?;
                     return Err(OpenError::Open(e));
@@ -3952,6 +4117,7 @@ impl LineageRegistry {
             (Some(head), None) => Some(head),
             (None, through) => through,
         };
+        let whole_source = after_seq == 0 && anchor.is_none() && requested_through.is_none();
         let range_read = |through_seq| {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
@@ -4036,6 +4202,7 @@ impl LineageRegistry {
             return Ok(candidate);
         };
         if cached_head.is_some_and(|head| candidate_head <= head) {
+            self.cache_run_compatibility_range(key, &candidate, whole_source, candidate_head);
             return Ok(candidate);
         }
 
@@ -4115,7 +4282,34 @@ impl LineageRegistry {
         if let Some(identity) = flush_identity {
             self.cache_read_proof(key, identity, candidate_head);
         }
+        self.cache_run_compatibility_range(key, &proven, whole_source, candidate_head);
         Ok(proven)
+    }
+
+    fn cache_run_compatibility_range(
+        &self,
+        key: &LineageKey,
+        range: &broca_wal::WalRangeRead,
+        whole_source: bool,
+        head: u64,
+    ) {
+        if !whole_source {
+            return;
+        }
+        let Ok(records) =
+            crate::durable_read::DurableRead::classify(range, 0, Some(head)).records()
+        else {
+            return;
+        };
+        // Reuse a full read only after its durability proof. A suffix cannot establish that an
+        // unseen prefix lacks the reader-only feature, and classification must not add a flush.
+        self.inner.read_only_lineages.lock().unwrap().insert(
+            key.clone(),
+            (
+                range.lineage_id.map(|id| id.to_string()),
+                ReadOnlyLineage::from_frames(range.check_run_compatible().is_err(), records),
+            ),
+        );
     }
 
     fn cached_read_proof(&self, key: &LineageKey, identity: u64) -> Option<u64> {
@@ -4305,6 +4499,24 @@ impl LineageRegistry {
         ),
         OpenError,
     > {
+        let (records, lineage, _) = self
+            .read_durable_wal_with_compatibility(key, purpose)
+            .await?;
+        Ok((records, lineage))
+    }
+
+    async fn read_durable_wal_with_compatibility(
+        &self,
+        key: &LineageKey,
+        purpose: ReadPurpose,
+    ) -> Result<
+        (
+            Vec<broca_wal::FramedRecord>,
+            Option<broca_wal::WalLineageId>,
+            bool,
+        ),
+        OpenError,
+    > {
         match purpose {
             ReadPurpose::Session | ReadPurpose::Media => self.check_expired(key, None).await?,
             ReadPurpose::Authorization => self.check_authorization_expired(key).await?,
@@ -4343,7 +4555,71 @@ impl LineageRegistry {
                 class: broca_protocol::ErrorClass::Transient,
             })?
             .to_vec();
-        Ok((records, range.lineage_id))
+        Ok((
+            records,
+            range.lineage_id,
+            range.check_run_compatible().is_err(),
+        ))
+    }
+
+    /// Shared by session.read, run.status and run.result. An actorless reader-only run without
+    /// a terminal or durable pause is interrupted without sealing; a durable pause wins.
+    pub(crate) async fn read_only_run_state(
+        &self,
+        key: &LineageKey,
+        lineage: Option<String>,
+        run_id: Option<&str>,
+        active: bool,
+        observed: Option<(bool, &[broca_wal::FramedRecord])>,
+    ) -> Result<Option<ReadOnlyRunState>, OpenError> {
+        if !active
+            || matches!(
+                self.inner.slots.lock().unwrap().get(key),
+                Some(Entry::Open { .. })
+            )
+        {
+            return Ok(None);
+        }
+        if let Some((read_only, records)) = observed {
+            self.inner.read_only_lineages.lock().unwrap().insert(
+                key.clone(),
+                (
+                    lineage.clone(),
+                    ReadOnlyLineage::from_frames(read_only, records),
+                ),
+            );
+        }
+        let cached = self
+            .inner
+            .read_only_lineages
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|(stored, _)| stored == &lineage)
+            .map(|(_, facts)| facts.state(run_id));
+        match cached {
+            Some(state) => Ok(state),
+            None => {
+                let (records, current, read_only) = self
+                    .read_durable_wal_with_compatibility(key, ReadPurpose::Session)
+                    .await?;
+                if current.map(|id| id.to_string()) != lineage {
+                    return Err(OpenError::Classified {
+                        reason: "session lineage changed while classifying an unfinished run"
+                            .into(),
+                        class: broca_protocol::ErrorClass::Transient,
+                    });
+                }
+                let facts = ReadOnlyLineage::from_frames(read_only, &records);
+                let state = facts.state(run_id);
+                self.inner
+                    .read_only_lineages
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), (lineage, facts));
+                Ok(state)
+            }
+        }
     }
 
     /// Returns the same page as `route_read` and, when `include_tools` is set, the tool list
@@ -4435,7 +4711,42 @@ impl LineageRegistry {
             .route_read_page_view(key, from_ordinal, limit, include_tools, None)
             .await?
         {
-            RoutedPage::Raw(page) => Ok(*page),
+            RoutedPage::Raw(mut page) => {
+                let lineage = page.page.lineage_id.map(|id| id.to_string());
+                if let Some(state) = self
+                    .read_only_run_state(
+                        key,
+                        lineage,
+                        page.page
+                            .lineage_state
+                            .last_run_id
+                            .as_ref()
+                            .map(|run| run.0.as_str()),
+                        page.page.lineage_state.state == broca_core::SessionReadStateKind::Active,
+                        None,
+                    )
+                    .await?
+                {
+                    match state {
+                        ReadOnlyRunState::Interrupted => {
+                            page.page.lineage_state.state =
+                                broca_core::SessionReadStateKind::Interrupted;
+                            page.page.lineage_state.reason =
+                                Some(broca_core::SessionReadReason::Terminal(
+                                    broca_protocol::RunFinishReason::Interrupted,
+                                ));
+                        }
+                        ReadOnlyRunState::Paused { reason, error } => {
+                            page.page.lineage_state.state =
+                                broca_core::SessionReadStateKind::Paused;
+                            page.page.lineage_state.reason =
+                                Some(broca_core::SessionReadReason::Pause(reason));
+                            page.page.lineage_state.error = error.map(|error| *error);
+                        }
+                    }
+                }
+                Ok(*page)
+            }
             RoutedPage::Model(_) => unreachable!("raw read requested"),
         }
     }
@@ -7134,6 +7445,7 @@ mod tests {
 
     pub(super) fn started_record(session: &LineageKey) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -7749,6 +8061,7 @@ impl LineageRegistry {
         }
         self.inner.opener.retire_session_transport(key);
         self.inner.read_proofs.lock().unwrap().remove(key);
+        self.inner.read_only_lineages.lock().unwrap().remove(key);
         self.inner.dispatch_cache.lock().unwrap().remove(key);
         self.inner.frozen_senders.lock().unwrap().remove(key);
         self.inner.attribution_notices.lock().unwrap().remove(key);
@@ -7855,6 +8168,7 @@ mod offset_page_tests {
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

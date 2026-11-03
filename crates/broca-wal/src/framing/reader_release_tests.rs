@@ -8,6 +8,132 @@
 
 use super::*;
 
+#[test]
+fn compaction_v2_frame_requirements_allow_reads_but_refuse_writer_open_decoding() {
+    let mut records: Vec<WalRecord> =
+        include_str!("../../tests/fixtures/compaction_v2_records.jsonl")
+            .lines()
+            .map(|bytes| serde_json::from_str(bytes).unwrap())
+            .collect();
+    // Even a body with no compaction fields is read-only when its frame requires the feature.
+    records.push(WalRecord::TurnFinished {
+        step_id: broca_protocol::StepId(1),
+    });
+    for record in records {
+        for bytes in [
+            encode_with_requires(1, 1, &[COMPACTION_V2_FEATURE], &record).unwrap(),
+            encode_v4(
+                v4::Metadata {
+                    seq: 1,
+                    fence: 1,
+                    appended_ms: 1,
+                    writer_id: [1; 16],
+                },
+                &[COMPACTION_V2_FEATURE],
+                &record,
+            )
+            .unwrap(),
+        ] {
+            assert!(
+                matches!(decode_next(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
+            );
+            assert!(
+                matches!(decode_next_for_writer(&bytes), DecodeStep::NewerWriter { missing, .. } if missing == [COMPACTION_V2_FEATURE])
+            );
+        }
+    }
+}
+
+#[test]
+fn compaction_v2_records_and_plan_version_round_trip_exact_bytes() {
+    let records: Vec<WalRecord> = include_str!("../../tests/fixtures/compaction_v2_records.jsonl")
+        .lines().map(|pinned| {
+            let record: WalRecord = serde_json::from_str(pinned).unwrap();
+            assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+            assert_eq!(record.required_features(), [COMPACTION_V2_FEATURE]);
+            let bytes = encode(7, 3, &record).unwrap();
+            assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+            let payload = format!("{{\"requires\":[\"compaction-v2/v1\"],\"record\":{pinned}}}");
+            assert_eq!(&bytes[HEADER_LEN..], payload.as_bytes());
+            assert!(matches!(decode_next(&bytes), DecodeStep::Record { framed, consumed } if consumed == bytes.len() && framed.record == record));
+            let value = serde_json::to_value(&record).unwrap();
+            let from_value: WalRecord = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&from_value).unwrap(), value);
+            record
+        }).collect();
+    let WalRecord::CompactionViewV2(view) = &records[0] else {
+        panic!("view decoded as another record")
+    };
+    assert_eq!(view.version, 2);
+    assert_eq!(view.checksum, "w7-provider-checksum");
+    assert!(matches!(
+        view.edits[0],
+        crate::StoredViewEdit::Previous { index: 1 }
+    ));
+    let crate::StoredViewEdit::Full { edit } = &view.edits[1] else {
+        panic!("full edit lost")
+    };
+    assert_eq!(
+        edit.get(),
+        r#"{"since":2, "vendor":{"z":1e+02,"a":"\u0061"},"text":"summary"}"#
+    );
+    assert!(matches!(
+        view.edits[2],
+        crate::StoredViewEdit::Previous { index: 0 }
+    ));
+    assert!(
+        matches!(&records[1], WalRecord::CompactionMarker { harness, session, view_version: 2, first_kept_mid, first_kept_ordinal: 7, checkpoint: 3 } if harness == "runner" && session == "s" && first_kept_mid == "m7")
+    );
+    assert!(
+        matches!(&records[2], WalRecord::CompactionViewAppliedV2 { step_id: 4, version: 2, checksum } if checksum == "w7-provider-checksum")
+    );
+    assert!(matches!(
+        records[3],
+        WalRecord::RunStarted {
+            compaction_plan_version: Some(1),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_reader_without_compaction_v2_refuses_all_four_shapes_by_name() {
+    let older: Vec<_> = KNOWN_FEATURES
+        .iter()
+        .copied()
+        .filter(|name| *name != COMPACTION_V2_FEATURE)
+        .collect();
+    for pinned in include_str!("../../tests/fixtures/compaction_v2_records.jsonl").lines() {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        let bytes = encode(1, 1, &record).unwrap();
+        assert!(
+            matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == ["compaction-v2/v1"])
+        );
+    }
+}
+
+#[test]
+fn compaction_plan_version_unions_with_other_record_requirements_even_when_zero() {
+    let mut record: WalRecord = serde_json::from_str(PINNED_SCHEMA_PIN_RUN_STARTED).unwrap();
+    let mut expected = record.required_features().to_vec();
+    expected.push(COMPACTION_V2_FEATURE);
+    expected.sort_unstable();
+    if let WalRecord::RunStarted {
+        compaction_plan_version,
+        ..
+    } = &mut record
+    {
+        assert_eq!(*compaction_plan_version, None);
+        *compaction_plan_version = Some(0);
+    }
+    assert_eq!(record.required_features(), expected);
+    let bytes = encode(1, 1, &record).unwrap();
+    assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+    assert!(
+        matches!(decode_next(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
+    );
+}
+
 /// A `RunStarted` whose plan manifest froze the catalog's schema pin for `read`, as the build
 /// that writes `tool-schema-pins/v1` serializes it: the pins follow the provider's other
 /// declarations inside `declarations_frozen`, keyed by tool name.

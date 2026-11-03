@@ -513,7 +513,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                     }
                 } else if let Some(service) = service {
                     service
-                        .delete_expired_typed(&session, service.clock.now_ms())
+                        .delete_expired_for_run(&session, service.clock.now_ms())
                         .map_err(OpenError::from_retention)?;
                 } else if retention.is_some() {
                     return Err(OpenError::Open(

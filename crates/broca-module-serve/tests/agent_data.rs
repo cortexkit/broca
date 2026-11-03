@@ -387,6 +387,7 @@ impl Rig {
 }
 fn started(session: &BindIdentity, run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,

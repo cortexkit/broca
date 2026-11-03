@@ -426,6 +426,7 @@ async fn append_projection_episode(fixture: &Fixture, episodes: usize, iteration
     let suffix = format!("projection-{episodes}-{iteration}");
     let writer = fixture.writer.as_ref().expect("writer is present");
     writer.record(WalRecord::RunStarted {
+        compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,

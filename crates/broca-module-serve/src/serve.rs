@@ -8163,6 +8163,7 @@ mod tests {
     async fn refused_replacement_goodbye_preserves_published_route_and_stream() {
         let session = BrocaBindIdentity::new("/tmp/project-a", "runner", "published");
         let record = broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

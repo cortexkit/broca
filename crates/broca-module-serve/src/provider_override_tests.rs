@@ -543,7 +543,7 @@ async fn resume_through_core(
     let mut wal = wal_store.open(&req.session).unwrap();
     wal.append(
         1,
-        &broca_wal::WalRecord::RunStarted { sent_by: None, written_at_ms: None, tags: None, session_class: None, retention: None,
+        &broca_wal::WalRecord::RunStarted { compaction_plan_version: None, sent_by: None, written_at_ms: None, tags: None, session_class: None, retention: None,
         hooks: None,
          title: None,
          on_restart: None,

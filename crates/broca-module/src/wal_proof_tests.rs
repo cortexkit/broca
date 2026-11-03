@@ -288,6 +288,7 @@ impl Fixture {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
                     tags: None,
@@ -763,6 +764,7 @@ async fn retained_first_send_cut_before_its_index_sync_is_recovered_at_boot() {
     let digest = send_identity_digest(&request, broca_protocol::Delivery::Queue, None);
     writer
         .record(WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

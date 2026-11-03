@@ -1676,6 +1676,7 @@ mod tests {
 
     fn run_started(session: &BindIdentity) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -3363,6 +3364,7 @@ mod tests {
                 seq: 1,
                 fence: 1,
                 record: WalRecord::RunStarted {
+                    compaction_plan_version: None,
                     sent_by: None,
                     written_at_ms: None,
                     tags: None,
@@ -3698,6 +3700,7 @@ mod episode_attach_tests {
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

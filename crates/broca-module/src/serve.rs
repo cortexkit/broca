@@ -1338,7 +1338,10 @@ fn frozen_auth_selection(state: &broca_core::ReconciledRunState) -> Option<Strin
         .filter(|credential_id| !credential_id.is_empty())
 }
 
-fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStatusResponse {
+fn run_status_response_with_reader_policy(
+    state: Option<broca_core::ReconciledRunState>,
+    preserve_pause: bool,
+) -> RunStatusResponse {
     use broca_core::RunIndexState as State;
 
     let Some(state) = state else {
@@ -1366,6 +1369,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
     // A provider-held park is an implementation recovery boundary, not an owner pause.
     let public_state = if state.state == State::Paused
         && state.pause_reason == Some(broca_protocol::PauseReason::ToolHeld)
+        && !preserve_pause
     {
         State::Active
     } else {
@@ -3611,10 +3615,28 @@ impl ServeHandler for crate::LineageRegistry {
         run_id: broca_protocol::RunId,
     ) -> Result<broca_wire::RunResultResponse, ServeError> {
         let row_read = self.read_run_row_state(session, &run_id).await?;
-        let (state, mut records) = match &row_read {
-            Some(read) => (Some(read.state.clone()), Some(read.records.clone())),
+        let (state, mut records, preserve_pause) = match &row_read {
+            Some(read) => {
+                let policy = self
+                    .read_only_run_state(
+                        session,
+                        read.lineage_id.map(|id| id.to_string()),
+                        Some(&run_id.0),
+                        read.state.state == broca_core::RunIndexState::Paused,
+                        None,
+                    )
+                    .await?;
+                (
+                    Some(read.state.clone()),
+                    Some(read.records.clone()),
+                    matches!(
+                        policy,
+                        Some(crate::registry::ReadOnlyRunState::Paused { .. })
+                    ),
+                )
+            }
             None => {
-                self.route_run_state_with_wal(session, run_id.clone())
+                self.route_run_state_with_reader_policy(session, run_id.clone())
                     .await?
             }
         };
@@ -3631,7 +3653,7 @@ impl ServeHandler for crate::LineageRegistry {
             .map(|state| state.run_usage.clone())
             .unwrap_or_default();
         let mut finish = state.as_ref().and_then(|state| state.finish.clone());
-        let status = run_status_response(state);
+        let status = run_status_response_with_reader_policy(state, preserve_pause);
         let (mut state, mut reason, mut error) = match status {
             RunStatusResponse::Unknown => return Err(ServeError::UnknownRun(run_id.0)),
             RunStatusResponse::Active { .. } => ("active".to_owned(), None, None),
@@ -4513,11 +4535,33 @@ impl ServeHandler for crate::LineageRegistry {
         run_id: broca_protocol::RunId,
     ) -> Result<RunStatusResponse, ServeError> {
         let row_read = self.read_run_row_state(session, &run_id).await?;
-        let state = match &row_read {
-            Some(read) => Some(read.state.clone()),
-            None => self.route_run_state(session, run_id.clone()).await?,
+        let (state, preserve_pause) = match &row_read {
+            Some(read) => {
+                let policy = self
+                    .read_only_run_state(
+                        session,
+                        read.lineage_id.map(|id| id.to_string()),
+                        Some(&run_id.0),
+                        read.state.state == broca_core::RunIndexState::Paused,
+                        None,
+                    )
+                    .await?;
+                (
+                    Some(read.state.clone()),
+                    matches!(
+                        policy,
+                        Some(crate::registry::ReadOnlyRunState::Paused { .. })
+                    ),
+                )
+            }
+            None => {
+                let (state, _, preserve_pause) = self
+                    .route_run_state_with_reader_policy(session, run_id.clone())
+                    .await?;
+                (state, preserve_pause)
+            }
         };
-        let mut response = run_status_response(state);
+        let mut response = run_status_response_with_reader_policy(state, preserve_pause);
         // Lifecycle resolution above remains authoritative when its transcript reader or
         // final text is unavailable. Enrich the answer only with readable durable metadata.
         let metadata = if matches!(
@@ -4643,7 +4687,11 @@ mod held_status_tests {
             broca_core::RunIndexState::Active,
             broca_core::RunIndexState::Paused,
         ] {
-            let wire = serde_json::to_value(run_status_response(Some(state(index)))).unwrap();
+            let wire = serde_json::to_value(run_status_response_with_reader_policy(
+                Some(state(index)),
+                false,
+            ))
+            .unwrap();
             assert!(
                 wire.get("held_calls").is_none(),
                 "empty held_calls must be omitted, not null or []: {wire}"
@@ -4677,7 +4725,11 @@ mod held_status_tests {
                     "running",
                     42,
                 ));
-            let wire = serde_json::to_value(run_status_response(Some(reconciled))).unwrap();
+            let wire = serde_json::to_value(run_status_response_with_reader_policy(
+                Some(reconciled),
+                false,
+            ))
+            .unwrap();
             assert_eq!(
                 wire["held_calls"], expected,
                 "open held calls must be reported on live and paused runs"
@@ -4699,7 +4751,7 @@ mod held_status_tests {
 
 #[cfg(test)]
 mod paused_auth_tests {
-    use super::run_status_response;
+    use super::run_status_response_with_reader_policy;
 
     #[test]
     fn paused_auth_uses_frozen_identity_and_open_path_vocabulary() {
@@ -4755,7 +4807,11 @@ mod paused_auth_tests {
                     }),
                     ride_wait_deadline_ms: None,
                 };
-                let value = serde_json::to_value(run_status_response(Some(state.clone()))).unwrap();
+                let value = serde_json::to_value(run_status_response_with_reader_policy(
+                    Some(state.clone()),
+                    false,
+                ))
+                .unwrap();
                 assert_eq!(value["auth_selection"], "requested-key");
                 assert_eq!(value["auth"]["path"], wire);
                 assert_eq!(value["auth"]["credential_id"], "resolved-key");
@@ -4768,8 +4824,11 @@ mod paused_auth_tests {
                 selection.resolved_credential_id = None;
                 selection.account_ref = None;
                 selection.account_decision = None;
-                let value =
-                    serde_json::to_value(run_status_response(Some(legacy.clone()))).unwrap();
+                let value = serde_json::to_value(run_status_response_with_reader_policy(
+                    Some(legacy.clone()),
+                    false,
+                ))
+                .unwrap();
                 assert_eq!(
                     value["auth"],
                     serde_json::json!({"credential_id": "requested-key"})
@@ -4780,11 +4839,18 @@ mod paused_auth_tests {
                     .unwrap()
                     .credential_id
                     .clear();
-                let value =
-                    serde_json::to_value(run_status_response(Some(legacy.clone()))).unwrap();
+                let value = serde_json::to_value(run_status_response_with_reader_policy(
+                    Some(legacy.clone()),
+                    false,
+                ))
+                .unwrap();
                 assert!(value.get("auth_selection").is_none());
                 legacy.auth_selection = None;
-                let value = serde_json::to_value(run_status_response(Some(legacy))).unwrap();
+                let value = serde_json::to_value(run_status_response_with_reader_policy(
+                    Some(legacy),
+                    false,
+                ))
+                .unwrap();
                 assert!(value.get("auth").is_none());
                 assert!(value.get("auth_selection").is_none());
             }
@@ -4827,7 +4893,8 @@ mod context_ceiling_tests {
     fn a_ceiling_wait_status_is_active_with_reason_and_absolute_deadline() {
         let mut state = reconciled(broca_core::RunIndexState::Active);
         state.ceiling_deadline_ms = Some(123_456);
-        let wire = serde_json::to_value(run_status_response(Some(state))).unwrap();
+        let wire = serde_json::to_value(run_status_response_with_reader_policy(Some(state), false))
+            .unwrap();
         assert_eq!(wire["state"], "active");
         assert_eq!(
             wire["reason"],
@@ -4844,7 +4911,8 @@ mod context_ceiling_tests {
             90,
             "view_timeout",
         ));
-        let wire = serde_json::to_value(run_status_response(Some(state))).unwrap();
+        let wire = serde_json::to_value(run_status_response_with_reader_policy(Some(state), false))
+            .unwrap();
         assert_eq!(wire["state"], "context_ceiling");
         assert_eq!(
             wire["context_ceiling"],
@@ -4860,7 +4928,8 @@ mod context_ceiling_tests {
     fn a_ride_wait_reports_compaction_wait_by_its_deadline() {
         let mut state = reconciled(broca_core::RunIndexState::Active);
         state.ride_wait_deadline_ms = Some(234_567);
-        let wire = serde_json::to_value(run_status_response(Some(state))).unwrap();
+        let wire = serde_json::to_value(run_status_response_with_reader_policy(Some(state), false))
+            .unwrap();
         assert_eq!(wire["state"], "active");
         assert_eq!(wire["reason"], "compaction_wait");
         assert_eq!(wire["deadline_ms"], 234_567);
@@ -4944,6 +5013,7 @@ mod offset_head_tests {
 
     fn run_started() -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

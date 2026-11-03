@@ -192,6 +192,7 @@ fn usage() -> (u64, u64) {
 
 fn run_started(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,

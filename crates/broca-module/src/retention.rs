@@ -617,13 +617,35 @@ type AcquireLease = dyn Fn(&BindIdentity) -> Result<Box<dyn LeaseHandle>, String
 /// retention failures whose string-based contracts remain unchanged.
 #[derive(Debug)]
 pub(crate) enum RetentionReadError {
-    RelocationIncomplete { reason: String },
+    NewerWriter {
+        missing: Vec<String>,
+        reason: String,
+    },
+    RelocationIncomplete {
+        reason: String,
+    },
     Other(String),
 }
 
 impl RetentionReadError {
     fn from_wal(error: broca_wal::WalError) -> Self {
         match error {
+            broca_wal::WalError::NewerWriter {
+                offset,
+                ver,
+                missing,
+            } if missing
+                .iter()
+                .any(|name| name == broca_wal::COMPACTION_V2_FEATURE) =>
+            {
+                let reason = broca_wal::WalError::NewerWriter {
+                    offset,
+                    ver,
+                    missing: missing.clone(),
+                }
+                .to_string();
+                Self::NewerWriter { missing, reason }
+            }
             error @ broca_wal::WalError::RelocationIncomplete { .. } => {
                 Self::RelocationIncomplete {
                     reason: error.to_string(),
@@ -646,6 +668,7 @@ impl From<&str> for RetentionReadError {
 impl std::fmt::Display for RetentionReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NewerWriter { reason, .. } => f.write_str(reason),
             Self::RelocationIncomplete { reason } => f.write_str(reason),
             Self::Other(error) => f.write_str(error),
         }
@@ -1769,6 +1792,23 @@ impl RetentionService {
         key: &BindIdentity,
         now_ms: u64,
     ) -> Result<Option<String>, RetentionReadError> {
+        self.delete_expired_for_mode(key, now_ms, false)
+    }
+
+    pub(crate) fn delete_expired_for_run(
+        &self,
+        key: &BindIdentity,
+        now_ms: u64,
+    ) -> Result<Option<String>, RetentionReadError> {
+        self.delete_expired_for_mode(key, now_ms, true)
+    }
+
+    fn delete_expired_for_mode(
+        &self,
+        key: &BindIdentity,
+        now_ms: u64,
+        for_run: bool,
+    ) -> Result<Option<String>, RetentionReadError> {
         if self.defer_overhaul() {
             crate::diagnostics::retention_fenced(key, "overhaul_deferred", now_ms);
             return Ok(None);
@@ -1785,7 +1825,7 @@ impl RetentionService {
             .into_iter()
             .filter(|s| s.completed_at_ms.is_none())
         {
-            self.complete(key, stone, now_ms)?;
+            self.complete_deletion_for_mode(key, stone, now_ms, for_run)?;
         }
         let path = match overhaul_path {
             Some(path) => path,
@@ -1795,6 +1835,12 @@ impl RetentionService {
             return Ok(None);
         };
         let read = self.read_path(&path);
+        if for_run {
+            if let Ok(read) = &read {
+                read.check_run_compatible()
+                    .map_err(RetentionReadError::from_wal)?;
+            }
+        }
         let (id, deadline) = match &read {
             Ok(read) => {
                 let Some((_, _, Some(deadline))) = policy(frames(read)) else {
@@ -1951,7 +1997,7 @@ impl RetentionService {
         };
         self.remember_session(key)?;
         self.write_tombstone(key, &stone)?;
-        self.complete(key, stone, now_ms)?;
+        self.complete_deletion_for_mode(key, stone, now_ms, for_run)?;
         Ok(Some(id))
     }
 
@@ -2055,9 +2101,20 @@ impl RetentionService {
     fn complete_deletion(
         &self,
         key: &BindIdentity,
-        mut stone: Tombstone,
+        stone: Tombstone,
         now_ms: u64,
     ) -> Result<(), String> {
+        self.complete_deletion_for_mode(key, stone, now_ms, false)
+            .map_err(|error| error.to_string())
+    }
+
+    fn complete_deletion_for_mode(
+        &self,
+        key: &BindIdentity,
+        mut stone: Tombstone,
+        now_ms: u64,
+        for_run: bool,
+    ) -> Result<(), RetentionReadError> {
         self.validate_recovery_artifacts(key, &stone.recovery_artifacts)?;
         #[cfg(test)]
         deletion_boundary("prepared");
@@ -2068,7 +2125,13 @@ impl RetentionService {
             .map_err(|e| e.to_string())?
         {
             let identity = match self.read_path(&path) {
-                Ok(read) => read.lineage_id.map(|id| id.to_string()),
+                Ok(read) => {
+                    if for_run {
+                        read.check_run_compatible()
+                            .map_err(RetentionReadError::from_wal)?;
+                    }
+                    read.lineage_id.map(|id| id.to_string())
+                }
                 Err(_) => Some(self.initial_lineage(&path)?),
             };
             if identity.as_deref() == Some(stone.lineage_id.as_str()) {
@@ -2097,6 +2160,12 @@ impl RetentionService {
         }
         if moved.exists() {
             let read = self.read_path(&moved);
+            if for_run {
+                if let Ok(read) = &read {
+                    read.check_run_compatible()
+                        .map_err(RetentionReadError::from_wal)?;
+                }
+            }
             let identity = match &read {
                 Ok(read) => read.lineage_id.map(|id| id.to_string()),
                 Err(_) => Some(self.initial_lineage(&moved)?),
@@ -2180,7 +2249,7 @@ impl RetentionService {
                 match fs::remove_file(side) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.to_string()),
+                    Err(error) => return Err(error.to_string().into()),
                 }
                 #[cfg(test)]
                 deletion_boundary("identity_sidecar");

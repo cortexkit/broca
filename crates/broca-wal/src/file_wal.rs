@@ -156,10 +156,24 @@ pub struct WalRangeRead {
     /// and `None` means the result was constructed without determining presence.
     file_present: Option<bool>,
     archive_lookup_missed: bool,
+    run_incompatible: Option<(usize, u8)>,
     anchors: Vec<WalByteAnchor>,
 }
 
 impl WalRangeRead {
+    /// Refuse running a session when any verified frame in this source requires a reader-only
+    /// feature. This summary includes frames filtered out of the returned record range. An
+    /// anchored suffix cannot prove that an unobserved prefix is writable.
+    pub fn check_run_compatible(&self) -> Result<(), WalError> {
+        if let Some((offset, ver)) = self.run_incompatible {
+            return Err(WalError::NewerWriter {
+                offset,
+                ver,
+                missing: vec![crate::COMPACTION_V2_FEATURE.to_string()],
+            });
+        }
+        Ok(())
+    }
     /// An authoritative miss after consulting archives, unlike legacy live-only absence.
     /// Keep the Absent variant while allowing readers to reject a store-prefix-only answer.
     pub fn absent_after_archive_lookup() -> Self {
@@ -231,6 +245,7 @@ impl WalRangeRead {
             complete_byte_end: None,
             file_present: None,
             archive_lookup_missed: false,
+            run_incompatible: None,
             anchors,
         }
     }
@@ -244,6 +259,7 @@ impl WalRangeRead {
             complete_byte_end: None,
             file_present: None,
             archive_lookup_missed: false,
+            run_incompatible: None,
             anchors: Vec::new(),
         }
     }
@@ -414,6 +430,14 @@ impl std::fmt::Display for WalError {
             WalError::Corrupt { offset, source } => {
                 write!(f, "wal corruption at offset {offset}: {source}")
             }
+            WalError::NewerWriter {
+                missing,
+                ..
+            } if missing.iter().any(|name| name == crate::framing::COMPACTION_V2_FEATURE) => write!(
+                f,
+                "session requires {} and needs a newer build to run; it is read-only on this build",
+                missing.join(", ")
+            ),
             WalError::NewerWriter {
                 offset,
                 ver,
@@ -2544,14 +2568,26 @@ fn scan_writer_open(path: &Path, cap: u64, overhaul: bool) -> Result<WriterOpenS
                 });
             }
             (
-                scan_prefix(std::io::BufReader::new(file), cap, &mut observe)?,
+                scan_prefix_with_decoder(
+                    std::io::BufReader::new(file),
+                    cap,
+                    &mut observe,
+                    crate::framing::decode_next_for_writer,
+                )?,
                 file_len,
                 false,
             )
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            (scan_prefix(std::io::empty(), cap, &mut observe)?, 0, true)
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+            scan_prefix_with_decoder(
+                std::io::empty(),
+                cap,
+                &mut observe,
+                crate::framing::decode_next_for_writer,
+            )?,
+            0,
+            true,
+        ),
         Err(error) => return Err(WalError::Io(error)),
     };
     Ok(WriterOpenScan {
@@ -2580,7 +2616,16 @@ fn read_up_to(file: &mut impl Read, bytes: &mut [u8]) -> Result<usize, WalError>
 fn scan_prefix<T>(
     file: impl Read,
     max_bytes: u64,
+    found: impl FnMut(&FramedRecord) -> Option<T>,
+) -> Result<PrefixScan<T>, WalError> {
+    scan_prefix_with_decoder(file, max_bytes, found, crate::framing::decode_next)
+}
+
+fn scan_prefix_with_decoder<T>(
+    file: impl Read,
+    max_bytes: u64,
     mut found: impl FnMut(&FramedRecord) -> Option<T>,
+    decode: fn(&[u8]) -> DecodeStep,
 ) -> Result<PrefixScan<T>, WalError> {
     let mut file = access_counter::AccessReader::new(file, 0);
     let mut scan = PrefixScan {
@@ -2639,7 +2684,7 @@ fn scan_prefix<T>(
                 scan.bytes_read += n as u64;
             }
         }
-        match decode_next_counted(&frame) {
+        match decode_next_counted_with(&frame, decode) {
             DecodeStep::Record { framed, consumed } => {
                 scan.legacy_records |= frame[4] != crate::framing::V4_FRAMING_VERSION;
                 validate_contiguous_sequence(scan.last_seq, 1, framed.seq)?;
@@ -2818,6 +2863,7 @@ pub fn read_records_range(
                 file_present: Some(false),
                 complete_byte_end: None,
                 archive_lookup_missed: false,
+                run_incompatible: None,
                 anchors: Vec::new(),
             });
         }
@@ -3049,10 +3095,50 @@ pub fn read_verified_member_range(
     )
 }
 
+/// Check a member's frame requirements before restoring its already-loaded archive bytes.
+/// Project only sequence metadata: no second file read or decoded transcript is needed.
+pub fn check_member_run_compatible(bytes: &[u8]) -> Result<(), WalError> {
+    let mut offset = 0;
+    let mut last_seq = None;
+    let mut lineage = None;
+    while offset < bytes.len() {
+        match access_counter::decode_using(&bytes[offset..], |buf| {
+            crate::framing::decode_projected_for_writer(buf, |seq, _, _| Ok(seq))
+        }) {
+            DecodeStep::Record {
+                framed: seq,
+                consumed,
+            } => {
+                validate_contiguous_sequence(last_seq, 1, *seq)?;
+                last_seq = Some(*seq);
+                offset += consumed;
+            }
+            DecodeStep::Lineage {
+                lineage_id,
+                consumed,
+            } => {
+                fold_lineage_id(&mut lineage, lineage_id)?;
+                offset += consumed;
+            }
+            DecodeStep::NewerWriter { ver, missing } => {
+                return Err(WalError::NewerWriter {
+                    offset,
+                    ver,
+                    missing,
+                })
+            }
+            DecodeStep::Corrupt(source) => return Err(WalError::Corrupt { offset, source }),
+            DecodeStep::TornTail => break,
+        }
+    }
+    Ok(())
+}
+
 struct DecodedBytes {
     records: Vec<(FramedRecord, u64)>,
     valid_end: u64,
     lineage_id: Option<WalLineageId>,
+    run_incompatible: Option<(usize, u8)>,
 }
 
 /// A verified prefix, not a durability witness. Only the caller's descriptor
@@ -3075,7 +3161,15 @@ pub fn recover_prefix(
     previous_seq: Option<u64>,
     lineage: Option<WalLineageId>,
 ) -> Result<WalRecoveryPrefix, WalError> {
-    let decoded = decode_bytes_seeded(bytes, absolute_start, previous_seq, 1, Vec::new(), lineage)?;
+    let decoded = decode_bytes_seeded(
+        bytes,
+        absolute_start,
+        previous_seq,
+        1,
+        Vec::new(),
+        lineage,
+        None,
+    )?;
     Ok(WalRecoveryPrefix {
         valid_end: decoded.valid_end,
         last_seq: decoded
@@ -3092,7 +3186,11 @@ std::thread_local! {
 }
 
 fn decode_next_counted(bytes: &[u8]) -> DecodeStep {
-    let step = decode_next(bytes);
+    decode_next_counted_with(bytes, crate::framing::decode_next)
+}
+
+fn decode_next_counted_with<T>(bytes: &[u8], decode: fn(&[u8]) -> DecodeStep<T>) -> DecodeStep<T> {
+    let step = access_counter::decode_using(bytes, decode);
     #[cfg(test)]
     if let DecodeStep::Record { consumed, .. } | DecodeStep::Lineage { consumed, .. } = &step {
         DECODED_BYTE_COUNT.with(|count| count.set(count.get() + *consumed as u64));
@@ -3135,7 +3233,10 @@ fn decode_anchored_suffix(
     let mut lineage_id = None;
     while offset < bytes.len() {
         open_observed("frame decode");
-        match decode_next_counted(&bytes[offset..]) {
+        match decode_next_counted_with(
+            &bytes[offset..],
+            crate::framing::decode_with_run_requirement,
+        ) {
             DecodeStep::Lineage {
                 lineage_id: found,
                 consumed,
@@ -3144,6 +3245,7 @@ fn decode_anchored_suffix(
                 offset += consumed;
             }
             DecodeStep::Record { framed, consumed } => {
+                let (framed, read_only) = *framed;
                 if let Err(error) = validate_contiguous_sequence(None, expected_next, framed.seq) {
                     return match error {
                         WalError::SequenceGap { .. } => Ok(None),
@@ -3152,7 +3254,7 @@ fn decode_anchored_suffix(
                 }
                 let first_seq = framed.seq;
                 let first_end = absolute_start + offset as u64 + consumed as u64;
-                let records = vec![(*framed, first_end)];
+                let records = vec![(framed, first_end)];
                 return match decode_bytes_seeded(
                     &bytes[offset + consumed..],
                     first_end,
@@ -3160,6 +3262,8 @@ fn decode_anchored_suffix(
                     expected_next,
                     records,
                     lineage_id,
+                    read_only
+                        .then_some(((absolute_start + offset as u64) as usize, bytes[offset + 4])),
                 ) {
                     Ok(decoded) => Ok(Some(decoded)),
                     // Return `None` for a gap in an anchored suffix so the caller retries from byte
@@ -3175,6 +3279,7 @@ fn decode_anchored_suffix(
                     records: Vec::new(),
                     valid_end: absolute_start + offset as u64,
                     lineage_id,
+                    run_incompatible: None,
                 }));
             }
             // A complete frame that only a newer build can read is an answer, not a reason to
@@ -3196,6 +3301,7 @@ fn decode_anchored_suffix(
         records: Vec::new(),
         valid_end: absolute_start + offset as u64,
         lineage_id,
+        run_incompatible: None,
     }))
 }
 
@@ -3210,6 +3316,7 @@ fn decode_bytes(
         None,
         expected_first_seq,
         Vec::new(),
+        None,
         None,
     )
 }
@@ -3270,16 +3377,25 @@ fn decode_bytes_seeded(
     expected_first_seq: u64,
     mut records: Vec<(FramedRecord, u64)>,
     mut lineage_id: Option<WalLineageId>,
+    mut run_incompatible: Option<(usize, u8)>,
 ) -> Result<DecodedBytes, WalError> {
     let mut offset = 0usize;
     while offset < bytes.len() {
         open_observed("frame decode");
-        match decode_next_counted(&bytes[offset..]) {
+        match decode_next_counted_with(
+            &bytes[offset..],
+            crate::framing::decode_with_run_requirement,
+        ) {
             DecodeStep::Record { framed, consumed } => {
+                let (framed, read_only) = *framed;
+                if read_only && run_incompatible.is_none() {
+                    run_incompatible =
+                        Some(((absolute_start + offset as u64) as usize, bytes[offset + 4]));
+                }
                 validate_contiguous_sequence(prev_seq, expected_first_seq, framed.seq)?;
                 prev_seq = Some(framed.seq);
                 offset += consumed;
-                records.push((*framed, absolute_start + offset as u64));
+                records.push((framed, absolute_start + offset as u64));
             }
             DecodeStep::Lineage {
                 lineage_id: found,
@@ -3319,6 +3435,7 @@ fn decode_bytes_seeded(
         records,
         valid_end: absolute_start + offset as u64,
         lineage_id,
+        run_incompatible,
     })
 }
 
@@ -3339,6 +3456,7 @@ fn select_decoded_range(
         through_seq,
         decoded.lineage_id,
     );
+    range.run_incompatible = decoded.run_incompatible;
     if source_head.is_some() && range.next_anchor.map(|a| a.seq) == source_head {
         range.complete_byte_end = Some(complete_end);
     }
@@ -5916,6 +6034,42 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(path).unwrap();
         file.write_all(&bytes).unwrap();
         offset
+    }
+
+    #[test]
+    fn compaction_v2_writer_open_refuses_before_repair_and_reads_still_work() {
+        let path = tmp("mode3-read-only");
+        let _ = std::fs::remove_file(&path);
+        let record = run_started(1);
+        let mut bytes =
+            crate::framing::encode_with_requires(1, 1, &[crate::COMPACTION_V2_FEATURE], &record)
+                .unwrap();
+        // A writer normally repairs a torn tail at open. A reader-only session must not even
+        // perform that repair, much less append recovery records or start a run.
+        bytes.extend_from_slice(&[0, 1, 2]);
+        std::fs::write(&path, &bytes).unwrap();
+        let frames = replay_file(&path, DEFAULT_MAX_READ_BYTES).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].record, record);
+        let range = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 1, None, None).unwrap();
+        assert!(
+            matches!(range.records(), WalRangeRecords::Complete(records) if records.is_empty())
+        );
+        assert!(
+            matches!(range.check_run_compatible(), Err(WalError::NewerWriter { missing, .. }) if missing == ["compaction-v2/v1"])
+        );
+        match FileWal::open(&path) {
+            Err(error @ WalError::NewerWriter { .. }) => {
+                assert!(error.to_string().contains("compaction-v2/v1"));
+                assert!(error.to_string().contains("needs a newer build to run"));
+                assert!(
+                    matches!(error, WalError::NewerWriter { missing, .. } if missing == ["compaction-v2/v1"])
+                );
+            }
+            _ => panic!("mode-3 writer open must refuse"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let _ = std::fs::remove_file(&path);
     }
 
     fn expect_newer_writer<T: std::fmt::Debug>(result: Result<T, WalError>, offset: u64) {
