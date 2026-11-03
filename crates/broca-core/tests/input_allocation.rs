@@ -919,6 +919,33 @@ async fn admitted_turn_does_not_retain_a_second_tool_copy() {
     let serialized_tool_bytes = serde_json::to_vec(&tools)
         .expect("serialize production-shaped tools")
         .len();
+    // Compare against the same turn with no tools, so the guard measures only what the tool
+    // list itself retains: a second deep copy of the tools would add about their serialized
+    // size, while fields that every RunStarted carries cancel out.
+    let (with_tools, with_allocations) = retained_at_run_started(tools).await;
+    let (without_tools, without_allocations) = retained_at_run_started(Vec::new()).await;
+    let retained_bytes = with_tools - without_tools;
+    let retained_allocations = with_allocations - without_allocations;
+    eprintln!(
+        "retained while appending tool-bearing RunStarted: {retained_bytes} bytes in \
+         {retained_allocations} allocations; serialized tools: {serialized_tool_bytes} bytes"
+    );
+    // ONE-SIDED ON PURPOSE. Only retained growth can reveal a second manifest graph; a net
+    // decrease means unrelated frees outweighed allocations and cannot violate this ownership rule.
+    assert!(
+        retained_bytes < (serialized_tool_bytes / 4) as isize,
+        "RunStarted retained a deep tool copy: {retained_bytes} tracked bytes for \
+         {serialized_tool_bytes} serialized tool bytes"
+    );
+    assert!(
+        retained_allocations < 200,
+        "RunStarted retained a second tool allocation graph: {retained_allocations} live allocations"
+    );
+}
+
+/// Run one admitted turn carrying `tools` and return the bytes and allocations still live when
+/// its `RunStarted` reaches the WAL append seam.
+async fn retained_at_run_started(tools: Vec<Tool>) -> (isize, isize) {
     let policy_allowed = tools.iter().map(|tool| tool.name.clone()).collect();
     let request = RunRequest {
         route_decision_id: None,
@@ -993,21 +1020,7 @@ async fn admitted_turn_does_not_retain_a_second_tool_copy() {
     );
     let retained_bytes = snapshot.retained_bytes.load(Ordering::SeqCst);
     let retained_allocations = snapshot.retained_allocations.load(Ordering::SeqCst);
-    eprintln!(
-        "retained while appending tool-bearing RunStarted: {retained_bytes} bytes in \
-         {retained_allocations} allocations; serialized tools: {serialized_tool_bytes} bytes"
-    );
-    // ONE-SIDED ON PURPOSE. Only retained growth can reveal a second manifest graph; a net
-    // decrease means unrelated frees outweighed allocations and cannot violate this ownership rule.
-    assert!(
-        retained_bytes < (serialized_tool_bytes / 4) as isize,
-        "RunStarted retained a deep tool copy: {retained_bytes} tracked bytes for \
-         {serialized_tool_bytes} serialized tool bytes"
-    );
-    assert!(
-        retained_allocations < 200,
-        "RunStarted retained a second tool allocation graph: {retained_allocations} live allocations"
-    );
+    (retained_bytes, retained_allocations as isize)
 }
 
 #[tokio::test(flavor = "current_thread")]
