@@ -5628,11 +5628,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 plane: self.executor.compaction_plane(),
             })),
             display_sent_by,
-            // A brand-new log starts under the mode-3 compaction contract with the view
-            // library's current plan version. An existing log keeps the mode its first run
-            // recorded: the run loop reads that before looking at this field, so a legacy
-            // session is never upgraded here.
-            new_log_compaction_plan_version: Some(broca_core::compaction_v2::PLAN_VERSION),
+            // A brand-new log whose plan names a compaction provider starts under the mode-3
+            // compaction contract with the view library's current plan version. Sessions with no
+            // compaction keep the established log layout. An existing log keeps the mode its
+            // first run recorded: the run loop reads that before looking at this field, so a
+            // legacy session is never upgraded here.
+            new_log_compaction_plan_version: manifest
+                .as_deref()
+                .is_some_and(|manifest| {
+                    matches!(broca_core::compaction::item(manifest), Ok(Some(_)))
+                })
+                .then_some(broca_core::compaction_v2::PLAN_VERSION),
             emit_display_context: true,
             step_progress: Some(Arc::clone(&step_progress)),
             clock: self
@@ -7222,7 +7228,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     step_id,
                 )
             }
-            None => match broca_core::cache_warm::last_recorded_request(&records) {
+            // A mode-3 session rebuilds its last request from entries keyed by its lineage.
+            None => match broca_core::cache_warm::last_recorded_request_with_lineage(
+                &records,
+                writer
+                    .lineage_id()
+                    .map(|lineage| lineage.to_string())
+                    .as_deref(),
+            ) {
                 Ok(recorded) => {
                     let (config, run_id, step_id) = (
                         recorded.config.clone(),

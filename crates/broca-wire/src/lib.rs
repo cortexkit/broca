@@ -1686,7 +1686,7 @@ mod approval_wire_tests {
     #[test]
     fn session_read_call_states_and_late_approvals_golden() {
         let mut response: SessionReadResponse = serde_json::from_str(
-            r#"{"messages":[],"lineage_state":{"last_run_id":"r","state":"active"}}"#,
+            r#"{"history_version":1,"incarnation":"00112233445566778899aabbccddeeff","messages":[],"lineage_state":{"last_run_id":"r","state":"active"}}"#,
         )
         .unwrap();
         response.deferred_calls = Some(
@@ -1732,7 +1732,7 @@ mod approval_wire_tests {
         let golden = include_str!("../tests/golden/session_read.approvals.json").trim();
         assert_eq!(
             format!("{:x}", Sha256::digest(golden)),
-            "4ba5ba8ff1223d968a15ffe51b27c01bc09e1eb0376295aaadaef8ee3728ef5e"
+            "8d1f37df19b2f3a0bec18f806ff07485fc9efae8016736854040be0f3435251d"
         );
         assert_eq!(serde_json::to_string(&response).unwrap(), golden);
         assert_eq!(
@@ -1744,7 +1744,7 @@ mod approval_wire_tests {
     #[test]
     fn an_unreported_approval_view_is_not_an_empty_view() {
         let mut response: SessionReadResponse =
-            serde_json::from_str(r#"{"messages":[],"lineage_state":{"state":"idle"}}"#).unwrap();
+            serde_json::from_str(r#"{"history_version":1,"incarnation":"00112233445566778899aabbccddeeff","messages":[],"lineage_state":{"state":"idle"}}"#).unwrap();
         let unknown = serde_json::to_value(&response).unwrap();
         assert!(unknown.get("deferred_calls").is_none());
         assert!(unknown.get("late_approvals").is_none());
@@ -4274,6 +4274,7 @@ mod tests {
         assert_eq!(
             send_params_keys(),
             &[
+                "route_decision_id",
                 "content",
                 "directives",
                 "session_class",
@@ -4460,11 +4461,14 @@ mod tests {
             "messages": [],
             "next_from_ordinal": 4,
             "head": {"wal_seq": 8, "sub_index": 2},
-            "lineage_id": "9bb6d92f-1290-4d1f-a8f1-b8bcf5673073",
+            "history_version": 3,
+            "incarnation": "00112233445566778899aabbccddeeff",
             "lineage_state": {"state": "active"}
         }));
         let legacy_read: SessionReadResponse = serde_json::from_value(serde_json::json!({
             "messages": [],
+            "history_version": 1,
+            "incarnation": "00112233445566778899aabbccddeeff",
             "lineage_state": {"state": "idle"}
         }))
         .unwrap();
@@ -5710,7 +5714,7 @@ mod late_page_goldens {
     use super::*;
     fn page(key: &str, id: &str, text: &str, next: Option<&str>) -> SessionReadResponse {
         let mut page: SessionReadResponse = serde_json::from_str(
-            r#"{"messages":[],"lineage_state":{"last_run_id":"r","state":"interrupted"}}"#,
+            r#"{"history_version":1,"incarnation":"00112233445566778899aabbccddeeff","messages":[],"lineage_state":{"last_run_id":"r","state":"interrupted"}}"#,
         )
         .unwrap();
         page.late_approvals = Some(vec![LateApprovalView {
@@ -5743,7 +5747,7 @@ mod late_page_goldens {
         pin(
             page("l:4", "el-1", "late-one", Some("l:4")),
             include_str!("../tests/golden/session_read.late_default.json"),
-            "0af9d6174d5d35b549a6088420887ead13c406f71fbf7ec5aa039af20fe0df58",
+            "4419a30b34e92accd3376e81e7a4bd876f51ff3ce9b24fb36a51e873ac4b16f8",
         );
     }
     #[test]
@@ -5751,7 +5755,7 @@ mod late_page_goldens {
         pin(
             page("l:5", "el-2", "late-two", Some("l:5")),
             include_str!("../tests/golden/session_read.late_continuation.json"),
-            "f71c405440445d913c20be34ef454833811bef73f3788cd21881fb22c4beb974",
+            "e621d4b3643b9d4648a8f83698cb168f8b409bd61da1c6df9e64e7058b8626e6",
         );
     }
     #[test]
@@ -5759,7 +5763,7 @@ mod late_page_goldens {
         pin(
             page("l:6", "el-3", "late-three", None),
             include_str!("../tests/golden/session_read.late_final.json"),
-            "832e846bddd1c0e7c6b875cd288291abf6132eb6b886aa6872ef1fd4aef019a0",
+            "ce62fb255d06daa2747bec0b9491b2af8c962f48f1c9dfcdfd7200a2c465095c",
         );
     }
     #[test]

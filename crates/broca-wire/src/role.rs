@@ -1252,7 +1252,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "fc6b8ce60873d611126dd4998d2e1f49d3416d09bb981669302deac10c74bfc5",
+            "3882df4442ce703fd39aa886adc82df4282e0c977ade5f5f172e56dad689b176",
         );
     }
 
@@ -1297,15 +1297,17 @@ mod pinned_reply_bytes {
     }
 
     #[test]
-    fn compaction_and_model_view_follow_the_installed_bus_writer() {
+    fn retired_compaction_groups_are_not_advertised_with_the_writer_installed() {
+        // llm-runner 0.8 retired the `compaction` and `model_view` groups: a compaction
+        // provider finds broca through the `compaction-runner/v1` module role instead.
         use cortexkit_role_llm_runner::describe::check_describe;
         let encoded =
             serde_json::to_value(broca_role_describe_with_writers("test", true, false, false))
                 .unwrap();
         check_describe(&encoded).unwrap_or_else(|error| panic!("{error:?}"));
         let capabilities = encoded["capabilities"].as_array().unwrap();
-        assert!(capabilities.contains(&serde_json::json!("compaction")));
-        assert!(capabilities.contains(&serde_json::json!("model_view")));
+        assert!(!capabilities.contains(&serde_json::json!("compaction")));
+        assert!(!capabilities.contains(&serde_json::json!("model_view")));
         assert!(!encoded["majors"][0]["ops"]
             .as_array()
             .unwrap()
@@ -1345,8 +1347,8 @@ mod pinned_reply_bytes {
                     } else {
                         assert!(encoded.get("step_hooks").is_none(), "{encoded}");
                     }
-                    assert_eq!(caps.contains(&serde_json::json!("compaction")), compaction);
-                    assert_eq!(caps.contains(&serde_json::json!("model_view")), compaction);
+                    assert!(!caps.contains(&serde_json::json!("compaction")));
+                    assert!(!caps.contains(&serde_json::json!("model_view")));
                     assert!(!encoded["majors"][0]["ops"]
                         .as_array()
                         .unwrap()
@@ -1431,7 +1433,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "3f8cdd4460a60e5eca1a535aab476a321c798a395973477df1e2a8742c521fd2";
+        "5180347a01e1e3264e72546475b746aad42dc76c23e34f6a71c077c919536a29";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

@@ -166,30 +166,34 @@ impl Session {
                 _ => {}
             }
         }
-        let rebuilt =
-            broca_core::cache_warm::last_recorded_request(&records)
-                .ok()
-                .and_then(|recorded| {
-                    let provider = recorded
-                        .route
-                        .as_ref()
-                        .map_or(&recorded.config.model, |route| &route.model)
-                        .provider_module_id
-                        .clone();
-                    let frozen: FrozenRenderConfig =
-                        serde_json::from_value(recorded.config.frozen_render_config).ok()?;
-                    let frozen = if recorded.route.is_some() {
-                        frozen.refusal_fallback?.frozen
-                    } else {
-                        frozen
-                    };
-                    let mut provenance =
-                        broca_protocol::render_provenance::RenderProvenance::default();
-                    let body = crate::registry::wire_family(frozen.family_id)?
-                        .render_with_provenance(&frozen, &recorded.opts, Some(&mut provenance));
-                    (RequestDigest::of(&body).sha256 == recorded.request_body_sha256)
-                        .then_some((frozen, body, provider, provenance))
-                });
+        let rebuilt = broca_core::cache_warm::last_recorded_request_with_lineage(
+            &records,
+            lineage.as_deref(),
+        )
+        .ok()
+        .and_then(|recorded| {
+            let provider = recorded
+                .route
+                .as_ref()
+                .map_or(&recorded.config.model, |route| &route.model)
+                .provider_module_id
+                .clone();
+            let frozen: FrozenRenderConfig =
+                serde_json::from_value(recorded.config.frozen_render_config).ok()?;
+            let frozen = if recorded.route.is_some() {
+                frozen.refusal_fallback?.frozen
+            } else {
+                frozen
+            };
+            let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
+            let body = crate::registry::wire_family(frozen.family_id)?.render_with_provenance(
+                &frozen,
+                &recorded.opts,
+                Some(&mut provenance),
+            );
+            (RequestDigest::of(&body).sha256 == recorded.request_body_sha256)
+                .then_some((frozen, body, provider, provenance))
+        });
         if let Some((frozen, body, provider, provenance)) = rebuilt {
             if let Some((sent, account)) =
                 frames.iter().rev().find_map(|frame| match &frame.record {
