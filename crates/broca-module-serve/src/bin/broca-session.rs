@@ -29,6 +29,7 @@ use broca_module_serve::wire::{VaultAuditResponse, VaultAuditRow};
 use broca_module_serve::SessionClient;
 use broca_protocol::caller::{ControlUnit, OpenRunFinishReason, OpenState, RunFinishReason};
 use broca_protocol::request::{CacheRole, Tool};
+use broca_subc::carrier_scope::CarrierScope;
 use broca_subc::SubcConnection;
 use clap::{Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
@@ -74,6 +75,14 @@ struct Args {
     harness: Option<String>,
     #[arg(long, global = true, default_value = "")]
     session: String,
+    /// Carry a scope owned by a module configured as reserved in subc, on broca routes and
+    /// compose-plan catalog fetches.
+    /// Read its private 32-byte bind proof as 64 hex characters from stdin (optional newline,
+    /// then EOF), never argv or environment. OWNER is the module id, REF the scope reference,
+    /// and EPOCH its numeric incarnation. Tool presets come from the plan's tool items;
+    /// no --preset flag is needed.
+    #[arg(long, global = true, value_name = "OWNER/REF/EPOCH")]
+    scope: Option<CarrierScope>,
     /// State root for reading the session-ref inventory (read-only; never migrates the store).
     #[arg(long, global = true)]
     state_root: Option<PathBuf>,
@@ -770,19 +779,26 @@ async fn run(args: Args) -> Result<i32, String> {
     }
     subc_path(&args)?;
     validate_max_output_tokens(&args.cmd)?;
+    let carrier_scope = args
+        .scope
+        .as_ref()
+        .map(|scope| scope.read_proof(&mut std::io::stdin().lock()))
+        .transpose()
+        .map_err(str::to_owned)?;
     let plan = match &args.cmd {
         Cmd::Run { admission, .. } | Cmd::Send { admission, .. } => load_plan(&admission.plan)?,
         _ => None,
     };
     let json = args.json_events;
-    // The audit is dispatched before the broca management-surface bind, and it returns its own
-    // exit code rather than an error: every way it can fail to run is exit 2, and an `Err` out
-    // of here would be rendered as the exit-1 "wire/startup error" every other command uses.
+    // After local input validation, the audit handles its own connection/bind/op failures as
+    // exit 2. Returning an `Err` for those failures would instead render the exit-1
+    // "wire/startup error" every other command uses, conflating a check that could not answer
+    // with a check that found a credential problem.
     if let Cmd::CredentialAudit { .. } = &args.cmd {
-        return Ok(credential_audit(&args, json).await);
+        return Ok(credential_audit(&args, json, carrier_scope).await);
     }
     if let Cmd::ComposePlan { items } = &args.cmd {
-        return compose_plan(&args, items).await;
+        return compose_plan(&args, items, carrier_scope).await;
     }
     let session = bind_identity(&args)?;
     session
@@ -791,10 +807,11 @@ async fn run(args: Args) -> Result<i32, String> {
     let conn = SubcConnection::connect(subc_path(&args)?)
         .await
         .map_err(|_| "cannot connect subc".to_string())?;
-    let client = SessionClient::bind_with_timeout(
+    let client = SessionClient::bind_with_scope_and_timeout(
         conn,
         &args.module_id,
         session.clone(),
+        carrier_scope,
         std::time::Duration::from_millis(args.bind_timeout_ms),
     )
     .await
@@ -1217,7 +1234,11 @@ async fn run(args: Args) -> Result<i32, String> {
     }
 }
 
-async fn compose_plan(args: &Args, path: &std::path::Path) -> Result<i32, String> {
+async fn compose_plan(
+    args: &Args,
+    path: &std::path::Path,
+    scope: Option<subc_protocol::scope::ScopeSelector>,
+) -> Result<i32, String> {
     let bytes =
         std::fs::read(path).map_err(|error| format!("read --items {}: {error}", path.display()))?;
     let items = serde_json::from_slice(&bytes)
@@ -1230,6 +1251,10 @@ async fn compose_plan(args: &Args, path: &std::path::Path) -> Result<i32, String
         .await
         .map_err(|_| "cannot connect subc".to_string())?;
     let fetcher = broca_subc::SubcPlanFetcher::new(std::sync::Arc::new(conn), identity, None);
+    let fetcher = match scope {
+        Some(scope) => fetcher.with_direct_carrier_scope(scope),
+        None => fetcher,
+    };
     let result =
         broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE).await;
     fetcher.close().await;
@@ -1385,7 +1410,10 @@ fn audit_events(answer: &Result<VaultAuditResponse, String>) -> Vec<(serde_json:
 
 /// Ask the daemon for `vault.audit`. A request that got no reply at all (no connection, no
 /// bind, a refused op) is an `Err`; the daemon's own `Unanswered` comes back as `Ok`.
-async fn request_vault_audit(args: &Args) -> Result<VaultAuditResponse, String> {
+async fn request_vault_audit(
+    args: &Args,
+    scope: Option<subc_protocol::scope::ScopeSelector>,
+) -> Result<VaultAuditResponse, String> {
     let session = bind_identity(args)?;
     session
         .validate_keyable()
@@ -1393,10 +1421,11 @@ async fn request_vault_audit(args: &Args) -> Result<VaultAuditResponse, String> 
     let conn = SubcConnection::connect(subc_path(args)?)
         .await
         .map_err(|_| "cannot connect subc".to_string())?;
-    let client = SessionClient::bind_with_timeout(
+    let client = SessionClient::bind_with_scope_and_timeout(
         conn,
         &args.module_id,
         session,
+        scope,
         std::time::Duration::from_millis(args.bind_timeout_ms),
     )
     .await
@@ -1408,8 +1437,12 @@ async fn request_vault_audit(args: &Args) -> Result<VaultAuditResponse, String> 
 }
 
 /// Run the daemon's credential audit, print it, and return this process's exit code.
-async fn credential_audit(args: &Args, json: bool) -> i32 {
-    let answer = request_vault_audit(args).await;
+async fn credential_audit(
+    args: &Args,
+    json: bool,
+    scope: Option<subc_protocol::scope::ScopeSelector>,
+) -> i32 {
+    let answer = request_vault_audit(args, scope).await;
     for (event, line) in audit_events(&answer) {
         emit(json, &event, || line);
     }
@@ -2343,6 +2376,67 @@ fn emit_to(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scope_is_global_and_uses_plan_presets() {
+        use clap::{CommandFactory, Parser};
+        for op in [
+            vec!["send", "--model", "openai/mock", "--prompt", "read a file"],
+            vec!["run", "--model", "openai/mock", "--prompt", "read a file"],
+            vec!["read"],
+            vec!["compose-plan", "--items", "items.json"],
+        ] {
+            for after_op in [false, true] {
+                let mut argv = vec!["broca-session"];
+                if !after_op {
+                    argv.extend(["--scope", "rig/nested/ref/7"]);
+                }
+                argv.extend(op.iter().copied());
+                if after_op {
+                    argv.extend(["--scope", "rig/nested/ref/7"]);
+                }
+                let args = super::Args::try_parse_from(argv).unwrap();
+                let proof = "00".repeat(32);
+                let selector = args
+                    .scope
+                    .unwrap()
+                    .read_proof(&mut proof.as_bytes())
+                    .unwrap();
+                assert_eq!(selector.scope_ref, "nested/ref");
+                assert_eq!(selector.scope_epoch, Some(7));
+                assert_eq!(
+                    selector.owner,
+                    subc_protocol::Principal::Reserved {
+                        module_id: "rig".into()
+                    }
+                );
+            }
+        }
+        let help = super::Args::command().render_long_help().to_string();
+        assert!(help.contains("presets come from the plan's tool items"));
+        assert!(help.contains("no --preset flag is needed"));
+        let args = super::Args::try_parse_from(["broca-session", "read"]).unwrap();
+        assert!(args.scope.is_none());
+    }
+
+    #[test]
+    fn scope_refuses_malformed_selectors_and_missing_proof() {
+        use clap::Parser;
+        for value in ["rig", "rig/ref", "rig/ref/not-an-epoch", "rig//1"] {
+            let error = super::Args::try_parse_from(["broca-session", "--scope", value, "read"])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid_scope:"), "{error}");
+        }
+        let args =
+            super::Args::try_parse_from(["broca-session", "--scope", "rig/ref/1", "read"]).unwrap();
+        assert!(args
+            .scope
+            .unwrap()
+            .read_proof(&mut std::io::empty())
+            .unwrap_err()
+            .starts_with("scope_bind_proof_required:"));
+    }
+
     #[test]
     fn namespace_diagnostic_never_canonicalizes_a_cwd_directory() {
         const CHILD: &str = "BROCA_NAMESPACE_DIAGNOSTIC_CHILD";
