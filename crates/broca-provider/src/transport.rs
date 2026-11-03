@@ -81,11 +81,18 @@ mod websocket_tests {
     mod attempt_equivalence {
         include!("transport/attempt_equivalence_websocket.rs");
     }
+    mod attempt_effect_boundaries {
+        include!("transport/attempt_effect_boundaries.rs");
+    }
 }
 
 #[cfg(test)]
 #[path = "transport/attempt_test_hooks.rs"]
 mod attempt_test_hooks;
+
+#[cfg(test)]
+#[path = "transport/attempt_effect_hooks.rs"]
+mod attempt_effect_hooks;
 
 #[cfg(test)]
 #[path = "transport/attempt_trace_cases.rs"]
@@ -3160,7 +3167,8 @@ where
     // Driver-kept exceptions: the model has no cancellation, receiver-close, shutdown-seal
     // or top-of-loop deadline outcome. These remain quiet ends with zero retries. Journal
     // settlement errors also bypass retry policy: a failed durability effect cannot be retried
-    // as a provider failure. The gzip identity re-send stays inside one recorded attempt.
+    // as a provider failure. Resending a rejected gzip body without compression stays inside
+    // one recorded attempt.
     loop {
         let attempt_index = attempts.attempt_index();
         let attempt_started = retry_clock.mark();
@@ -3391,6 +3399,8 @@ where
         match result {
             Ok(completion) => return Ok((completion, attempts.retries_used())),
             Err(mut failure) => {
+                #[cfg(test)]
+                attempt_effect_hooks::at(attempt_effect_hooks::Boundary::FailedAttempt);
                 let facts = AttemptFacts {
                     error: &failure.error,
                     cause: failure.cause,
@@ -3401,20 +3411,42 @@ where
                     got_response_bytes: trace.response_len != 0,
                     can_refresh: auth_recovery.is_some(),
                 };
-                let inputs = AttemptInputs {
-                    until_deadline: deadline.map(|deadline| {
-                        deadline.saturating_duration_since(attempt_deadline_now!())
-                    }),
-                    jitter: if use_codex {
-                        codex_retry::jitter()
-                    } else {
-                        retry_jitter()
+                let mut inputs = AttemptInputs {
+                    until_deadline: || {
+                        deadline.map(|deadline| {
+                            deadline.saturating_duration_since(attempt_deadline_now!())
+                        })
                     },
-                    can_switch_to_https: request.family
-                        == Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt)
-                        && websocket.is_some_and(|session| session.can_switch_to_https()),
+                    jitter: || {
+                        if use_codex {
+                            codex_retry::jitter()
+                        } else {
+                            retry_jitter()
+                        }
+                    },
                 };
-                let mut decision = attempt_policy::decide_attempt(&mut attempts, &facts, &inputs);
+                let mut decision =
+                    attempt_policy::decide_attempt(&mut attempts, &facts, &mut inputs);
+                if let AttemptDecision::SwitchToHttps(pending) = decision {
+                    // The configuration callback can change or block. Only the actual switch
+                    // result authorizes fallback; the deadline source runs after that effect.
+                    #[cfg(test)]
+                    attempt_effect_hooks::at(attempt_effect_hooks::Boundary::Switch);
+                    let switched = request.family
+                        == Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt)
+                        && websocket.is_some_and(|session| session.try_switch_to_https());
+                    #[cfg(test)]
+                    if switched {
+                        attempt_test_hooks::record(attempt_test_hooks::Event::SwitchToHttps);
+                    }
+                    decision = attempt_policy::resolve_https_switch(
+                        &mut attempts,
+                        &facts,
+                        pending,
+                        switched,
+                        inputs.until_deadline,
+                    );
+                }
                 let recovering = matches!(decision, AttemptDecision::RefreshAndResend);
                 let mut account_changed_error = None;
                 if recovering {
@@ -3488,20 +3520,10 @@ where
                     | AttemptDecision::EndStep {
                         switch_to_https, ..
                     } => *switch_to_https,
-                    AttemptDecision::RefreshAndResend => unreachable!("refresh was resolved above"),
-                };
-                // Switching precedes even a deadline-vetoed end, so the next step uses HTTPS.
-                if switch_to_https {
-                    let switched = websocket
-                        .expect("the policy requires a switchable session")
-                        .try_switch_to_https();
-                    #[cfg(test)]
-                    if switched {
-                        attempt_test_hooks::record(attempt_test_hooks::Event::SwitchToHttps);
+                    AttemptDecision::RefreshAndResend | AttemptDecision::SwitchToHttps(_) => {
+                        unreachable!("pending effects were resolved above")
                     }
-                    #[cfg(not(test))]
-                    let _ = switched;
-                }
+                };
                 match decision {
                     AttemptDecision::EndStep {
                         reason,
@@ -3601,7 +3623,9 @@ where
                             }
                         }
                     }
-                    AttemptDecision::RefreshAndResend => unreachable!("refresh was resolved above"),
+                    AttemptDecision::RefreshAndResend | AttemptDecision::SwitchToHttps(_) => {
+                        unreachable!("pending effects were resolved above")
+                    }
                 }
             }
         }
@@ -3804,10 +3828,12 @@ impl StepSeal<'_> {
 
 #[cfg(test)]
 fn retry_delay(error: &ProviderError, failed_attempt_index: usize) -> Duration {
-    attempt_policy::generic_delay(error, failed_attempt_index, retry_jitter())
+    attempt_policy::generic_delay(error, failed_attempt_index, retry_jitter)
 }
 
 fn retry_jitter() -> f64 {
+    #[cfg(test)]
+    attempt_effect_hooks::at(attempt_effect_hooks::Boundary::Jitter);
     #[cfg(test)]
     if let Some(factor) = attempt_test_hooks::jitter(false) {
         return factor;

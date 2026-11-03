@@ -449,6 +449,7 @@ impl Session {
         true
     }
 
+    #[cfg(test)]
     pub(super) fn can_switch_to_https(&self) -> bool {
         self.https_switch_eligible().is_some()
     }

@@ -31,15 +31,14 @@ pub(crate) struct AttemptFacts<'a> {
     pub can_refresh: bool,
 }
 
-pub(crate) struct AttemptInputs {
-    pub until_deadline: Option<Duration>,
-    /// The factor already drawn by the driver: generic 0.8..=1.2, Codex 0.9..1.1.
-    pub jitter: f64,
-    /// Whether the driver's lazy switch callback would successfully switch the session.
-    pub can_switch_to_https: bool,
+pub(crate) struct AttemptInputs<J, D> {
+    /// Sampled only at a deadline veto, after delay computation and preceding effects.
+    pub until_deadline: D,
+    /// Drawn only by backoff computation: generic 0.8..=1.2, Codex 0.9..1.1.
+    pub jitter: J,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttemptState {
     /// Zero-based index of the attempt whose failure is being decided.
     attempt_index: usize,
@@ -116,6 +115,7 @@ pub(crate) enum EndReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AttemptDecision {
     RefreshAndResend,
+    SwitchToHttps(PendingHttpsSwitch),
     Resend {
         delay: Duration,
         server_advised: bool,
@@ -131,11 +131,24 @@ pub(crate) enum AttemptDecision {
     },
 }
 
-pub(crate) fn decide_attempt(
+/// Staged state is committed only after the driver's actual HTTPS-switch result is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingHttpsSwitch {
+    state: AttemptState,
+    delay: Duration,
+    server_advised: bool,
+}
+
+pub(crate) fn decide_attempt<J, D>(
     state: &mut AttemptState,
     facts: &AttemptFacts<'_>,
-    inputs: &AttemptInputs,
-) -> AttemptDecision {
+    inputs: &mut AttemptInputs<J, D>,
+) -> AttemptDecision
+where
+    J: FnMut() -> f64,
+    D: FnMut() -> Option<Duration>,
+{
+    let original = *state;
     if !facts.got_response_bytes {
         state.retry_wait_spent += facts.attempt_elapsed;
     }
@@ -168,16 +181,27 @@ pub(crate) fn decide_attempt(
         if facts.cause == Some(AttemptCause::DeterministicDecode) {
             state.decode_retries += 1;
         }
-        let decision = codex.decide_with_jitter(
+        let decision = codex.decide_before_switch(
             &CodexFailure {
                 error: facts.error,
                 outcome: &facts.outcome,
                 https: facts.over_https,
             },
-            || inputs.can_switch_to_https,
-            || inputs.jitter,
+            &mut inputs.jitter,
         );
         let (delay, server_advised, switch_to_https, reason) = match decision {
+            CodexDecision::SwitchToHttps {
+                delay,
+                server_advised,
+            } => {
+                let pending = PendingHttpsSwitch {
+                    state: *state,
+                    delay,
+                    server_advised,
+                };
+                *state = original;
+                return AttemptDecision::SwitchToHttps(pending);
+            }
             CodexDecision::Terminal { reason } => {
                 return state.end(match reason {
                     "attempt_limit" => EndReason::AttemptLimit,
@@ -197,7 +221,7 @@ pub(crate) fn decide_attempt(
                 server_advised,
             } => (delay, server_advised, true, "socket_attempt_limit"),
         };
-        if server_advised && inputs.until_deadline.is_some_and(|left| delay >= left) {
+        if server_advised && (inputs.until_deadline)().is_some_and(|left| delay >= left) {
             return AttemptDecision::EndStep {
                 reason: EndReason::RetryAfterExceedsDeadline,
                 retries_used: state.retries_used(),
@@ -217,11 +241,11 @@ pub(crate) fn decide_attempt(
     let delay = generic_delay(
         facts.error,
         state.attempt_index - state.refreshes,
-        inputs.jitter,
+        &mut inputs.jitter,
     );
     if facts.error.status == Some(429)
         && facts.error.retry_after_secs.is_some()
-        && inputs.until_deadline.is_some_and(|left| delay >= left)
+        && (inputs.until_deadline)().is_some_and(|left| delay >= left)
     {
         return state.end(EndReason::RetryAfterExceedsDeadline);
     }
@@ -237,7 +261,11 @@ pub(crate) fn decide_attempt(
     )
 }
 
-pub(crate) fn generic_delay(error: &ProviderError, ordinary_index: usize, jitter: f64) -> Duration {
+pub(crate) fn generic_delay(
+    error: &ProviderError,
+    ordinary_index: usize,
+    mut jitter: impl FnMut() -> f64,
+) -> Duration {
     if let Some(seconds) = error.retry_after_secs {
         // Preserve the retry schedule's NaN-to-zero conversion; clamp alone preserves NaN.
         let capped = if seconds.is_nan() {
@@ -251,7 +279,41 @@ pub(crate) fn generic_delay(error: &ProviderError, ordinary_index: usize, jitter
     BASE_RETRY_DELAY
         .saturating_mul(1u32 << doublings)
         .min(MAX_BACKOFF_DELAY)
-        .mul_f64(jitter)
+        .mul_f64(jitter())
+}
+
+pub(crate) fn resolve_https_switch(
+    state: &mut AttemptState,
+    facts: &AttemptFacts<'_>,
+    pending: PendingHttpsSwitch,
+    switched: bool,
+    until_deadline: impl FnOnce() -> Option<Duration>,
+) -> AttemptDecision {
+    *state = pending.state;
+    let decision = state
+        .codex
+        .as_mut()
+        .expect("only Codex requests an HTTPS switch")
+        .resolve_switch(switched, pending.delay, pending.server_advised);
+    match decision {
+        CodexDecision::Terminal { .. } => state.end(EndReason::AttemptLimit),
+        CodexDecision::FallBackToHttps {
+            delay,
+            server_advised,
+        } => {
+            if server_advised && until_deadline().is_some_and(|left| delay >= left) {
+                AttemptDecision::EndStep {
+                    reason: EndReason::RetryAfterExceedsDeadline,
+                    retries_used: state.retries_used(),
+                    switch_to_https: true,
+                    note_unrecovered_rejection: false,
+                }
+            } else {
+                state.resend(facts, delay, server_advised, true, "socket_attempt_limit")
+            }
+        }
+        _ => unreachable!("a switch resolves to fallback or terminal"),
+    }
 }
 
 /// Only a successful rejected-token refresh is charged here. Failed or unchanged refreshes

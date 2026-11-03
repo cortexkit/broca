@@ -299,16 +299,26 @@ pub(super) fn expected(case: &Case) -> Vec<Event> {
             got_response_bytes: !matches!(attempt.kind, Kind::Connect | Kind::Disconnect),
             can_refresh: case.refresh.is_some(),
         };
-        let inputs = AttemptInputs {
-            until_deadline: case.deadline.map(|d| d.saturating_sub(now)),
-            jitter: if case.policy == Policy::Generic {
-                0.8 + f64::from(attempt.jitter) / 500.0
-            } else {
-                0.9 + f64::from(attempt.jitter) / 1000.0
+        let mut inputs = AttemptInputs {
+            until_deadline: || case.deadline.map(|d| d.saturating_sub(now)),
+            jitter: || {
+                if case.policy == Policy::Generic {
+                    0.8 + f64::from(attempt.jitter) / 500.0
+                } else {
+                    0.9 + f64::from(attempt.jitter) / 1000.0
+                }
             },
-            can_switch_to_https: websocket,
         };
-        let mut next = model::decide_attempt(&mut state, &facts, &inputs);
+        let mut next = model::decide_attempt(&mut state, &facts, &mut inputs);
+        if let AttemptDecision::SwitchToHttps(pending) = next {
+            next = model::resolve_https_switch(
+                &mut state,
+                &facts,
+                pending,
+                websocket,
+                inputs.until_deadline,
+            );
+        }
         if next == AttemptDecision::RefreshAndResend {
             let refresh = case.refresh.unwrap();
             trace.push(Event::Refresh {
@@ -386,7 +396,7 @@ pub(super) fn expected(case: &Case) -> Vec<Event> {
                     model::note_waited(&mut state, delay);
                 }
             }
-            AttemptDecision::RefreshAndResend => unreachable!(),
+            AttemptDecision::RefreshAndResend | AttemptDecision::SwitchToHttps(_) => unreachable!(),
         }
     }
     panic!("attempt model did not terminate: {case:?}");
