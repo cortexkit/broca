@@ -93,6 +93,32 @@ impl subc_client_rs::ModuleHandler for AcceptanceCatalog {
     }
 }
 
+fn worker_acceptance_scope(checkout: &Path) -> serde_json::Value {
+    serde_json::json!([{
+        "ref": SCOPE_REF, "scope_epoch": SCOPE_EPOCH, "kind": "head",
+        "workdir": checkout, "attributes": {},
+        "carriers": [{
+            "principal": {"kind": "reserved", "module_id": "broca"},
+            "targets": ["aft"],
+        }],
+    }])
+}
+
+#[test]
+fn worker_acceptance_scope_authorizes_broca_for_aft() {
+    let scopes = worker_acceptance_scope(Path::new("/fixture/checkout"));
+    let _: Vec<subc_protocol::scope::ScopeRecord> = serde_json::from_value(scopes.clone())
+        .expect("the fixture follows the daemon's scope schema");
+    assert_eq!(
+        scopes[0]["carriers"],
+        serde_json::json!([{
+            "principal": {"kind": "reserved", "module_id": "broca"},
+            "targets": ["aft"],
+        }]),
+        "broca must carry the owner's scope to the plan's AFT provider"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_admission_acceptance_reads_real_run_started_gates() {
     use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, ProviderRole, Tool};
@@ -164,14 +190,7 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
     let checkout = rig.dir.join("acceptance-checkout");
     std::fs::create_dir_all(&checkout).unwrap();
     let checkout = checkout.canonicalize().unwrap();
-    rig.sync_scopes(
-        serde_json::json!([{
-            "ref": SCOPE_REF, "scope_epoch": SCOPE_EPOCH, "kind": "head",
-            "workdir": checkout, "attributes": {}, "carriers": [],
-        }]),
-        1,
-    )
-    .await;
+    rig.sync_scopes(worker_acceptance_scope(&checkout), 1).await;
     let owner = std::sync::Arc::new(rig.connect_as(OWNER, &rig.owner_nonce).await);
     let session = rig.session("worker-admission-acceptance");
     let route = open_scoped(&owner, &session).await.unwrap();
@@ -332,6 +351,90 @@ fn require_subc() -> bool {
     std::env::var_os("BROCA_REQUIRE_SUBC").is_some()
 }
 
+async fn broca_management_ready<T, Open, Opened>(mut open: Open) -> T
+where
+    Open: FnMut() -> Opened,
+    Opened: std::future::Future<Output = Result<T, broca_subc::ConnError>>,
+{
+    broca_test_support::wait_until("broca's sessionless management bind", || {
+        let opened = open();
+        async move {
+            match opened.await {
+                Ok(route) => Ok(route),
+                Err(error) if error.code() == Some("module_warming") => Err(error.to_string()),
+                Err(error) => panic!("broca startup readiness failed: {error}"),
+            }
+        }
+    })
+    .await
+}
+
+fn warming_refusal(code: &str) -> broca_subc::ConnError {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "code": code, "message": "broca is supervised but not available",
+    }))
+    .unwrap();
+    broca_subc::ConnError::Rejected(
+        broca_subc::connection::RejectedMessage::from_error_frame_body_for_test(&body),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn rig_readiness_waits_for_a_live_management_bind() {
+    let attempts = std::cell::Cell::new(0);
+    let opened = broca_management_ready(|| {
+        attempts.set(attempts.get() + 1);
+        std::future::ready(if attempts.get() == 3 {
+            Ok("management route")
+        } else {
+            Err(warming_refusal("module_warming"))
+        })
+    })
+    .await;
+    assert_eq!(opened, "management route");
+    assert_eq!(attempts.get(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn rig_readiness_refuses_nonwarming_errors_without_retrying() {
+    use futures::FutureExt;
+    for error in [
+        warming_refusal("permission_denied"),
+        warming_refusal("module_reloading"),
+        broca_subc::ConnError::Rejected("module_warming in plain text".into()),
+        broca_subc::ConnError::Transport("connection lost".into()),
+    ] {
+        let expected = error.to_string();
+        let error = std::cell::RefCell::new(Some(error));
+        let attempts = std::cell::Cell::new(0);
+        let start = tokio::time::Instant::now();
+        let panic = std::panic::AssertUnwindSafe(broca_management_ready(|| {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Err::<(), _>(
+                error
+                    .borrow_mut()
+                    .take()
+                    .expect("must not retry a terminal error"),
+            ))
+        }))
+        .catch_unwind()
+        .await
+        .expect_err("a non-warming refusal must fail readiness");
+        let report = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                panic
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+            })
+            .expect("readiness panic is text");
+        assert!(report.contains(&expected), "{report}");
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+}
+
 async fn project_identity_open(
     connection: &SubcConnection,
     identity: &broca_protocol::BindIdentity,
@@ -365,6 +468,7 @@ async fn project_identity_existing_unscoped_and_scoped_resume_on_legacy_addresse
         let Some(rig) = Rig::start().await else {
             return;
         };
+        rig.wait_for_broca_ready().await;
         if scoped {
             rig.sync_scopes(
                 serde_json::json!([{
@@ -812,6 +916,29 @@ impl Rig {
             sleep(Duration::from_millis(25)).await;
         }
         Some(rig)
+    }
+
+    async fn wait_for_broca_ready(&self) {
+        // The process image and connection file can precede store initialization and
+        // HELLO. A permissions-role bind observes readiness without creating a session.
+        let connection =
+            SubcConnection::connect_with_consumer_identity(&self.connection_file, None)
+                .await
+                .expect("connect for broca readiness");
+        let identity = broca_protocol::BindIdentity::new("broca-unscoped-v1", "", "");
+        let route = broca_management_ready(|| {
+            connection.route_open_management_roles_within(
+                "broca",
+                &identity,
+                std::collections::BTreeMap::from([("permissions".into(), "v1".into())]),
+                RouteOpenRetry::within(Duration::ZERO, Duration::ZERO),
+            )
+        })
+        .await;
+        connection
+            .route_close(&route)
+            .await
+            .expect("close readiness route");
     }
 
     async fn wait_for_file(&self, path: &Path) -> String {
@@ -1430,6 +1557,7 @@ async fn real_basal_sender_guard_protects_other_runs_and_allows_own_flow() {
     let Some(rig) = Rig::start().await else {
         return;
     };
+    rig.wait_for_broca_ready().await;
     rig.sync_scope_with(Some("flow-a"), 1).await;
     let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
     let basal = rig.connect_as(CARRIER, &rig.carrier_nonce).await;
