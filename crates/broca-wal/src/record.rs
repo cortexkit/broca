@@ -652,6 +652,12 @@ impl<'de> Deserialize<'de> for StoredViewEdit {
 /// sites pick out a few variants and end in `_ =>`; those skip `Unknown` by construction and
 /// will also say nothing when a variant is added. Do not add new wildcard arms to silence
 /// the compiler at an exhaustive site: name the variant.
+// The gap between the largest variant (`RunStarted`, with its frozen config and scope) and the
+// small ones exceeds clippy's threshold on the Windows target, where some of those fields are
+// larger. Boxing `RunStarted` would touch every constructor of the most-written record; the
+// cost it would save is the full enum size held per record during a whole-log replay, which
+// predates this allow and belongs to the replay redesign, not to a field-by-field patch.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(remote = "Self", tag = "type", rename_all = "snake_case")]
 pub enum WalRecord {
