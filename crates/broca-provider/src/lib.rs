@@ -9,6 +9,10 @@
 //! subcommands, not in this library surface.
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "live")]
+#[allow(dead_code)]
+pub(crate) mod attempt_policy;
+
 pub mod cache_evidence;
 mod cache_hints;
 pub mod cache_markers;
