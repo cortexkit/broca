@@ -171,9 +171,12 @@ placement cannot acquire a writer; `session.head` and the other read surfaces st
 Explicit frame requirements count even when the decoded record has no compaction fields.
 Archive restoration checks requirements in the already-loaded bytes before publishing a
 live copy. Run-initiated retention checks reuse their existing full read before deleting an
-expired lineage. An actorless run with neither a terminal nor a durable pause reads as
-interrupted on all read surfaces without writing a seal; recorded terminals and pauses
-keep their recorded states and reasons.
+expired lineage. `run.status` and `run.result` establish the read-only run-state policy:
+a run with no live session actor, terminal or durable pause reads as interrupted without
+writing a seal; recorded terminals and pauses keep their states and reasons. Pure transcript
+reads, tag resolution and head use only policy facts already held or cached, never an extra
+read of the WAL from byte zero. A cold bounded read with unknown compatibility keeps its
+pre-existing state until a run-state endpoint establishes the policy.
 
 **The feature floor.** Before the first frame that requires a feature, the writer adds the
 feature to `wal-feature-floor` in the state root (next to `wal/`): one name per line, sorted,
