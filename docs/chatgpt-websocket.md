@@ -124,10 +124,11 @@ transport choices do not reset the retry count.
 
 ## Retries
 
-This family and the API-key `OpenAiResponses` family retry exactly as Codex does (revision
-af91f6ef2c), in `crates/broca-provider/src/transport_codex_retry.rs`. Codex runs both families
-through one retry path. Every other family keeps broca's schedule (six sends, 2 s doubling
-backoff, `Retry-After` capped at 120 s, 240 s waiting budget).
+This family and the API-key `OpenAiResponses` family retry as Codex does (revision
+af91f6ef2c), in `crates/broca-provider/src/transport_codex_retry.rs`, with one difference:
+broca bounds connect failures (see **Counts**). Codex runs both families through one retry path.
+Every other family keeps broca's schedule (six sends, 2 s doubling backoff, `Retry-After`
+capped at 120 s, 240 s waiting budget).
 
 - **Server retry time.** Only the `Retry-After` header (whole seconds or an HTTP date) counts,
   read from an HTTPS answer, a refused upgrade, or the `headers` of a wrapped socket error frame
@@ -150,11 +151,13 @@ backoff, `Retry-After` capped at 120 s, 240 s waiting budget).
 - **Counts.** An HTTPS send first gets Codex's request-layer retries: a connect failure, header
   timeout, failure before a status, or 5xx answer is re-sent up to 4 times, waiting for the
   server's time or 200 ms doubling (jittered the same way). A 429 skips that layer. After that,
-  up to 5 stream retries follow. Each one starts a fresh request layer. A connect failure is
-  retried without limit, waiting 5 s and doubling to 60 s with no jitter. It ignores any server
-  time and doesn't count against the 5 retries. Only cancel, shutdown or the step deadline
-  stop it. Each send writes one content-free attempt record, roughly 285 an hour while an
-  endpoint stays unreachable.
+  up to 5 stream retries follow. Each one starts a fresh request layer. A connect failure waits
+  5 s, doubling to 60 s with no jitter, ignores any server time, and doesn't count against the 5
+  stream retries. Unlike Codex, which retries a connect failure without limit for a person
+  watching, broca ends the step after the sixth failed connect in it, counted across both layers
+  and across the HTTPS fallback, with a transient `connection_failed` error. A headless caller
+  can then retry or reroute rather than wait out an outage. From the first failed connect, the
+  step ends in under 5 minutes.
 - **Fallback.** When the 5 stream retries are spent on the socket, the run switches to HTTPS
   for the rest of the run. It waits out the server's time if one was given, and starts a fresh
   count of 5 retries. A step already on HTTPS is not switched again, so the next exhausted

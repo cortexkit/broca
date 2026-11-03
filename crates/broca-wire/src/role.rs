@@ -343,6 +343,7 @@ pub use cortexkit_role_llm_runner::capabilities::RUN_TOOL_CALLS as RUN_TOOL_CALL
 /// Discovery and caller grants use the same supported delivery modes.
 pub const DELIVERY_MODES: &[cortexkit_role_llm_runner::delivery_order::Mode] = &[
     cortexkit_role_llm_runner::delivery_order::Mode::ToolResult,
+    cortexkit_role_llm_runner::delivery_order::Mode::TurnSystem,
     cortexkit_role_llm_runner::delivery_order::Mode::Steer,
     cortexkit_role_llm_runner::delivery_order::Mode::IdleStart,
 ];
@@ -424,8 +425,8 @@ pub fn broca_role_describe_with_writers(
         // A mid-session plan change: refresh, its policy and a prefix flush. All three
         // ops are served together, owner-only; the group is declared only then.
         cortexkit_role_llm_runner::capabilities::SESSION_CHANGE,
-        // Ordered sends can land beside tool results, at a running step boundary, or when an
-        // idle session starts. `turn_system` has no renderer and is deliberately not advertised.
+        // Ordered sends can land beside tool results, as turn-scoped template text on a
+        // confirmed route, at a running step boundary, or when an idle session starts.
         DELIVERY_ORDER_GROUP,
         cortexkit_role_llm_runner::capabilities::SENDER_SUCCESSION,
         // Client identity belongs to the display envelope, never to a model-visible message.
@@ -1188,7 +1189,7 @@ mod pinned_reply_bytes {
         let encoded = serde_json::to_value(broca_role_describe("test")).unwrap();
         assert_eq!(
             encoded["delivery_order_modes"],
-            serde_json::json!(["tool_result", "steer", "idle_start"])
+            serde_json::json!(["tool_result", "turn_system", "steer", "idle_start"])
         );
     }
 
@@ -1261,7 +1262,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "57ee36a2dfcdf4a002269949c1a72d32d888ee172d14a7a624fe91b12cbce22e",
+            "7c28492fb6522287ff780564d94e0b08e0bcbc4ff567c971ddd7cfb38824f619",
         );
     }
 
@@ -1439,7 +1440,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "9837325639bc53a7a696cbf983c6054267ad85358f8b16ecd58760490a646309";
+        "8eb2dc78de4b1c1f516992596f3e6fddd41fbd755bdc497c70fad84ba3374363";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

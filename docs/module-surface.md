@@ -324,6 +324,13 @@ message and field; it does not invent a `preset_missing` difference for a nonexi
 
 ### Health counters and per-request diagnostics
 
+`health.check.metrics.refusal_schedule_unrecorded_replays` counts prior reconstructions
+that require complete WAL replay because the legacy materialized prefix has no recorded
+refusal state at its watermark. It is a process-lifetime counter, present at zero. A
+recorded empty schedule needs no extra WAL read and does not increment it. Projection
+writes record the state so later resumes can use the prefix again; an older writer's
+replaced row or stale watermark-bound checkpoint requires replay rather than guessing.
+
 `health.check.metrics.tool_routes` is an in-memory census of the shared tool-provider route
 cache. It reports `open_session_actors`, `cached_routes`, `cached_routes_per_provider`,
 `oldest_route_idle_secs` (null for an empty cache), `routes_for_closed_sessions` (normally zero),
@@ -536,6 +543,17 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   build that does not know the inherited set still runs it on the session's model.
   With the service-tier writer enabled, `service_tier` follows the fixed-run rules below
   instead of inheriting from an ended run.
+
+- Ordered delivery advertises `tool_result`, `turn_system`, `steer` and `idle_start` globally.
+  A `turn_system` delivery requires a validated plan template and a legal position on the
+  frozen provider route. Responses renders a `developer` input item in conversation order,
+  never top-level `instructions`. Anthropic requires the provider's explicit
+  `capability.mid_conversation_system` catalog fact and renders a persistent `system` message
+  after a user turn or tool result, at the end of the request; it adds neither `clear_at` nor
+  a beta header. An absent fact is unsupported, not an admission failure. Gemini and other
+  unsupported routes skip to the next listed mode, or keep the send pending if none is
+  possible. A stored system entry switched to an unsupported route renders as user text
+  without changing the stored role, text or delivery mode.
 
 Broca does not send `service_tier` to account routing; a tier chosen by a router reaches broca
 only through the caller's send. Broca does not report `service_tier_applied` or

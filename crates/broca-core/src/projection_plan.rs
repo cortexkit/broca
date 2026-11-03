@@ -145,6 +145,7 @@ impl ProjectionPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedProjection {
+    pub refusal_json: String,
     pub head_json: String,
     pub message_times: Vec<Option<u64>>,
     pub episode_spans: Vec<std::ops::Range<u64>>,
@@ -413,6 +414,7 @@ pub fn plan_projection(
         episode_spans,
         open_episode_span,
         episode_metadata,
+        refusal,
     ) = if let Some(seed) = incremental_seed {
         // A seed stored before the ownership summary existed (or before it recorded the frozen
         // plan manifest) cannot carry it forward: the summary covers every episode, and the
@@ -439,6 +441,7 @@ pub fn plan_projection(
             delta.episode_spans,
             delta.open_episode_span,
             delta.episodes,
+            delta.refusal,
         )
     } else {
         // Legacy or malformed checkpoint metadata asks the caller for a complete WAL read;
@@ -488,6 +491,10 @@ pub fn plan_projection(
             episode_spans,
             open_episode_span,
             Some(episode_metadata),
+            crate::refusal_fallback::RefusalReplayState {
+                schedule: prefix_state.refusal_fallback,
+                refused_steps: prefix_state.refused_steps,
+            },
         )
     };
 
@@ -535,6 +542,7 @@ pub fn plan_projection(
     // from the WAL to know the run ended. Replay those unmaterialized records too, persisting
     // their final-message metadata without moving the watermark past that terminal record.
     let final_seed = ProjectionSeed {
+        refusal: refusal.clone(),
         watermark_seq: new_watermark,
         prefix_len: (next_ord as u64).saturating_add(new_messages.len() as u64),
         completed_steps,
@@ -552,7 +560,7 @@ pub fn plan_projection(
         .cloned()
         .collect();
     let episode = final_seed.admission_checkpoint.last_episode.as_ref();
-    let final_state = crate::replay::replay_seeded(
+    let final_state = crate::replay::replay_seeded_with_refusal(
         suffix.iter().map(|frame| &frame.record),
         episode.map(|episode| episode.config.model.clone()),
         final_seed.last_run_id.clone(),
@@ -564,6 +572,7 @@ pub fn plan_projection(
         false,
         // Only run metadata of this replay is persisted, never its messages or their tags.
         crate::tags::TagSeed::default(),
+        final_seed.refusal,
     )?;
     let final_run_json = final_state
         .run_finals
@@ -614,6 +623,10 @@ pub fn plan_projection(
     let lineage_id = incoming_lineage_id.or_else(|| expected_lineage_id.clone());
 
     Ok(ProjectionPlan::Write(Box::new(PreparedProjection {
+        refusal_json: serde_json::to_string(&crate::refusal_fallback::RefusalReplayCheckpoint {
+            at_seq: new_watermark,
+            state: refusal,
+        })?,
         message_times,
         head_json: serde_json::to_string(&admission_checkpoint.head)?,
         episode_spans,

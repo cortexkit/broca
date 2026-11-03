@@ -53,7 +53,7 @@ class MaintenanceTests(unittest.TestCase):
             db.execute("CREATE TABLE meta (session TEXT PRIMARY KEY, prefix_len INT)")
             db.execute("CREATE TABLE message (session TEXT, body TEXT)")
             db.execute("CREATE TABLE run_index (run_id TEXT PRIMARY KEY, session TEXT)")
-            db.execute("INSERT INTO meta VALUES (?, 0)", (self.old_key,))
+            db.execute("INSERT INTO meta (session, prefix_len) VALUES (?, 0)", (self.old_key,))
         db.close()
         (self.root / "wal" / rekey.wal_name(self.old_key)).write_bytes(b"")
         payload = bytes(range(16))

@@ -2224,6 +2224,9 @@ async fn handle_control_request(
             metrics["account_limit_pause_declined"] = broca_core::account_limit_pause_declined();
             metrics["account_limit_hold_cap_unknown"] =
                 serde_json::json!(crate::account_routing::account_limit_hold_cap_unknown());
+            metrics["refusal_schedule_unrecorded_replays"] = serde_json::json!(
+                broca_core::refusal_fallback::refusal_schedule_unrecorded_replays()
+            );
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
                 // status Ok. Fusiform reachability is deliberately absent because health never
@@ -10536,9 +10539,11 @@ mod delivery_list_tests {
         .unwrap();
         let before = serde_json::to_value(&params.delivery).unwrap();
         let describe = broca_wire::broca_role_describe("test").role;
+        assert!(delivery_list_refusal(params.delivery.as_ref(), &describe).is_none());
+        let describe = describe.with_delivery_order_modes(vec!["steer".into()]);
         let refusal = serde_json::to_value(
             delivery_list_refusal(params.delivery.as_ref(), &describe)
-                .expect("turn_system has no landing path"),
+                .expect("a narrowed declaration must still refuse turn_system"),
         )
         .unwrap();
         assert_eq!(refusal["code"], broca_wire::DELIVERY_UNSUPPORTED);

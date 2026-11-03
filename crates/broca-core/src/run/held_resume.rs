@@ -115,6 +115,7 @@ fn load_held(input: &HeldInput) -> Result<Option<ReplayState>, String> {
         .episodes
         .ok_or("store keeps no usable episode projection")?;
     let seed = PrefixSeed {
+        refusal: prefix.refusal,
         prefix_len: prefix.prefix_len,
         completed_steps: prefix.completed_steps,
         usage: prefix.usage,

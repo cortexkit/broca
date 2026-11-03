@@ -62,31 +62,8 @@ VERSION=$(awk -F'"' '/^version = "/ {print $2; exit}' Cargo.toml)
 # a struct field, changing control flow -- all invisible to `strings`, all visible as a
 # monomorphized symbol in `nm`. Searching only strings makes those releases look unchanged,
 # which is the same wrong answer as an absent marker and arrives wearing a measurement.
-probe_hits() { # <file> <needle>
-    # -F IS LOAD-BEARING. The marker is documented as a literal string, and without it grep reads
-    # metacharacters as a pattern: a marker like run_index.db also matches run_indexXdb, inflating
-    # the staged count and making a marker look discriminating when a literal search would show
-    # 1/1 -- no release change at all. That fails in the REASSURANCE direction, certifying an
-    # artifact whose marker proves nothing, which is the direction nobody trips over later.
-    #
-    # verify-deploy.sh's identical probe was fixed the same night this one was not. Same function,
-    # same body, one twin repaired -- so if a third copy of this appears, fix all of them.
-    #
-    # REPORTS THE TABLES SEPARATELY, AND THAT IS THE POINT RATHER THAN DETAIL. This used to echo
-    # `s + n`, so a count of 1 could be a string constant or a symbol and the caller could not tell.
-    # Measured 2026-09-10: I put `stop_and_seal 1/0` on a release card from this tool; the placing
-    # seat read `strings` only, got 0/0, and correctly refused. Both numbers were honest --
-    # stop_and_seal survives as a SYMBOL and never appears as a string.
-    #
-    # A COUNT WITHOUT ITS TABLE MEANS TWO THINGS DEPENDING ON THE READER'S TOOL. That one failed
-    # loud (0/0 refuses). The inverse is the dangerous shape: a marker reading 1/0 here and 1/1 in
-    # a strings-only check would pass both seats while proving nothing about the artifact.
-    local s n listing
-    listing=$(strings "$1") || return $?
-    s=$(grep -F -c -- "$2" <<<"$listing" || true)
-    n=$(nm -a "$1" 2>/dev/null | grep -F -c -- "$2" || true)
-    echo "$s $n"
-}
+source "$ROOT/scripts/lib/artifact-probe.sh"
+probe_hits() { broca_artifact_hits "$@"; }
 
 # THE VERDICT AS ONE FUNCTION: removal assertion, marker/control readings, card lines,
 # discriminate refusal. Called at the end of a real staging run and by --probe-only.

@@ -10,6 +10,7 @@ mod anthropic_conformance;
 mod bedrock_converse_conformance;
 mod conformance_catches_bugs;
 mod gemini_conformance;
+mod generated_streams;
 mod generation_render;
 mod google_codeassist_conformance;
 mod live_parts;

@@ -10,6 +10,7 @@ import tempfile
 import uuid
 
 from lib.archive_read import ArchiveRefusal, read_records
+from lib.acceptance_contract import UNSCOPED_SESSION_ROOT, bind_no_project
 from lib.state_root import default_state_root
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -204,13 +205,14 @@ def main():
                 compose_plan(base + ["--session", "acceptance-plan-" + uuid.uuid4().hex], args.timeout, plan_path)
                 print("acceptance-worker-turn: COMPOSE ONLY -- no send", flush=True)
                 return 0
-            return run_models(base, args, state_root, project_root, plan_path)
+            no_project = bind_no_project(description)
+            return run_models(base, args, state_root, project_root, plan_path, no_project)
     except (ArchiveRefusal, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
         print(f"acceptance-worker-turn: FAILED -- {error}", file=sys.stderr)
         return 1
 
 
-def run_models(base, args, state_root, project_root, plan_path):
+def run_models(base, args, state_root, project_root, plan_path, no_project):
     models = candidates(args.model)
     # The reader fetch-plan preset is legal unscoped; worker requires a daemon-attested session scope.
     # No tool call is needed: declarations freeze during admission, before the model turn.
@@ -220,7 +222,11 @@ def run_models(base, args, state_root, project_root, plan_path):
     max_output_tokens = "2048"
     for index, model in enumerate(models, 1):
         session = "acceptance-plan-" + uuid.uuid4().hex
-        path = state_root / "wal" / wal_name(project_root, "broca", session)
+        # Neither session.head nor the send receipt carries a physical WAL address.
+        # These fresh, unscoped pairs use the declared namespace on no-project builds;
+        # the client's bound event only echoes its local --project-root hint.
+        storage_root = UNSCOPED_SESSION_ROOT if no_project else project_root
+        path = state_root / "wal" / wal_name(storage_root, "broca", session)
         print(f"acceptance-worker-turn: attempt {index}/{len(models)} model={model}", flush=True)
         try:
             output = composed_turn(base + ["--session", session],

@@ -571,6 +571,7 @@ impl MeasuredPrefixStore {
         let lineage_id = range.lineage_id.map(|id| id.to_string());
         Self {
             prefix: StorePrefix {
+                refusal: Some(Default::default()),
                 lineage_id: lineage_id.clone(),
                 prefix: state.prompt,
                 completed_steps: state.completed_steps,

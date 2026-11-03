@@ -50,6 +50,9 @@ pub use model_page::{
 /// counters it reflects + the WAL seq watermark + the context epoch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePrefix {
+    /// Refusal state at this watermark. None means an older writer did not record it;
+    /// the prior must then be reconstructed from the complete WAL, not an empty seed.
+    pub refusal: Option<crate::refusal_fallback::RefusalReplayState>,
     /// WAL identity captured in the same transaction as the messages and watermark.
     /// Readers must compare it with the authoritative WAL before merging this prefix.
     pub lineage_id: Option<String>,
@@ -80,6 +83,7 @@ impl StorePrefix {
     /// (the merge then degenerates to a full-WAL replay).
     pub fn empty() -> Self {
         Self {
+            refusal: Some(Default::default()),
             lineage_id: None,
             prefix: Vec::new(),
             completed_steps: 0,
@@ -373,6 +377,7 @@ pub(crate) fn finish_offset_prompt_window(
 /// with the WAL tail would take from it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeldPrefix {
+    pub refusal: Option<crate::refusal_fallback::RefusalReplayState>,
     /// WAL identity captured in the same transaction; compared with the WAL before merging.
     pub lineage_id: Option<String>,
     pub watermark_seq: u64,
@@ -2254,6 +2259,7 @@ pub fn resume_state_from_store(
     budget_state: Option<crate::BudgetReplayStateV1>,
 ) -> Result<crate::ReplayState, crate::ReplayError> {
     let seed = PrefixSeed {
+        refusal: prefix.refusal.clone(),
         prefix_len: prefix.prefix.len() as u64,
         completed_steps: prefix.completed_steps,
         usage: prefix.usage,
@@ -2279,6 +2285,7 @@ pub fn resume_state_from_store(
 /// [`MaterializedStore::read_held_prefix`]) seeds the tail exactly as a merge of all of them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PrefixSeed {
+    pub refusal: Option<crate::refusal_fallback::RefusalReplayState>,
     /// How many transcript messages the prefix holds: the tail's first ordinal.
     pub prefix_len: u64,
     pub completed_steps: u64,
@@ -2320,10 +2327,14 @@ pub(crate) fn merge_prefix_and_tail(
     run_id: Option<crate::RunId>,
     budget_state: Option<crate::BudgetReplayStateV1>,
 ) -> Result<(crate::ReplayState, TailEpisodes), crate::ReplayError> {
+    let refusal = seed.refusal.clone().ok_or_else(|| {
+        crate::refusal_fallback::note_unrecorded_replay();
+        crate::ReplayError::UnrecordedRefusalSchedule
+    })?;
     let abandoned = materialized_zero_step_seed_was_interrupted(seed.completed_steps, tail);
     // Seed the mid-episode tail's origin from the prefix's trailing assistant turn (see
     // `effective_context`) so a resumed turn stamps the same model a full replay would.
-    let tail_state = crate::replay::replay_seeded(
+    let tail_state = crate::replay::replay_seeded_with_refusal(
         tail,
         seed.trailing_origin.clone(),
         run_id.clone(),
@@ -2332,6 +2343,7 @@ pub(crate) fn merge_prefix_and_tail(
         if abandoned { 0 } else { seed.prefix_len },
         seed.prefix_len > 0,
         seed.tag_seed,
+        refusal,
     )?;
     // A view the prefix's leading records applied or replaced: a replacement at the transcript's
     // start, so the prompt no longer leads with the lineage's first message and the tail's
@@ -2491,7 +2503,9 @@ pub(crate) fn merge_prefix_and_tail(
         // `latest_projection_boundary`), so every unplaced steer is in the tail.
         pending_steers: tail_state.pending_steers,
         resolution: tail_state.resolution,
-        // Only what the tail recorded: the materialized prefix keeps no schedule.
+        // Tail replay starts with the prefix's refusal state, then applies each later
+        // admission and step once. Projection catching up must preserve the refusal
+        // schedule already carried through tail replay.
         refusal_fallback: tail_state.refusal_fallback,
         refused_steps: tail_state.refused_steps,
         committed_tool_turns: Vec::new(),
@@ -3491,6 +3505,7 @@ mod tests {
         (
             framed,
             StorePrefix {
+                refusal: Some(Default::default()),
                 lineage_id: None,
                 prefix,
                 completed_steps: committed_state.completed_steps,
@@ -3777,6 +3792,7 @@ mod tests {
         let watermark = framed.len() as u64 - 1;
         let committed = replay(&wal[..watermark as usize]).expect("committed prefix replays");
         let prefix = StorePrefix {
+            refusal: Some(Default::default()),
             lineage_id: None,
             prefix: committed.prompt,
             completed_steps: committed.completed_steps,
@@ -4179,6 +4195,7 @@ mod episode_merge_regression {
         let projected = crate::replay(&wal[..2]).expect("episode A prefix replays");
         let stored_messages = projected.prompt;
         let prefix = StorePrefix {
+            refusal: Some(Default::default()),
             lineage_id: None,
             prefix: stored_messages,
             completed_steps: projected.completed_steps,

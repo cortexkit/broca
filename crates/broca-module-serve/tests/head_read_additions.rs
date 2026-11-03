@@ -273,7 +273,7 @@ async fn recorded_read_times_and_caller_head_grants_match_serve_goldens() {
             8,
             "owner",
             "session_head.owner.json",
-            vec!["tool_result", "steer", "idle_start"],
+            vec!["tool_result", "turn_system", "steer", "idle_start"],
             true,
             true,
         ),
@@ -281,7 +281,7 @@ async fn recorded_read_times_and_caller_head_grants_match_serve_goldens() {
             9,
             "named",
             "session_head.named.json",
-            vec!["tool_result", "steer"],
+            vec!["tool_result", "turn_system", "steer"],
             false,
             false,
         ),
@@ -297,7 +297,7 @@ async fn recorded_read_times_and_caller_head_grants_match_serve_goldens() {
             11,
             "starter",
             "session_head.starter.json",
-            vec!["tool_result", "steer", "idle_start"],
+            vec!["tool_result", "turn_system", "steer", "idle_start"],
             true,
             false,
         ),
@@ -428,7 +428,7 @@ async fn planless_head_reports_a_grant_only_to_its_owner() {
         if caller == "owner" {
             assert_eq!(
                 head["sender"],
-                json!({"modes":["tool_result","steer","idle_start"],"interrupt":true,"owner":true})
+                json!({"modes":["tool_result","turn_system","steer","idle_start"],"interrupt":true,"owner":true})
             );
         } else {
             assert!(head.get("sender").is_none());
@@ -514,7 +514,7 @@ async fn ownerless_legacy_head_matches_permissive_real_send_admission() {
     );
     assert_eq!(
         head["sender"],
-        json!({"modes":["tool_result","steer","idle_start"],"interrupt":true,"owner":true})
+        json!({"modes":["tool_result","turn_system","steer","idle_start"],"interrupt":true,"owner":true})
     );
     rig.script.push(&[Step::Text("accepted legacy send")]);
     let send = rig
@@ -700,6 +700,10 @@ async fn reasoning_tokens_are_an_output_breakdown_on_run_and_session_spend() {
     assert_eq!(answer["usage"]["reasoning_tokens"], 7);
     assert_eq!(answer["usage"]["input_tokens"], 16);
     assert_eq!(answer["usage"]["steps"], 2);
+    assert_eq!(
+        answer["sender"]["modes"],
+        json!(["tool_result", "turn_system", "steer", "idle_start"])
+    );
     capture_known_with_run(&head, "session_head.reasoning_usage.json", Some(&run));
     rig.finish().await;
 }
