@@ -118,13 +118,13 @@ pub struct ProviderHttpClient {
     cache_sessions: cache_runtime::Sessions,
     #[cfg(feature = "test-harness")]
     warm_reply: Option<Bytes>,
-    /// Tests only: when set, every send fails at once with a refused connection, without
+    /// Tests only: the number of upcoming sends to refuse immediately, without
     /// opening a socket. A refused localhost connect takes seconds on some platforms, so a
     /// test that needs many connect failures in a bounded window cannot dial a real closed
     /// port; this keeps the failure and its `ConnectFailed` outcome while removing the
     /// operating system from the timing.
     #[cfg(test)]
-    fail_connects: bool,
+    fail_connects: Arc<AtomicUsize>,
 }
 
 struct JournaledHttpClients {
@@ -181,7 +181,7 @@ impl ProviderHttpClient {
             #[cfg(feature = "test-harness")]
             warm_reply: None,
             #[cfg(test)]
-            fail_connects: false,
+            fail_connects: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -233,7 +233,7 @@ impl ProviderHttpClient {
     /// step's one escape attempt fails the same way the primary pool does.
     #[cfg(test)]
     fn with_test_hooks_from(mut self, source: &Self) -> Self {
-        self.fail_connects = source.fail_connects;
+        self.fail_connects = source.fail_connects.clone();
         self
     }
 
@@ -283,7 +283,7 @@ impl From<reqwest::Client> for ProviderHttpClient {
             #[cfg(feature = "test-harness")]
             warm_reply: None,
             #[cfg(test)]
-            fail_connects: false,
+            fail_connects: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -2352,8 +2352,9 @@ impl StreamRateWindow {
 //
 // The two OpenAI Responses families (`openai_responses` and `openai_responses_chatgpt`) do not
 // use this schedule. They take Codex's retry decision instead: see `codex_retry`. For them
-// there is no MAX_ATTEMPTS, cap on the server's time or waiting budget. The permanent-class,
-// `x-should-retry: false`, exhausted-account and second-decode-failure vetoes and the 401
+// only connection failures share MAX_ATTEMPTS across both retry layers; there is no cap on
+// the server's time or waiting budget. The permanent-class, `x-should-retry: false`,
+// exhausted-account and second-decode-failure vetoes and the 401
 // re-send apply to them unchanged.
 const MAX_ATTEMPTS: usize = 6;
 const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -3102,7 +3103,7 @@ where
     // `credential_refresh` is the evidence the next attempt's record carries when it goes out
     // with a token refreshed inside this step, by either the 401 path or the pre-send check.
     // The OpenAI Responses families count their retries the way Codex does, in `codex_retry`;
-    // for them the loop itself sets no attempt limit.
+    // for them the loop itself sets no attempt limit; the policy bounds connection failures.
     let mut codex =
         codex_retry::applies(request.family).then(codex_retry::CodexRetryState::default);
     let mut attempt_budget = if codex.is_some() {
@@ -3345,7 +3346,7 @@ where
         step_seal.end_attempt();
         match result {
             Ok(completion) => return Ok((completion, attempt_index as u32)),
-            Err(failure) => {
+            Err(mut failure) => {
                 if is_rejected_token(&failure.error) {
                     let rejected_status = failure.error.status.unwrap_or(401);
                     let Some(recovery) = auth_recovery.as_mut() else {
@@ -3457,12 +3458,21 @@ where
                     );
                     let (delay, server_advised, decision, reason) = match decision {
                         codex_retry::CodexDecision::Terminal { reason } => {
-                            let decision = if reason == "attempt_limit" {
-                                "attempts_exhausted"
-                            } else {
-                                "not_retryable"
-                            };
+                            let decision =
+                                if matches!(reason, "attempt_limit" | "connection_attempt_limit") {
+                                    "attempts_exhausted"
+                                } else {
+                                    "not_retryable"
+                                };
                             warn_attempt_retry(&failure, &trace, decision, reason);
+                            if reason == "connection_attempt_limit" {
+                                failure.error.class = ErrorClass::Transient;
+                                failure.error.provider_code = Some("connection_failed".into());
+                                failure.error.message = format!(
+                                    "connection failed after {MAX_ATTEMPTS} failed attempts: {}",
+                                    failure.error.message
+                                );
+                            }
                             return Err((failure.error, attempt_index as u32));
                         }
                         codex_retry::CodexDecision::Retry {
@@ -4170,7 +4180,13 @@ async fn send_attempt(
     }
     // A deterministic connect refusal still reserves an attempt, but never stamps a send.
     #[cfg(test)]
-    if client.fail_connects {
+    if client
+        .fail_connects
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+    {
         return Err(AttemptFailure::transport(
             transport_error("refused test connection (no socket opened)"),
             AttemptOutcome::ConnectFailed,
@@ -12306,84 +12322,123 @@ mod tests {
         }
     }
 
-    /// An endpoint that refuses every connection is retried without limit, as Codex's
-    /// `unbounded_connection_retries` does: each round is one send and four request-layer
-    /// re-sends at Codex's backoff, then a connect wait of 5 s doubling to 60 s. Every send
-    /// leaves its attempt record. Only the caller's cancel ends it, promptly and without an
-    /// error.
-    ///
-    /// The refusal is injected, not dialed: a refused localhost connect takes seconds on
-    /// some platforms, so forty real refusals cannot fit the bounded wait below. The seam
-    /// fails the connect before any socket opens, and the `ConnectFailed` outcome it feeds
-    /// the retry decision is the production refusal's.
+    /// A headless step must return an actionable transient failure instead of waiting for a
+    /// connection forever. Inject refusals and retry waits so no socket or real backoff is needed.
     #[tokio::test]
-    async fn codex_unreachable_endpoint_retries_until_cancelled() {
-        let address = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        };
-        let mut frozen = openai_chat_frozen_config("retry-test");
-        frozen.family_id = WireFamilyId::OpenAiResponses;
-        // Never dialed: the test client refuses the connect before any socket opens.
-        frozen.base_url = Some(format!("http://{address}"));
-        let mut provider = LiveProvider::new(RetryTestFamily::new(0), frozen, AuthHandle::None);
-        provider.client.fail_connects = true;
-        let waits = use_virtual_retry_waits(&mut provider);
-        let cancel = CancellationToken::new();
-        let mut rx = provider.start_step(
-            StepId(1),
-            Arc::new(CallOptions::new(Vec::new())),
-            cancel.clone(),
-            None,
-        );
-        const SENDS: usize = 40;
-        let mut recorded = 0;
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while recorded < SENDS {
-                match rx.recv().await {
-                    Some(NormalizedEvent::Control(ProviderControl::AttemptFinished {
-                        attempt,
-                    })) => {
+    async fn codex_connection_failures_end_the_step_after_six_attempts() {
+        for family in CODEX_FAMILIES {
+            let server = ScriptedServer::start(Vec::new()).await;
+            let mut provider = family_retry_test_provider(&server, family);
+            provider
+                .client
+                .fail_connects
+                .store(usize::MAX, Ordering::SeqCst);
+            let waits = use_virtual_retry_waits(&mut provider);
+            let mut rx = provider.start_step(
+                StepId(1),
+                Arc::new(CallOptions::new(Vec::new())),
+                CancellationToken::new(),
+                None,
+            );
+            let events = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut events = Vec::new();
+                let mut attempts = 0;
+                while let Some(event) = rx.recv().await {
+                    if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
+                        &event
+                    {
                         assert_eq!(attempt.outcome, AttemptOutcome::ConnectFailed);
-                        recorded += 1;
+                        assert_eq!(attempt.attempt, attempts);
+                        attempts += 1;
+                        assert!(attempts <= 6, "connection retry bound exceeded: {family:?}");
                     }
-                    Some(NormalizedEvent::Control(ProviderControl::Error { error, .. })) => {
-                        panic!("an unreachable endpoint must not end the step: {error:?}")
-                    }
-                    Some(_) => {}
-                    None => panic!("the step ended before it was cancelled"),
+                    events.push(event);
                 }
-            }
-        })
-        .await
-        .expect("connect failures keep being retried");
-        cancel.cancel();
-        let started = Instant::now();
-        let rest = tokio::time::timeout(Duration::from_secs(1), async {
-            let mut rest = Vec::new();
-            while let Some(event) = rx.recv().await {
-                rest.push(event);
-            }
-            rest
-        })
-        .await
-        .expect("the cancelled step stops promptly");
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(terminal_error_if_any(&rest).is_none(), "{rest:?}");
+                assert_eq!(attempts, 6);
+                events
+            })
+            .await
+            .expect("connection exhaustion must end the step without cancellation");
+            let error = terminal_error(&events);
+            assert_eq!(error.class, ErrorClass::Transient);
+            assert_eq!(error.provider_code.as_deref(), Some("connection_failed"));
+            assert!(error.message.contains("connection failed"), "{error:?}");
+            assert_eq!(provider.family.render_calls.load(Ordering::SeqCst), 1);
+            assert!(server.request_bodies().is_empty(), "no request was sent");
+            let digests = attempt_digests(&events);
+            assert_eq!(digests.len(), 6);
+            assert!(digests.iter().all(|digest| digest == &digests[0]));
 
-        let waits = waits.lock().unwrap().clone();
-        assert!(waits.len() >= SENDS - 1);
-        let connect_waits: Vec<_> = waits.iter().skip(4).step_by(5).copied().collect();
-        assert_eq!(
-            connect_waits[..7],
-            [5, 10, 20, 40, 60, 60, 60].map(Duration::from_secs)
-        );
-        for (index, wait) in waits.iter().enumerate().filter(|(index, _)| index % 5 != 4) {
-            let nominal = 200u64 << (index % 5);
-            let millis = wait.as_millis() as u64;
-            assert!(
-                millis >= nominal * 9 / 10 && millis < nominal * 11 / 10,
-                "request retry wait {index} was {wait:?}, not Codex's backoff around {nominal} ms"
+            let waits = waits.lock().unwrap();
+            assert_eq!(waits.len(), 5);
+            for (wait, nominal) in waits[..4].iter().zip([200, 400, 800, 1600]) {
+                let millis = wait.as_millis() as u64;
+                assert!(millis >= nominal * 9 / 10 && millis < nominal * 11 / 10);
+            }
+            assert_eq!(waits[4], Duration::from_secs(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_connection_failures_then_success_reset_the_next_step() {
+        for family in CODEX_FAMILIES {
+            let server = ScriptedServer::start(vec![
+                ScriptResponse::Http {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"success",
+                };
+                2
+            ])
+            .await;
+            let mut provider = family_retry_test_provider(&server, family);
+            let waits = use_virtual_retry_waits(&mut provider);
+            for _ in 0..2 {
+                provider.client.fail_connects.store(5, Ordering::SeqCst);
+                let events = collect_step_events(&provider, CancellationToken::new(), None).await;
+                assert!(terminal_error_if_any(&events).is_none(), "{events:?}");
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    NormalizedEvent::Control(ProviderControl::Finished {
+                        retries_used: 5,
+                        ..
+                    })
+                )));
+                let outcomes: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) => {
+                            Some(attempt.outcome.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    outcomes,
+                    [
+                        AttemptOutcome::ConnectFailed,
+                        AttemptOutcome::ConnectFailed,
+                        AttemptOutcome::ConnectFailed,
+                        AttemptOutcome::ConnectFailed,
+                        AttemptOutcome::ConnectFailed,
+                        AttemptOutcome::Complete,
+                    ]
+                );
+                let digests = attempt_digests(&events);
+                assert_eq!(digests.len(), 6);
+                assert!(digests.iter().all(|digest| digest == &digests[0]));
+            }
+            assert_eq!(provider.family.render_calls.load(Ordering::SeqCst), 2);
+            let bodies = server.request_bodies();
+            assert_eq!(bodies.len(), 2);
+            assert_eq!(bodies[0], bodies[1]);
+            let waits = waits.lock().unwrap();
+            assert_eq!(waits.len(), 10);
+            assert_eq!(waits[4], Duration::from_secs(5));
+            assert_eq!(
+                waits[9],
+                Duration::from_secs(5),
+                "backoff resets after success"
             );
         }
     }
