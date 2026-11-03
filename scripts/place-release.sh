@@ -44,6 +44,7 @@
 # the same binary. A later restart must check the gate again, even when the bytes are already on disk.
 #
 # --restart-only rechecks the live-run gate and loads bytes already at --dest, without placing.
+# Before either restart, save private health JSON in ~/.local/state/cortexkit/broca/health-before-restart (newest 50; failures only warn).
 # Exit codes: 0 placed or restarted, 1 refused on a checked condition,
 # 2 cannot compare / bad invocation, 3 placed but NOT restarted because a run went live after
 # the first check (use --restart-only when the gate is clear; the new bytes are on disk),
@@ -326,6 +327,48 @@ if [ "$SKIP_GATE" -eq 0 ]; then
   fi
 fi
 
+save_health_before_restart() {
+  local reason
+  if ! reason="$(python3 - "$HOME/.local/state/cortexkit/broca/health-before-restart" "${PLACE_RELEASE_CK:-ck}" "$1" 2>&1 <<'PY'
+import datetime, json, os, pathlib, subprocess, sys, tempfile
+
+directory, ck, pid = sys.argv[1:]
+directory = pathlib.Path(directory)
+temporary = None
+try:
+    if not pid:
+        raise RuntimeError("no running broca pid to snapshot")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    with tempfile.NamedTemporaryFile(dir=directory, prefix=".health-", delete=False) as output:
+        temporary = pathlib.Path(output.name)
+        os.fchmod(output.fileno(), 0o600)
+        reply = subprocess.run([ck, "--json", "health", "broca"], stdout=output,
+                               stderr=subprocess.PIPE, timeout=30)
+        if reply.returncode:
+            detail = reply.stderr.decode(errors="replace").strip()
+            raise RuntimeError(f"ck --json health broca exited {reply.returncode}: {detail}")
+    # Validate the reply without reserializing it: the saved bytes stay exactly as ck printed them.
+    json.loads(temporary.read_bytes())
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    temporary.replace(directory / f"{timestamp}-{pid}.json")
+    temporary = None
+    for older in sorted(directory.glob("*.json"), reverse=True)[50:]:
+        older.unlink()
+except Exception as error:
+    print(error)
+    sys.exit(1)
+finally:
+    if temporary is not None:
+        temporary.unlink(missing_ok=True)
+PY
+)"; then
+    reason="${reason//$'\n'/ }"
+    reason="${reason//$'\r'/ }"
+    printf 'place-release: warning: could not save pre-restart health: %s\n' "$reason" >&2
+  fi
+}
+
 # Require a new process running the inode currently on disk, not just a new pid.
 restart_and_wait() {
   local expected_inode="$1" expected_sha="$2"
@@ -336,6 +379,7 @@ restart_and_wait() {
     echo "place-release: REFUSING -- unknown running-image identity (pid $old_pid)" >&2
     return 2
   fi
+  save_health_before_restart "$old_pid"
   "${PLACE_RELEASE_CK:-ck}" module restart broca
   wait_seconds="${PLACE_RELEASE_WAIT_SECONDS:-90}"
   poll_seconds="${PLACE_RELEASE_POLL_SECONDS:-1}"
