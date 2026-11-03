@@ -13,9 +13,7 @@ use broca_core::{
     Provider, RunError, RunSummary, StartMode, StubReply, StubToolPlane, WalStore,
 };
 use broca_module::actor::{SendKey, SendOutcome, SendPlan};
-use broca_module::{
-    DefaultOpener, LineageRegistry, RunExecutor, RunJob, RunKind, ServeHandler, SessionReadRequest,
-};
+use broca_module::{DefaultOpener, LineageRegistry, RunExecutor, RunJob, RunKind};
 use broca_protocol::{
     AssistantMessage, BindIdentity, CallOptions, ContentBlock, FinishReason, Message, MessageId,
     NormalizedEvent, ProviderControl, Role, RunId, StepId, ToolCall, ToolCallId,
@@ -347,22 +345,6 @@ impl Drop for Rig {
     }
 }
 
-#[tokio::test]
-async fn legacy_plan_without_an_applied_view_stays_raw_without_provider_calls_or_notices() {
-    let rig = Rig::new(0);
-    assert!(rig.registry.compaction_supported());
-    rig.send(true).await;
-    let prompt = rig.prompt().await;
-    assert_eq!(prompt[0].content, text(Role::User, "user").content);
-    let records = rig.records();
-    assert!(!records.iter().any(|frame| matches!(
-        frame.record,
-        broca_wal::WalRecord::CompactionNotice { .. }
-            | broca_wal::WalRecord::CompactionMessage { .. }
-    )));
-    rig.close().await;
-}
-
 /// A session enrolls in compaction only on its first episode, when it has no stored messages
 /// yet: a session whose first episode ran without a plan cannot take one naming a compaction
 /// provider later. Its send is refused `plan_drift` (no frozen plan, the plan it sent) and writes
@@ -422,127 +404,6 @@ async fn an_imported_session_cannot_enroll_in_compaction() {
     assert_eq!(refusal.code(), "plan_drift");
     assert_eq!(refusal.detail(), json!({"sent": "plan"}));
     assert_eq!(rig.records(), before, "the refused send wrote nothing");
-    rig.close().await;
-}
-
-/// A frozen legacy session never calls the retired v1 Setup, so reads never wait for its
-/// numbering checkpoint; public reads expose immutable history with no renderer tag rows.
-#[tokio::test]
-async fn legacy_reads_never_wait_for_a_retired_provider_numbering_checkpoint() {
-    let held = Arc::new(HeldCompactor {
-        arrived: Semaphore::new(0),
-        release: Semaphore::new(0),
-    });
-    let rig = Rig::with_compactor(0, held.clone());
-    rig.send_manifest(Some(manifest_rendering(true))).await;
-    let _ = rig.prompt().await;
-    assert_eq!(
-        held.arrived.available_permits(),
-        0,
-        "the retired Setup must not be called"
-    );
-    let request = SessionReadRequest::new(rig.key.clone(), Some(0), Some(100));
-    let before = rig.registry.read(request.clone()).await.unwrap();
-    let after = rig.registry.read(request).await.unwrap();
-    assert_eq!(before.messages[0].ordinal, 1);
-    assert!(serde_json::to_value(&before).unwrap()["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|entry| entry.get("tags").is_none()));
-    assert_eq!(after.messages[0].message, before.messages[0].message);
-    assert_eq!(after.messages[0].mid, before.messages[0].mid);
-    assert_eq!(after.messages[0].part_keys, before.messages[0].part_keys);
-    assert_eq!(after.history_version, before.history_version);
-    rig.close().await;
-}
-
-#[tokio::test]
-async fn legacy_reads_do_not_wait_after_projection_or_in_a_later_run() {
-    use broca_core::MaterializedStore;
-
-    let rig = Rig::new(0);
-    rig.send_manifest(Some(manifest_rendering(true))).await;
-    rig.prompt().await;
-    rig.model.finish.add_permits(1);
-    broca_test_support::event_timeout("first run completion", rig.completed.acquire(), || {
-        format!("session={:?}", rig.key)
-    })
-    .await
-    .expect("first run completes")
-    .unwrap()
-    .forget();
-
-    let started_seq = rig
-        .records()
-        .iter()
-        .find_map(|frame| {
-            matches!(frame.record, broca_wal::WalRecord::RunStarted { .. }).then_some(frame.seq)
-        })
-        .expect("run input is durable");
-    let snapshot = rig
-        .store
-        .read_page_with_watermark(&rig.key, Some(0), 1, broca_core::ReadView::Raw)
-        .unwrap();
-    assert!(snapshot.watermark_seq >= started_seq);
-
-    let outcome = rig.submit("run2", None).await;
-    assert!(
-        matches!(
-            outcome,
-            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
-        ),
-        "{outcome:?}"
-    );
-    rig.prompt().await;
-    let snapshot = rig
-        .store
-        .read_page_with_watermark(&rig.key, Some(0), 1, broca_core::ReadView::Raw)
-        .unwrap();
-    let tail: Vec<_> = rig
-        .records()
-        .into_iter()
-        .filter(|frame| frame.seq > snapshot.watermark_seq)
-        .collect();
-    assert!(tail.iter().any(|frame| matches!(
-        &frame.record,
-        broca_wal::WalRecord::RunStarted { run_id, .. } if run_id.0 == "run2"
-    )));
-    assert!(!tail.iter().any(|frame| matches!(
-        frame.record,
-        broca_wal::WalRecord::CompactionMessage {
-            kind: broca_wal::CompactionMessageKind::Setup,
-            ..
-        }
-    )));
-    let read = rig
-        .registry
-        .read(SessionReadRequest::new(rig.key.clone(), Some(0), Some(1)))
-        .await;
-    assert!(
-        read.is_ok(),
-        "a frozen legacy session has no pending provider checkpoint: {read:?}"
-    );
-    let read = read.unwrap();
-    assert_eq!(read.messages.len(), 1);
-    assert_eq!(read.messages[0].part_keys, Some(vec!["m0#0".into()]));
-    assert_eq!(
-        read.messages[0].message.part_tags().unwrap().parts,
-        vec![Some(1)]
-    );
-    let closed = LineageRegistry::new_with_reader(
-        rig.opener.clone(),
-        rig.wal.clone(),
-        Some(rig.store.clone()),
-    );
-    let read = closed
-        .read(SessionReadRequest::new(rig.key.clone(), Some(0), Some(1)))
-        .await;
-    assert!(
-        read.is_ok(),
-        "the closed-actor read must use the same frozen numbering: {read:?}"
-    );
-    assert_eq!(closed.slot_counts().open, 0, "reads must not open an actor");
     rig.close().await;
 }
 

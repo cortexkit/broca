@@ -3937,9 +3937,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // saves a WAL reconcile, and its digest stands in only for an episode recorded before
         // `RunStarted` carried one. A lost or stale index row therefore cannot change the
         // answer. Only a send whose run id has no started episode follows the ordinary admission path.
-        let checkpoint = match self.load_checkpoint_at_head().await {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => return SendOutcome::Transient(error),
+        // The idle admission view is current until a run starts (which clears it), so reuse it
+        // rather than reading the log on every send; only a send while a run is live loads it.
+        let checkpoint = match self.prior_snapshot.as_ref() {
+            Some(snapshot) => snapshot.checkpoint_at_head.clone(),
+            None => match self.load_checkpoint_at_head().await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return SendOutcome::Transient(error),
+            },
         };
         let running = match &self.state {
             RunState::Active { run_id, .. } => self.durable_finish_of_active(run_id).is_none(),

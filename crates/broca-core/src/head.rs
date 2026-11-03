@@ -172,6 +172,7 @@ impl HeadProjection {
         head.model = fold.model.clone();
         head.run_id = fold.run_id.clone();
         head.usage = fold.usage.clone();
+        head.mode3 = head.mode3.or(fold.mode3);
         Some(head)
     }
 
@@ -342,6 +343,10 @@ pub struct HeadReadFold {
     model: Option<HeadModel>,
     run_id: Option<RunId>,
     usage: Option<SessionUsage>,
+    /// Whether the session's first run started under mode 3. Fixed for the session's life, so
+    /// a reader restored from the fold never has to read the log's first run to learn it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode3: Option<bool>,
 }
 
 impl<'de> Deserialize<'de> for HeadReadFold {
@@ -353,6 +358,8 @@ impl<'de> Deserialize<'de> for HeadReadFold {
             model: Option<serde_json::Value>,
             run_id: Option<RunId>,
             usage: Option<serde_json::Value>,
+            #[serde(default)]
+            mode3: Option<bool>,
         }
         fn counters(value: &serde_json::Value, model: bool) -> bool {
             let Some(object) = value.as_object() else {
@@ -402,6 +409,7 @@ impl<'de> Deserialize<'de> for HeadReadFold {
                 .map(serde_json::from_value)
                 .transpose()
                 .map_err(serde::de::Error::custom)?,
+            mode3: fields.mode3,
         })
     }
 }
@@ -413,6 +421,7 @@ impl Default for HeadReadFold {
             model: None,
             run_id: None,
             usage: None,
+            mode3: None,
         }
     }
 }
@@ -423,12 +432,14 @@ impl HeadReadFold {
             model: self.model.clone(),
             run_id: self.run_id.clone(),
             usage: self.usage.take(),
+            mode3: self.mode3,
             ..HeadProjection::default()
         };
         head.observe(record);
         self.model = head.model;
         self.run_id = head.run_id;
         self.usage = head.usage;
+        self.mode3 = head.mode3;
     }
 }
 

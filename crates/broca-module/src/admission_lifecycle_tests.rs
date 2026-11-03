@@ -194,7 +194,11 @@ async fn queued_restart_waiter_receives_explicit_error_on_failed_seal() {
 struct MissingCompactionLimitAdmission;
 #[async_trait]
 impl RunExecutor for MissingCompactionLimitAdmission {
-    async fn execute(&self, _job: RunJob, _out: mpsc::Sender<OutputEvent>) -> Result<RunSummary, RunError> {
+    async fn execute(&self, mut job: RunJob, _out: mpsc::Sender<OutputEvent>) -> Result<RunSummary, RunError> {
+        // The run loop refuses through the admission channel before it writes anything.
+        if let Some(reply) = job.on_admitted.take() {
+            let _ = reply.send(Err(RunError::CompactionContextLimitMissing));
+        }
         Err(RunError::CompactionContextLimitMissing)
     }
 }

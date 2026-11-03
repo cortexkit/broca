@@ -3873,9 +3873,19 @@ where
     A: ApprovalPolicy,
 {
     held_prompt::release_read_metadata(&mut prior);
-    let mode3 = prior
-        .mode3
-        .unwrap_or(control.new_log_compaction_plan_version.is_some());
+    // Only a session with no history is new and may start under mode 3. A replay seeded from a
+    // checkpoint, or a session holding only imported messages, cannot prove its first run's
+    // mode from what it replayed, so that is read from the log: an existing legacy session is
+    // never upgraded, and an existing mode-3 session is never rendered as legacy.
+    let mode3 = match prior.mode3 {
+        Some(mode3) => mode3,
+        None if prior.prompt.is_empty() => control.new_log_compaction_plan_version.is_some(),
+        None => match approval_store {
+            Some(store) => crate::head::mode3_log_from_wal(store, &req.session)
+                .map_err(|error| RunError::Wal(error.to_string()))?,
+            None => false,
+        },
+    };
     if let Some(version) = control.new_log_compaction_plan_version.filter(|_| mode3) {
         crate::compaction_v2::conditions::check_plan_version(version).map_err(RunError::Wal)?;
     }

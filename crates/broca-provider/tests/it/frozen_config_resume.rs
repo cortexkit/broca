@@ -267,6 +267,11 @@ mod gated {
         render_tags: bool,
     ) {
         let wal_store = FileWalStore::new(dir.join("wal"));
+        // Every run of a mode-3 log (an import, for example) freezes the plan version.
+        let mode3 = wal_store
+            .read_records(&request.session)
+            .map(|frames| broca_core::is_mode3_log(frames.iter().map(|frame| &frame.record)))
+            .unwrap_or(false);
         let mut wal = wal_store
             .open(&request.session)
             .expect("open WAL for resumable seed");
@@ -301,7 +306,7 @@ mod gated {
         wal.append(
             1,
             &WalRecord::RunStarted {
-                compaction_plan_version: None,
+                compaction_plan_version: mode3.then_some(broca_core::compaction_v2::PLAN_VERSION),
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
