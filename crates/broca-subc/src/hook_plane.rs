@@ -73,11 +73,6 @@ impl SubcHookPlane {
         call: HookCall,
         deadline: Instant,
     ) -> Result<HookAnswer, HookUnavailable> {
-        // Identity in a request is the caller's durable key, never the bind's `runner` value.
-        // Refuse a mismatched request rather than silently sending it to another conversation.
-        if call.session != bind.session || call.harness != bind.harness {
-            return Err(HookUnavailable);
-        }
         let deadline =
             deadline.min(Instant::now() + Duration::from_millis(STEP_TRANSFORM_HOOK_CAP));
         self.route

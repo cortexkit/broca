@@ -126,11 +126,7 @@ async fn controlled_hook_deadlines() {
         };
         let started = tokio::time::Instant::now();
         let mut chain = Box::pin(runtime.chain(
-            Subject::PreUser {
-                blocks: vec!["input".into()],
-                mark: None,
-                delivery: None,
-            },
+            Subject::PreUser { blocks: vec!["input".into()], mark: None, delivery: None, at_ms: None },
             Trace::default(),
             |_| true,
         ));

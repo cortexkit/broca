@@ -52,3 +52,6 @@ mod keep_warm;
 pub mod move_files;
 pub mod move_install;
 mod source_warm;
+
+#[cfg(test)]
+mod history_version_tests;

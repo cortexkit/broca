@@ -78,20 +78,24 @@ subc-os = "=0.1.26"
 cortexkit-lease = "=0.1.2"
 cortexkit-log = "=0.3.5"
 cortexkit-role-harness = "=0.1.0"
-cortexkit-role-tool-provider = "=0.14.4"
+cortexkit-role-tool-provider = "=0.15.0"
 cortexkit-llm-tools = "=0.2.1"
-cortexkit-role-tool-provider-conformance = "=0.14.4"
-cortexkit-role-llm-runner = "=0.7.48"
+cortexkit-role-tool-provider-conformance = "=0.15.0"
+cortexkit-role-llm-runner = "=0.8.1"
+# Recorded v1 requests must keep the exact tag-rendering bytes of their original contract.
+cortexkit-role-llm-runner-v1 = { package = "cortexkit-role-llm-runner", version = "=0.7.48" }
 cortexkit-bus-naming = "=0.2.7"
 cortexkit-bus-trait = "=0.3.0"
 cortexkit-bus-nats = "=0.3.0"
-cortexkit-role-llm-runner-conformance = "=0.16.11"
+cortexkit-role-llm-runner-conformance = "=0.17.2"
 # Draft 2020-12 validation of structured-output values. Default features are off so the
 # validator has no HTTP or file retriever: a schema can never make broca fetch anything.
 jsonschema = { version = "=0.58.6", default-features = false }
 cortexkit-role-agent-data = "=0.2.2"
-cortexkit-role-step-transform-provider = "=0.4.2"
+cortexkit-role-step-transform-provider = "=0.5.0"
 cortexkit-role-compaction-provider = "=0.7.14"
+cortexkit-role-compaction = "=0.2.2"
+cortexkit-compaction-view = "=0.1.1"
 # System One: the one-pass decision-model role and the batch rules it shares with extraction.
 cortexkit-role-classifier = "=0.5.1"
 cortexkit-role-classifier-conformance = "=0.7.0"

@@ -51,6 +51,8 @@ impl ServeHandler for InstantSessions {
     async fn read(&self, _req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         Ok(SessionReadResponse {
+            history_version: 0,
+            incarnation: "unwritten".into(),
             next_late_after: None,
             deferred_calls: None,
             late_approvals: None,

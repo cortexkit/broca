@@ -31,6 +31,7 @@ use broca_wal::{
 use rusqlite::{config::DbConfig, Connection, OptionalExtension};
 
 mod history_mode;
+mod served_history;
 
 const STORE_SCHEMA_VERSION: i64 = 1;
 
@@ -1259,6 +1260,7 @@ impl SqliteStore {
         let schema_tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         let conn = &schema_tx;
+        crate::served_history::initialize(conn)?;
         let from_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let has_existing_schema: bool = conn.query_row(
             "SELECT EXISTS(
@@ -2267,6 +2269,10 @@ impl SqliteStore {
 }
 
 impl MaterializedStore for SqliteStore {
+    fn served_history(&self) -> Option<&dyn broca_core::ServedHistory> {
+        Some(self)
+    }
+
     fn cache_history_mode(&self, session: &BindIdentity, mode3: bool) -> Result<(), String> {
         crate::history_mode::cache(&mut self.conn.lock().unwrap(), &Self::key(session), mode3)
     }

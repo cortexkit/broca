@@ -889,6 +889,7 @@ impl Fixture {
         ServeHandler::read(
             &self.registry,
             SessionReadRequest {
+                history_version: None,
                 late_after: None,
                 session: self.key.clone(),
                 from_ordinal: Some(0),

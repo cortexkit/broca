@@ -1768,9 +1768,16 @@ impl SubcToolPlane {
                         raw.clone(),
                     )
                     .map_err(|error| error.to_string())
-                    .and_then(|reply| {
-                        cortexkit_role_tool_provider::result::validate(&reply)
-                            .map_err(|error| error.to_string())?;
+                    .and_then(|mut reply| {
+                        if reply.held().is_some() {
+                            cortexkit_role_llm_runner::tool_result_limit::enforce(&mut reply);
+                        }
+                        if reply.held().is_some()
+                            || cortexkit_role_tool_provider::result::model_visible_bytes(&reply)
+                                <= cortexkit_role_tool_provider::result::MAX_MODEL_VISIBLE_BYTES {
+                            cortexkit_role_tool_provider::result::validate(&reply)
+                                .map_err(|error| error.to_string())?;
+                        }
                         Ok(reply)
                     })
                 });
@@ -1877,13 +1884,17 @@ impl SubcToolPlane {
                             )
                         });
                     let captures = if ctx.media_capture.is_some()
-                        && decoded.as_ref().is_some_and(Result::is_ok)
+                        && decoded.as_ref().is_some_and(|reply| reply.as_ref().is_ok_and(|reply|
+                            cortexkit_role_tool_provider::result::model_visible_bytes(reply)
+                                <= cortexkit_role_tool_provider::result::MAX_MODEL_VISIBLE_BYTES))
                     {
                         tool_capture::content_v1_captures(&mut result, &raw)
                     } else {
                         Vec::new()
                     };
                     (result, captures)
+                } else if let Some(error) = cortexkit_role_llm_runner::tool_result_limit::legacy_size_error(&raw) {
+                    (crate::content_v1::size_error_result(&call.tool_call_id, error), Vec::new())
                 } else if ctx.media_capture.is_some() {
                     map_call_tool_result(&call.tool_call_id, &raw)
                 } else {
@@ -1944,9 +1955,11 @@ impl SubcToolPlane {
                 // it does not authorize a retry after a provider received the call. Only a
                 // route.open refusal, where nothing was sent, is held and retried. A test
                 // (`a_provider_scope_not_synced_refusal_is_recorded_and_never_resent`) pins this.
+                let output = crate::content_v1::oversized_refusal(msg.code(), msg.message())
+                    .unwrap_or_else(|| ToolOutput::error(format!("tool/route rejected: {msg}")));
                 let result = ToolResult {
                     tool_call_id: call.tool_call_id.clone(),
-                    output: ToolOutput::error(format!("tool/route rejected: {msg}")),
+                    output,
                     is_error: true,
                 };
                 self.fence

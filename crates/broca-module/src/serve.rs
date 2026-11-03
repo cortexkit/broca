@@ -38,11 +38,10 @@ pub struct SessionReadRequest {
     pub include_tools: bool,
     pub include_rich_ui: bool,
     pub include_display_facts: bool,
-    /// Read strictly after the message with this `mid`, taken from an earlier page of the
-    /// lineage `lineage_id`. The serve adapter refuses a request that sets it without
-    /// `lineage_id`, or together with `from_ordinal`.
+    /// Continue after a mid only while the history snapshot is unchanged.
     pub after_mid: Option<String>,
-    /// The lineage the caller's cursor belongs to; a read naming another is refused.
+    pub history_version: Option<u64>,
+    /// Internal migration input; ignored by serving.
     pub lineage_id: Option<String>,
     /// The page's byte cap; `None` is the default cap.
     pub max_bytes: Option<u64>,
@@ -63,6 +62,7 @@ impl SessionReadRequest {
             include_rich_ui: false,
             include_display_facts: false,
             after_mid: None,
+            history_version: None,
             lineage_id: None,
             max_bytes: None,
             media: cortexkit_role_llm_runner::read::MediaMode::Inline,
@@ -74,6 +74,7 @@ impl SessionReadRequest {
 /// spelling, which names no message.
 fn ordinal_of_mid(mid: &str) -> Option<u64> {
     let digits = mid.strip_prefix('m')?;
+    let digits = digits.split_once('.').map_or(digits, |(_, position)| position);
     let canonical = !digits.is_empty()
         && digits.bytes().all(|byte| byte.is_ascii_digit())
         && (digits == "0" || !digits.starts_with('0'));
@@ -112,15 +113,6 @@ fn reply_frame_limit_refusal(
     })
 }
 
-fn model_group_reply_too_large_subject(
-    page: &broca_wire::ModelPage,
-) -> Option<ReplyTooLargeSubject> {
-    page.messages
-        .first()
-        .map(|entry| ReplyTooLargeSubject::ModelGroup {
-            source: entry.source.clone(),
-        })
-}
 
 fn cap_page_bytes(
     page: &mut SessionReadResponse,
@@ -450,60 +442,6 @@ pub use broca_wire::{
     SessionReadResponse, SessionReadTool,
 };
 
-/// The answer for `params` from a read page, when one of its messages holds the tag.
-fn resolve_in_page(
-    page: &SessionReadResponse,
-    params: &broca_wire::ResolveParams,
-) -> Option<Result<broca_wire::ResolveResponse, (&'static str, String)>> {
-    page.messages.iter().find_map(|entry| {
-        let number = params.number().ok()?;
-        let row = entry
-            .tags
-            .iter()
-            .find(|row| row.tag.as_deref() == Some(params.tag.as_str()))?;
-        let (index, _) = entry
-            .message
-            .part_tags()?
-            .tagged()
-            .find(|(_, tag)| *tag == number)?;
-        // The part as every exposure shows it: the model's text cleaned where the run that
-        // wrote it cleans, any other part in its complete stored encoding.
-        let stored = broca_protocol::tags::exposed_part_text(&entry.message, index)?;
-        Some(match broca_wire::resolve_range(&stored, params.range) {
-            Some(text) => {
-                let descriptors =
-                    params.media == Some(cortexkit_role_llm_runner::read::MediaMode::Descriptors);
-                let content = descriptors.then(|| {
-                    broca_wire::describe_resolved_part(
-                        &entry.message,
-                        entry.ordinal,
-                        index,
-                        text.clone(),
-                    )
-                });
-                let mut reply = broca_wire::ResolveResponse::new(
-                    &params.tag,
-                    entry.ordinal,
-                    &entry.mid,
-                    &row.part,
-                    text,
-                );
-                if let Some(content) = content {
-                    reply.content = content;
-                }
-                reply.range = params.range;
-                Ok(reply)
-            }
-            None => Err((
-                broca_wire::INVALID_PARAMS,
-                format!(
-                    "range must lie within the part's {} characters",
-                    stored.chars().count()
-                ),
-            )),
-        })
-    })
-}
 
 fn session_read_response(
     page: broca_core::SessionReadPage,
@@ -517,6 +455,8 @@ fn session_read_response(
         None => (None, None),
     };
     SessionReadResponse {
+        history_version: 0,
+        incarnation: page.lineage_id.map(|id| id.to_string()).unwrap_or_else(|| "unwritten".into()),
         next_late_after: None,
         messages: page
             .messages
@@ -533,9 +473,9 @@ fn session_read_response(
                     .map(|delivery| {
                         cortexkit_role_llm_runner::delivery_order::EntryDelivery::new(delivery.mode)
                     }),
-                ordinal: message.ordinal,
+                ordinal: message.ordinal + 1,
                 mid: format!("m{}", message.ordinal),
-                tags: broca_wire::tag_rows(message.ordinal, &message.message),
+                part_keys: Some(broca_wire::part_keys(message.ordinal, &message.message)),
                 message: message.message,
                 run: message.run,
                 tool_calls: Vec::new(),
@@ -544,7 +484,7 @@ fn session_read_response(
                 part_digests: None,
             })
             .collect(),
-        next_from_ordinal: page.next_from_ordinal,
+        next_from_ordinal: page.next_from_ordinal.map(|position| position + 1),
         head: page.head.map(|cursor| CursorWire {
             wal_seq: cursor.wal_seq,
             sub_index: cursor.sub_index,
@@ -732,7 +672,7 @@ fn final_message_from_prompt(
         })
         .collect();
     Ok(broca_wire::FinalMessage {
-        ordinal,
+        ordinal: ordinal + 1,
         mid: format!("m{ordinal}"),
         text,
     })
@@ -1023,7 +963,7 @@ fn indexed_run_tool_calls(
                                 call.tool_name.clone(),
                                 call.input.clone(),
                                 "",
-                                active_step_ordinal,
+                                active_step_ordinal + 1,
                             )
                             .with_position(position as u32),
                             has_intent: false,
@@ -1121,7 +1061,7 @@ fn indexed_run_tool_calls(
             {
                 if current_run.as_deref() == Some(target_run_id) {
                     for builder in &mut active_calls {
-                        builder.call.result_ordinal = Some(active_step_ordinal + 1);
+                        builder.call.result_ordinal = Some(active_step_ordinal + 2);
                     }
                     finish_calls(
                         &mut active_calls,
@@ -1646,10 +1586,9 @@ pub enum ServeError {
         field: String,
         message: String,
     },
-    /// A read named a lineage that is not the session's current one.
-    LineageChanged {
-        requested: String,
-    },
+    /// A requested version no longer names the session's active history.
+    HistoryChanged,
+    HistoryRewriting,
     /// `after_mid` names no message of the lineage.
     UnknownMid(String),
     /// `run.result` names no run of the session.
@@ -1671,23 +1610,13 @@ pub enum ServeError {
 impl ServeError {
     fn from_history_read(
         error: OpenError,
-        requested: Option<&str>,
+        _requested: Option<&str>,
         after: Option<(Option<u64>, &str)>,
     ) -> Self {
         if let OpenError::SessionLogMissing {
             read: Some(read), ..
         } = &error
         {
-            if let Some(requested) = requested {
-                if read.lineage_id.as_deref() != Some(requested) {
-                    return Self::LineageChanged {
-                        requested: requested.into(),
-                    };
-                }
-            }
-            if read.tags_await_setup {
-                return Self::TagsAwaitSetup;
-            }
             if let (Some(prompt_len), Some((after, mid))) = (read.prompt_len, after) {
                 if !after.is_some_and(|ordinal| ordinal < prompt_len) {
                     return Self::UnknownMid(mid.into());
@@ -1714,6 +1643,8 @@ impl From<OpenError> for ServeError {
             },
             OpenError::LeaseHeld(s) => ServeError::SessionHeld(s),
             // Legacy open errors erased the cause; do not infer retryability from text.
+            OpenError::HistoryChanged => ServeError::HistoryChanged,
+            OpenError::HistoryRewriting => ServeError::HistoryRewriting,
             OpenError::Open(s) => ServeError::Open(s, None),
             OpenError::Classified { reason, class } => ServeError::Open(reason, Some(class)),
             OpenError::HistoryUnreachable {
@@ -1794,10 +1725,8 @@ impl std::fmt::Display for ServeError {
             ServeError::PlanRefused(refusal) => f.write_str(&refusal.message()),
             ServeError::PreUserUnavailable { provider } => write!(f, "pre_user_unavailable: {provider}"),
             ServeError::InvalidParams { message, .. } => f.write_str(message),
-            ServeError::LineageChanged { requested } => write!(
-                f,
-                "the session's lineage is not '{requested}'; re-read it from the tail"
-            ),
+            ServeError::HistoryRewriting => f.write_str("history is being rewritten; retry after its writer finishes recovery"),
+            ServeError::HistoryChanged => f.write_str("the session's history changed; read its newest page"),
             ServeError::UnknownMid(mid) => write!(f, "the lineage has no message '{mid}'"),
             ServeError::UnknownRun(run_id) => write!(f, "the session has no run '{run_id}'"),
             ServeError::AccountSelectionRefused(refusal) => write!(
@@ -1860,17 +1789,6 @@ pub trait ServeHandler: Send + Sync {
         false
     }
 
-    /// Model-view reads are separate from raw reads so existing transcript replies keep
-    /// their shape and do not decode the checkpoint's compaction payload.
-    async fn read_model(
-        &self,
-        _req: SessionReadRequest,
-    ) -> Result<broca_wire::ModelPage, ServeError> {
-        Err(ServeError::InvalidParams {
-            field: "view".into(),
-            message: "model view is unsupported".into(),
-        })
-    }
 
     /// Authorize the daemon-attested caller before any session operation has an effect.
     /// Handlers without history (such as protocol test doubles) have nothing to freeze.
@@ -1991,6 +1909,15 @@ pub trait ServeHandler: Send + Sync {
 
     /// The plan manifest the session froze at admission. `None` for a session admitted without a
     /// plan, and from a handler that cannot read the session's history.
+    /// Locate a stored part for output-reference reads without scanning the transcript.
+    async fn tag_location(
+        &self,
+        _session: &LineageKey,
+        _tag: u64,
+    ) -> Result<Option<broca_core::TagLocation>, ServeError> {
+        Ok(None)
+    }
+
     async fn frozen_manifest(
         &self,
         _session: &LineageKey,
@@ -2038,90 +1965,6 @@ pub trait ServeHandler: Send + Sync {
         crate::output_refs::read(self, session, request).await
     }
 
-    /// Where the session's materialized transcript holds the part tagged `tag`, from the
-    /// store's tag index (see [`broca_core::TagLocation`]). `None` when this handler keeps no
-    /// tag index, which leaves [`ServeHandler::resolve`] to read the transcript from its start.
-    async fn tag_location(
-        &self,
-        _session: &LineageKey,
-        _tag: u64,
-    ) -> Result<Option<broca_core::TagLocation>, ServeError> {
-        Ok(None)
-    }
-
-    /// `session.resolve` — the stored text of the part tagged `params.tag`, or a character
-    /// range of it. A refusal is answered as its typed code and message.
-    ///
-    /// The tag index names the part's message, which is then read as a one-message
-    /// `session.read` page: the store's row and the WAL past the store's watermark, never the
-    /// whole transcript. A tag the index does not hold can only be in the transcript past the
-    /// materialized prefix, which is read from there, through the same page path (the WAL
-    /// after the watermark). Every read goes through `session.read`'s own path, so resolve
-    /// sees exactly what a read sees, under the same authorization; the pages after the first
-    /// are pinned to its lineage, so a lineage recreated mid-search is refused rather than
-    /// searched half old, half new.
-    async fn resolve(
-        &self,
-        session: &LineageKey,
-        params: &broca_wire::ResolveParams,
-    ) -> Result<Result<broca_wire::ResolveResponse, (&'static str, String)>, ServeError> {
-        let number = match params.number() {
-            Ok(number) => number,
-            Err(_) => {
-                return Ok(Err((
-                    broca_wire::INVALID_PARAMS,
-                    "tag must have the form §N§ for a positive integer N".into(),
-                )))
-            }
-        };
-        let mut location = self.tag_location(session, number).await?;
-        let mut lineage_id = None;
-        if let Some((ordinal, _)) = location.and_then(|location| location.found) {
-            let page = self
-                .read(SessionReadRequest::new(
-                    session.clone(),
-                    Some(ordinal),
-                    Some(1),
-                ))
-                .await?;
-            lineage_id = page.lineage_id.clone();
-            if let Some(answer) = resolve_in_page(&page, params) {
-                return Ok(answer);
-            }
-            // The indexed location may predate a lineage change repaired by this read.
-            // Its old prefix bound cannot exclude parts carried into the new lineage.
-            location = None;
-        }
-        // Not in the index: past the materialized prefix, or a store without an index.
-        let mut from = location.map_or(0, |location| location.indexed_through);
-        loop {
-            let mut request = SessionReadRequest::new(
-                session.clone(),
-                Some(from),
-                Some(broca_core::SESSION_READ_MAX_LIMIT),
-            );
-            request.lineage_id = lineage_id.clone();
-            let page = self.read(request).await?;
-            if lineage_id.is_none() {
-                lineage_id = page.lineage_id.clone();
-            }
-            if let Some(answer) = resolve_in_page(&page, params) {
-                return Ok(answer);
-            }
-            match page.next_from_ordinal {
-                Some(next) if next > from => from = next,
-                _ => {
-                    return Ok(Err((
-                        broca_wire::UNKNOWN_TAG,
-                        format!(
-                            "no part of the session's transcript holds tag {}",
-                            params.tag
-                        ),
-                    )))
-                }
-            }
-        }
-    }
 
     /// `run.cancel` — cooperatively cancel the active run (→ Cancelled).
     async fn cancel(
@@ -2404,9 +2247,9 @@ impl crate::LineageRegistry {
                         delivery.mode == broca_protocol::DeliveryMode::ToolResult
                     })
                 {
-                    message.ordinal.checked_sub(1)
+                    message.ordinal.checked_sub(2)
                 } else if !calls_of(&message.message).is_empty() {
-                    Some(message.ordinal)
+                    message.ordinal.checked_sub(1)
                 } else {
                     None
                 }
@@ -2442,7 +2285,7 @@ impl crate::LineageRegistry {
             {
                 if let Some(dispatch) = message
                     .ordinal
-                    .checked_sub(1)
+                    .checked_sub(2)
                     .and_then(|ordinal| dispatches.get(&ordinal))
                     .and_then(|calls| calls.iter().find(|call| &call.tool_call_id == carrier))
                 {
@@ -2461,7 +2304,7 @@ impl crate::LineageRegistry {
             if ids.is_empty() {
                 continue;
             }
-            message.tool_calls = match dispatches.get(&message.ordinal) {
+            message.tool_calls = match dispatches.get(&message.ordinal.saturating_sub(1)) {
                 // The step that produced this message holds exactly these calls: report them.
                 Some(found) if found.iter().map(|d| &d.tool_call_id).eq(ids.iter()) => found
                     .iter()
@@ -2521,14 +2364,13 @@ impl ServeHandler for crate::LineageRegistry {
         crate::LineageRegistry::compaction_supported(self)
     }
 
+
     async fn tag_location(
         &self,
         session: &LineageKey,
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, ServeError> {
-        self.route_tag_location(session, tag)
-            .await
-            .map_err(ServeError::from)
+        self.route_tag_location(session, tag).await.map_err(ServeError::from)
     }
 
     async fn frozen_manifest(
@@ -2564,56 +2406,6 @@ impl ServeHandler for crate::LineageRegistry {
         }
     }
 
-    async fn read_model(
-        &self,
-        req: SessionReadRequest,
-    ) -> Result<broca_wire::ModelPage, ServeError> {
-        if req.after_mid.is_some() {
-            return Err(ServeError::InvalidParams {
-                field: "view".into(),
-                message: "model view does not support after_mid".into(),
-            });
-        }
-        let page = self
-            .route_read_model_page(
-                &req.session,
-                &broca_core::ModelPageRequest {
-                    from_ordinal: req.from_ordinal,
-                    after_mid: None,
-                    limit: req.limit,
-                    max_bytes: req.max_bytes,
-                },
-            )
-            .await
-            .map_err(|error| {
-                ServeError::from_history_read(error, req.lineage_id.as_deref(), None)
-            })?;
-        if req
-            .lineage_id
-            .as_ref()
-            .is_some_and(|requested| page.lineage_id.as_ref() != Some(requested))
-        {
-            return Err(ServeError::LineageChanged {
-                requested: req.lineage_id.unwrap(),
-            });
-        }
-        let mut page: broca_wire::ModelPage = page.try_into().map_err(|error| {
-            ServeError::Open(
-                format!("model page source: {error}"),
-                Some(broca_protocol::ErrorClass::Permanent),
-            )
-        })?;
-        if req.media == cortexkit_role_llm_runner::read::MediaMode::Inline {
-            page.render_inline_media();
-        }
-        let subject = model_group_reply_too_large_subject(&page);
-        if let Some(error) =
-            reply_frame_limit_refusal(broca_wire::serialized_result_frame_bytes(&page), subject)
-        {
-            return Err(error);
-        }
-        Ok(page)
-    }
 
     async fn authorize_session(
         &self,
@@ -2895,6 +2687,10 @@ impl ServeHandler for crate::LineageRegistry {
             }),
             SendOutcome::VariantUnsupported(e) => Err(ServeError::VariantUnsupported(e)),
             SendOutcome::ToolAliasInvalid(e) => Err(ServeError::ToolAliasInvalid(e)),
+            SendOutcome::RouteDecisionFixed => Err(ServeError::InvalidParams {
+                field: "route_decision_id".into(),
+                message: "route_decision_id is fixed for the active run".into(),
+            }),
             SendOutcome::ServiceTierInvalid { reason, message } => {
                 Err(ServeError::ServiceTierInvalid { reason, message })
             }
@@ -3227,6 +3023,7 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
+        let before_history = self.history_read_version(&req.session).await?;
         let late_only = req.late_after.is_some();
         // A mid not of the form `m<ordinal>` names no message. The read still runs (from past
         // the last ordinal, so it returns no message), because a read naming a stale lineage
@@ -3235,7 +3032,7 @@ impl ServeHandler for crate::LineageRegistry {
         let from_ordinal = match after {
             Some(Some(ordinal)) => Some(ordinal.saturating_add(1)),
             Some(None) => Some(u64::MAX),
-            None => req.from_ordinal,
+            None => req.from_ordinal.map(|at| at.saturating_sub(1)),
         };
         let read = self
             .route_read_page(
@@ -3251,6 +3048,7 @@ impl ServeHandler for crate::LineageRegistry {
             tools,
             dispatches,
             open_batch,
+            head_facts,
             ..
         } = read.map_err(|error| {
             if late_only && matches!(error, crate::registry::OpenError::Expired { .. }) {
@@ -3268,22 +3066,18 @@ impl ServeHandler for crate::LineageRegistry {
                 )
             }
         })?;
-        if let Some(requested) = &req.lineage_id {
-            let current = page.lineage_id.map(|lineage_id| lineage_id.to_string());
-            if current.as_deref() != Some(requested.as_str()) {
-                return Err(ServeError::LineageChanged {
-                    requested: requested.clone(),
-                });
-            }
+        let snapshot = self.served_snapshot(
+            &req.session, page.lineage_id.map(|id| id.to_string()), at_seq > 0, before_history,
+        ).await?;
+        if req.history_version.is_some_and(|requested| requested != snapshot.history_version) {
+            return Err(ServeError::HistoryChanged);
         }
-        // A Setup answer may still anchor the running run's numbers at a checkpoint and change
-        // every number from its cut (llm-runner §9.6): until it is durable, refuse rather than
-        // show numbers a later read would contradict. The window lasts one Setup call.
-        if page.tags_await_setup {
-            return Err(ServeError::TagsAwaitSetup);
-        }
+        let mode3 = self.mode3_for_page(
+            &req.session, page.lineage_id.map(|id| id.to_string()), &head_facts,
+        ).await?;
         if let (Some(after), Some(mid)) = (after, &req.after_mid) {
-            if !after.is_some_and(|ordinal| ordinal < page.prompt_len) {
+            if broca_core::position_of_mid(mid, mode3, page.lineage_id.map(|id| id.to_string()).as_deref()).is_none()
+                || !after.is_some_and(|ordinal| ordinal < page.prompt_len) {
                 return Err(ServeError::UnknownMid(mid.clone()));
             }
         }
@@ -3301,7 +3095,7 @@ impl ServeHandler for crate::LineageRegistry {
                 Some(broca_protocol::ErrorClass::Transient),
             ));
         }
-        let default_page = req.from_ordinal.unwrap_or(0) == 0 && req.after_mid.is_none();
+        let default_page = req.from_ordinal.unwrap_or(1) <= 1 && req.after_mid.is_none();
         let had_late = !page.late_approvals.is_empty();
         let (late, next_late_after) = if !unreported && (late_only || default_page) {
             let (entries, next) =
@@ -3321,6 +3115,8 @@ impl ServeHandler for crate::LineageRegistry {
         }
         let prompt_len = page.prompt_len;
         let mut response = session_read_response(page, tools);
+        response.history_version = snapshot.history_version;
+        response.incarnation = snapshot.incarnation;
         if req.include_display_facts {
             if let Some(lineage) = &response.lineage_id {
                 let facts = self
@@ -3331,12 +3127,12 @@ impl ServeHandler for crate::LineageRegistry {
                         response
                             .messages
                             .iter()
-                            .map(|entry| entry.ordinal)
+                            .map(|entry| entry.ordinal - 1)
                             .collect(),
                     )
                     .await?;
                 for entry in &mut response.messages {
-                    if let Some(facts) = facts.get(&entry.ordinal) {
+                    if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
                         if entry.message.role == broca_protocol::Role::User {
                             entry.client_message_id = facts.client_message_id.clone();
                         }
@@ -3429,6 +3225,10 @@ impl ServeHandler for crate::LineageRegistry {
                 }
             }
         }
+        for entry in &mut response.messages {
+            entry.mid = broca_core::message_mid(mode3, response.lineage_id.as_deref(), entry.ordinal - 1)
+                .map_err(|error| ServeError::Open(error, Some(broca_protocol::ErrorClass::Permanent)))?;
+        }
         cap_page_bytes(
             &mut response,
             cap,
@@ -3449,6 +3249,7 @@ impl ServeHandler for crate::LineageRegistry {
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
     ) -> Result<broca_wire::HeadResponse, ServeError> {
+        let before_history = self.history_read_version(session).await?;
         // The newest page of one message: the store's last row and the WAL past its watermark,
         // so the cost follows what is not yet materialized, never the session's length.
         let crate::registry::RouteReadPage {
@@ -3462,13 +3263,16 @@ impl ServeHandler for crate::LineageRegistry {
             last_title,
             ..
         } = self.route_read_page(session, None, Some(1), false).await?;
-        // A session never written has no lineage, and then nothing else to report either.
-        // A session never written answers every member absent, `input` included: the
-        // conformance kit (0.10.2 `never_written_session_empty_head`) requires it, although
-        // llm-runner 0.5.1 §4.3 lets such a session state `input`.
-        let Some(lineage_id) = page.lineage_id else {
-            return Ok(broca_wire::HeadResponse::default());
-        };
+        let snapshot = self.served_snapshot(
+            session, page.lineage_id.map(|id| id.to_string()), at_seq > 0, before_history,
+        ).await?;
+        if snapshot.incarnation == "unwritten" {
+            return Ok(broca_wire::HeadResponse {
+                history_version: snapshot.history_version,
+                incarnation: snapshot.incarnation,
+                ..Default::default()
+            });
+        }
         if !head_facts_complete {
             return Err(crate::registry::OpenError::Open(
                 "session.head cannot attest metadata from an incomplete WAL suffix".into(),
@@ -3493,7 +3297,8 @@ impl ServeHandler for crate::LineageRegistry {
                 .find_map(|framed| broca_core::record_time_ms(&framed.record))
                 .unwrap_or(0),
         };
-        let media_facts = Some(
+        let media_facts = if let Some(lineage_id) = page.lineage_id {
+            Some(
             self.media_facts_for_head(
                 session,
                 crate::registry::media_head::Request {
@@ -3505,8 +3310,9 @@ impl ServeHandler for crate::LineageRegistry {
                     stored: head_media.as_ref(),
                 },
             )
-            .await?,
-        );
+                .await?,
+            )
+        } else { None };
         let interrupted_reason = if page.lineage_state.state.as_str() == "interrupted" {
             if let Some(facts) = &media_facts {
                 facts.interrupt_reason.clone()
@@ -3543,18 +3349,20 @@ impl ServeHandler for crate::LineageRegistry {
         } else {
             None
         };
+        let mode3 = self.mode3_for_page(session, page.lineage_id.map(|id| id.to_string()), &head_facts).await?;
         let input = media_facts.map_or_else(broca_wire::head_input, |facts| facts.input);
         Ok(broca_wire::HeadResponse {
+            mode3,
             last_run_rich_ui: head_facts.last_run_rich_ui,
             last_run_error,
             model: head_facts.model,
             usage: head_facts.usage.filter(|usage| usage.consistent()),
             sender,
-            incarnation: lineage_id.incarnation(),
-            lineage_id: Some(lineage_id.to_string()),
-            last_ordinal: page.prompt_len.checked_sub(1),
-            first_ordinal: Some(0),
-            history_version: Some(0),
+            incarnation: snapshot.incarnation,
+            lineage_id: page.lineage_id.map(|id| id.to_string()),
+            last_ordinal: (page.prompt_len > 0).then_some(page.prompt_len),
+            first_ordinal: (page.prompt_len > 0).then_some(1),
+            history_version: snapshot.history_version,
             head: page.head.map(|cursor| CursorWire {
                 wal_seq: cursor.wal_seq,
                 sub_index: cursor.sub_index,
@@ -3699,10 +3507,16 @@ impl ServeHandler for crate::LineageRegistry {
                 Some(records) => records,
                 None => self.read_durable_wal(session).await?.0,
             };
-            let message = match &row_read {
+            let mut message = match &row_read {
                 Some(read) => final_message_from_prompt(&read.replayed.prompt, &run_id)?,
                 None => final_message_of(&records, &run_id)?,
             };
+            let head = self.head(session).await?;
+            if row_read.as_ref().is_some_and(|read| read.lineage_id.map(|id| id.to_string()) != head.lineage_id) {
+                return Err(ServeError::UnknownRun(run_id.0));
+            }
+            message.mid = broca_core::message_mid(head.mode3, head.lineage_id.as_deref(), message.ordinal - 1)
+                .map_err(|error| ServeError::Open(error, Some(broca_protocol::ErrorClass::Permanent)))?;
             directives = completed_directives(&records, &run_id, &message.text);
             Some(message)
         } else {
@@ -4964,30 +4778,30 @@ mod offset_head_tests {
             ts_ms: None,
             run_id: RunId("r1".into()),
             session: BindIdentity::new("/tmp/project", "runner", "session"),
-            config: Box::new(RunConfig {
-                account_limit_pause: false,
-                turn_directives_v1: None,
-                render_tags: false,
-                computed_tags: None,
-                model: ModelHandle::new("stub", "m"),
-                tools: vec![].into(),
-                tool_choice: Default::default(),
-                generation: Default::default(),
-                response_format: Default::default(),
-                provider_options: serde_json::Value::Null,
-                cache_tiers: serde_json::Value::Null,
-                context_epoch: 0,
-                renderer_version: 1,
-                frozen_render_config: serde_json::Value::Null,
-                auth_selection: None,
-                tools_were_omitted: false,
-                budget: None,
-                context_limit: None,
-                work_class: None,
-                variant: None,
-                service_tier: None,
-                stop_when: Vec::new(),
-                context_management: None,
+            config: Box::new(RunConfig { route_decision_id: None,
+            account_limit_pause: false,
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: ModelHandle::new("stub", "m"),
+            tools: vec![].into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: Vec::new(),
+            context_management: None,
             }),
             input: vec![user("task")].into(),
             origin: RunOrigin::Fresh,
@@ -5224,14 +5038,14 @@ mod raw_database_composition_tests {
             );
         }
         let mut request = SessionReadRequest::new(key.clone(), None, Some(1));
-        request.lineage_id = Some("wrong-lineage".into());
-        assert!(matches!(
-            raw.read(request).await,
-            Err(ServeError::LineageChanged { .. })
-        ));
+        request.history_version = Some(u64::MAX);
+        assert!(matches!(raw.read(request).await, Err(ServeError::HistoryChanged)));
+        let mut legacy_argument = SessionReadRequest::new(key.clone(), None, Some(1));
+        legacy_argument.lineage_id = Some("ignored-legacy-lineage".into());
+        assert!(raw.read(legacy_argument).await.is_ok());
         let head = raw.head(&key).await.unwrap();
         let mut request = SessionReadRequest::new(key.clone(), None, Some(1));
-        request.lineage_id = head.lineage_id;
+        request.history_version = Some(head.history_version);
         request.after_mid = Some("m0".into());
         let next = raw.read(request).await.unwrap();
         assert_eq!(next.messages[0].mid, "m1");
@@ -5294,23 +5108,6 @@ mod raw_database_composition_tests {
                 serde_json::to_vec(&legacy.read(request).await.unwrap()).unwrap()
             );
         }
-        for from in [None, Some(0), Some(2), Some(4)] {
-            let request = SessionReadRequest::new(key.clone(), from, Some(2));
-            let actual = counter
-                .operation(format!("composed model page {from:?}"))
-                .run_future(raw.read_model(request.clone()))
-                .await
-                .unwrap();
-            assert_eq!(
-                serde_json::to_vec(&actual).unwrap(),
-                serde_json::to_vec(&legacy.read_model(request).await.unwrap()).unwrap()
-            );
-        }
-        let mut invalid = SessionReadRequest::new(key.clone(), None, Some(2));
-        invalid.after_mid = Some("m0".into());
-        assert!(
-            matches!(raw.read_model(invalid).await,Err(ServeError::InvalidParams{field,..}) if field=="view")
-        );
         assert!(!root.join("run-index.db").exists());
         for op in counter.snapshot() {
             assert!(

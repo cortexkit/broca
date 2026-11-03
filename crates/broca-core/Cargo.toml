@@ -20,6 +20,8 @@ cortexkit-role-compaction-provider = { workspace = true }
 cortexkit-role-step-transform-provider.workspace = true
 cortexkit-role-tool-provider.workspace = true
 cortexkit-role-llm-runner.workspace = true
+cortexkit-role-compaction.workspace = true
+cortexkit-compaction-view.workspace = true
 # The shared single-writer durable lease (OS advisory lock + monotonic forensic epoch stamp).
 cortexkit-lease = { workspace = true }
 serde.workspace = true

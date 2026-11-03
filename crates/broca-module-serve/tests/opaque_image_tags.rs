@@ -150,21 +150,21 @@ async fn model(responses: Vec<String>) -> Model {
 }
 
 fn request(root: &Path) -> RunRequest {
-    RunRequest {
-        input_written_at_ms: None, directives: None, session_class: None,
-        retention: None, on_restart: None, keep_warm: None, project_id: None,
-        principal: None, run_id: RunId("run".into()),
-        session: BindIdentity::new(root, "test", "image-tags"),
-        model: ModelHandle::new("mock", "mock-model"),
-        input: vec![Message::new(Role::User, vec![ContentBlock::Text { text: "Look at this image".into() }])],
-        tools: vec![serde_json::from_value(json!({"name":"photo","description":"Returns an image","input_schema":{"type":"object"}})).unwrap()],
-        policy_allowed: ["photo".into()].into_iter().collect(),
-        tool_choice: Default::default(), generation: Default::default(), cache: None,
-        budget: None, context_limit: None, work_class: None, variant: None,
-        service_tier: None, stop_when: vec![broca_protocol::StopCondition::StepCount { n: 4 }],
-        context_management: None, submission_id: None, send_id: None,
-        request_identity_digest: None, title: None, scope: None,
-        inherit_frozen_cache: false, structured_output: None,
+    RunRequest { route_decision_id: None,
+    input_written_at_ms: None, directives: None, session_class: None,
+    retention: None, on_restart: None, keep_warm: None, project_id: None,
+    principal: None, run_id: RunId("run".into()),
+    session: BindIdentity::new(root, "test", "image-tags"),
+    model: ModelHandle::new("mock", "mock-model"),
+    input: vec![Message::new(Role::User, vec![ContentBlock::Text { text: "Look at this image".into() }])],
+    tools: vec![serde_json::from_value(json!({"name":"photo","description":"Returns an image","input_schema":{"type":"object"}})).unwrap()],
+    policy_allowed: ["photo".into()].into_iter().collect(),
+    tool_choice: Default::default(), generation: Default::default(), cache: None,
+    budget: None, context_limit: None, work_class: None, variant: None,
+    service_tier: None, stop_when: vec![broca_protocol::StopCondition::StepCount { n: 4 }],
+    context_management: None, submission_id: None, send_id: None,
+    request_identity_digest: None, title: None, scope: None,
+    inherit_frozen_cache: false, structured_output: None,
     }
 }
 

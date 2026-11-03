@@ -140,48 +140,48 @@ fn tool(name: &str) -> Tool {
 }
 
 fn request(dir: &std::path::Path, run: &str, model: &str, user: Message) -> RunRequest {
-    RunRequest {
-        input_written_at_ms: None,
-        directives: None,
-        session_class: None,
-        retention: None,
-        title: None,
-        on_restart: None,
-        keep_warm: None,
-        scope: None,
-        send_id: None,
-        request_identity_digest: None,
-        project_id: None,
-        principal: None,
-        run_id: RunId(run.into()),
-        session: broca_protocol::BindIdentity::new(dir, "append-only-anthropic", "s1"),
-        model: ModelHandle::new("anthropic", model),
-        // Every send repeats the session's system prompt, as clients do; admission drops the
-        // byte-identical repeat.
-        input: vec![
-            Message::new(
-                Role::System,
-                vec![ContentBlock::Text {
-                    text: "You are a careful agent.".into(),
-                }],
-            ),
-            user,
-        ],
-        tools: vec![tool(TOOL)],
-        policy_allowed: [TOOL.to_string()].into_iter().collect(),
-        tool_choice: ToolChoice::Auto,
-        generation: GenerationConfig::default(),
-        cache: None,
-        stop_when: vec![StopCondition::StepCount { n: 8 }],
-        submission_id: None,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        context_management: None,
-        variant: None,
-        service_tier: None,
-        inherit_frozen_cache: false,
-        structured_output: None,
+    RunRequest { route_decision_id: None,
+    input_written_at_ms: None,
+    directives: None,
+    session_class: None,
+    retention: None,
+    title: None,
+    on_restart: None,
+    keep_warm: None,
+    scope: None,
+    send_id: None,
+    request_identity_digest: None,
+    project_id: None,
+    principal: None,
+    run_id: RunId(run.into()),
+    session: broca_protocol::BindIdentity::new(dir, "append-only-anthropic", "s1"),
+    model: ModelHandle::new("anthropic", model),
+    // Every send repeats the session's system prompt, as clients do; admission drops the
+    // byte-identical repeat.
+    input: vec![
+        Message::new(
+            Role::System,
+            vec![ContentBlock::Text {
+                text: "You are a careful agent.".into(),
+            }],
+        ),
+        user,
+    ],
+    tools: vec![tool(TOOL)],
+    policy_allowed: [TOOL.to_string()].into_iter().collect(),
+    tool_choice: ToolChoice::Auto,
+    generation: GenerationConfig::default(),
+    cache: None,
+    stop_when: vec![StopCondition::StepCount { n: 8 }],
+    submission_id: None,
+    budget: None,
+    context_limit: None,
+    work_class: None,
+    context_management: None,
+    variant: None,
+    service_tier: None,
+    inherit_frozen_cache: false,
+    structured_output: None,
     }
 }
 

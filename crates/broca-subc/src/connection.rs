@@ -172,6 +172,10 @@ impl RejectedMessage {
         self
     }
 
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
     pub(crate) fn code(&self) -> &str {
         self.code.as_deref().unwrap_or("")
     }
@@ -4466,7 +4470,7 @@ pub fn supervised_consumer_identity() -> Option<subc_control::ConsumerIdentity> 
 ///
 /// Tool modules accept only a fixed set of harness values at bind (opencode, pi, runner, mcp:*,
 /// fed:*) and reject anything else, so every `RouteTarget::ToolProvider` bind that does not
-/// declare the compaction-provider role presents `runner`.
+/// declare a session-keyed compaction or step-transform role presents `runner`.
 ///
 /// Broca's own `BindIdentity.harness` cannot simply be that value: it is an opaque key component,
 /// joined into WAL, lease, store and idempotency keys, so it partitions durable state and broca
@@ -4521,9 +4525,15 @@ fn to_subc_bind(
     // workaround onto a surface that never asked for it (which is the defect this fixes), and
     // defaulting to pass-through silently hands a closed enum a value it rejects at bind.
     let harness = match target {
-        // A compaction provider keys the conversation on the session's real identity, and its
-        // Setup body reports that identity, so the route presents it unchanged.
-        RouteTarget::ToolProvider { .. } if declares_compaction_provider(role_versions) => {
+        // Session-keyed compaction and step-transform roles use the caller's real harness;
+        // only tool-provider routes need the closed-enum `runner` translation.
+        RouteTarget::ToolProvider { .. }
+            if declares_compaction_provider(role_versions)
+                || role_versions.is_some_and(|roles| {
+                    roles.get(cortexkit_role_step_transform_provider::ROLE)
+                        .is_some_and(|version| version == cortexkit_role_step_transform_provider::VERSION)
+                }) =>
+        {
             identity.harness.as_str()
         }
         // Tool modules run a closed enum and reject anything else at bind.

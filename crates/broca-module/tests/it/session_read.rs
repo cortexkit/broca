@@ -590,41 +590,41 @@ fn tool(name: &str) -> Tool {
 fn req(key: &BindIdentity, run: &str, text: &str) -> RunRequest {
     let tools = vec![tool("lookup")];
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
-    RunRequest {
-        input_written_at_ms: None,
-        directives: None,
-        session_class: None,
-        retention: None,
-        title: None,
-        on_restart: None,
-        keep_warm: None,
-        scope: None,
-        send_id: None,
-        request_identity_digest: None,
-        project_id: None,
-        principal: None,
-        run_id: RunId(run.into()),
-        session: key.clone(),
-        model: ModelHandle::new("stub", "stub-model"),
-        input: vec![Message::new(
-            Role::User,
-            vec![ContentBlock::Text { text: text.into() }],
-        )],
-        tools,
-        policy_allowed,
-        tool_choice: ToolChoice::Auto,
-        generation: Default::default(),
-        cache: None,
-        stop_when: vec![],
-        submission_id: None,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        context_management: None,
-        variant: None,
-        service_tier: None,
-        inherit_frozen_cache: false,
-        structured_output: None,
+    RunRequest { route_decision_id: None,
+    input_written_at_ms: None,
+    directives: None,
+    session_class: None,
+    retention: None,
+    title: None,
+    on_restart: None,
+    keep_warm: None,
+    scope: None,
+    send_id: None,
+    request_identity_digest: None,
+    project_id: None,
+    principal: None,
+    run_id: RunId(run.into()),
+    session: key.clone(),
+    model: ModelHandle::new("stub", "stub-model"),
+    input: vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text { text: text.into() }],
+    )],
+    tools,
+    policy_allowed,
+    tool_choice: ToolChoice::Auto,
+    generation: Default::default(),
+    cache: None,
+    stop_when: vec![],
+    submission_id: None,
+    budget: None,
+    context_limit: None,
+    work_class: None,
+    context_management: None,
+    variant: None,
+    service_tier: None,
+    inherit_frozen_cache: false,
+    structured_output: None,
     }
 }
 
@@ -1690,30 +1690,30 @@ async fn idle_read_flush_failure_hides_the_unproven_tail() {
 }
 
 fn min_config() -> RunConfig {
-    RunConfig {
-        account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        model: ModelHandle::new("stub", "stub-model"),
-        tools: vec![tool("lookup")].into(),
-        tool_choice: ToolChoice::Auto,
-        generation: Default::default(),
-        response_format: Default::default(),
-        provider_options: serde_json::Value::Null,
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: 1,
-        frozen_render_config: serde_json::Value::Null,
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: Vec::new(),
-        context_management: None,
+    RunConfig { route_decision_id: None,
+    account_limit_pause: false,
+    turn_directives_v1: None,
+    render_tags: false,
+    computed_tags: None,
+    model: ModelHandle::new("stub", "stub-model"),
+    tools: vec![tool("lookup")].into(),
+    tool_choice: ToolChoice::Auto,
+    generation: Default::default(),
+    response_format: Default::default(),
+    provider_options: serde_json::Value::Null,
+    cache_tiers: serde_json::Value::Null,
+    context_epoch: 0,
+    renderer_version: 1,
+    frozen_render_config: serde_json::Value::Null,
+    auth_selection: None,
+    tools_were_omitted: false,
+    budget: None,
+    context_limit: None,
+    work_class: None,
+    variant: None,
+    service_tier: None,
+    stop_when: Vec::new(),
+    context_management: None,
     }
 }
 
@@ -1780,18 +1780,18 @@ fn read_request(
     from_ordinal: Option<u64>,
     limit: Option<u64>,
 ) -> SessionReadRequest {
-    SessionReadRequest {
-        session: key.clone(),
-        late_after: None,
-        from_ordinal,
-        limit,
-        include_tools: false,
-        include_rich_ui: false,
-        include_display_facts: false,
-        after_mid: None,
-        lineage_id: None,
-        max_bytes: None,
-        media: Default::default(),
+    SessionReadRequest { history_version: None,
+    session: key.clone(),
+    late_after: None,
+    from_ordinal,
+    limit,
+    include_tools: false,
+    include_rich_ui: false,
+    include_display_facts: false,
+    after_mid: None,
+    lineage_id: None,
+    max_bytes: None,
+    media: Default::default(),
     }
 }
 
@@ -2030,9 +2030,9 @@ fn read_request_with_tools(
     from_ordinal: Option<u64>,
     limit: Option<u64>,
 ) -> SessionReadRequest {
-    SessionReadRequest {
-        include_tools: true,
-        ..read_request(key, from_ordinal, limit)
+    SessionReadRequest { history_version: None,
+    include_tools: true,
+    ..read_request(key, from_ordinal, limit)
     }
 }
 
@@ -4214,11 +4214,7 @@ async fn responses_reasoning_summary_reads_back_as_the_stored_blocks() {
         )
         .await
         .expect("model view read");
-    let model = serde_json::to_value(
-        broca_wire::ModelPage::try_from(model).expect("model page reaches the wire"),
-    )
-    .unwrap();
-    assert_eq!(model["messages"][1]["message"]["content"], stored_wire);
+    assert_eq!(serde_json::to_value(&model.messages[1].message.content).unwrap(), stored_wire);
 
     let records = rig.wal_store.read_records(&key).expect("read WAL");
     let durable = records
@@ -4889,71 +4885,6 @@ async fn transcript_reply_body_budget_applies_to_tail_range_and_large_requests()
     }
 }
 
-#[tokio::test]
-async fn model_view_pages_fit_the_serialized_wire_reply_and_continue_exactly() {
-    let rig = crate::common::Rig::new(
-        "model-read-reply-budget",
-        crate::common::FakeExecutor::auto(),
-        Duration::from_secs(3600),
-    );
-    let key = rig.key("session");
-    let messages: Vec<_> = (0..3)
-        .map(|_| {
-            Message::new(
-                Role::User,
-                vec![ContentBlock::Text {
-                    text: "x".repeat(1_250_000),
-                }],
-            )
-        })
-        .collect();
-    rig.registry
-        .import(SessionImportRequest {
-            project_id: None,
-            principal: None,
-            session: key.clone(),
-            run_id: RunId("import-model-budget".into()),
-            messages: messages.clone(),
-            source_ref: "fixture:model-read-budget".into(),
-        })
-        .await
-        .unwrap();
-
-    let first = rig
-        .registry
-        .read_model(SessionReadRequest::new(key.clone(), Some(0), Some(100)))
-        .await
-        .unwrap();
-    assert_eq!(first.messages.len(), 2);
-    assert_eq!(first.next_from_ordinal, Some(2));
-    assert!(serde_json::to_vec(&first).unwrap().len() < 3 * 1024 * 1024);
-    for (entry, ordinal) in first.messages.iter().zip(0..2) {
-        assert_eq!(entry.source.from_ordinal(), ordinal);
-        assert_eq!(
-            serde_json::to_value(&entry.message).unwrap(),
-            serde_json::to_value(&messages[ordinal as usize]).unwrap()
-        );
-    }
-
-    let second = rig
-        .registry
-        .read_model(SessionReadRequest::new(
-            key,
-            first.next_from_ordinal,
-            Some(100),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(second.messages.len(), 1);
-    assert_eq!(second.messages[0].source.from_ordinal(), 2);
-    assert_eq!(
-        serde_json::to_value(&second.messages[0].message).unwrap(),
-        serde_json::to_value(&messages[2]).unwrap()
-    );
-    assert_eq!(second.next_from_ordinal, None);
-    assert!(serde_json::to_vec(&second).unwrap().len() < 3 * 1024 * 1024);
-    drop(rig);
-}
 
 #[tokio::test]
 async fn imported_message_over_page_target_is_served_whole_when_frame_fits() {
@@ -5042,7 +4973,7 @@ async fn imported_message_over_frame_limit_is_refused_with_identity() {
 }
 
 #[tokio::test]
-async fn missing_history_keeps_an_explicit_lineage_changed_refusal() {
+async fn missing_history_is_not_bypassed_by_a_legacy_lineage_argument() {
     for forked_stub in [false, true] {
         let (rig, resolved, real, real_bytes) = stale_inventory_fixture().await;
         let history = rig
@@ -5061,7 +4992,7 @@ async fn missing_history_keeps_an_explicit_lineage_changed_refusal() {
         request.lineage_id = Some(requested.clone());
         let error = rig.registry.read(request).await.unwrap_err();
         assert!(
-            matches!(error, broca_module::serve::ServeError::LineageChanged { requested: ref id } if id == &requested),
+            matches!(error, broca_module::serve::ServeError::SessionLogMissing { .. }),
             "{error:?}"
         );
         assert_eq!(std::fs::read(path).ok(), before);

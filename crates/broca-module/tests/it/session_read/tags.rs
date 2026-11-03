@@ -16,52 +16,24 @@ async fn page_bytes(rig: &Rig, key: &BindIdentity, media: MediaMode) -> Value {
     request.media = media;
     let response = rig.registry.read(request).await.expect("session.read");
     for entry in &response.messages {
-        let tags = if entry.tags.is_empty() {
-            "<absent>".into()
-        } else {
-            serde_json::to_string(&entry.tags).unwrap()
-        };
-        let digests = entry
-            .part_digests
-            .as_ref()
-            .map(|parts| serde_json::to_string(parts).unwrap())
-            .unwrap_or("<absent>".into());
-        eprintln!(
-            "{} {media:?}: tags={tags}; part_digests={digests}",
-            entry.mid
-        );
-        assert_eq!(
-            entry.part_digests.is_some(),
-            media == MediaMode::Descriptors
-        );
+        let keys = entry.part_keys.as_ref().map(|keys| serde_json::to_string(keys).unwrap()).unwrap_or_else(|| "<absent>".into());
+        let digests = entry.part_digests.as_ref().map(|parts| serde_json::to_string(parts).unwrap()).unwrap_or_else(|| "<absent>".into());
+        eprintln!("{} {media:?}: part_keys={keys}; part_digests={digests}", entry.mid);
+        assert_eq!(entry.part_digests.is_some(), media == MediaMode::Descriptors);
     }
-    serde_json::to_value(response).unwrap()
+    let value = serde_json::to_value(response).unwrap();
+    assert!(value["incarnation"].as_str().is_some_and(|value| !value.is_empty()));
+    assert!(value["history_version"].as_u64().is_some());
+    value
 }
 
 fn assert_rows(entry: &Value, expected: Value) {
-    assert_eq!(
-        entry["tags"], expected,
-        "every exposed part needs a tag row"
-    );
-    if entry.get("part_digests").is_none() {
-        return;
-    }
-    let keys: Vec<_> = entry["tags"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| &row["part"])
-        .collect();
-    let digests: Vec<_> = entry["part_digests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| &row["part"])
-        .collect();
-    assert_eq!(
-        keys, digests,
-        "tag and digest keys must agree in part order"
-    );
+    assert!(entry.get("tags").is_none(), "legacy tag rows are not a read surface");
+    assert_eq!(entry["part_keys"], expected, "every exposed part needs its opaque key");
+    if entry.get("part_digests").is_none() { return; }
+    let keys: Vec<_> = entry["part_keys"].as_array().unwrap().iter().collect();
+    let digests: Vec<_> = entry["part_digests"].as_array().unwrap().iter().map(|row| &row["part"]).collect();
+    assert_eq!(keys, digests, "part and digest keys must agree in content order");
 }
 
 #[tokio::test]
@@ -86,7 +58,7 @@ async fn open_batch_has_rows_before_results_commit() {
     }
     for page in pages {
         assert_eq!(page["messages"].as_array().unwrap().len(), 2);
-        assert_rows(&page["messages"][1], json!([{"part": "m1#0"}]));
+        assert_rows(&page["messages"][1], json!(["m1#0"]));
     }
 }
 
@@ -105,7 +77,7 @@ async fn open_and_committed_rows_keep_the_same_part_keys() {
     }
     for (media, committed) in committed_pages {
         assert_eq!(
-            open["messages"][1]["tags"], committed["messages"][1]["tags"],
+            open["messages"][1]["part_keys"], committed["messages"][1]["part_keys"],
             "part keys must survive batch commitment"
         );
         if media == MediaMode::Descriptors {
@@ -114,19 +86,16 @@ async fn open_and_committed_rows_keep_the_same_part_keys() {
                 committed["messages"][1]["part_digests"]
             );
         }
-        assert_rows(&committed["messages"][1], json!([{"part": "m1#0"}]));
+        assert_rows(&committed["messages"][1], json!(["m1#0"]));
     }
     materialize_all(&rig, &key);
     let stored = page_bytes(&rig, &key, MediaMode::Inline).await;
-    assert_eq!(open["messages"][1]["tags"], stored["messages"][1]["tags"]);
+    assert_eq!(open["messages"][1]["part_keys"], stored["messages"][1]["part_keys"]);
 }
 
-/// A read that lands after a tool turn is written but before its batch commits exposes the
-/// turn's text. The text counts, so the read must already show the number commit gives it:
-/// llm-runner §9.6 makes any change to an exposed part's number a new lineage, and an
-/// unnumbered row that later gains a number is such a change.
+/// Reads expose stable opaque keys before and after a batch commits, never renderer tag rows.
 #[tokio::test]
-async fn open_text_shows_its_final_number_before_batch_commit() {
+async fn open_text_keeps_its_part_keys_across_batch_commit() {
     let rig = Rig::new("open-text-tags", Arc::new(NoopExec));
     let key = rig.key("open-text");
     let mut records = tagged_episode(&key);
@@ -141,15 +110,15 @@ async fn open_text_shows_its_final_number_before_batch_commit() {
             },
         );
     }
-    let expected = json!([{"part": "m1#0", "tag": "§2§"}, {"part": "m1#1"}]);
+    let expected = json!(["m1#0", "m1#1"]);
     // Stop the WAL between the step's dispatch intent and its results: the batch is open.
     append_seed(&rig.wal_store, &key, &records[..4]);
     let mut open_pages = Vec::new();
     for media in [MediaMode::Inline, MediaMode::Descriptors] {
         let open = page_bytes(&rig, &key, media).await;
         assert_eq!(
-            open["messages"][1]["tags"], expected,
-            "an exposed counted part shows its final number before batch commitment"
+            open["messages"][1]["part_keys"], expected,
+            "an exposed part has its stable key before batch commitment"
         );
         assert_rows(&open["messages"][1], expected.clone());
         open_pages.push(open);
@@ -160,10 +129,11 @@ async fn open_text_shows_its_final_number_before_batch_commit() {
         .zip(open_pages)
     {
         let committed = page_bytes(&rig, &key, media).await;
-        assert_eq!(open["lineage_id"], committed["lineage_id"]);
+        assert_eq!(open["incarnation"], committed["incarnation"]);
+        assert_eq!(open["history_version"], committed["history_version"]);
         assert_eq!(
-            open["messages"][1]["tags"], committed["messages"][1]["tags"],
-            "batch commitment changes no number a read exposed"
+            open["messages"][1]["part_keys"], committed["messages"][1]["part_keys"],
+            "batch commitment changes no exposed key"
         );
         assert_eq!(
             open["messages"][1]["part_digests"],
@@ -229,15 +199,15 @@ async fn live_tail_and_steer_rows_cover_parts_before_materialization() {
         assert_eq!(page["messages"].as_array().unwrap().len(), 3);
         assert_rows(
             &page["messages"][0],
-            json!([{"part": "m0#0", "tag": "§1§"}]),
+            json!(["m0#0"]),
         );
         assert_rows(
             &page["messages"][1],
-            json!([{"part": "m1#0", "tag": "§2§"}, {"part": "m1#1", "tag": "§3§"}]),
+            json!(["m1#0", "m1#1"]),
         );
         assert_rows(
             &page["messages"][2],
-            json!([{"part": "m2#0", "tag": "§4§"}]),
+            json!(["m2#0"]),
         );
     }
     materialize_all(&rig, &key);
@@ -284,13 +254,13 @@ async fn crash_sealed_batch_rows_keep_exposed_keys() {
         pages.push(after);
     }
     for after in pages {
-        assert_rows(&after["messages"][1], json!([{"part": "m1#0"}]));
+        assert_rows(&after["messages"][1], json!(["m1#0"]));
         assert_rows(
             &after["messages"][2],
-            json!([{"part": "m2#0", "tag": "§2§"}]),
+            json!(["m2#0"]),
         );
         assert_eq!(
-            before["messages"][1]["tags"], after["messages"][1]["tags"],
+            before["messages"][1]["part_keys"], after["messages"][1]["part_keys"],
             "sealing must preserve exposed keys"
         );
     }

@@ -369,7 +369,7 @@ async fn descriptors_keep_marker_only_and_empty_parts_as_stored() {
 #[tokio::test]
 async fn stored_parts_count_once_and_render_without_losing_media() {
     use broca_protocol::tags::{part_kind, render_tags_into, TagRendering};
-    use cortexkit_role_llm_runner::tags::PartKind;
+    use broca_protocol::tags::v1::PartKind;
     let rig = Rig::new("parts-render-tags", Arc::new(NoopExec));
     let document = MediaRef {
         kind: MediaKind::Document,
@@ -428,14 +428,10 @@ async fn stored_parts_count_once_and_render_without_losing_media() {
         let key = rig.key(name);
         write_legacy_seed(&rig.wal_store, &key, &seed(&key, parts.clone()));
         let page = read(&rig, &key, MediaMode::Blocks).await;
-        assert_eq!(
-            serde_json::to_value(&page.messages[2].tags).unwrap(),
-            json!([{"part":"m2#0","tag":"§2§"}])
-        );
-        assert_eq!(
-            serde_json::to_value(&page.messages[3].tags).unwrap(),
-            json!([{"part":"m3#0","tag":"§3§"}])
-        );
+        assert_eq!(page.messages[2].part_keys, Some(vec!["m2#0".into()]));
+        assert_eq!(page.messages[2].message.part_tags().unwrap().parts, vec![Some(2)]);
+        assert_eq!(page.messages[3].part_keys, Some(vec!["m3#0".into()]));
+        assert_eq!(page.messages[3].message.part_tags().unwrap().parts, vec![Some(3)]);
         let mut prompt: Vec<_> = page
             .messages
             .into_iter()
@@ -505,7 +501,7 @@ async fn stored_parts_count_once_and_render_without_losing_media() {
 #[tokio::test]
 async fn stored_empty_text_parts_do_not_consume_or_hide_a_number() {
     use broca_protocol::tags::{part_kind, render_tags_into, TagRendering};
-    use cortexkit_role_llm_runner::tags::PartKind;
+    use broca_protocol::tags::v1::PartKind;
     let rig = Rig::new("empty-parts-tags", Arc::new(NoopExec));
     for (name, parts, kind, label, next) in [
         (
@@ -552,17 +548,10 @@ async fn stored_empty_text_parts_do_not_consume_or_hide_a_number() {
         let key = rig.key(name);
         write_legacy_seed(&rig.wal_store, &key, &seed(&key, parts));
         let page = read(&rig, &key, MediaMode::Blocks).await;
-        let rows = serde_json::to_value(&page.messages[2].tags).unwrap();
-        let expected = if label.is_some() {
-            json!([{"part":"m2#0","tag":"§2§"}])
-        } else {
-            json!([{"part":"m2#0"}])
-        };
-        assert_eq!(rows, expected, "{name}");
-        assert_eq!(
-            serde_json::to_value(&page.messages[3].tags).unwrap(),
-            json!([{"part":"m3#0","tag":next}])
-        );
+        assert_eq!(page.messages[2].part_keys, Some(vec!["m2#0".into()]));
+        assert_eq!(page.messages[2].message.part_tags().unwrap().parts, vec![label.map(|_| 2)], "{name}");
+        assert_eq!(page.messages[3].part_keys, Some(vec!["m3#0".into()]));
+        assert_eq!(page.messages[3].message.part_tags().unwrap().parts, vec![Some(broca_protocol::tags::v1::parse_tag(next).unwrap())]);
         let mut prompt: Vec<_> = page
             .messages
             .into_iter()

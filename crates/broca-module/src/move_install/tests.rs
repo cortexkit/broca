@@ -30,30 +30,30 @@ pub(crate) fn started(session: &BindIdentity, id: &str) -> WalRecord {
         run_id: RunId(id.into()),
         session: session.clone(),
         ts_ms: Some(1),
-        config: Box::new(RunConfig {
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: broca_protocol::ModelHandle::new("stub", "m"),
-            tools: vec![].into(),
-            tool_choice: broca_protocol::ToolChoice::Auto,
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: Value::Null,
-            cache_tiers: Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: Value::Null,
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: vec![],
-            context_management: None,
+        config: Box::new(RunConfig { route_decision_id: None,
+        account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: broca_protocol::ModelHandle::new("stub", "m"),
+        tools: vec![].into(),
+        tool_choice: broca_protocol::ToolChoice::Auto,
+        generation: Default::default(),
+        response_format: Default::default(),
+        provider_options: Value::Null,
+        cache_tiers: Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: Value::Null,
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: vec![],
+        context_management: None,
         }),
         input: Default::default(),
         origin: RunOrigin::Fresh,
@@ -117,7 +117,7 @@ fn whole_ref_set_divergence_refuses_before_any_installation_or_floor() {
     ];
     let export = broca_store::SqliteStore::open_in_memory().unwrap();
     let drops = std::sync::atomic::AtomicUsize::new(0);
-    let result = install_verified(&root, "cut", &specs, &export, |_| {
+    let result = install_verified(&root, "cut", &specs, &export, |_| Ok(()), |_| {
         drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     });
@@ -158,13 +158,7 @@ fn operational_overhaul_activation_recovery_keeps_exclusions_across_the_rename_c
         digest: &digest,
     }];
     let db = broca_store::db::OverhaulDb::open(&root).unwrap();
-    let error = install_verified(
-        &root,
-        "cut",
-        &specs,
-        &db,
-        |_| Err("cut after rename".into()),
-    )
+    let error = install_verified(&root, "cut", &specs, &db, |_| Ok(()), |_| Err("cut after rename".into()))
     .unwrap_err();
     assert_eq!(error.code.as_str(), "unavailable");
     assert_eq!(std::fs::read(&live).unwrap(), incoming);
@@ -177,7 +171,7 @@ fn operational_overhaul_activation_recovery_keeps_exclusions_across_the_rename_c
         &RunId("foreign-run".into())
     )
     .unwrap());
-    install_verified(&root, "cut", &specs, &db, |session| {
+    install_verified(&root, "cut", &specs, &db, |_| Ok(()), |session| {
         db.forget_session(session).map_err(|e| e.to_string())
     })
     .unwrap();
@@ -233,7 +227,7 @@ fn imported_floor_excludes_foreign_runs_and_preserves_local_billing_after_recove
         digest: &digest,
     }];
     let export = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-    let result = install_verified(&root, "cut", &specs, &export, |_| {
+    let result = install_verified(&root, "cut", &specs, &export, |_| Ok(()), |_| {
         Err("crash after rename".into())
     });
     assert_eq!(result.unwrap_err().code.as_str(), "unavailable");
@@ -241,7 +235,7 @@ fn imported_floor_excludes_foreign_runs_and_preserves_local_billing_after_recove
     assert!(!staged.exists());
     drop(export);
     let export = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-    install_verified(&root, "cut", &specs, &export, |_| Ok(())).unwrap();
+    install_verified(&root, "cut", &specs, &export, |_| Ok(()), |_| Ok(())).unwrap();
     assert!(!live.with_extension("moved").exists());
     let records = broca_wal::replay_file(&live, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
     let resolver = |_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1);
@@ -398,20 +392,14 @@ fn mixed_identity_import_excludes_every_historical_run_and_bills_fresh_receiver_
     let live = wal.wal_path(&current);
     let receiver_path = root.join("receiver.db");
     let receiver = broca_store::SqliteStore::open(&receiver_path).unwrap();
-    install_verified(
-        &root,
-        "mixed-cut",
-        &[Installation {
-            session: &current,
-            staged: &staged,
-            live: &live,
-            local_archive: None,
-            end_offset: bytes.len() as u64,
-            digest: &digest,
-        }],
-        &receiver,
-        |_| Ok(()),
-    )
+    install_verified(&root, "mixed-cut", &[Installation {
+        session: &current,
+        staged: &staged,
+        live: &live,
+        local_archive: None,
+        end_offset: bytes.len() as u64,
+        digest: &digest,
+    }], &receiver, |_| Ok(()), |_| Ok(()))
     .unwrap();
     drop(receiver);
     let receiver = broca_store::SqliteStore::open(receiver_path).unwrap();
@@ -483,7 +471,7 @@ fn already_renamed_activation_repays_the_staging_source_barrier() {
             }
             Ok(())
         });
-        assert!(install_verified(&root, "cut", &specs, &export, |_| {
+        assert!(install_verified(&root, "cut", &specs, &export, |_| Ok(()), |_| {
             drops.set(drops.get() + 1);
             Ok(())
         })
@@ -502,7 +490,7 @@ fn already_renamed_activation_repays_the_staging_source_barrier() {
             }
             Ok(())
         });
-        let error = install_verified(&root, "cut", &specs, &export, |_| {
+        let error = install_verified(&root, "cut", &specs, &export, |_| Ok(()), |_| {
             drops.set(drops.get() + 1);
             Ok(())
         })
@@ -524,7 +512,7 @@ fn already_renamed_activation_repays_the_staging_source_barrier() {
         }
         Ok(())
     });
-    install_verified(&root, "cut", &specs, &export, |_| {
+    install_verified(&root, "cut", &specs, &export, |_| Ok(()), |_| {
         assert!(
             synced.get(),
             "recovery must finish staging removal before projection cleanup"

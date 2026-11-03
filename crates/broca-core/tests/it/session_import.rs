@@ -546,6 +546,7 @@ fn complete_import_records_for_test(
     prompt: &str,
 ) -> Vec<WalRecord> {
     let config = broca_wal::RunConfig {
+        route_decision_id: None,
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,

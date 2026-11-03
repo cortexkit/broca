@@ -313,17 +313,8 @@ impl HookRuntime<'_> {
             std::future::pending::<()>().await;
         }
         for (index, (item, sub, declaration)) in matching.iter().enumerate() {
-            let mut call = HookCall::new(
-                &self.bind.session,
-                &self.bind.harness,
-                output.subject.clone(),
-            )
-            .with_item(item.preset.clone(), item.params.clone());
-            // A file header may already have minted a lineage, but the first pre-user
-            // subject belongs to a session with no recorded message yet.
-            if self.writer.next_record_seq() > 1 {
-                call.lineage_id = self.writer.lineage_id().map(|id| id.to_string());
-            }
+            let call = HookCall::new(output.subject.clone())
+                .with_item(item.preset.clone(), item.params.clone());
             let answer = tokio::select! {
                 biased;
                 _ = cancelled(self.cancel) => HookCompletion::Cancelled(HookCancellation::CallerCancel),
@@ -378,15 +369,6 @@ impl HookRuntime<'_> {
                         answer,
                     )
                     .is_ok()
-                    && match (&output.subject, answer) {
-                        (Subject::PostTool { blocks, .. }, HookAnswer::Ops { ops }) => {
-                            apply_ops(blocks, ops).is_ok_and(|final_blocks| {
-                                final_blocks.iter().map(String::len).sum::<usize>()
-                                    <= crate::run::TOOL_RESULT_MAX_BYTES
-                            })
-                        }
-                        _ => true,
-                    }
             });
             match answer {
                 None if sub.on_unavailable == OnUnavailable::Refuse
@@ -445,6 +427,9 @@ impl HookRuntime<'_> {
                     // provider must not replace the consent terms the human will answer.
                     return output;
                 }
+                Some(_) => {
+                    output.refusal = Some((item.provider.clone(), "unavailable".into(), true));
+                }
             }
             if output.refusal.is_some() {
                 if !observe(&output) {
@@ -464,31 +449,14 @@ fn attribution(provider: &str, sub: &Subscription, operation: &Operation) -> Hoo
         Operation::Prepend { note, .. }
         | Operation::Append { note, .. }
         | Operation::Replace { note, .. } => note.clone(),
+        _ => None,
     };
     HookOp {
         module: provider.into(),
-        hook: match sub.hook {
-            Hook::PreUser => "pre_user",
-            Hook::PostAssistant => "post_assistant",
-            Hook::PreTool => "pre_tool",
-            Hook::PostTool => "post_tool",
-        }
-        .into(),
-        phase: sub.phase.map(|phase| {
-            match phase {
-                Phase::Mutate => "mutate",
-                Phase::Validate => "validate",
-                Phase::Approve => "approve",
-            }
-            .into()
-        }),
-        op: match operation.op() {
-            Op::Append => "append",
-            Op::Prepend => "prepend",
-            Op::Replace => "replace",
-        }
-        .into(),
-        block: Some(operation.block()),
+        hook: sub.hook.as_str().into(),
+        phase: sub.phase.as_ref().map(|phase| phase.as_str().into()),
+        op: operation.op().as_str().into(),
+        block: operation.block(),
         note,
     }
 }

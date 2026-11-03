@@ -66,18 +66,18 @@ async fn import_then_read_returns_the_canonical_transcript() {
 
     let page = rig
         .registry
-        .read(SessionReadRequest {
-            late_after: None,
-            session: key,
-            from_ordinal: Some(0),
-            limit: Some(500),
-            include_tools: false,
-            include_rich_ui: false,
-            include_display_facts: false,
-            after_mid: None,
-            lineage_id: None,
-            max_bytes: None,
-            media: Default::default(),
+        .read(SessionReadRequest { history_version: None,
+        late_after: None,
+        session: key,
+        from_ordinal: Some(0),
+        limit: Some(500),
+        include_tools: false,
+        include_rich_ui: false,
+        include_display_facts: false,
+        after_mid: None,
+        lineage_id: None,
+        max_bytes: None,
+        media: Default::default(),
         })
         .await
         .expect("read import");

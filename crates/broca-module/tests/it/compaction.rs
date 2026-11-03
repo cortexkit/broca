@@ -446,12 +446,9 @@ async fn an_imported_session_cannot_enroll_in_compaction() {
     rig.close().await;
 }
 
-/// While a run that renders tags waits for its first Setup answer, which may anchor its numbers
-/// at a checkpoint, `session.read` and `session.resolve` refuse `transient` and write nothing.
-/// Once the answer is durable they answer, with the checkpoint's numbers: no read ever shows a
-/// number a later read changes.
+/// Public reads no longer expose renderer tag rows, so a v1 Setup cannot block immutable history.
 #[tokio::test]
-async fn reads_wait_out_the_setup_answer_and_never_show_a_number_that_changes() {
+async fn reads_expose_immutable_history_while_v1_setup_is_pending() {
     let held = Arc::new(HeldCompactor {
         arrived: Semaphore::new(0),
         release: Semaphore::new(0),
@@ -469,32 +466,16 @@ async fn reads_wait_out_the_setup_answer_and_never_show_a_number_that_changes() 
         rig.registry
             .read(SessionReadRequest::new(rig.key.clone(), Some(0), Some(100)))
     };
-    let before = read().await;
-    assert!(
-        matches!(before, Err(broca_module::ServeError::TagsAwaitSetup)),
-        "a read inside the Setup window is refused: {before:?}"
-    );
-    let resolve = rig
-        .registry
-        .resolve(&rig.key, &broca_wire::ResolveParams::new("§1§"))
-        .await;
-    assert!(
-        matches!(resolve, Err(broca_module::ServeError::TagsAwaitSetup)),
-        "a resolve inside the Setup window is refused: {resolve:?}"
-    );
+    let before = read().await.expect("Setup does not block raw history");
+    assert_eq!(before.messages[0].ordinal, 1);
+    assert!(serde_json::to_value(&before).unwrap()["messages"].as_array().unwrap().iter().all(|entry| entry.get("tags").is_none()));
     held.release.add_permits(1);
     rig.prompt().await;
     let after = read().await.expect("the Setup answer is durable");
-    let shown: Vec<_> = after
-        .messages
-        .iter()
-        .flat_map(|entry| entry.tags.iter().filter_map(|row| row.tag.clone()))
-        .collect();
-    assert_eq!(
-        shown,
-        vec!["§501§".to_owned()],
-        "the prompt shows the checkpoint's number"
-    );
+    assert_eq!(after.messages[0].message, before.messages[0].message);
+    assert_eq!(after.messages[0].mid, before.messages[0].mid);
+    assert_eq!(after.messages[0].part_keys, before.messages[0].part_keys);
+    assert_eq!(after.history_version, before.history_version);
     rig.close().await;
 }
 
@@ -573,14 +554,8 @@ async fn reads_after_projected_setup_do_not_wait_again_in_a_later_run() {
     );
     let read = read.unwrap();
     assert_eq!(read.messages.len(), 1);
-    assert_eq!(
-        read.messages[0]
-            .tags
-            .iter()
-            .filter_map(|row| row.tag.as_deref())
-            .collect::<Vec<_>>(),
-        vec!["§1§"]
-    );
+    assert_eq!(read.messages[0].part_keys, Some(vec!["m0#0".into()]));
+    assert_eq!(read.messages[0].message.part_tags().unwrap().parts, vec![Some(1)]);
     let closed = LineageRegistry::new_with_reader(
         rig.opener.clone(),
         rig.wal.clone(),
@@ -597,73 +572,4 @@ async fn reads_after_projected_setup_do_not_wait_again_in_a_later_run() {
     rig.close().await;
 }
 
-#[tokio::test]
-async fn model_read_without_compaction_rejects_after_mid() {
-    let rig = Rig::new(0);
-    rig.send(false).await;
-    rig.prompt().await;
-    let mut req = SessionReadRequest::new(rig.key.clone(), Some(0), Some(100));
-    req.after_mid = Some("m0".into());
-    assert!(matches!(rig.registry.read_model(req).await,
-        Err(broca_module::ServeError::InvalidParams { field, .. }) if field == "view"));
-    let req = SessionReadRequest::new(rig.key.clone(), Some(0), Some(100));
-    let raw = rig.registry.read(req.clone()).await.unwrap();
-    let model = rig.registry.read_model(req).await.unwrap();
-    assert_eq!(model.compaction_id, None);
-    assert_eq!(model.version, None);
-    assert_eq!(
-        serde_json::to_vec(&raw.messages[0].message).unwrap(),
-        serde_json::to_vec(&model.messages[0].message).unwrap()
-    );
-    rig.close().await;
-}
 
-#[tokio::test]
-async fn store_backed_model_page_matches_sent_guidance_tail_under_setups_head() {
-    let rig = Rig::new(8);
-    rig.send(true).await;
-    let mut sent = Vec::new();
-    for _ in 0..9 {
-        sent = rig.prompt().await;
-    }
-    let req = SessionReadRequest::new(rig.key.clone(), Some(0), Some(100));
-    let raw = rig.registry.read(req.clone()).await.unwrap();
-    let page = rig.registry.read_model(req.clone()).await.unwrap();
-    assert_eq!(page.compaction_id.as_deref(), Some("c1"));
-    assert_eq!(page.version, Some(1));
-    let messages: Vec<_> = page
-        .messages
-        .iter()
-        .map(|entry| entry.message.clone())
-        .collect();
-    assert_eq!(
-        serde_json::to_vec(&messages).unwrap(),
-        serde_json::to_vec(&sent).unwrap(),
-        "model read must match the native values actually sent, not undecorated store rows"
-    );
-    assert_eq!(
-        serde_json::to_value(&page.messages[0].source).unwrap(),
-        json!({
-        "kind":"replacement","compaction_id":"c1","version":1,"from_ordinal":0,"to_ordinal":0})
-    );
-    assert_eq!(
-        serde_json::to_value(&page.messages[1].source).unwrap(),
-        json!({
-        "kind":"message","ordinal":0,"mid":"m0"})
-    );
-    assert_ne!(
-        page.messages.last().unwrap().message.content,
-        raw.messages.last().unwrap().message.content,
-        "the tail must actually contain model-only repetition guidance"
-    );
-    assert_eq!(page.messages[0].message.ordinal, None);
-    let mut tail_req = req;
-    tail_req.from_ordinal = Some(15);
-    let tail = rig.registry.read_model(tail_req).await.unwrap();
-    assert_eq!(
-        serde_json::to_vec(&tail.messages[0].message).unwrap(),
-        serde_json::to_vec(&sent[16]).unwrap(),
-        "a range starting mid-episode keeps replaced counters"
-    );
-    rig.close().await;
-}

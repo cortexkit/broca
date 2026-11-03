@@ -99,6 +99,7 @@ pub enum OutputEvent {
 /// The caller's request to start a run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunRequest {
+    pub route_decision_id: Option<String>,
     pub input_written_at_ms: Option<u64>,
     pub directives: Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>,
     pub session_class: Option<String>,
@@ -197,39 +198,39 @@ impl RunRequest {
     ///
     /// [`from_submission`]: RunRequest::from_submission
     pub fn to_submission(&self) -> SubmissionRequest {
-        SubmissionRequest {
-            service_tier_level: None,
-            staged_uploads: None,
-            content: Vec::new(),
-            directives: self.directives.clone(),
-            on_restart: self.on_restart,
-            keep_warm: self.keep_warm,
-            scope: Default::default(),
-            project_id: self.project_id.clone(),
-            principal: self.principal.clone(),
-            model: self.model.clone(),
-            input: self.input.clone(),
-            tools: Some(self.tools.clone()),
-            policy_allowed: self.policy_allowed.clone(),
-            tool_choice: self.tool_choice.clone(),
-            generation: self.generation.clone(),
-            cache: self.cache.clone(),
-            budget: self.budget.clone(),
-            auth: None,
-            context_limit: self.context_limit,
-            work_class: self.work_class.clone(),
-            variant: self.variant.clone(),
-            service_tier: self.service_tier,
-            stop_when: self.stop_when.clone(),
-            context_management: self.context_management.clone(),
-            inherit_frozen: if self.inherit_frozen_cache {
-                [broca_protocol::request::InheritedParam::Cache].into()
-            } else {
-                Default::default()
-            },
-            structured_output: self.structured_output.clone(),
-            // The run keeps a send's client_message_id only inside `request_identity_digest`.
-            client_message_id: None,
+        SubmissionRequest { route_decision_id: self.route_decision_id.clone(),
+        service_tier_level: None,
+        staged_uploads: None,
+        content: Vec::new(),
+        directives: self.directives.clone(),
+        on_restart: self.on_restart,
+        keep_warm: self.keep_warm,
+        scope: Default::default(),
+        project_id: self.project_id.clone(),
+        principal: self.principal.clone(),
+        model: self.model.clone(),
+        input: self.input.clone(),
+        tools: Some(self.tools.clone()),
+        policy_allowed: self.policy_allowed.clone(),
+        tool_choice: self.tool_choice.clone(),
+        generation: self.generation.clone(),
+        cache: self.cache.clone(),
+        budget: self.budget.clone(),
+        auth: None,
+        context_limit: self.context_limit,
+        work_class: self.work_class.clone(),
+        variant: self.variant.clone(),
+        service_tier: self.service_tier,
+        stop_when: self.stop_when.clone(),
+        context_management: self.context_management.clone(),
+        inherit_frozen: if self.inherit_frozen_cache {
+            [broca_protocol::request::InheritedParam::Cache].into()
+        } else {
+            Default::default()
+        },
+        structured_output: self.structured_output.clone(),
+        // The run keeps a send's client_message_id only inside `request_identity_digest`.
+        client_message_id: None,
         }
     }
 
@@ -245,44 +246,44 @@ impl RunRequest {
         session: BindIdentity,
         submission_id: broca_protocol::SubmissionId,
     ) -> Self {
-        RunRequest {
-            input_written_at_ms: None,
-            directives: req.directives,
-            session_class: None,
-            retention: None,
-            on_restart: req.on_restart,
-            keep_warm: req.keep_warm,
-            project_id: req.project_id,
-            principal: req.principal,
-            run_id,
-            session,
-            model: req.model,
-            input: req.input,
-            tools: req.tools.unwrap_or_default(),
-            policy_allowed: req.policy_allowed,
-            tool_choice: req.tool_choice,
-            generation: req.generation,
-            cache: req.cache,
-            budget: req.budget,
-            context_limit: req.context_limit,
-            work_class: req.work_class,
-            variant: req.variant,
-            service_tier: req.service_tier,
-            stop_when: req.stop_when,
-            context_management: req.context_management,
-            submission_id: Some(submission_id),
-            // `send_id` and `request_identity_digest` identify the caller's send for retry
-            // deduplication, and `title` labels it; none is part of the queued payload, so the
-            // coordinator sets them after building the request.
-            send_id: None,
-            request_identity_digest: None,
-            title: None,
-            // Decided by admission from the session's history, never carried by the request.
-            scope: None,
-            inherit_frozen_cache: req
-                .inherit_frozen
-                .contains(&broca_protocol::request::InheritedParam::Cache),
-            structured_output: req.structured_output,
+        RunRequest { route_decision_id: req.route_decision_id,
+        input_written_at_ms: None,
+        directives: req.directives,
+        session_class: None,
+        retention: None,
+        on_restart: req.on_restart,
+        keep_warm: req.keep_warm,
+        project_id: req.project_id,
+        principal: req.principal,
+        run_id,
+        session,
+        model: req.model,
+        input: req.input,
+        tools: req.tools.unwrap_or_default(),
+        policy_allowed: req.policy_allowed,
+        tool_choice: req.tool_choice,
+        generation: req.generation,
+        cache: req.cache,
+        budget: req.budget,
+        context_limit: req.context_limit,
+        work_class: req.work_class,
+        variant: req.variant,
+        service_tier: req.service_tier,
+        stop_when: req.stop_when,
+        context_management: req.context_management,
+        submission_id: Some(submission_id),
+        // `send_id` and `request_identity_digest` identify the caller's send for retry
+        // deduplication, and `title` labels it; none is part of the queued payload, so the
+        // coordinator sets them after building the request.
+        send_id: None,
+        request_identity_digest: None,
+        title: None,
+        // Decided by admission from the session's history, never carried by the request.
+        scope: None,
+        inherit_frozen_cache: req
+            .inherit_frozen
+            .contains(&broca_protocol::request::InheritedParam::Cache),
+        structured_output: req.structured_output,
         }
     }
 }
@@ -791,9 +792,9 @@ pub struct RunControl {
     /// Input transforms computed by the lineage actor. A queue drain carries its recorded
     /// final input here; core only renders and records it, never calls pre_user.
     pub input_hooks: Option<Box<broca_wal::Hooks>>,
-    /// An input hook refused the session's first send. Admission is durable before this
+    /// An input hook or routing decision refused execution. Admission is durable before this
     /// terminal error is written; no model step or tool dispatch may follow it.
-    pub pre_user_error: Option<ProviderError>,
+    pub pre_model_error: Option<ProviderError>,
     /// Optional driver that refreshes the provider's prompt cache during tool waits. The
     /// loop uses it only when this episode's keep_warm policy is auto.
     pub keep_warm: Option<Arc<dyn crate::keep_warm_wait::KeepWarmDriver>>,
@@ -936,7 +937,7 @@ impl Default for RunControl {
             elicitation_plane: None,
             hook_plane: None,
             input_hooks: None,
-            pre_user_error: None,
+            pre_model_error: None,
         }
     }
 }
@@ -5366,7 +5367,7 @@ where
         let admitted_at_ms = control.now_ms();
         output_history.start_run(&cfg.model);
         let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
-            compaction_plan_version: None,
+            compaction_plan_version: Some(cortexkit_compaction_view::PLAN_VERSION),
             sent_by: control.display_sent_by.clone(),
             written_at_ms: req
                 .input_written_at_ms
@@ -5404,37 +5405,37 @@ where
             run_id: resolved_run_id.clone(),
             session: req.session.clone(),
             config: remember_warm_config(
-                RunConfig {
-                    account_limit_pause: account_limit_pause_enabled,
-                    turn_directives_v1: req.directives.clone(),
-                    render_tags,
-                    computed_tags,
-                    model: cfg.model.clone(),
-                    tools: Arc::clone(&tools),
-                    tool_choice: cfg.tool_choice.clone(),
-                    generation: cfg.generation.clone(),
-                    response_format: cfg.response_format.clone(),
-                    provider_options: cfg.provider_options.clone(),
-                    cache_tiers: serde_json::Value::Null,
-                    context_epoch: 0,
-                    renderer_version: provider.renderer_version(),
-                    frozen_render_config: provider.render_config_blob(),
-                    // Freeze the resolved credential id so a resume retrieves the same credential,
-                    // never choosing its method again from configuration or account routing.
-                    // The frozen credential id is metadata, not a provider render input.
-                    auth_selection: control.auth_selection.clone(),
-                    tools_were_omitted: control.tools_were_omitted,
-                    budget: cfg.budget.clone(),
-                    context_limit,
-                    work_class,
-                    variant: variant.clone(),
-                    service_tier,
-                    stop_when: cfg.stop_when.clone(),
-                    // Before any record is written, accepting the send resolves context management
-                    // into req.context_management: the session's inherited mode, or on its
-                    // first send the caller's choice, project/global broca.jsonc defaults,
-                    // then "none", in that order.
-                    context_management: req.context_management.clone(),
+                RunConfig { route_decision_id: req.route_decision_id.clone(),
+                account_limit_pause: account_limit_pause_enabled,
+                turn_directives_v1: req.directives.clone(),
+                render_tags,
+                computed_tags,
+                model: cfg.model.clone(),
+                tools: Arc::clone(&tools),
+                tool_choice: cfg.tool_choice.clone(),
+                generation: cfg.generation.clone(),
+                response_format: cfg.response_format.clone(),
+                provider_options: cfg.provider_options.clone(),
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: provider.renderer_version(),
+                frozen_render_config: provider.render_config_blob(),
+                // Freeze the resolved credential id so a resume retrieves the same credential,
+                // never choosing its method again from configuration or account routing.
+                // The frozen credential id is metadata, not a provider render input.
+                auth_selection: control.auth_selection.clone(),
+                tools_were_omitted: control.tools_were_omitted,
+                budget: cfg.budget.clone(),
+                context_limit,
+                work_class,
+                variant: variant.clone(),
+                service_tier,
+                stop_when: cfg.stop_when.clone(),
+                // Before any record is written, accepting the send resolves context management
+                // into req.context_management: the session's inherited mode, or on its
+                // first send the caller's choice, project/global broca.jsonc defaults,
+                // then "none", in that order.
+                context_management: req.context_management.clone(),
                 },
                 &mut warm_config,
                 control.keep_warm.is_some(),
@@ -5526,7 +5527,7 @@ where
     admit(&mut on_admitted, Ok(resolved_run_id.clone()));
 
     if !is_resume || append_episode {
-        if let Some(error) = control.pre_user_error.clone() {
+        if let Some(error) = control.pre_model_error.clone() {
             control.close_steers();
             let (summary, last_fsynced_seq) = finish_run(
                 writer,
@@ -11218,117 +11219,7 @@ fn apply_ordered_appends(results: &mut [ToolResult], appends: &[(ToolCallId, Str
     }
 }
 
-/// UTF-8 bytes bound the character count, so this sits far below the smallest known
-/// per-item provider limit (OpenAI Responses: 10,485,760 characters). A result this size
-/// already overflows most context windows.
-pub const TOOL_RESULT_MAX_BYTES: usize = 1_048_576;
-/// Reserve space only for subscribed text subjects; structured JSON retains the full ceiling.
-pub const POST_TOOL_HEADROOM: usize = 16_384;
 
-/// Cap once before persistence so live execution and replay use the same stored bytes.
-fn cap_tool_result(result: &mut ToolResult, run_id: &RunId, tool_name: &str, headroom: bool) {
-    let limit = if headroom {
-        TOOL_RESULT_MAX_BYTES - POST_TOOL_HEADROOM
-    } else {
-        TOOL_RESULT_MAX_BYTES
-    };
-    // ToolOutput has no image/content-block variant. JSON is measured as serialized model
-    // text, and oversized structured results become text rather than invalid partial JSON.
-    // Denied's provider-facing prefix is included; small outputs retain their original variant.
-    let serialized;
-    let text = match &result.output {
-        // Cap text parts only; capture-time media validation owns size limits for stored objects.
-        ToolOutput::Parts { .. } => {
-            if let ToolOutput::Parts { parts } = &mut result.output {
-                let mut remaining = limit;
-                for part in parts.iter_mut() {
-                    if let broca_protocol::ToolOutputPart::Text { text } = part {
-                        let mut end = text.len().min(remaining);
-                        while !text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        text.truncate(end);
-                        remaining -= end;
-                    }
-                }
-            }
-            return;
-        }
-        ToolOutput::Text { text } => text.as_str(),
-        ToolOutput::Error {
-            message,
-            module,
-            code,
-            detail,
-            nothing_sent,
-            retry,
-        } => {
-            // Measure (and cap below) the text the model actually reads, including any
-            // module-outage attribution.
-            serialized = ToolOutput::error_model_text(
-                message,
-                module.as_deref(),
-                code.as_deref(),
-                detail.as_deref(),
-                *nothing_sent,
-                retry.as_deref(),
-            );
-            &serialized
-        }
-        ToolOutput::Denied { reason } => {
-            serialized = format!("denied: {reason}");
-            &serialized
-        }
-        ToolOutput::Json { value } => {
-            serialized = value.to_string();
-            &serialized
-        }
-    };
-    let original_bytes = text.len();
-    if headroom {
-        if original_bytes <= limit {
-            return;
-        }
-    } else if original_bytes <= TOOL_RESULT_MAX_BYTES {
-        return;
-    }
-    // Tool names are unbounded; shorten only the diagnostic label so it cannot consume
-    // the entire result budget. The warning below retains the full name, never result content.
-    let shortened_name;
-    let marker_name = if tool_name.len() > 256 {
-        let mut end = 256;
-        while !tool_name.is_char_boundary(end) {
-            end -= 1;
-        }
-        shortened_name = format!("{}…", &tool_name[..end]);
-        shortened_name.as_str()
-    } else {
-        tool_name
-    };
-    let marker = |kept| {
-        if headroom {
-            format!("\n[broca: tool result truncated: {marker_name} returned {original_bytes} bytes, over the {limit} byte limit; POST_TOOL_HEADROOM reserves {POST_TOOL_HEADROOM} bytes; the first {kept} bytes are shown. Narrow the request (a smaller range, a filter, or a more specific query).]")
-        } else {
-            // Keep the hookless marker byte-identical for existing sessions.
-            format!("\n[broca: tool result truncated: {marker_name} returned {original_bytes} bytes, over the {TOOL_RESULT_MAX_BYTES} byte limit; the first {kept} bytes are shown. Narrow the request (a smaller range, a filter, or a more specific query).]")
-        }
-    };
-    let mut kept_bytes = limit.saturating_sub(marker(0).len());
-    // Account for the kept count's own decimal digits, then find the last complete character.
-    while kept_bytes + marker(kept_bytes).len() > limit || !text.is_char_boundary(kept_bytes) {
-        kept_bytes = kept_bytes.saturating_sub(1);
-    }
-    let capped = format!("{}{}", &text[..kept_bytes], marker(kept_bytes));
-    result.output = ToolOutput::Text { text: capped };
-    tracing::warn!(
-        target: "tool_results",
-        run_id = %run_id.0,
-        tool_name,
-        original_bytes,
-        kept_bytes,
-        "tool result truncated"
-    );
-}
 
 /// A synthetic `interrupted` resolution for a call abandoned because an earlier
 /// sequential call was ambiguous. It WAS planned dispatchable (its intent was
@@ -13779,30 +13670,30 @@ mod tests {
         });
         let mut prior = crate::replay::replay(&[]).unwrap();
         prior.render_episodes = None;
-        prior.run_config = Some(RunConfig {
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: broca_protocol::request::ModelHandle::new("chatgpt", "gpt-6.1-sol"),
-            tools: vec![].into(),
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: serde_json::Value::Null,
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: frozen.clone(),
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: vec![],
-            context_management: None,
+        prior.run_config = Some(RunConfig { route_decision_id: None,
+        account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: broca_protocol::request::ModelHandle::new("chatgpt", "gpt-6.1-sol"),
+        tools: vec![].into(),
+        tool_choice: Default::default(),
+        generation: Default::default(),
+        response_format: Default::default(),
+        provider_options: serde_json::Value::Null,
+        cache_tiers: serde_json::Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: frozen.clone(),
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: vec![],
+        context_management: None,
         });
         assert!(
             store_prior_needs_episode_spans(&prior),
@@ -13910,50 +13801,50 @@ mod tests {
             },
             reply: None,
         };
-        let mut req = RunRequest {
-            input_written_at_ms: None,
-            directives: None,
-            session_class: None,
-            retention: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            scope: None,
-            send_id: None,
-            request_identity_digest: None,
-            project_id: None,
-            principal: None,
-            run_id: RunId("filter-order".into()),
-            session: BindIdentity {
-                project_root: "/tmp/filter-order".into(),
-                harness: "test".into(),
-                session: "filter-order".into(),
-            },
-            model: ModelHandle::new("stub", "stub-model"),
-            input: Vec::new(),
-            tools: vec![
-                make_tool("denied-first", 0),
-                make_tool("allowed-first", 1),
-                make_tool("denied-middle", 2),
-                make_tool("allowed-second", 3),
-                make_tool("denied-last", 4),
-            ],
-            policy_allowed: ["allowed-first".into(), "allowed-second".into()]
-                .into_iter()
-                .collect(),
-            tool_choice: ToolChoice::Auto,
-            generation: GenerationConfig::default(),
-            cache: None,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            submission_id: None,
-            context_management: None,
-            inherit_frozen_cache: false,
-            structured_output: None,
+        let mut req = RunRequest { route_decision_id: None,
+        input_written_at_ms: None,
+        directives: None,
+        session_class: None,
+        retention: None,
+        title: None,
+        on_restart: None,
+        keep_warm: None,
+        scope: None,
+        send_id: None,
+        request_identity_digest: None,
+        project_id: None,
+        principal: None,
+        run_id: RunId("filter-order".into()),
+        session: BindIdentity {
+            project_root: "/tmp/filter-order".into(),
+            harness: "test".into(),
+            session: "filter-order".into(),
+        },
+        model: ModelHandle::new("stub", "stub-model"),
+        input: Vec::new(),
+        tools: vec![
+            make_tool("denied-first", 0),
+            make_tool("allowed-first", 1),
+            make_tool("denied-middle", 2),
+            make_tool("allowed-second", 3),
+            make_tool("denied-last", 4),
+        ],
+        policy_allowed: ["allowed-first".into(), "allowed-second".into()]
+            .into_iter()
+            .collect(),
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig::default(),
+        cache: None,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        submission_id: None,
+        context_management: None,
+        inherit_frozen_cache: false,
+        structured_output: None,
         };
         // This is the cloning filter that retain replaces; comparing complete Tool values pins
         // both policy membership and the provider-visible request order.
@@ -15803,35 +15694,35 @@ mod tests {
             }
         }
 
-        let config = RunConfig {
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("stub", "m"),
-            tools: Vec::new().into(),
-            tool_choice: ToolChoice::Auto,
-            generation: GenerationConfig::default(),
-            response_format: Default::default(),
-            provider_options: serde_json::Value::Null,
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: serde_json::Value::Null,
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: Some(BudgetConfig {
-                max_input_tokens: None,
-                nudges: Vec::new(),
-                finalize_at_tool_calls: 99,
-                finalize_text: "finalize".into(),
-            }),
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            context_management: None,
+        let config = RunConfig { route_decision_id: None,
+        account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: ModelHandle::new("stub", "m"),
+        tools: Vec::new().into(),
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig::default(),
+        response_format: Default::default(),
+        provider_options: serde_json::Value::Null,
+        cache_tiers: serde_json::Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: serde_json::Value::Null,
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: Some(BudgetConfig {
+            max_input_tokens: None,
+            nudges: Vec::new(),
+            finalize_at_tool_calls: 99,
+            finalize_text: "finalize".into(),
+        }),
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None,
         };
         let seed = crate::ProjectionSeed {
             refusal: Default::default(),

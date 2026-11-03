@@ -222,6 +222,10 @@ pub async fn run_import_with_store<W: WalStore>(
     wal_store: &W,
     store: Option<Arc<dyn SessionStore>>,
 ) -> Result<ImportOutcome, ImportError> {
+    let history_store = store.clone();
+    let wal_history = wal_store.served_history();
+    let history = history_store.as_ref().and_then(|store| store.served_history()).or(wal_history.as_deref());
+
     if !request
         .origin
         .source_ref
@@ -317,6 +321,9 @@ pub async fn run_import_with_store<W: WalStore>(
                 crate::run::project_committed(wal_store, store, &request.session, safe_h, false)
                     .await;
             }
+            if let Some(history) = history {
+                history.history_rewrite_finished(&request.session).map_err(ImportError::Wal)?;
+            }
             return Ok(ImportOutcome {
                 run_id: request.run_id,
                 synthesized_tool_results: counts.synthesized_tool_results,
@@ -342,6 +349,10 @@ pub async fn run_import_with_store<W: WalStore>(
         let dangling_seed =
             repairable_import_prefix(&frames)?.ok_or(ImportError::LineageNotEmpty)?;
         if dangling_seed {
+            if let Some(history) = history {
+                history.history_rewritten(&request.session, writer.lineage_id().map(|id| id.to_string()).as_deref())
+                    .map_err(ImportError::Wal)?;
+            }
             writer.record(WalRecord::RunFinished {
                 interrupt_reason: None,
                 ts_ms: epoch_millis(),
@@ -355,7 +366,7 @@ pub async fn run_import_with_store<W: WalStore>(
 
     let session = request.session.clone();
     writer.record(WalRecord::RunStarted {
-        compaction_plan_version: None,
+        compaction_plan_version: Some(cortexkit_compaction_view::PLAN_VERSION),
         sent_by: None,
         written_at_ms: None,
         tags: None,
@@ -411,6 +422,9 @@ pub async fn run_import_with_store<W: WalStore>(
         crate::run::project_committed(wal_store, store, &session, safe_h, false).await;
     }
 
+    if let Some(history) = history {
+        history.history_rewrite_finished(&session).map_err(ImportError::Wal)?;
+    }
     Ok(ImportOutcome {
         run_id: request.run_id,
         synthesized_tool_results: counts.synthesized_tool_results,
@@ -421,37 +435,37 @@ pub async fn run_import_with_store<W: WalStore>(
 }
 
 fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig {
-    RunConfig {
-        account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: Some(broca_wal::ComputedTagRules {
-            checkpoint: tag_checkpoint,
-        }),
-        model: ModelHandle::new("import", "import"),
-        tools: Vec::new().into(),
-        tool_choice: ToolChoice::None,
-        generation: GenerationConfig::default(),
-        response_format: ResponseFormat::default(),
-        provider_options: serde_json::json!({"import_request_digest": request_digest}),
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: 0,
-        // Null is deliberate: the W3-B frozen-render guard refuses to resume this marker as
-        // a provider run. Replay classifies a dangling zero-step SeededFrom episode as
-        // Interrupted before any provider can be selected.
-        frozen_render_config: serde_json::Value::Null,
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: Vec::new(),
-        // An import seed chooses no context management: the first harness episode after it is
-        // the session's first real admission, and binds the value then.
-        context_management: None,
+    RunConfig { route_decision_id: None,
+    account_limit_pause: false,
+    turn_directives_v1: None,
+    render_tags: false,
+    computed_tags: Some(broca_wal::ComputedTagRules {
+        checkpoint: tag_checkpoint,
+    }),
+    model: ModelHandle::new("import", "import"),
+    tools: Vec::new().into(),
+    tool_choice: ToolChoice::None,
+    generation: GenerationConfig::default(),
+    response_format: ResponseFormat::default(),
+    provider_options: serde_json::json!({"import_request_digest": request_digest}),
+    cache_tiers: serde_json::Value::Null,
+    context_epoch: 0,
+    renderer_version: 0,
+    // Null is deliberate: the W3-B frozen-render guard refuses to resume this marker as
+    // a provider run. Replay classifies a dangling zero-step SeededFrom episode as
+    // Interrupted before any provider can be selected.
+    frozen_render_config: serde_json::Value::Null,
+    auth_selection: None,
+    tools_were_omitted: false,
+    budget: None,
+    context_limit: None,
+    work_class: None,
+    variant: None,
+    service_tier: None,
+    stop_when: Vec::new(),
+    // An import seed chooses no context management: the first harness episode after it is
+    // the session's first real admission, and binds the value then.
+    context_management: None,
     }
 }
 

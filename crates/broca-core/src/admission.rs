@@ -71,6 +71,7 @@ pub fn submission_difference(
     requested: &SubmissionRequest,
 ) -> Option<&'static str> {
     let SubmissionRequest {
+        route_decision_id: existing_route_decision_id,
         staged_uploads: _,
         content: existing_content,
         directives: existing_directives,
@@ -102,6 +103,7 @@ pub fn submission_difference(
         client_message_id: _,
     } = existing;
     let SubmissionRequest {
+        route_decision_id: requested_route_decision_id,
         staged_uploads: _,
         content: requested_content,
         directives: requested_directives,
@@ -132,6 +134,7 @@ pub fn submission_difference(
     } = requested;
 
     [
+        (existing_route_decision_id != requested_route_decision_id, "route_decision_id"),
         (existing_content != requested_content, "content"),
         (existing_directives != requested_directives, "directives"),
         (
@@ -198,6 +201,8 @@ fn inherited_difference(
 
 #[derive(Serialize, Deserialize)]
 struct SubmissionIdentityDigestV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route_decision_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     directives: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,6 +310,7 @@ fn identity_digest_v1(
     conversation_key: Option<&str>,
 ) -> SubmissionIdentityDigestV1 {
     let SubmissionRequest {
+        route_decision_id,
         staged_uploads: _,
         content,
         directives,
@@ -336,6 +342,7 @@ fn identity_digest_v1(
     let mut policy_allowed: Vec<&str> = policy_allowed.iter().map(String::as_str).collect();
     policy_allowed.sort_unstable();
     SubmissionIdentityDigestV1 {
+        route_decision_id: route_decision_id.clone(),
         content: (!content.is_empty()).then(|| digest_json(serde_json::json!(content))),
         directives: directives
             .as_ref()
@@ -411,6 +418,7 @@ pub fn send_identity_difference_with_conversation_key(
     }
     let requested = identity_digest_v1(requested, delivery, conversation_key);
     [
+        (stored.route_decision_id != requested.route_decision_id, "route_decision_id"),
         (
             stored.client_message_id != requested.client_message_id,
             "client_message_id",
@@ -3111,49 +3119,49 @@ mod tests {
     }
 
     fn config(model: &str) -> RunConfig {
-        RunConfig {
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("stub", model),
-            tools: Arc::new(vec![
-                Tool {
-                    name: "second".into(),
-                    description: "second tool".into(),
-                    input_schema: serde_json::json!({"type": "object", "order": 2}),
-                    module: Some("tools-b".into()),
-                    execution_mode: ExecutionMode::Parallel,
-                    reply: None,
-                },
-                Tool {
-                    name: "first".into(),
-                    description: "first tool".into(),
-                    input_schema: serde_json::json!({"type": "object", "order": 1}),
-                    module: Some("tools-a".into()),
-                    execution_mode: ExecutionMode::Sequential,
-                    reply: None,
-                },
-            ]),
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: serde_json::json!({"opaque": [1, 2, 3]}),
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: serde_json::json!({"wire": "old"}),
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: vec![StopCondition::HasToolCall {
-                name: Some("second".into()),
-            }],
-            context_management: None,
+        RunConfig { route_decision_id: None,
+        account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: ModelHandle::new("stub", model),
+        tools: Arc::new(vec![
+            Tool {
+                name: "second".into(),
+                description: "second tool".into(),
+                input_schema: serde_json::json!({"type": "object", "order": 2}),
+                module: Some("tools-b".into()),
+                execution_mode: ExecutionMode::Parallel,
+                reply: None,
+            },
+            Tool {
+                name: "first".into(),
+                description: "first tool".into(),
+                input_schema: serde_json::json!({"type": "object", "order": 1}),
+                module: Some("tools-a".into()),
+                execution_mode: ExecutionMode::Sequential,
+                reply: None,
+            },
+        ]),
+        tool_choice: Default::default(),
+        generation: Default::default(),
+        response_format: Default::default(),
+        provider_options: serde_json::json!({"opaque": [1, 2, 3]}),
+        cache_tiers: serde_json::Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: serde_json::json!({"wire": "old"}),
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: vec![StopCondition::HasToolCall {
+            name: Some("second".into()),
+        }],
+        context_management: None,
         }
     }
 
@@ -3299,34 +3307,34 @@ mod tests {
     }
 
     fn request(text: &str) -> SubmissionRequest {
-        SubmissionRequest {
-            service_tier_level: None,
-            staged_uploads: None,
-            content: Vec::new(),
-            directives: None,
-            on_restart: None,
-            keep_warm: None,
-            scope: Default::default(),
-            project_id: None,
-            principal: None,
-            model: ModelHandle::new("stub", "queued"),
-            input: vec![message(text)],
-            tools: Some(Vec::new()),
-            policy_allowed: Default::default(),
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            cache: None,
-            budget: None,
-            auth: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            context_management: None,
-            inherit_frozen: Default::default(),
-            structured_output: None,
-            client_message_id: None,
+        SubmissionRequest { route_decision_id: None,
+        service_tier_level: None,
+        staged_uploads: None,
+        content: Vec::new(),
+        directives: None,
+        on_restart: None,
+        keep_warm: None,
+        scope: Default::default(),
+        project_id: None,
+        principal: None,
+        model: ModelHandle::new("stub", "queued"),
+        input: vec![message(text)],
+        tools: Some(Vec::new()),
+        policy_allowed: Default::default(),
+        tool_choice: Default::default(),
+        generation: Default::default(),
+        cache: None,
+        budget: None,
+        auth: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None,
+        inherit_frozen: Default::default(),
+        structured_output: None,
+        client_message_id: None,
         }
     }
 

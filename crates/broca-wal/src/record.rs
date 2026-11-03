@@ -3923,6 +3923,9 @@ pub enum SeedOriginKind {
 /// across a run and its resume.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunConfig {
+    /// Caller-owned decision fixed for the run; AuthSelection holds routing's own decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_decision_id: Option<String>,
     /// Frozen operator consent to automatic same-selection recovery. Omitted on legacy runs.
     #[serde(default, skip_serializing_if = "is_false")]
     pub account_limit_pause: bool,
@@ -4485,37 +4488,37 @@ mod schema_tests {
 
     #[test]
     fn run_config_tools_arc_keeps_existing_wal_bytes() {
-        let config = RunConfig {
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("p", "m"),
-            tools: Arc::new(vec![Tool {
-                name: "edit".into(),
-                description: "edit a file".into(),
-                input_schema: json!({"type": "object"}),
-                module: Some("aft".into()),
-                execution_mode: broca_protocol::request::ExecutionMode::Parallel,
-                reply: None,
-            }]),
-            tool_choice: ToolChoice::Auto,
-            generation: GenerationConfig::default(),
-            response_format: ResponseFormat::default(),
-            provider_options: Value::Null,
-            cache_tiers: Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: Value::Null,
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            context_management: None,
+        let config = RunConfig { route_decision_id: None,
+        account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: ModelHandle::new("p", "m"),
+        tools: Arc::new(vec![Tool {
+            name: "edit".into(),
+            description: "edit a file".into(),
+            input_schema: json!({"type": "object"}),
+            module: Some("aft".into()),
+            execution_mode: broca_protocol::request::ExecutionMode::Parallel,
+            reply: None,
+        }]),
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig::default(),
+        response_format: ResponseFormat::default(),
+        provider_options: Value::Null,
+        cache_tiers: Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: Value::Null,
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None,
         };
 
         let bytes = serde_json::to_vec(&config).expect("serialize config with shared tools");
@@ -4599,30 +4602,30 @@ mod schema_tests {
     }
 
     fn min_config() -> Box<RunConfig> {
-        Box::new(RunConfig {
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("p", "m"),
-            tools: vec![].into(),
-            tool_choice: ToolChoice::Auto,
-            generation: GenerationConfig::default(),
-            response_format: ResponseFormat::default(),
-            provider_options: Value::Null,
-            cache_tiers: Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: Value::Null,
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            context_management: None,
+        Box::new(RunConfig { route_decision_id: None,
+        account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: ModelHandle::new("p", "m"),
+        tools: vec![].into(),
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig::default(),
+        response_format: ResponseFormat::default(),
+        provider_options: Value::Null,
+        cache_tiers: Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: Value::Null,
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None,
         })
     }
 
@@ -5533,6 +5536,7 @@ mod schema_tests {
                 delivery: None,
                 submission_id: SubmissionId("sub2".into()),
                 request: Box::new(SubmissionRequest {
+                    route_decision_id: None,
                     service_tier_level: None,
                     staged_uploads: None,
                     content: Vec::new(),

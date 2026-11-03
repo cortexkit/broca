@@ -523,6 +523,10 @@ pub fn parse_plan_with(
         return Err(Refusal::invalid("plan.composition"));
     }
 
+    if object.get("compaction_item").is_some_and(|item| !item.is_null()
+        && item.get("preset").and_then(Value::as_str).is_none()) {
+        return Err(Refusal::invalid("plan.compaction_item.preset"));
+    }
     // Reader releases can replay compaction records but cannot serve the writer surface.
     // Refuse before admission starts any provider fetch or declaration.
     if compaction == CompactionSupport::Unsupported && compaction_item.is_some() {
@@ -538,13 +542,12 @@ pub fn parse_plan_with(
                 && subscription.on_unavailable == OnUnavailable::Pass
             {
                 return Err(Refusal::InvalidParams {
-                    detail: serde_json::to_value(InvalidSubscriptionDetail {
-                        field: "plan.step_transform_items".into(),
-                        item: index,
-                        subscription: position,
-                        problem: "approve_on_unavailable_pass".into(),
-                    })
-                    .expect("a subscription detail is JSON"),
+                    detail: serde_json::json!({
+                        "field": "plan.step_transform_items",
+                        "item": index,
+                        "subscription": position,
+                        "problem": "approve_on_unavailable_pass",
+                    }),
                 });
             }
             if subscription.budget_ms > broca_protocol::STEP_TRANSFORM_HOOK_CAP {
