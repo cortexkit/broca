@@ -19,7 +19,7 @@ from lib.state_root import StateRootError, default_state_root
 ROOT = Path(__file__).resolve().parents[1]
 PLAN = ROOT / "scripts/fixtures/acceptance-reader-plan.json"
 CLASS = "acceptance"
-# Core labels its plan-composed worker and research sessions mason and sidekick.
+# Core labels its worker and research sessions mason and sidekick.
 WORKER_CLASSES = ("mason", "sidekick")
 REQUIRED = ("session-class/v1", "provider-declarations/v1")
 MODELS_FILE = ROOT / "scripts/lib/acceptance-models.txt"
@@ -46,6 +46,14 @@ def check_start(start, session_class):
     declarations = [fetch.get("declarations_frozen") or {} for fetch in fetches]
     if not any(item.get("late_results") is True or item.get("result_formats") for item in declarations):
         raise ValueError("RunStarted manifest has no frozen result formats or late_results declaration")
+
+
+def aft_fetches(record):
+    manifest = record.get("manifest")
+    fetches = manifest.get("fetches", []) if isinstance(manifest, dict) else []
+    if not isinstance(fetches, list):
+        return []
+    return [fetch for fetch in fetches if isinstance(fetch, dict) and fetch.get("provider") == "aft"]
 
 
 def checked_run(path, run_id, *, finish_reason):
@@ -83,15 +91,25 @@ def worker_summaries(frames, after_ms):
             if (session_class not in WORKER_CLASSES or not isinstance(timestamp, int)
                     or isinstance(timestamp, bool) or timestamp <= after_ms):
                 continue
+            fetches = aft_fetches(record)
             active = {"ts_ms": timestamp, "seq": frame.seq, "class": session_class,
-                      "reason": None, "error": None}
+                      "candidate": bool(fetches), "reason": None, "error": None}
+            summaries.append(active)
+            # The aft tool provider always declares support for late tool results.
+            # Sessions without an aft fetch need not freeze any declarations, so
+            # plan-less sessions and other providers' plans are counted, not checked.
+            if not fetches:
+                active = None
+                continue
             try:
                 check_start(frame, session_class)
+                declarations = [fetch.get("declarations_frozen") or {} for fetch in fetches]
+                if not all(item.get("late_results") is True or item.get("result_formats") for item in declarations):
+                    raise ValueError("RunStarted AFT fetch has no frozen result formats or late_results declaration")
             except ValueError as error:
                 active["error"] = str(error)
             except (TypeError, AttributeError):
                 active["error"] = "RunStarted manifest has invalid provider declarations"
-            summaries.append(active)
         elif active is not None and record["type"] == "run_finished":
             reason = record.get("reason")
             if active["reason"] is not None:
@@ -130,13 +148,16 @@ def scan_workers(state_root, after_ms, cache):
 
 
 def worker_counts(observed):
-    classes = Counter(summary["class"] for summary in observed.values())
-    reasons = Counter(summary["reason"] for summary in observed.values() if summary["reason"] is not None)
+    candidates = [summary for summary in observed.values() if summary["candidate"]]
+    classes = Counter(summary["class"] for summary in candidates)
+    ignored = Counter(summary["class"] for summary in observed.values() if not summary["candidate"])
+    reasons = Counter(summary["reason"] for summary in candidates if summary["reason"] is not None)
     class_counts = ",".join(f"{name}:{classes[name]}" for name in WORKER_CLASSES)
+    ignored_counts = ",".join(f"{name}:{ignored[name]}" for name in WORKER_CLASSES)
     terminal_counts = ",".join(f"{reason}:{reasons[reason]}" for reason in sorted(set(reasons) | {"completed"}))
-    return (f"classes={','.join(WORKER_CLASSES)} candidates={len(observed)} "
-            f"class_counts={class_counts} pending={len(observed) - sum(reasons.values())} "
-            f"terminal_counts={terminal_counts}")
+    return (f"classes={','.join(WORKER_CLASSES)} candidates={len(candidates)} "
+            f"class_counts={class_counts} pending={len(candidates) - sum(reasons.values())} "
+            f"terminal_counts={terminal_counts} ignored_counts={ignored_counts}")
 
 
 def wait_for_worker(state_root, after_ms, timeout=600, poll=5):
@@ -149,7 +170,7 @@ def wait_for_worker(state_root, after_ms, timeout=600, poll=5):
                 key = (path.stem, summary["seq"], summary["ts_ms"])
                 observed[key] = dict(summary, address=path.stem)
         counts = worker_counts(observed)
-        # Validate every admission in the snapshot before accepting any completion.
+        # Validate every candidate that fetched the aft tool provider before passing.
         # A long-running worker need not finish, but a bad later start cannot hide
         # behind an earlier success in the same session log or another session's log.
         for summary in observed.values():
@@ -158,7 +179,8 @@ def wait_for_worker(state_root, after_ms, timeout=600, poll=5):
                       f"class={summary['class']} start_seq={summary['seq']}; {summary['error']}; {counts}",
                       file=sys.stderr)
                 return 1
-        completed = next((summary for summary in observed.values() if summary["reason"] == "completed"), None)
+        completed = next((summary for summary in observed.values()
+                          if summary["candidate"] and summary["reason"] == "completed"), None)
         if completed is not None:
             print(f"acceptance-worker-turn: PASS -- admitted, completed; session={completed['address']} "
                   f"class={completed['class']} start_seq={completed['seq']}; "
@@ -168,9 +190,10 @@ def wait_for_worker(state_root, after_ms, timeout=600, poll=5):
         if remaining <= 0:
             break
         time.sleep(min(poll, remaining))
-    failure = "worker_completion_timeout" if observed else "no_worker_candidate"
+    has_candidates = any(summary["candidate"] for summary in observed.values())
+    failure = "worker_completion_timeout" if has_candidates else "no_worker_candidate"
     evidence = f"; evidence={','.join(sorted(unavailable))}" if unavailable else ""
-    print(f"acceptance-worker-turn: FAILED -- {failure}; no completed post-restart candidate "
+    print(f"acceptance-worker-turn: FAILED -- {failure}; no completed post-restart AFT candidate "
           f"within {timeout:g}s; {worker_counts(observed)}{evidence}", file=sys.stderr)
     return 1
 

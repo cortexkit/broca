@@ -271,7 +271,7 @@ class WorkerTrafficTests(unittest.TestCase):
         self.address = "1234567890abcdef"
         self.start = {"type": "run_started", "run_id": "DO-NOT-PRINT-RUN-ID", "ts_ms": 101,
                       "session_class": "mason",
-                      "manifest": {"fetches": [{"declarations_frozen": {"late_results": True}}]}}
+                      "manifest": {"fetches": [{"provider": "aft", "declarations_frozen": {"late_results": True}}]}}
         self.finish = {"type": "run_finished", "reason": "completed"}
 
     def write(self, records=None, folder="wal", address=None, requires=None):
@@ -296,7 +296,7 @@ class WorkerTrafficTests(unittest.TestCase):
                 for declaration in ({"late_results": True}, {"result_formats": {"read": "text"}}):
                     with self.subTest(folder=folder, session_class=session_class, declaration=declaration):
                         start = dict(self.start, session_class=session_class,
-                                     manifest={"fetches": [{"declarations_frozen": declaration}]})
+                                     manifest={"fetches": [{"provider": "aft", "declarations_frozen": declaration}]})
                         path = self.write([start, {"type": "message", "text": "DO-NOT-PRINT-CONTENT"}, self.finish],
                                           folder=folder)
                         status, output = self.wait()
@@ -323,15 +323,92 @@ class WorkerTrafficTests(unittest.TestCase):
                 self.assertEqual(status, 1, output)
                 self.assertIn("no_worker_candidate", output)
 
-    def test_declaration_less_worker_fails_even_with_a_later_declaring_completion(self):
-        for manifest in (None, {}, {"fetches": []},
-                         {"fetches": [{"declarations_frozen": {"late_results": False, "result_formats": {}}}]}):
-            with self.subTest(manifest=manifest):
+    def test_declaration_less_aft_fetch_fails_even_with_a_later_declaring_completion(self):
+        for declarations in (None, {}, {"late_results": False, "result_formats": {}}, {"call_keepalive": True}):
+            with self.subTest(declarations=declarations):
+                manifest = {"fetches": [{"provider": "aft", "declarations_frozen": declarations}]}
                 self.write([dict(self.start, manifest=manifest), self.finish,
                             dict(self.start, ts_ms=102), self.finish])
                 status, output = self.wait()
                 self.assertEqual(status, 1, output)
                 self.assertIn("no frozen result formats or late_results declaration", output)
+
+    def test_runs_without_an_aft_fetch_are_ignored_and_cannot_pass(self):
+        manifests = (None, {}, {"fetches": []},
+                     {"fetches": [{"provider": "other", "declarations_frozen": {"late_results": True}}]},
+                     {"fetches": [{"declarations_frozen": {"late_results": True}}]},
+                     {"tools": [{"provider": "aft"}]})
+        for manifest in manifests:
+            with self.subTest(manifest=manifest):
+                mason = dict(self.start, manifest=manifest)
+                sidekick = dict(mason, session_class="sidekick", ts_ms=102)
+                self.write([mason, self.finish, sidekick, self.finish], requires=[])
+                status, output = self.wait()
+                self.assertEqual(status, 1, output)
+                self.assertIn("no_worker_candidate", output)
+                self.assertIn("candidates=0 class_counts=mason:0,sidekick:0 pending=0", output)
+                self.assertIn("terminal_counts=completed:0 ignored_counts=mason:1,sidekick:1", output)
+                self.assertNotIn("missing required", output)
+
+    def test_other_provider_declarations_cannot_certify_an_aft_fetch(self):
+        for session_class in ("mason", "sidekick"):
+            with self.subTest(session_class=session_class):
+                manifest = {"fetches": [
+                    {"provider": "other", "declarations_frozen": {"late_results": True}},
+                    {"provider": "aft"},
+                ]}
+                self.write([dict(self.start, session_class=session_class, manifest=manifest), self.finish])
+                status, output = self.wait()
+                self.assertEqual(status, 1, output)
+                self.assertIn(f"session={self.address} class={session_class}", output)
+                self.assertIn("AFT fetch has no frozen result formats or late_results declaration", output)
+
+    def test_planless_structured_output_sidekick_is_ignored_beside_a_completed_aft_candidate(self):
+        sidekick = {
+            "type": "run_started", "run_id": "DO-NOT-PRINT-SIDEKICK-RUN", "ts_ms": 102,
+            "session_class": "sidekick", "retention": 3600,
+            "session": {"project_root": "broca-unscoped-v1", "harness": "core", "session": "fixture-sidekick"},
+            "config": {
+                "model": {"provider_module_id": "fixture", "model_id": "fixture-model"},
+                "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
+                "response_format": {"type": "text"}, "context_epoch": 0, "renderer_version": 1,
+                "frozen_render_config": {"structured_output": {
+                    "mode": "final_text", "name": "result", "schema_jcs": '{"type":"object"}',
+                    "enforcement": "best_effort", "reason": "route_unsupported", "delivery": "unconstrained",
+                }},
+            },
+            "input": [], "origin": {"kind": "fresh"},
+        }
+        self.write([sidekick, self.finish], folder="wal-ephemeral",
+                   requires=["session-class/v1", "structured-output/v1"])
+        self.write(address="0000000000000000")
+        status, output = self.wait()
+        self.assertEqual(status, 0, output)
+        self.assertIn("session=0000000000000000 class=mason", output)
+        self.assertIn("candidates=1 class_counts=mason:1,sidekick:0 pending=0", output)
+        self.assertIn("terminal_counts=completed:1 ignored_counts=mason:0,sidekick:1", output)
+
+    def test_ignored_completion_does_not_certify_a_pending_aft_candidate(self):
+        ignored = dict(self.start, session_class="sidekick", ts_ms=102, manifest=None)
+        self.write([ignored, self.finish], folder="wal-ephemeral", requires=["session-class/v1"])
+        self.write([self.start])
+        status, output = self.wait()
+        self.assertEqual(status, 1, output)
+        self.assertIn("worker_completion_timeout", output)
+        self.assertIn("candidates=1 class_counts=mason:1,sidekick:0 pending=1", output)
+        self.assertIn("terminal_counts=completed:0 ignored_counts=mason:0,sidekick:1", output)
+
+    def test_ignored_counts_are_deduplicated_across_polls(self):
+        ignored = dict(self.start, session_class="sidekick", manifest=None)
+        self.write([ignored, self.finish], requires=["session-class/v1"])
+        with patch.object(self.worker.time, "monotonic", side_effect=[0, 0, 120]), \
+                patch.object(self.worker.time, "sleep") as sleep:
+            status, output = self.wait(timeout=120)
+        self.assertEqual(status, 1, output)
+        self.assertIn("no_worker_candidate", output)
+        self.assertIn("candidates=0", output)
+        self.assertIn("ignored_counts=mason:0,sidekick:1", output)
+        sleep.assert_called_once_with(1)
 
     def test_both_required_features_are_checked_on_the_worker_start(self):
         for missing in self.worker.REQUIRED:
@@ -375,7 +452,7 @@ class WorkerTrafficTests(unittest.TestCase):
                 for missing in (None, "session-class/v1", "provider-declarations/v1"):
                     with self.subTest(session_class=session_class, same_wal=same_wal, missing=missing):
                         bad = dict(self.start, session_class=session_class, ts_ms=102,
-                                   manifest=None if missing is None else self.start["manifest"])
+                                   manifest={"fetches": [{"provider": "aft"}]} if missing is None else self.start["manifest"])
                         requires = [feature for feature in self.worker.REQUIRED if feature != missing]
                         good_path = self.write(address="0000000000000000")
                         bad_path = good_path if same_wal else self.write([bad])
@@ -392,7 +469,7 @@ class WorkerTrafficTests(unittest.TestCase):
 
     def test_bad_admission_fails_as_soon_as_it_appears_while_another_run_is_pending(self):
         self.write([self.start])
-        bad = dict(self.start, session_class="sidekick", ts_ms=102, manifest=None)
+        bad = dict(self.start, session_class="sidekick", ts_ms=102, manifest={"fetches": [{"provider": "aft"}]})
         with patch.object(self.worker.time, "monotonic", side_effect=[0, 0]), \
                 patch.object(self.worker.time, "sleep", side_effect=lambda _: self.write(
                     [self.start, bad])) as sleep:
@@ -498,7 +575,8 @@ class WorkerAddressTests(unittest.TestCase):
         state_root = Path(self.fixture.tmp.name)
         path = state_root / "wal-durable/1234567890abcdef.wal"
         path.parent.mkdir()
-        start = dict(self.fixture.start, session_class="mason", ts_ms=101)
+        start = dict(self.fixture.start, session_class="mason", ts_ms=101,
+                     manifest={"fetches": [{"provider": "aft", "declarations_frozen": {"late_results": True}}]})
         path.write_bytes(frame(1, start, list(self.acceptance.REQUIRED))
                          + frame(2, {"type": "run_finished", "reason": "completed"}))
         refused_fetch = self.acceptance.ClientFailure(self.acceptance.subprocess.CompletedProcess(

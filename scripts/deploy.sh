@@ -177,8 +177,9 @@ if [ ! -x "${CARGO_TARGET_DIR:-./target}/release/broca-session" ] || ! acceptanc
   rollback_command >&2
   exit 1
 fi
-# Project-free builds check every observed mason/sidekick admission, then wait for
-# any candidate to complete; other terminal reasons are counted, not failures.
+# Project-free builds check mason/sidekick admissions whose plan fetched the aft
+# tool provider, then wait for any candidate to complete. Runs without an aft
+# fetch are counted as ignored; other terminal reasons are counted, not failures.
 # Older builds compose and send an acceptance turn with their project folder.
 # Observation sends nothing and reports metadata only; it never creates a
 # daemon-authenticated project scope. It waits at most ten minutes for completion.
