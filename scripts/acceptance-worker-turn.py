@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify a worker completed after admission recorded how providers can return tool results."""
 import argparse
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -18,11 +19,14 @@ from lib.state_root import StateRootError, default_state_root
 ROOT = Path(__file__).resolve().parents[1]
 PLAN = ROOT / "scripts/fixtures/acceptance-reader-plan.json"
 CLASS = "acceptance"
-# Core labels its worker sessions mason; sidekick and consult are different traffic.
-WORKER_CLASS = "mason"
+# Core labels its plan-composed worker and research sessions mason and sidekick.
+WORKER_CLASSES = ("mason", "sidekick")
 REQUIRED = ("session-class/v1", "provider-declarations/v1")
 MODELS_FILE = ROOT / "scripts/lib/acceptance-models.txt"
 ADDRESS = re.compile(r"[0-9a-f]{16}")
+# Only RunFinishReason spellings from broca-protocol may reach diagnostic output.
+FINISH_REASONS = frozenset(("completed", "max_steps", "budget_exhausted", "context_ceiling",
+                            "cancelled", "interrupted", "error", "transform_unavailable"))
 
 
 def wal_name(project_root, harness, session):
@@ -69,34 +73,33 @@ def check_wal(path, run_id):
     return checked_run(path, run_id, finish_reason="completed")[0]
 
 
-def worker_summary(frames, after_ms):
-    starts = [frame for frame in frames if frame.record["type"] == "run_started"
-              and frame.record.get("session_class") == WORKER_CLASS
-              and isinstance(frame.record.get("ts_ms"), int)
-              and not isinstance(frame.record["ts_ms"], bool)
-              and frame.record["ts_ms"] > after_ms]
-    if not starts:
-        return None
-    start = min(starts, key=lambda frame: (frame.record["ts_ms"], frame.seq))
-    summary = {"ts_ms": start.record["ts_ms"], "seq": start.seq, "state": "pending"}
-    try:
-        check_start(start, WORKER_CLASS)
-    except ValueError as error:
-        return dict(summary, state="failed", error=str(error))
-    terminals, closed = [], False
+def worker_summaries(frames, after_ms):
+    summaries, active = [], None
     for frame in frames:
-        if frame.seq <= start.seq:
-            continue
-        if frame.record["type"] == "run_started":
-            closed = True
-            break
-        if frame.record["type"] == "run_finished":
-            terminals.append(frame.record)
-    if len(terminals) == 1 and terminals[0].get("reason") == "completed":
-        return dict(summary, state="completed")
-    if terminals or closed:
-        return dict(summary, state="failed", error="worker run did not complete with reason completed")
-    return summary
+        record = frame.record
+        if record["type"] == "run_started":
+            active = None
+            timestamp, session_class = record.get("ts_ms"), record.get("session_class")
+            if (session_class not in WORKER_CLASSES or not isinstance(timestamp, int)
+                    or isinstance(timestamp, bool) or timestamp <= after_ms):
+                continue
+            active = {"ts_ms": timestamp, "seq": frame.seq, "class": session_class,
+                      "reason": None, "error": None}
+            try:
+                check_start(frame, session_class)
+            except ValueError as error:
+                active["error"] = str(error)
+            except (TypeError, AttributeError):
+                active["error"] = "RunStarted manifest has invalid provider declarations"
+            summaries.append(active)
+        elif active is not None and record["type"] == "run_finished":
+            reason = record.get("reason")
+            if active["reason"] is not None:
+                active["reason"] = "invalid_terminal"
+            else:
+                active["reason"] = (reason if isinstance(reason, str) and reason in FINISH_REASONS
+                                    else "unclassified_terminal")
+    return summaries
 
 
 def scan_workers(state_root, after_ms, cache):
@@ -113,8 +116,8 @@ def scan_workers(state_root, after_ms, cache):
                     continue
                 identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
                 if cache.get(path, (None,))[0] != identity:
-                    cache[path] = (identity, worker_summary(read_records(path), after_ms))
-                if cache[path][1] is not None:
+                    cache[path] = (identity, worker_summaries(read_records(path), after_ms))
+                if cache[path][1]:
                     summaries[path] = cache[path][1]
             except FileNotFoundError:
                 continue
@@ -126,42 +129,49 @@ def scan_workers(state_root, after_ms, cache):
     return summaries, unavailable
 
 
+def worker_counts(observed):
+    classes = Counter(summary["class"] for summary in observed.values())
+    reasons = Counter(summary["reason"] for summary in observed.values() if summary["reason"] is not None)
+    class_counts = ",".join(f"{name}:{classes[name]}" for name in WORKER_CLASSES)
+    terminal_counts = ",".join(f"{reason}:{reasons[reason]}" for reason in sorted(set(reasons) | {"completed"}))
+    return (f"classes={','.join(WORKER_CLASSES)} candidates={len(observed)} "
+            f"class_counts={class_counts} pending={len(observed) - sum(reasons.values())} "
+            f"terminal_counts={terminal_counts}")
+
+
 def wait_for_worker(state_root, after_ms, timeout=600, poll=5):
     deadline = time.monotonic() + timeout
-    cache, selected = {}, None
+    cache, observed = {}, {}
     while True:
         summaries, unavailable = scan_workers(state_root, after_ms, cache)
-        if selected is None and summaries:
-            path = min(summaries, key=lambda path: (summaries[path]["ts_ms"], path.name,
-                                                    summaries[path]["seq"], str(path)))
-            selected = (path, summaries[path]["ts_ms"], summaries[path]["seq"])
-        if selected is not None:
-            path, timestamp, seq = selected
-            summary = summaries.get(path)
-            identity = f"session={path.stem} class={WORKER_CLASS} start_seq={seq}"
-            # Pin the first observed admission: a later successful worker cannot
-            # hide missing declarations, an error, or a missing terminal on it.
-            if summary and (summary["ts_ms"], summary["seq"]) == (timestamp, seq):
-                if summary["state"] == "completed":
-                    print(f"acceptance-worker-turn: PASS -- admitted, completed; {identity}; "
-                          f"RunStarted requires {', '.join(REQUIRED)}", flush=True)
-                    return 0
-                if summary["state"] == "failed":
-                    print(f"acceptance-worker-turn: FAILED -- {identity}; {summary['error']}", file=sys.stderr)
-                    return 1
+        for path, candidates in summaries.items():
+            for summary in candidates:
+                key = (path.stem, summary["seq"], summary["ts_ms"])
+                observed[key] = dict(summary, address=path.stem)
+        counts = worker_counts(observed)
+        # Validate every admission in the snapshot before accepting any completion.
+        # A long-running worker need not finish, but a bad later start cannot hide
+        # behind an earlier success in the same session log or another session's log.
+        for summary in observed.values():
+            if summary["error"] is not None:
+                print(f"acceptance-worker-turn: FAILED -- session={summary['address']} "
+                      f"class={summary['class']} start_seq={summary['seq']}; {summary['error']}; {counts}",
+                      file=sys.stderr)
+                return 1
+        completed = next((summary for summary in observed.values() if summary["reason"] == "completed"), None)
+        if completed is not None:
+            print(f"acceptance-worker-turn: PASS -- admitted, completed; session={completed['address']} "
+                  f"class={completed['class']} start_seq={completed['seq']}; "
+                  f"RunStarted requires {', '.join(REQUIRED)}; {counts}", flush=True)
+            return 0
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         time.sleep(min(poll, remaining))
-    if selected is not None:
-        path, _, seq = selected
-        print(f"acceptance-worker-turn: FAILED -- worker_terminal_timeout; "
-              f"session={path.stem} class={WORKER_CLASS} start_seq={seq}; "
-              "no verified completed terminal for the selected post-restart worker", file=sys.stderr)
-    else:
-        evidence = f"; evidence={','.join(sorted(unavailable))}" if unavailable else ""
-        print(f"acceptance-worker-turn: FAILED -- no_worker_candidate; no post-restart "
-              f"session_class={WORKER_CLASS} RunStarted within {timeout:g}s{evidence}", file=sys.stderr)
+    failure = "worker_completion_timeout" if observed else "no_worker_candidate"
+    evidence = f"; evidence={','.join(sorted(unavailable))}" if unavailable else ""
+    print(f"acceptance-worker-turn: FAILED -- {failure}; no completed post-restart candidate "
+          f"within {timeout:g}s; {worker_counts(observed)}{evidence}", file=sys.stderr)
     return 1
 
 

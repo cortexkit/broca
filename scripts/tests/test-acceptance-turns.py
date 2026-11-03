@@ -292,26 +292,30 @@ class WorkerTrafficTests(unittest.TestCase):
 
     def test_completed_declaring_worker_in_every_live_folder_passes(self):
         for folder in ("wal", "wal-durable", "wal-ephemeral"):
-            for declaration in ({"late_results": True}, {"result_formats": {"read": "text"}}):
-                with self.subTest(folder=folder, declaration=declaration):
-                    start = dict(self.start, manifest={"fetches": [{"declarations_frozen": declaration}]})
-                    path = self.write([start, {"type": "message", "text": "DO-NOT-PRINT-CONTENT"}, self.finish],
-                                      folder=folder)
-                    status, output = self.wait()
-                    self.assertEqual(status, 0, output)
-                    self.assertIn(f"session={self.address} class=mason", output)
-                    self.assertIn("admitted, completed", output)
-                    path.unlink()
+            for session_class in ("mason", "sidekick"):
+                for declaration in ({"late_results": True}, {"result_formats": {"read": "text"}}):
+                    with self.subTest(folder=folder, session_class=session_class, declaration=declaration):
+                        start = dict(self.start, session_class=session_class,
+                                     manifest={"fetches": [{"declarations_frozen": declaration}]})
+                        path = self.write([start, {"type": "message", "text": "DO-NOT-PRINT-CONTENT"}, self.finish],
+                                          folder=folder)
+                        status, output = self.wait()
+                        self.assertEqual(status, 0, output)
+                        self.assertIn(f"session={self.address} class={session_class}", output)
+                        self.assertIn("admitted, completed", output)
+                        self.assertIn("terminal_counts=completed:1", output)
+                        path.unlink()
 
-    def test_no_candidate_is_a_named_failure_with_the_worker_label(self):
+    def test_no_candidate_is_a_named_failure_with_both_classes_and_zero_counts(self):
         status, output = self.wait()
         self.assertEqual(status, 1)
         self.assertIn("no_worker_candidate", output)
-        self.assertIn("session_class=mason", output)
+        self.assertIn("classes=mason,sidekick candidates=0", output)
+        self.assertIn("class_counts=mason:0,sidekick:0 pending=0 terminal_counts=completed:0", output)
 
     def test_pre_restart_and_non_worker_starts_are_not_candidates(self):
         starts = [dict(self.start, ts_ms=value) for value in (99, 100, True, "101")]
-        starts += [dict(self.start, session_class=value) for value in (None, "head", "sidekick", "consult", "worker")]
+        starts += [dict(self.start, session_class=value) for value in (None, "head", "acceptance", "consult", "worker")]
         for start in starts:
             with self.subTest(start=start):
                 self.write([start, self.finish])
@@ -337,11 +341,12 @@ class WorkerTrafficTests(unittest.TestCase):
                 self.assertEqual(status, 1, output)
                 self.assertIn("missing required WAL feature(s): " + missing, output)
 
-    def test_error_or_missing_terminal_cannot_borrow_a_later_runs_completion(self):
+    def test_only_a_candidates_own_single_completed_terminal_can_certify_it(self):
         for records in ([self.start],
                         [self.start, dict(self.finish, reason="error", error={"message": "DO-NOT-PRINT-ERROR"})],
                         [self.start, dict(self.finish, reason="max_steps")],
-                        [self.start, dict(self.start, ts_ms=102), self.finish],
+                        [self.start, dict(self.start, session_class="head", ts_ms=102), self.finish],
+                        [self.start, dict(self.start, ts_ms=99), self.finish],
                         [self.finish, self.start],
                         [self.start, self.finish, self.finish]):
             with self.subTest(records=records):
@@ -350,22 +355,93 @@ class WorkerTrafficTests(unittest.TestCase):
                 self.assertEqual(status, 1, output)
                 self.assertIn("FAILED", output)
 
-    def test_earliest_worker_across_sessions_is_selected_and_pinned_until_terminal(self):
-        path = self.write([self.start])
-        self.write([dict(self.start, ts_ms=102), self.finish], address="0000000000000000")
+    def test_long_running_first_candidate_does_not_block_a_later_completed_candidate(self):
+        self.write([self.start])
+        later = dict(self.start, session_class="sidekick", ts_ms=102)
+        later_address = "0000000000000000"
         with patch.object(self.worker.time, "monotonic", side_effect=[0, 0, 120]), \
-                patch.object(self.worker.time, "sleep") as sleep:
-            status, output = self.wait(timeout=120)
-        self.assertEqual(status, 1, output)
-        self.assertIn("worker_terminal_timeout", output)
-        self.assertIn(f"session={self.address}", output)
-        sleep.assert_called_once_with(1)
-        with patch.object(self.worker.time, "monotonic", side_effect=[0, 0]), \
-                patch.object(self.worker.time, "sleep", side_effect=lambda _: self.write()) as sleep:
+                patch.object(self.worker.time, "sleep", side_effect=lambda _: self.write(
+                    [later, self.finish], address=later_address)) as sleep:
             status, output = self.wait(timeout=120)
         self.assertEqual(status, 0, output)
-        self.assertIn(f"session={path.stem}", output)
+        self.assertIn(f"session={later_address} class=sidekick", output)
+        self.assertIn("candidates=2 class_counts=mason:1,sidekick:1 pending=1", output)
+        self.assertIn("terminal_counts=completed:1", output)
         sleep.assert_called_once_with(1)
+
+    def test_bad_admission_after_an_earlier_completion_beats_success_in_the_snapshot(self):
+        for session_class in ("mason", "sidekick"):
+            for same_wal in (True, False):
+                for missing in (None, "session-class/v1", "provider-declarations/v1"):
+                    with self.subTest(session_class=session_class, same_wal=same_wal, missing=missing):
+                        bad = dict(self.start, session_class=session_class, ts_ms=102,
+                                   manifest=None if missing is None else self.start["manifest"])
+                        requires = [feature for feature in self.worker.REQUIRED if feature != missing]
+                        good_path = self.write(address="0000000000000000")
+                        bad_path = good_path if same_wal else self.write([bad])
+                        bad_frame = frame(3 if same_wal else 1, bad, requires)
+                        bad_path.write_bytes((good_path.read_bytes() if same_wal else b"") + bad_frame)
+                        status, output = self.wait()
+                        self.assertEqual(status, 1, output)
+                        self.assertIn(f"session={bad_path.stem} class={session_class}", output)
+                        self.assertIn(missing or "no frozen result formats or late_results declaration", output)
+                        self.assertNotIn("PASS", output)
+                        bad_path.unlink()
+                        if not same_wal:
+                            good_path.unlink()
+
+    def test_bad_admission_fails_as_soon_as_it_appears_while_another_run_is_pending(self):
+        self.write([self.start])
+        bad = dict(self.start, session_class="sidekick", ts_ms=102, manifest=None)
+        with patch.object(self.worker.time, "monotonic", side_effect=[0, 0]), \
+                patch.object(self.worker.time, "sleep", side_effect=lambda _: self.write(
+                    [self.start, bad])) as sleep:
+            status, output = self.wait(timeout=600)
+        self.assertEqual(status, 1, output)
+        self.assertIn(f"session={self.address} class=sidekick", output)
+        self.assertIn("no frozen result formats or late_results declaration", output)
+        sleep.assert_called_once_with(1)
+
+    def test_other_endings_are_counted_but_do_not_block_a_later_completion(self):
+        records = []
+        for index, reason in enumerate(("error", "interrupted", "max_steps")):
+            records.extend([dict(self.start, session_class="mason" if index % 2 == 0 else "sidekick",
+                                 ts_ms=101 + index),
+                            dict(self.finish, reason=reason, error={"message": "DO-NOT-PRINT-ERROR"})])
+        self.write(records)
+        later = dict(self.start, session_class="sidekick", ts_ms=104)
+        with patch.object(self.worker.time, "monotonic", side_effect=[0, 0]), \
+                patch.object(self.worker.time, "sleep", side_effect=lambda _: self.write(
+                    records + [later, self.finish])) as sleep:
+            status, output = self.wait(timeout=600)
+        self.assertEqual(status, 0, output)
+        self.assertIn("candidates=4 class_counts=mason:2,sidekick:2 pending=0", output)
+        self.assertIn("terminal_counts=completed:1,error:1,interrupted:1,max_steps:1", output)
+        sleep.assert_called_once_with(1)
+
+    def test_completion_timeout_names_both_classes_and_counts_each_run_only_once(self):
+        records = []
+        for index, reason in enumerate(("error", "interrupted", "max_steps")):
+            records.extend([dict(self.start, session_class="mason" if index % 2 == 0 else "sidekick",
+                                 ts_ms=101 + index), dict(self.finish, reason=reason)])
+        self.write(records + [dict(self.start, session_class="sidekick", ts_ms=104)])
+        with patch.object(self.worker.time, "monotonic", side_effect=[0, 0, 5, 600]), \
+                patch.object(self.worker.time, "sleep") as sleep:
+            status, output = self.wait(timeout=600)
+        self.assertEqual(status, 1, output)
+        self.assertIn("worker_completion_timeout", output)
+        self.assertIn("classes=mason,sidekick candidates=4", output)
+        self.assertIn("class_counts=mason:2,sidekick:2 pending=1", output)
+        self.assertIn("terminal_counts=completed:0,error:1,interrupted:1,max_steps:1", output)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_unrecognized_terminal_reasons_are_counted_without_printing_their_value(self):
+        for reason in ("DO-NOT-PRINT-REASON", {"content": "DO-NOT-PRINT-REASON"}, None):
+            with self.subTest(reason=reason):
+                self.write([self.start, dict(self.finish, reason=reason)])
+                status, output = self.wait()
+                self.assertEqual(status, 1, output)
+                self.assertIn("terminal_counts=completed:0,unclassified_terminal:1", output)
 
     def test_no_candidate_wait_is_bounded_and_observes_new_admissions(self):
         with patch.object(self.worker.time, "monotonic", side_effect=[0, 0, 120]), \
@@ -466,7 +542,7 @@ class WorkerAddressTests(unittest.TestCase):
             extra_args=("--placement-report", str(report), "--timeout", "0"))
         self.assertEqual(result, 1, output)
         self.assertIn("no_worker_candidate", output)
-        self.assertIn("session_class=mason", output)
+        self.assertIn("classes=mason,sidekick candidates=0", output)
         self.assertEqual(invoke.call_count, 1)
         check.assert_not_called()
 
