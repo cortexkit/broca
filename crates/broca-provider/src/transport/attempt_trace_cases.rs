@@ -560,6 +560,7 @@ pub(super) fn assert_trace(case: &Case, actual: &[Event]) {
         "wire/model trace mismatch (seed {:?}): {case:?}",
         case.seed
     );
+    golden::assert_or_capture(case, actual);
     let mut in_flight = None;
     for event in actual {
         match event {
@@ -579,4 +580,8 @@ pub(super) fn assert_trace(case: &Case, actual: &[Event]) {
             _ => {}
         }
     }
+}
+
+mod golden {
+    include!("attempt_trace_golden.rs");
 }
