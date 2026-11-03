@@ -204,7 +204,6 @@ mod bus;
 #[path = "llm_runner_conformance/catalog.rs"]
 mod catalog;
 
-
 #[path = "llm_runner_conformance/attribution.rs"]
 mod attribution;
 #[path = "llm_runner_conformance/boundary_cancel.rs"]
@@ -680,7 +679,6 @@ async fn serve_model_request(
             .unwrap()
             .contains_key(session)
             .then(|| session.to_owned())
-
     } else {
         std::iter::once(&request["system"])
             .chain(
@@ -698,7 +696,6 @@ async fn serve_model_request(
                     .collect();
                 Some(name)
             })
-
     };
     let refusal = session
         .as_ref()
@@ -846,7 +843,6 @@ async fn serve_model_request(
         shared.released.notified().await;
         return Ok(());
     }
-
 
     *shared.last_session.lock().unwrap() = Some(session.clone());
     let id = format!("chatcmpl-{session}-{turn_index}");
@@ -1654,7 +1650,8 @@ impl BrocaSubject {
     fn holds_point(&self, live: &Live, session: &str, point: &str) -> Result<(), String> {
         use broca_wal::WalRecord as R;
         let all = self.records(live, session);
-        let current = all.iter()
+        let current = all
+            .iter()
             .rposition(|r| matches!(r, R::RunStarted { .. }))
             .unwrap_or(0);
         let (earlier, records) = all.split_at(current);
@@ -1877,18 +1874,25 @@ fn captured_part_numbers(message: &Value) -> (Value, Vec<Option<u64>>) {
         let text = value.as_str()?;
         let (number, rest) = text.strip_prefix('§')?.split_once("§ ")?;
         let number: u64 = number.parse().ok()?;
-        if number == 0 { return None; }
+        if number == 0 {
+            return None;
+        }
         *value = rest.to_owned().into();
         Some(number)
     }
     let mut cleaned = message.clone();
-    let numbers = cleaned["content"].as_array_mut().into_iter().flatten().map(|part| {
-        if part["type"] == "tool_result" {
-            strip(&mut part["output"]["text"])
-        } else {
-            strip(&mut part["text"])
-        }
-    }).collect();
+    let numbers = cleaned["content"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .map(|part| {
+            if part["type"] == "tool_result" {
+                strip(&mut part["output"]["text"])
+            } else {
+                strip(&mut part["text"])
+            }
+        })
+        .collect();
     (cleaned, numbers)
 }
 
@@ -2050,12 +2054,35 @@ impl RunnerRoute for BrocaRoute {
                     for entry in value["result"]["messages"].as_array().into_iter().flatten() {
                         if let Some(mid) = entry["mid"].as_str() {
                             mids.insert(entry["message"].to_string(), mid.to_owned());
-                            let keys = entry["part_keys"].as_array().map(|keys| keys.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
-                                .or_else(|| entry["part_digests"].as_array().map(|parts| parts.iter().filter_map(|part| part["part"].as_str()).map(str::to_owned).collect()));
+                            let keys = entry["part_keys"]
+                                .as_array()
+                                .map(|keys| {
+                                    keys.iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_owned)
+                                        .collect::<Vec<_>>()
+                                })
+                                .or_else(|| {
+                                    entry["part_digests"].as_array().map(|parts| {
+                                        parts
+                                            .iter()
+                                            .filter_map(|part| part["part"].as_str())
+                                            .map(str::to_owned)
+                                            .collect()
+                                    })
+                                });
                             if let Some(keys) = keys {
-                                self.subject.shared.read_part_keys.lock().unwrap().insert(entry["message"].to_string(), keys);
+                                self.subject
+                                    .shared
+                                    .read_part_keys
+                                    .lock()
+                                    .unwrap()
+                                    .insert(entry["message"].to_string(), keys);
                             }
-                            self.subject.shared.read_entries.lock().unwrap().insert((self.session.session.clone(), mid.to_owned()), entry.clone());
+                            self.subject.shared.read_entries.lock().unwrap().insert(
+                                (self.session.session.clone(), mid.to_owned()),
+                                entry.clone(),
+                            );
                         }
                     }
                 }
@@ -2484,8 +2511,12 @@ impl LlmRunnerSubject for BrocaSubject {
             );
             return fields;
         }
-        if session.contains("tool_result_too_large") && !self.shared.plan_sessions.lock().unwrap().contains(session) {
-            return self.send_fields_with_plan(session, first, &Map::new()).unwrap();
+        if session.contains("tool_result_too_large")
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
         }
         if session_change_kit_session(session)
             && !self.shared.plan_sessions.lock().unwrap().contains(session)
@@ -3041,26 +3072,54 @@ impl LlmRunnerSubject for BrocaSubject {
         Ok(())
     }
 
-    fn oversized_tool_result(&self, message: &Value, tool_call_id: &str) -> Option<cortexkit_role_llm_runner_conformance::ToolResultLimitObservation> {
-        let block = message["content"].as_array()?.iter().find(|block| block["tool_call_id"].as_str() == Some(tool_call_id))?;
+    fn oversized_tool_result(
+        &self,
+        message: &Value,
+        tool_call_id: &str,
+    ) -> Option<cortexkit_role_llm_runner_conformance::ToolResultLimitObservation> {
+        let block = message["content"]
+            .as_array()?
+            .iter()
+            .find(|block| block["tool_call_id"].as_str() == Some(tool_call_id))?;
         let output = &block["output"];
         let detail: Value = serde_json::from_str(output["detail"].as_str()?).ok()?;
-        Some(cortexkit_role_llm_runner_conformance::ToolResultLimitObservation::new(
-            output["code"].as_str()?, detail["bytes"].as_u64()?, detail["limit"].as_u64()?,
-            output["message"].as_str()?, block["is_error"].as_bool()?,
-        ))
+        Some(
+            cortexkit_role_llm_runner_conformance::ToolResultLimitObservation::new(
+                output["code"].as_str()?,
+                detail["bytes"].as_u64()?,
+                detail["limit"].as_u64()?,
+                output["message"].as_str()?,
+                block["is_error"].as_bool()?,
+            ),
+        )
     }
 
     fn shown_part_number(&self, session: &str, mid: &str, part: &str) -> Option<u64> {
-        let entry = self.shared.read_entries.lock().unwrap().get(&(session.to_owned(), mid.to_owned())).cloned()?;
-        let keys = self.shared.read_part_keys.lock().unwrap().get(&entry["message"].to_string()).cloned()?;
+        let entry = self
+            .shared
+            .read_entries
+            .lock()
+            .unwrap()
+            .get(&(session.to_owned(), mid.to_owned()))
+            .cloned()?;
+        let keys = self
+            .shared
+            .read_part_keys
+            .lock()
+            .unwrap()
+            .get(&entry["message"].to_string())
+            .cloned()?;
         let index = keys.iter().position(|key| key == part)?;
         let requests = self.shared.requests.lock().unwrap();
         let mut numbers = BTreeSet::new();
         for message in requests.get(session)?.iter().flatten() {
             let (cleaned, shown) = captured_part_numbers(message);
-            if cleaned["role"] == entry["message"]["role"] && cleaned["content"] == entry["message"]["content"] {
-                if let Some(Some(number)) = shown.get(index) { numbers.insert(*number); }
+            if cleaned["role"] == entry["message"]["role"]
+                && cleaned["content"] == entry["message"]["content"]
+            {
+                if let Some(Some(number)) = shown.get(index) {
+                    numbers.insert(*number);
+                }
             }
         }
         (numbers.len() == 1).then(|| *numbers.iter().next().unwrap())
@@ -3090,11 +3149,18 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn read_parts(&self, message: &Value) -> Vec<(String, Value)> {
-        let keys = self.shared.read_part_keys.lock().unwrap()
-            .get(&message.to_string()).cloned().unwrap_or_default();
-        keys.into_iter().zip(message["content"].as_array().into_iter().flatten().cloned()).collect()
+        let keys = self
+            .shared
+            .read_part_keys
+            .lock()
+            .unwrap()
+            .get(&message.to_string())
+            .cloned()
+            .unwrap_or_default();
+        keys.into_iter()
+            .zip(message["content"].as_array().into_iter().flatten().cloned())
+            .collect()
     }
-
 
     /// Resolve identity from the listed call and the keys of the actual read entry.
     fn tool_result_part(
@@ -3119,7 +3185,10 @@ impl LlmRunnerSubject for BrocaSubject {
         if matching.next().is_some() {
             return None;
         }
-        result.served_part_keys()?.get(index).map(|key| (*key).to_owned())
+        result
+            .served_part_keys()?
+            .get(index)
+            .map(|key| (*key).to_owned())
     }
 
     /// Legacy image fixture: invalid bytes keep the marker in a stored media-failure notice.
@@ -3504,6 +3573,24 @@ async fn describe_diagnostics_follow_each_call_across_two_routes_on_one_worker()
     broca_test_support::remove_rig_dir(&scratch);
 }
 
+const UNNUMBERED_PLAN_INAPPLICABLE_CASES: &[&str] = &[
+    "output_refs_scanning",
+    "output_refs_shared_samples",
+    "output_refs_writing_request",
+    "output_refs_target_reasons",
+    "output_refs_held_placeholder",
+    "output_refs_snapshot_size",
+    "output_refs_snapshot_budget",
+    "output_refs_descriptor_digest",
+    "output_refs_rewind",
+    "output_refs_compaction",
+    "output_refs_session_isolation",
+    "output_refs_slots",
+    "output_refs_reference_limit",
+    "output_refs_read_limits",
+    "delivery_order_template_part_gone_refused",
+];
+
 const REQUIRED_INPUT_CAP_CASES: &[&str] = &[
     "input_token_cap_at_limit",
     "input_token_cap_crossing_tools",
@@ -3669,7 +3756,11 @@ mod named_contract_case_tests {
 /// include a real process kill rather than only simulated recovery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ck_broca_passes_the_llm_runner_conformance_suite() {
-    assert!(cfg!(feature = "test-clock"), "native conformance requires the debug-only test-clock feature");
+    let test_clock_enabled = cfg!(feature = "test-clock");
+    assert!(
+        test_clock_enabled,
+        "native conformance requires the debug-only test-clock feature"
+    );
     for (name, env_key) in [
         ("ck-subc", "SUBC_CORE_BIN"),
         ("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
@@ -3803,15 +3894,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "finish_reason_provider_limit",
         "finish_reason_no_model_step",
         "finish_reason_last_model_step",
-        "output_refs_scanning",
-        "output_refs_target_reasons",
-        "output_refs_descriptor_digest",
-        "output_refs_session_isolation",
-        "output_refs_slots",
-        "output_refs_shared_samples",
-        "output_refs_reference_limit",
-        "output_refs_read_limits",
-        "output_refs_snapshot_budget",
+        "output_refs_without_compaction_unknown_tag",
         "run_cancel_step_boundary_finishes_tool_batch",
         "run_cancel_unlisted_at_refused",
         "run_cancel_step_boundary_escalates_to_now",
@@ -3879,6 +3962,18 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             "{name}\n{}",
             report.render()
         );
+    }
+    // These fixture plans deliberately omit compaction_item. The kit grades numbered
+    // scenarios by the opening plan, not by whether a runner happened to render numbers.
+    for name in UNNUMBERED_PLAN_INAPPLICABLE_CASES {
+        let case = report
+            .cases
+            .iter()
+            .find(|case| case.case == *name)
+            .unwrap_or_else(|| panic!("the suite has no case {name}"));
+        assert_eq!(case.outcome, CaseOutcome::Inapplicable {
+            reason: "the kit's opening plan has no plan.compaction_item, so no part numbers are shown".into(),
+        }, "{name}\n{}", report.render());
     }
     let host_set = report
         .cases
@@ -3989,8 +4084,6 @@ async fn attach_notice_bus(subject: &mut BrocaSubject, root: &Path) {
 fn skip_crash_kills() -> bool {
     std::env::var("BROCA_CONFORMANCE_SKIP_CRASH_KILLS").as_deref() == Ok("1")
 }
-
-
 
 /// After a cut between a step's record and its calls' dispatch intents, broca does not resume
 /// the run: the restarted module seals it `interrupted` without sending the call. So the tool

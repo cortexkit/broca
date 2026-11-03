@@ -90,6 +90,13 @@ impl HookPlan {
         }
         let mut declarations = Vec::new();
         for (item, frozen) in items.iter().zip(&manifest.declarations) {
+            // Open wire enums retain future values on decode. A frozen plan must still
+            // validate them before an unknown hook or policy could silently skip work.
+            for sub in &item.subscriptions {
+                sub.check().map_err(|problem| {
+                    format!("invalid frozen transform subscription: {problem:?}")
+                })?;
+            }
             // Resume bypasses admission, so enforce the fail-closed approval policy here too.
             if item.subscriptions.iter().any(|sub| {
                 sub.phase == Some(Phase::Approve) && sub.on_unavailable == OnUnavailable::Pass
@@ -99,9 +106,15 @@ impl HookPlan {
             if item.provider != frozen.provider {
                 return Err("frozen transform declaration provider mismatch".into());
             }
-            declarations.push(
-                serde_json::from_str(frozen.answer.as_json_text()).map_err(|e| e.to_string())?,
-            );
+            let declaration: Declaration =
+                serde_json::from_str(frozen.answer.as_json_text()).map_err(|e| e.to_string())?;
+            let problems = declaration.check();
+            if !problems.is_empty() {
+                return Err(format!(
+                    "invalid frozen transform declaration: {problems:?}"
+                ));
+            }
+            declarations.push(declaration);
         }
         let grants = plan_user_grants(object).map_err(|e| e.to_string())?;
         let mut result_ops = std::collections::HashMap::new();
@@ -517,5 +530,45 @@ mod permission_tests {
         frozen.fetches.clear();
         let plan = HookPlan::from_manifest(&frozen).unwrap();
         assert!(plan.result_ops.is_empty());
+    }
+
+    #[test]
+    fn frozen_unknown_hook_policies_and_declarations_are_rejected() {
+        let known = json!({"hook":"pre_user", "ops":["append"], "on_unavailable":"refuse", "budget_ms":500});
+        let frozen = |planned: Value, declared: Value| {
+            let mut manifest = manifest(json!({}));
+            manifest.plan = broca_wal::OpaqueJson::from_json_text(
+                json!({"step_transform_items":[{
+                    "provider":"transform", "subscriptions":[planned]
+                }]})
+                .to_string(),
+            )
+            .unwrap();
+            manifest.declarations = vec![broca_wal::FrozenDeclaration {
+                provider: "transform".into(),
+                answer: broca_wal::OpaqueJson::from_json_text(
+                    json!({"subscriptions":[declared]}).to_string(),
+                )
+                .unwrap(),
+            }];
+            manifest
+        };
+        assert!(HookPlan::from_manifest(&frozen(known.clone(), known.clone())).is_ok());
+        for (field, value) in [
+            ("hook", json!("future_hook")),
+            ("on_unavailable", json!("future_policy")),
+            ("ops", json!(["future_op"])),
+        ] {
+            let mut unknown = known.clone();
+            unknown[field] = value;
+            assert!(
+                HookPlan::from_manifest(&frozen(unknown.clone(), known.clone())).is_err(),
+                "unknown planned {field}"
+            );
+            assert!(
+                HookPlan::from_manifest(&frozen(known.clone(), unknown)).is_err(),
+                "unknown declared {field}"
+            );
+        }
     }
 }

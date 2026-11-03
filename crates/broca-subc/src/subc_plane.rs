@@ -1774,7 +1774,8 @@ impl SubcToolPlane {
                         }
                         if reply.held().is_some()
                             || cortexkit_role_tool_provider::result::model_visible_bytes(&reply)
-                                <= cortexkit_role_tool_provider::result::MAX_MODEL_VISIBLE_BYTES {
+                                <= cortexkit_role_tool_provider::result::MAX_MODEL_VISIBLE_BYTES
+                        {
                             cortexkit_role_tool_provider::result::validate(&reply)
                                 .map_err(|error| error.to_string())?;
                         }
@@ -1884,17 +1885,24 @@ impl SubcToolPlane {
                             )
                         });
                     let captures = if ctx.media_capture.is_some()
-                        && decoded.as_ref().is_some_and(|reply| reply.as_ref().is_ok_and(|reply|
-                            cortexkit_role_tool_provider::result::model_visible_bytes(reply)
-                                <= cortexkit_role_tool_provider::result::MAX_MODEL_VISIBLE_BYTES))
-                    {
+                        && decoded.as_ref().is_some_and(|reply| {
+                            reply.as_ref().is_ok_and(|reply| {
+                                cortexkit_role_tool_provider::result::model_visible_bytes(reply)
+                                    <= cortexkit_role_tool_provider::result::MAX_MODEL_VISIBLE_BYTES
+                            })
+                        }) {
                         tool_capture::content_v1_captures(&mut result, &raw)
                     } else {
                         Vec::new()
                     };
                     (result, captures)
-                } else if let Some(error) = cortexkit_role_llm_runner::tool_result_limit::legacy_size_error(&raw) {
-                    (crate::content_v1::size_error_result(&call.tool_call_id, error), Vec::new())
+                } else if let Some(error) =
+                    cortexkit_role_llm_runner::tool_result_limit::legacy_size_error(&raw)
+                {
+                    (
+                        crate::content_v1::size_error_result(&call.tool_call_id, error),
+                        Vec::new(),
+                    )
                 } else if ctx.media_capture.is_some() {
                     map_call_tool_result(&call.tool_call_id, &raw)
                 } else {
@@ -1931,6 +1939,20 @@ impl SubcToolPlane {
                     self.remove_batch_call_route(ctx, &call.tool_call_id);
                     let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id, sent_on);
                 }
+                if let Some(output) =
+                    crate::content_v1::oversized_refusal(msg.code(), msg.message())
+                {
+                    let result = ToolResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        output,
+                        is_error: true,
+                    };
+                    self.fence
+                        .lock()
+                        .unwrap()
+                        .insert(&ctx.batch_id, fence_key, result.clone());
+                    return DispatchResult::Completed(result);
+                }
                 // `module_reloading` here answers the one re-send after a re-open: the module
                 // began draining again. The protocol refuses it before the request reaches the
                 // tool, so nothing was sent, and the call is reported exactly like a module that
@@ -1955,8 +1977,7 @@ impl SubcToolPlane {
                 // it does not authorize a retry after a provider received the call. Only a
                 // route.open refusal, where nothing was sent, is held and retried. A test
                 // (`a_provider_scope_not_synced_refusal_is_recorded_and_never_resent`) pins this.
-                let output = crate::content_v1::oversized_refusal(msg.code(), msg.message())
-                    .unwrap_or_else(|| ToolOutput::error(format!("tool/route rejected: {msg}")));
+                let output = ToolOutput::error(format!("tool/route rejected: {msg}"));
                 let result = ToolResult {
                     tool_call_id: call.tool_call_id.clone(),
                     output,
@@ -6488,6 +6509,62 @@ mod tests {
         assert!(
             conn.closed_routes.lock().unwrap().is_empty(),
             "a reloading route must be forgotten, not closed: a close can cut off an in-flight sibling"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_reloading_refusal_keeps_its_code_and_discards_its_message() {
+        let refusal = |message: &str| {
+            Err(ConnError::Rejected(crate::connection::decode_error_body(
+                &serde_json::to_vec(
+                    &serde_json::json!({"code":"module_reloading", "message":message}),
+                )
+                .unwrap(),
+            )))
+        };
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![Vec::new(), Vec::new(), Vec::new()],
+            vec![refusal("draining endpoint"), refusal(&"x".repeat(65_537))],
+        );
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("batch-oversized-refusal");
+        let tool_call = call("read");
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&tool_call),
+                &ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]),
+            )
+            .await
+            .unwrap();
+        let DispatchResult::Completed(result) = plane.dispatch(&ctx, &tool_call).await else {
+            panic!("a final refusal must complete the call");
+        };
+        let ToolOutput::Error {
+            code,
+            message,
+            detail,
+            ..
+        } = result.output
+        else {
+            panic!("an oversized refusal must remain an error");
+        };
+        assert_eq!(code.as_deref(), Some("module_reloading"));
+        assert!(
+            message.contains("refused") && message.contains("discarded"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("tool ran"),
+            "a refusal must not claim execution"
+        );
+        let detail: serde_json::Value = serde_json::from_str(detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["bytes"], 65_537);
+        assert_eq!(detail["limit"], 65_536);
+        assert_eq!(
+            conn.dispatched_ids.lock().unwrap().len(),
+            2,
+            "no resend after the final refusal"
         );
     }
 

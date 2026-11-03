@@ -1683,6 +1683,41 @@ async fn collect_subscription_frames_at(
     frames
 }
 
+/// Normalize only minted snapshot identity and wall-clock version fields in serialized replies.
+/// Message content and request-rendering bytes are deliberately left intact.
+pub fn normalize_snapshot_bytes(body: &[u8], run_id: &str, incarnation: &str) -> String {
+    use base64::Engine;
+    let mut text = String::from_utf8(body.to_vec()).unwrap();
+    let scope_prefix = format!(
+        "h1.{}.",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(incarnation.as_bytes())
+    );
+    while let Some(start) = text.find(&scope_prefix) {
+        let end = start
+            + scope_prefix.len()
+            + text[start + scope_prefix.len()..]
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count();
+        text.replace_range(start..end, "@SNAPSHOT@");
+    }
+    let version_prefix = "\"history_version\":";
+    let mut from = 0;
+    while let Some(at) = text[from..].find(version_prefix) {
+        let start = from + at + version_prefix.len();
+        let end = start + text[start..].bytes().take_while(u8::is_ascii_digit).count();
+        if start != end {
+            text.replace_range(start..end, "1");
+        }
+        from = start + 1;
+    }
+    if incarnation.len() >= 8 {
+        text = text.replace(&format!("m{}.", &incarnation[..8]), "m@LINEAGE_PREFIX@.");
+    }
+    text.replace(run_id, "@RUN_ID@")
+        .replace(incarnation, "@LINEAGE_ID@")
+}
+
 #[cfg(test)]
 mod subscription_tests {
     use super::*;

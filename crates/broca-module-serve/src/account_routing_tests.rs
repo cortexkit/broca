@@ -164,17 +164,18 @@ async fn choose(
     let static_credential = CredentialId::parse(static_credential).unwrap();
     choose_account(
         client,
-        ChoiceInputs { decision_id: None,
-        hold_cap: Default::default(),
-        conversation_key: None,
-        inherited_conversation_key: None,
-        static_credential: &static_credential,
-        caller_named_account,
-        model: "claude-opus-5-5",
-        session: &session(),
-        send_id: None,
-        run_id: "run-1",
-        initial_input_bytes: 42,
+        ChoiceInputs {
+            decision_id: None,
+            hold_cap: Default::default(),
+            conversation_key: None,
+            inherited_conversation_key: None,
+            static_credential: &static_credential,
+            caller_named_account,
+            model: "claude-opus-5-5",
+            session: &session(),
+            send_id: None,
+            run_id: "run-1",
+            initial_input_bytes: 42,
         },
         async move { listing },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -280,14 +281,15 @@ fn account_for_hold_cap_params_preserve_legacy_members_and_bound_the_previous_ac
             },
             "{name}"
         );
-        let mut params = account_for_params(&AccountForRequest { decision_id: None,
-        provider: "anthropic",
-        model: "new-model",
-        conversation_key: "conversation",
-        admission_id: "run-1",
-        initial_input_bytes: 42,
-        candidates: &candidates,
-        hold_cap: cap,
+        let mut params = account_for_params(&AccountForRequest {
+            decision_id: None,
+            provider: "anthropic",
+            model: "new-model",
+            conversation_key: "conversation",
+            admission_id: "run-1",
+            initial_input_bytes: 42,
+            candidates: &candidates,
+            hold_cap: cap,
         });
         let mut expected = legacy.clone();
         expected["hold_wait_max_s"] = json!(seconds);
@@ -312,20 +314,21 @@ async fn account_for_counts_only_sent_unknown_hold_caps_not_real_zero_or_static_
         let client = client(&routing);
         choose_account(
             &client,
-            ChoiceInputs { decision_id: None,
-            hold_cap: AccountHoldCap {
-                max_s: 0,
-                evidence_unknown: unknown,
-            },
-            conversation_key: None,
-            inherited_conversation_key: None,
-            static_credential: &credential,
-            caller_named_account: pinned,
-            model: "claude-opus-5-5",
-            session: &session(),
-            send_id: None,
-            run_id: "run-1",
-            initial_input_bytes: 42,
+            ChoiceInputs {
+                decision_id: None,
+                hold_cap: AccountHoldCap {
+                    max_s: 0,
+                    evidence_unknown: unknown,
+                },
+                conversation_key: None,
+                inherited_conversation_key: None,
+                static_credential: &credential,
+                caller_named_account: pinned,
+                model: "claude-opus-5-5",
+                session: &session(),
+                send_id: None,
+                run_id: "run-1",
+                initial_input_bytes: 42,
             },
             async { Some(two_accounts()) },
             tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -430,17 +433,18 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
     let started = tokio::time::Instant::now();
     let (choice, events) = broca_test_support::capture_logs(choose_account(
         &client,
-        ChoiceInputs { decision_id: None,
-        hold_cap: Default::default(),
-        conversation_key: None,
-        inherited_conversation_key: None,
-        static_credential: &static_credential,
-        caller_named_account: false,
-        model: "claude-opus-5-5",
-        session: &session(),
-        send_id: None,
-        run_id: "run-1",
-        initial_input_bytes: 0,
+        ChoiceInputs {
+            decision_id: None,
+            hold_cap: Default::default(),
+            conversation_key: None,
+            inherited_conversation_key: None,
+            static_credential: &static_credential,
+            caller_named_account: false,
+            model: "claude-opus-5-5",
+            session: &session(),
+            send_id: None,
+            run_id: "run-1",
+            initial_input_bytes: 0,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + budget,
@@ -483,17 +487,18 @@ async fn a_slow_listing_shares_the_admission_budget() {
     let started = tokio::time::Instant::now();
     let choice = choose_account(
         &client,
-        ChoiceInputs { decision_id: None,
-        hold_cap: Default::default(),
-        conversation_key: None,
-        inherited_conversation_key: None,
-        static_credential: &static_credential,
-        caller_named_account: false,
-        model: "claude-opus-5-5",
-        session: &session(),
-        send_id: None,
-        run_id: "run-1",
-        initial_input_bytes: 0,
+        ChoiceInputs {
+            decision_id: None,
+            hold_cap: Default::default(),
+            conversation_key: None,
+            inherited_conversation_key: None,
+            static_credential: &static_credential,
+            caller_named_account: false,
+            model: "claude-opus-5-5",
+            session: &session(),
+            send_id: None,
+            run_id: "run-1",
+            initial_input_bytes: 0,
         },
         std::future::pending::<Option<Arc<ScopedList>>>(),
         tokio::time::Instant::now() + Duration::from_millis(200),
@@ -608,17 +613,18 @@ async fn caller_affinity_changes_only_the_conversation_key_in_the_routing_body()
     let credential = CredentialId::parse("oauth:anthropic").unwrap();
     let choice = choose_account(
         &client,
-        ChoiceInputs { decision_id: None,
-        hold_cap: Default::default(),
-        conversation_key: Some("consult:42:subject:phase"),
-        inherited_conversation_key: None,
-        static_credential: &credential,
-        caller_named_account: false,
-        model: "claude-opus-5-5",
-        session: &session(),
-        send_id: None,
-        run_id: "run-1",
-        initial_input_bytes: 42,
+        ChoiceInputs {
+            decision_id: None,
+            hold_cap: Default::default(),
+            conversation_key: Some("consult:42:subject:phase"),
+            inherited_conversation_key: None,
+            static_credential: &credential,
+            caller_named_account: false,
+            model: "claude-opus-5-5",
+            session: &session(),
+            send_id: None,
+            run_id: "run-1",
+            initial_input_bytes: 42,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -936,17 +942,18 @@ async fn refusal_log_names_send_and_routing_decision() {
     let session = session();
     let (result, events) = broca_test_support::capture_logs(choose_account(
         &client,
-        ChoiceInputs { decision_id: None,
-        hold_cap: Default::default(),
-        conversation_key: None,
-        inherited_conversation_key: None,
-        static_credential: &credential,
-        caller_named_account: false,
-        model: "claude-opus-5-5",
-        session: &session,
-        send_id: Some("send-refused"),
-        run_id: "run-refused",
-        initial_input_bytes: 42,
+        ChoiceInputs {
+            decision_id: None,
+            hold_cap: Default::default(),
+            conversation_key: None,
+            inherited_conversation_key: None,
+            static_credential: &credential,
+            caller_named_account: false,
+            model: "claude-opus-5-5",
+            session: &session,
+            send_id: Some("send-refused"),
+            run_id: "run-refused",
+            initial_input_bytes: 42,
         },
         async { Some(two_accounts()) },
         tokio::time::Instant::now() + ADMISSION_BUDGET,
@@ -1829,16 +1836,36 @@ async fn a_caller_decision_is_forwarded_even_with_a_pin_and_is_not_runner_report
     let client = client(&routing);
     let credential = CredentialId::parse("oauth:anthropic").unwrap();
     let session = session();
-    let choice = choose_account(&client, ChoiceInputs {
-        decision_id: Some("caller-decision"),
-        hold_cap: Default::default(), conversation_key: None, inherited_conversation_key: None,
-        static_credential: &credential, caller_named_account: true, model: "claude-opus-5-5",
-        session: &session, send_id: None, run_id: "run-caller", initial_input_bytes: 42,
-    }, async { Some(two_accounts()) }, tokio::time::Instant::now() + ADMISSION_BUDGET).await.unwrap();
-    assert_eq!(routing.requests.lock().unwrap()[0]["params"]["decision_id"], "caller-decision");
+    let choice = choose_account(
+        &client,
+        ChoiceInputs {
+            decision_id: Some("caller-decision"),
+            hold_cap: Default::default(),
+            conversation_key: None,
+            inherited_conversation_key: None,
+            static_credential: &credential,
+            caller_named_account: true,
+            model: "claude-opus-5-5",
+            session: &session,
+            send_id: None,
+            run_id: "run-caller",
+            initial_input_bytes: 42,
+        },
+        async { Some(two_accounts()) },
+        tokio::time::Instant::now() + ADMISSION_BUDGET,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        routing.requests.lock().unwrap()[0]["params"]["decision_id"],
+        "caller-decision"
+    );
     let decision = choice.decision().unwrap();
     assert_eq!(decision.decision_id.as_deref(), Some("acd-7"));
-    assert_eq!(decision.admission_id, None, "caller-owned decisions cannot enable any runner reporter");
+    assert_eq!(
+        decision.admission_id, None,
+        "caller-owned decisions cannot enable any runner reporter"
+    );
 }
 
 #[tokio::test]
@@ -1847,12 +1874,27 @@ async fn an_unknown_caller_decision_never_falls_back_to_a_static_account() {
     let client = client(&routing);
     let credential = CredentialId::parse("oauth:anthropic").unwrap();
     let session = session();
-    let result = choose_account(&client, ChoiceInputs {
-        decision_id: Some("expired"),
-        hold_cap: Default::default(), conversation_key: None, inherited_conversation_key: None,
-        static_credential: &credential, caller_named_account: false, model: "claude-opus-5-5",
-        session: &session, send_id: None, run_id: "run-caller", initial_input_bytes: 42,
-    }, async { Some(listing(vec![anthropic("oauth:anthropic", "acct-a")])) }, tokio::time::Instant::now() + ADMISSION_BUDGET).await;
-    assert!(matches!(result, Err(ChoiceRefusal::Refused(refusal)) if refusal.routing_code == "unknown_decision"));
+    let result = choose_account(
+        &client,
+        ChoiceInputs {
+            decision_id: Some("expired"),
+            hold_cap: Default::default(),
+            conversation_key: None,
+            inherited_conversation_key: None,
+            static_credential: &credential,
+            caller_named_account: false,
+            model: "claude-opus-5-5",
+            session: &session,
+            send_id: None,
+            run_id: "run-caller",
+            initial_input_bytes: 42,
+        },
+        async { Some(listing(vec![anthropic("oauth:anthropic", "acct-a")])) },
+        tokio::time::Instant::now() + ADMISSION_BUDGET,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ChoiceRefusal::Refused(refusal)) if refusal.routing_code == "unknown_decision")
+    );
     assert_eq!(routing.methods(), vec!["route.account_for"]);
 }

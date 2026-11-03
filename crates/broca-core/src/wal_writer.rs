@@ -486,14 +486,22 @@ impl broca_wal::recovery::RecoveryHooks for ProjectionRecovery {
         self.before_cut_with_lineage(cut, None)
     }
 
-    fn before_cut_with_lineage(&self, cut: &broca_wal::recovery::RecoveryCut, lineage: Option<broca_wal::WalLineageId>) -> Result<(), WalError> {
+    fn before_cut_with_lineage(
+        &self,
+        cut: &broca_wal::recovery::RecoveryCut,
+        lineage: Option<broca_wal::WalLineageId>,
+    ) -> Result<(), WalError> {
         let lineage = lineage.map(|id| id.to_string());
         if let Some(history) = &self.history {
-            history.history_rewritten(&self.session, lineage.as_deref()).map_err(|error| self.failed("history fence refused before cut", error))?;
+            history
+                .history_rewritten(&self.session, lineage.as_deref())
+                .map_err(|error| self.failed("history fence refused before cut", error))?;
         } else {
             for view in &self.views {
                 if let Some(history) = view.served_history() {
-                    history.history_rewritten(&self.session, lineage.as_deref()).map_err(|error| self.failed("history fence refused before cut", error))?;
+                    history
+                        .history_rewritten(&self.session, lineage.as_deref())
+                        .map_err(|error| self.failed("history fence refused before cut", error))?;
                 }
             }
         }

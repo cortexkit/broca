@@ -17,9 +17,7 @@ use subc_protocol::{Frame, FrameType};
 /// `body` with the run id and lineage id it names replaced by placeholders, so the rest of its
 /// bytes can be pinned: both are minted per run from a per-process scratch directory.
 fn normalized(body: &[u8], run_id: &str, lineage_id: &str) -> String {
-    String::from_utf8_lossy(body)
-        .replace(run_id, "@RUN_ID@")
-        .replace(lineage_id, "@LINEAGE_ID@")
+    normalize_snapshot_bytes(body, run_id, lineage_id)
 }
 
 /// The pinned text of `file`, without its trailing newline.
@@ -568,7 +566,7 @@ async fn display_facts_opt_in_preserves_default_and_matches_stored_times() {
     rig.wait_idle().await;
     let default = call(&mut rig, "session.read", serde_json::json!({})).await;
     let plain = result(&default);
-    let lineage = plain["lineage_id"].as_str().unwrap();
+    let lineage = plain["incarnation"].as_str().unwrap();
     let mut baseline = normalized(&default.body, &run, lineage);
     for entry in plain["messages"].as_array().unwrap() {
         if let Some(at) = entry["written_at"].as_u64() {
@@ -683,7 +681,7 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
         )
         .await;
     let page = result(&read);
-    let lineage_id = page["lineage_id"].as_str().unwrap().to_owned();
+    let lineage_id = page["incarnation"].as_str().unwrap().to_owned();
     // Times are intentional default envelope additions. Require each one, then remove only
     // its envelope spelling to compare the older member bytes; new shape goldens pin the additions.
     let mut body = normalized(&read.body, &run_id, &lineage_id);
@@ -746,7 +744,7 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
         })
         .collect();
     assert_eq!(
-        legacy.join("\n"),
+        legacy.join("\n").replace("m@LINEAGE_PREFIX@.", "m"),
         pinned("session_subscribe.tool_turn.legacy.jsonl")
     );
     for (index, body) in events.iter().enumerate() {
@@ -838,30 +836,30 @@ async fn tagged_open_tool_turn_read_bytes_are_pinned() {
         )
         .await;
     let page = result(&read);
-    let lineage_id = page["lineage_id"].as_str().unwrap();
+    let lineage_id = page["incarnation"].as_str().unwrap();
     assert_eq!(page["messages"].as_array().unwrap().len(), 4);
     assert_eq!(
-        page["messages"][0]["tags"],
-        serde_json::json!([{"part": "m0#0", "tag": "§1§"}])
+        page["messages"][0]["part_keys"],
+        serde_json::json!(["m0#0"])
     );
     assert_eq!(
-        page["messages"][1]["tags"],
-        serde_json::json!([{"part": "m1#0", "tag": "§2§"}, {"part": "m1#1"}])
+        page["messages"][1]["part_keys"],
+        serde_json::json!(["m1#0", "m1#1"])
     );
     assert_eq!(
-        page["messages"][2]["tags"],
-        serde_json::json!([{"part": "m2#0", "tag": "§3§"}])
+        page["messages"][2]["part_keys"],
+        serde_json::json!(["m2#0"])
     );
     assert_eq!(
-        page["messages"][3]["tags"],
-        serde_json::json!([{"part": "m3#0"}])
+        page["messages"][3]["part_keys"],
+        serde_json::json!(["m3#0"])
     );
     assert_eq!(
         page["messages"][3]["tool_calls"][0]["tool_call_id"],
         "call-open"
     );
     let mut body = normalized(&read.body, &run_id, lineage_id);
-    // Entry times are pinned by session_read.written_at.json. This golden pins the tag rows, so
+    // Entry times are pinned by session_read.written_at.json. This golden pins part identity, so
     // remove each recorded time from the envelope (the user message must carry one) and compare
     // the rest.
     for entry in page["messages"].as_array().unwrap() {
@@ -888,11 +886,10 @@ async fn tagged_open_tool_turn_read_bytes_are_pinned() {
 }
 
 /// A read held between a tool turn's write and its batch commit (the tool provider holds the
-/// call) exposes the turn's text. llm-runner §9.6 lets an exposed part change its number only
-/// on a new lineage, so the number that read shows must be the one the finished run shows: an
-/// unnumbered row there, numbered after commit, is a renumbering on the same lineage.
+/// call) exposes stable part identity. The public read no longer exposes the former `tags`
+/// field's rendered `§N§` labels; committing the batch must not change keys a reader holds.
 #[tokio::test]
-async fn a_held_tool_turns_text_keeps_the_number_a_read_exposed() {
+async fn a_held_tool_turn_keeps_the_part_keys_a_read_exposed() {
     let (mut rig, _) = crate::plan_admission::plan_rig("held-turn-text-number").await;
     rig.script.push(&[
         Step::Usage {
@@ -941,10 +938,10 @@ async fn a_held_tool_turns_text_keeps_the_number_a_read_exposed() {
         )
         .await;
     let held = result(&held).clone();
-    let expected = serde_json::json!([{"part": "m1#0", "tag": "§2§"}, {"part": "m1#1"}]);
+    let expected = serde_json::json!(["m1#0", "m1#1"]);
     assert_eq!(
-        held["messages"][1]["tags"], expected,
-        "the held turn's text shows its final number: {held}"
+        held["messages"][1]["part_keys"], expected,
+        "the held turn's parts already have stable keys: {held}"
     );
 
     rig.script.hold_tool(false);
@@ -957,10 +954,11 @@ async fn a_held_tool_turns_text_keeps_the_number_a_read_exposed() {
         )
         .await;
     let after = result(&after).clone();
-    assert_eq!(after["lineage_id"], held["lineage_id"]);
+    assert_eq!(after["incarnation"], held["incarnation"]);
+    assert_eq!(after["history_version"], held["history_version"]);
     assert_eq!(
-        after["messages"][1]["tags"], held["messages"][1]["tags"],
-        "a number a read exposed is unchanged on the same lineage"
+        after["messages"][1]["part_keys"], held["messages"][1]["part_keys"],
+        "part identity exposed by a read is unchanged after commit"
     );
     rig.finish().await;
 }
@@ -1231,19 +1229,17 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
 
 // ---- session.read ---------------------------------------------------------------------------
 
-/// A session never written answers an empty page with no `lineage_id`, and `session.head` with
-/// every member absent; neither writes anything.
+/// A never-written session exposes the unwritten snapshot without creating a log.
 #[tokio::test]
-async fn a_never_written_session_has_no_lineage_page_or_head() {
+async fn a_never_written_session_has_an_unwritten_page_and_head() {
     let mut rig = Rig::start("unwritten").await;
     let page = read(&mut rig, serde_json::json!({})).await;
-    assert_eq!(page, ReadPage::no_lineage());
+    assert_eq!(page, ReadPage::empty(0, "unwritten"));
     let head: HeadMeta = serde_json::from_value(result(
         &call(&mut rig, "session.head", serde_json::json!({})).await,
     ))
     .unwrap();
-    // §4.3 would let it state `input`, but the conformance kit requires every member absent.
-    assert_eq!(head, HeadMeta::no_lineage());
+    assert_eq!(head, HeadMeta::empty(0, "unwritten"));
     assert!(
         rig.wal_bytes().is_empty(),
         "a read of an unwritten session wrote"
@@ -1252,39 +1248,40 @@ async fn a_never_written_session_has_no_lineage_page_or_head() {
 }
 
 /// The tail is the newest page, a range stops at its limit with a cursor, and `after_mid` reads
-/// strictly after the message it names; every page carries the session's lineage.
+/// strictly after the message it names; every page carries the same snapshot identity.
 #[tokio::test]
 async fn tail_range_and_after_mid_reads() {
     let mut rig = three_turns("modes").await;
     let all = read(&mut rig, serde_json::json!({})).await;
-    assert_eq!(ordinals(&all), [0, 1, 2, 3, 4, 5]);
-    let lineage = all
-        .lineage_id
-        .clone()
-        .expect("a written session has a lineage");
+    assert_eq!(ordinals(&all), [1, 2, 3, 4, 5, 6]);
+    assert!(all.history_version > 0);
+    assert_ne!(all.incarnation, "unwritten");
 
     let tail = read(&mut rig, serde_json::json!({"limit": 2})).await;
-    assert_eq!(ordinals(&tail), [4, 5], "the tail is the newest page");
+    assert_eq!(ordinals(&tail), [5, 6], "the tail is the newest page");
     assert_eq!(tail.next_from_ordinal, None);
 
     let range = read(&mut rig, serde_json::json!({"from_ordinal": 0, "limit": 2})).await;
-    assert_eq!(ordinals(&range), [0, 1]);
-    assert_eq!(range.next_from_ordinal, Some(2));
+    assert_eq!(ordinals(&range), [1, 2]);
+    assert_eq!(range.next_from_ordinal, Some(3));
+    let first = read(&mut rig, serde_json::json!({"from_ordinal": 1, "limit": 2})).await;
+    assert_eq!(first, range, "zero aliases the first ordinal");
 
     let after = read(
         &mut rig,
-        serde_json::json!({"after_mid": "m1", "lineage_id": lineage}),
+        serde_json::json!({"after_mid": all.messages[1].mid, "history_version": all.history_version}),
     )
     .await;
-    assert_eq!(ordinals(&after), [2, 3, 4, 5]);
+    assert_eq!(ordinals(&after), [3, 4, 5, 6]);
     let past_end = read(
         &mut rig,
-        serde_json::json!({"after_mid": "m5", "lineage_id": lineage}),
+        serde_json::json!({"after_mid": all.messages[5].mid, "history_version": all.history_version}),
     )
     .await;
     assert!(past_end.messages.is_empty());
     for page in [&tail, &range, &after, &past_end] {
-        assert_eq!(page.lineage_id.as_deref(), Some(lineage.as_str()));
+        assert_eq!(page.incarnation, all.incarnation);
+        assert_eq!(page.history_version, all.history_version);
     }
     // Broca runs no hooks, so asking for originals adds nothing.
     let with_originals = read(&mut rig, serde_json::json!({"include_originals": true})).await;
@@ -1293,38 +1290,40 @@ async fn tail_range_and_after_mid_reads() {
 }
 
 /// Each refusal of a read is by name, writes nothing, and is never answered from the tail: a
-/// lineage other than the session's, a mid the lineage does not hold, and every misuse of the
+/// stale snapshot version, a mid the session does not hold, and every misuse of the
 /// request, naming the member at fault.
 #[tokio::test]
 async fn read_refusals_are_named_and_write_nothing() {
     let mut rig = three_turns("refusals").await;
-    let lineage = read(&mut rig, serde_json::json!({}))
-        .await
-        .lineage_id
-        .unwrap();
+    let page = read(&mut rig, serde_json::json!({})).await;
+    let version = page.history_version;
     for params in [
-        serde_json::json!({"lineage_id": "not-this-lineage"}),
-        serde_json::json!({"from_ordinal": 0, "lineage_id": "not-this-lineage"}),
-        serde_json::json!({"after_mid": "m1", "lineage_id": "not-this-lineage"}),
-        // Naming another lineage is refused `lineage_changed` even when the mid is malformed.
-        serde_json::json!({"after_mid": "bogus", "lineage_id": "not-this-lineage"}),
+        serde_json::json!({"history_version": version - 1}),
+        serde_json::json!({"from_ordinal": 0, "history_version": version - 1}),
+        serde_json::json!({"after_mid": page.messages[1].mid, "history_version": version - 1}),
+        // Version mismatch is checked before even a malformed mid.
+        serde_json::json!({"after_mid": "bogus", "history_version": version - 1}),
     ] {
         let body = refused_writing_nothing(&mut rig, "session.read", params).await;
-        assert_eq!(body["code"], "lineage_changed", "{body}");
+        assert_eq!(body["code"], "history_changed", "{body}");
     }
     for mid in ["m6", "m99", "bogus", "m01", "m"] {
         let body = refused_writing_nothing(
             &mut rig,
             "session.read",
-            serde_json::json!({"after_mid": mid, "lineage_id": lineage}),
+            serde_json::json!({"after_mid": mid, "history_version": version}),
         )
         .await;
         assert_eq!(body["code"], "unknown_mid", "{mid}: {body}");
     }
     for (params, field) in [
-        (serde_json::json!({"after_mid": "m1"}), "lineage_id"),
+        (serde_json::json!({"after_mid": "m1"}), "history_version"),
         (
-            serde_json::json!({"after_mid": "m1", "lineage_id": lineage, "from_ordinal": 0}),
+            serde_json::json!({"after_mid": "m1", "lineage_id": "legacy"}),
+            "history_version",
+        ),
+        (
+            serde_json::json!({"after_mid": page.messages[1].mid, "history_version": version, "from_ordinal": 0}),
             "from_ordinal",
         ),
         (serde_json::json!({"from_ordinl": 0}), "from_ordinl"),
@@ -1334,6 +1333,13 @@ async fn read_refusals_are_named_and_write_nothing() {
         let body = refused_writing_nothing(&mut rig, "session.read", params.clone()).await;
         assert_eq!(body["code"], "invalid_params", "{params}: {body}");
         assert_eq!(body["detail"]["field"], field, "{params}: {body}");
+    }
+    for legacy in [
+        serde_json::Value::Null,
+        serde_json::json!("ignored-lineage"),
+    ] {
+        let compatible = read(&mut rig, serde_json::json!({"lineage_id": legacy})).await;
+        assert_eq!(compatible, page, "legacy lineage selectors are input-only");
     }
     let body =
         refused_writing_nothing(&mut rig, "session.head", serde_json::json!({"x": true})).await;
@@ -1358,15 +1364,15 @@ async fn pages_are_capped_by_bytes() {
     rig.wait_for_finished(2).await;
     rig.wait_idle().await;
     let all = read(&mut rig, serde_json::json!({})).await;
-    assert_eq!(ordinals(&all), [0, 1, 2, 3]);
+    assert_eq!(ordinals(&all), [1, 2, 3, 4]);
 
     let one = read(
         &mut rig,
-        serde_json::json!({"from_ordinal": 1, "limit": 100, "max_bytes": 1}),
+        serde_json::json!({"from_ordinal": 2, "limit": 100, "max_bytes": 1}),
     )
     .await;
     assert_eq!(one.messages, all.messages[1..2]);
-    assert_eq!(one.next_from_ordinal, Some(2));
+    assert_eq!(one.next_from_ordinal, Some(3));
 
     let oversize = read(
         &mut rig,
@@ -1379,7 +1385,7 @@ async fn pages_are_capped_by_bytes() {
         "the big message comes alone"
     );
     assert!(oversize.messages[0].message.to_string().contains(&big));
-    assert_eq!(oversize.next_from_ordinal, Some(1));
+    assert_eq!(oversize.next_from_ordinal, Some(2));
 
     let tail = read(&mut rig, serde_json::json!({"max_bytes": 1})).await;
     assert_eq!(
@@ -1408,7 +1414,7 @@ async fn every_call_has_its_own_key_and_module() {
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
     let page = read(&mut rig, serde_json::json!({})).await;
-    let lineage = page.lineage_id.clone().unwrap();
+    let lineage = page.incarnation.clone();
     let entries: Vec<_> = page
         .messages
         .iter()
@@ -1442,7 +1448,7 @@ async fn every_call_has_its_own_key_and_module() {
         assert!(!entry.indeterminate);
     }
     // A page holding only part of the transcript reports the same keys for the calls it holds.
-    let later = read(&mut rig, serde_json::json!({"from_ordinal": 3, "limit": 1})).await;
+    let later = read(&mut rig, serde_json::json!({"from_ordinal": 4, "limit": 1})).await;
     assert_eq!(
         later.messages[0].tool_calls[0].call_key.as_ref(),
         Some(&keys[2])
@@ -1517,7 +1523,7 @@ async fn an_intent_without_a_module_reads_with_no_dispatched_to() {
         .unwrap()
         .seq;
     let page = read(&mut rig, serde_json::json!({})).await;
-    let lineage = page.lineage_id.clone().unwrap();
+    let lineage = page.incarnation.clone();
     let entry = &page.messages[1].tool_calls[0];
     assert_eq!(entry.tool_call_id, "call-1");
     assert_eq!(entry.call_key, Some(format!("{lineage}:{intent_seq}")));
@@ -1528,7 +1534,7 @@ async fn an_intent_without_a_module_reads_with_no_dispatched_to() {
 
 // ---- session.head ---------------------------------------------------------------------------
 
-/// `session.head` names the lineage, the newest ordinal, the control head and the last run,
+/// `session.head` names the snapshot, the newest ordinal, the control head and the last run,
 /// with the time of the newest write, and no message body.
 #[tokio::test]
 async fn head_reports_the_session_without_bodies() {
@@ -1536,23 +1542,22 @@ async fn head_reports_the_session_without_bodies() {
     let page = read(&mut rig, serde_json::json!({})).await;
     let raw = result(&call(&mut rig, "session.head", serde_json::json!({})).await);
     let head: HeadMeta = serde_json::from_value(raw.clone()).unwrap();
-    assert!(head.lineage_consistent(), "{raw}");
-    assert_eq!(head.lineage_id, page.lineage_id);
-    assert_eq!(head.last_ordinal, Some(5));
+    assert!(head.snapshot_consistent(), "{raw}");
+    assert_eq!(head.incarnation, page.incarnation);
+    assert_eq!(head.history_version, page.history_version);
+    assert!(raw.get("lineage_id").is_none());
+    assert_eq!(head.last_ordinal, Some(6));
     assert_eq!(head.head, page.head);
     let last = head.last_run_state.unwrap();
     assert_eq!(last.state, "completed");
     assert!(head.updated_at.is_some_and(|at| at > 1_700_000_000_000));
     assert!(raw.get("messages").is_none() && !raw.to_string().contains("prompt 0"));
-    // llm-runner 0.5.0 §4.3, §4.5: broca applies no view with a cut, so its one lineage
-    // starts at ordinal 0 and the head names no cut.
-    assert_eq!(head.first_ordinal, Some(0));
+    assert_eq!(head.first_ordinal, Some(1));
     assert_eq!(head.cut, None);
-    // Always 0 within one WAL: broca has no revert and no recovery that rewrites a written
-    // message. The one case it misstates (a session whose WAL was deleted and later written
-    // again) is the "history_version floor" section of
-    // .cortexkit/internal-docs/designs/lineage-and-history-0.5.md.
-    assert_eq!(head.history_version, Some(0));
+    assert!(
+        head.history_version > 0,
+        "first 0.8 serve supersedes version zero"
+    );
     // A send's prompt is text only, a known fact, so `no` rather than `unknown`.
     assert_eq!(
         head.input
@@ -1604,7 +1609,9 @@ async fn run_result_answers_the_final_text() {
     assert_eq!(one.state, "completed");
     let message = one.final_message.unwrap();
     assert_eq!(message.text, "{\"answer\":\"yes\",\"n\":1}");
-    assert_eq!((message.ordinal, message.mid.as_str()), (3, "m3"));
+    let page = read(&mut rig, serde_json::json!({"from_ordinal": 4, "limit": 1})).await;
+    assert_eq!(message.ordinal, 4);
+    assert_eq!(message.mid, page.messages[0].mid);
 
     let two: RunResult = serde_json::from_value(result(
         &call(&mut rig, "run.result", serde_json::json!({"run_id": run_2})).await,
@@ -1658,7 +1665,7 @@ async fn run_result_refuses_a_final_message_that_exceeds_the_frame_limit() {
     assert_eq!(body["detail"]["limit"], broca_wire::SUBC_MAX_FRAME_BYTES);
     assert_eq!(body["detail"]["subject"]["kind"], "message");
     assert_eq!(body["detail"]["subject"]["session"], rig.session.session);
-    assert_eq!(body["detail"]["subject"]["ordinal"], 1);
+    assert_eq!(body["detail"]["subject"]["ordinal"], 2);
     rig.finish().await;
 }
 
@@ -2570,17 +2577,17 @@ async fn assert_projected_control_mids_match_read(rig: &mut Rig) {
         if let Some(ordinal) = frame.message_ordinal {
             let (entry, _) = stored
                 .iter()
-                .find(|(entry, message)| matches(&entry.mid, message))
+                .find(|(entry, message)| matches(&format!("m{}", entry.ordinal - 1), message))
                 .unwrap_or_else(|| {
                     panic!(
                         "control payload has no session.read message: {:?}",
                         frame.unit
                     )
                 });
-            assert_eq!(ordinal, entry.ordinal, "{:?}", frame.unit);
+            assert_eq!(ordinal + 1, entry.ordinal, "{:?}", frame.unit);
             assert_eq!(
                 frame.mid().as_deref(),
-                Some(entry.mid.as_str()),
+                Some(format!("m{}", entry.ordinal - 1).as_str()),
                 "{:?}",
                 frame.unit
             );
@@ -2605,6 +2612,38 @@ async fn assert_projected_control_mids_match_read(rig: &mut Rig) {
     assert!(
         checked >= 8,
         "the comparison must reach the complete tool turn"
+    );
+    // Core projection keeps native positions. The public stream must translate them to
+    // exactly the mids a reader already holds, for both boundaries and lifecycle events.
+    let frames = rig
+        .subscribe_collect(
+            20,
+            serde_json::json!({"from":"start"}),
+            Duration::from_millis(100),
+        )
+        .await;
+    let mut public_mids = 0;
+    for frame in frames {
+        let value: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        for mid in [
+            value["event"]["mid"].as_str(),
+            (value["unit"]["type"] == "message_boundary")
+                .then(|| value["unit"]["mid"].as_str())
+                .flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                page.messages.iter().any(|entry| entry.mid == mid),
+                "unreadable public mid {mid}: {value}"
+            );
+            public_mids += 1;
+        }
+    }
+    assert!(
+        public_mids >= 8,
+        "the public stream must include message identities"
     );
 }
 
@@ -3000,7 +3039,7 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
         assert_eq!(live.unit.get().as_bytes(), replay.unit.get().as_bytes());
         assert_eq!(
             live.event,
-            serde_json::json!({"type":"message_finished","mid":"m1"})
+            serde_json::json!({"type":"message_finished","mid":page.messages[1].mid})
         );
         assert_eq!(replay.event, live.event);
         cortexkit_role_llm_runner::live::LiveEvent::decode_strict(&live.event).unwrap();
@@ -3015,13 +3054,13 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
         let entry = page
             .messages
             .iter()
-            .find(|entry| entry.mid == "m1")
+            .find(|entry| entry.ordinal == 2)
             .unwrap();
         assert_eq!(entry.message["content"], expected);
         let entry = descriptors
             .messages
             .iter()
-            .find(|entry| entry.mid == "m1")
+            .find(|entry| entry.ordinal == 2)
             .unwrap();
         assert_eq!(entry.message["content"], expected);
     }
@@ -3029,7 +3068,7 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
 
 async fn pin_live_sample(rig: &mut Rig, frames: &[Frame], run_id: &str, file: &str) {
     let page = read(rig, serde_json::json!({})).await;
-    let lineage = page.lineage_id.as_ref().unwrap();
+    let lineage = &page.incarnation;
     let values = assert_stream_sequences(frames);
     let mut lines = Vec::new();
     for (frame, value) in frames.iter().zip(&values) {
@@ -3135,11 +3174,13 @@ async fn live_display_samples_match_stored_parts_and_attach_replays_current_step
         };
         rig.wait_for_finished(1).await;
         rig.wait_idle().await;
+        let page = read(&mut rig, serde_json::json!({"from_ordinal":2, "limit":1})).await;
+        let mid = &page.messages[0].mid;
         assert!(frames
             .iter()
             .any(
                 |f| serde_json::from_slice::<serde_json::Value>(&f.body).unwrap()["event"]["mid"]
-                    == "m1"
+                    == *mid
             ));
         pin_live_sample(
             &mut rig,
@@ -3192,7 +3233,11 @@ async fn live_display_mid_after_reopen_comes_from_seeded_placement() {
         .find(|v| v["event"]["type"] == "text_delta")
         .unwrap();
     assert_eq!(delta["event"]["mid"], stored.mid);
-    assert_eq!(delta["event"]["mid"], "m3");
+    assert_eq!(stored.ordinal, 4);
+    assert_eq!(
+        delta["event"]["mid"],
+        format!("m{}.3", &page.incarnation[..8])
+    );
     rig.finish().await;
 }
 
@@ -3328,7 +3373,11 @@ async fn live_display_after_steer_uses_the_next_step_placement() {
         .find(|v| v["event"]["type"] == "text_delta" && v["event"]["delta"] == "after steer")
         .unwrap();
     let page = read(&mut rig, serde_json::json!({})).await;
-    assert_eq!(page.messages.last().unwrap().mid, "m4");
+    assert_eq!(page.messages.last().unwrap().ordinal, 5);
+    assert_eq!(
+        page.messages.last().unwrap().mid,
+        format!("m{}.4", &page.incarnation[..8])
+    );
     assert_eq!(delta["event"]["mid"], page.messages.last().unwrap().mid);
     rig.finish().await;
 }
@@ -3403,10 +3452,10 @@ async fn late_subscriber_gets_context_captured_before_the_step_streamed() {
         .map(|f| serde_json::from_slice::<serde_json::Value>(&f.body).unwrap())
         .find(|v| v["event"]["type"] == "text_delta")
         .expect("late attach replays the streamed part");
-    assert_eq!(delta["event"]["mid"], "m1");
     assert_eq!(delta["event"]["part"], "0");
     assert_eq!(delta["event"]["delta"], "before attach");
     let page = read(&mut rig, serde_json::json!({})).await;
+    assert_eq!(page.messages.last().unwrap().ordinal, 2);
     assert_eq!(delta["event"]["mid"], page.messages.last().unwrap().mid);
     rig.finish().await;
 }

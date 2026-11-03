@@ -113,7 +113,8 @@ pub fn install_verified<E: broca_core::ImportedRunExclusions + ?Sized>(
                 }
             };
             let history_replaced = !local.is_empty()
-                && !broca_core::replay_transcript(&incoming).map_err(unavailable)?
+                && !broca_core::replay_transcript(&incoming)
+                    .map_err(unavailable)?
                     .starts_with(&broca_core::replay_transcript(&local).map_err(unavailable)?);
             let imported: std::collections::BTreeSet<_> =
                 broca_core::imported_run_ids(&incoming, &local)
@@ -154,7 +155,9 @@ pub fn install_verified<E: broca_core::ImportedRunExclusions + ?Sized>(
                 .parent()
                 .ok_or_else(|| unavailable("live WAL has no directory"))?;
             broca_wal::migration::durable_dir(state_root, parent).map_err(unavailable)?;
-            if history_replaced { before_rewrite(item.session).map_err(unavailable)?; }
+            if history_replaced {
+                before_rewrite(item.session).map_err(unavailable)?;
+            }
             fs::rename(item.staged, item.live).map_err(unavailable)?;
             broca_wal::migration::sync_dir(parent).map_err(unavailable)?;
             broca_wal::migration::sync_dir(item.staged.parent().unwrap()).map_err(unavailable)?;

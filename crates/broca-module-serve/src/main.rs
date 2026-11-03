@@ -968,7 +968,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .reconcile_boot()
         .await
         .map_err(|error| ServeIoError(format!("agent-data boot recovery: {}", error.message)))?;
-    let _history_rewrites = registry.finish_history_rewrites_at_boot().await
+    let _history_rewrites = registry
+        .finish_history_rewrites_at_boot()
+        .await
         .map_err(|error| ServeIoError(format!("finish fenced history recovery: {error}")))?;
     registry
         .boot_retention()
@@ -4312,7 +4314,8 @@ mod executor {
             {
                 Ok(choice) => choice,
                 Err(broca_module_serve::account_routing::ChoiceRefusal::Refused(refusal))
-                    if job.req.route_decision_id.is_some() && refusal.routing_code == "unknown_decision" =>
+                    if job.req.route_decision_id.is_some()
+                        && refusal.routing_code == "unknown_decision" =>
                 {
                     routing_decision_error = Some(serde_json::from_value::<ProviderError>(serde_json::json!({
                         "class":"permanent", "provider_code":"routing_decision_refused",
@@ -4339,35 +4342,40 @@ mod executor {
             };
             let mut resolution = if let Some(error) = &routing_decision_error {
                 AuthResolution {
-                    mode: AuthMode::None, pause: Some(error.clone()), selection: None,
-                    method: pinned_method, project_id: None, account_id: None,
-                    record_version: None, in_run_refresh: None,
+                    mode: AuthMode::None,
+                    pause: Some(error.clone()),
+                    selection: None,
+                    method: pinned_method,
+                    project_id: None,
+                    account_id: None,
+                    record_version: None,
+                    in_run_refresh: None,
                 }
             } else {
                 match self
-                .decide_auth_with_account(
-                    job.req.model.provider_module_id.as_str(),
-                    frozen_credential_id.as_deref(),
-                    frozen_auth_method.as_deref(),
-                    fresh_episode,
-                    pinned_method,
-                    pinned_account,
-                    &account_choice,
-                    frozen_decision.as_ref(),
-                )
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    self.provider_client
-                        .chatgpt_connections()
-                        .retire_session(&job.req.session);
-                    if let Some(ack) = job.on_admitted {
-                        let _ = ack.send(Err(e.clone()));
+                    .decide_auth_with_account(
+                        job.req.model.provider_module_id.as_str(),
+                        frozen_credential_id.as_deref(),
+                        frozen_auth_method.as_deref(),
+                        fresh_episode,
+                        pinned_method,
+                        pinned_account,
+                        &account_choice,
+                        frozen_decision.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.provider_client
+                            .chatgpt_connections()
+                            .retire_session(&job.req.session);
+                        if let Some(ack) = job.on_admitted {
+                            let _ = ack.send(Err(e.clone()));
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
-            }
             };
             // A resolve supplies today's token evidence, not a replacement for frozen billing facts.
             preserve_billing_vault_snapshot(
@@ -4914,7 +4922,11 @@ mod executor {
             // so suppress their payload clones while retaining display, lifecycle, pause, and
             // error controls needed by the actor and direct loop consumers.
             control.emit_control_payloads = false;
-            control.pause_for_auth_at_start = if routing_decision_error.is_some() { None } else { resolution.pause.clone() };
+            control.pause_for_auth_at_start = if routing_decision_error.is_some() {
+                None
+            } else {
+                resolution.pause.clone()
+            };
             control.pre_model_error = routing_decision_error.or(control.pre_model_error);
             control.auth_selection = resolution.selection.clone();
             // Report this run's account evidence to routing when it has an admission id there:
@@ -5312,29 +5324,31 @@ mod executor {
             frozen.cache = Some(policy.clone());
             frozen.prompt_cache_key = Some("frozen-key".into());
             let mut req = drift_request(std::path::Path::new("/inherit-cache"));
-            let config = broca_wal::RunConfig { route_decision_id: None,
-            account_limit_pause: false, turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: req.model.clone(),
-            tools: req.tools.clone().into(),
-            tool_choice: req.tool_choice.clone(),
-            generation: req.generation.clone(),
-            response_format: Default::default(),
-            provider_options: serde_json::Value::Null,
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: frozen.renderer_version,
-            frozen_render_config: serde_json::to_value(&frozen).unwrap(),
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: vec![],
-            context_management: None,
+            let config = broca_wal::RunConfig {
+                route_decision_id: None,
+                account_limit_pause: false,
+                turn_directives_v1: None,
+                render_tags: false,
+                computed_tags: None,
+                model: req.model.clone(),
+                tools: req.tools.clone().into(),
+                tool_choice: req.tool_choice.clone(),
+                generation: req.generation.clone(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: frozen.renderer_version,
+                frozen_render_config: serde_json::to_value(&frozen).unwrap(),
+                auth_selection: None,
+                tools_were_omitted: false,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: vec![],
+                context_management: None,
             };
             req.inherit_frozen_cache = true;
             assert_eq!(
@@ -6508,29 +6522,31 @@ mod executor {
                     run_id: broca_protocol::RunId(run_id.into()),
                     session: BindIdentity::new("/tmp/project", "harness", "session"),
                     ts_ms: None,
-                    config: Box::new(broca_wal::RunConfig { route_decision_id: None,
-                    account_limit_pause: false, turn_directives_v1: None,
-                    render_tags: false,
-                    computed_tags: None,
-                    model: broca_protocol::request::ModelHandle::new("openai", "gpt-test"),
-                    tools: Vec::new().into(),
-                    tool_choice: Default::default(),
-                    generation: Default::default(),
-                    response_format: Default::default(),
-                    provider_options: serde_json::Value::Null,
-                    cache_tiers: serde_json::Value::Null,
-                    context_epoch: 0,
-                    renderer_version: 1,
-                    frozen_render_config: serde_json::Value::Null,
-                    auth_selection: None,
-                    tools_were_omitted: false,
-                    budget: None,
-                    context_limit: None,
-                    work_class: None,
-                    variant: None,
-                    service_tier: None,
-                    stop_when: Vec::new(),
-                    context_management: None,
+                    config: Box::new(broca_wal::RunConfig {
+                        route_decision_id: None,
+                        account_limit_pause: false,
+                        turn_directives_v1: None,
+                        render_tags: false,
+                        computed_tags: None,
+                        model: broca_protocol::request::ModelHandle::new("openai", "gpt-test"),
+                        tools: Vec::new().into(),
+                        tool_choice: Default::default(),
+                        generation: Default::default(),
+                        response_format: Default::default(),
+                        provider_options: serde_json::Value::Null,
+                        cache_tiers: serde_json::Value::Null,
+                        context_epoch: 0,
+                        renderer_version: 1,
+                        frozen_render_config: serde_json::Value::Null,
+                        auth_selection: None,
+                        tools_were_omitted: false,
+                        budget: None,
+                        context_limit: None,
+                        work_class: None,
+                        variant: None,
+                        service_tier: None,
+                        stop_when: Vec::new(),
+                        context_management: None,
                     }),
                     input: Vec::new().into(),
                     origin: broca_wal::RunOrigin::Fresh,

@@ -1,4 +1,4 @@
-//! Snapshot identity survives retention and is independent of transcript projection rows.
+//! Snapshot identity survives log retention and rebuilds of the materialized message table.
 
 use broca_core::served_history::{ServedHistory, ServedSnapshot};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -34,14 +34,28 @@ fn row(conn: &Connection, address: &str) -> Result<Option<Row>, String> {
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    value.map(|(incarnation, lineage, version, rewriting_session)| {
-        Ok(Row { incarnation, lineage, version: version.parse::<u64>().map_err(|error| error.to_string())?, rewriting_session })
-    }).transpose()
+    value
+        .map(|(incarnation, lineage, version, rewriting_session)| {
+            Ok(Row {
+                incarnation,
+                lineage,
+                version: version.parse::<u64>().map_err(|error| error.to_string())?,
+                rewriting_session,
+            })
+        })
+        .transpose()
 }
 
-fn checked_row(conn: &Connection, address: &str, expected: Option<Option<u64>>) -> Result<Option<Row>, String> {
+fn checked_row(
+    conn: &Connection,
+    address: &str,
+    expected: Option<Option<u64>>,
+) -> Result<Option<Row>, String> {
     let row = row(conn, address)?;
-    if row.as_ref().is_some_and(|row| row.rewriting_session.is_some()) {
+    if row
+        .as_ref()
+        .is_some_and(|row| row.rewriting_session.is_some())
+    {
         return Err(broca_core::served_history::HISTORY_REWRITING.into());
     }
     if expected.is_some_and(|expected| expected != row.as_ref().map(|row| row.version)) {
@@ -55,13 +69,20 @@ pub(crate) fn read_version(conn: &Connection, address: &str) -> Result<Option<u6
 }
 
 fn now_ms() -> Result<u64, String> {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| error.to_string())?.as_millis().try_into().map_err(|error| format!("history clock overflow: {error}"))
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis()
+        .try_into()
+        .map_err(|error| format!("history clock overflow: {error}"))
 }
 
 fn allocate(previous: Option<u64>, increment: u64, now: u64) -> Result<u64, String> {
-    Ok(previous.unwrap_or(0).checked_add(increment)
-        .ok_or("served history version exhausted")?.max(now))
+    Ok(previous
+        .unwrap_or(0)
+        .checked_add(increment)
+        .ok_or("served history version exhausted")?
+        .max(now))
 }
 
 fn random_incarnation() -> Result<String, String> {
@@ -71,7 +92,10 @@ fn random_incarnation() -> Result<String, String> {
 }
 
 fn snapshot(row: &Row) -> ServedSnapshot {
-    ServedSnapshot { incarnation: row.incarnation.clone(), history_version: row.version }
+    ServedSnapshot {
+        incarnation: row.incarnation.clone(),
+        history_version: row.version,
+    }
 }
 
 fn version_at(
@@ -88,7 +112,11 @@ fn version_at(
     if !has_log {
         return Ok(ServedSnapshot {
             incarnation: "unwritten".into(),
-            history_version: prior.map_or(Ok(0), |row| row.version.checked_add(1).ok_or_else(|| "served history version exhausted".to_owned()))?,
+            history_version: prior.map_or(Ok(0), |row| {
+                row.version
+                    .checked_add(1)
+                    .ok_or_else(|| "served history version exhausted".to_owned())
+            })?,
         });
     }
     if let Some(row) = &prior {
@@ -96,8 +124,11 @@ fn version_at(
             return Ok(snapshot(row));
         }
     }
-    conn.pragma_update(None, "synchronous", "FULL").map_err(|error| error.to_string())?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+    conn.pragma_update(None, "synchronous", "FULL")
+        .map_err(|error| error.to_string())?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
     let prior = checked_row(&tx, address, expected_version)?;
     let current = match prior {
         Some(row) if row.lineage.as_deref() == lineage => row,
@@ -107,9 +138,16 @@ fn version_at(
             row
         }
         prior => Row {
-            incarnation: match lineage { Some(id) => id.to_owned(), None => random_incarnation()? },
+            incarnation: match lineage {
+                Some(id) => id.to_owned(),
+                None => random_incarnation()?,
+            },
             lineage: lineage.map(str::to_owned),
-            version: allocate(prior.as_ref().map(|row| row.version), if prior.is_some() { 2 } else { 1 }, now)?,
+            version: allocate(
+                prior.as_ref().map(|row| row.version),
+                if prior.is_some() { 2 } else { 1 },
+                now,
+            )?,
             rewriting_session: None,
         },
     };
@@ -122,19 +160,35 @@ fn version_at(
     Ok(snapshot(&current))
 }
 
-pub(crate) fn version(conn: &mut Connection, address: &str, has_log: bool, lineage: Option<&str>, expected_version: Option<Option<u64>>) -> Result<ServedSnapshot, String> {
+pub(crate) fn version(
+    conn: &mut Connection,
+    address: &str,
+    has_log: bool,
+    lineage: Option<&str>,
+    expected_version: Option<Option<u64>>,
+) -> Result<ServedSnapshot, String> {
     version_at(conn, address, has_log, lineage, now_ms()?, expected_version)
 }
 
-
-pub(crate) fn rewritten(conn: &mut Connection, session: &broca_protocol::BindIdentity, lineage: Option<&str>) -> Result<(), String> {
+pub(crate) fn rewritten(
+    conn: &mut Connection,
+    session: &broca_protocol::BindIdentity,
+    lineage: Option<&str>,
+) -> Result<(), String> {
     let address = broca_core::session_addr(session);
-    conn.pragma_update(None, "synchronous", "FULL").map_err(|error| error.to_string())?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+    conn.pragma_update(None, "synchronous", "FULL")
+        .map_err(|error| error.to_string())?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
     let prior = row(&tx, &address)?;
-    let lineage = lineage.map(str::to_owned).or_else(|| prior.as_ref().and_then(|row| row.lineage.clone()));
+    let lineage = lineage
+        .map(str::to_owned)
+        .or_else(|| prior.as_ref().and_then(|row| row.lineage.clone()));
     let lineage = lineage.as_deref();
-    let same = prior.as_ref().is_some_and(|row| row.lineage.as_deref() == lineage || row.lineage.is_none());
+    let same = prior
+        .as_ref()
+        .is_some_and(|row| row.lineage.as_deref() == lineage || row.lineage.is_none());
     let incarnation = match (&prior, lineage) {
         (Some(row), _) if same => row.incarnation.clone(),
         (_, Some(lineage)) => lineage.to_owned(),
@@ -142,7 +196,11 @@ pub(crate) fn rewritten(conn: &mut Connection, session: &broca_protocol::BindIde
     };
     let next = match &prior {
         Some(row) if same && row.rewriting_session.is_some() => row.version,
-        _ => allocate(prior.as_ref().map(|row| row.version), if prior.is_some() && !same { 2 } else { 1 }, now_ms()?)?,
+        _ => allocate(
+            prior.as_ref().map(|row| row.version),
+            if prior.is_some() && !same { 2 } else { 1 },
+            now_ms()?,
+        )?,
     };
     let identity = serde_json::to_string(session).map_err(|error| error.to_string())?;
     tx.execute("INSERT INTO served_history(session,incarnation,lineage_id,version,rewriting_session) VALUES(?1,?2,?3,?4,?5)
@@ -151,30 +209,70 @@ pub(crate) fn rewritten(conn: &mut Connection, session: &broca_protocol::BindIde
     tx.commit().map_err(|error| error.to_string())
 }
 
-pub(crate) fn rewrite_finished(conn: &mut Connection, session: &broca_protocol::BindIdentity) -> Result<(), String> {
-    if !row(conn, &broca_core::session_addr(session))?.is_some_and(|row| row.rewriting_session.is_some()) { return Ok(()); }
-    conn.pragma_update(None, "synchronous", "FULL").map_err(|error| error.to_string())?;
-    conn.execute("UPDATE served_history SET rewriting_session=NULL WHERE session=?1", [broca_core::session_addr(session)]).map_err(|error| error.to_string())?;
+pub(crate) fn rewrite_finished(
+    conn: &mut Connection,
+    session: &broca_protocol::BindIdentity,
+) -> Result<(), String> {
+    if !row(conn, &broca_core::session_addr(session))?
+        .is_some_and(|row| row.rewriting_session.is_some())
+    {
+        return Ok(());
+    }
+    conn.pragma_update(None, "synchronous", "FULL")
+        .map_err(|error| error.to_string())?;
+    conn.execute(
+        "UPDATE served_history SET rewriting_session=NULL WHERE session=?1",
+        [broca_core::session_addr(session)],
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-pub(crate) fn rewriting_sessions(conn: &Connection) -> Result<Vec<broca_protocol::BindIdentity>, String> {
+pub(crate) fn rewriting_sessions(
+    conn: &Connection,
+) -> Result<Vec<broca_protocol::BindIdentity>, String> {
     let mut statement = conn.prepare("SELECT rewriting_session FROM served_history INDEXED BY served_history_rewriting_idx WHERE rewriting_session IS NOT NULL ORDER BY session").map_err(|error| error.to_string())?;
-    let values = statement.query_map([], |row| row.get::<_, String>(0)).map_err(|error| error.to_string())?;
-    values.map(|row| serde_json::from_str(&row.map_err(|error| error.to_string())?).map_err(|error| error.to_string())).collect()
+    let values = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    values
+        .map(|row| {
+            serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
 }
 
 impl ServedHistory for crate::SqliteStore {
     fn history_read_version(&self, address: &str) -> Result<Option<u64>, String> {
         read_version(&self.conn.lock().unwrap(), address)
     }
-    fn served_snapshot(&self, address: &str, has_log: bool, lineage: Option<&str>, expected_version: Option<Option<u64>>) -> Result<ServedSnapshot, String> {
-        version(&mut self.conn.lock().unwrap(), address, has_log, lineage, expected_version)
+    fn served_snapshot(
+        &self,
+        address: &str,
+        has_log: bool,
+        lineage: Option<&str>,
+        expected_version: Option<Option<u64>>,
+    ) -> Result<ServedSnapshot, String> {
+        version(
+            &mut self.conn.lock().unwrap(),
+            address,
+            has_log,
+            lineage,
+            expected_version,
+        )
     }
-    fn history_rewritten(&self, session: &broca_protocol::BindIdentity, lineage: Option<&str>) -> Result<(), String> {
+    fn history_rewritten(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        lineage: Option<&str>,
+    ) -> Result<(), String> {
         rewritten(&mut self.conn.lock().unwrap(), session, lineage)
     }
-    fn history_rewrite_finished(&self, session: &broca_protocol::BindIdentity) -> Result<(), String> {
+    fn history_rewrite_finished(
+        &self,
+        session: &broca_protocol::BindIdentity,
+    ) -> Result<(), String> {
         rewrite_finished(&mut self.conn.lock().unwrap(), session)
     }
     fn rewriting_sessions(&self) -> Result<Vec<broca_protocol::BindIdentity>, String> {
@@ -191,14 +289,38 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         initialize(&conn).unwrap();
         let first = version_at(&mut conn, "address", false, None, 100, None).unwrap();
-        assert_eq!((first.incarnation.as_str(), first.history_version), ("unwritten", 0));
+        assert_eq!(
+            (first.incarnation.as_str(), first.history_version),
+            ("unwritten", 0)
+        );
         assert!(row(&conn, "address").unwrap().is_none());
         let first = version_at(&mut conn, "address", true, Some("abc"), 100, None).unwrap();
-        assert_eq!((first.incarnation.as_str(), first.history_version), ("abc", 100));
-        assert_eq!(version_at(&mut conn, "address", true, Some("abc"), 200, None).unwrap(), first);
-        assert_eq!(version_at(&mut conn, "address", false, None, 200, None).unwrap().history_version, 101);
-        assert_eq!(version_at(&mut conn, "address", true, Some("def"), 100, None).unwrap().history_version, 102);
-        assert_eq!(version_at(&mut conn, "address", true, Some("abc"), 500, None).unwrap().history_version, 500);
+        assert_eq!(
+            (first.incarnation.as_str(), first.history_version),
+            ("abc", 100)
+        );
+        assert_eq!(
+            version_at(&mut conn, "address", true, Some("abc"), 200, None).unwrap(),
+            first
+        );
+        assert_eq!(
+            version_at(&mut conn, "address", false, None, 200, None)
+                .unwrap()
+                .history_version,
+            101
+        );
+        assert_eq!(
+            version_at(&mut conn, "address", true, Some("def"), 100, None)
+                .unwrap()
+                .history_version,
+            102
+        );
+        assert_eq!(
+            version_at(&mut conn, "address", true, Some("abc"), 500, None)
+                .unwrap()
+                .history_version,
+            500
+        );
     }
 
     #[test]
@@ -209,11 +331,25 @@ mod tests {
         let address = broca_core::session_addr(&session);
         let before = version_at(&mut conn, &address, true, Some("abc"), 100, None).unwrap();
         rewritten(&mut conn, &session, Some("abc")).unwrap();
-        assert_eq!(read_version(&conn, &address).unwrap_err(), broca_core::served_history::HISTORY_REWRITING);
+        assert_eq!(
+            read_version(&conn, &address).unwrap_err(),
+            broca_core::served_history::HISTORY_REWRITING
+        );
         assert_eq!(rewriting_sessions(&conn).unwrap(), vec![session.clone()]);
         rewrite_finished(&mut conn, &session).unwrap();
         assert!(rewriting_sessions(&conn).unwrap().is_empty());
-        assert_eq!(version_at(&mut conn, &address, true, Some("abc"), 200, Some(Some(before.history_version))).unwrap_err(), broca_core::served_history::HISTORY_CHANGED);
+        assert_eq!(
+            version_at(
+                &mut conn,
+                &address,
+                true,
+                Some("abc"),
+                200,
+                Some(Some(before.history_version))
+            )
+            .unwrap_err(),
+            broca_core::served_history::HISTORY_CHANGED
+        );
         let after = version_at(&mut conn, &address, true, Some("abc"), 200, None).unwrap();
         assert!(after.history_version > before.history_version);
         assert_eq!(after.incarnation, before.incarnation);
@@ -227,6 +363,9 @@ mod tests {
         assert_eq!(before.incarnation.len(), 32);
         let after = version_at(&mut conn, "a", true, Some("abc"), 50, None).unwrap();
         assert_eq!(before, after);
-        assert_eq!(row(&conn, "a").unwrap().unwrap().lineage.as_deref(), Some("abc"));
+        assert_eq!(
+            row(&conn, "a").unwrap().unwrap().lineage.as_deref(),
+            Some("abc")
+        );
     }
 }

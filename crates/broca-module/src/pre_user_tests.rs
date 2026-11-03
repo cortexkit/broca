@@ -442,16 +442,31 @@ async fn pre_user_first_send_and_steer_carry_the_frozen_session_scope() {
         *f.hooks.scopes.lock().unwrap(),
         vec![Some(scope.clone()), Some(scope)]
     );
-    let recorded_times: Vec<_> = f.records().iter().filter_map(|record| match record {
-        WalRecord::RunStarted { written_at_ms, .. } | WalRecord::Steered { written_at_ms, .. } => Some(*written_at_ms),
-        _ => None,
-    }).collect();
-    let hook_times: Vec<_> = f.hooks.calls.lock().unwrap().iter().map(|(_, call)| match &call.subject {
-        cortexkit_role_step_transform_provider::hook::Subject::PreUser { at_ms, .. } => *at_ms,
-        _ => panic!("only pre_user hooks are subscribed"),
-    }).collect();
+    let recorded_times: Vec<_> = f
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::RunStarted { written_at_ms, .. }
+            | WalRecord::Steered { written_at_ms, .. } => Some(*written_at_ms),
+            _ => None,
+        })
+        .collect();
+    let hook_times: Vec<_> = f
+        .hooks
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, call)| match &call.subject {
+            cortexkit_role_step_transform_provider::hook::Subject::PreUser { at_ms, .. } => *at_ms,
+            _ => panic!("only pre_user hooks are subscribed"),
+        })
+        .collect();
     assert!(hook_times.iter().all(Option::is_some));
-    assert_eq!(hook_times, recorded_times, "hooks and stored messages must share one admission stamp");
+    assert_eq!(
+        hook_times, recorded_times,
+        "hooks and stored messages must share one admission stamp"
+    );
     f.stop().await;
 }
 fn text(input: &[Message]) -> String {

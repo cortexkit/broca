@@ -79,7 +79,6 @@ fn parse_cursor(token: &str) -> Result<Cursor, HistoryError> {
         })
 }
 
-
 fn media(media: &MediaRef) -> Reference {
     Reference::MediaRef {
         part: None,
@@ -264,7 +263,7 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, RowMetadat
 }
 
 /// The pure projection for broca's canonical stored message schema. Part keys are the same
-/// stable keys served by session.read's tag rows, including unnumbered tool calls.
+/// stable part keys served by session.read, including unnumbered tool calls.
 pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRow {
     let parts = entry
         .message
@@ -272,7 +271,14 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
         .iter()
         .enumerate()
         .map(|(index, block)| {
-            let key = broca_protocol::tags::part_key(entry.ordinal, index);
+            let key = entry
+                .part_keys
+                .as_ref()
+                .and_then(|keys| keys.get(index))
+                .cloned()
+                .unwrap_or_else(|| {
+                    broca_protocol::tags::part_key(entry.ordinal.saturating_sub(1), index)
+                });
             match block {
                 ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
                     DisplayPart::Text(TextPart::new(key, text))
@@ -415,7 +421,9 @@ pub async fn read<H: ServeHandler + ?Sized>(
                 "session.history ordinal is not retained",
             ));
         }
-        return Ok(serde_json::json!({"messages": [], "incarnation": head.incarnation, "history_version": head.history_version}));
+        return Ok(
+            serde_json::json!({"messages": [], "incarnation": head.incarnation, "history_version": head.history_version}),
+        );
     }
     let lineage = head.incarnation.clone();
     let end = head.last_ordinal.map_or(1, |last| last.saturating_add(1));
@@ -423,7 +431,10 @@ pub async fn read<H: ServeHandler + ?Sized>(
         HistoryMode::Newest => (end, true),
         HistoryMode::Cursor(token) => {
             let position = parse_cursor(token)?;
-            if position.incarnation != lineage || position.history_version != head.history_version || position.boundary > end {
+            if position.incarnation != lineage
+                || position.history_version != head.history_version
+                || position.boundary > end
+            {
                 return Err(refused(
                     "cursor_expired",
                     "session.history cursor is not in this session's surviving history",
@@ -433,12 +444,14 @@ pub async fn read<H: ServeHandler + ?Sized>(
         }
         HistoryMode::FromMid(mid) | HistoryMode::BeforeMid(mid) => {
             let at = broca_core::position_of_mid(mid, head.mode3, head.lineage_id.as_deref())
-                .map(|position| position + 1).filter(|at| *at < end).ok_or_else(|| {
-                refused(
-                    "unknown_mid",
-                    format!("session.history mid {mid} is not retained"),
-                )
-            })?;
+                .map(|position| position + 1)
+                .filter(|at| *at < end)
+                .ok_or_else(|| {
+                    refused(
+                        "unknown_mid",
+                        format!("session.history mid {mid} is not retained"),
+                    )
+                })?;
             (at, matches!(mode, HistoryMode::BeforeMid(_)))
         }
         HistoryMode::FromOrdinal(at) | HistoryMode::BeforeOrdinal(at) => {
@@ -522,7 +535,15 @@ pub async fn read<H: ServeHandler + ?Sized>(
         .transpose()?
         .unwrap_or_default();
     let refs = if request.form() == HistoryForm::Display {
-        crate::output_refs::page_output_refs(handler, session, &lineage, &entries, records).await?
+        crate::output_refs::page_output_refs(
+            handler,
+            session,
+            &lineage,
+            head.history_version,
+            &entries,
+            records,
+        )
+        .await?
     } else {
         Default::default()
     };
@@ -559,7 +580,7 @@ pub async fn read<H: ServeHandler + ?Sized>(
                     row.sender = metadata.sender.clone();
                 }
             }
-            if let Some(refs) = refs.get(&entry.ordinal) {
+            if let Some(refs) = refs.get(&entry.ordinal.saturating_sub(1)) {
                 row = refs.attach(row);
             }
             serde_json::to_value(
@@ -634,7 +655,8 @@ mod tests {
     #[test]
     fn projection_preserves_native_part_order_keys_media_and_utf8_limits() {
         let entry: SessionReadMessage = serde_json::from_value(json!({
-            "ordinal": 7, "mid":"m7", "written_at":123,
+            "ordinal": 8, "mid":"mdeadbeef.7", "written_at":123,
+            "part_keys": (0..6).map(|n| format!("m7#{n}")).collect::<Vec<_>>(),
             "message":{"role":"assistant", "origin":{"provider_module_id":"mock", "model_id":"model"}, "content":[
                 {"type":"text","text":"first"},
                 {"type":"reasoning","text":"thinking"},

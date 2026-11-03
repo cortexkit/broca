@@ -1300,35 +1300,36 @@ fn submission_from_config(
     input: Vec<broca_protocol::Message>,
 ) -> SubmissionRequest {
     let policy_allowed = config.tools.iter().map(|tool| tool.name.clone()).collect();
-    SubmissionRequest { route_decision_id: config.route_decision_id,
-    service_tier_level: None,
-    staged_uploads: None,
-    content: Vec::new(),
-    directives: config.turn_directives_v1,
-    on_restart: None,
-    keep_warm: None,
-    scope: Default::default(),
-    project_id: None,
-    principal: None,
-    model: config.model,
-    input,
-    tools: Some(Arc::unwrap_or_clone(config.tools)),
-    policy_allowed,
-    tool_choice: config.tool_choice,
-    generation: config.generation,
-    cache: None,
-    budget: config.budget,
-    // A resumed episode must reuse the frozen credential id rather than reconstructing a pin.
-    auth: None,
-    context_limit: config.context_limit,
-    work_class: config.work_class,
-    variant: config.variant,
-    service_tier: None,
-    stop_when: config.stop_when,
-    context_management: config.context_management,
-    inherit_frozen: Default::default(),
-    structured_output: None,
-    client_message_id: None,
+    SubmissionRequest {
+        route_decision_id: config.route_decision_id,
+        service_tier_level: None,
+        staged_uploads: None,
+        content: Vec::new(),
+        directives: config.turn_directives_v1,
+        on_restart: None,
+        keep_warm: None,
+        scope: Default::default(),
+        project_id: None,
+        principal: None,
+        model: config.model,
+        input,
+        tools: Some(Arc::unwrap_or_clone(config.tools)),
+        policy_allowed,
+        tool_choice: config.tool_choice,
+        generation: config.generation,
+        cache: None,
+        budget: config.budget,
+        // A resumed episode must reuse the frozen credential id.
+        auth: None,
+        context_limit: config.context_limit,
+        work_class: config.work_class,
+        variant: config.variant,
+        service_tier: None,
+        stop_when: config.stop_when,
+        context_management: config.context_management,
+        inherit_frozen: Default::default(),
+        structured_output: None,
+        client_message_id: None,
     }
 }
 
@@ -3037,19 +3038,32 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
         let history_store = self.materialized_store.clone();
         let wal_history = self.wal_store.served_history();
-        let history = history_store.as_ref().and_then(|store| store.served_history()).or(wal_history.as_deref());
-        let rewriting = match history.map(|history| history.history_read_version(&broca_core::session_addr(&self.key))) {
+        let history = history_store
+            .as_ref()
+            .and_then(|store| store.served_history())
+            .or(wal_history.as_deref());
+        let rewriting = match history
+            .map(|history| history.history_read_version(&broca_core::session_addr(&self.key)))
+        {
             Some(Err(error)) if error == broca_core::served_history::HISTORY_REWRITING => true,
             Some(Err(error)) => return Err(error),
             _ => false,
         };
         if rewriting {
             self.refresh_admission_view().await?;
-            if let Some(run_id) = self.recovery_records().await?.iter().rev().find_map(|record| match record {
-                WalRecord::RunStarted { run_id, .. } => Some(run_id.clone()),
-                _ => None,
-            }) {
-                self.crash_orphan_candidates.get_or_insert_with(HashSet::new).insert(run_id);
+            if let Some(run_id) = self
+                .recovery_records()
+                .await?
+                .iter()
+                .rev()
+                .find_map(|record| match record {
+                    WalRecord::RunStarted { run_id, .. } => Some(run_id.clone()),
+                    _ => None,
+                })
+            {
+                self.crash_orphan_candidates
+                    .get_or_insert_with(HashSet::new)
+                    .insert(run_id);
             }
         }
         // Recovery can be polled beneath command/admission handling on a worker's
@@ -3067,9 +3081,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
             self.registry.report_recovered(&self.key);
         }
         if rewriting {
-            self.writer.as_ref().expect("writer live during recovery").sync().await.map_err(|error| error.to_string())?;
+            self.writer
+                .as_ref()
+                .expect("writer live during recovery")
+                .sync()
+                .await
+                .map_err(|error| error.to_string())?;
             self.registry.invalidate_history_caches(&self.key);
-            history.expect("a rewrite fence has a history store").history_rewrite_finished(&self.key)?;
+            history
+                .expect("a rewrite fence has a history store")
+                .history_rewrite_finished(&self.key)?;
         }
         Ok(())
     }
@@ -3909,12 +3930,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
         };
         let running = match &self.state {
             RunState::Active { run_id, .. } => self.durable_finish_of_active(run_id).is_none(),
-            RunState::Idle => checkpoint.last_episode.as_ref()
+            RunState::Idle => checkpoint
+                .last_episode
+                .as_ref()
                 .is_some_and(|episode| episode.disposition == EpisodeDisposition::Paused),
         };
-        let fixed_route_decision = checkpoint.last_episode.as_ref().filter(|_| running)
+        let fixed_route_decision = checkpoint
+            .last_episode
+            .as_ref()
+            .filter(|_| running)
             .map(|episode| episode.config.route_decision_id.clone());
-        if let (Some(requested), Some(fixed)) = (&request.route_decision_id, &fixed_route_decision) {
+        if let (Some(requested), Some(fixed)) = (&request.route_decision_id, &fixed_route_decision)
+        {
             if Some(requested) != fixed.as_ref() {
                 return SendOutcome::RouteDecisionFixed;
             }
@@ -4743,7 +4770,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         Err(outcome) => return outcome,
                     };
                     let prepared = match self
-                        .prepare_input(input, broca_protocol::Delivery::Steer, manifest, None, self.message_timestamp())
+                        .prepare_input(
+                            input,
+                            broca_protocol::Delivery::Steer,
+                            manifest,
+                            None,
+                            self.message_timestamp(),
+                        )
                         .await
                     {
                         Ok(prepared) => prepared,
@@ -4884,7 +4917,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Err(outcome) => return outcome,
         };
         let prepared = match self
-            .prepare_input(input, broca_protocol::Delivery::Steer, manifest, None, self.message_timestamp())
+            .prepare_input(
+                input,
+                broca_protocol::Delivery::Steer,
+                manifest,
+                None,
+                self.message_timestamp(),
+            )
             .await
         {
             Ok(prepared) => prepared,
@@ -6010,8 +6049,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // queued record keeps the title it was written with.
             if request.route_decision_id.is_none()
                 && request_identity_digest.is_some()
-                && existing.request_identity_digest == request_identity_digest {
-                request.route_decision_id.clone_from(&existing.request.route_decision_id);
+                && existing.request_identity_digest == request_identity_digest
+            {
+                request
+                    .route_decision_id
+                    .clone_from(&existing.request.route_decision_id);
             }
             if broca_protocol::service_tier_enabled()
                 && request.service_tier_level.is_none()
@@ -6065,7 +6107,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Err(outcome) => return outcome,
                 };
                 match self
-                    .prepare_input(request.input.clone(), hook_delivery, manifest, None, self.message_timestamp())
+                    .prepare_input(
+                        request.input.clone(),
+                        hook_delivery,
+                        manifest,
+                        None,
+                        self.message_timestamp(),
+                    )
                     .await
                 {
                     Ok(prepared) => prepared,
@@ -12836,46 +12884,47 @@ mod tests {
 
     pub(super) fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
         use broca_protocol::content::{ContentBlock, Message, Role};
-        RunRequest { route_decision_id: None,
-        input_written_at_ms: None,
-        directives: None,
-        session_class: None,
-        retention: None,
-        title: None,
-        on_restart: None,
-        keep_warm: None,
-        scope: None,
-        send_id: None,
-        request_identity_digest: None,
-        project_id: None,
-        principal: None,
-        run_id: RunId(run.into()),
-        session: key.clone(),
-        model: broca_protocol::request::ModelHandle::new("fake", "fake"),
-        input: vec![Message {
-            turn_system: false,
-            cache_prefix_blocks: None,
-            origin: None,
-            ordinal: None,
-            tags: Default::default(),
-            role: Role::User,
-            content: vec![ContentBlock::Text { text: "hi".into() }],
-        }],
-        tools: vec![],
-        policy_allowed: Default::default(),
-        tool_choice: Default::default(),
-        generation: Default::default(),
-        cache: None,
-        stop_when: vec![],
-        submission_id: None,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        context_management: None,
-        variant: None,
-        service_tier: None,
-        inherit_frozen_cache: false,
-        structured_output: None,
+        RunRequest {
+            route_decision_id: None,
+            input_written_at_ms: None,
+            directives: None,
+            session_class: None,
+            retention: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            scope: None,
+            send_id: None,
+            request_identity_digest: None,
+            project_id: None,
+            principal: None,
+            run_id: RunId(run.into()),
+            session: key.clone(),
+            model: broca_protocol::request::ModelHandle::new("fake", "fake"),
+            input: vec![Message {
+                turn_system: false,
+                cache_prefix_blocks: None,
+                origin: None,
+                ordinal: None,
+                tags: Default::default(),
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }],
+            tools: vec![],
+            policy_allowed: Default::default(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            cache: None,
+            stop_when: vec![],
+            submission_id: None,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            context_management: None,
+            variant: None,
+            service_tier: None,
+            inherit_frozen_cache: false,
+            structured_output: None,
         }
     }
 

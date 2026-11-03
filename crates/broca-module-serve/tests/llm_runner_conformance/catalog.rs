@@ -6,10 +6,15 @@ pub(super) fn catalog(request: &Value) -> Value {
     let composition = &args["composition"];
     let digest = cortexkit_role_tool_provider::catalog::composition_digest(composition).unwrap();
     let schema = json!({"type":"object"});
-    let tool_free = composition["providers"].as_array().into_iter().flatten()
+    let tool_free = composition["providers"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .find(|entry| entry["provider"] == TOOL_MODULE)
         .is_some_and(|entry| entry["tools"].as_array().is_some_and(Vec::is_empty));
-    let tools = if tool_free { json!([]) } else {
+    let tools = if tool_free {
+        json!([])
+    } else {
         json!([{"name":SCRIPTED_TOOL,"schema_digest":cortexkit_role_tool_provider::catalog::schema_digest(&schema).unwrap(),
             "semantics":1,"result_format":"tool-result/v1","capabilities":[],"description":"Answers each call with its scripted result.","input_schema":schema,
             "reference_slots":[{"name":"data","kind":"token"},{"name":"program","kind":"source:rich-ui/1"}]}])

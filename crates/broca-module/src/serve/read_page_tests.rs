@@ -158,7 +158,3 @@ fn oversized_atomic_items_and_fixed_metadata_are_not_truncated() {
     cap_page_bytes(&mut capped, 1, false, "test-session").unwrap();
     assert_eq!(capped, original, "unpaged tools and metadata stay whole");
 }
-
-
-
-

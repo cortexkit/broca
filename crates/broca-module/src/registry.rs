@@ -266,7 +266,6 @@ impl OpenError {
         tags_await_setup: bool,
     ) -> Self {
         match self {
-
             Self::SessionLogMissing {
                 session, harness, ..
             } => Self::SessionLogMissing {
@@ -1529,39 +1528,84 @@ pub struct RegistryHandle {
 
 impl LineageRegistry {
     async fn history_query<T: Send + 'static>(
-        &self, query: impl FnOnce(&dyn broca_core::ServedHistory) -> Result<T, String> + Send + 'static,
+        &self,
+        query: impl FnOnce(&dyn broca_core::ServedHistory) -> Result<T, String> + Send + 'static,
     ) -> Result<Option<T>, OpenError> {
-        let direct: Option<Arc<dyn broca_core::ServedHistory>> = self.inner.raw_pages.get()
+        let direct: Option<Arc<dyn broca_core::ServedHistory>> = self
+            .inner
+            .raw_pages
+            .get()
             .map(|source| source.db.clone() as Arc<dyn broca_core::ServedHistory>)
-            .or_else(|| self.inner.episode_source.get().map(|source| source.db.clone() as Arc<dyn broca_core::ServedHistory>))
-            .or_else(|| self.inner.run_rows.as_ref().map(|source| source.history_db() as Arc<dyn broca_core::ServedHistory>))
-            .or_else(|| self.inner.reader.as_ref().and_then(|reader| reader.wal_store.served_history()));
-        let store = self.inner.reader.as_ref().and_then(|reader| reader.store.clone());
+            .or_else(|| {
+                self.inner
+                    .episode_source
+                    .get()
+                    .map(|source| source.db.clone() as Arc<dyn broca_core::ServedHistory>)
+            })
+            .or_else(|| {
+                self.inner
+                    .run_rows
+                    .as_ref()
+                    .map(|source| source.history_db() as Arc<dyn broca_core::ServedHistory>)
+            })
+            .or_else(|| {
+                self.inner
+                    .reader
+                    .as_ref()
+                    .and_then(|reader| reader.wal_store.served_history())
+            });
+        let store = self
+            .inner
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.store.clone());
         spawn_blocking(JobKind::StoreRead, move || {
-            match direct.as_deref().or_else(|| store.as_ref().and_then(|store| store.served_history())) {
-                Some(source) => query(source).map(Some).map_err(OpenError::from_history_error),
+            match direct
+                .as_deref()
+                .or_else(|| store.as_ref().and_then(|store| store.served_history()))
+            {
+                Some(source) => query(source)
+                    .map(Some)
+                    .map_err(OpenError::from_history_error),
                 None => Ok(None),
             }
-        }).await.map_err(|error| OpenError::Open(error.to_string()))?
+        })
+        .await
+        .map_err(|error| OpenError::Open(error.to_string()))?
     }
 
     /// Read-only gate shared by every history operation, including session.entries.
-    pub async fn history_read_version(&self, session: &LineageKey) -> Result<Option<u64>, OpenError> {
+    pub async fn history_read_version(
+        &self,
+        session: &LineageKey,
+    ) -> Result<Option<u64>, OpenError> {
         let address = broca_core::session_addr(session);
-        Ok(self.history_query(move |source| source.history_read_version(&address)).await?.flatten())
+        Ok(self
+            .history_query(move |source| source.history_read_version(&address))
+            .await?
+            .flatten())
     }
 
     /// Boot opens only the indexed fenced sessions. Status waits for each actor's recovery
     /// barrier, whose writer clears the fence after its repaired log is durable.
     pub async fn finish_history_rewrites_at_boot(&self) -> Result<usize, OpenError> {
-        let sessions = self.history_query(|source| source.rewriting_sessions()).await?.unwrap_or_default();
+        let sessions = self
+            .history_query(|source| source.rewriting_sessions())
+            .await?
+            .unwrap_or_default();
         let mut recovered = 0;
         for session in sessions {
             let actor = self.actor_for(&session).await?;
             let (reply, response) = tokio::sync::oneshot::channel();
-            actor.send(crate::actor::LineageCmd::Status { reply }).await
-                .map_err(|_| OpenError::Open("fenced writer closed before its recovery barrier".into()))?;
-            response.await.map_err(|_| OpenError::Open("fenced writer recovery barrier was lost".into()))?;
+            actor
+                .send(crate::actor::LineageCmd::Status { reply })
+                .await
+                .map_err(|_| {
+                    OpenError::Open("fenced writer closed before its recovery barrier".into())
+                })?;
+            response
+                .await
+                .map_err(|_| OpenError::Open("fenced writer recovery barrier was lost".into()))?;
             self.history_read_version(&session).await?;
             recovered += 1;
         }
@@ -1569,13 +1613,22 @@ impl LineageRegistry {
     }
 
     pub(crate) async fn mode3_for_page(
-        &self, session: &LineageKey, lineage: Option<String>, head: &broca_core::head::HeadProjection,
+        &self,
+        session: &LineageKey,
+        lineage: Option<String>,
+        head: &broca_core::head::HeadProjection,
     ) -> Result<bool, OpenError> {
         if let Some(mode3) = head.mode3 {
             return Ok(mode3);
         }
-        if let Some((_, mode3)) = self.inner.mode3_logs.lock().unwrap().get(session)
-            .filter(|(cached, _)| *cached == lineage) {
+        if let Some((_, mode3)) = self
+            .inner
+            .mode3_logs
+            .lock()
+            .unwrap()
+            .get(session)
+            .filter(|(cached, _)| *cached == lineage)
+        {
             return Ok(*mode3);
         }
         let mode3 = if let Some(reader) = &self.inner.reader {
@@ -1583,21 +1636,32 @@ impl LineageRegistry {
             let store = reader.store.clone();
             let key = session.clone();
             spawn_blocking(JobKind::StoreRead, move || {
-                let mode3 = broca_core::mode3_log_from_wal(wal.as_ref(), &key).map_err(|error| OpenError::Open(error.to_string()))?;
-                if let Some(store) = store { store.cache_history_mode(&key, mode3).map_err(OpenError::Open)?; }
+                let mode3 = broca_core::mode3_log_from_wal(wal.as_ref(), &key)
+                    .map_err(|error| OpenError::Open(error.to_string()))?;
+                if let Some(store) = store {
+                    store
+                        .cache_history_mode(&key, mode3)
+                        .map_err(OpenError::Open)?;
+                }
                 Ok::<_, OpenError>(mode3)
-            }).await.map_err(|error| OpenError::Open(error.to_string()))??
+            })
+            .await
+            .map_err(|error| OpenError::Open(error.to_string()))??
         } else {
             let records = self.read_durable_wal(session).await?.0;
             broca_core::is_mode3_log(records.iter().map(|record| &record.record))
         };
         if head.model.is_some() {
-            self.inner.mode3_logs.lock().unwrap().insert(session.clone(), (lineage, mode3));
+            self.inner
+                .mode3_logs
+                .lock()
+                .unwrap()
+                .insert(session.clone(), (lineage, mode3));
         }
         Ok(mode3)
     }
 
-        pub async fn served_snapshot(
+    pub async fn served_snapshot(
         &self,
         session: &LineageKey,
         lineage: Option<String>,
@@ -1609,16 +1673,33 @@ impl LineageRegistry {
                 let wal = reader.wal_store.clone();
                 let key = session.clone();
                 has_log = spawn_blocking(JobKind::StoreRead, move || wal.wal_present_checked(&key))
-                    .await.map_err(|error| OpenError::Open(error.to_string()))?
-                    .map_err(|error| OpenError::Open(error.to_string()))?.unwrap_or(false);
+                    .await
+                    .map_err(|error| OpenError::Open(error.to_string()))?
+                    .map_err(|error| OpenError::Open(error.to_string()))?
+                    .unwrap_or(false);
             }
         }
         let address = broca_core::session_addr(session);
         let fallback_lineage = lineage.clone();
-        Ok(self.history_query(move |source| source.served_snapshot(&address, has_log, lineage.as_deref(), Some(expected_version))).await?
+        Ok(self
+            .history_query(move |source| {
+                source.served_snapshot(
+                    &address,
+                    has_log,
+                    lineage.as_deref(),
+                    Some(expected_version),
+                )
+            })
+            .await?
             .unwrap_or_else(|| broca_core::served_history::ServedSnapshot {
                 history_version: u64::from(has_log),
-                incarnation: fallback_lineage.unwrap_or_else(|| if has_log { "legacy".into() } else { "unwritten".into() }),
+                incarnation: fallback_lineage.unwrap_or_else(|| {
+                    if has_log {
+                        "legacy".into()
+                    } else {
+                        "unwritten".into()
+                    }
+                }),
             }))
     }
 
@@ -4998,7 +5079,9 @@ impl LineageRegistry {
             broca_wal::WalRangeRecords::Absent => snapshot.watermark_seq,
         };
         if snapshot.prefix_len > 0 && snapshot.head.as_ref().and_then(|head| head.mode3).is_none() {
-            let mode3 = self.mode3_for_page(key, lineage_id.map(|id| id.to_string()), &head_facts).await?;
+            let mode3 = self
+                .mode3_for_page(key, lineage_id.map(|id| id.to_string()), &head_facts)
+                .await?;
             snapshot.head.get_or_insert_with(Default::default).mode3 = Some(mode3);
             head_facts.mode3 = Some(mode3);
         }
@@ -7275,30 +7358,31 @@ mod tests {
             ts_ms: None,
             run_id: RunId("r1".into()),
             session: session.clone(),
-            config: Box::new(RunConfig { route_decision_id: None,
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("stub", "stub-model"),
-            tools: Vec::new().into(),
-            tool_choice: ToolChoice::Auto,
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: serde_json::Value::Null,
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: serde_json::Value::Null,
-            auth_selection: None,
-            tools_were_omitted: true,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: Vec::new(),
-            context_management: None,
+            config: Box::new(RunConfig {
+                route_decision_id: None,
+                account_limit_pause: false,
+                turn_directives_v1: None,
+                render_tags: false,
+                computed_tags: None,
+                model: ModelHandle::new("stub", "stub-model"),
+                tools: Vec::new().into(),
+                tool_choice: ToolChoice::Auto,
+                generation: Default::default(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: 1,
+                frozen_render_config: serde_json::Value::Null,
+                auth_selection: None,
+                tools_were_omitted: true,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: Vec::new(),
+                context_management: None,
             }),
             input: vec![Message::new(
                 Role::User,
@@ -7959,30 +8043,31 @@ mod offset_page_tests {
     }
 
     fn run_config() -> Box<RunConfig> {
-        Box::new(RunConfig { route_decision_id: None,
-        account_limit_pause: false,
-        turn_directives_v1: None,
-        render_tags: false,
-        computed_tags: None,
-        model: ModelHandle::new("stub", "m"),
-        tools: vec![].into(),
-        tool_choice: Default::default(),
-        generation: Default::default(),
-        response_format: Default::default(),
-        provider_options: serde_json::Value::Null,
-        cache_tiers: serde_json::Value::Null,
-        context_epoch: 0,
-        renderer_version: 1,
-        frozen_render_config: serde_json::Value::Null,
-        auth_selection: None,
-        tools_were_omitted: false,
-        budget: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: Vec::new(),
-        context_management: None,
+        Box::new(RunConfig {
+            route_decision_id: None,
+            account_limit_pause: false,
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: ModelHandle::new("stub", "m"),
+            tools: vec![].into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: Vec::new(),
+            context_management: None,
         })
     }
 

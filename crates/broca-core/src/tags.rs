@@ -353,15 +353,12 @@ impl TagNumbering {
             checkpoint.tag_checkpoint,
             checkpoint.cut.clone(),
         );
-        let anchor =
-            broca_protocol::tags::v1::anchor(session, markers, Some(&setup), |cut| {
-                index_of(cut).is_some()
-            });
+        let anchor = broca_protocol::tags::v1::anchor(session, markers, Some(&setup), |cut| {
+            index_of(cut).is_some()
+        });
         let (anchor, cut) = match anchor {
             Ok(broca_protocol::tags::v1::Anchor::Marker { checkpoint, cut })
-            | Ok(broca_protocol::tags::v1::Anchor::Setup { checkpoint, cut }) => {
-                (checkpoint, cut)
-            }
+            | Ok(broca_protocol::tags::v1::Anchor::Setup { checkpoint, cut }) => (checkpoint, cut),
             // The cut message is not in this stretch of the transcript, or the session is a
             // fork: nothing to re-anchor here.
             _ => return Ok(false),

@@ -229,13 +229,26 @@ impl broca_core::ServedHistory for OverhaulDb {
         lineage: Option<&str>,
         expected_version: Option<Option<u64>>,
     ) -> Result<broca_core::served_history::ServedSnapshot, String> {
-        crate::served_history::version(&mut self.conn.lock().unwrap(), address, has_log, lineage, expected_version)
+        crate::served_history::version(
+            &mut self.conn.lock().unwrap(),
+            address,
+            has_log,
+            lineage,
+            expected_version,
+        )
     }
 
-    fn history_rewritten(&self, session: &broca_protocol::BindIdentity, lineage: Option<&str>) -> Result<(), String> {
+    fn history_rewritten(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        lineage: Option<&str>,
+    ) -> Result<(), String> {
         crate::served_history::rewritten(&mut self.conn.lock().unwrap(), session, lineage)
     }
-    fn history_rewrite_finished(&self, session: &broca_protocol::BindIdentity) -> Result<(), String> {
+    fn history_rewrite_finished(
+        &self,
+        session: &broca_protocol::BindIdentity,
+    ) -> Result<(), String> {
         crate::served_history::rewrite_finished(&mut self.conn.lock().unwrap(), session)
     }
     fn rewriting_sessions(&self) -> Result<Vec<broca_protocol::BindIdentity>, String> {

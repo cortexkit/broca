@@ -265,12 +265,14 @@ send.status { send_id }
 absent `form` serves raw entries; `form: "display"` serves canonical rows with optional
 UTF-8 tool-payload `limits`. Newest pages and `before_*` seeks page backward; `from_*`
 seeks page forward. Entries are always oldest first, and opaque `older`/`newer` cursors
-are session-lineage bound. Broca has no unnumbered host history or history rewrites;
-its surviving history is the full append-only lineage and its history version is zero.
-If the shared `session.read` timestamp derivation has no creation time, history refuses the whole page with
+are bound to the session's incarnation and history version. Ordinals start at one;
+normal appends keep the version, while destructive recovery advances it before serving history.
+If the legacy `session.read` timestamp derivation has no creation time, history refuses the whole page with
 `history_unrepresentable`, class `permanent`, and `detail: {ordinal, field}` naming
 the first unrepresentable row and `written_at`. It never substitutes an
 invented value or returns a partial page. Raw `session.read` remains the recovery path.
+Mode-3 logs materialize creation times using the preceding entry's time, or zero for an
+untimed prefix; later appends cannot change a time already served.
 Under llm-runner 0.6.13 §4.7, assistant rows carry their recorded producing model.
 Imported or adopted messages without one omit `model` (unknown); the projection
 never guesses or copies the session's current model. Messages written by a run keep theirs.

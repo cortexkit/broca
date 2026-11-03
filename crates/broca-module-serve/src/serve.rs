@@ -4086,6 +4086,7 @@ where
             "close",
             async {
                 let mut next_seq = cortexkit_role_llm_runner::live::FIRST_SEQ;
+                let mut message_identity: Option<broca_wire::HeadResponse> = None;
                 loop {
                     let delivery = tokio::select! {
                         _ = cancel.cancelled() => { record_request_outcome("cancelled"); break },
@@ -4127,6 +4128,30 @@ where
                         )
                         .await;
                         return;
+                    }
+                    let mut delivery = delivery;
+                    // Projection and provider display keep native stored positions. Resolve the
+                    // public vocabulary only when a message exists, including subscriptions
+                    // opened before the first send, and use it for both replay and live lanes.
+                    if message_identity.is_none() && delivery_has_mid(&delivery) {
+                        match tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            head = handler.head(&session) => head,
+                        } {
+                            Ok(head) => message_identity = Some(head),
+                            Err(error) => {
+                                let _ = send_subscribe_error_body(&writer, (ver, channel, epoch, corr), next_seq,
+                                    ErrorBody::new("subscribe_replay_failed", error.to_string())).await;
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(head) = &message_identity {
+                        if let Err(error) = public_delivery_mids(&mut delivery, head.mode3, head.lineage_id.as_deref()) {
+                            let _ = send_subscribe_error_body(&writer, (ver, channel, epoch, corr), next_seq,
+                                ErrorBody::new("subscribe_replay_failed", error)).await;
+                            return;
+                        }
                     }
                     let delivery = limit_live_arguments(delivery, limits.as_ref());
                     let (priority, body) = match encode_delivery(&delivery, next_seq) {
@@ -4226,6 +4251,78 @@ where
         }
         .with_current_subscriber(),
     );
+    Ok(())
+}
+
+fn delivery_has_mid(delivery: &Delivery) -> bool {
+    use cortexkit_role_llm_runner::live::LiveEvent;
+    match delivery {
+        Delivery::Control(event) => {
+            matches!(
+                &event.1,
+                broca_protocol::caller::ControlUnit::MessageBoundary { .. }
+            ) || matches!(
+                &event.2,
+                LiveEvent::MessageStarted(_)
+                    | LiveEvent::MessageFinished(_)
+                    | LiveEvent::ToolStarted(_)
+                    | LiveEvent::ToolFinished(_)
+            )
+        }
+        Delivery::Display(event) => match event.as_ref() {
+            broca_protocol::display::DisplayEvent::TextDelta { mid, .. }
+            | broca_protocol::display::DisplayEvent::ReasoningDelta { mid, .. }
+            | broca_protocol::display::DisplayEvent::ToolInputDelta { mid, .. } => mid.is_some(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Translate native control/display coordinates at the wire boundary, never in stored messages
+/// or provider requests. Legacy subscriptions retain their original bytes.
+fn public_delivery_mids(
+    delivery: &mut Delivery,
+    mode3: bool,
+    lineage: Option<&str>,
+) -> Result<(), String> {
+    use cortexkit_role_llm_runner::live::LiveEvent;
+    if !mode3 {
+        return Ok(());
+    }
+    let translate = |mid: &mut String| -> Result<(), String> {
+        if let Some(position) = broca_core::position_of_mid(mid, false, None) {
+            *mid = broca_core::message_mid(true, lineage, position)?;
+        } else if broca_core::position_of_mid(mid, true, lineage).is_none() {
+            return Err("subscription message id does not name this log".into());
+        }
+        Ok(())
+    };
+    match delivery {
+        Delivery::Control(event) => {
+            let (_, unit, live) = Arc::make_mut(event);
+            if let broca_protocol::caller::ControlUnit::MessageBoundary { mid } = unit {
+                translate(mid)?;
+            }
+            match live {
+                LiveEvent::MessageStarted(event) | LiveEvent::MessageFinished(event) => {
+                    translate(&mut event.mid)?
+                }
+                LiveEvent::ToolStarted(event) => translate(&mut event.mid)?,
+                LiveEvent::ToolFinished(event) => translate(&mut event.mid)?,
+                _ => {}
+            }
+        }
+        Delivery::Display(event) => match Arc::make_mut(event) {
+            broca_protocol::display::DisplayEvent::TextDelta { mid: Some(mid), .. }
+            | broca_protocol::display::DisplayEvent::ReasoningDelta { mid: Some(mid), .. }
+            | broca_protocol::display::DisplayEvent::ToolInputDelta { mid: Some(mid), .. } => {
+                translate(mid)?
+            }
+            _ => {}
+        },
+        _ => {}
+    }
     Ok(())
 }
 
@@ -6103,7 +6200,6 @@ mod tests {
         let handler = Arc::new(MockSubscribeHandler {
             sink_tx,
             refuse_session: std::sync::atomic::AtomicBool::new(false),
-            
         });
         let (writer, mut frames) = broca_diagnostics::channel(8, Arc::default());
         let identity = BrocaBindIdentity::new("/private/project", "runner", "subscribe");
@@ -6980,7 +7076,6 @@ mod tests {
         assert_eq!(frame.body, expected);
     }
 
-
     #[tokio::test]
     async fn ended_ordered_send_retries_are_successful_terminal_replies() {
         let (tx, mut rx) = broca_diagnostics::channel(1, Arc::default());
@@ -7132,7 +7227,6 @@ mod tests {
         assert!(a1.0.starts_with("run-iid-"));
     }
 
-
     struct MockSubscribeHandler {
         sink_tx: mpsc::Sender<mpsc::Sender<Delivery>>,
         refuse_session: std::sync::atomic::AtomicBool,
@@ -7140,7 +7234,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ServeHandler for MockSubscribeHandler {
-
         async fn authorize_session(
             &self,
             _session: &BrocaBindIdentity,
@@ -7210,7 +7303,6 @@ mod tests {
             let handler = Arc::new(MockSubscribeHandler {
                 sink_tx,
                 refuse_session: std::sync::atomic::AtomicBool::new(false),
-                
             });
             let (writer, mut written) = broca_diagnostics::channel::<Frame>(8, Arc::default());
             start_subscribe_stream(
@@ -7269,7 +7361,6 @@ mod tests {
         let handler = Arc::new(MockSubscribeHandler {
             sink_tx,
             refuse_session: std::sync::atomic::AtomicBool::new(false),
-            
         });
 
         // Bounded channel of size 1 for the writer.
@@ -7494,7 +7585,6 @@ mod tests {
                 handler: Arc::new(MockSubscribeHandler {
                     sink_tx,
                     refuse_session: std::sync::atomic::AtomicBool::new(false),
-                    
                 }),
                 writer,
                 written,
@@ -7784,29 +7874,31 @@ mod tests {
             ts_ms: None,
             run_id: broca_protocol::RunId("legacy".into()),
             session,
-            config: Box::new(broca_wal::RunConfig { route_decision_id: None,
-            account_limit_pause: false, turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: broca_protocol::request::ModelHandle::new("fake", "fake"),
-            tools: vec![].into(),
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: serde_json::Value::Null,
-            cache_tiers: serde_json::Value::Null,
-            context_epoch: 0,
-            renderer_version: 1,
-            frozen_render_config: serde_json::json!({"test": true}),
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: vec![],
-            context_management: None,
+            config: Box::new(broca_wal::RunConfig {
+                route_decision_id: None,
+                account_limit_pause: false,
+                turn_directives_v1: None,
+                render_tags: false,
+                computed_tags: None,
+                model: broca_protocol::request::ModelHandle::new("fake", "fake"),
+                tools: vec![].into(),
+                tool_choice: Default::default(),
+                generation: Default::default(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: 1,
+                frozen_render_config: serde_json::json!({"test": true}),
+                auth_selection: None,
+                tools_were_omitted: false,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: vec![],
+                context_management: None,
             }),
             input: vec![].into(),
             origin: broca_wal::RunOrigin::Fresh,

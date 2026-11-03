@@ -1033,49 +1033,50 @@ fn request(session: &BindIdentity, run: &str, inputs: usize) -> RunRequest {
         execution_mode: ExecutionMode::Parallel,
         reply: None,
     };
-    RunRequest { route_decision_id: None,
-    input_written_at_ms: None,
-    directives: None,
-    session_class: None,
-    retention: None,
-    title: None,
-    on_restart: None,
-    keep_warm: None,
-    scope: None,
-    send_id: None,
-    request_identity_digest: None,
-    project_id: None,
-    principal: None,
-    run_id: RunId(format!("run-{run}")),
-    session: session.clone(),
-    model: ModelHandle::new("stub", "bench"),
-    input: (0..inputs)
-        .map(|index| {
-            text_message(
-                Role::User,
-                format!("question {run}.{index}: please look this up"),
-            )
-        })
-        .collect(),
-    // `read` is a read-only tool, so its repeated identical results draw repetition
-    // guidance; `lookup` is not, so it never does.
-    tools: vec![tool("lookup"), tool("read")],
-    policy_allowed: HashSet::from(["lookup".to_owned(), "read".to_owned()]),
-    tool_choice: ToolChoice::Auto,
-    generation: GenerationConfig::default(),
-    cache: None,
-    stop_when: vec![StopCondition::StepCount {
-        n: LONG_READS as u64 + 8,
-    }],
-    submission_id: None,
-    budget: None,
-    context_limit: None,
-    work_class: None,
-    context_management: None,
-    variant: None,
-    service_tier: None,
-    inherit_frozen_cache: false,
-    structured_output: None,
+    RunRequest {
+        route_decision_id: None,
+        input_written_at_ms: None,
+        directives: None,
+        session_class: None,
+        retention: None,
+        title: None,
+        on_restart: None,
+        keep_warm: None,
+        scope: None,
+        send_id: None,
+        request_identity_digest: None,
+        project_id: None,
+        principal: None,
+        run_id: RunId(format!("run-{run}")),
+        session: session.clone(),
+        model: ModelHandle::new("stub", "bench"),
+        input: (0..inputs)
+            .map(|index| {
+                text_message(
+                    Role::User,
+                    format!("question {run}.{index}: please look this up"),
+                )
+            })
+            .collect(),
+        // Repeated identical results from the read-only `read` tool add model-facing
+        // guidance to stop repeating the call. `lookup` does not opt into that guidance.
+        tools: vec![tool("lookup"), tool("read")],
+        policy_allowed: HashSet::from(["lookup".to_owned(), "read".to_owned()]),
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig::default(),
+        cache: None,
+        stop_when: vec![StopCondition::StepCount {
+            n: LONG_READS as u64 + 8,
+        }],
+        submission_id: None,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        context_management: None,
+        variant: None,
+        service_tier: None,
+        inherit_frozen_cache: false,
+        structured_output: None,
     }
 }
 

@@ -143,38 +143,39 @@ impl Drop for Rig {
 
 /// A run frozen under the computed tag rules that shows the model its numbers.
 fn tagged_config() -> RunConfig {
-    RunConfig { route_decision_id: None,
-    account_limit_pause: false,
-    turn_directives_v1: None,
-    render_tags: true,
-    computed_tags: Some(broca_wal::ComputedTagRules { checkpoint: 0 }),
-    model: ModelHandle::new("stub", "stub-model"),
-    tools: vec![Tool {
-        name: "lookup".into(),
-        description: "test tool".into(),
-        input_schema: json!({"type": "object"}),
-        module: Some("tools".into()),
-        execution_mode: ExecutionMode::Parallel,
-        reply: None,
-    }]
-    .into(),
-    tool_choice: ToolChoice::Auto,
-    generation: Default::default(),
-    response_format: Default::default(),
-    provider_options: serde_json::Value::Null,
-    cache_tiers: serde_json::Value::Null,
-    context_epoch: 0,
-    renderer_version: 1,
-    frozen_render_config: serde_json::Value::Null,
-    auth_selection: None,
-    tools_were_omitted: false,
-    budget: None,
-    context_limit: None,
-    work_class: None,
-    variant: None,
-    service_tier: None,
-    stop_when: Vec::new(),
-    context_management: None,
+    RunConfig {
+        route_decision_id: None,
+        account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: true,
+        computed_tags: Some(broca_wal::ComputedTagRules { checkpoint: 0 }),
+        model: ModelHandle::new("stub", "stub-model"),
+        tools: vec![Tool {
+            name: "lookup".into(),
+            description: "test tool".into(),
+            input_schema: json!({"type": "object"}),
+            module: Some("tools".into()),
+            execution_mode: ExecutionMode::Parallel,
+            reply: None,
+        }]
+        .into(),
+        tool_choice: ToolChoice::Auto,
+        generation: Default::default(),
+        response_format: Default::default(),
+        provider_options: serde_json::Value::Null,
+        cache_tiers: serde_json::Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: serde_json::Value::Null,
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None,
     }
 }
 
@@ -558,7 +559,7 @@ async fn a_display_page_reads_each_shared_target_and_manifest_once() {
     let entries: Vec<_> = page
         .messages
         .into_iter()
-        .filter(|entry| entry.ordinal % 4 == 3)
+        .filter(|entry| (entry.ordinal - 1) % 4 == 3)
         .collect();
     let counted = CountedReads {
         registry: &rig.registry,
@@ -569,7 +570,8 @@ async fn a_display_page_reads_each_shared_target_and_manifest_once() {
     let sets = broca_module::output_refs::page_output_refs(
         &counted,
         &rig.key(),
-        page.lineage_id.as_deref().unwrap(),
+        &page.incarnation,
+        page.history_version,
         &entries,
         None,
     )

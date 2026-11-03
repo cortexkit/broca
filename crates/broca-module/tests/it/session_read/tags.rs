@@ -16,24 +16,56 @@ async fn page_bytes(rig: &Rig, key: &BindIdentity, media: MediaMode) -> Value {
     request.media = media;
     let response = rig.registry.read(request).await.expect("session.read");
     for entry in &response.messages {
-        let keys = entry.part_keys.as_ref().map(|keys| serde_json::to_string(keys).unwrap()).unwrap_or_else(|| "<absent>".into());
-        let digests = entry.part_digests.as_ref().map(|parts| serde_json::to_string(parts).unwrap()).unwrap_or_else(|| "<absent>".into());
-        eprintln!("{} {media:?}: part_keys={keys}; part_digests={digests}", entry.mid);
-        assert_eq!(entry.part_digests.is_some(), media == MediaMode::Descriptors);
+        let keys = entry
+            .part_keys
+            .as_ref()
+            .map(|keys| serde_json::to_string(keys).unwrap())
+            .unwrap_or_else(|| "<absent>".into());
+        let digests = entry
+            .part_digests
+            .as_ref()
+            .map(|parts| serde_json::to_string(parts).unwrap())
+            .unwrap_or_else(|| "<absent>".into());
+        eprintln!(
+            "{} {media:?}: part_keys={keys}; part_digests={digests}",
+            entry.mid
+        );
+        assert_eq!(
+            entry.part_digests.is_some(),
+            media == MediaMode::Descriptors
+        );
     }
     let value = serde_json::to_value(response).unwrap();
-    assert!(value["incarnation"].as_str().is_some_and(|value| !value.is_empty()));
+    assert!(value["incarnation"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
     assert!(value["history_version"].as_u64().is_some());
     value
 }
 
 fn assert_rows(entry: &Value, expected: Value) {
-    assert!(entry.get("tags").is_none(), "legacy tag rows are not a read surface");
-    assert_eq!(entry["part_keys"], expected, "every exposed part needs its opaque key");
-    if entry.get("part_digests").is_none() { return; }
+    assert!(
+        entry.get("tags").is_none(),
+        "legacy tag rows are not a read surface"
+    );
+    assert_eq!(
+        entry["part_keys"], expected,
+        "every exposed part needs its opaque key"
+    );
+    if entry.get("part_digests").is_none() {
+        return;
+    }
     let keys: Vec<_> = entry["part_keys"].as_array().unwrap().iter().collect();
-    let digests: Vec<_> = entry["part_digests"].as_array().unwrap().iter().map(|row| &row["part"]).collect();
-    assert_eq!(keys, digests, "part and digest keys must agree in content order");
+    let digests: Vec<_> = entry["part_digests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| &row["part"])
+        .collect();
+    assert_eq!(
+        keys, digests,
+        "part and digest keys must agree in content order"
+    );
 }
 
 #[tokio::test]
@@ -90,7 +122,10 @@ async fn open_and_committed_rows_keep_the_same_part_keys() {
     }
     materialize_all(&rig, &key);
     let stored = page_bytes(&rig, &key, MediaMode::Inline).await;
-    assert_eq!(open["messages"][1]["part_keys"], stored["messages"][1]["part_keys"]);
+    assert_eq!(
+        open["messages"][1]["part_keys"],
+        stored["messages"][1]["part_keys"]
+    );
 }
 
 /// Reads expose stable opaque keys before and after a batch commits, never renderer tag rows.
@@ -197,18 +232,9 @@ async fn live_tail_and_steer_rows_cover_parts_before_materialization() {
     }
     for page in &pages {
         assert_eq!(page["messages"].as_array().unwrap().len(), 3);
-        assert_rows(
-            &page["messages"][0],
-            json!(["m0#0"]),
-        );
-        assert_rows(
-            &page["messages"][1],
-            json!(["m1#0", "m1#1"]),
-        );
-        assert_rows(
-            &page["messages"][2],
-            json!(["m2#0"]),
-        );
+        assert_rows(&page["messages"][0], json!(["m0#0"]));
+        assert_rows(&page["messages"][1], json!(["m1#0", "m1#1"]));
+        assert_rows(&page["messages"][2], json!(["m2#0"]));
     }
     materialize_all(&rig, &key);
     for (media, before) in [MediaMode::Inline, MediaMode::Descriptors]
@@ -255,10 +281,7 @@ async fn crash_sealed_batch_rows_keep_exposed_keys() {
     }
     for after in pages {
         assert_rows(&after["messages"][1], json!(["m1#0"]));
-        assert_rows(
-            &after["messages"][2],
-            json!(["m2#0"]),
-        );
+        assert_rows(&after["messages"][2], json!(["m2#0"]));
         assert_eq!(
             before["messages"][1]["part_keys"], after["messages"][1]["part_keys"],
             "sealing must preserve exposed keys"
@@ -283,9 +306,11 @@ async fn counted_default_read_bytes_are_pinned() {
         .read(read_request(&key, Some(0), Some(10)))
         .await
         .unwrap();
-    let bytes = serde_json::to_string(&page).unwrap();
-    assert_eq!(
-        bytes,
-        include_str!("../../golden/session_read.counted.json").trim_end()
-    );
+    let bytes = pinned_read_bytes(&page);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/session_read.counted.json");
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&path, format!("{bytes}\n")).unwrap();
+    }
+    assert_eq!(bytes, std::fs::read_to_string(path).unwrap().trim_end());
 }

@@ -523,8 +523,10 @@ pub fn parse_plan_with(
         return Err(Refusal::invalid("plan.composition"));
     }
 
-    if object.get("compaction_item").is_some_and(|item| !item.is_null()
-        && item.get("preset").and_then(Value::as_str).is_none()) {
+    if object
+        .get("compaction_item")
+        .is_some_and(|item| !item.is_null() && item.get("preset").and_then(Value::as_str).is_none())
+    {
         return Err(Refusal::invalid("plan.compaction_item.preset"));
     }
     // Reader releases can replay compaction records but cannot serve the writer surface.

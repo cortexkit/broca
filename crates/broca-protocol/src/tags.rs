@@ -612,8 +612,9 @@ fn render_computed(
                     ToolOutput::Text { text: message }
                     | ToolOutput::Error { message, .. }
                     | ToolOutput::Denied { reason: message } => {
-                        *message =
-                            cortexkit_role_llm_runner_v1::tags::render_counted_text(number, message);
+                        *message = cortexkit_role_llm_runner_v1::tags::render_counted_text(
+                            number, message,
+                        );
                     }
                     ToolOutput::Json { .. } => {}
                     ToolOutput::Parts { parts } => {

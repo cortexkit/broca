@@ -1055,7 +1055,15 @@ where
     let decision = |path: &str, admission_id, decision_id| {
         // The caller owns reports for an explicit decision; only runner allocations have
         // an admission id that enables broca's normal and sealed-run reporters.
-        let mut result = decision(path, if inputs.decision_id.is_some() { None } else { admission_id }, decision_id);
+        let mut result = decision(
+            path,
+            if inputs.decision_id.is_some() {
+                None
+            } else {
+                admission_id
+            },
+            decision_id,
+        );
         result.conversation_key = Some(conversation.to_owned());
         result.conversation_key_source = Some(if inputs.conversation_key.is_some() {
             broca_wal::ConversationKeySource::Caller
@@ -1106,14 +1114,15 @@ where
             None,
         )));
     }
-    let params = account_for_params(&AccountForRequest { decision_id: inputs.decision_id,
-    provider,
-    model: inputs.model,
-    conversation_key: conversation,
-    admission_id: &admission,
-    initial_input_bytes: inputs.initial_input_bytes,
-    candidates: &candidates,
-    hold_cap: inputs.hold_cap,
+    let params = account_for_params(&AccountForRequest {
+        decision_id: inputs.decision_id,
+        provider,
+        model: inputs.model,
+        conversation_key: conversation,
+        admission_id: &admission,
+        initial_input_bytes: inputs.initial_input_bytes,
+        candidates: &candidates,
+        hold_cap: inputs.hold_cap,
     });
     if inputs.hold_cap.evidence_unknown {
         HOLD_CAP_UNKNOWN.fetch_add(1, Ordering::Relaxed);

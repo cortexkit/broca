@@ -125,54 +125,55 @@ async fn loop_drives_aimock_through_real_aft() {
     frozen.base_url = Some(base_url.clone());
     let provider = LiveProvider::new(OpenAiChat, frozen, auth);
 
-    let req = RunRequest { route_decision_id: None,
-    input_written_at_ms: None,
-    directives: None,
-    session_class: None,
-    retention: None,
-    title: None,
-    on_restart: None,
-    keep_warm: None,
-    scope: None,
-    send_id: None,
-    request_identity_digest: None,
-    project_id: None,
-    principal: None,
-    run_id: RunId("m2-spike".into()),
-    // The real AFT validates `harness` against an allowlist
-    // {opencode, pi, runner, mcp:<client>} — "runner" is THIS harness's
-    // designated identity (the fake-aft-stub skipped this check, so the
-    // in-process dogfood tests could use an arbitrary string; the real binary
-    // can't).
-    session: BindIdentity::new(&rig.dir, "runner", "spike-1"),
-    model: ModelHandle::new(&module_id, &model),
-    input: vec![Message {
-        turn_system: false,
-        cache_prefix_blocks: None,
-        origin: None,
-        ordinal: None,
-        tags: Default::default(),
-        role: Role::User,
-        content: vec![ContentBlock::Text {
-            text: format!("Read the file {rel_name} and report its contents."),
+    let req = RunRequest {
+        route_decision_id: None,
+        input_written_at_ms: None,
+        directives: None,
+        session_class: None,
+        retention: None,
+        title: None,
+        on_restart: None,
+        keep_warm: None,
+        scope: None,
+        send_id: None,
+        request_identity_digest: None,
+        project_id: None,
+        principal: None,
+        run_id: RunId("m2-spike".into()),
+        // The real AFT validates `harness` against an allowlist
+        // {opencode, pi, runner, mcp:<client>} — "runner" is THIS harness's
+        // designated identity (the fake-aft-stub skipped this check, so the
+        // in-process dogfood tests could use an arbitrary string; the real binary
+        // can't).
+        session: BindIdentity::new(&rig.dir, "runner", "spike-1"),
+        model: ModelHandle::new(&module_id, &model),
+        input: vec![Message {
+            turn_system: false,
+            cache_prefix_blocks: None,
+            origin: None,
+            ordinal: None,
+            tags: Default::default(),
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: format!("Read the file {rel_name} and report its contents."),
+            }],
         }],
-    }],
-    tools: vec![read_tool],
-    policy_allowed: [tool_name.clone()].into_iter().collect(),
-    tool_choice: ToolChoice::Auto,
-    generation: GenerationConfig::default(),
-    // Bound the run so a misbehaving script can't loop forever.
-    cache: None,
-    stop_when: vec![StopCondition::StepCount { n: 4 }],
-    submission_id: None,
-    budget: None,
-    context_limit: None,
-    work_class: None,
-    context_management: None,
-    variant: None,
-    service_tier: None,
-    inherit_frozen_cache: false,
-    structured_output: None,
+        tools: vec![read_tool],
+        policy_allowed: [tool_name.clone()].into_iter().collect(),
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig::default(),
+        // Bound the run so a misbehaving script can't loop forever.
+        cache: None,
+        stop_when: vec![StopCondition::StepCount { n: 4 }],
+        submission_id: None,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        context_management: None,
+        variant: None,
+        service_tier: None,
+        inherit_frozen_cache: false,
+        structured_output: None,
     };
 
     let (tx, mut rx) = mpsc::channel(2048);

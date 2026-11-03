@@ -24,33 +24,34 @@ use broca_wal::{PauseReason, RunConfig, RunOrigin, WalRecord};
 // ───────────────────────── record builders ─────────────────────────
 
 fn run_config(max_tokens: u32) -> RunConfig {
-    RunConfig { route_decision_id: None,
-    account_limit_pause: false,
-    turn_directives_v1: None,
-    render_tags: false,
-    computed_tags: None,
-    model: ModelHandle::new("stub", "m"),
-    tools: vec![].into(),
-    tool_choice: ToolChoice::Auto,
-    generation: GenerationConfig {
-        max_output_tokens: Some(u64::from(max_tokens)),
-        ..Default::default()
-    },
-    response_format: Default::default(),
-    provider_options: serde_json::Value::Null,
-    cache_tiers: serde_json::Value::Null,
-    context_epoch: 0,
-    renderer_version: 1,
-    frozen_render_config: serde_json::Value::Null,
-    auth_selection: None,
-    tools_were_omitted: false,
-    budget: None,
-    context_limit: None,
-    work_class: None,
-    variant: None,
-    service_tier: None,
-    stop_when: Vec::new(),
-    context_management: None,
+    RunConfig {
+        route_decision_id: None,
+        account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: ModelHandle::new("stub", "m"),
+        tools: vec![].into(),
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig {
+            max_output_tokens: Some(u64::from(max_tokens)),
+            ..Default::default()
+        },
+        response_format: Default::default(),
+        provider_options: serde_json::Value::Null,
+        cache_tiers: serde_json::Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: serde_json::Value::Null,
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None,
     }
 }
 

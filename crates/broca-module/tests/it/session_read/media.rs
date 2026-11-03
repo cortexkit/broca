@@ -105,7 +105,7 @@ async fn notice_matches_descriptors(name: &str, state: Option<broca_protocol::Te
         )
         .unwrap();
         let headers = notice.to_headers();
-        assert_eq!(headers["through_ordinal"], entry.ordinal.to_string());
+        assert_eq!(headers["through_ordinal"], (entry.ordinal - 1).to_string());
         assert_eq!(described["ordinal"], entry.ordinal);
         assert_eq!(
             json!(headers["through_digest"]),
@@ -113,7 +113,7 @@ async fn notice_matches_descriptors(name: &str, state: Option<broca_protocol::Te
             "{name}: notice and descriptors identity for ordinal {}",
             entry.ordinal
         );
-        let served = &caller["messages"][entry.ordinal as usize]["message"];
+        let served = &caller["messages"][(entry.ordinal - 1) as usize]["message"];
         assert_eq!(
             described["digest"],
             cortexkit_role_llm_runner::content_digest::content_digest(served),
@@ -238,7 +238,7 @@ async fn served_media_read_modes_have_pinned_bytes_and_stored_identities() {
         ),
     ] {
         let page = read(&rig, &key, mode).await;
-        let bytes = serde_json::to_string(&page).unwrap();
+        let bytes = pinned_read_bytes(&page);
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/golden")
             .join(fixture);
@@ -368,8 +368,8 @@ async fn descriptors_keep_marker_only_and_empty_parts_as_stored() {
 
 #[tokio::test]
 async fn stored_parts_count_once_and_render_without_losing_media() {
-    use broca_protocol::tags::{part_kind, render_tags_into, TagRendering};
     use broca_protocol::tags::v1::PartKind;
+    use broca_protocol::tags::{part_kind, render_tags_into, TagRendering};
     let rig = Rig::new("parts-render-tags", Arc::new(NoopExec));
     let document = MediaRef {
         kind: MediaKind::Document,
@@ -429,9 +429,15 @@ async fn stored_parts_count_once_and_render_without_losing_media() {
         write_legacy_seed(&rig.wal_store, &key, &seed(&key, parts.clone()));
         let page = read(&rig, &key, MediaMode::Blocks).await;
         assert_eq!(page.messages[2].part_keys, Some(vec!["m2#0".into()]));
-        assert_eq!(page.messages[2].message.part_tags().unwrap().parts, vec![Some(2)]);
+        assert_eq!(
+            page.messages[2].message.part_tags().unwrap().parts,
+            vec![Some(2)]
+        );
         assert_eq!(page.messages[3].part_keys, Some(vec!["m3#0".into()]));
-        assert_eq!(page.messages[3].message.part_tags().unwrap().parts, vec![Some(3)]);
+        assert_eq!(
+            page.messages[3].message.part_tags().unwrap().parts,
+            vec![Some(3)]
+        );
         let mut prompt: Vec<_> = page
             .messages
             .into_iter()
@@ -500,8 +506,8 @@ async fn stored_parts_count_once_and_render_without_losing_media() {
 
 #[tokio::test]
 async fn stored_empty_text_parts_do_not_consume_or_hide_a_number() {
-    use broca_protocol::tags::{part_kind, render_tags_into, TagRendering};
     use broca_protocol::tags::v1::PartKind;
+    use broca_protocol::tags::{part_kind, render_tags_into, TagRendering};
     let rig = Rig::new("empty-parts-tags", Arc::new(NoopExec));
     for (name, parts, kind, label, next) in [
         (
@@ -549,9 +555,16 @@ async fn stored_empty_text_parts_do_not_consume_or_hide_a_number() {
         write_legacy_seed(&rig.wal_store, &key, &seed(&key, parts));
         let page = read(&rig, &key, MediaMode::Blocks).await;
         assert_eq!(page.messages[2].part_keys, Some(vec!["m2#0".into()]));
-        assert_eq!(page.messages[2].message.part_tags().unwrap().parts, vec![label.map(|_| 2)], "{name}");
+        assert_eq!(
+            page.messages[2].message.part_tags().unwrap().parts,
+            vec![label.map(|_| 2)],
+            "{name}"
+        );
         assert_eq!(page.messages[3].part_keys, Some(vec!["m3#0".into()]));
-        assert_eq!(page.messages[3].message.part_tags().unwrap().parts, vec![Some(broca_protocol::tags::v1::parse_tag(next).unwrap())]);
+        assert_eq!(
+            page.messages[3].message.part_tags().unwrap().parts,
+            vec![Some(broca_protocol::tags::v1::parse_tag(next).unwrap())]
+        );
         let mut prompt: Vec<_> = page
             .messages
             .into_iter()
@@ -590,7 +603,8 @@ async fn stored_empty_text_parts_do_not_consume_or_hide_a_number() {
 async fn served_tool_result_numbering_matches_runner_vectors() {
     use broca_protocol::tags::{render_tags_into, TagRendering};
     let vectors: Value = serde_json::from_str(
-        cortexkit_role_llm_runner::vectors::file("tags.json").expect("runner tags vectors"),
+        cortexkit_role_llm_runner_v1::vectors::file("tags.json")
+            .expect("recorded v1 runner tags vectors"),
     )
     .unwrap();
     let rig = Rig::new("runner-parts-vectors", Arc::new(NoopExec));

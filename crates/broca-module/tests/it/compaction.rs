@@ -468,7 +468,11 @@ async fn reads_expose_immutable_history_while_v1_setup_is_pending() {
     };
     let before = read().await.expect("Setup does not block raw history");
     assert_eq!(before.messages[0].ordinal, 1);
-    assert!(serde_json::to_value(&before).unwrap()["messages"].as_array().unwrap().iter().all(|entry| entry.get("tags").is_none()));
+    assert!(serde_json::to_value(&before).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry.get("tags").is_none()));
     held.release.add_permits(1);
     rig.prompt().await;
     let after = read().await.expect("the Setup answer is durable");
@@ -555,7 +559,10 @@ async fn reads_after_projected_setup_do_not_wait_again_in_a_later_run() {
     let read = read.unwrap();
     assert_eq!(read.messages.len(), 1);
     assert_eq!(read.messages[0].part_keys, Some(vec!["m0#0".into()]));
-    assert_eq!(read.messages[0].message.part_tags().unwrap().parts, vec![Some(1)]);
+    assert_eq!(
+        read.messages[0].message.part_tags().unwrap().parts,
+        vec![Some(1)]
+    );
     let closed = LineageRegistry::new_with_reader(
         rig.opener.clone(),
         rig.wal.clone(),
@@ -571,5 +578,3 @@ async fn reads_after_projected_setup_do_not_wait_again_in_a_later_run() {
     assert_eq!(closed.slot_counts().open, 0, "reads must not open an actor");
     rig.close().await;
 }
-
-

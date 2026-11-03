@@ -431,7 +431,13 @@ async fn service_reads(
         .run_future(async {
             daemon
                 .registry
-                .route_read_model_page(bind, &broca_core::ModelPageRequest { limit: Some(2), ..Default::default() })
+                .route_read_model_page(
+                    bind,
+                    &broca_core::ModelPageRequest {
+                        limit: Some(2),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
         })

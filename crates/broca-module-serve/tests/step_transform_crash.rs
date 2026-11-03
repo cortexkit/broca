@@ -228,7 +228,12 @@ async fn drive(
         let original = serde_json::to_value(&req.input).unwrap();
         let output = runtime
             .chain(
-                Subject::PreUser { blocks: vec!["user".into()], mark: None, delivery: None, at_ms: None },
+                Subject::PreUser {
+                    blocks: vec!["user".into()],
+                    mark: None,
+                    delivery: None,
+                    at_ms: None,
+                },
                 Default::default(),
                 |_| true,
             )
@@ -689,7 +694,12 @@ async fn pre_user_answer_lost_before_send_record_retries_once() {
     };
     let answered = runtime
         .chain(
-            Subject::PreUser { blocks: vec!["user".into()], mark: None, delivery: None, at_ms: None },
+            Subject::PreUser {
+                blocks: vec!["user".into()],
+                mark: None,
+                delivery: None,
+                at_ms: None,
+            },
             Default::default(),
             |_| true,
         )

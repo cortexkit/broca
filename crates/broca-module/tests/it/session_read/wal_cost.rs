@@ -303,7 +303,7 @@ async fn run_result_snapshot_matches_full_replay_after_crash_and_archive() {
             assert!(response.reason.is_none(), "{phase}");
             assert_eq!(response.error, expected.error.map(Into::into), "{phase}");
             let message = response.final_message.unwrap();
-            assert_eq!(message.ordinal, ordinal, "{phase}");
+            assert_eq!(message.ordinal, ordinal + 1, "{phase}");
             assert_eq!(message.mid, format!("m{ordinal}"), "{phase}");
             assert_eq!(message.text, text, "{phase}");
             assert_eq!(
@@ -438,10 +438,3 @@ impl broca_core::ChargeBasisResolver for UnknownCharge {
         broca_core::NO_CHARGE_BASIS_OVERRIDES.into()
     }
 }
-
-
-
-
-
-
-

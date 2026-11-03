@@ -410,9 +410,13 @@ async fn run_case(steps: usize, media: bool) {
         media,
         steps,
         "model_page",
-        daemon
-            .registry
-            .route_read_model_page(&bind, &broca_core::ModelPageRequest { limit: Some(2), ..Default::default() }),
+        daemon.registry.route_read_model_page(
+            &bind,
+            &broca_core::ModelPageRequest {
+                limit: Some(2),
+                ..Default::default()
+            },
+        ),
     )
     .await
     .unwrap();

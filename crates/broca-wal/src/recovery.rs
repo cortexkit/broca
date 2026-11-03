@@ -32,7 +32,11 @@ pub fn physical_call_key(lineage: &str, seq: u64, generation: Option<&str>) -> S
 /// also finish its projection before a writable log can be returned to an actor.
 pub trait RecoveryHooks: Send + Sync {
     fn before_cut(&self, cut: &RecoveryCut) -> Result<(), WalError>;
-    fn before_cut_with_lineage(&self, cut: &RecoveryCut, _lineage: Option<framing::WalLineageId>) -> Result<(), WalError> {
+    fn before_cut_with_lineage(
+        &self,
+        cut: &RecoveryCut,
+        _lineage: Option<framing::WalLineageId>,
+    ) -> Result<(), WalError> {
         self.before_cut(cut)
     }
     fn after_repair(&self, log: &Path, cut_ids: &BTreeSet<String>) -> Result<(), WalError>;

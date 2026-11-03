@@ -11,7 +11,6 @@ pub use role::*;
 pub mod warm;
 pub use warm::*;
 
-
 use broca_protocol::caller::SharedProviderError;
 use broca_protocol::request::{
     CacheMode, CacheRole, CacheTail, GenerationConfig, StopCondition, Tool, ToolChoice,
@@ -27,7 +26,9 @@ pub const SUBC_MAX_FRAME_BYTES: u64 = 4_194_304;
 /// This matches `subc_protocol::HEADER_LEN`, defined in `subc-protocol/src/lib.rs:417`.
 pub const SUBC_FRAME_HEADER_BYTES: u64 = 21;
 
-fn discard_legacy_lineage<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+fn discard_legacy_lineage<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
     let _ = Option::<String>::deserialize(deserializer)?;
     Ok(None)
 }
@@ -1253,7 +1254,10 @@ impl SessionReadMessage {
                 .flatten()
                 .enumerate()
                 .map(|(index, part)| {
-                    PartDigest::new(broca_protocol::tags::part_key(self.ordinal.saturating_sub(1), index), part)
+                    PartDigest::new(
+                        broca_protocol::tags::part_key(self.ordinal.saturating_sub(1), index),
+                        part,
+                    )
                 })
                 .collect(),
         );
@@ -1288,7 +1292,10 @@ impl SessionReadMessage {
                     format!("/content/{index}"),
                     media_reference(
                         part,
-                        Some(broca_protocol::tags::part_key(self.ordinal.saturating_sub(1), index)),
+                        Some(broca_protocol::tags::part_key(
+                            self.ordinal.saturating_sub(1),
+                            index,
+                        )),
                     ),
                 )),
                 Some("text") => {
@@ -1398,7 +1405,6 @@ fn media_reference(
     }
 }
 
-
 fn serialized_json_len(value: &impl Serialize) -> usize {
     serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
 }
@@ -1416,10 +1422,12 @@ fn serialize_run_attribution<S: serde::Serializer>(
         .serialize(serializer)
 }
 
-
 /// Stable part identities are derived from immutable stored positions, not tag numbers.
 pub fn part_keys(ordinal: u64, message: &broca_protocol::Message) -> Vec<String> {
-    message.content.iter().enumerate()
+    message
+        .content
+        .iter()
+        .enumerate()
         .map(|(index, _)| broca_protocol::tags::part_key(ordinal, index))
         .collect()
 }
@@ -3575,11 +3583,23 @@ pub(crate) mod scope_refusal_golden {
             .join("tests/golden")
             .join(file);
         if std::env::var_os("BROCA_REGENERATE_ROLE_REPLIES").is_some()
-            && matches!(file, "session_head.json" | "session_head.title.json" | "session_head.lineage.json" | "session_head.cache.json" | "role_describe.json" | "role_describe_reader.json")
+            && matches!(
+                file,
+                "session_head.json"
+                    | "session_head.title.json"
+                    | "session_head.lineage.json"
+                    | "session_head.cache.json"
+                    | "role_describe.json"
+                    | "role_describe_reader.json"
+            )
         {
             let serialized = serde_json::to_vec(&body).unwrap();
             std::fs::write(&path, &serialized).unwrap();
-            println!("regenerated {} sha256 {:x}", file, Sha256::digest(&serialized));
+            println!(
+                "regenerated {} sha256 {:x}",
+                file,
+                Sha256::digest(&serialized)
+            );
             return;
         }
         let golden = std::fs::read(&path)
@@ -6268,10 +6288,7 @@ mod caller_message_tests {
 
         let plain_json = serde_json::to_value(&plain).unwrap();
         let tagged_json = serde_json::to_value(&tagged).unwrap();
-        assert_eq!(
-            plain_json["part_keys"],
-            json!(["m3#0", "m3#1"])
-        );
+        assert_eq!(plain_json["part_keys"], json!(["m3#0", "m3#1"]));
         assert_eq!(tagged_json["message"], plain_json["message"]);
         assert_eq!(
             serde_json::to_string(&tagged).unwrap(),
@@ -6292,14 +6309,8 @@ mod caller_message_tests {
             },
         ]);
         for (parts, expected) in [
-            (
-                vec![Some(7)],
-                json!(["m3#0", "m3#1"]),
-            ),
-            (
-                vec![Some(7), None, Some(9)],
-                json!(["m3#0", "m3#1"]),
-            ),
+            (vec![Some(7)], json!(["m3#0", "m3#1"])),
+            (vec![Some(7), None, Some(9)], json!(["m3#0", "m3#1"])),
         ] {
             entry.message.set_tags(Some(std::sync::Arc::new(
                 broca_protocol::tags::PartTags::new(parts),

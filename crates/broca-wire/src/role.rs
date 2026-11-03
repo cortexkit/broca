@@ -42,11 +42,11 @@ pub const READ_MAXIMUM_MAX_BYTES: u64 = READ_REPLY_MAX_BYTES;
 /// A send whose delivery mode, or every mode in its ordered list, is undeclared.
 /// `detail.delivery` preserves the delivery value the caller sent.
 pub use cortexkit_role_llm_runner::errors::DELIVERY_UNSUPPORTED;
+/// A paging version no longer names the session's active history.
+pub use cortexkit_role_llm_runner::errors::HISTORY_CHANGED;
 /// A request member is malformed, unknown, or combined with one it excludes. `detail.field`
 /// names it.
 pub use cortexkit_role_llm_runner::errors::INVALID_PARAMS;
-/// A paging version no longer names the session's active history.
-pub use cortexkit_role_llm_runner::errors::HISTORY_CHANGED;
 /// A terminal refusal when an indivisible `session.read` reply exceeds the transport frame
 /// limit. The detail is `cortexkit_role_llm_runner::errors::ReplyTooLargeDetail`.
 pub use cortexkit_role_llm_runner::errors::REPLY_TOO_LARGE;
@@ -176,11 +176,23 @@ pub struct HeadResponse {
 impl Default for HeadResponse {
     fn default() -> Self {
         Self {
-            mode3: false, last_run_rich_ui: None, lineage_id: None,
-            last_ordinal: None, first_ordinal: None, history_version: 0,
-            head: None, last_run_state: None, updated_at: None, cache: None,
-            title: None, input: None, model: None, usage: None, sender: None,
-            incarnation: "unwritten".into(), last_run_error: None,
+            mode3: false,
+            last_run_rich_ui: None,
+            lineage_id: None,
+            last_ordinal: None,
+            first_ordinal: None,
+            history_version: 0,
+            head: None,
+            last_run_state: None,
+            updated_at: None,
+            cache: None,
+            title: None,
+            input: None,
+            model: None,
+            usage: None,
+            sender: None,
+            incarnation: "unwritten".into(),
+            last_run_error: None,
         }
     }
 }
@@ -523,7 +535,6 @@ fn service_tiers() -> cortexkit_role_llm_runner::service_tier::ServiceTiers {
     .collect()
 }
 
-
 /// A dropped ordered send is a terminal send state, not a request refusal: retries must
 /// report the durable outcome without inviting the sender to submit the text again.
 pub fn ordered_send_ended_reply(
@@ -532,7 +543,6 @@ pub fn ordered_send_ended_reply(
 ) -> cortexkit_role_llm_runner::send::SendReply {
     cortexkit_role_llm_runner::send::SendReply::new(outcome).with_submission_id(submission_id)
 }
-
 
 /// `session.baseline` params: none. Strict.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -748,7 +758,78 @@ mod pinned_reply_bytes {
     #[test]
     fn session_head_bytes_are_pinned() {
         assert_golden(
-            HeadResponse { mode3: false,
+            HeadResponse {
+                mode3: false,
+                last_run_rich_ui: None,
+                model: None,
+                usage: None,
+                sender: None,
+                incarnation: "00112233445566778899aabbccddeeff".into(),
+                title: None,
+                lineage_id: None,
+                last_ordinal: Some(4),
+                first_ordinal: Some(1),
+                history_version: 1,
+                head: Some(CursorWire {
+                    wal_seq: 12,
+                    sub_index: 0,
+                }),
+                last_run_state: Some(LastRunState {
+                    run_id: "run-1".into(),
+                    state: "completed".into(),
+                    reason: None,
+                }),
+                updated_at: Some(1_790_000_000_000),
+                cache: None,
+                input: None,
+                last_run_error: None,
+            },
+            "session_head.json",
+            SESSION_HEAD_SHA256,
+        );
+    }
+
+    /// `session.head` for a session whose newest send carried a title. A session with no title
+    /// keeps exactly the bytes of `session_head.json`.
+    #[test]
+    fn session_head_with_a_title_bytes_are_pinned() {
+        assert_golden(
+            HeadResponse {
+                mode3: false,
+                last_run_rich_ui: None,
+                model: None,
+                usage: None,
+                sender: None,
+                incarnation: "00112233445566778899aabbccddeeff".into(),
+                title: Some("Fix the login bug".into()),
+                lineage_id: None,
+                last_ordinal: Some(4),
+                first_ordinal: Some(1),
+                history_version: 1,
+                head: Some(CursorWire {
+                    wal_seq: 12,
+                    sub_index: 0,
+                }),
+                last_run_state: Some(LastRunState {
+                    run_id: "run-1".into(),
+                    state: "completed".into(),
+                    reason: None,
+                }),
+                updated_at: Some(1_790_000_000_000),
+                cache: None,
+                input: None,
+                last_run_error: None,
+            },
+            "session_head.title.json",
+            SESSION_HEAD_TITLE_SHA256,
+        );
+    }
+
+    /// Written heads carry the required snapshot pair and one-based ordinal bounds.
+    #[test]
+    fn session_head_snapshot_members_are_pinned() {
+        let head = HeadResponse {
+            mode3: false,
             last_run_rich_ui: None,
             model: None,
             usage: None,
@@ -770,81 +851,13 @@ mod pinned_reply_bytes {
             }),
             updated_at: Some(1_790_000_000_000),
             cache: None,
-            input: None,
+            input: Some(head_input()),
             last_run_error: None,
-            },
-            "session_head.json",
-            SESSION_HEAD_SHA256,
-        );
-    }
-
-    /// `session.head` for a session whose newest send carried a title. A session with no title
-    /// keeps exactly the bytes of `session_head.json`.
-    #[test]
-    fn session_head_with_a_title_bytes_are_pinned() {
-        assert_golden(
-            HeadResponse { mode3: false,
-            last_run_rich_ui: None,
-            model: None,
-            usage: None,
-            sender: None,
-            incarnation: "00112233445566778899aabbccddeeff".into(),
-            title: Some("Fix the login bug".into()),
-            lineage_id: None,
-            last_ordinal: Some(4),
-            first_ordinal: Some(1),
-            history_version: 1,
-            head: Some(CursorWire {
-                wal_seq: 12,
-                sub_index: 0,
-            }),
-            last_run_state: Some(LastRunState {
-                run_id: "run-1".into(),
-                state: "completed".into(),
-                reason: None,
-            }),
-            updated_at: Some(1_790_000_000_000),
-            cache: None,
-            input: None,
-            last_run_error: None,
-            },
-            "session_head.title.json",
-            SESSION_HEAD_TITLE_SHA256,
-        );
-    }
-
-    /// Written heads carry the required snapshot pair and one-based ordinal bounds.
-    #[test]
-    fn session_head_snapshot_members_are_pinned() {
-        let head = HeadResponse { mode3: false,
-        last_run_rich_ui: None,
-        model: None,
-        usage: None,
-        sender: None,
-        incarnation: "00112233445566778899aabbccddeeff".into(),
-        title: None,
-        lineage_id: None,
-        last_ordinal: Some(4),
-        first_ordinal: Some(1),
-        history_version: 1,
-        head: Some(CursorWire {
-            wal_seq: 12,
-            sub_index: 0,
-        }),
-        last_run_state: Some(LastRunState {
-            run_id: "run-1".into(),
-            state: "completed".into(),
-            reason: None,
-        }),
-        updated_at: Some(1_790_000_000_000),
-        cache: None,
-        input: Some(head_input()),
-        last_run_error: None,
         };
         assert_golden(
             head.clone(),
             "session_head.lineage.json",
-            "ee91bd7075fde2a4871ddc490585fd1d9975838ba8f2dae9759f445a12233b45",
+            "8a8c4852b0c2330444aa8b58203db1ca3f64488a246a02b1e346d6e9fdc7af91",
         );
         let meta: cortexkit_role_llm_runner::read::HeadMeta =
             serde_json::from_value(serde_json::to_value(&head).unwrap()).unwrap();
@@ -1231,7 +1244,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "e6a97c7169d84ac7c1750d0682e0136b0b75950c99fb19cb5cc12979cd8ed416",
+            "fc6b8ce60873d611126dd4998d2e1f49d3416d09bb981669302deac10c74bfc5",
         );
     }
 
@@ -1341,36 +1354,37 @@ mod pinned_reply_bytes {
     #[test]
     fn cache_facts_on_head_and_baseline_are_pinned() {
         assert_golden(
-            HeadResponse { mode3: false,
-            last_run_rich_ui: None,
-            model: None,
-            usage: None,
-            sender: None,
-            incarnation: "00112233445566778899aabbccddeeff".into(),
-            title: None,
-            lineage_id: None,
-            last_ordinal: Some(4),
-            first_ordinal: Some(1),
-            history_version: 1,
-            head: Some(CursorWire {
-                wal_seq: 12,
-                sub_index: 0,
-            }),
-            last_run_state: Some(LastRunState {
-                run_id: "run-1".into(),
-                state: "completed".into(),
-                reason: None,
-            }),
-            updated_at: Some(1_790_000_000_000),
-            cache: Some(crate::HeadCacheWire {
-                last_sent_at_ms: 1_790_000_000_000,
-                ttl_ms: Some(3_600_000),
-                expires_at_ms: Some(1_790_003_600_000),
-                prefix_tokens: None,
-                expiry_basis: crate::EXPIRY_BASIS_ESTIMATED.into(),
-            }),
-            input: None,
-            last_run_error: None,
+            HeadResponse {
+                mode3: false,
+                last_run_rich_ui: None,
+                model: None,
+                usage: None,
+                sender: None,
+                incarnation: "00112233445566778899aabbccddeeff".into(),
+                title: None,
+                lineage_id: None,
+                last_ordinal: Some(4),
+                first_ordinal: Some(1),
+                history_version: 1,
+                head: Some(CursorWire {
+                    wal_seq: 12,
+                    sub_index: 0,
+                }),
+                last_run_state: Some(LastRunState {
+                    run_id: "run-1".into(),
+                    state: "completed".into(),
+                    reason: None,
+                }),
+                updated_at: Some(1_790_000_000_000),
+                cache: Some(crate::HeadCacheWire {
+                    last_sent_at_ms: 1_790_000_000_000,
+                    ttl_ms: Some(3_600_000),
+                    expires_at_ms: Some(1_790_003_600_000),
+                    prefix_tokens: None,
+                    expiry_basis: crate::EXPIRY_BASIS_ESTIMATED.into(),
+                }),
+                input: None,
+                last_run_error: None,
             },
             "session_head.cache.json",
             SESSION_HEAD_CACHE_SHA256,
@@ -1391,13 +1405,13 @@ mod pinned_reply_bytes {
     }
 
     const SESSION_HEAD_CACHE_SHA256: &str =
-        "cabd121e8604ed081860ea7ed7f5f35879797212a069ddda2f612cefc621d740";
+        "889e38341e781a06dbd65a9c4eb59155ca628238a4d41ed1aa207986fad64985";
     const SESSION_BASELINE_CACHE_SHA256: &str =
         "653da81354c090f96432d86dc52cc7a43f346b0eea6289dbff47a001778a54d6";
     const SESSION_HEAD_TITLE_SHA256: &str =
-        "96eeaa6374e9f8820c01ea8d4e7366dea00b1a8dc190af701fbf8c86e4c4b37b";
+        "596b86b8f2ce89e99a82094677717c62d4fbdf7302523a92c668b46bebaca6ea";
     const SESSION_HEAD_SHA256: &str =
-        "aec01aab3542523cb8dacf5407a659a9b822e836cac01f00125caa253614467a";
+        "ca9502e1b2d457284d515de64d12895c64917d1e60fe1bb39e99d21a71ff6452";
     const SESSION_BASELINE_SHA256: &str =
         "e450a5b79e0b17af513f8c7c07a9be821e87134d03359e27e75c11e8282c7df1";
     const ADMISSION_REPLY_SHA256: &str =
@@ -1409,7 +1423,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "2e374f73c424a2a34fc29b520183b939ec879dde0dd67d2456d204248f8f65f2";
+        "3f8cdd4460a60e5eca1a535aab476a321c798a395973477df1e2a8742c521fd2";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

@@ -4530,8 +4530,11 @@ fn to_subc_bind(
         RouteTarget::ToolProvider { .. }
             if declares_compaction_provider(role_versions)
                 || role_versions.is_some_and(|roles| {
-                    roles.get(cortexkit_role_step_transform_provider::ROLE)
-                        .is_some_and(|version| version == cortexkit_role_step_transform_provider::VERSION)
+                    roles
+                        .get(cortexkit_role_step_transform_provider::ROLE)
+                        .is_some_and(|version| {
+                            version == cortexkit_role_step_transform_provider::VERSION
+                        })
                 }) =>
         {
             identity.harness.as_str()

@@ -18,8 +18,7 @@ pub(super) fn wall_ms() -> u128 {
         .map_or(0, |elapsed| elapsed.as_millis())
 }
 
-impl Shared {
-}
+impl Shared {}
 
 /// The `cortexkit` directory under the rig's `XDG_DATA_HOME`. [`BrocaSubject::start`] puts the
 /// state root and `data-home` side by side in the rig directory.

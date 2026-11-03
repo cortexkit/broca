@@ -586,12 +586,15 @@ mod tests {
         let id = broca_protocol::ToolCallId("late".into());
         for bytes in [65_536, 65_537] {
             let mut entry = settled("result");
-            entry.result = Some(serde_json::json!({"content":[{"type":"text","text":"x".repeat(bytes)}]}));
+            entry.result =
+                Some(serde_json::json!({"content":[{"type":"text","text":"x".repeat(bytes)}]}));
             let stored = late_entry_tool_result(&id, &entry).unwrap();
             assert_eq!(stored.is_error, bytes > 65_536);
             if bytes > 65_536 {
-                assert!(matches!(stored.output, broca_protocol::ToolOutput::Error { code: Some(code), detail: Some(detail), .. }
-                    if code == "tool_result_too_large" && serde_json::from_str::<serde_json::Value>(&detail).unwrap()["bytes"] == 65_537));
+                assert!(
+                    matches!(stored.output, broca_protocol::ToolOutput::Error { code: Some(code), detail: Some(detail), .. }
+                    if code == "tool_result_too_large" && serde_json::from_str::<serde_json::Value>(&detail).unwrap()["bytes"] == 65_537)
+                );
             }
         }
     }

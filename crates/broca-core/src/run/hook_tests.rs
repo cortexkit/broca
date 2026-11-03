@@ -609,7 +609,9 @@ fn replaced() -> HookAnswer {
 async fn post_tool_edits_are_not_subject_to_the_removed_intake_cut() {
     let (result, records) = post_answer(append(&"x".repeat(1_048_576)), None, false).await;
     assert!(!result.is_error);
-    assert!(matches!(&result.output, ToolOutput::Text { text } if text.len() == "original".len() + 1_048_576));
+    assert!(
+        matches!(&result.output, ToolOutput::Text { text } if text.len() == "original".len() + 1_048_576)
+    );
     assert!(!records.iter().any(|r| matches!(r, WalRecord::ToolResult { reason: Some(reason), .. } if reason == "post_tool_unavailable")));
 }
 #[tokio::test]
@@ -818,7 +820,7 @@ async fn post_assistant_record_control_next_prompt_and_display_all_use_final_mes
             false,
         ));
         let (plane, seen) = scripted(move |_, call| {
-            assert!(serde_json::to_value(&call).unwrap().get("harness").is_none());
+            assert!(serde_json::to_value(call).unwrap().get("harness").is_none());
             assert_eq!(call.subject.blocks().unwrap(), ["answer"]);
             Reply::Answer(if changed {
                 append("+hook")
@@ -1672,11 +1674,19 @@ async fn pre_user_identity_stays_on_the_route_before_and_after_recording() {
     let (hooks, seen) = scripted(|_, _| Reply::Answer(HookAnswer::Pass));
     let bind = BindIdentity::new(scratch.as_path(), "caller", "s");
     let runtime = runtime(&plan, &hooks, &bind, &writer);
-    let subject = Subject::PreUser { blocks: vec!["user".into()], mark: None, delivery: None, at_ms: None };
+    let subject = Subject::PreUser {
+        blocks: vec!["user".into()],
+        mark: None,
+        delivery: None,
+        at_ms: None,
+    };
     runtime
         .chain(subject.clone(), Trace::default(), |_| true)
         .await;
-    assert!(serde_json::to_value(&seen.lock().unwrap()[0].1).unwrap().get("lineage_id").is_none());
+    assert!(serde_json::to_value(&seen.lock().unwrap()[0].1)
+        .unwrap()
+        .get("lineage_id")
+        .is_none());
     writer.record(WalRecord::ToolBatchStarted {
         batch_id: BatchId("seed".into()),
         step_id: StepId(1),
@@ -1879,7 +1889,12 @@ async fn pre_user_seal_cancellation_returns_discardable_output_instead_of_parkin
     let mut runtime = runtime(&plan, &hooks, &bind, &writer);
     runtime.seal = Some(&seal);
     let mut chain = Box::pin(runtime.chain(
-        Subject::PreUser { blocks: vec!["original".into()], mark: None, delivery: None, at_ms: None },
+        Subject::PreUser {
+            blocks: vec!["original".into()],
+            mark: None,
+            delivery: None,
+            at_ms: None,
+        },
         Trace::default(),
         |_| true,
     ));
@@ -2023,7 +2038,12 @@ async fn post_tool_subscriber_is_not_called_for_other_subjects() {
     let bind = BindIdentity::new("/project", "caller", "s");
     let runtime = runtime(&plan, &hooks, &bind, &writer);
     for subject in [
-        Subject::PreUser { blocks: vec!["user".into()], mark: None, delivery: None, at_ms: None },
+        Subject::PreUser {
+            blocks: vec!["user".into()],
+            mark: None,
+            delivery: None,
+            at_ms: None,
+        },
         Subject::PostAssistant {
             step_id: "1".into(),
             blocks: vec!["assistant".into()],
