@@ -5110,7 +5110,19 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     } else {
         broca_fetch_plan::CompactionSupport::Unsupported
     };
-    let parsed = broca_fetch_plan::parse_plan_with(plan, support, output_refs)?;
+    let parsed = match broca_fetch_plan::parse_plan_with(plan, support, output_refs) {
+        Ok(parsed) => parsed,
+        // A plan whose compaction item names no preset is refused as that, ahead of whatever
+        // else the plan lacks, so the caller learns the one member every new plan must carry.
+        Err(_)
+            if plan.get("compaction_item").is_some_and(|item| {
+                item.is_object() && !item.get("preset").is_some_and(serde_json::Value::is_string)
+            }) =>
+        {
+            return Err(broca_fetch_plan::Refusal::invalid("plan.compaction_item.preset").into());
+        }
+        Err(refusal) => return Err(refusal.into()),
+    };
     let plan_state = handler.plan_state(session).await;
     // A new plan names its compaction preset before any other send member is weighed, so a
     // missing preset is refused as itself (llm-runner 0.8 kit `compaction_item_preset_required`).

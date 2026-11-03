@@ -190,14 +190,11 @@ fn native_entry(mut entry: SessionReadMessage) -> SessionReadMessage {
 
 /// Whether `message` was written by a model step of a run that showed the model numbers under
 /// the computed rules: only such a message has sets.
+/// Every assistant message a run wrote has reference sets. Under llm-runner 0.8 (§9.13) output
+/// references no longer depend on part numbering: in a session that shows no numbers, a
+/// reference the model writes is still recorded, as `unknown_tag`.
 fn has_sets(entry: &SessionReadMessage) -> bool {
-    entry.message.role == Role::Assistant
-        && entry.run.is_some()
-        && entry
-            .message
-            .part_tags()
-            .and_then(|tags| tags.computed)
-            .is_some_and(|computed| computed.render)
+    entry.message.role == Role::Assistant && entry.run.is_some()
 }
 
 /// The model's own text parts of `message`, in block order, as every exposure shows them.

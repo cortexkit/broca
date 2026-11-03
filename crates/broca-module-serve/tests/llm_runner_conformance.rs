@@ -3806,7 +3806,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         .cases
         .iter()
         .filter(|case| matches!(case.outcome, CaseOutcome::Failed { .. }))
-        .filter(|case| known_kit_defect(&case.case, &case.outcome).is_none())
+        .filter(|case| known_kit_defect(case.case, &case.outcome).is_none())
         .collect();
     if !failed.is_empty() {
         // Print before asserting: the panic message keeps only the report, and CI keeps only

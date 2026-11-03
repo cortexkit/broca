@@ -88,6 +88,11 @@ pub async fn prepare(
     if !runtime.ensure_setup(plane, &setup).await && view.is_none() {
         return Ok(Prepared::CompactionUnavailable);
     }
+    // A resumed step that already applied a view keeps exactly the bytes it may have sent, so
+    // it never rides. A resumed step with no view applied rides as a fresh step would: the ride
+    // it began before the crash left nothing durable, and only its answer can give the step the
+    // view the uninterrupted run sent with.
+    let frozen = frozen && view.is_some();
     let mut prompt = render::prompt(at.stored, at.entries, edits(&view), &mut image)?;
     let mut tokens = estimate(&prompt)?;
     let causes = if frozen {
@@ -187,8 +192,9 @@ async fn ride(
         return Ok(());
     };
     let version = received.view().version;
+    let identity = received.view().applied();
     let mut state = state.lock().await;
-    match state
+    let answer = state
         .accept(
             journal,
             at.entries,
@@ -196,27 +202,40 @@ async fn ride(
             &at.conditions.rules,
             at.conditions.accepts_images == Some(true),
         )
-        .await?
-    {
-        Ok(()) => {
-            for event in state
-                .apply(
-                    journal,
-                    Boundary {
-                        step: at.step,
-                        entries: at.entries,
-                        rules: &at.conditions.rules,
-                        accepts_images: at.conditions.accepts_images == Some(true),
-                        next_mid: at.next_mid,
-                    },
-                )
-                .await?
-            {
-                runtime.event(event);
-            }
-            setup.applied_view = state.applied_identity();
-        }
+        .await?;
+    // A crash can leave a ride's view accepted but not applied. Resumed, the step rides again,
+    // and the provider re-offers that same view: it is still this step's answer, so it applies
+    // now instead of being refused as not newer.
+    let reoffered = answer.is_err()
+        && state
+            .latest()
+            .is_some_and(|latest| latest.applied() == identity);
+    match answer {
+        Ok(()) => apply_ride_answer(&mut state, runtime, journal, setup, at).await?,
+        Err(_) if reoffered => apply_ride_answer(&mut state, runtime, journal, setup, at).await?,
         Err(refusal) => runtime.event(Event::ViewRefused { version, refusal }),
     }
+    Ok(())
+}
+
+/// Apply the view a ride answered with at this step's boundary.
+async fn apply_ride_answer(
+    state: &mut State,
+    runtime: &Runtime,
+    journal: &dyn Journal,
+    setup: &mut cortexkit_role_compaction::setup::SetupRequest,
+    at: &At<'_>,
+) -> Result<(), String> {
+    let boundary = Boundary {
+        step: at.step,
+        entries: at.entries,
+        rules: &at.conditions.rules,
+        accepts_images: at.conditions.accepts_images == Some(true),
+        next_mid: at.next_mid,
+    };
+    for event in state.apply(journal, boundary).await? {
+        runtime.event(event);
+    }
+    setup.applied_view = state.applied_identity();
     Ok(())
 }

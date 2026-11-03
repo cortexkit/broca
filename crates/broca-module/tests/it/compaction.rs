@@ -109,36 +109,6 @@ impl Provider for Model {
     }
 }
 
-/// A compaction provider whose Setup waits until the test releases it, then answers with a
-/// head and a tag checkpoint of 500 cut at the newest message, as a provider does for a
-/// session it moved from standalone Magic Context.
-struct HeldCompactor {
-    arrived: Semaphore,
-    release: Semaphore,
-}
-
-#[async_trait]
-impl CompactionPlane for HeldCompactor {
-    async fn setup(
-        &self,
-        _: &str,
-        _: &BindIdentity,
-        _scope: Option<&broca_protocol::SessionScope>,
-        request: SetupRequest,
-    ) -> Result<SetupAnswer, CompactionUnavailable> {
-        self.arrived.add_permits(1);
-        self.release.acquire().await.unwrap().forget();
-        let cut = request.newest.as_ref().map(|newest| newest.mid.clone());
-        Ok(serde_json::from_value(
-            json!({"answer":"ready","request_id":request.request_id,"initial":{
-                "compaction_id":"c1","version":1,"range":{"from":0,"to":0},
-                "replacement":[text(Role::User, "head")]
-            },"checkpoint":{"tag_checkpoint":500,"cut":cut}}),
-        )
-        .unwrap())
-    }
-}
-
 struct Exec {
     wal: Arc<FileWalStore>,
     store: Arc<broca_store::SqliteStore>,
@@ -191,13 +161,10 @@ impl RunExecutor for Exec {
 struct Rig {
     dir: std::path::PathBuf,
     wal: Arc<FileWalStore>,
-    store: Arc<broca_store::SqliteStore>,
     registry: LineageRegistry,
-    opener: Arc<dyn broca_module::registry::LineageOpener>,
     key: BindIdentity,
     model: Arc<Model>,
     prompts: Mutex<mpsc::UnboundedReceiver<Vec<Message>>>,
-    completed: Arc<Semaphore>,
 }
 
 fn manifest() -> Arc<PlanManifest> {
@@ -267,19 +234,15 @@ impl Rig {
             .with_run_index(store.clone())
             .with_materialized_store(store.clone()),
         );
-        let registry =
-            LineageRegistry::new_with_reader(opener.clone(), wal.clone(), Some(store.clone()));
+        let registry = LineageRegistry::new_with_reader(opener, wal.clone(), Some(store));
         let key = BindIdentity::new(dir.clone(), "caller", "session");
         Self {
             dir,
             wal,
-            store,
             registry,
-            opener,
             key,
             model,
             prompts: Mutex::new(prompt_rx),
-            completed,
         }
     }
 

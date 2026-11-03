@@ -1020,7 +1020,7 @@ async fn retained_at_run_started(tools: Vec<Tool>) -> (isize, isize) {
     );
     let retained_bytes = snapshot.retained_bytes.load(Ordering::SeqCst);
     let retained_allocations = snapshot.retained_allocations.load(Ordering::SeqCst);
-    (retained_bytes, retained_allocations as isize)
+    (retained_bytes, retained_allocations)
 }
 
 #[tokio::test(flavor = "current_thread")]
