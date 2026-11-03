@@ -77,13 +77,39 @@ async fn responses(rig: &Rig, key: &BindIdentity) -> Vec<Value> {
             }
             out.push_str(rest);
             let mut value: Value = serde_json::from_str(&out).unwrap();
-            // Each session allocates its own history version from its first served read.
+            // Each session allocates its own history version from its first served read, and an
+            // output-reference set id (`h1.<incarnation>.<history version>/<mid>`) repeats it.
             if let Some(version) = value.get_mut("history_version") {
                 *version = json!("@HISTORY_VERSION@");
             }
+            mask_set_id_versions(&mut value);
             value
         })
         .collect()
+}
+
+/// Replaces the history-version segment of every output-reference `set_id`, which the two rigs
+/// allocate independently from the wall clock, so equal histories compare equal.
+fn mask_set_id_versions(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, field) in map.iter_mut() {
+                if key == "set_id" {
+                    if let Some(id) = field.as_str() {
+                        if let Some((scope, mid)) = id.split_once('/') {
+                            if let Some((prefix, _version)) = scope.rsplit_once('.') {
+                                *field = json!(format!("{prefix}.@HISTORY_VERSION@/{mid}"));
+                            }
+                        }
+                    }
+                } else {
+                    mask_set_id_versions(field);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(mask_set_id_versions),
+        _ => {}
+    }
 }
 
 #[tokio::test]
