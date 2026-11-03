@@ -9918,9 +9918,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
             JobKind::WalRead,
             broca_wal::access_counter::inherit(move || {
                 if let Some(reader) = admission_reader {
-                    return reader
-                        .prior_snapshot(&key, safe_head)
-                        .map(|snapshot| snapshot.checkpoint_at_head);
+                    match reader.prior_snapshot(&key, safe_head) {
+                        Ok(snapshot) => return Ok(snapshot.checkpoint_at_head),
+                        // While a run appends, the database's publication can trail the durable
+                        // head. The log is the authority, so fold the log instead.
+                        Err(cause) => tracing::debug!(
+                            target: "admission",
+                            %cause,
+                            "database admission view trails the log; reading the log"
+                        ),
+                    }
                 }
                 match broca_core::load_prior_wal_snapshot(
                     wal_store.as_ref(),
