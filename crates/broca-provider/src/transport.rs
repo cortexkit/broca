@@ -86,7 +86,7 @@ mod cache_runtime;
 pub use responses_websocket::Connections as ChatgptConnections;
 
 #[path = "transport_codex_retry.rs"]
-mod codex_retry;
+pub(crate) mod codex_retry;
 
 #[path = "transport_request_gzip.rs"]
 pub mod request_gzip;
@@ -2458,7 +2458,7 @@ impl RetryClock {
 /// Why a transient attempt failed. This tag stays inside the transport: public error classes do
 /// not distinguish a broken stream from deterministic response decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttemptCause {
+pub(crate) enum AttemptCause {
     TransportTransient,
     DeterministicDecode,
 }

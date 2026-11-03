@@ -104,17 +104,17 @@ pub(super) fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<f
 /// What one failed attempt tells the decision. Everything else about the failure (its class,
 /// `x-should-retry`, a repeated decode failure, the response deadline) has already been through
 /// the transport's vetoes, which end the step before this decision is asked.
-pub(super) struct CodexFailure<'a> {
-    pub(super) error: &'a ProviderError,
-    pub(super) outcome: &'a AttemptOutcome,
+pub(crate) struct CodexFailure<'a> {
+    pub(crate) error: &'a ProviderError,
+    pub(crate) outcome: &'a AttemptOutcome,
     /// The attempt's request went out over HTTPS, the only transport Codex's request layer
     /// wraps.
-    pub(super) https: bool,
+    pub(crate) https: bool,
 }
 
 /// What to do after a failed attempt.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum CodexDecision {
+pub(crate) enum CodexDecision {
     /// Send the same request again after `delay`. `server_advised` says `delay` is the time
     /// the server asked for rather than a local backoff.
     Retry {
@@ -203,7 +203,7 @@ fn request_layer_retries(failure: &CodexFailure<'_>) -> bool {
 /// The retry counters for one step, Codex's `ResponsesStreamRetryState` plus the request
 /// layer's attempt counter.
 #[derive(Debug)]
-pub(super) struct CodexRetryState {
+pub(crate) struct CodexRetryState {
     retries: u64,
     request_retries: u64,
     connection_failures: usize,
@@ -233,7 +233,7 @@ impl CodexRetryState {
         self.decide_with_jitter(failure, try_switch_to_https, jitter)
     }
 
-    pub(super) fn decide_with_jitter(
+    pub(crate) fn decide_with_jitter(
         &mut self,
         failure: &CodexFailure<'_>,
         try_switch_to_https: impl FnOnce() -> bool,
