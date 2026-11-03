@@ -102,6 +102,20 @@ async fn clock_deadline(clock: Option<&crate::Clock>, deadline_ms: u64) {
 /// Each call carries the session's frozen scope so opening a provider route cannot drop it.
 #[async_trait]
 pub trait CompactionPlane: Send + Sync {
+    /// Content-free mode-3 calls on a separate session-bound v2 route. Keeping
+    /// this seam distinct prevents a legacy Setup body from reaching v2.
+    async fn call_v2(
+        &self,
+        _provider: &str,
+        _bind: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
+        _method: &str,
+        _params: serde_json::Value,
+        _deadline_ms: u64,
+    ) -> Result<serde_json::Value, crate::compaction_v2::runtime::CallError> {
+        Err(crate::compaction_v2::runtime::CallError::Unavailable)
+    }
+
     async fn setup(
         &self,
         provider: &str,

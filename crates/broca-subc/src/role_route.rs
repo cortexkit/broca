@@ -29,11 +29,13 @@ fn route_key(bind: &BindIdentity, provider: &str, selector: Option<&ScopeSelecto
     )
 }
 
+type DescribeCheck = fn(&Value) -> Result<(), String>;
+
 pub(crate) struct RoleRoute {
     conn: Arc<SubcConnection>,
     role: &'static str,
     version: &'static str,
-    check_describe: fn(&Value) -> Result<(), String>,
+    check_describe: Option<DescribeCheck>,
     routes: Mutex<HashMap<RouteKey, RouteSlot>>,
 }
 
@@ -42,13 +44,29 @@ impl RoleRoute {
         conn: Arc<SubcConnection>,
         role: &'static str,
         version: &'static str,
-        check_describe: fn(&Value) -> Result<(), String>,
+        check_describe: DescribeCheck,
     ) -> Self {
         Self {
             conn,
             role,
             version,
-            check_describe,
+            check_describe: Some(check_describe),
+            routes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Protocols whose role contract has no discovery op open their bound route
+    /// directly. Role selection is still enforced by the daemon at route open.
+    pub(crate) fn without_discovery(
+        conn: Arc<SubcConnection>,
+        role: &'static str,
+        version: &'static str,
+    ) -> Self {
+        Self {
+            conn,
+            role,
+            version,
+            check_describe: None,
             routes: Mutex::new(HashMap::new()),
         }
     }
@@ -150,16 +168,20 @@ impl RoleRoute {
             lease.route = None;
         }
         if lease.route.is_none() {
-            let (opened, describe) = self
-                .open_and_describe(provider, bind, selector, deadline)
-                .await?;
-            lease = opened;
-            let describe = describe.map_err(refused)?;
-            (self.check_describe)(&describe).map_err(|problems| FetchError::Refused {
-                code: broca_fetch_plan::admit::INVALID_ANSWER.into(),
-                detail: Some(serde_json::json!({"provider": provider, "problems": problems})),
-                retryable: false,
-            })?;
+            if let Some(check_describe) = self.check_describe {
+                let (opened, describe) = self
+                    .open_and_describe(provider, bind, selector, deadline)
+                    .await?;
+                lease = opened;
+                let describe = describe.map_err(refused)?;
+                check_describe(&describe).map_err(|problems| FetchError::Refused {
+                    code: broca_fetch_plan::admit::INVALID_ANSWER.into(),
+                    detail: Some(serde_json::json!({"provider": provider, "problems": problems})),
+                    retryable: false,
+                })?;
+            } else {
+                lease = self.open(provider, bind, selector, deadline).await?;
+            }
         }
         let answer = self
             .request(lease.route.as_ref().unwrap(), body.to_vec(), deadline)
@@ -204,6 +226,29 @@ impl RoleRoute {
         selector: Option<ScopeSelector>,
         deadline: Instant,
     ) -> Result<(RouteLease, Result<Value, subc_protocol::ErrorBody>), FetchError> {
+        let lease = self.open(provider, bind, selector, deadline).await?;
+        let describe = match self
+            .exchange(
+                lease.route.as_ref().expect("opened route"),
+                serde_json::to_vec(&serde_json::json!({"method": "role.describe", "params": {}}))
+                    .expect("describe request is serializable"),
+                deadline,
+            )
+            .await?
+        {
+            Ok(reply) => Ok(decode(&reply)?),
+            Err(refusal) => Err(refusal),
+        };
+        Ok((lease, describe))
+    }
+
+    async fn open(
+        &self,
+        provider: &str,
+        bind: &BindIdentity,
+        selector: Option<ScopeSelector>,
+        deadline: Instant,
+    ) -> Result<RouteLease, FetchError> {
         let scoped = selector.is_some();
         let route = self
             .conn
@@ -225,23 +270,10 @@ impl RoleRoute {
                 }
                 open_error(error)
             })?;
-        let lease = RouteLease {
+        Ok(RouteLease {
             conn: self.conn.clone(),
             route: Some(route),
-        };
-        let describe = match self
-            .exchange(
-                &route,
-                serde_json::to_vec(&serde_json::json!({"method": "role.describe", "params": {}}))
-                    .expect("describe request is serializable"),
-                deadline,
-            )
-            .await?
-        {
-            Ok(reply) => Ok(decode(&reply)?),
-            Err(refusal) => Err(refusal),
-        };
-        Ok((lease, describe))
+        })
     }
 
     async fn selector(
