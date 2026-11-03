@@ -10538,9 +10538,11 @@ mod delivery_list_tests {
         .unwrap();
         let before = serde_json::to_value(&params.delivery).unwrap();
         let describe = broca_wire::broca_role_describe("test").role;
+        assert!(delivery_list_refusal(params.delivery.as_ref(), &describe).is_none());
+        let describe = describe.with_delivery_order_modes(vec!["steer".into()]);
         let refusal = serde_json::to_value(
             delivery_list_refusal(params.delivery.as_ref(), &describe)
-                .expect("turn_system has no landing path"),
+                .expect("a narrowed declaration must still refuse turn_system"),
         )
         .unwrap();
         assert_eq!(refusal["code"], broca_wire::DELIVERY_UNSUPPORTED);
