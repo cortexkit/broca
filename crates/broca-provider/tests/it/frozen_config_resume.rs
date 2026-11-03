@@ -298,6 +298,7 @@ mod gated {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,

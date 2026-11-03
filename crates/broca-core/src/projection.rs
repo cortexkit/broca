@@ -974,6 +974,9 @@ fn project_control_record<S: ControlProjectionSink>(
         WalRecord::WriterOpened { .. }
         | WalRecord::WriterClosed { .. }
         | WalRecord::VisibilityLate { .. }
+        | WalRecord::CompactionViewV2 { .. }
+        | WalRecord::CompactionMarker { .. }
+        | WalRecord::CompactionViewAppliedV2 { .. }
         | WalRecord::Unknown => {}
         WalRecord::ContextCeilingWait {
             deadline_ms,

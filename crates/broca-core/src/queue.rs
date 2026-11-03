@@ -458,6 +458,7 @@ mod tests {
 
     fn consumed(run: &str, sub: &str) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

@@ -1009,6 +1009,7 @@ pub(crate) mod tests {
         ts_ms: u64,
     ) -> broca_wal::WalRecord {
         broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

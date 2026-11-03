@@ -20,6 +20,7 @@ impl RunExecutor for TerminalExecutor {
         _out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
         job.writer.record(WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -409,6 +410,7 @@ async fn closed_polls_distinguish_absent_runs_from_a_pending_crash_orphan() {
 
 fn unsealed_start(key: &BindIdentity, run: &RunId) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
         sent_by: None,
         written_at_ms: None,
         tags: None,

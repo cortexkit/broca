@@ -699,6 +699,7 @@ async fn crash_recovery_preserves_stop_before_tool_dispatch() {
     wal.append(
         1,
         &broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

@@ -553,6 +553,77 @@ fn released_envelope<'de, D: serde::Deserializer<'de>>(
     Ok(Box::new(envelope))
 }
 
+/// An accepted mode-3 view. Edits stay raw JSON so provider extensions, key order and number
+/// spellings survive a reader round trip without depending on the compaction library.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactionViewV2 {
+    pub version: u64,
+    pub checksum: String,
+    pub edits: Vec<StoredViewEdit>,
+}
+
+/// One edit in rebuilt view order. A previous index names the latest earlier accepted view,
+/// whether or not it was applied. The writer may reference only byte-identical edits.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StoredViewEdit {
+    Full {
+        edit: Box<serde_json::value::RawValue>,
+    },
+    Previous {
+        index: u32,
+    },
+}
+
+impl PartialEq for StoredViewEdit {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Full { edit: a }, Self::Full { edit: b }) => a.get() == b.get(),
+            (Self::Previous { index: a }, Self::Previous { index: b }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredViewEdit {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Internally tagged enum buffering cannot retain RawValue bytes. Parse the outer
+        // object directly from its raw JSON instead of buffering the edit into serde values.
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        struct Kind {
+            kind: String,
+        }
+        let kind: Kind = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+        match kind.kind.as_str() {
+            "full" => {
+                #[derive(Deserialize)]
+                struct Full {
+                    edit: Box<serde_json::value::RawValue>,
+                }
+                let full: Full =
+                    serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+                Ok(Self::Full { edit: full.edit })
+            }
+            "previous" => {
+                #[derive(Deserialize)]
+                struct Previous {
+                    index: u32,
+                }
+                let previous: Previous =
+                    serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+                Ok(Self::Previous {
+                    index: previous.index,
+                })
+            }
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["full", "previous"],
+            )),
+        }
+    }
+}
+
 /// One durable record. Internally tagged (`{"type": …}`) for a self-describing,
 /// debuggable log.
 ///
@@ -582,7 +653,7 @@ fn released_envelope<'de, D: serde::Deserializer<'de>>(
 /// will also say nothing when a variant is added. Do not add new wildcard arms to silence
 /// the compiler at an exhaustive site: name the variant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(remote = "Self", tag = "type", rename_all = "snake_case")]
 pub enum WalRecord {
     /// Durable attribution of data removed by overhaul recovery. Readers must
     /// retain these call tombstones even when a later episode starts.
@@ -779,6 +850,11 @@ pub enum WalRecord {
         /// can ignore this optional field and continue rendering in their original order.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         marker_order_version: Option<u32>,
+        /// The compaction render-plan version frozen for a mode-3 run. Reader support ships
+        /// before writing: this release decodes but does not apply it. When present it requires
+        /// `compaction-v2/v1`, so a build without the reader refuses the log by feature name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_plan_version: Option<u32>,
         /// The tool catalogs and system text the session's first send fetched from its
         /// providers, frozen and repeated on every later episode, because a fold can take the
         /// first `RunStarted` out of the live WAL and every episode must render from the same
@@ -1696,6 +1772,27 @@ pub enum WalRecord {
         headers: std::collections::BTreeMap<String, String>,
     },
 
+    /// A mode-3 view delta, reserved for a later writer. This reader preserves the provider's
+    /// JSON edits and checksum without interpreting them or changing the transcript.
+    CompactionViewV2(CompactionViewV2),
+    /// A mode-3 cut marker, reserved for a later writer. This reader ignores it in all session
+    /// and run projections; its coordinates never renumber transcript messages.
+    CompactionMarker {
+        harness: String,
+        session: String,
+        view_version: u64,
+        first_kept_mid: String,
+        first_kept_ordinal: u64,
+        checkpoint: u64,
+    },
+    /// The accepted mode-3 view selected for a step, including a view the compaction provider
+    /// returned for that request. Content lives in `CompactionViewV2`; this reader applies neither record.
+    CompactionViewAppliedV2 {
+        step_id: u64,
+        version: u64,
+        checksum: String,
+    },
+
     // ── calls held for a human's approval (feature `deferred-call/v1`) ──
     //
     // Every record in this group except `QuestionWithdrawalAcknowledged` is must-understand and is
@@ -1942,6 +2039,34 @@ pub enum WalRecord {
     Unknown,
 }
 
+impl Serialize for WalRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WalRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        struct Tag {
+            #[serde(rename = "type")]
+            kind: String,
+        }
+        let tag: Tag = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+        if tag.kind == "compaction_view_v2" {
+            serde_json::from_str(raw.get())
+                .map(Self::CompactionViewV2)
+                .map_err(serde::de::Error::custom)
+        } else {
+            // Keep the existing tagged decoder for every older record shape. The raw-view
+            // branch bypasses its value buffer, which would discard the edits' original bytes.
+            Self::deserialize(&mut serde_json::Deserializer::from_str(raw.get()))
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
 fn is_recovery_unknown(result: &ToolResult) -> bool {
     result.is_error
         && matches!(&result.output, broca_protocol::ToolOutput::Error {
@@ -2042,6 +2167,9 @@ impl WalRecord {
                 | WalRecord::WriterOpened { .. }
                 | WalRecord::WriterClosed { .. }
                 | WalRecord::VisibilityLate { .. }
+                | WalRecord::CompactionViewV2 { .. }
+                | WalRecord::CompactionMarker { .. }
+                | WalRecord::CompactionViewAppliedV2 { .. }
                 | WalRecord::ModelAttemptFinished { .. }
                 | WalRecord::AttemptReserved { .. }
                 | WalRecord::AttemptFinished { .. }
@@ -2434,6 +2562,17 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if matches!(
+            self,
+            Self::RunStarted {
+                compaction_plan_version: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::COMPACTION_V2_FEATURE)
+        } else {
+            base
+        };
         if matches!(
             self,
             Self::ToolDispatchIntent {
@@ -2670,6 +2809,9 @@ impl WalRecord {
             | Self::CompactionRideWait { .. }
             | Self::CompactionRideWaitEnded { .. }
             | Self::CompactionNotice { .. }
+            | Self::CompactionViewV2 { .. }
+            | Self::CompactionMarker { .. }
+            | Self::CompactionViewAppliedV2 { .. }
             | Self::ToolCallDeferred { .. }
             | Self::AwaitingApproval { .. }
             | Self::LateApprovalRecorded { .. }
@@ -2953,6 +3095,9 @@ impl WalRecord {
             WalRecord::CompactionRideWait { .. } | WalRecord::CompactionRideWaitEnded { .. } => {
                 &[crate::framing::COMPACTION_RIDE_WAIT_FEATURE]
             }
+            WalRecord::CompactionViewV2 { .. }
+            | WalRecord::CompactionMarker { .. }
+            | WalRecord::CompactionViewAppliedV2 { .. } => &[crate::framing::COMPACTION_V2_FEATURE],
             WalRecord::ContextCeilingWait { .. }
             | WalRecord::ContextCeilingDecided { .. }
             | WalRecord::RunFinished {
@@ -4545,6 +4690,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -4603,6 +4749,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -4782,6 +4929,7 @@ mod schema_tests {
     #[test]
     fn pre_fix_run_started_omits_ts_ms_and_decodes_as_none() {
         let record = WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -4837,6 +4985,7 @@ mod schema_tests {
     #[test]
     fn pre_work_class_run_started_bytes_are_pinned() {
         let record = WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -4876,6 +5025,7 @@ mod schema_tests {
     #[test]
     fn pre_context_management_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -4932,6 +5082,7 @@ mod schema_tests {
     #[test]
     fn pre_variant_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -4992,6 +5143,7 @@ mod schema_tests {
     #[test]
     fn pre_service_tier_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -5106,6 +5258,7 @@ mod schema_tests {
             let mut config = min_config();
             config.frozen_render_config = frozen_render_config;
             WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -5271,6 +5424,7 @@ mod schema_tests {
         };
         let records = vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,

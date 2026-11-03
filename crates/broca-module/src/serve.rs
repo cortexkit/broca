@@ -4944,6 +4944,7 @@ mod offset_head_tests {
 
     fn run_started() -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,

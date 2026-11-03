@@ -283,6 +283,7 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     wal.append(
         1,
         &WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -938,6 +939,7 @@ async fn zero_step_count_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -1018,6 +1020,7 @@ async fn zero_context_limit_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,
@@ -1186,6 +1189,7 @@ async fn volatile_cache_tail_with_tools_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
                 sent_by: None,
                 written_at_ms: None,
                 tags: None,

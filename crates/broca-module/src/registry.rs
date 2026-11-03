@@ -7134,6 +7134,7 @@ mod tests {
 
     pub(super) fn started_record(session: &LineageKey) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
@@ -7855,6 +7856,7 @@ mod offset_page_tests {
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
             sent_by: None,
             written_at_ms: None,
             tags: None,
