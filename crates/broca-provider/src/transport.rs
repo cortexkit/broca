@@ -71,6 +71,30 @@ mod websocket_tests {
     mod codex_error_code_regressions {
         include!("transport/codex_error_code_regressions.rs");
     }
+    mod attempt_equivalence {
+        include!("transport/attempt_equivalence_websocket.rs");
+    }
+}
+
+#[cfg(test)]
+#[path = "transport/attempt_test_hooks.rs"]
+mod attempt_test_hooks;
+
+#[cfg(test)]
+#[path = "transport/attempt_trace_cases.rs"]
+mod attempt_trace_cases;
+
+macro_rules! attempt_deadline_now {
+    () => {{
+        #[cfg(test)]
+        {
+            attempt_test_hooks::deadline_now()
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }};
 }
 
 #[cfg(test)]
@@ -2410,6 +2434,8 @@ struct RetryClock {
 #[derive(Clone, Copy)]
 struct RetryMark {
     at: Instant,
+    #[cfg(test)]
+    virtual_at: Option<Instant>,
     #[cfg(any(test, feature = "test-harness"))]
     virtual_waits_before: usize,
 }
@@ -2418,17 +2444,21 @@ impl RetryClock {
     fn attempt_elapsed(&self, mark: RetryMark) -> Duration {
         #[cfg(test)]
         if let Some(attempts) = &self.virtual_retry_attempts {
-            return attempts
+            let elapsed = attempts
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("scripted attempt clock");
+            attempt_test_hooks::advance(elapsed);
+            return elapsed;
         }
         self.elapsed_since(mark)
     }
     fn mark(&self) -> RetryMark {
         RetryMark {
             at: Instant::now(),
+            #[cfg(test)]
+            virtual_at: attempt_test_hooks::virtual_now(),
             #[cfg(any(test, feature = "test-harness"))]
             virtual_waits_before: self
                 .virtual_waits
@@ -2438,6 +2468,10 @@ impl RetryClock {
     }
 
     fn elapsed_since(&self, mark: RetryMark) -> Duration {
+        #[cfg(test)]
+        if let Some(at) = mark.virtual_at {
+            return attempt_test_hooks::deadline_now().duration_since(at);
+        }
         let elapsed = mark.at.elapsed();
         #[cfg(test)]
         let elapsed = self.virtual_wait_overhead.unwrap_or(elapsed);
@@ -2452,6 +2486,10 @@ impl RetryClock {
     }
 
     async fn sleep(&self, delay: Duration) {
+        #[cfg(test)]
+        let delay = attempt_test_hooks::delay(delay);
+        #[cfg(test)]
+        attempt_test_hooks::record(attempt_test_hooks::Event::Wait(delay));
         // Keep the marker on the retry path even when no virtual waits were configured:
         // release admission must reject any linked test-harness transport.
         #[cfg(feature = "test-harness")]
@@ -2459,6 +2497,8 @@ impl RetryClock {
         #[cfg(any(test, feature = "test-harness"))]
         if let Some(waits) = &self.virtual_waits {
             waits.lock().unwrap().push(delay);
+            #[cfg(test)]
+            attempt_test_hooks::advance(delay);
             tokio::task::yield_now().await;
             return;
         }
@@ -3144,7 +3184,7 @@ where
         if cancel.is_cancelled() || tx.is_closed() {
             return Ok((Vec::new(), 0));
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if deadline.is_some_and(|deadline| attempt_deadline_now!() >= deadline) {
             cancel.cancel();
             return Ok((Vec::new(), 0));
         }
@@ -3161,6 +3201,11 @@ where
                 _ = tx.closed() => return Ok((Vec::new(), 0)),
                 refreshed = recovery.recovery.refresher.refresh_expiring() => refreshed,
             };
+            #[cfg(test)]
+            attempt_test_hooks::record(attempt_test_hooks::Event::Refresh {
+                rejected: false,
+                credential: refreshed.is_some(),
+            });
             if let Some(refreshed) = refreshed {
                 recovery
                     .recovery
@@ -3201,6 +3246,8 @@ where
         let escape_client = use_escape_client.then(|| {
             #[cfg(test)]
             escape_client_builds.fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            attempt_test_hooks::record(attempt_test_hooks::Event::EscapeClient);
             shared_client.http1_escape()
         });
         let client = escape_client.as_ref().unwrap_or(shared_client);
@@ -3393,6 +3440,11 @@ where
                         _ = tx.closed() => return Ok((Vec::new(), 0)),
                         refreshed = recovery.recovery.refresher.refresh_rejected(rejected_status) => refreshed,
                     };
+                    #[cfg(test)]
+                    attempt_test_hooks::record(attempt_test_hooks::Event::Refresh {
+                        rejected: true,
+                        credential: refreshed.is_some(),
+                    });
                     let Some(refreshed) = refreshed else {
                         warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
                         return Err((failure.error, attempt_index as u32));
@@ -3474,7 +3526,16 @@ where
                         || {
                             request.family
                                 == Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt)
-                                && websocket.is_some_and(|session| session.try_switch_to_https())
+                                && websocket.is_some_and(|session| {
+                                    let switched = session.try_switch_to_https();
+                                    #[cfg(test)]
+                                    if switched {
+                                        attempt_test_hooks::record(
+                                            attempt_test_hooks::Event::SwitchToHttps,
+                                        );
+                                    }
+                                    switched
+                                })
                         },
                     );
                     let (delay, server_advised, decision, reason) = match decision {
@@ -3516,7 +3577,7 @@ where
                     // lead to a send.
                     if server_advised
                         && deadline.is_some_and(|deadline| {
-                            delay >= deadline.saturating_duration_since(Instant::now())
+                            delay >= deadline.saturating_duration_since(attempt_deadline_now!())
                         })
                     {
                         warn_attempt_retry(
@@ -3544,7 +3605,7 @@ where
                     if failure.error.status == Some(429)
                         && failure.error.retry_after_secs.is_some()
                         && deadline.is_some_and(|deadline| {
-                            delay >= deadline.saturating_duration_since(Instant::now())
+                            delay >= deadline.saturating_duration_since(attempt_deadline_now!())
                         })
                     {
                         warn_attempt_retry(
@@ -3801,6 +3862,10 @@ fn retry_delay(error: &ProviderError, failed_attempt_index: usize) -> Duration {
     let nominal = BASE_RETRY_DELAY
         .saturating_mul(1u32 << doublings)
         .min(MAX_BACKOFF_DELAY);
+    #[cfg(test)]
+    if let Some(factor) = attempt_test_hooks::jitter(false) {
+        return nominal.mul_f64(factor);
+    }
     let factor = rand::rng().random_range((1.0 - BACKOFF_JITTER)..=(1.0 + BACKOFF_JITTER));
     nominal.mul_f64(factor)
 }
@@ -3811,6 +3876,11 @@ fn warn_attempt_retry(
     decision: &str,
     reason: &str,
 ) {
+    #[cfg(test)]
+    attempt_test_hooks::record(attempt_test_hooks::Event::Decision {
+        action: decision.to_owned(),
+        reason: reason.to_owned(),
+    });
     if trace.ephemeral_session && trace.defer_failure_warning {
         // Ephemeral sessions prohibit retained content: log only typed error tags and local
         // timing, not provider-controlled stream diagnostics.
@@ -3879,6 +3949,11 @@ fn warn_retry_metadata(
 /// Send one attempt's evidence to the run loop. A closed receiver means nobody is left to
 /// record it, so the send error is ignored.
 async fn publish_attempt(tx: &mpsc::Sender<NormalizedEvent>, attempt: ModelAttempt) {
+    #[cfg(test)]
+    attempt_test_hooks::record(attempt_test_hooks::Event::Attempt {
+        ordinal: attempt.attempt,
+        outcome: attempt.outcome.clone(),
+    });
     let _ = tx
         .send(NormalizedEvent::Control(ProviderControl::AttemptFinished {
             attempt,
@@ -4199,6 +4274,8 @@ async fn send_attempt(
     if trace.attempt_hook.is_some() {
         trace.reserve_send(request, body.len(), compressed).await?;
     }
+    #[cfg(test)]
+    attempt_test_hooks::send(trace.attempt_ordinal, trace.send_index, false);
     // A deterministic connect refusal still reserves an attempt, but never stamps a send.
     #[cfg(test)]
     if client
@@ -4305,6 +4382,10 @@ async fn drive_selected_attempt(
 ) -> Result<Vec<NormalizedEvent>, AttemptFailure> {
     if request.family == Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt) {
         if let Some(websocket) = transport.websocket {
+            #[cfg(test)]
+            if attempt_test_hooks::is_active() && !websocket.forced_https() {
+                attempt_test_hooks::send(trace.attempt_ordinal, trace.send_index, true);
+            }
             return responses_websocket::drive(
                 websocket,
                 transport.client,
@@ -6274,6 +6355,10 @@ mod tests {
 
     mod openai_billing {
         include!("transport_openai_billing_tests.rs");
+    }
+
+    mod attempt_equivalence {
+        include!("transport/attempt_equivalence_http.rs");
     }
 
     async fn assert_offloaded_render_matches_direct<F>(

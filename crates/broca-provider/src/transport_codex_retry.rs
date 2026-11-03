@@ -71,6 +71,10 @@ pub(super) fn applies(family: Option<crate::spec::WireFamilyId>) -> bool {
 /// The jitter factor both Codex backoffs draw: uniform in `0.9..1.1`
 /// (`async-utils/src/backoff.rs:15`, `codex-client/src/retry.rs:50`).
 fn jitter() -> f64 {
+    #[cfg(test)]
+    if let Some(factor) = attempt_test_hooks::jitter(true) {
+        return factor;
+    }
     rand::rng().random_range(0.9..1.1)
 }
 
