@@ -9,6 +9,42 @@
 use super::*;
 
 #[test]
+fn compaction_v2_frame_requirements_allow_reads_but_refuse_writer_open_decoding() {
+    let mut records: Vec<WalRecord> =
+        include_str!("../../tests/fixtures/compaction_v2_records.jsonl")
+            .lines()
+            .map(|bytes| serde_json::from_str(bytes).unwrap())
+            .collect();
+    // Even a body with no compaction fields is read-only when its frame requires the feature.
+    records.push(WalRecord::TurnFinished {
+        step_id: broca_protocol::StepId(1),
+    });
+    for record in records {
+        for bytes in [
+            encode_with_requires(1, 1, &[COMPACTION_V2_FEATURE], &record).unwrap(),
+            encode_v4(
+                v4::Metadata {
+                    seq: 1,
+                    fence: 1,
+                    appended_ms: 1,
+                    writer_id: [1; 16],
+                },
+                &[COMPACTION_V2_FEATURE],
+                &record,
+            )
+            .unwrap(),
+        ] {
+            assert!(
+                matches!(decode_next(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
+            );
+            assert!(
+                matches!(decode_next_for_writer(&bytes), DecodeStep::NewerWriter { missing, .. } if missing == [COMPACTION_V2_FEATURE])
+            );
+        }
+    }
+}
+
+#[test]
 fn compaction_v2_records_and_plan_version_round_trip_exact_bytes() {
     let records: Vec<WalRecord> = include_str!("../../tests/fixtures/compaction_v2_records.jsonl")
         .lines().map(|pinned| {

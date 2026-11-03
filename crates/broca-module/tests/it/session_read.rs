@@ -28,6 +28,8 @@ use broca_wal::{DispatchOutcome, FileWal, RunConfig, Wal, WalRecord};
 use tokio::sync::{mpsc, Mutex};
 #[path = "session_read/attribution.rs"]
 mod attribution;
+#[path = "session_read/compaction_v2.rs"]
+mod compaction_v2;
 #[path = "session_read/display_facts.rs"]
 mod display_facts;
 #[path = "session_read/media.rs"]

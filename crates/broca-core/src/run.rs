@@ -1169,6 +1169,11 @@ impl std::fmt::Display for RunError {
             RunError::RetainedSessionTooLarge { max_bytes } => write!(f, "{}", crate::wal_writer::retained_size::error(*max_bytes).message),
             RunError::SessionTooLarge { max_bytes } => write!(f, "{}", crate::wal_writer::retained_size::scoped_error(*max_bytes, broca_wal::size_limit::SizeScope::Session).message),
             RunError::Wal(s) => write!(f, "wal failure: {s}"),
+            RunError::NewerWriter { missing } if missing.iter().any(|name| name == broca_wal::COMPACTION_V2_FEATURE) => write!(
+                f,
+                "newer_writer: session requires {} and needs a newer build to run; it is read-only on this build",
+                missing.join(", ")
+            ),
             RunError::NewerWriter { missing } => write!(
                 f,
                 "newer_writer: a newer broca build wrote this session's WAL, which requires WAL \

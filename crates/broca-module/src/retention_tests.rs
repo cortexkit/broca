@@ -1822,6 +1822,42 @@ async fn first_retained_send_records_policy_and_never_indexes_the_title() {
     assert!(registry.stop_and_seal().await);
 }
 
+#[tokio::test]
+async fn compaction_v2_run_refusal_does_not_delete_an_expired_legacy_lineage() {
+    let rig = Rig::new();
+    let id = rig.seed(1, 100, Some(200));
+    let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.extend(
+        broca_wal::framing::encode_with_requires(
+            3,
+            1,
+            &[broca_wal::COMPACTION_V2_FEATURE],
+            &WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+        )
+        .unwrap(),
+    );
+    fs::write(&path, &bytes).unwrap();
+    let registry = rig.registry(None);
+    let outcome = registry
+        .route_send(
+            &rig.key,
+            request(&rig.key, "next"),
+            crate::executor::RunKind::FreshOrResume,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(outcome, crate::registry::OpenError::NewerWriter { missing, reason }
+        if missing == ["compaction-v2/v1"] && reason.contains("needs a newer build to run"))
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(!rig.service.deleting(&rig.key, &id).exists());
+    assert!(rig.service.tombstones(&rig.key).unwrap().is_empty());
+}
+
 /// A later run in a retained session must carry the lineage on its run-index row even when
 /// admission takes the bounded retention sync, which projects no run rows once the WAL is
 /// longer than the 256 KiB tail it may read. A run row without a lineage is invisible to

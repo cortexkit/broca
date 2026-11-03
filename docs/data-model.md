@@ -163,6 +163,17 @@ Builds before the gate refuse `ver = 3` as "unsupported WAL framing version 3".
 feature refuses the WAL by that name. Reader support ships before any production writer.
 The reader release decodes these shapes but ignores them in replay and every session/run
 projection, including reads, history, status and results.
+Any log containing a frame that requires this feature is read-only on this build. Writer
+open checks frame requirements before repair or recovery can write anything, and refuses
+through the incompatible-feature path, naming `compaction-v2/v1` and saying the session
+needs a newer build to run. Sends, restart resumes, approvals, held results and steer
+placement cannot acquire a writer; `session.head` and the other read surfaces still work.
+Explicit frame requirements count even when the decoded record has no compaction fields.
+Archive restoration checks requirements in the already-loaded bytes before publishing a
+live copy. Run-initiated retention checks reuse their existing full read before deleting an
+expired lineage. An actorless run with neither a terminal nor a durable pause reads as
+interrupted on all read surfaces without writing a seal; recorded terminals and pauses
+keep their recorded states and reasons.
 
 **The feature floor.** Before the first frame that requires a feature, the writer adds the
 feature to `wal-feature-floor` in the state root (next to `wal/`): one name per line, sorted,

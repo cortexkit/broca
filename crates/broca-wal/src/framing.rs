@@ -272,6 +272,30 @@ pub const ACCOUNT_LIMIT_PAUSE_FEATURE: &str = "account-limit-pause/v1";
 /// Mode-3 accepted views, applied-view selections, cut markers and the frozen plan version.
 pub const COMPACTION_V2_FEATURE: &str = "compaction-v2/v1";
 
+/// Writer opens verify the same framing as reads, but cannot run sessions whose frames require
+/// `compaction-v2/v1`: this reader release cannot render those views. Requirements are authoritative.
+pub(crate) fn decode_next_for_writer(buf: &[u8]) -> DecodeStep {
+    decode_projected_for_writer(buf, |seq, fence, payload| {
+        let record = serde_json::from_slice(payload)?;
+        Ok(FramedRecord { seq, fence, record })
+    })
+}
+
+pub(crate) fn decode_projected_for_writer<T>(
+    buf: &[u8],
+    project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
+) -> DecodeStep<T> {
+    static WRITABLE: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    let writable = WRITABLE.get_or_init(|| {
+        KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != COMPACTION_V2_FEATURE)
+            .collect()
+    });
+    decode_projected_with(buf, writable, project)
+}
+
 /// Physical-send reservation and settlement evidence for billing readers.
 pub const BILL_ATTEMPTS_FEATURE: &str = "bill-attempts/v1";
 
@@ -949,6 +973,23 @@ fn decode_projected_with<T>(
     known: &[&str],
     project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
 ) -> DecodeStep<T> {
+    decode_projected_with_requirements(buf, known, |seq, fence, payload, _| {
+        project(seq, fence, payload)
+    })
+}
+
+pub(crate) fn decode_with_run_requirement(buf: &[u8]) -> DecodeStep<(FramedRecord, bool)> {
+    decode_projected_with_requirements(buf, KNOWN_FEATURES, |seq, fence, payload, read_only| {
+        let record = serde_json::from_slice(payload)?;
+        Ok((FramedRecord { seq, fence, record }, read_only))
+    })
+}
+
+fn decode_projected_with_requirements<T>(
+    buf: &[u8],
+    known: &[&str],
+    project: impl FnOnce(u64, u64, &[u8], bool) -> Result<T, serde_json::Error>,
+) -> DecodeStep<T> {
     if buf.get(4) == Some(&V4_FRAMING_VERSION) {
         return decode_v4_projected(buf, known, project);
     }
@@ -990,11 +1031,15 @@ fn decode_projected_with<T>(
         };
     }
 
-    let payload = if ver == GATED_FRAMING_VERSION {
+    let (payload, read_only) = if ver == GATED_FRAMING_VERSION {
         let envelope = match serde_json::from_slice::<GatedRequires>(payload) {
             Ok(envelope) => envelope,
             Err(e) => return DecodeStep::Corrupt(FrameError::Deserialize(e)),
         };
+        let read_only = envelope
+            .requires
+            .iter()
+            .any(|name| name == COMPACTION_V2_FEATURE);
         let mut missing: Vec<String> = envelope
             .requires
             .into_iter()
@@ -1008,11 +1053,11 @@ fn decode_projected_with<T>(
             missing.dedup();
             return DecodeStep::NewerWriter { ver, missing };
         }
-        envelope.record.get().as_bytes()
+        (envelope.record.get().as_bytes(), read_only)
     } else {
-        payload
+        (payload, false)
     };
-    match project(seq, fence, payload) {
+    match project(seq, fence, payload, read_only) {
         Ok(record) => DecodeStep::Record {
             framed: Box::new(record),
             consumed: total,
@@ -1024,7 +1069,7 @@ fn decode_projected_with<T>(
 fn decode_v4_projected<T>(
     buf: &[u8],
     known: &[&str],
-    project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
+    project: impl FnOnce(u64, u64, &[u8], bool) -> Result<T, serde_json::Error>,
 ) -> DecodeStep<T> {
     use broca_wal_reader::features::Policy;
     use broca_wal_reader::frame::{decode_next_with_policy, DecodeStep as V4Step};
@@ -1044,7 +1089,12 @@ fn decode_v4_projected<T>(
         }
         Ok(V4Step::Frame(frame)) => {
             let metadata = frame.header.metadata;
-            match project(metadata.seq, metadata.fence, frame.payload) {
+            let read_only = frame
+                .header
+                .requires
+                .iter()
+                .any(|name| name == COMPACTION_V2_FEATURE);
+            match project(metadata.seq, metadata.fence, frame.payload, read_only) {
                 Ok(record) => DecodeStep::Record {
                     framed: Box::new(record),
                     consumed: frame.consumed,

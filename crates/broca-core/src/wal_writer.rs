@@ -1246,6 +1246,7 @@ impl FileWalStore {
         }
         let lookup = self.archived_member(session)?;
         let path = if let Some(member) = lookup.member {
+            broca_wal::file_wal::check_member_run_compatible(&member.payload)?;
             let path = if lookup.durable {
                 self.durable_wal_path(session)
             } else {
@@ -1414,7 +1415,17 @@ impl FileWalStore {
                 )));
             }
         }
-        let records = broca_wal::replay_file(live[0], self.max_read_bytes)?;
+        let read = broca_wal::read_records_range(live[0], self.max_read_bytes, 0, None, None)?;
+        read.check_run_compatible()?;
+        let records = match read.records() {
+            broca_wal::WalRangeRecords::Complete(records) => records,
+            _ => {
+                return Err(WalError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "linked WAL disappeared before placement repair",
+                )))
+            }
+        };
         if records.iter().any(|frame| {
             !matches!(
                 frame.record,

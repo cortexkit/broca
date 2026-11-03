@@ -292,7 +292,14 @@ pub fn record_read(offset: u64, length: u64) {
 
 /// Use at the decoding boundary, not at semantic replay (which may fold a frame twice).
 pub fn decode_next(bytes: &[u8]) -> DecodeStep {
-    let step = crate::framing::decode_next(bytes);
+    decode_using(bytes, crate::framing::decode_next)
+}
+
+pub(crate) fn decode_using<T>(
+    bytes: &[u8],
+    decode: impl FnOnce(&[u8]) -> DecodeStep<T>,
+) -> DecodeStep<T> {
+    let step = decode(bytes);
     if matches!(step, DecodeStep::Record { .. } | DecodeStep::Lineage { .. }) {
         if let Some(context) = current() {
             let mut operations = context.operation.counter.0.lock().unwrap();

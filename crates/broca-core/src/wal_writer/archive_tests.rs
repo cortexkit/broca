@@ -737,6 +737,37 @@ fn extraction_preserves_lineage_identity_and_sequence_and_runs_once() {
 }
 
 #[test]
+fn compaction_v2_writer_refusal_never_extracts_an_archived_member() {
+    let f = Fixture::new();
+    f.live();
+    let path = f.store.wal_path(&f.session);
+    let mut payload = std::fs::read(&path).unwrap();
+    payload.extend(
+        broca_wal::framing::encode_with_requires(
+            4,
+            1,
+            &[broca_wal::COMPACTION_V2_FEATURE],
+            &WalRecord::StepStarted { step_id: StepId(4) },
+        )
+        .unwrap(),
+    );
+    let archive = f.archive(1, &payload);
+    let container = std::fs::read(&archive).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(f.store.read_records(&f.session).unwrap().len(), 4);
+    match f.store.open(&f.session) {
+        Err(error @ WalError::NewerWriter { .. }) => {
+            assert!(error.to_string().contains("compaction-v2/v1"));
+            assert!(error.to_string().contains("needs a newer build to run"));
+        }
+        _ => panic!("archived mode-3 session must refuse writer open"),
+    }
+    assert!(!path.exists(), "refusal never publishes a live copy");
+    assert_eq!(std::fs::read(&archive).unwrap(), container);
+    assert_eq!(f.store.read_records(&f.session).unwrap().len(), 4);
+}
+
+#[test]
 fn extraction_crash_cuts_follow_observed_operations_and_keep_session_readable() {
     // Discover cut points from a completed extraction's operation trace, including every
     // payload chunk, rather than duplicating a fixed list of crash windows in the test.
