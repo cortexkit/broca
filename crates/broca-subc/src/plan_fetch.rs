@@ -38,6 +38,7 @@ pub struct SubcPlanFetcher {
     conn: Arc<SubcConnection>,
     identity: BindIdentity,
     scope: Option<SessionScope>,
+    direct_carrier_scope: Option<ScopeSelector>,
     opened: Mutex<Vec<RouteHandle>>,
     hooks: crate::SubcHookPlane,
     compaction: crate::SubcCompactionPlane,
@@ -59,9 +60,18 @@ impl SubcPlanFetcher {
             conn,
             identity,
             scope,
+            direct_carrier_scope: None,
             opened: Mutex::new(Vec::new()),
             catalog_snapshot: Mutex::new(None),
         }
+    }
+
+    /// Carry an owner's private selector for CLI catalog fetches instead of a session's frozen scope.
+    /// Step-transform declarations and compaction role.describe calls stay unscoped; only
+    /// tool catalogs use the CLI's private selector.
+    pub fn with_direct_carrier_scope(mut self, scope: ScopeSelector) -> Self {
+        self.direct_carrier_scope = Some(scope);
+        self
     }
 
     /// Close every route this fetcher opened. Best effort: a route that cannot be closed is
@@ -101,6 +111,26 @@ impl SubcPlanFetcher {
     /// for an unscoped session). Refused when the daemon does not support scoped routes, since
     /// it would ignore the selector and open an unscoped route.
     async fn selector(&self) -> Result<Option<ScopeSelector>, FetchError> {
+        if let Some(selector) = &self.direct_carrier_scope {
+            if self.scope.is_some() {
+                return Err(FetchError::Refused {
+                    code: "scope_unsupported".into(),
+                    detail: Some(Value::String(
+                        "a private Direct carrier selector cannot replace a frozen session scope"
+                            .into(),
+                    )),
+                    retryable: false,
+                });
+            }
+            crate::carrier_scope::verify_direct_carrier_scope(&self.conn, selector)
+                .await
+                .map_err(|error| FetchError::Refused {
+                    code: error.split(':').next().unwrap_or(error).into(),
+                    detail: Some(Value::String(error.into())),
+                    retryable: false,
+                })?;
+            return Ok(Some(selector.clone()));
+        }
         let Some(scope) = &self.scope else {
             return Ok(None);
         };
@@ -131,7 +161,13 @@ impl SubcPlanFetcher {
             .conn
             .route_open_tool_provider_v1(provider, &self.identity, selector)
             .await
-            .map_err(open_error)?;
+            .map_err(|error| {
+                open_error(if self.direct_carrier_scope.is_some() {
+                    crate::carrier_scope::private_route_error(error)
+                } else {
+                    error
+                })
+            })?;
         self.opened.lock().unwrap().push(route);
         let body = fetch_body(op, arguments)?;
         match self
