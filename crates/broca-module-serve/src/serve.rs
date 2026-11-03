@@ -5105,15 +5105,28 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     } else {
         broca_fetch_plan::OutputRefsSupport::Unsupported
     };
-    if let Some(params) = params.as_object() {
-        broca_fetch_plan::check_send_members_with(params, output_refs)?;
-    }
     let support = if handler.compaction_supported() {
         broca_fetch_plan::CompactionSupport::Supported
     } else {
         broca_fetch_plan::CompactionSupport::Unsupported
     };
     let parsed = broca_fetch_plan::parse_plan_with(plan, support, output_refs)?;
+    let plan_state = handler.plan_state(session).await;
+    // A new plan names its compaction preset before any other send member is weighed, so a
+    // missing preset is refused as itself (llm-runner 0.8 kit `compaction_item_preset_required`).
+    // A re-send of the session's frozen plan, including a legacy one without a preset, passes.
+    let new_plan = match &plan_state {
+        broca_module::serve::PlanState::Admitted { frozen } => {
+            frozen.as_deref() != Some(parsed.identity.as_str())
+        }
+        _ => true,
+    };
+    if new_plan {
+        broca_fetch_plan::require_compaction_preset(&parsed)?;
+    }
+    if let Some(params) = params.as_object() {
+        broca_fetch_plan::check_send_members_with(params, output_refs)?;
+    }
     // Filing an approval question and executing its tool call must use the scope
     // identity supplied by the daemon on the inbound route, never a caller's payload.
     // Check before fetching providers or opening an actor, so refusal writes no WAL.
@@ -5161,14 +5174,8 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
         }
         None => Some(std::sync::Arc::new(parsed.clone())),
     };
-    match handler.plan_state(session).await {
+    match plan_state {
         broca_module::serve::PlanState::Admitted { frozen } => {
-            // A plan that differs from the frozen one is checked for its own shape first, so a
-            // compaction item without a preset is named before any drift or tool refusal. Re-sends
-            // of the frozen plan itself, including a legacy plan whose item has no preset, pass.
-            if frozen.as_deref() != Some(parsed.identity.as_str()) {
-                broca_fetch_plan::require_compaction_preset(&parsed)?;
-            }
             // While a change is pending, a send whose plan is the effective plan or the latest
             // accepted one is not drift. That replaces today's plain different-plan refusal for
             // sessions with session_change state. Sessions that never received a refresh keep
@@ -5193,7 +5200,6 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
             })
         }
         broca_module::serve::PlanState::NotAdmitted | broca_module::serve::PlanState::Unknown => {
-            broca_fetch_plan::require_compaction_preset(&parsed)?;
             let Some(admitter) = handler.plan_admitter() else {
                 return Err(broca_fetch_plan::Refusal::InvalidParams {
                     detail: serde_json::json!({"field": "plan"}),

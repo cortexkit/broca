@@ -2887,12 +2887,10 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn output_refs_fields(&self, session: &str) -> Result<Map<String, Value>, HarnessError> {
+        // llm-runner 0.8 numbers parts only under a compaction item (§9.6), so the fixture no
+        // longer asks for the retired `render_tags`.
         let mut fields = self
-            .send_fields_with_plan(
-                session,
-                true,
-                json!({"render_tags": true}).as_object().unwrap(),
-            )
+            .send_fields_with_plan(session, true, &Map::new())
             .ok_or_else(|| HarnessError::new("output references need a scripted tool plan"))?;
         fields["plan"]["tool_items"][0]["output_refs"] = json!(true);
         fields["model"] = json!({"provider":output_refs::PROVIDER,"model":output_refs::MODEL});
@@ -3808,6 +3806,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         .cases
         .iter()
         .filter(|case| matches!(case.outcome, CaseOutcome::Failed { .. }))
+        .filter(|case| known_kit_defect(&case.case, &case.outcome).is_none())
         .collect();
     if !failed.is_empty() {
         // Print before asserting: the panic message keeps only the report, and CI keeps only
@@ -3949,6 +3948,9 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             .iter()
             .find(|case| case.case == name)
             .unwrap_or_else(|| panic!("the suite has no case {name}"));
+        if known_kit_defect(name, &case.outcome).is_some() {
+            continue;
+        }
         if skip_crash_kills()
             && case
                 .requires
@@ -6223,5 +6225,31 @@ fn assertion_address_lookup_does_not_contend_with_a_held_writer() {
             "the committed identity must remain readable while another connection owns the writer"
         );
         blocker.execute_batch("ROLLBACK").unwrap();
+    }
+}
+
+/// Kit 0.17.2 cases SUBC confirmed as kit defects against llm-runner 0.8.1 (Mode 3 room
+/// #2150-#2152). Each is excused only with its exact failure, so any other outcome of these
+/// cases still fails the suite. Remove an entry when the kit that fixes it is pinned.
+fn known_kit_defect(case: &str, outcome: &CaseOutcome) -> Option<&'static str> {
+    let CaseOutcome::Failed { reason } = outcome else {
+        return None;
+    };
+    match case {
+        // Its result is 131,072 bytes, over the 0.8 runner's 65,536-byte limit, so broca
+        // correctly refuses it at intake. Kit 0.17.3 uses a 32 KiB result.
+        "display_without_limits_is_whole"
+            if reason.starts_with("a display read without limits served arguments of") =>
+        {
+            Some("kit 0.17.2 sends a result over the 64 KiB limit; fixed in kit 0.17.3")
+        }
+        // retention.rs:463-464 demands the faithful fake's own identity for a never-written
+        // read, contradicting §4.3. Fixed in kit 0.17.4.
+        "retention_honoured"
+            if reason == "never-written session did not keep its empty success" =>
+        {
+            Some("kit 0.17.2 pins a fixed identity for a never-written read; fixed in kit 0.17.4")
+        }
+        _ => None,
     }
 }
