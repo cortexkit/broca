@@ -1659,6 +1659,24 @@ impl Sources {
                             );
                             json!("@HISTORY_VERSION@")
                         }
+                        // `h1.<incarnation>.<history version>/<mid>`: both stores mint their own
+                        // incarnation and version, so only the shape and the message id compare.
+                        "set_id" if value.is_string() => {
+                            let id = value.as_str().unwrap();
+                            let (scope, mid) = id.split_once('/').expect("set_id names its mid");
+                            let parts: Vec<_> = scope.split('.').collect();
+                            assert!(
+                                parts.len() == 3
+                                    && parts[0] == "h1"
+                                    && !parts[1].is_empty()
+                                    && parts[2].parse::<u64>().is_ok_and(|n| n > 0),
+                                "invalid output-reference set_id: {id}"
+                            );
+                            if let Some(own) = object.get("mid") {
+                                assert_eq!(own.as_str(), Some(mid), "set_id names another mid");
+                            }
+                            json!(format!("h1.@LINEAGE@.@HISTORY_VERSION@/{mid}"))
+                        }
                         "call_key" | "event_id" if !value.is_null() => {
                             let (lineage, seq) = value.as_str().unwrap().rsplit_once(':').unwrap();
                             assert_eq!(lineage, self.lineage);

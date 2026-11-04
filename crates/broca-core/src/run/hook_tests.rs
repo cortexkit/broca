@@ -459,6 +459,50 @@ async fn pre_tool_unavailable_refuse_is_a_single_completed_intentless_result() {
     let _ = writer.shutdown().await;
 }
 
+/// step-transform v2 decodes an answer it doesn't know into `HookAnswer::Unknown` instead of
+/// failing the call, so the plane returns it as a successful reply. The gate treats it as an
+/// unavailable hook, never as a pass of its own: the subscription's unavailability policy
+/// decides. `refuse` refuses the call; `pass` (the provider declared the check advisory) lets it
+/// run.
+#[tokio::test]
+async fn pre_tool_unknown_answer_is_unavailable_under_the_subscription_policy() {
+    for (policy, refused) in [("refuse", true), ("pass", false)] {
+        let manifest = frozen(
+            vec![vec![sub("pre_tool", Some("validate"), policy)]],
+            None,
+            false,
+        );
+        let plan = HookPlan::from_manifest(&manifest).unwrap();
+        let unknown: HookAnswer =
+            serde_json::from_value(json!({"answer": "a-future-answer"})).unwrap();
+        assert_eq!(unknown.name(), "a-future-answer");
+        let (hooks, _) = scripted(move |_, _| Reply::Answer(unknown.clone()));
+        let (writer, records) = writer();
+        let bind = BindIdentity::new("/project", "caller", "s");
+        let runtime = runtime(&plan, &hooks, &bind, &writer);
+        let plane = crate::StubToolPlane::new();
+        batch(
+            vec![call("c")],
+            &plane,
+            &crate::AllowAll,
+            &writer,
+            &runtime,
+            None,
+        )
+        .await;
+        let records = records.lock().unwrap().clone();
+        let unavailable = records.iter().filter(|r|matches!(r,WalRecord::ToolResult{outcome:DispatchOutcome::Completed,reason:Some(r),..}if r=="pre_tool_unavailable")).count();
+        let dispatched = plane
+            .log()
+            .iter()
+            .any(|event| matches!(event, crate::StubEvent::Dispatched(_)));
+        assert_eq!(unavailable, usize::from(refused), "policy {policy}");
+        assert_eq!(dispatched, !refused, "policy {policy}");
+        drop(records);
+        let _ = writer.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn pre_tool_cancel_stops_every_planned_dispatch_and_finishes_announced_batch() {
     let manifest = frozen(

@@ -413,13 +413,17 @@ async fn transient_refusal_reopens_and_retries_only_once() {
     assert_eq!(bind_count(&serving), 3);
 }
 
+/// A malformed answer fails the call. An answer that merely has a name this runner doesn't know
+/// is not malformed under step-transform v2: it decodes as `HookAnswer::Unknown`, which the run
+/// loop treats as an unavailable hook (core's
+/// `pre_tool_unknown_answer_is_unavailable_under_the_subscription_policy`).
 #[tokio::test]
 async fn terminal_refusal_and_bad_answer_do_not_retry_and_next_call_reopens() {
     let serving = start(
         "hook-failure",
         vec![
             Reply::Refuse("invalid_params"),
-            Reply::Json(json!({"answer": "unknown"})),
+            Reply::Json(json!(["not", "an", "answer"])),
             Reply::Json(json!({"answer": "pass"})),
         ],
         describe(),
