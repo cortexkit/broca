@@ -16,5 +16,6 @@
 
 pub mod codec;
 pub mod content;
+pub mod fold;
 pub mod frame;
 pub mod record;

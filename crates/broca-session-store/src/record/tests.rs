@@ -43,6 +43,7 @@ fn one_of_each() -> Vec<Record> {
                 template: None,
             }),
             tags_v1: Some(serde_json::json!({"parts": [3]})),
+            receipt_seq: Some(4),
         }),
         Record::Assistant(Assistant {
             run_id: "run-1".into(),

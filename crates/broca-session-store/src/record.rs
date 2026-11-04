@@ -123,6 +123,10 @@ message! {
         /// The part numbers a run frozen under runner tags v1 stamped on this message. Runs
         /// frozen later compute their numbers from the transcript and leave this absent.
         7 opt tags_v1: serde_json::Value,
+        /// For a message accepted before it was placed (a steer, or a queued send delivered
+        /// into a running run): the seq of the ledger record that accepted it. It arrives
+        /// while a step runs and is placed at the next step boundary, so the two are apart.
+        8 opt receipt_seq: u64,
     }
 }
 

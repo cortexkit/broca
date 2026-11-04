@@ -88,6 +88,57 @@ struct State {
     model: Option<ModelHandle>,
     setup: Vec<PartRef>,
     call_inputs: HashMap<String, Value>,
+    /// Steered and delivered messages accepted but not placed yet. Today's log records them
+    /// where they arrived; the conversation takes them at the next step boundary or run end,
+    /// which is where the new transcript records them.
+    held: Vec<Input>,
+}
+
+/// Writes the held messages as transcript entries at the boundary that places them.
+fn place_held(state: &mut State, out: &mut Converted) {
+    out.records.extend(state.held.drain(..).map(Record::Input));
+}
+
+/// Puts messages that were never placed back into the ledger record that accepted them: they
+/// never reached the conversation, so they stay part of that record's body.
+fn unplace_held(state: &mut State, out: &mut Converted) {
+    for input in state.held.drain(..) {
+        let seq = input.receipt_seq.expect("held messages name their receipt");
+        let Some(Record::Event(event)) = out.records.get_mut(seq as usize - 1) else {
+            unreachable!("a held message's receipt is a ledger event");
+        };
+        let body = event.body.get_or_insert_with(|| Value::Object(Map::new()));
+        let Value::Object(body) = body else {
+            unreachable!("event bodies are objects");
+        };
+        let messages = body
+            .entry("input")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Value::Array(messages) = messages {
+            messages.push(serde_json::to_value(&input.message).expect("messages serialize"));
+        }
+        if let Some(tags) = input.tags_v1 {
+            if let Value::Array(list) = body
+                .entry("tags")
+                .or_insert_with(|| Value::Array(Vec::new()))
+            {
+                list.push(tags);
+            }
+        }
+        if let Some(written) = input.written_at_ms {
+            body.entry("written_at_ms").or_insert(written.into());
+        }
+    }
+}
+
+/// Holds messages accepted by the ledger event about to be written, until a boundary places
+/// them.
+fn hold(inputs: Vec<Input>, state: &mut State, out: &Converted) {
+    let receipt = out.records.len() as u64 + 1;
+    state.held.extend(inputs.into_iter().map(|input| Input {
+        receipt_seq: Some(receipt),
+        ..input
+    }));
 }
 
 pub fn convert(old: &[FramedRecord]) -> Result<Converted, ConvertError> {
@@ -96,6 +147,7 @@ pub fn convert(old: &[FramedRecord]) -> Result<Converted, ConvertError> {
     for framed in old {
         convert_one(&framed.record, &mut state, &mut out)?;
     }
+    unplace_held(&mut state, &mut out);
     Ok(out)
 }
 
@@ -265,10 +317,13 @@ fn convert_one(
         "run_started" => run_started(&mut f, state, out)?,
         "model_step_finished" => model_step_finished(&mut f, state, out)?,
         "model_attempt_finished" => model_attempt(&mut f, state, out),
-        "step_started" => out.records.push(Record::StepStart(StepStart {
-            run_id: state.run_id.clone(),
-            step_id: f.req_u64("step_id"),
-        })),
+        "step_started" => {
+            place_held(state, out);
+            out.records.push(Record::StepStart(StepStart {
+                run_id: state.run_id.clone(),
+                step_id: f.req_u64("step_id"),
+            }));
+        }
         "tool_batch_started" => {
             let planned: Vec<ToolCallId> = f.parse("planned_calls")?.unwrap_or_default();
             out.records.push(Record::BatchStart(BatchStart {
@@ -288,6 +343,7 @@ fn convert_one(
             let reason = f
                 .parse("reason")?
                 .ok_or_else(|| err("run_finished without reason"))?;
+            place_held(state, out);
             out.records.push(Record::RunEnd(RunEnd {
                 run_id: state.run_id.clone(),
                 reason,
@@ -308,8 +364,10 @@ fn convert_one(
                 f.u64("written_at_ms")
             };
             let tags = per_message_tags(&mut f, input.len());
-            for (index, message) in input.into_iter().enumerate() {
-                out.records.push(Record::Input(Input {
+            let inputs = input
+                .into_iter()
+                .enumerate()
+                .map(|(index, message)| Input {
                     run_id: state.run_id.clone(),
                     placement: Placement::Steer,
                     message,
@@ -317,8 +375,10 @@ fn convert_one(
                     submission_id: None,
                     notice: None,
                     tags_v1: tags_at(&tags, index),
-                }));
-            }
+                    receipt_seq: None,
+                })
+                .collect();
+            hold(inputs, state, out);
             // The receipt (send id, delivery, retention, sender) is the queue's.
             event(&mut f, kind.clone(), out);
         }
@@ -333,6 +393,7 @@ fn convert_one(
                     submission_id: None,
                     notice: None,
                     tags_v1: f.take("tags"),
+                    receipt_seq: None,
                 }));
             }
             event(&mut f, kind.clone(), out);
@@ -620,6 +681,9 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
         choices.insert("record".into(), rest);
     }
     start.run_choices = (!choices.is_empty()).then_some(Value::Object(choices));
+    // Messages still held when a new run starts were never placed; today's conversation drops
+    // them, so they stay with the record that accepted them.
+    unplace_held(state, out);
     out.records.push(Record::RunStart(Box::new(start)));
     for (index, message) in input.into_iter().enumerate() {
         out.records.push(Record::Input(Input {
@@ -630,6 +694,7 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
             submission_id: submission_id.clone(),
             notice: None,
             tags_v1: tags_at(&tags, index),
+            receipt_seq: None,
         }));
     }
     state.run_id = run_id;
@@ -907,8 +972,10 @@ fn send_delivered(
         f.lose("input (with mode tool_result)".into(), 0);
     }
     let tags = per_message_tags(f, input.len());
-    for (index, message) in input.into_iter().enumerate() {
-        out.records.push(Record::Input(Input {
+    let inputs: Vec<Input> = input
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| Input {
             run_id: state.run_id.clone(),
             placement,
             message,
@@ -916,8 +983,9 @@ fn send_delivered(
             submission_id: submission.clone(),
             notice: None,
             tags_v1: tags_at(&tags, index),
-        }));
-    }
+            receipt_seq: None,
+        })
+        .collect();
     if f.has("appended_text") && f.has("tool_call_id") {
         let call: Option<ToolCallId> = f.parse("tool_call_id")?;
         out.records.push(Record::ResultAppend(ResultAppend {
@@ -928,6 +996,8 @@ fn send_delivered(
             written_at_ms: written,
         }));
     }
+    // Delivered messages are placed at the next step boundary, like steers.
+    hold(inputs, state, out);
     event(f, "send_delivered".into(), out);
     Ok(())
 }

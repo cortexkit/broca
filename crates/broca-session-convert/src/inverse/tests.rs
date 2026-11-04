@@ -59,6 +59,59 @@ fn changed_dispatch_arguments_round_trip() {
     ]));
 }
 
+const STEP: &str = r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"text","text":"ok"}]},"usage":{},"retries_used":0}"#;
+const STEER: &str = r#"{"type":"steered","input":[{"role":"user","content":[{"type":"text","text":"also this"}]}],"written_at_ms":7}"#;
+
+/// A steer arrives during a model step and is placed at the next step boundary: its entry moves
+/// there, names the steer's record, and both round-trip.
+#[test]
+fn a_steer_is_recorded_where_it_is_placed_and_round_trips() {
+    let old = log(&[
+        &RUN.replace("RUN", "r"),
+        r#"{"type":"step_started","step_id":1}"#,
+        STEER,
+        STEP,
+        r#"{"type":"step_started","step_id":2}"#,
+    ]);
+    let converted = convert(&old).unwrap();
+    let names: Vec<_> = converted.records.iter().map(|r| r.name()).collect();
+    assert_eq!(
+        names,
+        [
+            "SetupStub",
+            "RunStart",
+            "Input",
+            "StepStart",
+            "Event",
+            "Assistant",
+            "StepEnd",
+            "Input",
+            "StepStart"
+        ]
+    );
+    let broca_session_store::record::Record::Input(steer) = &converted.records[7] else {
+        panic!("the placed steer");
+    };
+    assert_eq!(
+        steer.receipt_seq,
+        Some(5),
+        "it names the steered event, at seq 5"
+    );
+    assert_round_trip(&old);
+}
+
+/// A steer no boundary placed before a new run started never reached the conversation, so its
+/// messages stay in the steer's record.
+#[test]
+fn an_unplaced_steer_keeps_its_messages_and_round_trips() {
+    let old = log(&[&RUN.replace("RUN", "r"), STEER]);
+    let converted = convert(&old).unwrap();
+    assert!(!converted.records.iter().any(
+        |r| matches!(r, broca_session_store::record::Record::Input(i) if i.receipt_seq.is_some())
+    ));
+    assert_round_trip(&old);
+}
+
 #[test]
 fn a_changed_value_is_named_by_path_only() {
     let a = serde_json::json!({"x": {"y": [1, {"z": "secret"}]}});

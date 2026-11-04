@@ -384,18 +384,24 @@ fn event(event: &Event, claimed: &[&Record]) -> Result<Value, String> {
         "steered" => {
             expect(replies.is_empty() && appends.is_empty())?;
             expect(inputs.iter().all(|i| i.placement == Placement::Steer))?;
-            object.insert(
-                "input".into(),
-                Value::Array(inputs.iter().map(|i| json(&i.message)).collect()),
-            );
-            if let Some(first) = inputs.first() {
-                set(&mut object, "written_at_ms", first.written_at_ms);
+            // Placed messages come back from their entries. A steer never placed kept its
+            // messages in the body, and a steer of no messages gets its empty list back.
+            if inputs.is_empty() {
+                object
+                    .entry("input")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+            } else {
+                object.insert(
+                    "input".into(),
+                    Value::Array(inputs.iter().map(|i| json(&i.message)).collect()),
+                );
+                set(&mut object, "written_at_ms", inputs[0].written_at_ms);
+                set(
+                    &mut object,
+                    "tags",
+                    tags(inputs.iter().map(|i| i.tags_v1.clone())),
+                );
             }
-            set(
-                &mut object,
-                "tags",
-                tags(inputs.iter().map(|i| i.tags_v1.clone())),
-            );
         }
         "budget_fired" => {
             expect(replies.is_empty() && appends.is_empty() && inputs.len() <= 1)?;
@@ -461,12 +467,30 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
             ))
         }
     };
+    // Steered and delivered messages are recorded where the conversation places them, after
+    // the record that accepted them; each names that record by seq, which claims it back.
+    let mut placed_later: HashMap<u64, Vec<&Record>> = HashMap::new();
+    for record in records {
+        if let Record::Input(Input {
+            receipt_seq: Some(seq),
+            ..
+        }) = record
+        {
+            placed_later.entry(*seq).or_default().push(record);
+        }
+    }
     let mut index = 0;
     while index < records.len() {
         let record = &records[index];
         index += 1;
+        // A record's seq is its position in the log, from 1.
+        let seq = index as u64;
         match record {
             Record::SetupStub(_) => {}
+            Record::Input(Input {
+                receipt_seq: Some(_),
+                ..
+            }) => {}
             Record::Input(input) if input.placement == Placement::RunInput => {
                 return Err("a run's input entry is not right after its run start".into());
             }
@@ -526,8 +550,9 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                 pending.clear();
             }
             Record::Event(e) => {
-                out.push(event(e, &pending)?);
-                pending.clear();
+                let mut claimed = std::mem::take(&mut pending);
+                claimed.extend(placed_later.remove(&seq).unwrap_or_default());
+                out.push(event(e, &claimed)?);
             }
             other => {
                 unclaimed(&pending, other.name())?;
@@ -576,6 +601,9 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
         }
     }
     unclaimed(&pending, "the end of the log")?;
+    if !placed_later.is_empty() {
+        return Err("a placed message names a record that didn't accept it".into());
+    }
     Ok(out)
 }
 

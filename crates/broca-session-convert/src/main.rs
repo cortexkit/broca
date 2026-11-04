@@ -26,7 +26,9 @@ use broca_session_convert::inverse::{comparable, first_difference, invert, witho
 use broca_session_convert::measure::{append_log, measure};
 use broca_session_convert::{convert, Tally};
 use broca_session_store::codec::Digest;
+use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::frame::{FrameKey, FRAME_OVERHEAD};
+use broca_session_store::record::Stream;
 use broca_wal::FramedRecord;
 use serde::Serialize;
 
@@ -204,6 +206,7 @@ fn main() {
     let args = parse_args();
     match args.command.as_str() {
         "check" => run_check(&args),
+        "prompt" => run_prompt(&args),
         "measure" => run_measure(&args),
         "append" => run_append(&args),
         _ => usage(),
@@ -270,6 +273,122 @@ fn run_check(args: &Args) {
         match difference {
             None => report.exact += 1,
             Some(path) => *report.mismatches.entry(path).or_default() += 1,
+        }
+    });
+    write_report(&report, args.out_file.as_deref());
+}
+
+#[derive(Default, Serialize)]
+struct PromptReport {
+    logs: u64,
+    /// Logs whose rebuilt conversation equals today's replayed prompt, message for message.
+    equal: u64,
+    messages: u64,
+    /// Logs today's replay refuses; they have no prompt to compare against.
+    replay_refused: BTreeMap<String, u64>,
+    /// Logs the new conversation fold refuses, by reason.
+    fold_refused: BTreeMap<String, u64>,
+    /// The first difference of each mismatching log, by field and roles. Never message content.
+    mismatches: BTreeMap<String, u64>,
+    /// A few mismatching logs per category, by name, to look at by hand.
+    examples: BTreeMap<String, Vec<String>>,
+}
+
+/// Where two prompts first differ, named by position, field and role only.
+fn prompt_difference(
+    today: &[broca_protocol::content::Message],
+    rebuilt: &[broca_protocol::content::Message],
+) -> Option<String> {
+    for (index, (a, b)) in today.iter().zip(rebuilt).enumerate() {
+        let at = if index + 1 == today.len().min(rebuilt.len()) {
+            "last common message"
+        } else {
+            "message"
+        };
+        let field = if a.role != b.role {
+            "role"
+        } else if a.content != b.content {
+            if a.content.len() != b.content.len() {
+                "block count"
+            } else {
+                "content"
+            }
+        } else if a.turn_system != b.turn_system {
+            "turn_system"
+        } else if a.cache_prefix_blocks != b.cache_prefix_blocks {
+            "cache_prefix_blocks"
+        } else if a.origin != b.origin {
+            "origin"
+        } else {
+            continue;
+        };
+        return Some(format!(
+            "{at}: {field} (today {:?}, rebuilt {:?})",
+            a.role, b.role
+        ));
+    }
+    (today.len() != rebuilt.len()).then(|| {
+        let (longer, role) = if today.len() > rebuilt.len() {
+            ("today longer", today[rebuilt.len()].role)
+        } else {
+            ("rebuilt longer", rebuilt[today.len()].role)
+        };
+        format!("length: {longer}, next is {role:?}")
+    })
+}
+
+/// Rebuilds each log's conversation from its converted transcript records with the new fold,
+/// and compares it with the prompt today's replay builds from the original log.
+fn run_prompt(args: &Args) {
+    let mut report = PromptReport::default();
+    each_log(args, |item| {
+        let Item::Log {
+            name, old: Ok(old), ..
+        } = item
+        else {
+            return;
+        };
+        report.logs += 1;
+        let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
+        let today = match broca_core::replay::replay(&records) {
+            Ok(state) => state.prompt,
+            Err(e) => {
+                let reason: String = e.to_string().chars().take(80).collect();
+                *report.replay_refused.entry(reason).or_default() += 1;
+                return;
+            }
+        };
+        let Ok(converted) = convert(&old) else {
+            *report.fold_refused.entry("convert".into()).or_default() += 1;
+            return;
+        };
+        let mode3 = broca_core::is_mode3_log(&records);
+        let mut conversation = Conversation::new(!mode3);
+        let folded = converted
+            .records
+            .iter()
+            .filter(|r| r.stream() == Stream::Transcript)
+            .try_for_each(|r| conversation.apply(r));
+        if let Err(e) = folded {
+            let reason = format!("{e:?}").chars().take(60).collect::<String>();
+            let key = reason.split('(').next().unwrap_or_default().to_owned();
+            *report.fold_refused.entry(key.clone()).or_default() += 1;
+            let examples = report.examples.entry(format!("fold: {key}")).or_default();
+            if examples.len() < 5 {
+                examples.push(name);
+            }
+            return;
+        }
+        report.messages += today.len() as u64;
+        match prompt_difference(&today, &conversation.messages) {
+            None => report.equal += 1,
+            Some(category) => {
+                *report.mismatches.entry(category.clone()).or_default() += 1;
+                let examples = report.examples.entry(category).or_default();
+                if examples.len() < 5 {
+                    examples.push(name);
+                }
+            }
         }
     });
     write_report(&report, args.out_file.as_deref());
