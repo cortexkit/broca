@@ -16,7 +16,7 @@ use broca_protocol::content::{ContentBlock, Message, Role, ToolResult};
 use broca_protocol::ids::ToolCallId;
 
 use crate::fold::Bound;
-use crate::record::{Placement, Record, Stream};
+use crate::record::{Marker, Placement, Record, Stream};
 
 /// Why a record can't be folded into the conversation. Each one means the records don't
 /// describe a conversation a provider would accept, so the fold refuses rather than guess.
@@ -70,6 +70,13 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The latest compaction marker: where the provider's cut falls. Requests render from
+        /// its first kept entry.
+        pub marker: Option<Marker> => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -79,6 +86,7 @@ impl Conversation {
             messages: Vec::new(),
             open: None,
             appends_in_conversation,
+            marker: None,
         }
     }
 
@@ -168,6 +176,7 @@ impl Conversation {
                     append_to_newest_result(&mut self.messages, &append.tool_call_id, &append.text);
                 }
             }
+            Record::Marker(marker) => self.marker = Some(marker.clone()),
             Record::SetupStub(_) | Record::Compaction(_) => {}
             _ => unreachable!("every transcript kind is matched above"),
         }

@@ -596,10 +596,21 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                 let mut object = members(Some(&compaction.body))?;
                 let name = match compaction.version {
                     1 => "compaction_message",
-                    2 => "compaction_marker",
                     other => return Err(format!("compaction version {other}")),
                 };
                 object.insert("type".into(), json(name));
+                out.push(Value::Object(object));
+            }
+            Record::Marker(marker) => {
+                unclaimed(&pending, "a compaction marker")?;
+                let mut object = Map::new();
+                object.insert("type".into(), json("compaction_marker"));
+                set(&mut object, "harness", marker.harness.as_ref());
+                set(&mut object, "session", marker.session.as_ref());
+                object.insert("view_version".into(), json(marker.view_version));
+                object.insert("first_kept_mid".into(), json(&marker.first_kept_mid));
+                object.insert("first_kept_ordinal".into(), json(marker.first_kept_ordinal));
+                object.insert("checkpoint".into(), json(marker.checkpoint));
                 out.push(Value::Object(object));
             }
             Record::RunStart(start) => {
@@ -707,6 +718,18 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         object.insert("sequential".into(), json(held.sequential));
                         Value::Object(object)
                     }
+                    Record::View(view) => serde_json::json!({
+                        "type": "compaction_view_v2",
+                        "version": view.version,
+                        "checksum": view.checksum,
+                        "edits": view.edits,
+                    }),
+                    Record::ViewApplied(applied) => serde_json::json!({
+                        "type": "compaction_view_applied_v2",
+                        "step_id": applied.step_id,
+                        "version": applied.version,
+                        "checksum": applied.checksum,
+                    }),
                     Record::SendEnded(ended) => {
                         let mut object = Map::new();
                         object.insert("type".into(), json("send_ended"));

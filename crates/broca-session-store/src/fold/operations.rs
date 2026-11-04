@@ -389,6 +389,13 @@ impl Run {
     }
 }
 
+/// A compaction view, by its version and checksum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewSlot {
+    pub version: u64,
+    pub checksum: String,
+}
+
 /// One send waiting in the queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
@@ -420,6 +427,19 @@ state! {
             owner: "queue",
             reset: "never",
             bound: Bound::OpenWork("sends waiting to run"),
+        },
+        /// The newest compaction view the provider handed over, which applies at the next step
+        /// boundary, as its version and checksum. Its edits stay in its record.
+        pub view_accepted: Option<ViewSlot> => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The view the latest step rendered with, and that step.
+        pub view_applied: Option<(u64, ViewSlot)> => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
         },
     }
 }
@@ -461,6 +481,24 @@ impl Operations {
             return Err(FoldError::TranscriptRecord(record.name()));
         }
         self.apply_queue(record);
+        match record {
+            Record::View(view) => {
+                self.view_accepted = Some(ViewSlot {
+                    version: view.version,
+                    checksum: view.checksum.clone(),
+                });
+            }
+            Record::ViewApplied(applied) => {
+                self.view_applied = Some((
+                    applied.step_id,
+                    ViewSlot {
+                        version: applied.version,
+                        checksum: applied.checksum.clone(),
+                    },
+                ));
+            }
+            _ => {}
+        }
         if let Record::RunStart(start) = record {
             self.run = Some(Run::new(start));
             self.refusal_schedule = start.refusal_schedule.clone();

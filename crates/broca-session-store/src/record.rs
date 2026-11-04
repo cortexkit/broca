@@ -435,15 +435,56 @@ message! {
 }
 
 message! {
-    /// A compaction boundary on the transcript. It is either a compaction message from the first
-    /// compaction protocol (found only on converted sessions), or a marker from the current
-    /// compaction contract that records where the provider's cut falls. The body is the record as
-    /// written; the compaction code is what reads it.
+    /// A compaction message from the first compaction protocol, found only on converted
+    /// sessions, which keep the last view it applied. The body is the record as written; the
+    /// first protocol's code is what reads it.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct Compaction {
-        /// 1 for a v1 compaction message, 2 for a mode-3 marker.
+        /// Always 1: the protocol the message belongs to.
         1 req version: u32,
         2 req body: serde_json::Value,
+    }
+}
+
+message! {
+    /// Where the compaction provider's cut falls, from the current compaction contract: the
+    /// first entry the applied view keeps, and the view that set it. It sits on the transcript
+    /// because an edit and resend can remove it, which moves the cut back.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Marker {
+        1 req view_version: u64,
+        /// The first kept entry's message id and ordinal.
+        2 req first_kept_mid: String,
+        3 req first_kept_ordinal: u64,
+        /// The part number the provider's numbering resumes from at the cut.
+        4 req checkpoint: u64,
+        /// The session the marker names, which a reader checks against the session it opened.
+        5 opt harness: String,
+        6 opt session: String,
+    }
+}
+
+message! {
+    /// A compaction view the provider handed over and broca accepted. It applies at the next
+    /// step boundary, recorded by `ViewApplied`.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct View {
+        1 req version: u64,
+        2 req checksum: String,
+        /// Owned by the compaction code: the view's edits as stored, each either the
+        /// provider's edit as raw JSON or the index of the identical edit in the previous
+        /// accepted view.
+        3 req edits: serde_json::Value,
+    }
+}
+
+message! {
+    /// The view a step renders with, recorded before the step's request is sent.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ViewApplied {
+        1 req step_id: u64,
+        2 req version: u64,
+        3 req checksum: String,
     }
 }
 
@@ -769,6 +810,7 @@ records! {
         4 ResultAppend,
         5 SetupStub,
         6 Compaction,
+        7 Marker,
     }
     ledger {
         // One per run, and much larger than the rest.
@@ -794,6 +836,8 @@ records! {
         83 Retraction,
         84 SendEnded,
         85 DeliveryOrdered,
+        86 View,
+        87 ViewApplied,
     }
 }
 

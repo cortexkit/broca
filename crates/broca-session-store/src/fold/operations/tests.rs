@@ -327,6 +327,42 @@ fn the_queue_drains_interrupts_first_and_drops_consumed_and_retracted_sends() {
     assert_eq!(order, ["interrupt-1", "interrupt-2", "plain-2"]);
 }
 
+/// An accepted view doesn't replace the applied one until a step applies it.
+#[test]
+fn an_accepted_view_waits_for_a_step_to_apply_it() {
+    use super::ViewSlot;
+    let view = |version: u64| {
+        Record::View(crate::record::View {
+            version,
+            checksum: format!("c{version}"),
+            edits: serde_json::json!([]),
+        })
+    };
+    let applied = Record::ViewApplied(crate::record::ViewApplied {
+        step_id: 1,
+        version: 1,
+        checksum: "c1".into(),
+    });
+    let operations = fold(&[start(), view(1), step_start(), applied, view(2)]).unwrap();
+    assert_eq!(
+        operations.view_accepted,
+        Some(ViewSlot {
+            version: 2,
+            checksum: "c2".into()
+        })
+    );
+    assert_eq!(
+        operations.view_applied,
+        Some((
+            1,
+            ViewSlot {
+                version: 1,
+                checksum: "c1".into()
+            }
+        ))
+    );
+}
+
 #[test]
 fn records_it_does_not_fold_yet_refuse_by_name() {
     let event = Record::Event(Event {

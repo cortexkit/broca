@@ -162,3 +162,32 @@ fn an_unclaimed_transcript_record_refuses() {
     let error = invert(&records, &converted.parts).unwrap_err();
     assert!(error.contains("unclaimed"), "{error}");
 }
+
+/// Records of the current compaction contract become typed records and round-trip: an accepted
+/// view with its stored edits, the view a step applied, and the marker of the provider's cut.
+#[test]
+fn current_compaction_records_round_trip() {
+    use broca_session_store::record::Record;
+    let old = log(&[
+        &RUN.replace("RUN", "r"),
+        r#"{"type":"compaction_view_v2","version":3,"checksum":"c3","edits":[{"kind":"full","edit":{"op":"drop","mid":"m1"}},{"kind":"previous","index":0}]}"#,
+        r#"{"type":"step_started","step_id":1}"#,
+        r#"{"type":"compaction_view_applied_v2","step_id":1,"version":3,"checksum":"c3"}"#,
+        r#"{"type":"compaction_marker","harness":"h","session":"s","view_version":3,"first_kept_mid":"m2","first_kept_ordinal":2,"checkpoint":7}"#,
+        STEP,
+    ]);
+    let converted = convert(&old).unwrap();
+    let kinds: Vec<_> = converted
+        .records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                Record::View(_) | Record::ViewApplied(_) | Record::Marker(_)
+            )
+        })
+        .map(|record| record.name())
+        .collect();
+    assert_eq!(kinds, ["View", "ViewApplied", "Marker"]);
+    assert_round_trip(&old);
+}

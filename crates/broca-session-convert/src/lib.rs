@@ -22,10 +22,10 @@ use broca_protocol::usage::Usage;
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::record::{
     Assistant, Attempt, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome, CancelPoint,
-    CancelRequest, Compaction, Delivery, DeliveryOrdered, Event, Input, PartKind, PartRef, Pause,
-    Placement, QueuedSend, Record, ResultAppend, Retraction, RunEnd, RunStart, SendEnded,
+    CancelRequest, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker, PartKind, PartRef,
+    Pause, Placement, QueuedSend, Record, ResultAppend, Retraction, RunEnd, RunStart, SendEnded,
     SessionRefresh, SetupStub, Steer, StepEnd, StepStart, StructuredResult, ToolHeld, ToolIntent,
-    ToolOutcome, ToolReply,
+    ToolOutcome, ToolReply, View, ViewApplied,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -532,11 +532,35 @@ fn convert_one(
                 result,
             }));
         }
-        "compaction_message" | "compaction_marker" => {
-            let version = if kind == "compaction_message" { 1 } else { 2 };
+        "compaction_marker" => out.records.push(Record::Marker(Marker {
+            view_version: f.req_u64("view_version"),
+            first_kept_mid: f.req_string("first_kept_mid"),
+            first_kept_ordinal: f.req_u64("first_kept_ordinal"),
+            checkpoint: f.req_u64("checkpoint"),
+            harness: f.string("harness"),
+            session: f.string("session"),
+        })),
+        "compaction_view_v2" => {
+            let version = f.req_u64("version");
+            let checksum = f.req_string("checksum");
+            let edits = f
+                .take("edits")
+                .ok_or_else(|| err("compaction_view_v2 without edits"))?;
+            out.records.push(Record::View(View {
+                version,
+                checksum,
+                edits,
+            }));
+        }
+        "compaction_view_applied_v2" => out.records.push(Record::ViewApplied(ViewApplied {
+            step_id: f.req_u64("step_id"),
+            version: f.req_u64("version"),
+            checksum: f.req_string("checksum"),
+        })),
+        "compaction_message" => {
             let body = f.rest().unwrap_or(Value::Null);
             out.records
-                .push(Record::Compaction(Compaction { version, body }));
+                .push(Record::Compaction(Compaction { version: 1, body }));
         }
         "recovery_call_closed" => {
             let result: ToolResult = f
