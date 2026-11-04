@@ -30,6 +30,9 @@ pub enum FoldError {
     NotFolded(String),
     /// A tool batch started over another batch that still holds evidence of a call.
     OverlappingBatch,
+    /// A record arrived after a change's intent closed the log, other than that change's abort;
+    /// or an abort with no open change.
+    LogClosed(&'static str),
 }
 
 /// The ledger events that change a run's state but aren't folded yet.
@@ -461,6 +464,13 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The change whose intent closed the log, until it aborts. A committed change starts a
+        /// new log whose checkpoint has none.
+        6 opt pub open_change: crate::codec::Id128 => {
+            owner: "writer",
+            reset: "change_aborted",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -501,6 +511,19 @@ impl Operations {
             return Err(FoldError::TranscriptRecord(record.name()));
         }
         self.apply_queue(record);
+        match (record, self.open_change) {
+            (Record::ChangeAborted(aborted), Some(open)) if aborted.change == open => {
+                self.open_change = None;
+                return Ok(());
+            }
+            (_, Some(_)) => return Err(FoldError::LogClosed(record.name())),
+            (Record::ChangeIntent(intent), None) => {
+                self.open_change = Some(intent.change);
+                return Ok(());
+            }
+            (Record::ChangeAborted(_), None) => return Err(FoldError::LogClosed(record.name())),
+            _ => {}
+        }
         match record {
             Record::View(view) => {
                 self.view_accepted = Some(ViewSlot {

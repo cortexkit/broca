@@ -27,6 +27,7 @@ pub mod backend;
 pub mod checkpoint;
 pub mod codec;
 pub mod content;
+pub mod directory;
 pub mod fold;
 pub mod frame;
 pub mod head;

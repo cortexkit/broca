@@ -8,6 +8,11 @@
 //! all. Every frame also carries the writer's sync claim (`synced_through`, the offset its last
 //! completed barrier made durable) and a back-link to the previous record of its own stream.
 //!
+//! A writer's batches take consecutive seqs. A batch copied into a new log by a change (see
+//! [`LogEncoder::copy_batch`]) keeps its records' seqs, which may skip the seqs of records left in
+//! the old log, so the read rule is only that seqs increase. A removed frame still reads as
+//! damage: frame indexes have no gaps, and every frame names its batch's frame count.
+//!
 //! Reading a log reports how it ends:
 //! - **clean:** every batch is complete and every frame authenticates;
 //! - **a torn tail:** the last batch is incomplete, which a crash in the middle of a write leaves;
@@ -57,6 +62,9 @@ pub enum LogError {
     Frame(FrameError),
     /// A batch holds more records than a frame header can count.
     BatchTooLarge(usize),
+    /// Copied records whose seqs don't increase, don't follow the log's last record, or aren't
+    /// below the seq the next new record takes.
+    CopiedSeqs,
     /// A frame authenticated, so its bytes are what was written, but its record doesn't decode.
     /// The log is refused, wherever the frame lies.
     Undecodable {
@@ -115,6 +123,16 @@ pub struct Encoded {
     pub first_seq: Option<u64>,
     next_seq: u64,
     last: ChainBase,
+    last_seq: Option<u64>,
+}
+
+impl Encoded {
+    /// Records this append as written by `encoder`, and returns its bytes, for a writer that
+    /// writes several appends in one call.
+    pub fn into_written(self, encoder: &mut LogEncoder) -> Vec<u8> {
+        encoder.written(&self);
+        self.bytes
+    }
 }
 
 /// Encodes the frames of one log. It holds the log's position (frame index, length, sync claim,
@@ -131,6 +149,8 @@ pub struct LogEncoder {
     synced_through: u64,
     next_seq: u64,
     last: ChainBase,
+    /// The seq of the last record written to this log.
+    last_seq: Option<u64>,
 }
 
 impl LogEncoder {
@@ -146,6 +166,7 @@ impl LogEncoder {
             synced_through: 0,
             next_seq,
             last: base,
+            last_seq: None,
         }
     }
 
@@ -161,6 +182,7 @@ impl LogEncoder {
             synced_through: log.durable_bound.min(log.complete_through),
             next_seq,
             last: log.last,
+            last_seq: log.records.last().map(|(seq, _)| *seq),
         }
     }
 
@@ -188,6 +210,7 @@ impl LogEncoder {
             first_seq: None,
             next_seq: self.next_seq,
             last: self.last,
+            last_seq: self.last_seq,
         })
     }
 
@@ -242,6 +265,61 @@ impl LogEncoder {
             first_seq: Some(first),
             next_seq: first + u64::from(count),
             last,
+            last_seq: Some(first + u64::from(count) - 1),
+        })
+    }
+
+    /// Records copied from another log as one batch, keeping their seqs, which must increase
+    /// and follow every seq this log holds. A change copies each batch of the records it keeps
+    /// this way, so the batch rule holds in the new log too.
+    pub fn copy_batch(&self, records: &[(u64, &Record)]) -> Result<Encoded, LogError> {
+        if self.frame_index == 0 {
+            return Err(LogError::CheckpointNotFirst);
+        }
+        let count = u16::try_from(records.len())
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or(LogError::BatchTooLarge(records.len()))?;
+        let first = records[0].0;
+        let final_seq = records.last().expect("non-empty").0;
+        let ordered = records.windows(2).all(|pair| pair[1].0 > pair[0].0)
+            && self.last_seq.is_none_or(|last| first > last)
+            && final_seq < self.next_seq;
+        if !ordered {
+            return Err(LogError::CopiedSeqs);
+        }
+        let mut last = self.last;
+        let mut bytes = Vec::new();
+        for (position, (seq, record)) in records.iter().enumerate() {
+            let stream = record.stream();
+            let header = FrameHeader {
+                flags: 0,
+                stream: frame_stream(stream),
+                kind: u8::try_from(record.kind())
+                    .map_err(|_| FrameError::BadHeader("record kind above 255"))?,
+                kind_version: 1,
+                key_id: self.key.id(),
+                seq: *seq,
+                batch_first: first,
+                batch_count: count,
+                frame_index: self.frame_index + position as u32,
+                synced_through: self.synced_through,
+                prev_in_stream: last.slot(stream).replace(*seq),
+            };
+            bytes.extend(frame::seal(
+                &header,
+                &record.encode_body(),
+                &self.key,
+                &self.bind,
+            )?);
+        }
+        Ok(Encoded {
+            bytes,
+            frames: u32::from(count),
+            first_seq: Some(first),
+            next_seq: self.next_seq,
+            last,
+            last_seq: Some(final_seq),
         })
     }
 
@@ -259,6 +337,7 @@ impl LogEncoder {
         self.frame_index += encoded.frames;
         self.next_seq = encoded.next_seq;
         self.last = encoded.last;
+        self.last_seq = encoded.last_seq;
     }
 
     /// Records that a barrier made everything written so far durable. Later frames claim it.
@@ -407,6 +486,8 @@ pub struct ReadLog {
     /// Each stream's last record in the complete batches, or the checkpoint's base when a
     /// stream has none.
     pub last: ChainBase,
+    /// Each complete batch, as a range of indexes into `records`.
+    pub batches: Vec<std::ops::Range<usize>>,
 }
 
 /// A batch read so far, kept apart until its last frame arrives.
@@ -438,6 +519,7 @@ pub fn read(
         complete_through: 0,
         frames: 0,
         last: ChainBase::default(),
+        batches: Vec::new(),
     };
     let mut offset = 0usize;
     let mut index = 0u32;
@@ -522,11 +604,9 @@ pub fn read(
         }
         let batch = match open.as_mut() {
             Some(batch) => {
-                let expected = batch.first + u64::from(batch.frames);
-                if header.batch_first != batch.first
-                    || header.batch_count != batch.count
-                    || header.seq != expected
-                {
+                // Seqs increase across the log, checked above; inside a copied batch they may
+                // skip.
+                if header.batch_first != batch.first || header.batch_count != batch.count {
                     damaged(&mut log, at as usize, Damage::BatchMismatch);
                     return Ok(log);
                 }
@@ -568,7 +648,9 @@ pub fn read(
         if batch.frames == batch.count {
             let batch = open.take().expect("the batch being read");
             chain = batch.last;
+            let start = log.records.len();
             log.records.extend(batch.records);
+            log.batches.push(start..log.records.len());
             log.complete_through = offset as u64;
             log.frames = index;
             log.last = chain;

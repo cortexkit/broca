@@ -13,6 +13,9 @@
 //! torn tail, and appends `WriterOpened` as a barrier before anything else. Both folds start from
 //! the log's checkpoint and apply the log's records.
 //!
+//! A change's intent at the end of the log means that change never committed, so opening the
+//! writer undoes it first (see `seal`).
+//!
 //! **Appending** folds a batch into the in-memory state, writes it in one call, and syncs it when
 //! it's a barrier. A writer whose fold or write fails is poisoned: it accepts nothing more, and
 //! its caller loads the session again, so it never appends on top of an end it isn't sure of.
@@ -25,7 +28,7 @@ use crate::fold::operations::Operations;
 use crate::head::{self, Head, HeadError, OpenLog, Residence, SessionTriple, WrappedKey};
 use crate::keys::{self, random_id, DataKey, DeploymentKey};
 use crate::log::{self, ChainBase, LogEncoder, LogEnd, LogError, ReadLog};
-use crate::record::{Record, Stream, WriterOpened};
+use crate::record::{ChangeAborted, Record, Stream, WriterOpened};
 
 /// The id of every session's first data key. The data key never rotates.
 const DATA_KEY_ID: u16 = 1;
@@ -47,6 +50,12 @@ pub enum SessionError {
     Fold(String),
     /// An earlier fold or write failed; load the session again.
     Poisoned,
+    /// A change's intent closed the log; only its abort may be appended.
+    ChangeOpen,
+    /// A cut that doesn't name the first record of an entry in the open log.
+    BadCut(u64),
+    Directory(crate::directory::DirectoryError),
+    Segment(crate::segment::SegmentError),
 }
 
 impl From<BackendError> for SessionError {
@@ -90,6 +99,7 @@ pub struct Session<'b, B: SessionBackend> {
     addr: SessionAddr,
     head: Head,
     version: Version,
+    key: DataKey,
     encoder: LogEncoder,
     log: Id128,
     poisoned: bool,
@@ -127,6 +137,10 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             generation: random_id(),
             next_seq: 1,
             open_log: None,
+            last_change: None,
+            transcript_dir: None,
+            ledger_dir: None,
+            pending: Vec::new(),
         };
         let version = backend
             .write_head(&addr, &head::seal(&head, &key), None, 1)
@@ -193,6 +207,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             addr,
             head,
             version,
+            key: key.clone(),
             encoder,
             log,
             poisoned: false,
@@ -270,6 +285,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             addr,
             head,
             version,
+            key: key.clone(),
             encoder: LogEncoder::resume(frame_key, bind, &read, next_seq),
             log: open.change,
             poisoned: false,
@@ -291,6 +307,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             complete_through: end,
             frames: 1,
             last: self.encoder.last(),
+            batches: Vec::new(),
         };
         self.open_writer_over(key, &read, end).await
     }
@@ -329,7 +346,22 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let opened = Record::WriterOpened(WriterOpened {
             generation: self.head.generation,
         });
-        self.append(&[opened], true).await?;
+        // A change whose intent ends the log never committed: a committed change's new log
+        // would be the head's open log. Undo it: delete what it created, then reopen the log.
+        let mut batch = Vec::new();
+        if let Some(change) = self.operations.open_change {
+            self.backend
+                .delete_change(&self.addr, &change, self.version)
+                .await?;
+            if change != self.log {
+                self.backend
+                    .delete_log(&self.addr, &change, self.version)
+                    .await?;
+            }
+            batch.push(Record::ChangeAborted(ChangeAborted { change }));
+        }
+        batch.push(opened);
+        self.append(&batch, true).await?;
         Ok(())
     }
 
@@ -338,6 +370,12 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     pub async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         if self.poisoned {
             return Err(SessionError::Poisoned);
+        }
+        // A closed log accepts only a batch that opens with its change's abort.
+        if self.operations.open_change.is_some()
+            && !matches!(records.first(), Some(Record::ChangeAborted(_)))
+        {
+            return Err(SessionError::ChangeOpen);
         }
         let encoded = self.encoder.batch(records)?;
         self.poisoned = true;
@@ -393,6 +431,9 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         (self.log, self.encoder.offset())
     }
 }
+
+mod seal;
+pub use seal::{Sealed, GRACE_MS};
 
 #[cfg(test)]
 mod tests;

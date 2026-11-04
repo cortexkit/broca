@@ -48,8 +48,8 @@ crate::message! {
     }
 }
 
-/// HMAC-SHA256, the keyed digest of a removed payload.
-fn keyed_digest(key: &[u8; 32], payload: &[u8]) -> Digest {
+/// HMAC-SHA256: the keyed digest of a removed payload, and how subkeys are derived.
+pub(crate) fn keyed_digest(key: &[u8; 32], payload: &[u8]) -> Digest {
     let mut inner = Sha256::new();
     let mut outer = Sha256::new();
     let mut block = [0u8; 64];

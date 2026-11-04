@@ -9,8 +9,11 @@
 //! no longer owns. An append also names the log end it expects, so it never lands on top of bytes
 //! it hasn't seen. A writer refused either way stops and reloads; it never retries blindly.
 //!
-//! This is the part of the interface the open log needs. Immutable objects, setup parts and
-//! deployment state come with sealing and setup.
+//! Besides the head and logs, a session has immutable objects: sealed segments and directory
+//! pages. Each belongs to the change that wrote it, and its name starts with that change's id
+//! (`<change id>/<name>`), so a change that never committed is undone by deleting its prefix.
+//! Storage shared across sessions (the tool definitions, system text and plans that runs are
+//! started with, stored once each) comes later, with its own operations.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -95,18 +98,72 @@ pub trait SessionBackend {
         expected_end: u64,
         at: Version,
     ) -> Result<(), BackendError>;
+    /// Deletes `log`, if it exists. Durable on return.
+    async fn delete_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError>;
+    /// Stores object `name`, whose first component is the id of the change writing it. Its data
+    /// is durable on return; the name is durable after [`sync_objects`](Self::sync_objects) for
+    /// that change. An object of that name already there is a crashed attempt's leftover, and is
+    /// replaced.
+    async fn put_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        bytes: &[u8],
+        at: Version,
+    ) -> Result<(), BackendError>;
+    /// Makes the names of every object `change` stored durable.
+    async fn sync_objects(
+        &self,
+        s: &SessionAddr,
+        change: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError>;
+    async fn get_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, BackendError>;
+    /// Deletes object `name`, if it exists.
+    async fn delete_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        at: Version,
+    ) -> Result<(), BackendError>;
+    /// Deletes every object `change` stored. Durable on return.
+    async fn delete_change(
+        &self,
+        s: &SessionAddr,
+        change: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError>;
+}
+
+/// The change id an object's name starts with.
+pub fn object_change(name: &str) -> &str {
+    name.split('/').next().unwrap_or_default()
 }
 
 /// A backend in memory, for tests.
 #[derive(Default)]
 pub struct MemoryBackend {
     sessions: Mutex<HashMap<SessionAddr, MemorySession>>,
+    /// Mutations left before the backend "crashes": every mutation after that fails. Tests only.
+    crash_after: Mutex<Option<usize>>,
+    /// Mutations left before exactly one of them fails. Tests only.
+    fail_at: Mutex<Option<usize>>,
 }
 
 #[derive(Default)]
 struct MemorySession {
     head: Option<(Vec<u8>, Version)>,
     logs: HashMap<Id128, Vec<u8>>,
+    objects: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 impl MemorySession {
@@ -119,6 +176,58 @@ impl MemorySession {
 }
 
 impl MemoryBackend {
+    /// Makes the backend fail every mutation after the next `mutations`, as if the process died
+    /// there: what landed before stays, nothing after lands. `None` revives it. Tests only.
+    pub fn crash_after(&self, mutations: Option<usize>) {
+        *self.crash_after.lock().unwrap() = mutations;
+    }
+
+    /// Makes the backend fail exactly one mutation, the one after the next `mutations`, and no
+    /// other. Tests only.
+    pub fn fail_once(&self, mutations: usize) {
+        *self.fail_at.lock().unwrap() = Some(mutations);
+    }
+
+    fn mutate(&self) -> Result<(), BackendError> {
+        let mut once = self.fail_at.lock().unwrap();
+        match once.as_mut() {
+            Some(0) => {
+                *once = None;
+                return Err(BackendError::Io(io::Error::other("failed once")));
+            }
+            Some(n) => *n -= 1,
+            None => {}
+        }
+        drop(once);
+        let mut left = self.crash_after.lock().unwrap();
+        match left.as_mut() {
+            Some(0) => Err(BackendError::Io(io::Error::other("crashed"))),
+            Some(n) => {
+                *n -= 1;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Every object name stored for `s`. Tests only.
+    pub fn object_names(&self, s: &SessionAddr) -> Vec<String> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions
+            .get(s)
+            .map(|session| session.objects.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every log stored for `s`. Tests only.
+    pub fn log_names(&self, s: &SessionAddr) -> Vec<Id128> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions
+            .get(s)
+            .map(|session| session.logs.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// Replaces a log's bytes, as a crash or damage would leave them. Tests only.
     pub fn set_log(&self, s: &SessionAddr, log: &Id128, bytes: Vec<u8>) {
         let mut sessions = self.sessions.lock().unwrap();
@@ -143,6 +252,7 @@ impl SessionBackend for MemoryBackend {
         expected: Option<Version>,
         next: Version,
     ) -> Result<Version, BackendError> {
+        self.mutate()?;
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.entry(s.clone()).or_default();
         let current = session.head.as_ref().map(|(_, version)| *version);
@@ -159,6 +269,7 @@ impl SessionBackend for MemoryBackend {
         log: &Id128,
         at: Version,
     ) -> Result<(), BackendError> {
+        self.mutate()?;
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.entry(s.clone()).or_default();
         session.fence(at)?;
@@ -201,6 +312,7 @@ impl SessionBackend for MemoryBackend {
         at: Version,
         _barrier: bool,
     ) -> Result<u64, BackendError> {
+        self.mutate()?;
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(s).ok_or(BackendError::NoSuchLog)?;
         session.fence(at)?;
@@ -220,6 +332,7 @@ impl SessionBackend for MemoryBackend {
         expected_end: u64,
         at: Version,
     ) -> Result<(), BackendError> {
+        self.mutate()?;
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(s).ok_or(BackendError::NoSuchLog)?;
         session.fence(at)?;
@@ -230,6 +343,84 @@ impl SessionBackend for MemoryBackend {
         stored.truncate(to as usize);
         Ok(())
     }
+
+    async fn delete_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        self.mutate()?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(s).ok_or(BackendError::NoSuchLog)?;
+        session.fence(at)?;
+        session.logs.remove(log);
+        Ok(())
+    }
+
+    async fn put_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        bytes: &[u8],
+        at: Version,
+    ) -> Result<(), BackendError> {
+        self.mutate()?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(s).ok_or(BackendError::Fenced)?;
+        session.fence(at)?;
+        session.objects.insert(name.to_owned(), bytes.to_vec());
+        Ok(())
+    }
+
+    async fn sync_objects(
+        &self,
+        _s: &SessionAddr,
+        _change: &Id128,
+        _at: Version,
+    ) -> Result<(), BackendError> {
+        self.mutate()
+    }
+
+    async fn get_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        let sessions = self.sessions.lock().unwrap();
+        Ok(sessions
+            .get(s)
+            .and_then(|session| session.objects.get(name).cloned()))
+    }
+
+    async fn delete_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        self.mutate()?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(s).ok_or(BackendError::Fenced)?;
+        session.fence(at)?;
+        session.objects.remove(name);
+        Ok(())
+    }
+
+    async fn delete_change(
+        &self,
+        s: &SessionAddr,
+        change: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        self.mutate()?;
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(s).ok_or(BackendError::Fenced)?;
+        session.fence(at)?;
+        let prefix = format!("{}/", hex(&change.0));
+        session.objects.retain(|name, _| !name.starts_with(&prefix));
+        Ok(())
+    }
 }
 
 /// A backend on local files:
@@ -238,6 +429,8 @@ impl SessionBackend for MemoryBackend {
 ///   the folder.
 /// - `<root>/logs/<addr>/<change id>`: one append-only file per log. A barrier syncs it with
 ///   `sync_all`, which issues `F_FULLFSYNC` on macOS and survives power loss.
+/// - `<root>/objects/<addr>/<change id>/<name>`: immutable objects, one folder per change, so
+///   undoing a change deletes one folder.
 ///
 /// Only one process may write a session: the caller holds the session's lease (an OS file
 /// lock) for as long as it writes. So the head version the fences compare against is kept in
@@ -269,6 +462,29 @@ impl LocalBackend {
 
     fn log_path(&self, s: &SessionAddr, log: &Id128) -> PathBuf {
         self.log_dir(s).join(hex(&log.0))
+    }
+
+    fn object_dir(&self, s: &SessionAddr) -> PathBuf {
+        self.root.join("objects").join(&s.0)
+    }
+
+    /// An object's path. A name may hold only `[0-9a-zA-Z._-]` and `/`, with no empty or `.`
+    /// components, so it can never leave the session's folder.
+    fn object_path(&self, s: &SessionAddr, name: &str) -> Result<PathBuf, BackendError> {
+        let safe = name.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        });
+        if !safe {
+            return Err(BackendError::Corrupt(
+                "object name outside the session's folder",
+            ));
+        }
+        Ok(self.object_dir(s).join(name))
     }
 
     fn read_head_file(&self, s: &SessionAddr) -> Result<Option<(Vec<u8>, Version)>, BackendError> {
@@ -454,5 +670,102 @@ impl SessionBackend for LocalBackend {
             file.sync_all()?;
             Ok(())
         })
+    }
+
+    async fn delete_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        self.fence(s, at)?;
+        self.open_logs.lock().unwrap().remove(&(s.clone(), *log));
+        match std::fs::remove_file(self.log_path(s, log)) {
+            Ok(()) => sync_dir(&self.log_dir(s))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    async fn put_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        bytes: &[u8],
+        at: Version,
+    ) -> Result<(), BackendError> {
+        self.fence(s, at)?;
+        let path = self.object_path(s, name)?;
+        let dir = path
+            .parent()
+            .expect("an object lives in its change's folder");
+        std::fs::create_dir_all(dir)?;
+        let mut file = File::create(&path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    async fn sync_objects(
+        &self,
+        s: &SessionAddr,
+        change: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        self.fence(s, at)?;
+        let dir = self.object_dir(s).join(hex(&change.0));
+        if dir.exists() {
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    sync_dir(&path)?;
+                }
+            }
+            sync_dir(&dir)?;
+            sync_dir(&self.object_dir(s))?;
+        }
+        Ok(())
+    }
+
+    async fn get_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        match std::fs::read(self.object_path(s, name)?) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn delete_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        self.fence(s, at)?;
+        match std::fs::remove_file(self.object_path(s, name)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn delete_change(
+        &self,
+        s: &SessionAddr,
+        change: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        self.fence(s, at)?;
+        match std::fs::remove_dir_all(self.object_dir(s).join(hex(&change.0))) {
+            Ok(()) => sync_dir(&self.object_dir(s))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 }

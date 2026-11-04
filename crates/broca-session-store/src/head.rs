@@ -1,7 +1,8 @@
 //! The session head: the one small, mutable object of a session.
 //!
 //! The head holds pointers, not state: which log is open, the session's identities, its wrapped
-//! data key, and the writer generation and next seq. Its size never grows with history. Every
+//! data key, the writer generation and next seq, and the roots of the session's directories. Its
+//! size never grows with history. Every
 //! change to a session commits by one compare-and-swap of the head, so the head is what decides
 //! which log is the session's.
 //!
@@ -52,6 +53,28 @@ crate::message! {
     }
 }
 
+crate::message! {
+    /// The last change the head committed, and the seq of its intent in the log it replaced.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct LastChange {
+        1 req change: Id128,
+        2 req intent_seq: u64,
+    }
+}
+
+crate::message! {
+    /// What a committed change stopped naming: the log it replaced and the directory pages it
+    /// rewrote. They're deleted once `unreferenced_at_ms` is a grace period old, so a reader that
+    /// read the head just before the commit can finish reading them first.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PendingDeletion {
+        1 req change: Id128,
+        2 req unreferenced_at_ms: u64,
+        3 rep logs: Id128,
+        4 rep objects: String,
+    }
+}
+
 crate::oneof! {
     /// Where the session stands. A head in any state but `Local` names an operation that
     /// crashed before its commit, which the next load finishes.
@@ -83,6 +106,13 @@ crate::message! {
         /// moves it backwards.
         10 req next_seq: u64,
         11 opt open_log: OpenLog,
+        12 opt last_change: LastChange,
+        /// The roots of the transcript and ledger directories (see `directory`).
+        13 opt transcript_dir: crate::directory::PageRef,
+        14 opt ledger_dir: crate::directory::PageRef,
+        /// Deletions waiting out the grace period. Every change runs due deletions before it
+        /// commits, so this holds only the changes of the last grace period.
+        15 rep pending: PendingDeletion,
     }
 }
 

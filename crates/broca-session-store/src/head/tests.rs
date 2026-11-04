@@ -29,6 +29,10 @@ fn head(deployment: &DeploymentKey, key: &DataKey) -> Head {
             change: random_id(),
             synced_len: 120,
         }),
+        last_change: None,
+        transcript_dir: None,
+        ledger_dir: None,
+        pending: Vec::new(),
     }
 }
 

@@ -817,6 +817,40 @@ message! {
     }
 }
 
+crate::values! {
+    /// What a change does.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum ChangeKind {
+        /// Seals the transcript before a compaction cut, and every ledger record.
+        1 Cut,
+        /// Seals every ledger record and keeps the transcript open.
+        2 LedgerSeal,
+    }
+}
+
+message! {
+    /// A change began: it may now create objects under its id and a new open log. Written as a
+    /// barrier before anything is created, it closes the log: the only record the log accepts
+    /// after it is the change's `ChangeAborted`. A committed change settles it by making its new
+    /// log the session's open log.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ChangeIntent {
+        1 req change: crate::codec::Id128,
+        2 req kind: ChangeKind,
+        /// For a cut, the seq of the first record kept above the cut.
+        3 opt cut: u64,
+    }
+}
+
+message! {
+    /// A change that never committed was undone: its objects and new log are deleted, and the log
+    /// accepts records again.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ChangeAborted {
+        1 req change: crate::codec::Id128,
+    }
+}
+
 records! {
     transcript {
         1 Input,
@@ -854,6 +888,8 @@ records! {
         86 View,
         87 ViewApplied,
         88 WriterOpened,
+        89 ChangeIntent,
+        90 ChangeAborted,
     }
 }
 

@@ -1070,6 +1070,11 @@ struct AppendReport {
     /// Loading a written log, in microseconds: read the file, read and decrypt every frame, and
     /// fold both streams.
     load_us: Percentiles,
+    /// Microseconds per seal (a cut, then a ledger seal), each followed by a reload that must give
+    /// the writer's state.
+    seal_us: Percentiles,
+    /// Logs where a cut was sealed; the rest had no run input where a cut may fall.
+    cuts: u64,
     /// Per log: the size of the session's log in today's format, records, barriers, total append time in milliseconds, the
     /// written log's size, and its load time in microseconds.
     per_log: Vec<(u64, u64, u64, f64, u64, u64)>,
@@ -1101,6 +1106,7 @@ fn run_append(args: &Args) {
     let mut report = AppendReport::default();
     let mut latencies = Vec::new();
     let mut loads = Vec::new();
+    let mut seals = Vec::new();
     for (index, file) in chosen.iter().enumerate() {
         let old = match broca_wal::replay_file(file, u64::MAX) {
             Ok(old) => old,
@@ -1137,6 +1143,8 @@ fn run_append(args: &Args) {
                 ));
                 latencies.extend(measured.barrier_us);
                 loads.push(measured.load_us);
+                seals.extend(measured.seal_us);
+                report.cuts += u64::from(measured.cut);
             }
             Err(e) => report.failures.push(format!("{}: {e}", file.display())),
         }
@@ -1144,6 +1152,7 @@ fn run_append(args: &Args) {
     }
     report.barrier_us = percentiles(latencies);
     report.load_us = percentiles(loads);
+    report.seal_us = percentiles(seals);
     write_report(&report, args.out_file.as_deref());
 }
 

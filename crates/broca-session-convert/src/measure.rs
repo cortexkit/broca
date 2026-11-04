@@ -17,7 +17,7 @@ use broca_session_store::codec::Message as _;
 use broca_session_store::frame::{open, seal, FrameHeader, FrameKey, FrameRead, FrameStream};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
-use broca_session_store::record::{Record, Stream};
+use broca_session_store::record::{Placement, Record, Stream};
 use broca_session_store::session::Session;
 use futures::executor::block_on;
 
@@ -230,6 +230,11 @@ pub struct AppendMeasure {
     /// decrypt and decode every frame, fold both streams from the checkpoint, and open the
     /// writer (one head update and a `WriterOpened` barrier).
     pub load_us: u64,
+    /// Microseconds for each seal: a cut at the newest run input that starts an entry (when
+    /// there is one), then a ledger seal on top.
+    pub seal_us: Vec<u64>,
+    /// Whether a cut was sealed.
+    pub cut: bool,
 }
 
 /// Writes a converted log as a real session on local files under `root`, as the live writer
@@ -237,6 +242,10 @@ pub struct AppendMeasure {
 /// batch, synced. On macOS a sync is `F_FULLFSYNC`, today's barrier. Then a fresh backend (as
 /// after a restart) loads the session through the real load path, which must give the state the
 /// writer held; that load is timed.
+///
+/// Then it seals twice: a cut at the newest run input where a cut may fall, which must leave the
+/// window as exactly the messages from there on, and a ledger seal on top. After each, the
+/// session reloads to the state its writer held.
 pub fn append_log(
     records: &[Record],
     appends_in_conversation: bool,
@@ -263,13 +272,20 @@ pub fn append_log(
         .await
         .map_err(|e| format!("create: {e:?}"))?;
         let mut batch_start = 0;
+        let mut run_inputs = Vec::new();
         for (index, record) in records.iter().enumerate() {
             if barrier_after(record, records.get(index + 1)) || index + 1 == records.len() {
                 let barrier = Instant::now();
-                session
+                let first = session
                     .append(&records[batch_start..=index], true)
                     .await
                     .map_err(|e| format!("append: {e:?}"))?;
+                for (offset, record) in records[batch_start..=index].iter().enumerate() {
+                    if matches!(record, Record::Input(input) if input.placement == Placement::RunInput)
+                    {
+                        run_inputs.push(first + offset as u64);
+                    }
+                }
                 measure
                     .barrier_us
                     .push(barrier.elapsed().as_micros() as u64);
@@ -280,17 +296,67 @@ pub fn append_log(
         measure.bytes = session.open_log().1;
         let state = (session.conversation.encode(), session.operations.encode());
         session.close().await.map_err(|e| format!("close: {e:?}"))?;
-        Ok::<_, String>(state)
+        Ok::<_, String>((state, run_inputs))
     })?;
+    let (written, run_inputs) = written;
     measure.total_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let reopened = LocalBackend::new(root);
     let load = Instant::now();
-    let loaded = block_on(Session::load(&reopened, addr, &triple, deployment))
+    let loaded = block_on(Session::load(&reopened, addr.clone(), &triple, deployment))
         .map_err(|e| format!("load: {e:?}"))?;
     measure.load_us = load.elapsed().as_micros() as u64;
     if (loaded.conversation.encode(), loaded.operations.encode()) != written {
         return Err("the loaded session's state differs from the writer's".into());
+    }
+    drop(loaded);
+
+    let sealed = block_on(async {
+        let mut session = Session::load(&reopened, addr.clone(), &triple, deployment)
+            .await
+            .map_err(|e| format!("load to seal: {e:?}"))?;
+        let before: Vec<Vec<u8>> = session
+            .conversation
+            .messages
+            .iter()
+            .map(|message| message.encode())
+            .collect();
+        for cut in run_inputs.iter().rev() {
+            let started = Instant::now();
+            match session.seal(Some(*cut), 0).await {
+                Ok(_) => {
+                    measure.seal_us.push(started.elapsed().as_micros() as u64);
+                    measure.cut = true;
+                    break;
+                }
+                Err(broca_session_store::session::SessionError::BadCut(_)) => continue,
+                Err(e) => return Err(format!("cut at {cut}: {e:?}")),
+            }
+        }
+        let after: Vec<Vec<u8>> = session
+            .conversation
+            .messages
+            .iter()
+            .map(|message| message.encode())
+            .collect();
+        if !before.ends_with(&after) {
+            return Err("the window after the cut isn't the tail of the window before it".into());
+        }
+        let started = Instant::now();
+        session
+            .seal(None, 0)
+            .await
+            .map_err(|e| format!("ledger seal: {e:?}"))?;
+        measure.seal_us.push(started.elapsed().as_micros() as u64);
+        let state = (session.conversation.encode(), session.operations.encode());
+        session.close().await.map_err(|e| format!("close: {e:?}"))?;
+        Ok::<_, String>(state)
+    })?;
+    let after_seals = LocalBackend::new(root);
+    let loaded = block_on(Session::load(&after_seals, addr, &triple, deployment))
+        .map_err(|e| format!("load after seals: {e:?}"))?;
+    if (loaded.conversation.encode(), loaded.operations.encode()) != sealed {
+        return Err("the session loaded after the seals differs from its writer's state".into());
     }
     Ok(measure)
 }

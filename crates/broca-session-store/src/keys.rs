@@ -47,6 +47,7 @@ impl DeploymentKey {
 }
 
 /// A session's data key in the clear, held only in memory.
+#[derive(Clone)]
 pub struct DataKey {
     pub id: u16,
     bytes: [u8; 32],
@@ -63,6 +64,12 @@ impl DataKey {
     /// The frame key that encrypts the session's frames under this data key.
     pub fn frame_key(&self) -> FrameKey {
         FrameKey::new(self.id, &self.bytes)
+    }
+
+    /// A key for one purpose, named by `context`, derived from this one by HMAC-SHA256, so keys
+    /// derived for different purposes are unrelated.
+    pub fn derive(&self, context: &[u8]) -> [u8; 32] {
+        crate::prune::keyed_digest(&self.bytes, context).0
     }
 }
 

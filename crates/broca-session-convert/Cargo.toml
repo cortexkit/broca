@@ -23,3 +23,6 @@ serde_jcs.workspace = true
 sha2.workspace = true
 zstd = "0.14"
 futures = { workspace = true, features = ["executor"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
