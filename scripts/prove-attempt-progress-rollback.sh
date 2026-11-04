@@ -2,8 +2,9 @@
 # Build the released WAL reader, not the worktree's reader, against a newer attempt payload.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
+source "$root/scripts/lib/exit-guard.sh"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/broca-progress-rollback.XXXXXX")"
-trap 'rm -rf "$scratch"' EXIT
+trap 'broca_exit_guard rm -rf "$scratch"' EXIT
 if [ -n "${BROCA_RELEASE_ARCHIVE:-}" ]; then
     tar -xf "$BROCA_RELEASE_ARCHIVE" -C "$scratch"
 else
@@ -38,3 +39,4 @@ fn released_0199_reads_attempt_progress_wal() {
 }
 RUST
 cargo test --manifest-path "$scratch/Cargo.toml" --locked -p broca-wal --test progress_rollback -- --exact released_0199_reads_attempt_progress_wal
+BROCA_EXIT_GUARD_FINISHED=1

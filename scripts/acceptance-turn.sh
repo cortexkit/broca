@@ -23,6 +23,7 @@
 # folderless-route refusal, and completed. Scoped success is checked separately.
 
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/exit-guard.sh"
 
 # ONE POSITIONAL ARG, AND ANYTHING FLAG-SHAPED IS A MISTAKE. The model and prompt are fixed
 # here on purpose (see the header), so `--model X` is not an option this script declined to
@@ -70,7 +71,7 @@ TOOLS='[{"name":"read","module":"aft","description":"Read a file from disk","inp
 SID="acceptance-$(date +%s)-$$"
 OUT="$(mktemp)"
 DESCRIPTION="$(mktemp)"
-trap 'rm -f "$OUT" "$DESCRIPTION"' EXIT
+trap 'broca_exit_guard rm -f "$OUT" "$DESCRIPTION"' EXIT
 
 # CANDIDATE MODELS, TRIED IN ORDER, AND THE LIST IS THE POINT.
 #
@@ -194,3 +195,4 @@ fi
 # the PASS line, so the summary asserted a version this script never observed -- the same claim
 # the check itself used to make, surviving in the output after the check was removed.
 echo "acceptance-turn: PASS -- tool dispatched, result returned, run completed"
+BROCA_EXIT_GUARD_FINISHED=1

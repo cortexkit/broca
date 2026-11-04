@@ -110,6 +110,7 @@ class PrepushDispatch(unittest.TestCase):
         shutil.copy(ROOT / 'scripts/prepush.sh', self.root / 'scripts/prepush.sh')
         (self.root / 'scripts/lib').mkdir()
         shutil.copy(ROOT / 'scripts/lib/prepush-report.sh', self.root / 'scripts/lib/prepush-report.sh')
+        shutil.copy(ROOT / 'scripts/lib/exit-guard.sh', self.root / 'scripts/lib/exit-guard.sh')
         shutil.copy(ROOT / 'scripts/lib/prepush-motor-timing.py', self.root / 'scripts/lib/prepush-motor-timing.py')
         (self.root / 'scripts/prepare-prepush-windows.py').write_text('''import argparse
 from pathlib import Path
@@ -896,6 +897,7 @@ class ArchiveShards(unittest.TestCase):
         library = self.root / 'scripts/lib'
         library.mkdir()
         shutil.copy2(ROOT / 'scripts/lib/cargo-watchdog.py', library / 'cargo-watchdog.py')
+        shutil.copy2(ROOT / 'scripts/lib/exit-guard.sh', library / 'exit-guard.sh')
         for name in ('ci-integration.sh', 'rust-test-gate.sh'):
             shutil.copy2(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         bins = self.root / 'bin'

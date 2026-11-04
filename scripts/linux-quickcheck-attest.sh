@@ -4,6 +4,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+source scripts/lib/exit-guard.sh
 
 if [[ "$(uname -s)" != Linux ]]; then
   echo "linux-quickcheck-attest: this wrapper must run on Linux" >&2
@@ -29,7 +30,8 @@ crate_list=$(IFS=,; printf '%s' "${crates[*]}")
 # The remote runner does not pass TMPDIR, hence the /tmp fallback rather than a path in the repo.
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/broca-linux-attest.XXXXXX")
 temporary=""
-trap 'rm -rf "$scratch"; [[ -z "$temporary" ]] || rm -f "$temporary"' EXIT
+cleanup_attestation() { rm -rf "$scratch"; [[ -z "$temporary" ]] || rm -f "$temporary"; }
+trap 'broca_exit_guard cleanup_attestation' EXIT
 objects="$scratch/objects"
 mkdir -p "$objects"
 alternate_objects=$(git rev-parse --git-path objects)
@@ -76,3 +78,4 @@ else
   echo "linux-quickcheck-attest: passing attestation written to $output"
   printf '%s' "$record"
 fi
+BROCA_EXIT_GUARD_FINISHED=1

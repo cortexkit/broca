@@ -3,8 +3,9 @@
 # during rollback, while continuing to read ordinary sessions without modifying either WAL.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
+source "$root/scripts/lib/exit-guard.sh"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/broca-input-cap-rollback.XXXXXX")"
-trap 'rm -rf "$scratch"' EXIT
+trap 'broca_exit_guard rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/released"
 if [ -n "${BROCA_RELEASE_ARCHIVE:-}" ]; then
     tar -xf "$BROCA_RELEASE_ARCHIVE" -C "$scratch/released"
@@ -46,3 +47,4 @@ RUST
 printf 'released reader: v0.3.210 (git archive; unmodified reader source)\n'
 cargo test --manifest-path "$scratch/released/Cargo.toml" --locked -p broca-wal \
     --test input_cap_rollback -- --nocapture
+BROCA_EXIT_GUARD_FINISHED=1

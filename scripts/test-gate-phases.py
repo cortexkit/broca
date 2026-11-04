@@ -80,6 +80,7 @@ class GatePhases(unittest.TestCase):
         library = scripts / "lib"
         library.mkdir()
         shutil.copy2(ROOT / "scripts/lib/cargo-watchdog.py", library / "cargo-watchdog.py")
+        shutil.copy2(ROOT / "scripts/lib/exit-guard.sh", library / "exit-guard.sh")
         for name in ("gate.sh", "rust-test-gate.sh", "rust-test-prewarm.sh"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         # These independent dependency gates are not the behavior under test.
@@ -183,6 +184,7 @@ class RustGateFailures(unittest.TestCase):
         library = scripts / "lib"
         library.mkdir()
         shutil.copy2(ROOT / "scripts/lib/cargo-watchdog.py", library / "cargo-watchdog.py")
+        shutil.copy2(ROOT / "scripts/lib/exit-guard.sh", library / "exit-guard.sh")
         shutil.copy2(ROOT / "scripts/rust-test-gate.sh", scripts)
         self.bins = self.root / "bin"
         self.bins.mkdir()

@@ -17,6 +17,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$repo_root/scripts/lib/exit-guard.sh"
 data_dir="$repo_root/crates/broca-catalog/data"
 snapshot="$data_dir/models.dev.json"
 meta="$data_dir/models.dev.meta.json"
@@ -26,7 +27,7 @@ command -v python3 >/dev/null || { echo "error: python3 is required" >&2; exit 1
 
 echo "→ fetching $source_url"
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+trap 'broca_exit_guard rm -f "$tmp"' EXIT
 curl -fsSL --max-time 60 "$source_url" -o "$tmp"
 
 # Normalize to a deterministic, diff-friendly form (sorted keys, 2-space indent) and
@@ -103,3 +104,4 @@ echo "Done. REVIEW THE DIFF before committing — especially data/resolution-rep
 echo "  git diff --stat crates/broca-catalog/data/"
 echo "Any provider whose resolved_family or resolution_source changed is a deliberate"
 echo "re-route that must be understood before it merges."
+BROCA_EXIT_GUARD_FINISHED=1

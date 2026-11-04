@@ -30,6 +30,7 @@
 # Exit 0 all judged runs concluded success · 1 one failed or is still going · 2 cannot compare.
 
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/exit-guard.sh"
 
 REF="${1:-HEAD}"
 if [[ "$#" -gt 0 ]]; then shift; fi
@@ -77,7 +78,7 @@ fi
 # stop false passes was a false pass in every arm. Caught only because a known-red commit and a
 # commit with no runs both reported 0. Pass the payload by PATH; stdin has one slot.
 RUNS_FILE="$(mktemp)"
-trap 'rm -f "$RUNS_FILE"' EXIT
+trap 'broca_exit_guard rm -f "$RUNS_FILE"' EXIT
 printf '%s' "$RUNS" > "$RUNS_FILE"
 
 python3 - "$FULL" "$RUNS_FILE" "$@" <<'PY'
@@ -150,3 +151,4 @@ if bad:
     raise SystemExit(1)
 print(f"ci-status: OK ({len(runs)} run(s) success)")
 PY
+BROCA_EXIT_GUARD_FINISHED=1

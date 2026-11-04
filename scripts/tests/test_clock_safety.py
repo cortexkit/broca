@@ -116,6 +116,7 @@ class TestClockGate(unittest.TestCase):
         library = scripts / "lib"
         library.mkdir()
         shutil.copy2(ROOT / "scripts/lib/cargo-watchdog.py", library / "cargo-watchdog.py")
+        shutil.copy2(ROOT / "scripts/lib/exit-guard.sh", library / "exit-guard.sh")
         shutil.copy2(ROOT / "scripts/rust-test-gate.sh", scripts / "rust-test-gate.sh")
         tools = self.root / "tools"
         tools.mkdir()

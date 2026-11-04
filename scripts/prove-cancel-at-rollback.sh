@@ -2,8 +2,9 @@
 # Prove the v0.3.202 WAL reader refuses cancellation frames by name but reads ordinary frames.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
+source "$root/scripts/lib/exit-guard.sh"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/broca-cancel-rollback.XXXXXX")"
-trap 'rm -rf "$scratch"' EXIT
+trap 'broca_exit_guard rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/released"
 if [ -n "${BROCA_RELEASE_ARCHIVE:-}" ]; then
     tar -xf "$BROCA_RELEASE_ARCHIVE" -C "$scratch/released"
@@ -46,3 +47,4 @@ RUST
 printf 'released reader: v0.3.202 (git archive)\n'
 cargo test --manifest-path "$scratch/released/Cargo.toml" --locked -p broca-wal \
     --test cancel_at_rollback -- --nocapture
+BROCA_EXIT_GUARD_FINISHED=1

@@ -25,6 +25,8 @@ class Release(unittest.TestCase):
         scripts.mkdir()
         for name in ('release.sh', 'ci-status.sh'):
             shutil.copy2(ROOT / 'scripts' / name, scripts / name)
+        (scripts / 'lib').mkdir()
+        shutil.copy2(ROOT / 'scripts/lib/exit-guard.sh', scripts / 'lib')
         self.events = self.parent / 'events'
         stage = scripts / 'stage-release.sh'
         stage.write_text(r'''#!/bin/sh

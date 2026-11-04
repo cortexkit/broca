@@ -7,6 +7,7 @@
 # Usage: scripts/script-suites.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source scripts/lib/exit-guard.sh
 
 # Suites can spawn Python themselves, so the variable (inherited) rather than `python3 -B`.
 # Bytecode left in scripts/__pycache__ would trip CI's clean-worktree guard.
@@ -34,7 +35,7 @@ fi
 # A temporary python3 link to the interpreter chosen above goes first on PATH, so a suite
 # that starts "python3" itself runs under that same interpreter.
 PY_DIR=$(mktemp -d "${TMPDIR:-/tmp}/broca-suites-python.XXXXXX")
-trap 'rm -rf "$PY_DIR"' EXIT
+trap 'broca_exit_guard rm -rf "$PY_DIR"' EXIT
 # A wrapper that execs the interpreter, not a symlink: a venv's Python finds its
 # site-packages relative to the path it was started from, so a symlink elsewhere drops them.
 printf '#!/bin/sh\nexec "%s" "$@"\n' "$PY" > "$PY_DIR/python3"
@@ -43,6 +44,7 @@ export PATH="$PY_DIR:$PATH"
 echo "script-suites: $(python3 --version) at $PY"
 
 suites=(
+    scripts/test-exit-guard.py
     scripts/test-check-path-deps.py
     scripts/test-stage-release.py
     scripts/tests/test-release-clients.py
@@ -138,3 +140,4 @@ python3 scripts/live-runs.py --self-test
 python3 scripts/audit-export-lane.py --self-test
 # Nothing under .cortexkit/ may be tracked except release-notes/, skills/, rules/ and WORKER.md.
 scripts/check-cortexkit-layout.sh
+BROCA_EXIT_GUARD_FINISHED=1

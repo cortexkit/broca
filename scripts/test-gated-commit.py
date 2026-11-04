@@ -155,6 +155,7 @@ class LinuxQuickcheckAttestation(unittest.TestCase):
         self.events = self.root / ".git" / "quickcheck-args"
         library = scripts / "lib"
         library.mkdir()
+        shutil.copy2(ROOT / "scripts/lib/exit-guard.sh", library / "exit-guard.sh")
         quickcheck = library / "linux-quickcheck.py"
         quickcheck.write_text(
             "import os, pathlib, sys\n"
