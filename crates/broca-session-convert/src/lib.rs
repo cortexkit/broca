@@ -1,10 +1,17 @@
 //! Converts one of today's session logs into records of the new session storage format.
 //!
-//! The mapping works on each old record's JSON form, the shape it is stored in today: typed
-//! fields are taken out by name, and whatever remains of an owned payload travels as JSON. Old
-//! records the new format has no kind for yet are counted as *uncovered*, with their bytes, so a
-//! measurement says exactly what it left out. Records the new format retires (the repeated
-//! lineage frame, `turn_finished`, `visibility_late`) are counted as *dropped*.
+//! The mapping works on each old record's JSON form, the shape it is stored in today. Fields are
+//! taken out one at a time by name into typed fields, or carried whole inside an owned payload.
+//! Nothing is dropped silently:
+//! - a field left over after its record is converted is reported as *lost*, by record type and
+//!   field name, and so is a value of the wrong type or a required field that is missing;
+//! - old records whose fields the new format's state rebuilding (its folds, see
+//!   `broca_session_store::record`) doesn't read individually yet become ledger events that
+//!   carry them whole;
+//! - what the new format retires on purpose (`turn_finished`, `visibility_late`, the session
+//!   identity repeated in every run start, which the head holds) is counted as *dropped*.
+//!
+//! A clean conversion is one whose lost tally is empty.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -14,17 +21,18 @@ use broca_protocol::request::ModelHandle;
 use broca_protocol::usage::Usage;
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::record::{
-    Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, Input, PartKind, PartRef, Placement,
-    Record, ResultAppend, RunEnd, RunStart, SetupStub, StepEnd, StepStart, ToolIntent, ToolOutcome,
-    ToolReply,
+    Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, Compaction, Event, Input, PartKind,
+    PartRef, Placement, QueuedSend, Record, ResultAppend, RunEnd, RunStart, SessionRefresh,
+    SetupStub, StepEnd, StepStart, StructuredResult, ToolIntent, ToolOutcome, ToolReply,
 };
 use broca_wal::{FramedRecord, WalRecord};
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
 pub mod measure;
 
-/// Old records of one type that were left out, and their stored JSON size.
+/// A count of old records, fields or values, and their stored JSON size.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct Tally {
     pub count: u64,
@@ -38,6 +46,10 @@ impl Tally {
     }
 }
 
+fn tally(map: &mut BTreeMap<String, Tally>, name: impl Into<String>, bytes: usize) {
+    map.entry(name.into()).or_default().add(bytes);
+}
+
 /// One converted log.
 #[derive(Debug, Default)]
 pub struct Converted {
@@ -46,7 +58,7 @@ pub struct Converted {
     pub parts: BTreeMap<Digest, Vec<u8>>,
     /// Bytes of setup parts as today's runs store them, summed over runs.
     pub part_bytes_per_run: u64,
-    pub uncovered: BTreeMap<String, Tally>,
+    pub lost: BTreeMap<String, Tally>,
     pub dropped: BTreeMap<String, Tally>,
     /// The session class of the log's first run.
     pub session_class: Option<String>,
@@ -106,37 +118,123 @@ fn hex_digest(text: &str) -> Option<Digest> {
     Some(Digest(out))
 }
 
-fn take(object: &mut Map<String, Value>, key: &str) -> Option<Value> {
-    object.remove(key).filter(|v| !v.is_null())
+fn json_len(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(0, |v| v.len())
 }
 
-fn take_str(object: &mut Map<String, Value>, key: &str) -> Option<String> {
-    match take(object, key)? {
-        Value::String(s) => Some(s),
-        other => Some(other.to_string()),
+/// The fields of one old record (or one object inside it), taken out one by one. Whatever is
+/// still there at `finish` is reported as lost, and so are values of the wrong type and missing
+/// required fields, so a misspelt field name shows up instead of reading as absent.
+struct Fields {
+    path: String,
+    object: Map<String, Value>,
+    lost: Vec<(String, usize)>,
+}
+
+impl Fields {
+    fn new(path: impl Into<String>, object: Map<String, Value>) -> Self {
+        Self {
+            path: path.into(),
+            object,
+            lost: Vec::new(),
+        }
     }
-}
 
-fn take_u64(object: &mut Map<String, Value>, key: &str) -> Option<u64> {
-    take(object, key).and_then(|v| v.as_u64())
-}
+    fn lose(&mut self, what: String, bytes: usize) {
+        self.lost.push((format!("{}.{what}", self.path), bytes));
+    }
 
-fn take_as<T: serde::de::DeserializeOwned>(
-    object: &mut Map<String, Value>,
-    key: &str,
-) -> Result<Option<T>, ConvertError> {
-    take(object, key)
-        .map(|v| serde_json::from_value(v).map_err(|e| err(format!("{key}: {e}"))))
-        .transpose()
-}
+    fn has(&self, key: &str) -> bool {
+        self.object.get(key).is_some_and(|v| !v.is_null())
+    }
 
-/// What's left of an object once its typed fields are taken: `None` when nothing is.
-fn rest(object: Map<String, Value>) -> Option<Value> {
-    (!object.is_empty()).then_some(Value::Object(object))
-}
+    fn take(&mut self, key: &str) -> Option<Value> {
+        self.object.remove(key).filter(|v| !v.is_null())
+    }
 
-fn json_size(record: &WalRecord) -> usize {
-    serde_json::to_vec(record).map(|v| v.len()).unwrap_or(0)
+    fn u64(&mut self, key: &str) -> Option<u64> {
+        let value = self.take(key)?;
+        let number = value.as_u64();
+        if number.is_none() {
+            self.lose(format!("{key} (not an unsigned integer)"), json_len(&value));
+        }
+        number
+    }
+
+    fn req_u64(&mut self, key: &str) -> u64 {
+        if !self.has(key) {
+            self.lose(format!("{key} (missing)"), 0);
+        }
+        self.u64(key).unwrap_or_default()
+    }
+
+    fn req_bool(&mut self, key: &str) -> bool {
+        match self.take(key) {
+            Some(Value::Bool(value)) => value,
+            Some(other) => {
+                self.lose(format!("{key} (not a bool)"), json_len(&other));
+                false
+            }
+            None => {
+                self.lose(format!("{key} (missing)"), 0);
+                false
+            }
+        }
+    }
+
+    fn string(&mut self, key: &str) -> Option<String> {
+        match self.take(key)? {
+            Value::String(text) => Some(text),
+            other => {
+                self.lose(format!("{key} (not a string)"), json_len(&other));
+                None
+            }
+        }
+    }
+
+    fn req_string(&mut self, key: &str) -> String {
+        if !self.has(key) {
+            self.lose(format!("{key} (missing)"), 0);
+        }
+        self.string(key).unwrap_or_default()
+    }
+
+    fn parse<T: DeserializeOwned>(&mut self, key: &str) -> Result<Option<T>, ConvertError> {
+        let path = format!("{}.{key}", self.path);
+        self.take(key)
+            .map(|v| serde_json::from_value(v).map_err(|e| err(format!("{path}: {e}"))))
+            .transpose()
+    }
+
+    /// An object member as its own fields, to take from separately.
+    fn object(&mut self, key: &str) -> Option<Fields> {
+        match self.take(key)? {
+            Value::Object(object) => Some(Fields::new(format!("{}.{key}", self.path), object)),
+            other => {
+                self.lose(format!("{key} (not an object)"), json_len(&other));
+                None
+            }
+        }
+    }
+
+    /// Everything not yet taken, as one payload carried whole: `None` when nothing is left.
+    fn rest(&mut self) -> Option<Value> {
+        let object = std::mem::take(&mut self.object);
+        (!object.is_empty()).then_some(Value::Object(object))
+    }
+
+    fn finish(self, out: &mut Converted) {
+        for (key, value) in self.object {
+            tally(
+                &mut out.lost,
+                format!("{}.{key}", self.path),
+                json_len(&value),
+            );
+        }
+        for (what, bytes) in self.lost {
+            tally(&mut out.lost, what, bytes);
+        }
+    }
 }
 
 fn convert_one(
@@ -144,56 +242,61 @@ fn convert_one(
     state: &mut State,
     out: &mut Converted,
 ) -> Result<(), ConvertError> {
+    if let WalRecord::ToolNoDispatch { .. } = record {
+        return tool_no_dispatch(record, state, out);
+    }
     let value = serde_json::to_value(record).map_err(|e| err(format!("serialize: {e}")))?;
-    let Value::Object(mut obj) = value else {
+    let size = json_len(&value);
+    let Value::Object(mut object) = value else {
         return Err(err("record is not an object"));
     };
-    let kind = take_str(&mut obj, "type").unwrap_or_default();
-    let size = json_size(record);
+    let kind = match object.remove("type") {
+        Some(Value::String(kind)) => kind,
+        _ => return Err(err("record without a type")),
+    };
+    let mut f = Fields::new(kind.clone(), object);
     match kind.as_str() {
-        "run_started" => run_started(obj, state, out)?,
-        "model_step_finished" => model_step_finished(obj, state, out)?,
-        "model_attempt_finished" => model_attempt(obj, state, out)?,
-        "step_started" => {
-            let step_id = take_u64(&mut obj, "step_id").unwrap_or_default();
-            out.records.push(Record::StepStart(StepStart {
-                run_id: state.run_id.clone(),
-                step_id,
-            }));
-        }
+        "run_started" => run_started(&mut f, state, out)?,
+        "model_step_finished" => model_step_finished(&mut f, state, out)?,
+        "model_attempt_finished" => model_attempt(&mut f, state, out),
+        "step_started" => out.records.push(Record::StepStart(StepStart {
+            run_id: state.run_id.clone(),
+            step_id: f.req_u64("step_id"),
+        })),
         "tool_batch_started" => {
-            let planned: Vec<ToolCallId> = take_as(&mut obj, "planned_calls")?.unwrap_or_default();
+            let planned: Vec<ToolCallId> = f.parse("planned_calls")?.unwrap_or_default();
             out.records.push(Record::BatchStart(BatchStart {
                 run_id: state.run_id.clone(),
-                batch_id: take_str(&mut obj, "batch_id").unwrap_or_default(),
-                step_id: take_u64(&mut obj, "step_id").unwrap_or_default(),
+                batch_id: f.req_string("batch_id"),
+                step_id: f.req_u64("step_id"),
                 planned,
             }));
         }
         "tool_batch_finished" => out.records.push(Record::BatchEnd(BatchEnd {
             run_id: state.run_id.clone(),
-            batch_id: take_str(&mut obj, "batch_id").unwrap_or_default(),
+            batch_id: f.req_string("batch_id"),
         })),
-        "tool_dispatch_intent" => tool_intent(obj, state, out)?,
-        "tool_result" => tool_result(obj, state, out)?,
-        "tool_no_dispatch" => tool_no_dispatch(record, state, out)?,
+        "tool_dispatch_intent" => tool_intent(&mut f, state, out)?,
+        "tool_result" => tool_result(&mut f, state, out)?,
         "run_finished" => {
-            let reason =
-                take_as(&mut obj, "reason")?.ok_or_else(|| err("run_finished without reason"))?;
+            let reason = f
+                .parse("reason")?
+                .ok_or_else(|| err("run_finished without reason"))?;
             out.records.push(Record::RunEnd(RunEnd {
                 run_id: state.run_id.clone(),
                 reason,
-                usage: take_as::<Usage>(&mut obj, "usage")?,
-                ts_ms: take_u64(&mut obj, "ts_ms"),
-                retries_used: take_u64(&mut obj, "retries_used").unwrap_or_default() as u32,
-                interrupt_reason: take_str(&mut obj, "interrupt_reason"),
-                error: take(&mut obj, "error"),
+                usage: f.parse::<Usage>("usage")?,
+                ts_ms: f.u64("ts_ms"),
+                retries_used: f.u64("retries_used").unwrap_or_default() as u32,
+                interrupt_reason: f.string("interrupt_reason"),
+                error: f.take("error"),
             }));
         }
         "steered" => {
-            let written = take_u64(&mut obj, "written_at_ms");
-            let input: Vec<Message> = take_as(&mut obj, "input")?.unwrap_or_default();
-            for message in input {
+            let written = f.u64("written_at_ms");
+            let input: Vec<Message> = f.parse("input")?.unwrap_or_default();
+            let tags = f.take("tags");
+            for (index, message) in input.into_iter().enumerate() {
                 out.records.push(Record::Input(Input {
                     run_id: state.run_id.clone(),
                     placement: Placement::Steer,
@@ -201,44 +304,15 @@ fn convert_one(
                     written_at_ms: written,
                     submission_id: None,
                     notice: None,
+                    tags_v1: tags_at(&tags, index),
                 }));
             }
-            // The receipt (send id, delivery, retention) belongs to the queue kinds, not yet
-            // defined: count what remains of it.
-            out.uncovered
-                .entry("steered (receipt)".into())
-                .or_default()
-                .add(serde_json::to_vec(&Value::Object(obj)).map_or(0, |v| v.len()));
+            // The receipt (send id, delivery, retention, sender) is the queue's.
+            event(&mut f, kind.clone(), state, out);
         }
-        "send_delivered" => {
-            let written = take_u64(&mut obj, "written_at_ms");
-            let submission = take_str(&mut obj, "submission_id");
-            let input: Vec<Message> = take_as(&mut obj, "input")?.unwrap_or_default();
-            for message in input {
-                out.records.push(Record::Input(Input {
-                    run_id: state.run_id.clone(),
-                    placement: Placement::Delivered,
-                    message,
-                    written_at_ms: written,
-                    submission_id: submission.clone(),
-                    notice: None,
-                }));
-            }
-            if let (Some(text), Some(call)) = (
-                take_str(&mut obj, "appended_text"),
-                take_as::<ToolCallId>(&mut obj, "tool_call_id")?,
-            ) {
-                out.records.push(Record::ResultAppend(ResultAppend {
-                    run_id: state.run_id.clone(),
-                    tool_call_id: call,
-                    text,
-                    notice: None,
-                    written_at_ms: written,
-                }));
-            }
-        }
+        "send_delivered" => send_delivered(&mut f, state, out)?,
         "budget_fired" => {
-            if let Some(text) = take_str(&mut obj, "caller_text") {
+            if let Some(text) = f.string("caller_text") {
                 out.records.push(Record::Input(Input {
                     run_id: state.run_id.clone(),
                     placement: Placement::BudgetNudge,
@@ -246,16 +320,73 @@ fn convert_one(
                     written_at_ms: None,
                     submission_id: None,
                     notice: None,
+                    tags_v1: f.take("tags"),
                 }));
             }
-            out.uncovered
-                .entry("budget_fired (trigger)".into())
-                .or_default()
-                .add(serde_json::to_vec(&Value::Object(obj)).map_or(0, |v| v.len()));
+            event(&mut f, kind.clone(), state, out);
         }
-        "turn_finished" | "visibility_late" => out.dropped.entry(kind).or_default().add(size),
-        _ => out.uncovered.entry(kind).or_default().add(size),
+        "queued" => queued(&mut f, out)?,
+        "session_refresh_accepted" => {
+            let mut setup = Vec::new();
+            let manifest = match f.object("manifest") {
+                Some(manifest) => manifest_parts(manifest, &mut setup, out)?,
+                None => None,
+            };
+            out.records.push(Record::SessionRefresh(SessionRefresh {
+                generation: f.req_u64("generation"),
+                policy: f.req_string("policy"),
+                run_in_progress: f.req_bool("run_in_progress"),
+                applies_from_next_run: f.req_bool("applies_from_next_run"),
+                setup,
+                manifest,
+            }));
+        }
+        "structured_output_result" => {
+            let run_id = f.req_string("run_id");
+            let result = f.take("result").unwrap_or(Value::Null);
+            out.records.push(Record::StructuredResult(StructuredResult {
+                run_id,
+                result,
+            }));
+        }
+        "compaction_message" | "compaction_marker" => {
+            let version = if kind == "compaction_message" { 1 } else { 2 };
+            let body = f.rest().unwrap_or(Value::Null);
+            out.records
+                .push(Record::Compaction(Compaction { version, body }));
+        }
+        "recovery_call_closed" => {
+            let result: ToolResult = f
+                .parse("result")?
+                .ok_or_else(|| err("recovery_call_closed without result"))?;
+            out.records.push(Record::ToolReply(ToolReply {
+                run_id: f.string("run_id").unwrap_or_else(|| state.run_id.clone()),
+                batch_id: f.string("batch_id"),
+                result,
+                finished_at_ms: None,
+                tags_v1: None,
+            }));
+            event(&mut f, kind.clone(), state, out);
+        }
+        "approval_recorded" => {
+            if let Some(result) = f.parse::<ToolResult>("closing_result")? {
+                out.records.push(Record::ToolReply(ToolReply {
+                    run_id: state.run_id.clone(),
+                    batch_id: None,
+                    result,
+                    finished_at_ms: f.u64("closed_at_ms"),
+                    tags_v1: f.take("tags"),
+                }));
+            }
+            event(&mut f, kind.clone(), state, out);
+        }
+        "turn_finished" | "visibility_late" => {
+            f.rest();
+            tally(&mut out.dropped, kind, size);
+        }
+        _ => event(&mut f, kind.clone(), state, out),
     }
+    f.finish(out);
     Ok(())
 }
 
@@ -276,57 +407,8 @@ fn add_part(
     Ok(())
 }
 
-fn run_started(
-    mut obj: Map<String, Value>,
-    state: &mut State,
-    out: &mut Converted,
-) -> Result<(), ConvertError> {
-    out.runs += 1;
-    let run_id = take_str(&mut obj, "run_id").unwrap_or_default();
-    let session_class = take_str(&mut obj, "session_class");
-    if out.session_class.is_none() {
-        out.session_class = session_class.clone();
-    }
-    let mut config = match take(&mut obj, "config") {
-        Some(Value::Object(config)) => config,
-        _ => return Err(err("run_started without config")),
-    };
-    let model: ModelHandle =
-        take_as(&mut config, "model")?.ok_or_else(|| err("run config without model"))?;
-
-    let mut parts = Vec::new();
-    if let Some(tools) = take(&mut config, "tools") {
-        add_part(PartKind::Tools, &tools, &mut parts, out)?;
-    }
-    if let Some(format) = take(&mut config, "response_format") {
-        add_part(PartKind::ResponseFormat, &format, &mut parts, out)?;
-    }
-    if let Some(global) = take(&mut config, "global_system") {
-        add_part(PartKind::GlobalSystem, &global, &mut parts, out)?;
-    }
-    let mut manifest_rest = None;
-    if let Some(Value::Object(mut manifest)) = take(&mut obj, "manifest") {
-        if let Some(plan) = take(&mut manifest, "plan") {
-            add_part(PartKind::Plan, &plan, &mut parts, out)?;
-        }
-        if let Some(Value::Array(fetches)) = take(&mut manifest, "fetches") {
-            for fetch in fetches {
-                add_part(PartKind::ProviderAnswer, &fetch, &mut parts, out)?;
-            }
-        }
-        if let Some(tools) = take(&mut manifest, "tools") {
-            add_part(PartKind::Tools, &tools, &mut parts, out)?;
-        }
-        if let Some(text) = take(&mut manifest, "system_text") {
-            add_part(PartKind::SystemText, &text, &mut parts, out)?;
-        }
-        if let Some(declarations) = take(&mut manifest, "declarations") {
-            add_part(PartKind::Declarations, &declarations, &mut parts, out)?;
-        }
-        manifest_rest = rest(manifest);
-    }
-
-    let tool_names: Vec<String> = parts
+fn tool_names(parts: &[PartRef], out: &Converted) -> Vec<String> {
+    parts
         .iter()
         .find(|p| p.kind == PartKind::Tools)
         .and_then(|p| out.parts.get(&p.digest))
@@ -337,7 +419,115 @@ fn run_started(
                 .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// Moves a plan manifest's shared members into setup parts and returns what remains of it.
+fn manifest_parts(
+    mut manifest: Fields,
+    parts: &mut Vec<PartRef>,
+    out: &mut Converted,
+) -> Result<Option<Value>, ConvertError> {
+    if let Some(plan) = manifest.take("plan") {
+        add_part(PartKind::Plan, &plan, parts, out)?;
+    }
+    match manifest.take("fetches") {
+        Some(Value::Array(fetches)) => {
+            for fetch in fetches {
+                add_part(PartKind::ProviderAnswer, &fetch, parts, out)?;
+            }
+        }
+        Some(other) => manifest.lose("fetches (not an array)".into(), json_len(&other)),
+        None => {}
+    }
+    for (key, kind) in [
+        ("tools", PartKind::Tools),
+        ("system_text", PartKind::SystemText),
+        ("declarations", PartKind::Declarations),
+    ] {
+        if let Some(value) = manifest.take(key) {
+            add_part(kind, &value, parts, out)?;
+        }
+    }
+    let rest = manifest.rest();
+    manifest.finish(out);
+    Ok(rest)
+}
+
+/// The v1 part numbers of the `index`th message of a record whose tags list one entry per
+/// message.
+fn tags_at(tags: &Option<Value>, index: usize) -> Option<Value> {
+    match tags {
+        Some(Value::Array(per_message)) => per_message.get(index).cloned(),
+        _ => None,
+    }
+}
+
+/// Carries the rest of an old record whole, as a ledger event under its old type name.
+fn event(f: &mut Fields, name: String, state: &State, out: &mut Converted) {
+    let run_id = f
+        .string("run_id")
+        .or_else(|| (!state.run_id.is_empty()).then(|| state.run_id.clone()));
+    out.records.push(Record::Event(Event {
+        name,
+        run_id,
+        body: f.rest(),
+    }));
+}
+
+fn queued(f: &mut Fields, out: &mut Converted) -> Result<(), ConvertError> {
+    let submission_id = f.req_string("submission_id");
+    let mut request = f
+        .object("request")
+        .ok_or_else(|| err("queued without request"))?;
+    let input: Vec<Message> = request.parse("input")?.unwrap_or_default();
+    let mut setup = Vec::new();
+    if let Some(tools) = request.take("tools") {
+        add_part(PartKind::Tools, &tools, &mut setup, out)?;
+    }
+    let request_rest = request.rest();
+    request.finish(out);
+    out.records.push(Record::QueuedSend(QueuedSend {
+        submission_id,
+        send_id: f.string("send_id"),
+        input,
+        setup,
+        written_at_ms: f.u64("written_at_ms"),
+        ts_ms: f.u64("ts_ms"),
+        request: request_rest,
+        receipt: f.rest(),
+    }));
+    Ok(())
+}
+
+fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result<(), ConvertError> {
+    out.runs += 1;
+    let run_id = f.req_string("run_id");
+    let session_class = f.string("session_class");
+    if out.session_class.is_none() {
+        out.session_class = session_class.clone();
+    }
+    let mut config = f
+        .object("config")
+        .ok_or_else(|| err("run_started without config"))?;
+    let model: ModelHandle = config
+        .parse("model")?
+        .ok_or_else(|| err("run config without model"))?;
+
+    let mut parts = Vec::new();
+    for (key, kind) in [
+        ("tools", PartKind::Tools),
+        ("response_format", PartKind::ResponseFormat),
+        ("global_system", PartKind::GlobalSystem),
+    ] {
+        if let Some(value) = config.take(key) {
+            add_part(kind, &value, &mut parts, out)?;
+        }
+    }
+    let manifest_rest = match f.object("manifest") {
+        Some(manifest) => manifest_parts(manifest, &mut parts, out)?,
+        None => None,
+    };
 
     let mut sorted = parts.clone();
     sorted.sort();
@@ -345,75 +535,67 @@ fn run_started(
         out.records.push(Record::SetupStub(SetupStub {
             parts: parts.clone(),
             model: model.clone(),
-            tool_names,
+            tool_names: tool_names(&parts, out),
         }));
         state.setup = sorted;
     }
 
-    let written_at = take_u64(&mut obj, "written_at_ms");
-    let submission_id = take_str(&mut obj, "submission_id");
-    let input: Vec<Message> = take_as(&mut obj, "input")?.unwrap_or_default();
-    let render_config = take(&mut config, "frozen_render_config");
-    let auth_selection = take(&mut config, "auth_selection");
-    let renderer_version = take_u64(&mut config, "renderer_version").unwrap_or_default() as u32;
-    let context_limit = take_u64(&mut config, "context_limit");
-    let service_tier = take_str(&mut config, "service_tier");
-    let route_decision_id = take_str(&mut config, "route_decision_id");
-
-    let mut choices = Map::new();
-    if let Some(config) = rest(config) {
-        choices.insert("config".into(), config);
-    }
-    if let Some(manifest) = manifest_rest {
-        choices.insert("manifest".into(), manifest);
-    }
-    // The session identity lives in the head; the v1 tag ledger is measured separately.
+    let written_at = f.u64("written_at_ms");
+    let submission_id = f.string("submission_id");
+    let input: Vec<Message> = f.parse("input")?.unwrap_or_default();
+    // The session identity lives in the head, not in each run start.
     for key in ["session", "project_id"] {
-        obj.remove(key);
+        if let Some(value) = f.take(key) {
+            tally(
+                &mut out.dropped,
+                format!("run_started.{key}"),
+                json_len(&value),
+            );
+        }
     }
-    if let Some(tags) = take(&mut obj, "tags") {
-        out.uncovered
-            .entry("run_started (v1 tags)".into())
-            .or_default()
-            .add(tags.to_string().len());
-    }
+    let tags = f.take("tags");
 
-    let start = RunStart {
+    let mut start = RunStart {
         run_id: run_id.clone(),
         model: model.clone(),
         setup: parts,
-        renderer_version,
+        renderer_version: config.req_u64("renderer_version") as u32,
         submission_id: submission_id.clone(),
-        send_id: take_str(&mut obj, "send_id"),
-        request_identity_digest: take_str(&mut obj, "request_identity_digest"),
-        ts_ms: take_u64(&mut obj, "ts_ms"),
+        send_id: f.string("send_id"),
+        request_identity_digest: f.string("request_identity_digest"),
+        ts_ms: f.u64("ts_ms"),
         written_at_ms: written_at,
         session_class,
-        retention_secs: take_u64(&mut obj, "retention"),
-        title: take_str(&mut obj, "title"),
-        context_limit,
-        service_tier,
-        route_decision_id,
-        compaction_plan_version: take_u64(&mut obj, "compaction_plan_version").map(|v| v as u32),
-        render_config,
-        auth_selection,
+        retention_secs: f.u64("retention"),
+        title: f.string("title"),
+        context_limit: config.u64("context_limit"),
+        service_tier: config.string("service_tier"),
+        route_decision_id: config.string("route_decision_id"),
+        compaction_plan_version: f.u64("compaction_plan_version").map(|v| v as u32),
+        render_config: config.take("frozen_render_config"),
+        auth_selection: config.take("auth_selection"),
         run_choices: None,
-        origin: take(&mut obj, "origin"),
-        principal: take(&mut obj, "principal"),
-        scope: take(&mut obj, "scope"),
-        hooks: take(&mut obj, "hooks"),
-        keep_warm: take(&mut obj, "keep_warm"),
-        on_restart: take(&mut obj, "on_restart"),
+        origin: f.take("origin"),
+        principal: f.take("principal"),
+        scope: f.take("scope"),
+        hooks: f.take("hooks"),
+        keep_warm: f.take("keep_warm"),
+        on_restart: f.take("on_restart"),
     };
-    if let Some(record) = rest(obj) {
-        choices.insert("record".into(), record);
+    let mut choices = Map::new();
+    if let Some(rest) = config.rest() {
+        choices.insert("config".into(), rest);
     }
-    let start = RunStart {
-        run_choices: rest(choices),
-        ..start
-    };
+    config.finish(out);
+    if let Some(rest) = manifest_rest {
+        choices.insert("manifest".into(), rest);
+    }
+    if let Some(rest) = f.rest() {
+        choices.insert("record".into(), rest);
+    }
+    start.run_choices = (!choices.is_empty()).then_some(Value::Object(choices));
     out.records.push(Record::RunStart(Box::new(start)));
-    for message in input {
+    for (index, message) in input.into_iter().enumerate() {
         out.records.push(Record::Input(Input {
             run_id: run_id.clone(),
             placement: Placement::RunInput,
@@ -421,6 +603,7 @@ fn run_started(
             written_at_ms: written_at,
             submission_id: submission_id.clone(),
             notice: None,
+            tags_v1: tags_at(&tags, index),
         }));
     }
     state.run_id = run_id;
@@ -430,18 +613,19 @@ fn run_started(
 }
 
 fn model_step_finished(
-    mut obj: Map<String, Value>,
+    f: &mut Fields,
     state: &mut State,
     out: &mut Converted,
 ) -> Result<(), ConvertError> {
-    let step_id = take_u64(&mut obj, "step_id").unwrap_or_default();
-    let mut assistant = match take(&mut obj, "assistant_message") {
-        Some(Value::Object(assistant)) => assistant,
-        _ => return Err(err("model_step_finished without assistant_message")),
-    };
-    let message_id: MessageId =
-        take_as(&mut assistant, "message_id")?.unwrap_or(MessageId(String::new()));
-    let content: Vec<ContentBlock> = take_as(&mut assistant, "content")?.unwrap_or_default();
+    let step_id = f.req_u64("step_id");
+    let mut assistant = f
+        .object("assistant_message")
+        .ok_or_else(|| err("model_step_finished without assistant_message"))?;
+    let message_id: MessageId = assistant
+        .parse("message_id")?
+        .unwrap_or(MessageId(String::new()));
+    let content: Vec<ContentBlock> = assistant.parse("content")?.unwrap_or_default();
+    assistant.finish(out);
     state.call_inputs.clear();
     let mut calls = 0u32;
     for block in &content {
@@ -452,7 +636,7 @@ fn model_step_finished(
                 .insert(call.tool_call_id.0.clone(), call.input.clone());
         }
     }
-    let usage: Option<Usage> = take_as(&mut obj, "usage")?;
+    let usage: Option<Usage> = f.parse("usage")?;
     let model = state
         .model
         .clone()
@@ -463,91 +647,87 @@ fn model_step_finished(
         provider_message_id: message_id,
         message: Message::assistant_from(content, model),
         usage,
-        written_at_ms: take_u64(&mut obj, "written_at_ms"),
+        written_at_ms: f.u64("written_at_ms"),
         last_content_at_ms: None,
+        tags_v1: f.take("tags"),
     }));
-    if let Some(tags) = take(&mut obj, "tags") {
-        out.uncovered
-            .entry("model_step_finished (v1 tags)".into())
-            .or_default()
-            .add(tags.to_string().len());
-    }
-    let finish_reason: Option<FinishReason> = take_as(&mut obj, "finish_reason")?;
+    let finish_reason: Option<FinishReason> = f.parse("finish_reason")?;
     out.records.push(Record::StepEnd(StepEnd {
         run_id: state.run_id.clone(),
         step_id,
         usage,
         finish_reason,
-        retries_used: take_u64(&mut obj, "retries_used").unwrap_or_default() as u32,
-        service_tier_used: take_str(&mut obj, "service_tier_used"),
-        speed_used: take_str(&mut obj, "speed_used"),
+        retries_used: f.u64("retries_used").unwrap_or_default() as u32,
+        service_tier_used: f.string("service_tier_used"),
+        speed_used: f.string("speed_used"),
         call_count: calls,
-        hooks: take(&mut obj, "hooks"),
-        fallback: rest(obj),
+        hooks: f.take("hooks"),
+        fallback: f.rest(),
     }));
     Ok(())
 }
 
-fn model_attempt(
-    mut obj: Map<String, Value>,
-    state: &mut State,
-    out: &mut Converted,
-) -> Result<(), ConvertError> {
+fn digest_field(f: &mut Fields, key: &str) -> Digest {
+    let text = f.req_string(key);
+    match hex_digest(&text) {
+        Some(digest) => digest,
+        None => {
+            f.lose(format!("{key} (not a SHA-256 hex digest)"), text.len());
+            Digest([0; 32])
+        }
+    }
+}
+
+fn model_attempt(f: &mut Fields, state: &mut State, out: &mut Converted) {
     let mut billing = Map::new();
     for key in ["reservation", "envelope", "account_limit_disposition"] {
-        if let Some(value) = take(&mut obj, key) {
+        if let Some(value) = f.take(key) {
             billing.insert(key.into(), value);
         }
     }
-    let request_sha = take_str(&mut obj, "request_body_sha256").unwrap_or_default();
-    let response_sha = take_str(&mut obj, "response_body_sha256").unwrap_or_default();
     let attempt = Attempt {
         run_id: state.run_id.clone(),
-        step_id: take_u64(&mut obj, "step_id").unwrap_or_default(),
-        attempt: take_u64(&mut obj, "attempt").unwrap_or_default() as u32,
-        attempt_id: take_str(&mut obj, "attempt_id"),
-        outcome: take_str(&mut obj, "outcome").unwrap_or_default(),
-        http_status: take_u64(&mut obj, "http_status").map(|v| v as u32),
-        request_body_len: take_u64(&mut obj, "request_body_len").unwrap_or_default(),
-        request_body_sha256: hex_digest(&request_sha).unwrap_or(Digest([0; 32])),
-        response_body_len: take_u64(&mut obj, "response_body_len").unwrap_or_default(),
-        response_body_sha256: hex_digest(&response_sha).unwrap_or(Digest([0; 32])),
-        ts_ms: take_u64(&mut obj, "ts_ms").unwrap_or_default(),
-        sent_at_ms: take_u64(&mut obj, "sent_at_ms"),
-        first_content_at_ms: take_u64(&mut obj, "first_content_at_ms"),
-        last_content_at_ms: take_u64(&mut obj, "last_content_at_ms"),
-        transport: take_str(&mut obj, "transport"),
-        served_account_ref: take_str(&mut obj, "served_account_ref"),
-        billing: rest(billing),
-        telemetry: rest(obj),
+        step_id: f.req_u64("step_id"),
+        attempt: f.req_u64("attempt") as u32,
+        attempt_id: f.string("attempt_id"),
+        outcome: f.req_string("outcome"),
+        http_status: f.u64("http_status").map(|v| v as u32),
+        request_body_len: f.req_u64("request_body_len"),
+        request_body_sha256: digest_field(f, "request_body_sha256"),
+        response_body_len: f.req_u64("response_body_len"),
+        response_body_sha256: digest_field(f, "response_body_sha256"),
+        ts_ms: f.req_u64("ts_ms"),
+        sent_at_ms: f.u64("sent_at_ms"),
+        first_content_at_ms: f.u64("first_content_at_ms"),
+        last_content_at_ms: f.u64("last_content_at_ms"),
+        transport: f.string("transport"),
+        served_account_ref: f.string("served_account_ref"),
+        billing: (!billing.is_empty()).then_some(Value::Object(billing)),
+        telemetry: f.rest(),
     };
     out.records.push(Record::Attempt(attempt));
-    Ok(())
 }
 
-fn tool_intent(
-    mut obj: Map<String, Value>,
-    state: &mut State,
-    out: &mut Converted,
-) -> Result<(), ConvertError> {
-    let call: ToolCallId =
-        take_as(&mut obj, "tool_call_id")?.ok_or_else(|| err("intent without tool_call_id"))?;
-    let args = take(&mut obj, "args").unwrap_or(Value::Null);
+fn tool_intent(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result<(), ConvertError> {
+    let call: ToolCallId = f
+        .parse("tool_call_id")?
+        .ok_or_else(|| err("intent without tool_call_id"))?;
+    let args = f.take("args").unwrap_or(Value::Null);
     let args_digest = sha256(&canonical(&args)?);
     let same_as_call = state.call_inputs.get(&call.0) == Some(&args);
     out.records.push(Record::ToolIntent(ToolIntent {
         run_id: state.run_id.clone(),
-        batch_id: take_str(&mut obj, "batch_id").unwrap_or_default(),
+        batch_id: f.req_string("batch_id"),
         tool_call_id: call,
-        tool_name: take_str(&mut obj, "tool_name"),
-        module_id: take_str(&mut obj, "module_id"),
+        tool_name: f.string("tool_name"),
+        module_id: f.string("module_id"),
         args_digest,
         args: (!same_as_call).then_some(args),
-        call_key: take_str(&mut obj, "call_key"),
-        approval_digest: take_str(&mut obj, "approval_digest"),
-        dispatched_at_ms: take_u64(&mut obj, "dispatched_at_ms"),
-        schema_pin: take(&mut obj, "schema_pin"),
-        hooks: take(&mut obj, "hooks"),
+        call_key: f.string("call_key"),
+        approval_digest: f.string("approval_digest"),
+        dispatched_at_ms: f.u64("dispatched_at_ms"),
+        schema_pin: f.take("schema_pin"),
+        hooks: f.take("hooks"),
     }));
     Ok(())
 }
@@ -562,6 +742,7 @@ struct Terminal {
     reason: Option<String>,
     detail: Option<Value>,
     hooks: Option<Value>,
+    tags: Option<Value>,
 }
 
 fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
@@ -573,15 +754,17 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
         reason,
         detail,
         hooks,
+        tags,
     } = terminal;
     let result_digest = sha256(&result.encode());
     let tool_call_id = result.tool_call_id.clone();
     let is_error = result.is_error;
     out.records.push(Record::ToolReply(ToolReply {
         run_id: state.run_id.clone(),
-        batch_id: batch_id.clone(),
+        batch_id: Some(batch_id.clone()),
         result,
         finished_at_ms,
+        tags_v1: tags,
     }));
     out.records.push(Record::ToolOutcome(ToolOutcome {
         run_id: state.run_id.clone(),
@@ -597,43 +780,32 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
     }));
 }
 
-fn tool_result(
-    mut obj: Map<String, Value>,
-    state: &mut State,
-    out: &mut Converted,
-) -> Result<(), ConvertError> {
-    let result: ToolResult =
-        take_as(&mut obj, "result")?.ok_or_else(|| err("tool_result without result"))?;
-    let outcome = match take_str(&mut obj, "outcome").as_deref() {
+fn tool_result(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result<(), ConvertError> {
+    let result: ToolResult = f
+        .parse("result")?
+        .ok_or_else(|| err("tool_result without result"))?;
+    let outcome = match f.string("outcome").as_deref() {
         Some("completed") | None => CallOutcome::Completed,
         Some("unknown") => CallOutcome::Unknown,
         Some("interrupted") => CallOutcome::Interrupted,
         Some("max_steps") => CallOutcome::MaxSteps,
         Some(other) => return Err(err(format!("unknown dispatch outcome {other}"))),
     };
-    if let Some(tags) = take(&mut obj, "tags") {
-        out.uncovered
-            .entry("tool_result (v1 tags)".into())
-            .or_default()
-            .add(tags.to_string().len());
-    }
     let terminal = Terminal {
         result,
-        batch_id: take_str(&mut obj, "batch_id").unwrap_or_default(),
+        batch_id: f.req_string("batch_id"),
         outcome,
-        finished_at_ms: take_u64(&mut obj, "finished_at_ms"),
-        reason: take_str(&mut obj, "reason"),
-        hooks: take(&mut obj, "hooks"),
+        finished_at_ms: f.u64("finished_at_ms"),
+        reason: f.string("reason"),
+        hooks: f.take("hooks"),
+        tags: f.take("tags"),
         detail: None,
     };
-    reply_and_outcome(
-        Terminal {
-            detail: rest(obj),
-            ..terminal
-        },
-        state,
-        out,
-    );
+    let terminal = Terminal {
+        detail: f.rest(),
+        ..terminal
+    };
+    reply_and_outcome(terminal, state, out);
     Ok(())
 }
 
@@ -642,6 +814,8 @@ fn tool_no_dispatch(
     state: &mut State,
     out: &mut Converted,
 ) -> Result<(), ConvertError> {
+    // Destructured field by field, so a field added to the old record fails to compile here
+    // instead of being dropped.
     let WalRecord::ToolNoDispatch {
         dispatched_at_ms,
         batch_id,
@@ -653,12 +827,6 @@ fn tool_no_dispatch(
     else {
         return Err(err("tool_no_dispatch shape"));
     };
-    if let Some(tags) = tags {
-        out.uncovered
-            .entry("tool_no_dispatch (v1 tags)".into())
-            .or_default()
-            .add(serde_json::to_vec(tags).map_or(0, |v| v.len()));
-    }
     reply_and_outcome(
         Terminal {
             result: broca_core::replay::no_dispatch_result(tool_call_id, reason),
@@ -668,10 +836,64 @@ fn tool_no_dispatch(
             reason: None,
             detail: serde_json::to_value(reason).ok(),
             hooks: hooks.as_ref().and_then(|h| serde_json::to_value(h).ok()),
+            tags: tags.as_ref().and_then(|t| serde_json::to_value(t).ok()),
         },
         state,
         out,
     );
+    Ok(())
+}
+
+fn send_delivered(
+    f: &mut Fields,
+    state: &mut State,
+    out: &mut Converted,
+) -> Result<(), ConvertError> {
+    let written = f.u64("written_at_ms");
+    let submission = f.string("submission_id");
+    // The run it was delivered into is the current one; anything else is reported.
+    let run_id = f.req_string("run_id");
+    if run_id != state.run_id {
+        f.lose("run_id (not the current run)".into(), run_id.len());
+    }
+    let tags = f.take("tags");
+    let mode = f.req_string("mode");
+    let placement = match mode.as_str() {
+        "steer" => Placement::Delivered,
+        "turn_system" => Placement::DeliveredTurnSystem,
+        // Delivered with a tool result: only `appended_text` below, no input message.
+        "tool_result" => Placement::Delivered,
+        other => {
+            f.lose(format!("mode (unknown: {other})"), other.len());
+            Placement::Delivered
+        }
+    };
+    let input: Vec<Message> = f.parse("input")?.unwrap_or_default();
+    if mode == "tool_result" && !input.is_empty() {
+        f.lose("input (with mode tool_result)".into(), 0);
+    }
+    for (index, message) in input.into_iter().enumerate() {
+        out.records.push(Record::Input(Input {
+            run_id: state.run_id.clone(),
+            placement,
+            message,
+            written_at_ms: written,
+            submission_id: submission.clone(),
+            notice: None,
+            tags_v1: tags_at(&tags, index),
+        }));
+    }
+    let text = f.string("appended_text");
+    let call: Option<ToolCallId> = f.parse("tool_call_id")?;
+    if let (Some(text), Some(call)) = (text, call) {
+        out.records.push(Record::ResultAppend(ResultAppend {
+            run_id: state.run_id.clone(),
+            tool_call_id: call,
+            text,
+            notice: None,
+            written_at_ms: written,
+        }));
+    }
     Ok(())
 }
 

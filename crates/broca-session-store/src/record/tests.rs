@@ -42,6 +42,7 @@ fn one_of_each() -> Vec<Record> {
                 sender: "magic-context".into(),
                 template: None,
             }),
+            tags_v1: Some(serde_json::json!({"parts": [3]})),
         }),
         Record::Assistant(Assistant {
             run_id: "run-1".into(),
@@ -54,12 +55,14 @@ fn one_of_each() -> Vec<Record> {
             usage: Some(usage),
             written_at_ms: Some(2),
             last_content_at_ms: None,
+            tags_v1: None,
         }),
         Record::ToolReply(ToolReply {
             run_id: "run-1".into(),
-            batch_id: "b1".into(),
+            batch_id: Some("b1".into()),
             result: result.clone(),
             finished_at_ms: Some(3),
+            tags_v1: None,
         }),
         Record::ResultAppend(ResultAppend {
             run_id: "run-1".into(),
@@ -72,6 +75,10 @@ fn one_of_each() -> Vec<Record> {
             parts: vec![part.clone()],
             model: model(),
             tool_names: vec!["read".into(), "bash".into()],
+        }),
+        Record::Compaction(Compaction {
+            version: 2,
+            body: serde_json::json!({"first_kept_ordinal": 12}),
         }),
         Record::RunStart(Box::new(RunStart {
             run_id: "run-1".into(),
@@ -180,6 +187,38 @@ fn one_of_each() -> Vec<Record> {
             finished_at_ms: Some(7),
             detail: None,
             hooks: None,
+        }),
+        Record::QueuedSend(QueuedSend {
+            submission_id: "sub".into(),
+            send_id: Some("s2".into()),
+            input: vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "next".into(),
+                }],
+            )],
+            setup: vec![],
+            written_at_ms: Some(8),
+            ts_ms: None,
+            request: Some(serde_json::json!({"model": {}})),
+            receipt: None,
+        }),
+        Record::SessionRefresh(SessionRefresh {
+            generation: 2,
+            policy: "immediately".into(),
+            run_in_progress: false,
+            applies_from_next_run: true,
+            setup: vec![],
+            manifest: None,
+        }),
+        Record::StructuredResult(StructuredResult {
+            run_id: "run-1".into(),
+            result: serde_json::json!({"ok": true}),
+        }),
+        Record::Event(Event {
+            name: "run_paused".into(),
+            run_id: Some("run-1".into()),
+            body: Some(serde_json::json!({"reason": "restart"})),
         }),
     ]
 }

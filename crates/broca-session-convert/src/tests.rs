@@ -54,6 +54,8 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
             "ToolReply",
             "ToolOutcome",
             "BatchEnd",
+            // A record whose fields nothing reads individually yet travels whole as an event.
+            "Event",
             "RunEnd",
             // The second run has the same setup, so it gets no second stub.
             "RunStart",
@@ -89,14 +91,45 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
     ));
     assert!(matches!(
         &converted.records[11],
+        Record::Event(event) if event.name == "input_token_cap_frozen"
+            && event.run_id.as_deref() == Some("run-1")
+            && event.body == Some(serde_json::json!({"limit": 5}))
+    ));
+    assert!(matches!(
+        &converted.records[12],
         Record::RunEnd(end) if end.run_id == "run-1"
     ));
 
+    assert!(converted.lost.is_empty(), "{:?}", converted.lost);
     // Tools, response format: two parts, each stored once though both runs named them.
     assert_eq!(converted.parts.len(), 2);
     assert_eq!(converted.runs, 2);
     assert_eq!(converted.dropped["turn_finished"].count, 1);
-    assert_eq!(converted.uncovered["input_token_cap_frozen"].count, 1);
+}
+
+#[test]
+fn unhandled_fields_wrong_types_and_missing_fields_are_reported_lost() {
+    // A planned-call list under a name the converter doesn't take, a step id that isn't a
+    // number, and a required field that is missing.
+    let mut out = super::Converted::default();
+    let mut object = serde_json::Map::new();
+    object.insert("batch_id".into(), serde_json::json!("b1"));
+    object.insert("planned".into(), serde_json::json!(["c1"]));
+    object.insert("step_id".into(), serde_json::json!("one"));
+    let mut f = super::Fields::new("tool_batch_started", object);
+    assert_eq!(f.req_string("batch_id"), "b1");
+    assert_eq!(f.req_u64("step_id"), 0);
+    assert_eq!(f.req_u64("attempt"), 0);
+    f.finish(&mut out);
+    let lost: Vec<&str> = out.lost.keys().map(String::as_str).collect();
+    assert_eq!(
+        lost,
+        [
+            "tool_batch_started.attempt (missing)",
+            "tool_batch_started.planned",
+            "tool_batch_started.step_id (not an unsigned integer)",
+        ]
+    );
 }
 
 #[test]

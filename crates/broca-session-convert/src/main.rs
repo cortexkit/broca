@@ -65,7 +65,9 @@ struct Report {
     /// The same parts as today's run starts carry them, once per run.
     parts_bytes_per_run: u64,
     runs: u64,
-    uncovered: BTreeMap<String, Tally>,
+    /// Old fields the conversion didn't place: misspelt or unhandled names, wrong types and
+    /// missing required fields. A clean conversion leaves this empty.
+    lost: BTreeMap<String, Tally>,
     dropped: BTreeMap<String, Tally>,
     by_class: BTreeMap<String, ClassTotal>,
     /// Per-log framed size, without setup parts, in bytes.
@@ -288,8 +290,8 @@ fn run_measure(args: &Args) {
         for (digest, bytes) in &converted.parts {
             parts.insert(*digest, bytes.len() as u64);
         }
-        for (name, tally) in converted.uncovered {
-            let total = report.uncovered.entry(name).or_default();
+        for (name, tally) in converted.lost {
+            let total = report.lost.entry(name).or_default();
             total.count += tally.count;
             total.json_bytes += tally.json_bytes;
         }

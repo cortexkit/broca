@@ -6,7 +6,9 @@
 //! - **Ledger:** what happened: runs, steps, model attempts, tool dispatches and their outcomes.
 //!   The ledger is never reverted, because money spent and side effects done stay true.
 //!
-//! Each record carries what its own stream's fold needs, so the two folds never read each other.
+//! A *fold* is the code that rebuilds a session's state by reading its records in order: the
+//! conversation fold reads the transcript, and the operational fold reads the ledger. Each record
+//! carries what its own stream's fold needs, so the two folds never read each other.
 //!
 //! Kind numbers are stored in every frame header and must never be reused. Transcript kinds use
 //! 1-63 and ledger kinds 64 and up, so a kind number alone names its stream.
@@ -86,12 +88,14 @@ values! {
         1 RunInput,
         /// A steer, placed at a step boundary of a running run.
         2 Steer,
-        /// A queued send delivered into a running run.
+        /// A queued send delivered into a running run as a user message (delivery mode `steer`).
         3 Delivered,
         /// The caller's text placed when a tool-call budget threshold fired.
         4 BudgetNudge,
         /// History imported from another harness's log.
         5 Imported,
+        /// A queued send delivered as a turn-scoped system entry (delivery mode `turn_system`).
+        6 DeliveredTurnSystem,
     }
 }
 
@@ -116,6 +120,9 @@ message! {
         4 opt written_at_ms: u64,
         5 opt submission_id: String,
         6 opt notice: Notice,
+        /// The part numbers a run frozen under runner tags v1 stamped on this message. Runs
+        /// frozen later compute their numbers from the transcript and leave this absent.
+        7 opt tags_v1: serde_json::Value,
     }
 }
 
@@ -134,6 +141,7 @@ message! {
         6 opt written_at_ms: u64,
         /// When the last content arrived, from which the entry's `completed_at` comes.
         7 opt last_content_at_ms: u64,
+        8 opt tags_v1: serde_json::Value,
     }
 }
 
@@ -144,9 +152,12 @@ message! {
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct ToolReply {
         1 req run_id: String,
-        2 req batch_id: String,
+        /// The batch the call ran in. Absent only on a closing result that named no batch: an
+        /// approval's closing result, or a recovery close-out written before batches were named.
+        2 opt batch_id: String,
         3 req result: ToolResult,
         4 opt finished_at_ms: u64,
+        5 opt tags_v1: serde_json::Value,
     }
 }
 
@@ -395,6 +406,75 @@ message! {
     }
 }
 
+message! {
+    /// A compaction boundary on the transcript. It is either a compaction message from the first
+    /// compaction protocol (found only on converted sessions), or a marker from the current
+    /// compaction contract that records where the provider's cut falls. The body is the record as
+    /// written; the compaction code is what reads it.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Compaction {
+        /// 1 for a v1 compaction message, 2 for a mode-3 marker.
+        1 req version: u32,
+        2 req body: serde_json::Value,
+    }
+}
+
+message! {
+    /// A send accepted into the queue, durable before the caller is answered. Its input is
+    /// written again as a transcript entry when it is placed.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct QueuedSend {
+        1 req submission_id: String,
+        2 opt send_id: String,
+        3 rep input: Message,
+        /// The tool surface the send carried, as a setup part.
+        4 rep setup: PartRef,
+        5 opt written_at_ms: u64,
+        6 opt ts_ms: u64,
+        /// Owned by admission: the rest of the request (model, generation, budget, stop
+        /// conditions, cache and auth preferences).
+        7 opt request: serde_json::Value,
+        /// The receipt: sender, principal, delivery, retention, title and hooks.
+        8 opt receipt: serde_json::Value,
+    }
+}
+
+message! {
+    /// A session refresh was accepted: the new setup, and when it applies.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct SessionRefresh {
+        1 req generation: u64,
+        2 req policy: String,
+        3 req run_in_progress: bool,
+        4 req applies_from_next_run: bool,
+        5 rep setup: PartRef,
+        /// The rest of the refreshed manifest, owned by the fetch-plan code.
+        6 opt manifest: serde_json::Value,
+    }
+}
+
+message! {
+    /// A structured-output run's final result.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct StructuredResult {
+        1 req run_id: String,
+        2 req result: serde_json::Value,
+    }
+}
+
+message! {
+    /// A ledger event whose fields no fold reads individually yet: pauses and resumes, policy waits,
+    /// approvals, held calls, late results, the rest of the queue, writer and recovery records,
+    /// and the v1 compaction protocol. `name` is the old record's type name and `body` its
+    /// fields. As each fold is built, the events it reads become typed kinds of their own.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Event {
+        1 req name: String,
+        2 opt run_id: String,
+        3 opt body: serde_json::Value,
+    }
+}
+
 /// The type a record variant holds: the record itself, or a box for the rare large kinds, so a
 /// loaded log's records don't all pay for the largest one.
 macro_rules! variant_type {
@@ -482,6 +562,7 @@ records! {
         3 ToolReply,
         4 ResultAppend,
         5 SetupStub,
+        6 Compaction,
     }
     ledger {
         // One per run, and much larger than the rest.
@@ -494,6 +575,10 @@ records! {
         70 BatchEnd,
         71 ToolIntent,
         72 ToolOutcome,
+        73 QueuedSend,
+        74 SessionRefresh,
+        75 StructuredResult,
+        76 Event,
     }
 }
 
