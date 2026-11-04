@@ -284,6 +284,49 @@ fn an_account_limit_pause_clears_when_the_run_continues() {
     assert!(resumed.provider_call_started);
 }
 
+fn queued(id: &str, delivery: Option<&str>) -> Record {
+    Record::QueuedSend(crate::record::QueuedSend {
+        submission_id: id.into(),
+        send_id: None,
+        input: Vec::new(),
+        setup: Vec::new(),
+        written_at_ms: None,
+        ts_ms: None,
+        request: None,
+        receipt: None,
+        delivery: delivery.map(str::to_owned),
+    })
+}
+
+/// Interrupts drain ahead of plain sends, each group in queued order, and a send leaves the
+/// queue when a run consumes it or it is retracted.
+#[test]
+fn the_queue_drains_interrupts_first_and_drops_consumed_and_retracted_sends() {
+    let mut consumes = start();
+    if let Record::RunStart(start) = &mut consumes {
+        start.submission_id = Some("plain-1".into());
+    }
+    let records = [
+        queued("plain-1", None),
+        queued("plain-2", None),
+        queued("interrupt-1", Some("interrupt")),
+        queued("plain-3", None),
+        queued("interrupt-2", Some("interrupt")),
+        consumes,
+        Record::Retraction(crate::record::Retraction {
+            submission_id: "plain-3".into(),
+            failure: None,
+        }),
+    ];
+    let order: Vec<String> = fold(&records)
+        .unwrap()
+        .queue
+        .into_iter()
+        .map(|pending| pending.submission_id)
+        .collect();
+    assert_eq!(order, ["interrupt-1", "interrupt-2", "plain-2"]);
+}
+
 #[test]
 fn records_it_does_not_fold_yet_refuse_by_name() {
     let event = Record::Event(Event {

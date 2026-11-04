@@ -323,6 +323,7 @@ fn queued(send: &QueuedSend, parts: &BTreeMap<Digest, Vec<u8>>) -> Result<Value,
     set(&mut object, "send_id", send.send_id.as_ref());
     set(&mut object, "written_at_ms", send.written_at_ms);
     set(&mut object, "ts_ms", send.ts_ms);
+    set(&mut object, "delivery", send.delivery.as_ref());
     let mut request = members(send.request.as_ref())?;
     request.insert("input".into(), json(&send.input));
     for part in &send.setup {
@@ -704,6 +705,21 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         set(&mut object, "detail_digest", held.detail_digest.as_ref());
                         object.insert("held_at_ms".into(), json(held.held_at_ms));
                         object.insert("sequential".into(), json(held.sequential));
+                        Value::Object(object)
+                    }
+                    Record::SendEnded(ended) => {
+                        let mut object = Map::new();
+                        object.insert("type".into(), json("send_ended"));
+                        object.insert("submission_id".into(), json(&ended.submission_id));
+                        set(&mut object, "reason", ended.reason.as_ref());
+                        Value::Object(object)
+                    }
+                    Record::DeliveryOrdered(ordered) => {
+                        let mut object = Map::new();
+                        object.insert("type".into(), json("delivery_ordered"));
+                        object.insert("submission_id".into(), json(&ordered.submission_id));
+                        object.insert("order".into(), ordered.order.clone());
+                        set(&mut object, "sent_by", ordered.sent_by.as_ref());
                         Value::Object(object)
                     }
                     Record::Retraction(retraction) => {

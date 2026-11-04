@@ -462,8 +462,11 @@ message! {
         /// Owned by admission: the rest of the request (model, generation, budget, stop
         /// conditions, cache and auth preferences).
         7 opt request: serde_json::Value,
-        /// The receipt: sender, principal, delivery, retention, title and hooks.
+        /// The receipt: sender, principal, retention, title and hooks.
         8 opt receipt: serde_json::Value,
+        /// How the send asked to be delivered, as the caller named it (`interrupt` drains ahead
+        /// of every plain send). Absent for a plain queued send.
+        9 opt delivery: String,
     }
 }
 
@@ -634,6 +637,29 @@ message! {
 }
 
 message! {
+    /// A queued send ended undelivered: replaced by a newer send with the same dedupe key, or
+    /// expired.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct SendEnded {
+        1 req submission_id: String,
+        /// Owned by the queue: why it ended.
+        2 opt reason: serde_json::Value,
+    }
+}
+
+message! {
+    /// The ordered delivery list of a queued send, written just before its `QueuedSend`.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct DeliveryOrdered {
+        1 req submission_id: String,
+        /// Owned by the queue: the delivery modes in order, the dedupe key and the expiry.
+        2 req order: serde_json::Value,
+        /// The sender whose dedupe key the send carries, when it isn't the session's owner.
+        3 opt sent_by: serde_json::Value,
+    }
+}
+
+message! {
     /// A caller asked to cancel a run.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct CancelRequest {
@@ -766,6 +792,8 @@ records! {
         81 Delivery,
         82 CancelRequest,
         83 Retraction,
+        84 SendEnded,
+        85 DeliveryOrdered,
     }
 }
 

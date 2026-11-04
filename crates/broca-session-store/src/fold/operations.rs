@@ -389,6 +389,14 @@ impl Run {
     }
 }
 
+/// One send waiting in the queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    pub submission_id: String,
+    /// Queued by an interrupting send: it drains ahead of every plain send.
+    pub interrupt: bool,
+}
+
 state! {
     /// The operational state rebuilt so far.
     #[derive(Debug, Clone, Default)]
@@ -406,14 +414,53 @@ state! {
             reset: "run_start",
             bound: Bound::Fixed,
         },
+        /// Sends waiting to run or to be delivered, in drain order: interrupts first, then
+        /// plain sends, each in the order they were queued.
+        pub queue: Vec<Pending> => {
+            owner: "queue",
+            reset: "never",
+            bound: Bound::OpenWork("sends waiting to run"),
+        },
     }
 }
 
 impl Operations {
+    /// A queued send joins the queue; a run that consumes it, a retraction, an ended send or a
+    /// delivery into a running run removes it.
+    fn apply_queue(&mut self, record: &Record) {
+        let removed = match record {
+            Record::QueuedSend(send) => {
+                let pending = Pending {
+                    submission_id: send.submission_id.clone(),
+                    interrupt: send.delivery.as_deref() == Some("interrupt"),
+                };
+                let at = if pending.interrupt {
+                    self.queue
+                        .iter()
+                        .position(|queued| !queued.interrupt)
+                        .unwrap_or(self.queue.len())
+                } else {
+                    self.queue.len()
+                };
+                self.queue.insert(at, pending);
+                return;
+            }
+            Record::RunStart(start) => start.submission_id.as_deref(),
+            Record::Retraction(retraction) => Some(retraction.submission_id.as_str()),
+            Record::SendEnded(ended) => Some(ended.submission_id.as_str()),
+            Record::Delivery(delivery) => Some(delivery.submission_id.as_str()),
+            _ => None,
+        };
+        if let Some(id) = removed {
+            self.queue.retain(|pending| pending.submission_id != id);
+        }
+    }
+
     pub fn apply(&mut self, record: &Record) -> Result<(), FoldError> {
         if record.stream() != Stream::Ledger {
             return Err(FoldError::TranscriptRecord(record.name()));
         }
+        self.apply_queue(record);
         if let Record::RunStart(start) = record {
             self.run = Some(Run::new(start));
             self.refusal_schedule = start.refusal_schedule.clone();

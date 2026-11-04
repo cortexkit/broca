@@ -22,9 +22,10 @@ use broca_protocol::usage::Usage;
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::record::{
     Assistant, Attempt, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome, CancelPoint,
-    CancelRequest, Compaction, Delivery, Event, Input, PartKind, PartRef, Pause, Placement,
-    QueuedSend, Record, ResultAppend, Retraction, RunEnd, RunStart, SessionRefresh, SetupStub,
-    Steer, StepEnd, StepStart, StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply,
+    CancelRequest, Compaction, Delivery, DeliveryOrdered, Event, Input, PartKind, PartRef, Pause,
+    Placement, QueuedSend, Record, ResultAppend, Retraction, RunEnd, RunStart, SendEnded,
+    SessionRefresh, SetupStub, Steer, StepEnd, StepStart, StructuredResult, ToolHeld, ToolIntent,
+    ToolOutcome, ToolReply,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -474,6 +475,21 @@ fn convert_one(
             held_at_ms: f.req_u64("held_at_ms"),
             sequential: f.req_bool("sequential"),
         })),
+        "send_ended" => out.records.push(Record::SendEnded(SendEnded {
+            submission_id: f.req_string("submission_id"),
+            reason: f.take("reason"),
+        })),
+        "delivery_ordered" => {
+            let submission_id = f.req_string("submission_id");
+            let order = f
+                .take("order")
+                .ok_or_else(|| err("delivery_ordered without order"))?;
+            out.records.push(Record::DeliveryOrdered(DeliveryOrdered {
+                submission_id,
+                order,
+                sent_by: f.take("sent_by"),
+            }));
+        }
         "retracted" => out.records.push(Record::Retraction(Retraction {
             submission_id: f.req_string("submission_id"),
             failure: f.take("failure"),
@@ -689,6 +705,7 @@ fn queued(f: &mut Fields, out: &mut Converted) -> Result<(), ConvertError> {
         written_at_ms: f.u64("written_at_ms"),
         ts_ms: f.u64("ts_ms"),
         request: request_rest,
+        delivery: f.string("delivery"),
         receipt: f.rest(),
     }));
     Ok(())

@@ -545,6 +545,15 @@ fn compare_ops(old: &[FramedRecord]) -> OpsOutcome {
         return OpsOutcome::FoldRefused(format!("{e:?}"));
     }
     let refusal_schedule = operations.refusal_schedule.clone();
+    let folded_queue: Vec<String> = operations
+        .queue
+        .iter()
+        .map(|pending| pending.submission_id.clone())
+        .collect();
+    let today_queue: Vec<String> = broca_core::queue::pending_submissions(&records)
+        .into_iter()
+        .map(|pending| pending.submission_id.0)
+        .collect();
     let Some(run) = operations.run else {
         // Nothing to compare only when today's replay has no run either.
         return if today.run_id.is_none() {
@@ -671,6 +680,7 @@ fn compare_ops(old: &[FramedRecord]) -> OpsOutcome {
         broca_wal::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
     });
     check("cancel", today_cancel == run.cancel);
+    check("queue", today_queue == folded_queue);
     let mut set = Vec::new();
     for (field, value) in [
         ("account_limit_pause", json_of(&today.account_limit_pause)),
@@ -684,6 +694,9 @@ fn compare_ops(old: &[FramedRecord]) -> OpsOutcome {
     }
     if today_cancel.is_some() {
         set.push("cancel");
+    }
+    if !today_queue.is_empty() {
+        set.push("queue");
     }
     let sizes = vec![
         ("run.unknown", run.unknown.len() as u64),

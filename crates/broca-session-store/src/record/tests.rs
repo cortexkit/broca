@@ -210,6 +210,7 @@ fn one_of_each() -> Vec<Record> {
             ts_ms: None,
             request: Some(serde_json::json!({"model": {}})),
             receipt: None,
+            delivery: Some("interrupt".into()),
         }),
         Record::SessionRefresh(SessionRefresh {
             generation: 2,
