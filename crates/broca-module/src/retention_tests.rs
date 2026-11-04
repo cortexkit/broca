@@ -2921,6 +2921,7 @@ impl crate::cache::CacheDeclarer for WarmDeclaration {
             read_refreshes_ttl: Some(true),
             warm: Ok(()),
             basis: None,
+            requested_ttl_ms: None,
         })
     }
 }

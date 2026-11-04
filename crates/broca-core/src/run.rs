@@ -6425,17 +6425,28 @@ where
             let previous = crate::compaction_v2::host::previous(&frames);
             let now = control.now_ms().unwrap_or_else(crate::compaction::now);
             let raw: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
-            let cache_expired = crate::compaction_v2::conditions::cache_proven_expired(
+            // Expiry counts from the last request that reached the cache, by the lifetime that
+            // request asked the provider for, which a refresh may have changed since.
+            let last_send = crate::cache_warm::last_cache_send(&raw);
+            let requested_ttl = |config: &RunConfig| {
                 control
                     .keep_warm
                     .as_ref()
-                    .and_then(|driver| driver.timing(&config).ok())
-                    .map(|timing| timing.ttl_ms),
-                crate::cache_warm::last_cache_send_at_ms(&raw),
+                    .and_then(|driver| driver.requested_ttl_ms(config))
+            };
+            let cache_expired = crate::compaction_v2::conditions::cache_proven_expired(
+                last_send
+                    .as_ref()
+                    .and_then(|(_, sent_under)| requested_ttl(sent_under)),
+                last_send.as_ref().map(|(sent_at_ms, _)| *sent_at_ms),
                 now,
             );
+            let detects_cache_expired = requested_ttl(&config).is_some();
             #[cfg(test)]
             let cache_expired = cache_expired || control.compaction_cache_proven_expired;
+            #[cfg(test)]
+            let detects_cache_expired =
+                detects_cache_expired || control.compaction_cache_proven_expired;
             let next_mid =
                 crate::message_mid(true, Some(&lineage), transcript.entries.len() as u64)
                     .map_err(RunError::Wal)?;
@@ -6462,6 +6473,7 @@ where
                     previous: previous.as_ref(),
                     current: &current,
                     cache_expired,
+                    detects_cache_expired,
                     chain_reset: chained && provider.prepare_chain_reset(),
                     now,
                     next_mid: &next_mid,
@@ -7848,6 +7860,7 @@ where
                         &req.session,
                         req.scope.as_ref(),
                         control.compaction_plane.as_deref(),
+                        control.keep_warm.as_deref(),
                     )
                     .await
                     .map_err(RunError::Wal)?;
@@ -8441,6 +8454,7 @@ where
             &req.session,
             req.scope.as_ref(),
             control.compaction_plane.as_deref(),
+            control.keep_warm.as_deref(),
         )
         .await
         .map_err(RunError::Wal)?;

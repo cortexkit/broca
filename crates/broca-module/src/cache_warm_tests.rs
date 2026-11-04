@@ -383,6 +383,7 @@ impl CacheDeclarer for FamilyDeclarer {
             read_refreshes_ttl: declared.read_refreshes_ttl,
             warm: declared.warm,
             basis: declared.basis.map(str::to_owned),
+            requested_ttl_ms: declared.requested_ttl_ms,
         })
     }
 }

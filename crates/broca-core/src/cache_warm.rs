@@ -226,9 +226,14 @@ fn last_cache_usage(records: &[WalRecord], last_sent_at_ms: u64) -> Option<Usage
 /// Only the new source-maintenance trigger opts into matching the latest request's digest;
 /// unmarked records retain their historical clock inference.
 pub fn last_cache_send_at_ms(records: &[WalRecord]) -> Option<u64> {
-    let mut latest: Option<u64> = None;
+    latest_cache_send(records).map(|(_, sent_at_ms)| sent_at_ms)
+}
+
+/// The index of the record [`last_cache_send_at_ms`] dates the cache from, and that time.
+fn latest_cache_send(records: &[WalRecord]) -> Option<(usize, u64)> {
+    let mut latest: Option<(usize, u64)> = None;
     let mut bound = SendLowerBound::default();
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         let sent_at_ms = match record {
             WalRecord::ModelAttemptFinished {
                 http_status,
@@ -251,10 +256,33 @@ pub fn last_cache_send_at_ms(records: &[WalRecord]) -> Option<u64> {
             }
             _ => None,
         };
-        latest = latest.max(sent_at_ms);
+        if let Some(sent_at_ms) = sent_at_ms {
+            if latest.is_none_or(|(_, latest)| sent_at_ms >= latest) {
+                latest = Some((index, sent_at_ms));
+            }
+        }
         bound.observe(record);
     }
     latest
+}
+
+/// The most recent request that reached the provider's cache, as [`last_cache_send_at_ms`]
+/// finds it, with the run configuration it was sent under: the configuration of the run it
+/// belongs to, with any refreeze written before it. That configuration names the cache lifetime
+/// the request asked the provider for, which may differ from the current run's.
+pub fn last_cache_send(records: &[WalRecord]) -> Option<(u64, RunConfig)> {
+    let (index, sent_at_ms) = latest_cache_send(records)?;
+    let start = records[..=index]
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::RunStarted { .. }))?;
+    let WalRecord::RunStarted { config, .. } = &records[start] else {
+        unreachable!("run_start indexes a RunStarted");
+    };
+    let mut config = (**config).clone();
+    for record in &records[start + 1..=index] {
+        fold_refreeze(&mut config, record);
+    }
+    Some((sent_at_ms, config))
 }
 
 // A standby source warm can finish after a fallback request. Its digest identifies another
@@ -1475,6 +1503,42 @@ mod tests {
             }));
         }
         assert_eq!(last_cache_send_at_ms(&[success]), Some(200));
+    }
+
+    /// The send that dates the cache comes with the configuration it was sent under: its own
+    /// run's, refreeze included, not a later run's, so expiry counts by the lifetime that request
+    /// asked for.
+    #[test]
+    fn the_last_cache_send_names_the_config_it_was_sent_under() {
+        let with_model = |model: &str| {
+            let WalRecord::RunStarted { mut config, .. } = run_started(Some(1_000)) else {
+                unreachable!()
+            };
+            config.model.model_id = model.into();
+            let mut record = run_started(Some(1_000));
+            if let WalRecord::RunStarted { config: slot, .. } = &mut record {
+                *slot = config;
+            }
+            record
+        };
+        let refreeze: WalRecord = serde_json::from_value(serde_json::json!({
+            "type": "run_config_refrozen", "renderer_version": 2,
+            "frozen_render_config": {"refrozen": true}
+        }))
+        .unwrap();
+        // Run one sent at 5 s; run two started but never reached the cache.
+        let records = [
+            with_model("first"),
+            refreeze,
+            attempt(Some(200), "complete", Some(5_000), 6_000),
+            with_model("second"),
+            attempt(Some(500), "provider_error", Some(9_000), 9_500),
+        ];
+        let (sent_at_ms, config) = last_cache_send(&records).unwrap();
+        assert_eq!(sent_at_ms, 5_000);
+        assert_eq!(config.model.model_id, "first");
+        assert_eq!(config.frozen_render_config["refrozen"], true);
+        assert_eq!(last_cache_send(&records[..1]), None);
     }
 
     #[test]

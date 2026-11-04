@@ -61,9 +61,10 @@ pub fn ride_causes(
     causes
 }
 
-/// Whether the session's prompt cache has provably expired: its cache lifetime is known, the log
-/// records the last send that reached the cache, and that lifetime has run out since. When broca
-/// can't tell (no cache clock for the route, or no send yet), the answer is `false`.
+/// Whether the session's prompt cache has provably expired: the log records the last send that
+/// reached the cache, that send asked the provider for a cache lifetime it honours (`ttl_ms`),
+/// and that lifetime has run out since. A lifetime broca only estimates proves nothing. When broca
+/// can't tell (no requested lifetime, or no send yet), the answer is `false`.
 ///
 /// Before a step, broca may *ride*: call the session's compaction provider with the causes that
 /// are about to change the request anyway. The `cache_expired` cause tells the provider that
@@ -83,14 +84,21 @@ pub fn usable_window(conditions: &Conditions) -> u64 {
 }
 
 /// Setup and notices describe the same frozen model, output reserve and rules.
-pub fn setup_request(preset: &str, conditions: &Conditions, now: u64) -> SetupRequest {
+/// `detects_cache_expired` says whether the session's requests ask for a cache lifetime that can
+/// prove expiry (see `runtime::detects`).
+pub fn setup_request(
+    preset: &str,
+    conditions: &Conditions,
+    now: u64,
+    detects_cache_expired: bool,
+) -> SetupRequest {
     let mut setup = SetupRequest::new(
         preset,
         conditions.model.clone(),
         conditions.context_window,
         conditions.output_reserve,
         conditions.rules.clone(),
-        super::runtime::detects(),
+        super::runtime::detects(detects_cache_expired),
         now,
     );
     setup.accepts_images = conditions.accepts_images;

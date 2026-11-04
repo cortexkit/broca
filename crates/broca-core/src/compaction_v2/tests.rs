@@ -310,7 +310,7 @@ fn setup() -> cortexkit_role_compaction::setup::SetupRequest {
         1000,
         100,
         rules::defaults("gpt-5"),
-        runtime::detects(),
+        runtime::detects(true),
         1,
     )
 }
@@ -638,7 +638,7 @@ fn compaction_v2_rides_include_every_simultaneous_cause() {
         &conditions
     )
     .is_empty());
-    let setup = session_conditions::setup_request("unchanged-preset", &conditions, 100);
+    let setup = session_conditions::setup_request("unchanged-preset", &conditions, 100, true);
     assert_eq!(setup.preset, "unchanged-preset");
     assert_eq!(setup.model, current.model);
     assert_eq!(setup.detects.len(), 7);
@@ -1377,10 +1377,74 @@ fn request_at<'a>(
         previous: Some(current),
         current,
         cache_expired: false,
+        detects_cache_expired: false,
         chain_reset: false,
         now: 1,
         next_mid: "m12345678.1",
     }
+}
+
+/// A proven expiry rides as `cache_expired` only when Setup told the provider broca detects it.
+/// Where the session's requests ask for no cache lifetime (ChatGPT's backend), Setup leaves the
+/// cause out, and the ride never claims it, even when broca's own estimate says the cache aged
+/// out.
+#[tokio::test]
+async fn compaction_v2_cache_expired_rides_only_where_setup_listed_it() {
+    for detects in [false, true] {
+        let messages = vec![text(Role::User, "question")];
+        let entries = project(&messages, &facts(1), &Deliveries::new(), true);
+        let plane = RecordingPlane::default();
+        plane.answers.lock().unwrap().extend([
+            json!({"answer":"ready"}),
+            json!({"answer":"received"}),
+            json!({"answer":"nothing"}),
+            json!({"answer":"received"}),
+        ]);
+        let state = tokio::sync::Mutex::new(state::State::default());
+        let conditions = conditions();
+        let current = send_context();
+        let mut at = request_at(&messages, &entries, &conditions, &current);
+        at.cache_expired = true;
+        at.detects_cache_expired = detects;
+        super::request::prepare(
+            &state,
+            &runtime::Runtime::default(),
+            &MemoryJournal::default(),
+            &plane,
+            at,
+            |_| panic!("no image"),
+            text_estimate,
+        )
+        .await
+        .unwrap();
+        let calls = plane.calls.lock().unwrap();
+        let (_, setup) = calls
+            .iter()
+            .find(|(method, _)| method == "compaction.setup")
+            .expect("Setup was sent");
+        let listed = setup["detects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cause| cause == "cache_expired");
+        assert_eq!(listed, detects);
+        let ride = calls.iter().find(|(method, _)| method == "compaction.ride");
+        if detects {
+            let (_, ride) = ride.expect("a proven expiry rides");
+            assert_eq!(ride["causes"], json!(["cache_expired"]), "{ride}");
+        } else {
+            assert!(ride.is_none(), "rode with {:?}", ride);
+        }
+    }
+}
+
+#[test]
+fn compaction_v2_detects_lists_cache_expired_only_when_asked() {
+    use cortexkit_role_compaction::ride::RideCause;
+    assert!(runtime::detects(true).contains(&RideCause::CacheExpired));
+    let without = runtime::detects(false);
+    assert!(!without.contains(&RideCause::CacheExpired));
+    assert_eq!(without.len() + 1, runtime::detects(true).len());
 }
 
 fn send_context() -> session_conditions::SendContext {

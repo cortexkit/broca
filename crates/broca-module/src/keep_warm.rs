@@ -148,6 +148,7 @@ pub fn automatic_warmer_for_test(
                 read_refreshes_ttl: Some(true),
                 warm: Ok(()),
                 basis: None,
+                requested_ttl_ms: None,
             })
         }),
         recorded: Mutex::new(Some(RecordedRequest {
@@ -248,6 +249,9 @@ impl KeepWarmDriver for AutomaticWarmer {
     }
     fn last_sent_at_ms(&self) -> Option<u64> {
         self.clock.read().map(|r| r.last_sent_at_ms)
+    }
+    fn requested_ttl_ms(&self, config: &RunConfig) -> Option<u64> {
+        (self.declare)(config)?.requested_ttl_ms
     }
     fn note_attempt(&self, attempt: &broca_protocol::ModelAttempt) {
         self.slot.note_headers(
@@ -671,6 +675,7 @@ mod retention_tests {
                     read_refreshes_ttl: Some(true),
                     warm: Ok(()),
                     basis: None,
+                    requested_ttl_ms: Some(300_000),
                 })
             }),
             recorded: Mutex::new(Some(RecordedRequest {
@@ -682,6 +687,9 @@ mod retention_tests {
                 route: None,
             })),
         };
+        // The lifetime that proves expiry is the requested one, never the warm schedule's.
+        assert_eq!(warmer.requested_ttl_ms(&config), Some(300_000));
+        assert_eq!(warmer.timing(&config).unwrap().ttl_ms, 600_000);
         let run_id = RunId("r".into());
         let tick = warmer.warm(&config, &run_id).await;
         let live = match tick {
@@ -827,6 +835,7 @@ mod retention_tests {
                     read_refreshes_ttl: Some(true),
                     warm: Ok(()),
                     basis: None,
+                    requested_ttl_ms: None,
                 })
             }),
             recorded: Mutex::new(Some(RecordedRequest {
@@ -908,6 +917,7 @@ mod retention_tests {
                         read_refreshes_ttl: Some(true),
                         warm: Ok(()),
                         basis: None,
+                        requested_ttl_ms: None,
                     })
                 }),
                 recorded: Mutex::new(Some(RecordedRequest {

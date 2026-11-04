@@ -27,6 +27,9 @@ pub struct At<'a> {
     pub current: &'a SendContext,
     /// The prompt cache has provably expired (see `conditions::cache_proven_expired`).
     pub cache_expired: bool,
+    /// The session's current requests ask for a cache lifetime that can prove expiry, so Setup
+    /// lists `cache_expired` as a cause broca detects.
+    pub detects_cache_expired: bool,
     pub chain_reset: bool,
     pub now: u64,
     pub next_mid: &'a str,
@@ -82,7 +85,8 @@ pub async fn prepare(
         state.start_step(at.step);
         (state.view_for_step(at.step).cloned(), frozen)
     };
-    let mut setup = conditions::setup_request(at.preset, at.conditions, at.now);
+    let mut setup =
+        conditions::setup_request(at.preset, at.conditions, at.now, at.detects_cache_expired);
     setup.applied_view = view.as_ref().map(View::applied);
     setup.newest = views::newest(at.entries);
     runtime.observe(at.entries);
@@ -94,6 +98,8 @@ pub async fn prepare(
     // it began before the crash left nothing durable, and only its answer can give the step the
     // view the uninterrupted run sent with.
     let frozen = frozen && view.is_some();
+    // Claimed only where the accepted Setup listed it.
+    let cache_expired = at.cache_expired && runtime.detects_cache_expired().await;
     let mut prompt = render::prompt(at.stored, at.entries, edits(&view), &mut image)?;
     let mut tokens = estimate(&prompt)?;
     let causes = if frozen {
@@ -102,7 +108,7 @@ pub async fn prepare(
         conditions::ride_causes(
             at.previous,
             at.current,
-            at.cache_expired,
+            cache_expired,
             at.chain_reset,
             tokens,
             at.conditions,

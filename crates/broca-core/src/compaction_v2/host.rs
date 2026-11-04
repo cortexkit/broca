@@ -195,6 +195,9 @@ pub async fn notice(
     bind: &broca_protocol::BindIdentity,
     scope: Option<&broca_protocol::SessionScope>,
     plane: Option<&dyn crate::CompactionPlane>,
+    // Reads the cache lifetime the session's requests ask for, which decides whether a Setup
+    // sent here lists `cache_expired`. `None` outside a run.
+    keep_warm: Option<&dyn crate::keep_warm_wait::KeepWarmDriver>,
 ) -> Result<(), String> {
     let frames = records(writer, store, bind).await?;
     let (config, manifest) = frozen(&frames)?;
@@ -217,7 +220,14 @@ pub async fn notice(
     let transcript = super::transcript::project(&frames, &lineage)?;
     let conditions = conditions(&config, &transcript.entries, false)?;
     let applied = session.state.lock().await.applied_identity();
-    let mut setup = conditions::setup_request(&preset, &conditions, crate::compaction::now());
+    let mut setup = conditions::setup_request(
+        &preset,
+        &conditions,
+        crate::compaction::now(),
+        keep_warm
+            .and_then(|driver| driver.requested_ttl_ms(&config))
+            .is_some(),
+    );
     setup.applied_view = applied.clone();
     setup.newest = super::views::newest(&transcript.entries);
     session.runtime.observe(&transcript.entries);

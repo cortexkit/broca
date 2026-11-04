@@ -348,6 +348,7 @@ impl Fixture {
                         read_refreshes_ttl: Some(true),
                         warm: Ok(()),
                         basis: None,
+                        requested_ttl_ms: None,
                     })
                 }),
                 slot: WarmSlot::default(),
@@ -1011,6 +1012,7 @@ async fn paused_source_warm_resume_uses_refrozen_auth_and_running_budget() {
                     read_refreshes_ttl: Some(true),
                     warm: Ok(()),
                     basis: None,
+                    requested_ttl_ms: None,
                 })
             }),
             slot: WarmSlot::default(),

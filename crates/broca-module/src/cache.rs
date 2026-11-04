@@ -16,6 +16,9 @@ pub struct CacheDeclaration {
     /// `Ok` when the session can be warmed, else why not.
     pub warm: Result<(), String>,
     pub basis: Option<String>,
+    /// The cache lifetime the session's requests ask the provider for, the only lifetime that
+    /// can prove its cache expired; see `broca_provider::cache_warm::CacheDeclaration`.
+    pub requested_ttl_ms: Option<u64>,
 }
 
 impl CacheDeclaration {
