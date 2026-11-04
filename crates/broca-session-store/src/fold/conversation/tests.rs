@@ -19,6 +19,7 @@ fn input(text: &str, placement: Placement) -> Record {
         notice: None,
         tags_v1: None,
         receipt_seq: None,
+        pruned: Vec::new(),
     })
 }
 
@@ -50,6 +51,7 @@ fn assistant(calls: &[&str]) -> Record {
         last_content_at_ms: None,
         budget_finalize: None,
         tags_v1: None,
+        pruned: Vec::new(),
     })
 }
 

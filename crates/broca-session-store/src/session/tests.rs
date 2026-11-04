@@ -35,6 +35,7 @@ fn input(text: &str) -> Record {
         notice: None,
         tags_v1: None,
         receipt_seq: None,
+        pruned: Vec::new(),
     })
 }
 

@@ -127,6 +127,8 @@ message! {
         /// into a running run): the seq of the ledger record that accepted it. It arrives
         /// while a step runs and is placed at the next step boundary, so the two are apart.
         8 opt receipt_seq: u64,
+        /// Opaque payloads removed when the record left the open log (see `prune`).
+        9 rep [must] pruned: crate::prune::PrunedOpaque,
     }
 }
 
@@ -150,6 +152,9 @@ message! {
         /// calls in it are never run, so the message enters the conversation without them; the
         /// record keeps them as the model wrote them.
         9 opt budget_finalize: bool,
+        /// Opaque payloads removed when the record left the open log (see `prune`). A record
+        /// carrying any must be rendered without its opaque parts.
+        10 rep [must] pruned: crate::prune::PrunedOpaque,
     }
 }
 

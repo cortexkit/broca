@@ -34,7 +34,7 @@ use broca_session_store::codec::Digest;
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::frame::{FrameKey, FRAME_OVERHEAD};
 use broca_session_store::keys::DeploymentKey;
-use broca_session_store::record::{CancelPoint, Stream};
+use broca_session_store::record::{CancelPoint, Record, Stream};
 use broca_wal::FramedRecord;
 use serde::Serialize;
 
@@ -236,6 +236,7 @@ fn main() {
         "measure" => run_measure(&args),
         "append" => run_append(&args),
         "split" => run_split(&args),
+        "seal" => run_seal(&args),
         _ => usage(),
     }
 }
@@ -1192,5 +1193,157 @@ fn run_split(args: &Args) {
             }
         }
     });
+    write_report(&report, args.out_file.as_deref());
+}
+
+#[derive(Default, Serialize)]
+struct SealReport {
+    logs: u64,
+    records: u64,
+    /// Today's log bytes for the logs sealed.
+    today_bytes: u64,
+    transcript_segment_bytes: u64,
+    /// The transcript segments again, with finished runs' opaque reasoning pruned, as a real seal
+    /// writes them.
+    pruned_transcript_segment_bytes: u64,
+    /// Opaque payloads pruned, and their bytes.
+    pruned_payloads: u64,
+    pruned_payload_bytes: u64,
+    ledger_segment_bytes: u64,
+    blocks: u64,
+    /// Microseconds to build both segments of one log (encode, compress, encrypt).
+    build_us: Percentiles,
+    /// Microseconds to read one record by seq from a sealed segment held in memory: open the
+    /// segment (decrypt its index), then decrypt, decompress and decode one block.
+    expand_us: Percentiles,
+    /// Records that read back different from what was sealed. Must be zero.
+    mismatches: u64,
+    failures: Vec<String>,
+}
+
+/// Seals every log: builds its transcript segment and its ledger segment with the real segment
+/// format, as if every record had left the open log, and reads a sample of records back by seq.
+/// It also seals each transcript again with finished runs' opaque reasoning pruned (a run is
+/// finished when the log holds its end), which is what a real seal writes.
+fn run_seal(args: &Args) {
+    let key = broca_session_store::frame::FrameKey::new(1, &[0x5a; 32]);
+    let mut report = SealReport::default();
+    let mut builds = Vec::new();
+    let mut expands = Vec::new();
+    each_log(args, |item| {
+        let Item::Log {
+            name,
+            size,
+            old: Ok(old),
+            ..
+        } = item
+        else {
+            return;
+        };
+        let Ok(converted) = convert(&old) else {
+            report.failures.push(format!("{name}: convert"));
+            return;
+        };
+        let numbered: Vec<(u64, Record)> = converted
+            .records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| (index as u64 + 1, record))
+            .collect();
+        let (transcript, ledger): (Vec<_>, Vec<_>) =
+            numbered.into_iter().partition(|(_, record)| {
+                record.stream() == broca_session_store::record::Stream::Transcript
+            });
+        let meta = || broca_session_store::segment::SegmentMeta {
+            session_id: broca_session_store::codec::Id128([0; 16]),
+            created_at_ms: 0,
+            prefixes: Vec::new(),
+            leading: None,
+            trailer: None,
+        };
+        report.logs += 1;
+        report.today_bytes += size;
+        let finished: std::collections::BTreeSet<&str> = ledger
+            .iter()
+            .filter_map(|(_, record)| match record {
+                Record::RunEnd(end) => Some(end.run_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let pruned: Vec<(u64, Record)> = transcript
+            .iter()
+            .map(|(seq, record)| {
+                let mut record = record.clone();
+                let run = match &record {
+                    Record::Assistant(assistant) => Some(assistant.run_id.clone()),
+                    Record::Input(input) => Some(input.run_id.clone()),
+                    _ => None,
+                };
+                if run.is_some_and(|run| finished.contains(run.as_str())) {
+                    broca_session_store::prune::prune_record(&mut record, &[0x11; 32]);
+                }
+                (*seq, record)
+            })
+            .collect();
+        for (_, record) in &pruned {
+            let stubs = match record {
+                Record::Assistant(assistant) => &assistant.pruned,
+                Record::Input(input) => &input.pruned,
+                _ => continue,
+            };
+            report.pruned_payloads += stubs.len() as u64;
+            report.pruned_payload_bytes += stubs.iter().map(|stub| stub.size).sum::<u64>();
+        }
+        if !pruned.is_empty() {
+            let object = format!("{name}/p");
+            match broca_session_store::segment::build(&key, object.as_bytes(), &pruned, meta()) {
+                Ok(bytes) => report.pruned_transcript_segment_bytes += bytes.len() as u64,
+                Err(e) => report.failures.push(format!("{name}: build pruned {e:?}")),
+            }
+        }
+        for (records, stream_name) in [(&transcript, "t"), (&ledger, "l")] {
+            if records.is_empty() {
+                continue;
+            }
+            report.records += records.len() as u64;
+            let object = format!("{name}/{stream_name}");
+            let started = Instant::now();
+            let bytes =
+                match broca_session_store::segment::build(&key, object.as_bytes(), records, meta())
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        report.failures.push(format!("{name}: build {e:?}"));
+                        continue;
+                    }
+                };
+            builds.push(started.elapsed().as_micros() as u64);
+            if stream_name == "t" {
+                report.transcript_segment_bytes += bytes.len() as u64;
+            } else {
+                report.ledger_segment_bytes += bytes.len() as u64;
+            }
+            // Up to 8 records spread over the segment, each read cold: open, then find.
+            let step = (records.len() / 8).max(1);
+            for (seq, record) in records.iter().step_by(step).take(8) {
+                let started = Instant::now();
+                let found =
+                    broca_session_store::segment::Segment::open(&bytes, &key, object.as_bytes())
+                        .and_then(|segment| segment.find(*seq));
+                expands.push(started.elapsed().as_micros() as u64);
+                match found {
+                    Ok(Some(found)) if &found == record => {}
+                    _ => report.mismatches += 1,
+                }
+            }
+            if let Ok(segment) =
+                broca_session_store::segment::Segment::open(&bytes, &key, object.as_bytes())
+            {
+                report.blocks += segment.index.blocks.len() as u64;
+            }
+        }
+    });
+    report.build_us = percentiles(builds);
+    report.expand_us = percentiles(expands);
     write_report(&report, args.out_file.as_deref());
 }

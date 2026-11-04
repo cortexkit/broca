@@ -451,6 +451,7 @@ fn convert_one(
                     notice: None,
                     tags_v1: tags,
                     receipt_seq: Some(out.records.len() as u64),
+                    pruned: Vec::new(),
                 }));
             }
         }
@@ -696,6 +697,7 @@ fn copies_of(
             notice: None,
             tags_v1: tags_at(&per_message, index),
             receipt_seq: None,
+            pruned: Vec::new(),
         })
         .collect()
 }
@@ -854,6 +856,7 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
             notice: None,
             tags_v1: tags_at(&tags, index),
             receipt_seq: None,
+            pruned: Vec::new(),
         }));
     }
     state.run_id = run_id;
@@ -902,6 +905,7 @@ fn model_step_finished(
         last_content_at_ms: None,
         tags_v1: f.take("tags"),
         budget_finalize: finalize,
+        pruned: Vec::new(),
     }));
     let finish_reason: Option<FinishReason> = f.parse("finish_reason")?;
     let retries_used = f.u64("retries_used").unwrap_or_default() as u32;

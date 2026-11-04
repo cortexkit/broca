@@ -20,6 +20,8 @@
 //! - `head`: the session head, the one small mutable object that names everything else.
 //! - `backend`: where a session's bytes live: memory for tests, and local files.
 //! - `session`: creating, loading and appending to a session.
+//! - `prune`: removing opaque reasoning from records that leave the open log.
+//! - `segment`: sealed segments, the immutable objects records move to when they leave the log.
 
 pub mod backend;
 pub mod checkpoint;
@@ -30,5 +32,7 @@ pub mod frame;
 pub mod head;
 pub mod keys;
 pub mod log;
+pub mod prune;
 pub mod record;
+pub mod segment;
 pub mod session;

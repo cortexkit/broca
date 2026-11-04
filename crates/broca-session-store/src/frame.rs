@@ -106,6 +106,43 @@ impl FrameKey {
     pub fn id(&self) -> u16 {
         self.id
     }
+
+    /// Encrypts `plaintext` as one sealed unit: a random nonce, the ciphertext and the tag.
+    /// `aad` names where the unit lives; [`open_unit`](Self::open_unit) must get the same bytes.
+    pub(crate) fn seal_unit(&self, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::getrandom(&mut nonce).expect("the OS random source is available");
+        let mut buffer = plaintext.to_vec();
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, &mut buffer)
+            .expect("encryption of a bounded unit cannot fail");
+        let mut out = Vec::with_capacity(NONCE_LEN + buffer.len() + TAG_LEN);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&buffer);
+        out.extend_from_slice(&tag);
+        out
+    }
+
+    /// Decrypts a unit [`seal_unit`](Self::seal_unit) produced, or `None` when it fails to
+    /// authenticate under `aad`.
+    pub(crate) fn open_unit(&self, aad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+        if sealed.len() < NONCE_LEN + TAG_LEN {
+            return None;
+        }
+        let (nonce, rest) = sealed.split_at(NONCE_LEN);
+        let (ciphertext, tag) = rest.split_at(rest.len() - TAG_LEN);
+        let mut buffer = ciphertext.to_vec();
+        self.cipher
+            .decrypt_in_place_detached(
+                XNonce::from_slice(nonce),
+                aad,
+                &mut buffer,
+                Tag::from_slice(tag),
+            )
+            .ok()?;
+        Some(buffer)
+    }
 }
 
 /// The result of reading a frame from the start of a byte slice.
