@@ -146,3 +146,44 @@ fn changed_dispatch_arguments_are_kept() {
     };
     assert_eq!(intent.args, Some(serde_json::json!({"cmd": "ls -la"})));
 }
+
+/// A refusal-fallback schedule carries to the next run under the same model and is dropped
+/// under another: the run start records what today's admission decided.
+#[test]
+fn a_run_start_records_the_refusal_schedule_admission_carried() {
+    use broca_session_store::record::RunStart;
+    let schedule = serde_json::json!({
+        "source": {"provider_module_id": "p", "model_id": "m"},
+        "fallback": {"provider_module_id": "p", "model_id": "fallback"},
+        "phase": {"kind": "fallback", "remaining": 9},
+        "re_refusals": 0,
+    });
+    let step = format!(
+        r#"{{"type":"model_step_finished","step_id":1,"assistant_message":{{"message_id":"a","content":[{{"type":"text","text":"ok"}}]}},"usage":{{}},"retries_used":0,"refusal_fallback":{schedule}}}"#
+    );
+    let end = r#"{"type":"run_finished","reason":"completed","usage":{},"retries_used":0}"#;
+    let other_model = RUN
+        .replace("RUN", "r3")
+        .replace(r#""model_id":"m""#, r#""model_id":"other""#);
+    let old = log(&[
+        &RUN.replace("RUN", "r1"),
+        r#"{"type":"step_started","step_id":1}"#,
+        &step,
+        end,
+        &RUN.replace("RUN", "r2"),
+        end,
+        &other_model,
+    ]);
+    let records = convert(&old).unwrap().records;
+    let schedules: Vec<Option<serde_json::Value>> = records
+        .iter()
+        .filter_map(|record| match record {
+            Record::RunStart(start) => {
+                let start: &RunStart = start;
+                Some(start.refusal_schedule.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(schedules, [None, Some(schedule), None]);
+}

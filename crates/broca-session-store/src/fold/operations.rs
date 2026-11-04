@@ -18,6 +18,7 @@ use broca_protocol::content::FinishReason;
 use broca_protocol::ids::ToolCallId;
 use broca_protocol::usage::Usage;
 
+use crate::fold::Bound;
 use crate::record::{BudgetFiring, CallOutcome, CancelPoint, Record, Stream};
 
 /// Why the ledger can't be folded.
@@ -68,12 +69,18 @@ pub enum CallState {
     NotSent,
 }
 
-/// A tool batch whose calls don't all have outcomes yet.
-#[derive(Debug, Clone, PartialEq)]
-pub struct OpenBatch {
-    pub batch_id: String,
-    pub step_id: u64,
-    pub calls: Vec<Call>,
+state! {
+    /// A tool batch whose calls don't all have outcomes yet.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct OpenBatch {
+        pub batch_id: String => { owner: "tool router", reset: "batch_start", bound: Bound::Fixed },
+        pub step_id: u64 => { owner: "tool router", reset: "batch_start", bound: Bound::Fixed },
+        pub calls: Vec<Call> => {
+            owner: "tool router",
+            reset: "batch_start",
+            bound: Bound::OpenWork("one step's tool calls"),
+        },
+    }
 }
 
 impl OpenBatch {
@@ -157,39 +164,113 @@ pub struct NaturalEnd {
     pub extendable: bool,
 }
 
-/// The tool-call budget of the run, as far as it has gone.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Budget {
-    /// The nudges that fired, by their index in the run's frozen budget.
-    pub nudges_fired: Vec<u64>,
-    pub finalize_fired: bool,
-    /// The finalize firing asked for one last step, and it hasn't happened yet.
-    pub finalize_pending: bool,
+state! {
+    /// The tool-call budget of the run, as far as it has gone.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct Budget {
+        /// The nudges that fired, by their index in the run's frozen budget.
+        pub nudges_fired: Vec<u64> => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Config("the frozen budget's nudge list"),
+        },
+        pub finalize_fired: bool => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+        /// The finalize firing asked for one last step, and it hasn't happened yet.
+        pub finalize_pending: bool => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+    }
 }
 
-/// The latest run.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Run {
-    pub run_id: String,
-    pub finished: Option<RunFinishReason>,
-    pub paused: Option<PauseReason>,
-    /// Seeded from an import or fork: it never calls a provider.
-    pub seeded: bool,
-    pub completed_steps: u64,
-    pub tool_call_count: u64,
-    pub usage: Usage,
-    pub retries_used: u32,
-    pub last_finish_reason: Option<FinishReason>,
-    pub natural_end: Option<NaturalEnd>,
-    pub open_batch: Option<OpenBatch>,
-    /// Calls whose outcome is unknown, from closed batches.
-    pub unknown: Vec<ToolCallId>,
-    /// Set when a closed batch was all stop-limit outcomes.
-    pub hard_stopped: Option<RunFinishReason>,
-    /// Steered or delivered messages waiting for a step boundary.
-    pub pending_steers: usize,
-    pub cancel: Option<CancelPoint>,
-    pub budget: Budget,
+state! {
+    /// The latest run.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Run {
+        pub run_id: String => { owner: "admission", reset: "run_start", bound: Bound::Fixed },
+        pub finished: Option<RunFinishReason> => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        pub paused: Option<PauseReason> => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// Seeded from an import or fork: it never calls a provider.
+        pub seeded: bool => { owner: "admission", reset: "run_start", bound: Bound::Fixed },
+        pub completed_steps: u64 => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+        pub tool_call_count: u64 => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+        pub usage: Usage => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+        pub retries_used: u32 => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+        pub last_finish_reason: Option<FinishReason> => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        pub natural_end: Option<NaturalEnd> => {
+            owner: "run loop",
+            reset: "step_start",
+            bound: Bound::Fixed,
+        },
+        pub open_batch: Option<OpenBatch> => {
+            owner: "tool router",
+            reset: "batch_end",
+            bound: Bound::OpenWork("one step's tool calls"),
+        },
+        /// Calls whose outcome is unknown, from closed batches.
+        pub unknown: Vec<ToolCallId> => {
+            owner: "tool router",
+            reset: "run_start",
+            bound: Bound::PerRun("one step's tool calls"),
+        },
+        /// Set when a closed batch was all stop-limit outcomes.
+        pub hard_stopped: Option<RunFinishReason> => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// Steered or delivered messages waiting for a step boundary.
+        pub pending_steers: usize => {
+            owner: "queue",
+            reset: "step_start",
+            bound: Bound::Fixed,
+        },
+        pub cancel: Option<CancelPoint> => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        pub budget: Budget => { owner: "run loop", reset: "run_start", bound: Bound::Declared },
+        /// The whole usage of the latest completed step.
+        pub last_step_usage: Option<Usage> => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// A step started, so a provider was attempted even if no step finished.
+        pub provider_call_started: bool => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        /// Owned by the run loop: why and until when a pause for an account limit waits. Cleared
+        /// when the run continues or ends.
+        pub account_limit_pause: Option<serde_json::Value> => {
+            owner: "run loop",
+            reset: "step_start",
+            bound: Bound::Fixed,
+        },
+        /// Owned by admission: the run's keep-warm and restart policies, as frozen.
+        pub keep_warm: Option<serde_json::Value> => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+        pub on_restart: Option<serde_json::Value> => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+    }
 }
 
 /// What a resume of the latest run must do.
@@ -209,12 +290,12 @@ pub enum Resolution {
 }
 
 impl Run {
-    fn new(run_id: String, seeded: bool) -> Self {
+    fn new(start: &crate::record::RunStart) -> Self {
         Self {
-            run_id,
+            run_id: start.run_id.clone(),
             finished: None,
             paused: None,
-            seeded,
+            seeded: start.seeded == Some(true),
             completed_steps: 0,
             tool_call_count: 0,
             usage: Usage::default(),
@@ -227,6 +308,11 @@ impl Run {
             pending_steers: 0,
             cancel: None,
             budget: Budget::default(),
+            last_step_usage: None,
+            provider_call_started: false,
+            account_limit_pause: None,
+            keep_warm: start.keep_warm.clone(),
+            on_restart: start.on_restart.clone(),
         }
     }
 
@@ -303,10 +389,24 @@ impl Run {
     }
 }
 
-/// The operational state rebuilt so far.
-#[derive(Debug, Clone, Default)]
-pub struct Operations {
-    pub run: Option<Run>,
+state! {
+    /// The operational state rebuilt so far.
+    #[derive(Debug, Clone, Default)]
+    pub struct Operations {
+        /// Only the latest run: an earlier run's state is replaced when the next one starts.
+        pub run: Option<Run> => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Declared,
+        },
+        /// Owned by the run loop: the refusal-fallback schedule. Session-scoped: each run start
+        /// records the schedule it starts with, and steps record its changes.
+        pub refusal_schedule: Option<serde_json::Value> => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
+    }
 }
 
 impl Operations {
@@ -315,8 +415,19 @@ impl Operations {
             return Err(FoldError::TranscriptRecord(record.name()));
         }
         if let Record::RunStart(start) = record {
-            self.run = Some(Run::new(start.run_id.clone(), start.seeded == Some(true)));
+            self.run = Some(Run::new(start));
+            self.refusal_schedule = start.refusal_schedule.clone();
             return Ok(());
+        }
+        if let Record::StepEnd(step) = record {
+            if let Some(next) = step
+                .fallback
+                .as_ref()
+                .and_then(|fallback| fallback.get("refusal_fallback"))
+                .filter(|next| !next.is_null())
+            {
+                self.refusal_schedule = Some(next.clone());
+            }
         }
         if let Record::Event(event) = record {
             if NOT_FOLDED.contains(&event.name.as_str()) {
@@ -328,17 +439,16 @@ impl Operations {
         };
         match record {
             Record::StepStart(_) => {
+                run.provider_call_started = true;
+                run.account_limit_pause = None;
                 run.paused = None;
                 run.natural_end = None;
                 run.pending_steers = 0;
             }
             Record::StepEnd(step) => {
-                run.usage.accumulate(
-                    step.total_usage
-                        .as_ref()
-                        .or(step.usage.as_ref())
-                        .unwrap_or(&Usage::default()),
-                );
+                let usage = step.total_usage.or(step.usage).unwrap_or_default();
+                run.usage.accumulate(&usage);
+                run.last_step_usage = Some(usage);
                 run.retries_used = run.retries_used.saturating_add(step.retries_used);
                 run.last_finish_reason = step.finish_reason;
                 run.completed_steps += 1;
@@ -454,12 +564,14 @@ impl Operations {
                 }
             },
             Record::RunEnd(end) => {
+                run.account_limit_pause = None;
                 run.finished = Some(end.reason);
                 run.retries_used = end.retries_used;
                 run.pending_steers = 0;
                 run.paused = None;
             }
             Record::Pause(pause) => {
+                run.account_limit_pause = pause.account_limit.clone();
                 run.paused = Some(pause.reason);
                 run.finished = None;
             }

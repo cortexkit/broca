@@ -109,6 +109,7 @@ fn one_of_each() -> Vec<Record> {
             keep_warm: None,
             on_restart: None,
             seeded: None,
+            refusal_schedule: None,
         })),
         Record::RunEnd(RunEnd {
             run_id: "run-1".into(),

@@ -260,6 +260,12 @@ message! {
         /// The run was seeded from an import or fork rather than started by a send. Such a run
         /// never calls a provider, so it can't be resumed, only closed.
         26 opt seeded: bool,
+        /// Owned by the run loop: the refusal-fallback schedule the run started with. Decided
+        /// at admission: an earlier run's schedule carries over only when this run uses the
+        /// model that armed it, and the schedule last changed no more than a day before this
+        /// run was admitted (`broca_core::refusal_fallback::on_episode_admitted`). Absent when
+        /// the run starts with none.
+        27 opt refusal_schedule: serde_json::Value,
     }
 }
 

@@ -41,6 +41,7 @@ fn start() -> Record {
         keep_warm: None,
         on_restart: None,
         seeded: None,
+        refusal_schedule: None,
     }))
 }
 
@@ -234,6 +235,53 @@ fn a_pause_is_reported_until_a_terminal_ends_the_run() {
         resolution(&[start(), pause, ended]),
         Resolution::Idle(RunFinishReason::Cancelled)
     );
+}
+
+/// The refusal-fallback schedule is session-scoped: a run starts with the schedule its run start
+/// recorded, and a step that changes it replaces it.
+#[test]
+fn the_refusal_schedule_comes_from_the_run_start_and_the_steps_that_change_it() {
+    let mut first = start();
+    if let Record::RunStart(start) = &mut first {
+        start.refusal_schedule = Some(serde_json::json!({"phase": "source"}));
+    }
+    let mut changed = step_end(0, false);
+    if let Record::StepEnd(step) = &mut changed {
+        step.fallback = Some(serde_json::json!({"refusal_fallback": {"phase": "fallback"}}));
+    }
+    let unchanged = step_end(0, false);
+    let operations = fold(&[
+        first.clone(),
+        step_start(),
+        changed,
+        step_start(),
+        unchanged,
+    ])
+    .unwrap();
+    assert_eq!(
+        operations.refusal_schedule,
+        Some(serde_json::json!({"phase": "fallback"}))
+    );
+    // A new run without a recorded schedule starts with none.
+    let operations = fold(&[first, start()]).unwrap();
+    assert_eq!(operations.refusal_schedule, None);
+}
+
+/// An account-limit pause is cleared when the run continues with a step or ends.
+#[test]
+fn an_account_limit_pause_clears_when_the_run_continues() {
+    let pause = Record::Pause(Pause {
+        run_id: "r".into(),
+        reason: PauseReason::AccountLimit,
+        ts_ms: None,
+        error: None,
+        account_limit: Some(serde_json::json!({"resume_not_before_ms": 5})),
+    });
+    let paused = fold(&[start(), pause.clone()]).unwrap().run.unwrap();
+    assert!(paused.account_limit_pause.is_some());
+    let resumed = fold(&[start(), pause, step_start()]).unwrap().run.unwrap();
+    assert_eq!(resumed.account_limit_pause, None);
+    assert!(resumed.provider_call_started);
 }
 
 #[test]

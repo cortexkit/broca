@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use broca_protocol::content::{ContentBlock, Message, Role, ToolResult};
 use broca_protocol::ids::ToolCallId;
 
+use crate::fold::Bound;
 use crate::record::{Placement, Record, Stream};
 
 /// Why a record can't be folded into the conversation. Each one means the records don't
@@ -43,17 +44,33 @@ struct ToolTurn {
     replies: HashMap<ToolCallId, ToolResult>,
 }
 
-/// The conversation as the model sees it.
-#[derive(Debug, Clone)]
-pub struct Conversation {
-    /// The messages in conversation order. An assistant message whose calls aren't all answered
-    /// isn't here yet.
-    pub messages: Vec<Message>,
-    open: Option<ToolTurn>,
-    /// Whether text delivered with a tool result becomes part of that result in the
-    /// conversation. Sessions on the first compaction protocol stored it that way; sessions on
-    /// the current contract keep the result as returned and add the text when a request renders.
-    appends_in_conversation: bool,
+state! {
+    /// The conversation as the model sees it.
+    #[derive(Debug, Clone)]
+    pub struct Conversation {
+        /// The messages in conversation order. An assistant message whose calls aren't all
+        /// answered isn't here yet. In a stored session this starts at the open log's
+        /// checkpoint, so it holds the active window, never the whole history.
+        pub messages: Vec<Message> => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Window,
+        },
+        open: Option<ToolTurn> => {
+            owner: "run loop",
+            reset: "tool replies",
+            bound: Bound::OpenWork("one assistant message's tool calls"),
+        },
+        /// Whether text delivered with a tool result becomes part of that result in the
+        /// conversation. Sessions on the first compaction protocol stored it that way; sessions
+        /// on the current contract keep the result as returned and add the text when a request
+        /// renders.
+        appends_in_conversation: bool => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+    }
 }
 
 impl Conversation {

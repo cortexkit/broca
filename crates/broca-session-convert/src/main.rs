@@ -28,7 +28,7 @@ use broca_session_convert::{convert, Tally};
 use broca_session_store::codec::Digest;
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::frame::{FrameKey, FRAME_OVERHEAD};
-use broca_session_store::record::Stream;
+use broca_session_store::record::{CancelPoint, Stream};
 use broca_wal::FramedRecord;
 use serde::Serialize;
 
@@ -472,6 +472,24 @@ struct OpsReport {
     /// Mismatching fields, counted once per log for each field that differs.
     mismatches: BTreeMap<String, u64>,
     examples: BTreeMap<String, Vec<String>>,
+    /// The largest size each growing field of the operational state reached, over every
+    /// compared state: the measured side of the bounds the fold declares.
+    largest: BTreeMap<&'static str, u64>,
+    /// For each compared field that is usually empty, how many compared states had a value on
+    /// today's side. A field that is never set anywhere compares nothing.
+    set_on_today: BTreeMap<&'static str, u64>,
+}
+
+/// Serializing values of different types through one closure.
+mod erased {
+    pub trait Serialize {
+        fn to_json(&self) -> serde_json::Value;
+    }
+    impl<T: serde::Serialize> Serialize for T {
+        fn to_json(&self) -> serde_json::Value {
+            serde_json::to_value(self).expect("a replay value encodes")
+        }
+    }
 }
 
 /// Today's resolution in the operational fold's terms.
@@ -500,7 +518,9 @@ enum OpsOutcome {
     /// Neither today's replay nor the fold has a run.
     NoRun,
     /// The fields that differ; empty when the two agree.
-    Compared(Vec<String>),
+    /// The fields that differ (empty when the two agree), and the sizes of the fold's growing
+    /// fields at this state.
+    Compared(Vec<String>, Vec<(&'static str, u64)>, Vec<&'static str>),
 }
 
 /// Folds one log's converted ledger with the new operational fold, and compares the latest
@@ -524,12 +544,17 @@ fn compare_ops(old: &[FramedRecord]) -> OpsOutcome {
     if let Err(e) = folded {
         return OpsOutcome::FoldRefused(format!("{e:?}"));
     }
+    let refusal_schedule = operations.refusal_schedule.clone();
     let Some(run) = operations.run else {
         // Nothing to compare only when today's replay has no run either.
         return if today.run_id.is_none() {
             OpsOutcome::NoRun
         } else {
-            OpsOutcome::Compared(vec!["run (missing from the fold)".into()])
+            OpsOutcome::Compared(
+                vec!["run (missing from the fold)".into()],
+                Vec::new(),
+                Vec::new(),
+            )
         };
     };
     let mut differs = Vec::new();
@@ -620,7 +645,59 @@ fn compare_ops(old: &[FramedRecord]) -> OpsOutcome {
         (batch.batch_id.clone(), batch.step_id, states)
     });
     check("open_batch", today_batch == folded_batch);
-    OpsOutcome::Compared(differs)
+    // Today's values as JSON, absent and null alike as `None`, against the fold's.
+    let as_json = |value: serde_json::Value| (!value.is_null()).then_some(value);
+    let json_of = |value: &dyn erased::Serialize| as_json(value.to_json());
+    check(
+        "last_step_usage",
+        today.last_step_usage == run.last_step_usage,
+    );
+    check(
+        "provider_call_started",
+        today.provider_call_started == run.provider_call_started,
+    );
+    check(
+        "account_limit_pause",
+        json_of(&today.account_limit_pause) == run.account_limit_pause,
+    );
+    check("keep_warm", json_of(&today.keep_warm) == run.keep_warm);
+    check("on_restart", json_of(&today.on_restart) == run.on_restart);
+    check(
+        "refusal_schedule",
+        json_of(&today.refusal_fallback) == refusal_schedule,
+    );
+    let today_cancel = today.cancel_at.map(|at| match at {
+        broca_wal::record::RunCancelAt::Now => CancelPoint::Now,
+        broca_wal::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
+    });
+    check("cancel", today_cancel == run.cancel);
+    let mut set = Vec::new();
+    for (field, value) in [
+        ("account_limit_pause", json_of(&today.account_limit_pause)),
+        ("keep_warm", json_of(&today.keep_warm)),
+        ("on_restart", json_of(&today.on_restart)),
+        ("refusal_schedule", json_of(&today.refusal_fallback)),
+    ] {
+        if value.is_some() {
+            set.push(field);
+        }
+    }
+    if today_cancel.is_some() {
+        set.push("cancel");
+    }
+    let sizes = vec![
+        ("run.unknown", run.unknown.len() as u64),
+        (
+            "run.open_batch.calls",
+            run.open_batch.as_ref().map_or(0, |b| b.calls.len() as u64),
+        ),
+        (
+            "run.budget.nudges_fired",
+            run.budget.nudges_fired.len() as u64,
+        ),
+        ("run.pending_steers", run.pending_steers as u64),
+    ];
+    OpsOutcome::Compared(differs, sizes, set)
 }
 
 /// Runs the operational comparison on each log, or with `--prefixes` on every prefix of it
@@ -662,7 +739,14 @@ fn run_ops(args: &Args) {
                     log_fields.insert(format!("fold refused: {reason}"));
                 }
                 OpsOutcome::NoRun => {}
-                OpsOutcome::Compared(differs) => {
+                OpsOutcome::Compared(differs, sizes, set) => {
+                    for field in set {
+                        *report.set_on_today.entry(field).or_default() += 1;
+                    }
+                    for (field, size) in sizes {
+                        let largest = report.largest.entry(field).or_default();
+                        *largest = (*largest).max(size);
+                    }
                     log_equal &= differs.is_empty();
                     log_fields.extend(differs);
                 }

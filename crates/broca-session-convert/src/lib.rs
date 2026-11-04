@@ -106,6 +106,9 @@ struct State {
     /// new ledger records them.
     stop_met: bool,
     limiting_stop_met: bool,
+    /// The refusal-fallback schedule the run being converted starts with, as today's replay
+    /// decides it at admission. The new run start records it.
+    admitted_schedule: Option<broca_wal::RefusalFallbackSchedule>,
 }
 
 /// Writes the held copies as transcript entries at the boundary that places them.
@@ -135,13 +138,27 @@ pub fn convert(old: &[FramedRecord]) -> Result<Converted, ConvertError> {
     let mut placement = broca_core::placement::Placement::default();
     let mut budget = None;
     let mut stop_when = Vec::new();
+    // Session-scoped: the schedule carries from run to run under the same model.
+    let mut schedule: Option<broca_wal::RefusalFallbackSchedule> = None;
     for framed in old {
         match &framed.record {
-            WalRecord::RunStarted { config, .. } => {
+            WalRecord::RunStarted { config, ts_ms, .. } => {
                 budget = config.budget.clone();
                 stop_when = config.stop_when.clone();
                 state.budget_configured = budget.is_some();
+                schedule = broca_core::refusal_fallback::on_episode_admitted(
+                    schedule.take(),
+                    &config.model,
+                    *ts_ms,
+                );
+                state.admitted_schedule = schedule.clone();
             }
+            WalRecord::ModelStepFinished { fallback, .. } => {
+                if let Some(next) = &fallback.refusal_fallback {
+                    schedule = Some(next.clone());
+                }
+            }
+            WalRecord::ModelStepRefused { schedule: next, .. } => schedule = Some(next.clone()),
             WalRecord::BudgetFired { .. } => {
                 state.due_firing = budget
                     .as_ref()
@@ -759,6 +776,10 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
         keep_warm: f.take("keep_warm"),
         on_restart: f.take("on_restart"),
         seeded: None,
+        refusal_schedule: state
+            .admitted_schedule
+            .take()
+            .map(|schedule| serde_json::to_value(schedule).expect("a schedule encodes")),
     };
     start.seeded = start
         .origin
