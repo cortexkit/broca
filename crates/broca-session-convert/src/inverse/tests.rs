@@ -82,7 +82,7 @@ fn a_steer_is_recorded_where_it_is_placed_and_round_trips() {
             "RunStart",
             "Input",
             "StepStart",
-            "Event",
+            "Steer",
             "Assistant",
             "StepEnd",
             "Input",

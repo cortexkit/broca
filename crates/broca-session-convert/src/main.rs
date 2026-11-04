@@ -145,6 +145,13 @@ struct Args {
     sample: usize,
     /// Visit only the archived log at this session address.
     only: Option<String>,
+    /// `ops`: compare at every prefix of each log, not only at its end.
+    prefixes: bool,
+    /// `ops --prefixes`: skip logs with more records than this, since each prefix is replayed
+    /// from the start.
+    max_records: Option<usize>,
+    /// Visit only every Nth log.
+    every: usize,
     dir: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
@@ -158,6 +165,9 @@ fn parse_args() -> Args {
         limit: usize::MAX,
         sample: 40,
         only: None,
+        prefixes: false,
+        max_records: None,
+        every: 1,
         dir: None,
         files: Vec::new(),
     };
@@ -174,6 +184,9 @@ fn parse_args() -> Args {
             }
             "--limit" => parsed.limit = number(),
             "--sample" => parsed.sample = number(),
+            "--prefixes" => parsed.prefixes = true,
+            "--max-records" => parsed.max_records = Some(number()),
+            "--every" => parsed.every = number().max(1),
             "--only" => parsed.only = Some(args.next().unwrap_or_else(|| usage())),
             "--dir" => parsed.dir = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             _ => paths.push(PathBuf::from(arg)),
@@ -212,6 +225,7 @@ fn main() {
         "check" => run_check(&args),
         "prompt" => run_prompt(&args),
         "trace" => run_trace(&args),
+        "ops" => run_ops(&args),
         "measure" => run_measure(&args),
         "append" => run_append(&args),
         _ => usage(),
@@ -441,6 +455,231 @@ fn run_trace(args: &Args) {
         println!("  today:   {}", roles(&today).join(" "));
         println!("  rebuilt: {}", roles(&conversation.messages).join(" "));
     });
+}
+
+#[derive(Default, Serialize)]
+struct OpsReport {
+    logs: u64,
+    /// Logs left out by `--every` or `--max-records`.
+    not_visited: u64,
+    /// States compared: one per log, or one per prefix with `--prefixes`.
+    compared: u64,
+    /// Logs whose folded run state equals today's replay on every compared field, at every
+    /// compared state.
+    equal: u64,
+    /// States today's replay refuses, so there is nothing to compare against.
+    replay_refused: BTreeMap<String, u64>,
+    /// Mismatching fields, counted once per log for each field that differs.
+    mismatches: BTreeMap<String, u64>,
+    examples: BTreeMap<String, Vec<String>>,
+}
+
+/// Today's resolution in the operational fold's terms.
+fn today_resolution(
+    resolution: &broca_core::replay::ReplayResolution,
+) -> broca_session_store::fold::operations::Resolution {
+    use broca_core::replay::ReplayResolution as Today;
+    use broca_session_store::fold::operations::Resolution;
+    let sorted = |ids: &[broca_protocol::ids::ToolCallId]| {
+        let mut ids = ids.to_vec();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        ids
+    };
+    match resolution {
+        Today::LineageIdle { last_reason } => Resolution::Idle(*last_reason),
+        Today::Interrupted { indeterminate } => Resolution::Interrupted(sorted(indeterminate)),
+        Today::Resume { .. } => Resolution::Resume,
+        Today::ProviderHeld { open_held, .. } => Resolution::ProviderHeld(sorted(open_held)),
+        Today::AuthRequired { reason, .. } => Resolution::Paused(*reason),
+    }
+}
+
+enum OpsOutcome {
+    ReplayRefused(String),
+    FoldRefused(String),
+    /// Neither today's replay nor the fold has a run.
+    NoRun,
+    /// The fields that differ; empty when the two agree.
+    Compared(Vec<String>),
+}
+
+/// Folds one log's converted ledger with the new operational fold, and compares the latest
+/// run's state with what today's replay derives from the same records.
+fn compare_ops(old: &[FramedRecord]) -> OpsOutcome {
+    use broca_session_store::fold::operations::{CallState, Operations, Resolution};
+    let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
+    let today = match broca_core::replay::replay(&records) {
+        Ok(state) => state,
+        Err(e) => return OpsOutcome::ReplayRefused(e.to_string().chars().take(80).collect()),
+    };
+    let Ok(converted) = convert(old) else {
+        return OpsOutcome::FoldRefused("convert".into());
+    };
+    let mut operations = Operations::default();
+    let folded = converted
+        .records
+        .iter()
+        .filter(|r| r.stream() == Stream::Ledger)
+        .try_for_each(|r| operations.apply(r));
+    if let Err(e) = folded {
+        return OpsOutcome::FoldRefused(format!("{e:?}"));
+    }
+    let Some(run) = operations.run else {
+        // Nothing to compare only when today's replay has no run either.
+        return if today.run_id.is_none() {
+            OpsOutcome::NoRun
+        } else {
+            OpsOutcome::Compared(vec!["run (missing from the fold)".into()])
+        };
+    };
+    let mut differs = Vec::new();
+    let mut folded_resolution = run.resolution();
+    if let Resolution::Interrupted(ids) | Resolution::ProviderHeld(ids) = &mut folded_resolution {
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    let expected = today_resolution(&today.resolution);
+    if expected != folded_resolution {
+        let class = |r: &Resolution| match r {
+            Resolution::Idle(reason) => format!("idle({reason:?})"),
+            Resolution::Interrupted(ids) => format!("interrupted({})", ids.len()),
+            Resolution::ProviderHeld(ids) => format!("held({})", ids.len()),
+            Resolution::Paused(reason) => format!("paused({reason:?})"),
+            Resolution::Resume => "resume".into(),
+        };
+        differs.push(format!(
+            "resolution: today {}, folded {}",
+            class(&expected),
+            class(&folded_resolution)
+        ));
+    }
+    let mut check = |field: &str, equal: bool| {
+        if !equal {
+            differs.push(field.to_owned());
+        }
+    };
+    check(
+        "run_id",
+        today.run_id.as_ref().map(|id| id.0.as_str()) == Some(run.run_id.as_str()),
+    );
+    check(
+        "completed_steps",
+        today.completed_steps == run.completed_steps,
+    );
+    check(
+        "tool_call_count",
+        today.tool_call_count == run.tool_call_count,
+    );
+    check("usage", today.usage == run.usage);
+    check("retries_used", today.retries_used == run.retries_used);
+    check(
+        "last_finish_reason",
+        today.last_step_finish_reason == run.last_finish_reason,
+    );
+    check(
+        "pending_steers",
+        today.pending_steers.len() == run.pending_steers,
+    );
+    let mut nudges: Vec<u64> = today
+        .budget_nudges_fired
+        .iter()
+        .map(|i| *i as u64)
+        .collect();
+    nudges.sort_unstable();
+    let mut folded_nudges = run.budget.nudges_fired.clone();
+    folded_nudges.sort_unstable();
+    check("budget_nudges", nudges == folded_nudges);
+    check(
+        "finalize_fired",
+        today.budget_finalize_fired == run.budget.finalize_fired,
+    );
+    check(
+        "finalize_pending",
+        today.budget_finalize_pending == run.budget.finalize_pending,
+    );
+    let today_batch = today.open_tool_batch.as_ref().map(|batch| {
+        let states: Vec<String> = batch
+            .calls
+            .iter()
+            .map(|(id, state)| format!("{}={state:?}", id.0))
+            .collect();
+        (batch.batch_id.0.clone(), batch.step_id.0, states)
+    });
+    let folded_batch = run.open_batch.as_ref().map(|batch| {
+        let states: Vec<String> = (0..batch.calls.len())
+            .map(|position| {
+                let state = match batch.state(position) {
+                    CallState::Terminated => "Terminated",
+                    CallState::Dispatched => "Dispatched",
+                    CallState::ProviderHeld => "ProviderHeld",
+                    CallState::HeldSuccessor => "HeldSuccessor",
+                    CallState::NotSent => "NotSent",
+                };
+                format!("{}={state}", batch.calls[position].id.0)
+            })
+            .collect();
+        (batch.batch_id.clone(), batch.step_id, states)
+    });
+    check("open_batch", today_batch == folded_batch);
+    OpsOutcome::Compared(differs)
+}
+
+/// Runs the operational comparison on each log, or with `--prefixes` on every prefix of it
+/// that ends at a record boundary: the states a crash could leave, which are the states a
+/// resume decides on. A field is counted once per log however many prefixes it differs at.
+fn run_ops(args: &Args) {
+    let mut report = OpsReport::default();
+    each_log(args, |item| {
+        let Item::Log {
+            name, old: Ok(old), ..
+        } = item
+        else {
+            return;
+        };
+        report.logs += 1;
+        if report.logs % args.every as u64 != 0 {
+            report.not_visited += 1;
+            return;
+        }
+        if args.prefixes && args.max_records.is_some_and(|max| old.len() > max) {
+            report.not_visited += 1;
+            return;
+        }
+        let ends: Vec<usize> = if args.prefixes {
+            (1..=old.len()).collect()
+        } else {
+            vec![old.len()]
+        };
+        let mut log_fields = std::collections::BTreeSet::new();
+        let mut log_equal = true;
+        for end in ends {
+            report.compared += 1;
+            match compare_ops(&old[..end]) {
+                OpsOutcome::ReplayRefused(reason) => {
+                    *report.replay_refused.entry(reason).or_default() += 1;
+                }
+                OpsOutcome::FoldRefused(reason) => {
+                    log_equal = false;
+                    log_fields.insert(format!("fold refused: {reason}"));
+                }
+                OpsOutcome::NoRun => {}
+                OpsOutcome::Compared(differs) => {
+                    log_equal &= differs.is_empty();
+                    log_fields.extend(differs);
+                }
+            }
+        }
+        if log_equal {
+            report.equal += 1;
+        }
+        for field in log_fields {
+            *report.mismatches.entry(field.clone()).or_default() += 1;
+            let examples = report.examples.entry(field).or_default();
+            if examples.len() < 3 {
+                examples.push(name.clone());
+            }
+        }
+    });
+    write_report(&report, args.out_file.as_deref());
 }
 
 /// Accumulates one report over many logs.

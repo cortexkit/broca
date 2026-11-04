@@ -3,3 +3,4 @@
 //! the transcript alone and the operational state from the ledger alone.
 
 pub mod conversation;
+pub mod operations;

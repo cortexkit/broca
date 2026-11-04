@@ -108,6 +108,7 @@ fn one_of_each() -> Vec<Record> {
             hooks: None,
             keep_warm: None,
             on_restart: None,
+            seeded: None,
         })),
         Record::RunEnd(RunEnd {
             run_id: "run-1".into(),
@@ -133,6 +134,10 @@ fn one_of_each() -> Vec<Record> {
             call_count: 1,
             fallback: None,
             hooks: None,
+            budget_finalize: None,
+            total_usage: None,
+            stop_met: None,
+            limiting_stop_met: None,
         }),
         Record::Attempt(Attempt {
             run_id: "run-1".into(),

@@ -12863,7 +12863,7 @@ fn message_finish_reason(m: &AssistantMessage) -> FinishReason {
 }
 
 /// The first satisfied stop condition, or None.
-pub(crate) fn stop_satisfied<'a>(
+pub fn stop_satisfied<'a>(
     conds: &'a [StopCondition],
     completed_steps: u64,
     last: &AssistantMessage,
@@ -12879,7 +12879,7 @@ pub(crate) fn stop_satisfied<'a>(
 
 /// Whether any satisfied stop other than LoopFinished forbids adding a model step
 /// to process a queued steer. Check every condition, even after a matching LoopFinished.
-pub(crate) fn limiting_stop_satisfied(
+pub fn limiting_stop_satisfied(
     conds: &[StopCondition],
     completed_steps: u64,
     last: &AssistantMessage,

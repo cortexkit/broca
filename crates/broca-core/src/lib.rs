@@ -16,7 +16,7 @@ pub mod admission;
 pub mod attempt_id;
 pub mod billing;
 mod budget_kernel;
-pub use budget_kernel::next_due_text;
+pub use budget_kernel::{next_due, DueFiring};
 pub mod cache_warm;
 pub mod capability;
 pub mod clock;

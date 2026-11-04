@@ -15,10 +15,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use broca_protocol::content::Message;
 use broca_session_store::codec::Digest;
 use broca_session_store::record::{
-    Assistant, Attempt, CallOutcome, Event, Input, PartKind, PartRef, Placement, QueuedSend,
-    Record, ResultAppend, RunStart, SessionRefresh, StepEnd, ToolIntent, ToolOutcome, ToolReply,
+    Assistant, Attempt, BudgetFire, BudgetFiring, CallOutcome, CancelPoint, Delivery, Event, Input,
+    PartKind, PartRef, Placement, QueuedSend, Record, ResultAppend, RunStart, SessionRefresh,
+    Steer, StepEnd, ToolIntent, ToolOutcome, ToolReply,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -356,6 +358,132 @@ fn session_refresh(
 }
 
 /// An event's old record, with whatever transcript records were split off it put back.
+/// The transcript records a ledger record claimed, by kind.
+struct Claimed<'a> {
+    inputs: Vec<&'a Input>,
+    replies: Vec<&'a ToolReply>,
+    appends: Vec<&'a ResultAppend>,
+}
+
+impl<'a> Claimed<'a> {
+    fn of(claimed: &[&'a Record]) -> Self {
+        let mut sorted = Claimed {
+            inputs: Vec::new(),
+            replies: Vec::new(),
+            appends: Vec::new(),
+        };
+        for record in claimed {
+            match record {
+                Record::Input(input) => sorted.inputs.push(input),
+                Record::ToolReply(reply) => sorted.replies.push(reply),
+                Record::ResultAppend(append) => sorted.appends.push(append),
+                _ => {}
+            }
+        }
+        sorted
+    }
+}
+
+fn expect(ok: bool, name: &str) -> Result<(), String> {
+    ok.then_some(())
+        .ok_or_else(|| format!("{name} claimed records it doesn't split into"))
+}
+
+/// Checks that each placed transcript copy equals the record's message in the same position.
+/// Copies exist only for messages the conversation placed, so there are none or all of them.
+fn check_copies(inputs: &[&Input], messages: &[Message], name: &str) -> Result<(), String> {
+    expect(
+        inputs.is_empty()
+            || (inputs.len() == messages.len()
+                && inputs.iter().zip(messages).all(|(i, m)| &i.message == m)),
+        name,
+    )
+}
+
+fn steered(steer: &Steer, claimed: &[&Record]) -> Result<Value, String> {
+    let claimed = Claimed::of(claimed);
+    expect(
+        claimed.replies.is_empty() && claimed.appends.is_empty(),
+        "steered",
+    )?;
+    check_copies(&claimed.inputs, &steer.input, "steered")?;
+    let mut object = members(steer.receipt.as_ref())?;
+    object.insert("type".into(), json("steered"));
+    object.insert("input".into(), json(&steer.input));
+    set(&mut object, "written_at_ms", steer.written_at_ms);
+    set(&mut object, "tags", steer.tags_v1.as_ref());
+    Ok(Value::Object(object))
+}
+
+fn send_delivered(delivery: &Delivery, claimed: &[&Record]) -> Result<Value, String> {
+    let claimed = Claimed::of(claimed);
+    expect(
+        claimed.replies.is_empty() && claimed.appends.len() <= 1,
+        "send_delivered",
+    )?;
+    check_copies(&claimed.inputs, &delivery.input, "send_delivered")?;
+    if let Some(append) = claimed.appends.first() {
+        expect(
+            delivery.appended_text.as_ref() == Some(&append.text)
+                && delivery.tool_call_id.as_ref() == Some(&append.tool_call_id),
+            "send_delivered",
+        )?;
+    }
+    let mut object = Map::new();
+    object.insert("type".into(), json("send_delivered"));
+    object.insert("submission_id".into(), json(&delivery.submission_id));
+    object.insert("run_id".into(), json(&delivery.run_id));
+    object.insert("mode".into(), json(&delivery.mode));
+    if delivery.input_listed == Some(true) {
+        object.insert("input".into(), json(&delivery.input));
+    }
+    set(&mut object, "tool_call_id", delivery.tool_call_id.as_ref());
+    set(
+        &mut object,
+        "appended_text",
+        delivery.appended_text.as_ref(),
+    );
+    set(&mut object, "written_at_ms", delivery.written_at_ms);
+    set(&mut object, "tags", delivery.tags_v1.as_ref());
+    Ok(Value::Object(object))
+}
+
+/// The transcript copy of a budget firing is the message the conversation took: the stored
+/// text when there is one, else the text the budget had due, which older records didn't store.
+fn budget_fired(fire: &BudgetFire, claimed: &[&Record]) -> Result<Value, String> {
+    let claimed = Claimed::of(claimed);
+    expect(
+        claimed.replies.is_empty() && claimed.appends.is_empty() && claimed.inputs.len() <= 1,
+        "budget_fired",
+    )?;
+    if let Some(input) = claimed.inputs.first() {
+        let text = match input.message.content.as_slice() {
+            [broca_protocol::content::ContentBlock::Text { text }] => text,
+            _ => return Err("budget nudge is not one text block".into()),
+        };
+        expect(
+            fire.caller_text
+                .as_ref()
+                .is_none_or(|stored| stored == text)
+                && input.tags_v1 == fire.tags_v1,
+            "budget_fired",
+        )?;
+    }
+    let mut object = Map::new();
+    object.insert("type".into(), json("budget_fired"));
+    object.insert("run_id".into(), json(&fire.run_id));
+    let kind = match fire.firing {
+        BudgetFiring::Nudge => "nudge",
+        BudgetFiring::Finalize => "finalize",
+    };
+    object.insert("kind".into(), json(kind));
+    object.insert("threshold".into(), json(fire.threshold));
+    object.insert("ordinal".into(), json(fire.ordinal));
+    set(&mut object, "caller_text", fire.caller_text.as_ref());
+    set(&mut object, "tags", fire.tags_v1.as_ref());
+    Ok(Value::Object(object))
+}
+
 fn event(event: &Event, claimed: &[&Record]) -> Result<Value, String> {
     let mut object = members(event.body.as_ref())?;
     object.insert("type".into(), json(&event.name));
@@ -386,45 +514,6 @@ fn event(event: &Event, claimed: &[&Record]) -> Result<Value, String> {
             .ok_or_else(|| format!("{} claimed records it doesn't split into", event.name))
     };
     match event.name.as_str() {
-        "steered" | "send_delivered" => {
-            // The record keeps everything it accepted. Its transcript entries are copies: each
-            // placed message must equal the record's message in the same position, and text
-            // delivered with a tool result must equal the record's.
-            expect(replies.is_empty() && appends.len() <= 1)?;
-            let messages = match object.get("input") {
-                Some(Value::Array(messages)) => messages.as_slice(),
-                _ => &[],
-            };
-            let copied = inputs.len() == messages.len()
-                && inputs.iter().zip(messages).all(|(input, message)| {
-                    without_nulls(&json(&input.message)) == without_nulls(message)
-                });
-            expect(inputs.is_empty() || copied)?;
-            if let Some(append) = appends.first() {
-                expect(
-                    object.get("appended_text") == Some(&json(&append.text))
-                        && object.get("tool_call_id") == Some(&json(&append.tool_call_id)),
-                )?;
-            }
-        }
-        "budget_fired" => {
-            // The record keeps what it stored. The transcript copy is the message the
-            // conversation took: the stored text when there is one, else the text the budget
-            // had due, which older records didn't store.
-            expect(replies.is_empty() && appends.is_empty() && inputs.len() <= 1)?;
-            if let Some(input) = inputs.first() {
-                let text = match input.message.content.as_slice() {
-                    [broca_protocol::content::ContentBlock::Text { text }] => text.clone(),
-                    _ => return Err("budget nudge is not one text block".into()),
-                };
-                expect(
-                    object
-                        .get("caller_text")
-                        .is_none_or(|stored| stored == &json(text)),
-                )?;
-                expect(object.get("tags") == input.tags_v1.as_ref())?;
-            }
-        }
         "recovery_call_closed" => {
             expect(inputs.is_empty() && appends.is_empty() && replies.len() == 1)?;
             let reply = replies[0];
@@ -542,10 +631,16 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                 out.push(tool_terminal(reply, outcome)?);
                 pending.clear();
             }
-            Record::Event(e) => {
+            Record::Event(_) | Record::Steer(_) | Record::Delivery(_) | Record::BudgetFire(_) => {
                 let mut claimed = std::mem::take(&mut pending);
                 claimed.extend(placed_later.remove(&seq).unwrap_or_default());
-                out.push(event(e, &claimed)?);
+                out.push(match record {
+                    Record::Event(e) => event(e, &claimed)?,
+                    Record::Steer(s) => steered(s, &claimed)?,
+                    Record::Delivery(d) => send_delivered(d, &claimed)?,
+                    Record::BudgetFire(b) => budget_fired(b, &claimed)?,
+                    _ => unreachable!("matched above"),
+                });
             }
             other => {
                 unclaimed(&pending, other.name())?;
@@ -587,6 +682,44 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         "type": "structured_output_result",
                         "run_id": result.run_id,
                         "result": result.result,
+                    }),
+                    Record::Pause(pause) => {
+                        let mut object = Map::new();
+                        object.insert("type".into(), json("run_paused"));
+                        object.insert("run_id".into(), json(&pause.run_id));
+                        object.insert("reason".into(), json(pause.reason));
+                        set(&mut object, "ts_ms", pause.ts_ms);
+                        set(&mut object, "error", pause.error.as_ref());
+                        set(&mut object, "account_limit", pause.account_limit.as_ref());
+                        Value::Object(object)
+                    }
+                    Record::ToolHeld(held) => {
+                        let mut object = Map::new();
+                        object.insert("type".into(), json("tool_call_provider_held"));
+                        object.insert("batch_id".into(), json(&held.batch_id));
+                        object.insert("tool_call_id".into(), json(&held.tool_call_id));
+                        object.insert("call_key".into(), json(&held.call_key));
+                        object.insert("module".into(), json(&held.module));
+                        object.insert("reason".into(), json(&held.reason));
+                        set(&mut object, "detail_digest", held.detail_digest.as_ref());
+                        object.insert("held_at_ms".into(), json(held.held_at_ms));
+                        object.insert("sequential".into(), json(held.sequential));
+                        Value::Object(object)
+                    }
+                    Record::Retraction(retraction) => {
+                        let mut object = Map::new();
+                        object.insert("type".into(), json("retracted"));
+                        object.insert("submission_id".into(), json(&retraction.submission_id));
+                        set(&mut object, "failure", retraction.failure.as_ref());
+                        Value::Object(object)
+                    }
+                    Record::CancelRequest(cancel) => serde_json::json!({
+                        "type": "run_cancel_requested",
+                        "run_id": cancel.run_id,
+                        "at": match cancel.at {
+                            CancelPoint::Now => "now",
+                            CancelPoint::StepBoundary => "step_boundary",
+                        },
                     }),
                     _ => unreachable!("every other kind is matched above"),
                 });

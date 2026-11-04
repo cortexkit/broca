@@ -21,9 +21,10 @@ use broca_protocol::request::ModelHandle;
 use broca_protocol::usage::Usage;
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::record::{
-    Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, Compaction, Event, Input, PartKind,
-    PartRef, Placement, QueuedSend, Record, ResultAppend, RunEnd, RunStart, SessionRefresh,
-    SetupStub, StepEnd, StepStart, StructuredResult, ToolIntent, ToolOutcome, ToolReply,
+    Assistant, Attempt, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome, CancelPoint,
+    CancelRequest, Compaction, Delivery, Event, Input, PartKind, PartRef, Pause, Placement,
+    QueuedSend, Record, ResultAppend, Retraction, RunEnd, RunStart, SessionRefresh, SetupStub,
+    Steer, StepEnd, StepStart, StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -95,11 +96,16 @@ struct State {
     /// Whether the current run was frozen with a tool-call budget. Only then does a budget
     /// firing place a message in today's conversation.
     budget_configured: bool,
-    /// The text the current run's budget had due when the record being converted fired, for an
-    /// older firing record that didn't store it.
-    due_budget_text: Option<String>,
+    /// The firing the current run's budget had due when the budget record being converted was
+    /// written. Older records stored neither which nudge fired nor its text.
+    due_firing: Option<broca_core::DueFiring>,
     /// Whether the step being converted is a run's budget-finalize step.
     finalize_step: bool,
+    /// For the step being converted: whether a stop condition was met, and whether a
+    /// limiting one was. Today's replay works these out from the frozen stop conditions; the
+    /// new ledger records them.
+    stop_met: bool,
+    limiting_stop_met: bool,
 }
 
 /// Writes the held copies as transcript entries at the boundary that places them.
@@ -123,22 +129,23 @@ fn hold(inputs: Vec<Input>, state: &mut State, out: &Converted) {
 pub fn convert(old: &[FramedRecord]) -> Result<Converted, ConvertError> {
     let mut out = Converted::default();
     let mut state = State::default();
-    // Today's placement rules track the budget a firing record without its text needs. They
-    // read each record before it is converted, as today's replay does.
+    // Today's placement and budget rules decide what older records left implicit: the firing a
+    // budget record stands for, and whether a step met a stop condition. They read each record
+    // before it is converted, as today's replay does.
     let mut placement = broca_core::placement::Placement::default();
     let mut budget = None;
+    let mut stop_when = Vec::new();
     for framed in old {
         match &framed.record {
             WalRecord::RunStarted { config, .. } => {
                 budget = config.budget.clone();
+                stop_when = config.stop_when.clone();
                 state.budget_configured = budget.is_some();
             }
-            WalRecord::BudgetFired {
-                caller_text: None, ..
-            } => {
-                state.due_budget_text = budget
+            WalRecord::BudgetFired { .. } => {
+                state.due_firing = budget
                     .as_ref()
-                    .and_then(|budget| broca_core::next_due_text(placement.budget(), budget));
+                    .and_then(|budget| broca_core::next_due(placement.budget(), budget));
             }
             _ => {}
         }
@@ -156,6 +163,16 @@ pub fn convert(old: &[FramedRecord]) -> Result<Converted, ConvertError> {
                 }
             )
         });
+        if let WalRecord::ModelStepFinished {
+            assistant_message, ..
+        } = &framed.record
+        {
+            let steps = placement.completed_steps();
+            state.stop_met =
+                broca_core::run::stop_satisfied(&stop_when, steps, assistant_message).is_some();
+            state.limiting_stop_met =
+                broca_core::run::limiting_stop_satisfied(&stop_when, steps, assistant_message);
+        }
         convert_one(&framed.record, &mut state, &mut out)?;
     }
     Ok(out)
@@ -214,21 +231,6 @@ impl Fields {
     fn take(&mut self, key: &str) -> Option<Value> {
         self.object.remove(key).filter(|v| !v.is_null())
     }
-
-    /// A field's value, left in place for whatever carries the rest of the record.
-    fn peek(&self, key: &str) -> Option<&Value> {
-        self.object.get(key).filter(|v| !v.is_null())
-    }
-
-    /// A field parsed as `T`, left in place like `peek`.
-    fn peek_parse<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, ConvertError> {
-        let path = format!("{}.{key}", self.path);
-        self.peek(key)
-            .cloned()
-            .map(|v| serde_json::from_value(v).map_err(|e| err(format!("{path}: {e}"))))
-            .transpose()
-    }
-
     fn u64(&mut self, key: &str) -> Option<u64> {
         let value = self.take(key)?;
         let number = value.as_u64();
@@ -374,25 +376,52 @@ fn convert_one(
             }));
         }
         "steered" => {
-            let written = f.peek("written_at_ms").and_then(Value::as_u64);
-            let copies = message_copies(&mut f, Placement::Steer, written, None)?;
-            hold(copies, state, out);
+            let input: Vec<Message> = f.parse("input")?.unwrap_or_default();
+            let written = f.u64("written_at_ms");
+            let tags = f.take("tags");
+            hold(
+                copies_of(&input, &tags, Placement::Steer, written, None),
+                state,
+                out,
+            );
             // The record keeps everything it accepted: the messages, and the receipt (send id,
             // delivery, retention, sender) the queue reads.
-            event(&mut f, kind.clone(), out);
+            out.records.push(Record::Steer(Steer {
+                input,
+                written_at_ms: written,
+                tags_v1: tags,
+                receipt: f.rest(),
+            }));
         }
         "send_delivered" => send_delivered(&mut f, state, out)?,
         "budget_fired" => {
-            // The record keeps what it stored; the transcript gets the message the conversation
-            // took, written right after the record and naming it. Older records didn't store
-            // the text, and today's conversation then takes the text the run's budget had due.
-            let stored = f
-                .peek("caller_text")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let text = stored.or_else(|| state.due_budget_text.take());
-            let tags = f.peek("tags").cloned();
-            event(&mut f, kind.clone(), out);
+            let firing = match f.req_string("kind").as_str() {
+                "nudge" => BudgetFiring::Nudge,
+                "finalize" => BudgetFiring::Finalize,
+                other => {
+                    f.lose(format!("kind (unknown: {other})"), other.len());
+                    BudgetFiring::Nudge
+                }
+            };
+            let due = state.due_firing.take();
+            let fire = BudgetFire {
+                run_id: f.req_string("run_id"),
+                firing,
+                threshold: f.req_u64("threshold"),
+                ordinal: f.req_u64("ordinal"),
+                caller_text: f.string("caller_text"),
+                tags_v1: f.take("tags"),
+                nudge_index: due
+                    .as_ref()
+                    .and_then(|due| due.nudge_index)
+                    .map(|index| index as u64),
+            };
+            // The transcript gets the message the conversation took, written right after the
+            // record and naming it. Older records didn't store the text, and today's
+            // conversation then takes the text the run's budget had due.
+            let text = fire.caller_text.clone().or_else(|| due.map(|due| due.text));
+            let tags = fire.tags_v1.clone();
+            out.records.push(Record::BudgetFire(fire));
             if let (Some(text), true) = (text, state.budget_configured) {
                 out.records.push(Record::Input(Input {
                     run_id: state.run_id.clone(),
@@ -405,6 +434,46 @@ fn convert_one(
                     receipt_seq: Some(out.records.len() as u64),
                 }));
             }
+        }
+        "run_paused" => {
+            let reason = f
+                .parse("reason")?
+                .ok_or_else(|| err("run_paused without reason"))?;
+            out.records.push(Record::Pause(Pause {
+                run_id: f.req_string("run_id"),
+                reason,
+                ts_ms: f.u64("ts_ms"),
+                error: f.take("error"),
+                account_limit: f.take("account_limit"),
+            }));
+        }
+        "tool_call_provider_held" => out.records.push(Record::ToolHeld(ToolHeld {
+            batch_id: f.req_string("batch_id"),
+            tool_call_id: ToolCallId(f.req_string("tool_call_id")),
+            call_key: f.req_string("call_key"),
+            module: f.req_string("module"),
+            reason: f.req_string("reason"),
+            detail_digest: f.string("detail_digest"),
+            held_at_ms: f.req_u64("held_at_ms"),
+            sequential: f.req_bool("sequential"),
+        })),
+        "retracted" => out.records.push(Record::Retraction(Retraction {
+            submission_id: f.req_string("submission_id"),
+            failure: f.take("failure"),
+        })),
+        "run_cancel_requested" => {
+            let at = match f.req_string("at").as_str() {
+                "now" => CancelPoint::Now,
+                "step_boundary" => CancelPoint::StepBoundary,
+                other => {
+                    f.lose(format!("at (unknown: {other})"), other.len());
+                    CancelPoint::Now
+                }
+            };
+            out.records.push(Record::CancelRequest(CancelRequest {
+                run_id: f.req_string("run_id"),
+                at,
+            }));
         }
         "queued" => queued(&mut f, out)?,
         "session_refresh_accepted" => {
@@ -545,40 +614,32 @@ fn tags_at(tags: &Option<Value>, index: usize) -> Option<Value> {
 
 /// Copies of the messages a steer or delivered send carries, to place in the transcript. The
 /// record keeps its own messages, `tags` (the part numbers its run showed the model) and time;
-/// each copy takes its message's entry from `tags`. A `tags` list that doesn't hold one entry
-/// per message is reported, since the copies couldn't carry it exactly.
-fn message_copies(
-    f: &mut Fields,
+/// each copy takes its message's entry from `tags` when `tags` holds one entry per message.
+fn copies_of(
+    messages: &[Message],
+    tags: &Option<Value>,
     placement: Placement,
     written: Option<u64>,
     submission: Option<String>,
-) -> Result<Vec<Input>, ConvertError> {
-    let messages: Vec<Message> = f.peek_parse("input")?.unwrap_or_default();
-    let tags = match f.peek("tags") {
-        Some(Value::Array(list)) if list.len() == messages.len() => {
-            Some(Value::Array(list.clone()))
-        }
-        Some(other) if !messages.is_empty() => {
-            let bytes = json_len(other);
-            f.lose("tags (not one entry per message)".into(), bytes);
-            None
-        }
+) -> Vec<Input> {
+    let per_message = match tags {
+        Some(Value::Array(list)) if list.len() == messages.len() => tags.clone(),
         _ => None,
     };
-    Ok(messages
-        .into_iter()
+    messages
+        .iter()
         .enumerate()
         .map(|(index, message)| Input {
             run_id: String::new(),
             placement,
-            message,
+            message: message.clone(),
             written_at_ms: written,
             submission_id: submission.clone(),
             notice: None,
-            tags_v1: tags_at(&tags, index),
+            tags_v1: tags_at(&per_message, index),
             receipt_seq: None,
         })
-        .collect())
+        .collect()
 }
 
 /// Carries the rest of an old record whole, as a ledger event under its old type name. The run
@@ -697,7 +758,13 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
         hooks: f.take("hooks"),
         keep_warm: f.take("keep_warm"),
         on_restart: f.take("on_restart"),
+        seeded: None,
     };
+    start.seeded = start
+        .origin
+        .as_ref()
+        .is_some_and(|origin| origin.get("kind").and_then(Value::as_str) == Some("seeded_from"))
+        .then_some(true);
     let mut choices = Map::new();
     if let Some(rest) = config.rest() {
         choices.insert("config".into(), rest);
@@ -761,6 +828,7 @@ fn model_step_finished(
         .model
         .clone()
         .ok_or_else(|| err("model step before any run start"))?;
+    let finalize = std::mem::take(&mut state.finalize_step).then_some(true);
     out.records.push(Record::Assistant(Assistant {
         run_id: state.run_id.clone(),
         step_id,
@@ -770,20 +838,38 @@ fn model_step_finished(
         written_at_ms: f.u64("written_at_ms"),
         last_content_at_ms: None,
         tags_v1: f.take("tags"),
-        budget_finalize: std::mem::take(&mut state.finalize_step).then_some(true),
+        budget_finalize: finalize,
     }));
     let finish_reason: Option<FinishReason> = f.parse("finish_reason")?;
+    let retries_used = f.u64("retries_used").unwrap_or_default() as u32;
+    let service_tier_used = f.string("service_tier_used");
+    let speed_used = f.string("speed_used");
+    let hooks = f.take("hooks");
+    let fallback = f.rest();
+    // A provider fallback inside the step served several model calls; `usage` holds the last
+    // one's and the fallback's iterations hold each. The step's whole usage is their sum.
+    let iterations: Option<Vec<broca_protocol::usage::UsageIteration>> = fallback
+        .as_ref()
+        .and_then(|fallback| fallback.get("usage_iterations"))
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|e| err(format!("model_step_finished.usage_iterations: {e}")))?;
+    let total = broca_protocol::usage::step_usage(usage.unwrap_or_default(), iterations.as_deref());
     out.records.push(Record::StepEnd(StepEnd {
         run_id: state.run_id.clone(),
         step_id,
         usage,
         finish_reason,
-        retries_used: f.u64("retries_used").unwrap_or_default() as u32,
-        service_tier_used: f.string("service_tier_used"),
-        speed_used: f.string("speed_used"),
+        retries_used,
+        service_tier_used,
+        speed_used,
         call_count: calls,
-        hooks: f.take("hooks"),
-        fallback: f.rest(),
+        hooks,
+        fallback,
+        budget_finalize: finalize,
+        total_usage: (Some(total) != usage).then_some(total),
+        stop_met: std::mem::take(&mut state.stop_met).then_some(true),
+        limiting_stop_met: std::mem::take(&mut state.limiting_stop_met).then_some(true),
     }));
     Ok(())
 }
@@ -974,47 +1060,50 @@ fn send_delivered(
     state: &mut State,
     out: &mut Converted,
 ) -> Result<(), ConvertError> {
-    let written = f.peek("written_at_ms").and_then(Value::as_u64);
-    let submission = f
-        .peek("submission_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    // The run it was delivered into is the current one; anything else is reported.
-    if f.peek("run_id").and_then(Value::as_str) != Some(state.run_id.as_str()) {
+    let input: Option<Vec<Message>> = f.parse("input")?;
+    let delivery = Delivery {
+        submission_id: f.req_string("submission_id"),
+        run_id: f.req_string("run_id"),
+        mode: f.req_string("mode"),
+        input_listed: input.is_some().then_some(true),
+        input: input.unwrap_or_default(),
+        tool_call_id: f.parse("tool_call_id")?,
+        appended_text: f.string("appended_text"),
+        written_at_ms: f.u64("written_at_ms"),
+        tags_v1: f.take("tags"),
+    };
+    // A delivery always lands in the run it was recorded with, which is the current run.
+    if delivery.run_id != state.run_id {
         f.lose("run_id (not the current run)".into(), 0);
     }
-    let mode = f
-        .peek("mode")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let placement = match mode.as_str() {
+    let placement = match delivery.mode.as_str() {
         "steer" => Placement::Delivered,
         "turn_system" => Placement::DeliveredTurnSystem,
         // Delivered with a tool result: only `appended_text` below, no input message.
-        "tool_result" => Placement::Delivered,
+        "tool_result" if delivery.input.is_empty() => Placement::Delivered,
         other => {
-            f.lose(format!("mode (unknown: {other})"), other.len());
+            f.lose(format!("mode (with this input: {other})"), other.len());
             Placement::Delivered
         }
     };
-    let copies = message_copies(f, placement, written, submission)?;
-    if mode == "tool_result" && !copies.is_empty() {
-        f.lose("input (with mode tool_result)".into(), 0);
-    }
-    let call: Option<ToolCallId> = f.peek_parse("tool_call_id")?;
-    let text = f.peek("appended_text").and_then(Value::as_str);
-    if let (Some(call), Some(text)) = (call, text) {
+    if let (Some(call), Some(text)) = (&delivery.tool_call_id, &delivery.appended_text) {
         out.records.push(Record::ResultAppend(ResultAppend {
             run_id: state.run_id.clone(),
-            tool_call_id: call,
-            text: text.to_owned(),
+            tool_call_id: call.clone(),
+            text: text.clone(),
             notice: None,
-            written_at_ms: written,
+            written_at_ms: delivery.written_at_ms,
         }));
     }
+    let copies = copies_of(
+        &delivery.input,
+        &delivery.tags_v1,
+        placement,
+        delivery.written_at_ms,
+        Some(delivery.submission_id.clone()),
+    );
     hold(copies, state, out);
-    event(f, "send_delivered".into(), out);
+    out.records.push(Record::Delivery(delivery));
     Ok(())
 }
 

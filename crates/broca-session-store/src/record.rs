@@ -22,7 +22,7 @@
 //! and that loading and appending exercise. The remaining kinds (queue, approvals, held calls,
 //! compaction, policy waits, recovery) are added as their folds are built.
 
-use broca_protocol::caller::RunFinishReason;
+use broca_protocol::caller::{PauseReason, RunFinishReason};
 use broca_protocol::content::{FinishReason, Message, ToolResult};
 use broca_protocol::ids::{MessageId, ToolCallId};
 use broca_protocol::request::ModelHandle;
@@ -257,6 +257,9 @@ message! {
         23 opt hooks: serde_json::Value,
         24 opt keep_warm: serde_json::Value,
         25 opt on_restart: serde_json::Value,
+        /// The run was seeded from an import or fork rather than started by a send. Such a run
+        /// never calls a provider, so it can't be resumed, only closed.
+        26 opt seeded: bool,
     }
 }
 
@@ -300,6 +303,17 @@ message! {
         /// Owned by the run loop: the refusal-fallback route and schedule.
         9 opt fallback: serde_json::Value,
         10 opt hooks: serde_json::Value,
+        /// The run's last step, taken after its tool-call budget asked the model to finish. The
+        /// transcript's `Assistant` carries the same flag; each fold reads only its own record.
+        11 opt budget_finalize: bool,
+        /// The step's whole usage, when a provider fallback inside the step served several
+        /// model calls and `usage` holds only the last one's. Absent when it equals `usage`.
+        12 opt total_usage: Usage,
+        /// Whether one of the run's stop conditions was met by this step.
+        13 opt stop_met: bool,
+        /// Whether a stop condition other than "the loop finished" was met, which forbids an
+        /// extra step to place a steer that arrived during this one.
+        14 opt limiting_stop_met: bool,
     }
 }
 
@@ -470,6 +484,158 @@ message! {
     }
 }
 
+impl Value for PauseReason {
+    const WIRE: Wire = Wire::Varint;
+    const NAME: &'static str = "PauseReason";
+    fn write(&self, out: &mut Vec<u8>) {
+        let n: u64 = match self {
+            PauseReason::AuthRequired => 1,
+            PauseReason::Restart => 2,
+            PauseReason::AccountLimit => 3,
+            PauseReason::ToolHeld => 4,
+        };
+        put_varint(out, n);
+    }
+    fn read(raw: Raw<'_>) -> Result<Self, DecodeError> {
+        let n = u64::read(raw).map_err(|e| DecodeError::new(Self::NAME, e.kind))?;
+        Ok(match n {
+            1 => PauseReason::AuthRequired,
+            2 => PauseReason::Restart,
+            3 => PauseReason::AccountLimit,
+            4 => PauseReason::ToolHeld,
+            other => {
+                return Err(DecodeError::new(
+                    Self::NAME,
+                    DecodeErrorKind::UnknownVariant(other),
+                ))
+            }
+        })
+    }
+}
+
+message! {
+    /// A run paused without ending: it waits for re-authentication, a restart, an account
+    /// limit's reset, or a held tool call's late result, and resumes as the same run.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Pause {
+        1 req run_id: String,
+        2 req reason: PauseReason,
+        3 opt ts_ms: u64,
+        /// Owned by the provider layer: the error that paused the run.
+        4 opt error: serde_json::Value,
+        /// Owned by the run loop: when an account-limit pause may resume.
+        5 opt account_limit: serde_json::Value,
+    }
+}
+
+message! {
+    /// A tool provider took responsibility for answering a dispatched call later. The call is
+    /// not indeterminate while it is held: its result arrives as a late result.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ToolHeld {
+        1 req batch_id: String,
+        2 req tool_call_id: ToolCallId,
+        3 req call_key: String,
+        4 req module: String,
+        5 req reason: String,
+        6 opt detail_digest: String,
+        7 req held_at_ms: u64,
+        /// Whether later calls of the batch wait for this one.
+        8 req sequential: bool,
+    }
+}
+
+values! {
+    /// What a tool-call budget firing does.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum BudgetFiring {
+        /// Reminds the model how many calls it has made.
+        1 Nudge,
+        /// Asks the model to finish: the next step is the run's last, with tools disabled.
+        2 Finalize,
+    }
+}
+
+message! {
+    /// A tool-call budget threshold fired. The message it placed is a transcript `Input` right
+    /// after it.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct BudgetFire {
+        1 req run_id: String,
+        2 req firing: BudgetFiring,
+        3 req threshold: u64,
+        /// The conversation position the message took, as today's log recorded it.
+        4 req ordinal: u64,
+        /// The text the record stored; older records didn't store it.
+        5 opt caller_text: String,
+        6 opt tags_v1: serde_json::Value,
+        /// For a nudge, its index in the run's frozen budget. Decided when the firing was
+        /// written, so the fold never re-derives which nudge fired.
+        7 opt nudge_index: u64,
+    }
+}
+
+message! {
+    /// A steer accepted into a running run. It keeps its messages: they are durable from
+    /// acceptance, and the transcript gets copies where the next step boundary places them.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Steer {
+        1 rep input: Message,
+        2 opt written_at_ms: u64,
+        3 opt tags_v1: serde_json::Value,
+        /// The receipt: sender, send id, delivery, retention, title and hooks.
+        4 opt receipt: serde_json::Value,
+    }
+}
+
+message! {
+    /// A queued send delivered into a running run: as user messages placed at the next step
+    /// boundary, as turn-scoped system text, or as text appended to a tool result.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Delivery {
+        1 req submission_id: String,
+        2 req run_id: String,
+        /// `steer`, `turn_system` or `tool_result`.
+        3 req mode: String,
+        4 rep input: Message,
+        5 opt tool_call_id: ToolCallId,
+        6 opt appended_text: String,
+        7 opt written_at_ms: u64,
+        8 opt tags_v1: serde_json::Value,
+        /// Whether the record listed `input` at all, which an empty list can't show.
+        9 opt input_listed: bool,
+    }
+}
+
+values! {
+    /// When a caller asked a run to stop.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum CancelPoint {
+        1 Now,
+        2 StepBoundary,
+    }
+}
+
+message! {
+    /// A queued send withdrawn before it was placed: by its sender, or because admitting it as
+    /// a run failed.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Retraction {
+        1 req submission_id: String,
+        /// Owned by admission: why admitting the send failed, when it did.
+        2 opt failure: serde_json::Value,
+    }
+}
+
+message! {
+    /// A caller asked to cancel a run.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct CancelRequest {
+        1 req run_id: String,
+        2 req at: CancelPoint,
+    }
+}
+
 message! {
     /// A ledger event whose fields no fold reads individually yet: pauses and resumes, policy waits,
     /// approvals, held calls, late results, the rest of the queue, writer and recovery records,
@@ -587,6 +753,13 @@ records! {
         74 SessionRefresh,
         75 StructuredResult,
         76 Event,
+        77 Pause,
+        78 ToolHeld,
+        79 BudgetFire,
+        80 Steer,
+        81 Delivery,
+        82 CancelRequest,
+        83 Retraction,
     }
 }
 

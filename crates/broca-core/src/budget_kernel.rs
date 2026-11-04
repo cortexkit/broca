@@ -81,11 +81,23 @@ pub(crate) struct Due {
     pub text: String,
 }
 
-/// The text of the next firing due, the message a budget firing places when its record didn't
-/// store the text. Replay reconstructs older records' messages this way, and so does any tool
-/// that rebuilds a conversation from them.
-pub fn next_due_text(state: &BudgetReplayStateV1, config: &BudgetConfig) -> Option<String> {
-    decide(state, config).first().map(|due| due.text.clone())
+/// The next firing due: which nudge it is (`None` for the finalize firing) and the message it
+/// places. Older budget firing records stored neither, so replay derives them, and so does any
+/// tool that rebuilds a session from those records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueFiring {
+    pub nudge_index: Option<usize>,
+    pub text: String,
+}
+
+pub fn next_due(state: &BudgetReplayStateV1, config: &BudgetConfig) -> Option<DueFiring> {
+    decide(state, config)
+        .into_iter()
+        .next()
+        .map(|due| DueFiring {
+            nudge_index: due.index,
+            text: due.text,
+        })
 }
 
 /// Return all outstanding firings in threshold order, with nudges before a tied finalize.
