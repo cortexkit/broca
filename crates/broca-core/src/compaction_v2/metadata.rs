@@ -14,6 +14,16 @@ use cortexkit_role_compaction::{
 
 use crate::placement::{AppendKind, HoldKind, Placement, PlacementAction};
 
+/// Compaction-view metadata and live display use the same frozen render configuration
+/// to decide whether assistant replies are cleaned.
+pub(crate) fn clean_replies(render_tags: bool, frozen_render_config: &serde_json::Value) -> bool {
+    render_tags
+        && !broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(
+            Some(frozen_render_config),
+        )
+        .is_some_and(|frozen| frozen.mode == broca_protocol::structured_output::Mode::FinalText)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Metadata {
     pub tag_base: u64,
@@ -318,7 +328,7 @@ impl Fold {
                                     .is_some_and(|item| !item.is_null())
                             })
                     });
-                self.clean_replies = self.render_tags && !broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(Some(&config.frozen_render_config)).is_some_and(|frozen| frozen.mode == broca_protocol::structured_output::Mode::FinalText);
+                self.clean_replies = clean_replies(self.render_tags, &config.frozen_render_config);
                 self.import_high = matches!(
                     origin,
                     broca_wal::RunOrigin::SeededFrom {

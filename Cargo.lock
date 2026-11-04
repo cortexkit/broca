@@ -508,6 +508,7 @@ version = "0.3.309"
 dependencies = [
  "cortexkit-anthropic-policy",
  "cortexkit-bus-naming",
+ "cortexkit-compaction-view",
  "cortexkit-role-llm-runner 0.7.48",
  "cortexkit-role-llm-runner 0.8.1",
  "jsonschema",
