@@ -2,6 +2,9 @@
 //! folders in memory, writes nothing, and reports what the new format would store, how long
 //! each log takes to load, and what its history would cost sealed.
 //!
+//! `session-convert archive --dir <scratch> <path>...`: the same measurement over the session
+//! logs stored inside WAL archive containers (`.ark`).
+//!
 //! `session-convert append --dir <scratch> [--sample N] <path>...`: replays a sample of logs
 //! through real barrier writes into files under `--dir`, then removes them, and reports barrier
 //! latency.
@@ -17,6 +20,7 @@ use broca_session_convert::measure::{append_log, measure};
 use broca_session_convert::{convert, Tally};
 use broca_session_store::codec::Digest;
 use broca_session_store::frame::{FrameKey, FRAME_OVERHEAD};
+use broca_wal::FramedRecord;
 use serde::Serialize;
 
 /// Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
@@ -100,12 +104,12 @@ fn percentiles(mut values: Vec<u64>) -> Percentiles {
     }
 }
 
-fn collect(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn collect(path: &Path, extension: &str, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     if path.is_dir() {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let child = entry.path();
-            if child.is_file() && child.extension().is_some_and(|e| e == "wal") {
+            if child.is_file() && child.extension().is_some_and(|e| e == extension) {
                 out.push(child);
             }
         }
@@ -118,6 +122,7 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 fn usage() -> ! {
     eprintln!(
         "usage: session-convert measure [--out FILE] [--limit N] PATH...\n       \
+         session-convert archive --dir SCRATCH [--out FILE] [--limit N] PATH...\n       \
          session-convert append --dir SCRATCH [--sample N] [--out FILE] PATH..."
     );
     std::process::exit(64);
@@ -160,8 +165,14 @@ fn parse_args() -> Args {
             _ => paths.push(PathBuf::from(arg)),
         }
     }
+    // Archive containers are `.ark` files; everything else measures session logs.
+    let extension = if parsed.command == "archive" {
+        "ark"
+    } else {
+        "wal"
+    };
     for path in &paths {
-        if let Err(e) = collect(path, &mut parsed.files) {
+        if let Err(e) = collect(path, extension, &mut parsed.files) {
             eprintln!("{}: {e}", path.display());
             std::process::exit(1);
         }
@@ -170,7 +181,7 @@ fn parse_args() -> Args {
     parsed.files.truncate(parsed.limit);
     if parsed.files.is_empty() {
         // A measurement over nothing must not look like a measurement of nothing to store.
-        eprintln!("no .wal files found under the given paths");
+        eprintln!("no .{extension} files found under the given paths");
         std::process::exit(2);
     }
     parsed
@@ -191,36 +202,43 @@ fn main() {
     let args = parse_args();
     match args.command.as_str() {
         "measure" => run_measure(&args),
+        "archive" => run_archive(&args),
         "append" => run_append(&args),
         _ => usage(),
     }
 }
 
-fn run_measure(args: &Args) {
-    let files = &args.files;
-    let key = measurement_key();
-    let mut report = Report::default();
-    let mut parts: BTreeMap<Digest, u64> = BTreeMap::new();
-    let mut per_log = Vec::with_capacity(files.len());
-    let mut load_us = Vec::with_capacity(files.len());
-    for (index, file) in files.iter().enumerate() {
-        if index % 1000 == 0 {
-            eprintln!("{index}/{}", files.len());
+/// Accumulates one report over many logs.
+struct Measuring {
+    key: FrameKey,
+    report: Report,
+    parts: BTreeMap<Digest, u64>,
+    per_log: Vec<u64>,
+    load_us: Vec<u64>,
+}
+
+impl Measuring {
+    fn new() -> Self {
+        Self {
+            key: measurement_key(),
+            report: Report::default(),
+            parts: BTreeMap::new(),
+            per_log: Vec::new(),
+            load_us: Vec::new(),
         }
-        let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-        let started = Instant::now();
-        let old = match broca_wal::replay_file(file, u64::MAX) {
-            Ok(old) => old,
-            Err(e) => {
-                report.failed_logs += 1;
-                report
-                    .errors
-                    .push((file.display().to_string(), format!("read: {e}")));
-                continue;
-            }
-        };
-        report.read_ms += started.elapsed().as_millis();
-        for framed in &old {
+    }
+
+    fn fail(&mut self, name: &str, error: String) {
+        self.report.failed_logs += 1;
+        self.report.errors.push((name.to_owned(), error));
+    }
+
+    /// Converts and measures one old log. `name` identifies it in errors, and its frames are
+    /// encrypted with `name` as their authenticated data, the way a real log's frames are bound
+    /// to that log. `size` is its size as stored today.
+    fn log(&mut self, name: &str, size: u64, old: &[FramedRecord]) {
+        let report = &mut self.report;
+        for framed in old {
             let bytes = serde_json::to_vec(&framed.record).map_or(0, |v| v.len());
             let kind = serde_json::to_value(&framed.record)
                 .ok()
@@ -232,15 +250,9 @@ fn run_measure(args: &Args) {
         }
 
         let started = Instant::now();
-        let converted = match convert(&old) {
+        let converted = match convert(old) {
             Ok(converted) => converted,
-            Err(e) => {
-                report.failed_logs += 1;
-                report
-                    .errors
-                    .push((file.display().to_string(), format!("convert: {e}")));
-                continue;
-            }
+            Err(e) => return self.fail(name, format!("convert: {e}")),
         };
         report.convert_ms += started.elapsed().as_millis();
 
@@ -260,26 +272,17 @@ fn run_measure(args: &Args) {
         }
         report.encode_ms += started.elapsed().as_millis();
 
-        let bind = file
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let measured = match measure(&converted, &key, bind.as_bytes()) {
+        let measured = match measure(&converted, &self.key, name.as_bytes()) {
             Ok(measured) => measured,
-            Err(e) => {
-                report.failed_logs += 1;
-                report
-                    .errors
-                    .push((file.display().to_string(), format!("measure: {e}")));
-                continue;
-            }
+            Err(e) => return self.fail(name, format!("measure: {e}")),
         };
+        let report = &mut self.report;
         report.new_framed_bytes += measured.frame_bytes;
         report.sealed_bytes += measured.sealed_bytes;
         report.sealed_pruned_bytes += measured.sealed_pruned_bytes;
         report.pruned_opaque_bytes += measured.pruned_opaque_bytes;
         report.load_us_total += measured.load_us;
-        load_us.push(measured.load_us);
+        self.load_us.push(measured.load_us);
 
         report.logs += 1;
         report.old_file_bytes += size;
@@ -288,7 +291,7 @@ fn run_measure(args: &Args) {
         report.parts_bytes_per_run += converted.part_bytes_per_run;
         report.runs += converted.runs;
         for (digest, bytes) in &converted.parts {
-            parts.insert(*digest, bytes.len() as u64);
+            self.parts.insert(*digest, bytes.len() as u64);
         }
         for (name, tally) in converted.lost {
             let total = report.lost.entry(name).or_default();
@@ -307,17 +310,123 @@ fn run_measure(args: &Args) {
         class.logs += 1;
         class.old_file_bytes += size;
         class.new_bytes += measured.frame_bytes;
-        per_log.push(measured.frame_bytes);
+        self.per_log.push(measured.frame_bytes);
     }
-    debug_assert_eq!(
-        report.new_framed_bytes,
-        report.new_body_bytes + report.new_records * FRAME_OVERHEAD as u64
+
+    fn finish(mut self, out_file: Option<&Path>) {
+        let report = &mut self.report;
+        debug_assert_eq!(
+            report.new_framed_bytes,
+            report.new_body_bytes + report.new_records * FRAME_OVERHEAD as u64
+        );
+        report.parts_distinct = self.parts.len() as u64;
+        report.parts_distinct_bytes = self.parts.values().sum();
+        report.new_bytes_per_log = percentiles(self.per_log);
+        report.load_us_per_log = percentiles(self.load_us);
+        write_report(report, out_file);
+    }
+}
+
+fn run_measure(args: &Args) {
+    let mut measuring = Measuring::new();
+    for (index, file) in args.files.iter().enumerate() {
+        if index % 1000 == 0 {
+            eprintln!("{index}/{}", args.files.len());
+        }
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+        let started = Instant::now();
+        match broca_wal::replay_file(file, u64::MAX) {
+            Ok(old) => {
+                measuring.report.read_ms += started.elapsed().as_millis();
+                measuring.log(&name, size, &old);
+            }
+            Err(e) => measuring.fail(&name, format!("read: {e}")),
+        }
+    }
+    measuring.finish(args.out_file.as_deref());
+}
+
+/// Archive containers hold whole session logs as members. Each member is written to a scratch
+/// file under `--dir`, read back with the ordinary log reader, measured, and removed.
+fn run_archive(args: &Args) {
+    let dir = args.dir.clone().unwrap_or_else(|| usage());
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        eprintln!("{}: {e}", dir.display());
+        std::process::exit(1);
+    });
+    let scratch = dir.join("member.wal");
+    let mut measuring = Measuring::new();
+    let mut members_seen = 0u64;
+    let mut addresses = std::collections::BTreeSet::new();
+    for container in &args.files {
+        let label = container.display().to_string();
+        let mut reader = match broca_wal::archive::ArchiveReader::open(container, u64::MAX) {
+            Ok(reader) => reader,
+            Err(e) => {
+                measuring.fail(&label, format!("open container: {e}"));
+                continue;
+            }
+        };
+        // A verified index names every member; without one, a header walk stops at the first
+        // damaged member, so report that the container was read that way.
+        let members: Vec<String> = match reader.verified_members() {
+            Ok(Some(members)) => members.into_iter().map(|m| m.session_addr).collect(),
+            Ok(None) | Err(_) => match reader.rescan() {
+                Ok(members) => {
+                    measuring.report.errors.push((
+                        label.clone(),
+                        "no verified index; read by header walk".into(),
+                    ));
+                    members.into_iter().map(|m| m.session_addr).collect()
+                }
+                Err(e) => {
+                    measuring.fail(&label, format!("list members: {e}"));
+                    continue;
+                }
+            },
+        };
+        eprintln!("{label}: {} members", members.len());
+        for addr in members {
+            members_seen += 1;
+            addresses.insert(addr.clone());
+            let name = format!("{label}#{addr}");
+            let member = match reader.read_member(&addr) {
+                Ok(Some(member)) => member,
+                Ok(None) => {
+                    measuring.fail(&name, "listed member not found".into());
+                    continue;
+                }
+                Err(e) => {
+                    measuring.fail(&name, format!("read member: {e}"));
+                    continue;
+                }
+            };
+            let size = member.payload.len() as u64;
+            let started = Instant::now();
+            let old = std::fs::write(&scratch, &member.payload)
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    broca_wal::replay_file(&scratch, u64::MAX).map_err(|e| e.to_string())
+                });
+            match old {
+                Ok(old) => {
+                    measuring.report.read_ms += started.elapsed().as_millis();
+                    measuring.log(&name, size, &old);
+                }
+                Err(e) => measuring.fail(&name, format!("read: {e}")),
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&scratch);
+    eprintln!(
+        "{members_seen} members, {} distinct session addresses",
+        addresses.len()
     );
-    report.parts_distinct = parts.len() as u64;
-    report.parts_distinct_bytes = parts.values().sum();
-    report.new_bytes_per_log = percentiles(per_log);
-    report.load_us_per_log = percentiles(load_us);
-    write_report(&report, args.out_file.as_deref());
+    measuring.finish(args.out_file.as_deref());
 }
 
 #[derive(Default, Serialize)]
