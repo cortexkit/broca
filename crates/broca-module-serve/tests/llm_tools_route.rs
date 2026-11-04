@@ -763,6 +763,7 @@ fn stamped(epoch: u64, owner: &str) -> broca_protocol::SendScope {
             owner: broca_protocol::BindPrincipal::Reserved {
                 module_id: owner.into(),
             },
+            agent_id_frozen: false,
             scope_ref: "run".into(),
             scope_epoch: epoch,
             flow_id: None,

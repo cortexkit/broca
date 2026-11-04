@@ -578,6 +578,7 @@ fn to_bind_scope(
     let run_id = stamp.attributes.run_id.clone();
     let agent_id = run_id
         .as_ref()
+        .or(flow_id.as_ref())
         .and(stamp.attributes.agent_id.as_ref())
         .cloned();
     let sender = flow_id
@@ -588,6 +589,7 @@ fn to_bind_scope(
     broca_protocol::BindScope {
         scope: broca_protocol::SessionScope {
             owner: to_bind_principal(&stamp.owner),
+            agent_id_frozen: false,
             scope_ref: stamp.scope_ref.clone(),
             scope_epoch: stamp.scope_epoch,
             flow_id,
@@ -10259,6 +10261,30 @@ mod agent_run_writer_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn flow_bind_preserves_agent_identity_for_new_freezes() {
+        let stamp: subc_protocol::scope::ScopeStamp = serde_json::from_value(serde_json::json!({
+            "owner":{"kind":"reserved","module_id":"owner-module"},
+            "ref":"flow","scope_epoch":1,"kind":"head","owner_authorized":true,
+            "attributes":{"flow_id":"flow","agent_id":"agent-a"}
+        }))
+        .unwrap();
+        let principal = subc_protocol::Principal::Reserved {
+            module_id: "flow-carrier".into(),
+        };
+        let bind = to_bind_scope(&stamp, Some(&principal));
+        assert_eq!(bind.scope.agent_id.as_deref(), Some("agent-a"));
+        let decision = broca_core::decide_scope(
+            &broca_core::SessionOwnershipV1::default(),
+            Some(&to_bind_principal(&principal)),
+            &broca_protocol::SendScope::Stamped(bind),
+        )
+        .unwrap();
+        let scope = decision.scope().unwrap();
+        assert!(scope.agent_id_frozen);
+        assert_eq!(scope.agent_id.as_deref(), Some("agent-a"));
     }
 
     #[test]

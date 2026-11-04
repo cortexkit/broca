@@ -5788,7 +5788,8 @@ mod late_page_goldens {
 /// A reader-only build cannot freeze or advance a session under an agent-run scope.
 pub const AGENT_RUN_SCOPES_UNSUPPORTED: &str = "agent_run_scopes_unsupported";
 /// A later send changed the agent-run or agent identifier frozen on the session.
-pub const SCOPE_RUN_MISMATCH: &str = "scope_run_mismatch";
+pub const SCOPE_RUN_ID_MISMATCH: &str = "scope_run_id_mismatch";
+pub const SCOPE_AGENT_ID_MISMATCH: &str = "scope_agent_id_mismatch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -5818,7 +5819,11 @@ impl ScopeRunMismatch {
             RunMismatchField::AgentId => "agent_id",
         };
         Self {
-            code: SCOPE_RUN_MISMATCH.into(),
+            code: match field {
+                RunMismatchField::RunId => SCOPE_RUN_ID_MISMATCH,
+                RunMismatchField::AgentId => SCOPE_AGENT_ID_MISMATCH,
+            }
+            .into(),
             message: format!("this send differs from the session's frozen {name}"),
             detail: RunMismatchDetail { field },
         }
@@ -5873,11 +5878,11 @@ mod agent_run_scope_tests {
         for (field, pinned) in [
             (
                 RunMismatchField::RunId,
-                r#"{"code":"scope_run_mismatch","message":"this send differs from the session's frozen run_id","detail":{"field":"run_id"}}"#,
+                r#"{"code":"scope_run_id_mismatch","message":"this send differs from the session's frozen run_id","detail":{"field":"run_id"}}"#,
             ),
             (
                 RunMismatchField::AgentId,
-                r#"{"code":"scope_run_mismatch","message":"this send differs from the session's frozen agent_id","detail":{"field":"agent_id"}}"#,
+                r#"{"code":"scope_agent_id_mismatch","message":"this send differs from the session's frozen agent_id","detail":{"field":"agent_id"}}"#,
             ),
         ] {
             assert_eq!(

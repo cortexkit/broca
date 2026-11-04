@@ -163,8 +163,8 @@ impl<'de> Deserialize<'de> for BindPrincipal {
 /// result, the session itself) can never carry over into the next session under that ref.
 ///
 /// For automation scopes, the flow or agent-run identifier and sending principal are frozen:
-/// an automation may not switch identity or borrow its owner agent's session. `agent_id` is
-/// identity only for agent-run scopes; ordinary agent delegation attributes are not frozen.
+/// an automation may not switch identity or borrow its owner agent's session. Older flow
+/// scopes did not freeze agent identity; `agent_id_frozen` distinguishes new flow freezes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionScope {
     pub owner: BindPrincipal,
@@ -177,12 +177,16 @@ pub struct SessionScope {
     /// The daemon-attested principal driving this automation, not its owner agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<BindPrincipal>,
-    /// Agent identity on an agent-run scope, absent on ordinary and flow scopes.
+    /// Agent identity on an agent-run scope or a newly frozen flow scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     /// The daemon-stamped agent run, not broca's episode `RunId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// New flow freezes compare agent identity, including its absence. Omission preserves
+    /// admission for historical flow records that discarded the stamped agent identity.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_id_frozen: bool,
 }
 
 /// The daemon-attested kind of a scope, fixed for its epoch.

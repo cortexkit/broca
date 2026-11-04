@@ -314,6 +314,7 @@ Sessions recorded before attested owners were stamped, and direct or unverified 
 their pre-existing unrestricted admission: any attested caller is admitted as owner. Head therefore
 reports the full owner grant to those callers too; reporting absence would incorrectly deny the
 permission the next send actually has. This does not tighten or otherwise change legacy admission.
+Flow sessions recorded without `agent_id_frozen` retain their historical admission that ignores `agent_id`; new flow freezes compare it, including absence.
 
 Tool and step-transform plan items may omit `preset`. Broca preserves the omission
 on catalog and declaration calls; it never substitutes an empty string. Mode-3 compaction

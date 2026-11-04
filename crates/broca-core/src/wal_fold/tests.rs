@@ -1829,6 +1829,7 @@ fn a_scoped_session_folds_and_extracts_with_its_gate_and_scope() {
         owner: broca_protocol::BindPrincipal::Reserved {
             module_id: "prefrontal-core".into(),
         },
+        agent_id_frozen: false,
         scope_ref: "head-1".into(),
         scope_epoch: 3,
         flow_id: None,

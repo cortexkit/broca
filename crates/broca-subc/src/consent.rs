@@ -687,6 +687,7 @@ mod tests {
                 owner: broca_protocol::BindPrincipal::Reserved {
                     module_id: "broca".into(),
                 },
+                agent_id_frozen: false,
                 scope_ref: "s".into(),
                 scope_epoch: 1,
                 flow_id: None,

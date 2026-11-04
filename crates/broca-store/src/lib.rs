@@ -6157,6 +6157,7 @@ mod tests {
         };
         let scope = broca_protocol::SessionScope {
             owner: owner.clone(),
+            agent_id_frozen: false,
             scope_ref: "head-1".into(),
             scope_epoch: 3,
             flow_id: None,

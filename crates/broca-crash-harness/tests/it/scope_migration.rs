@@ -60,6 +60,7 @@ fn other() -> BindPrincipal {
 fn head_scope() -> SessionScope {
     SessionScope {
         owner: core(),
+        agent_id_frozen: false,
         scope_ref: "head-1".into(),
         scope_epoch: 3,
         flow_id: None,

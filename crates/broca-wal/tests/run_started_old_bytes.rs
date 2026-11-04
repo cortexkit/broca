@@ -58,7 +58,7 @@ fn flow_run_started_bytes_before_agent_id_freeze_are_pinned() {
 }
 
 #[test]
-fn old_decoder_accepts_future_flow_discriminator_without_changing_replay_inputs() {
+fn flow_discriminator_changes_only_scope_policy_not_replay_inputs() {
     let mut envelope: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/pre_agent_id_frozen_flow_run_started.json"
     ))
@@ -66,6 +66,14 @@ fn old_decoder_accepts_future_flow_discriminator_without_changing_replay_inputs(
     let old: WalRecord = serde_json::from_value(envelope["record"].clone()).unwrap();
     envelope["record"]["scope"]["agent_id_frozen"] = serde_json::json!(true);
     let future: WalRecord = serde_json::from_value(envelope["record"].clone()).unwrap();
-    // Replay and rendering consume the decoded record, which the old decoder leaves identical.
-    assert_eq!(future, old);
+    let WalRecord::RunStarted { scope, .. } = &future else {
+        panic!("expected run start");
+    };
+    assert!(scope.as_ref().unwrap().agent_id_frozen);
+    let mut restored = future.clone();
+    if let WalRecord::RunStarted { scope, .. } = &mut restored {
+        scope.as_mut().unwrap().agent_id_frozen = false;
+    }
+    // The policy flag changes no replay input or frozen render configuration.
+    assert_eq!(restored, old);
 }

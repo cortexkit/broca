@@ -38,6 +38,7 @@ fn stamp() -> SendScope {
     SendScope::Stamped(BindScope {
         scope: SessionScope {
             owner: principal("owner"),
+            agent_id_frozen: false,
             scope_ref: "run".into(),
             scope_epoch: 1,
             flow_id: None,

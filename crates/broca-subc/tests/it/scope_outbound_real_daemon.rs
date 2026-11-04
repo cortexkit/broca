@@ -410,6 +410,7 @@ fn scope(owner: &str, scope_ref: &str) -> SessionScope {
         owner: BindPrincipal::Reserved {
             module_id: owner.into(),
         },
+        agent_id_frozen: false,
         scope_ref: scope_ref.into(),
         scope_epoch: 1,
         flow_id: None,

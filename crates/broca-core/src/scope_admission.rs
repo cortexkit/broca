@@ -24,8 +24,8 @@
 //!   its first send, when that first episode recorded one. A session whose first episode
 //!   recorded no principal (it predates principal recording) keeps accepting sends as before.
 //!
-//! Admission compares scope identity. `agent_id` is frozen only with an agent-run identifier;
-//! ordinary agent scopes still ignore `agent_id` and `delegates`.
+//! Admission compares scope identity. New flow sessions and agent-run sessions freeze
+//! `agent_id`; historical flow sessions and ordinary agent scopes keep their earlier rules.
 
 use broca_protocol::{BindPrincipal, SendScope, SessionScope};
 
@@ -289,8 +289,23 @@ fn decide_scope_with_writer(
         SendScope::Stamped(bind) => Some(&bind.scope),
     };
 
-    // A frozen agent-run session reports identifier changes (including a removed identifier)
-    // before Basal's generic missing-work-scope refusal. Ordinary and flow ordering is unchanged.
+    // The discriminator describes stored policy, not an attested scope attribute. Historical
+    // flow sessions discarded agent identity, so normalize only their comparison copy.
+    let normalized = stamped.cloned().map(|mut scope| {
+        if let Some(frozen) = &ownership.scope {
+            scope.agent_id_frozen = frozen.agent_id_frozen;
+            if frozen.flow_id.is_some() && !frozen.agent_id_frozen {
+                scope.agent_id = frozen.agent_id.clone();
+            }
+        }
+        scope
+    });
+    let stamped = normalized.as_ref();
+    if let Some(frozen) = &ownership.scope {
+        check_frozen_sender(frozen, principal, stamped)?;
+    }
+
+    // Frozen identities take precedence over the principal-specific work-scope checks.
     if ownership
         .scope
         .as_ref()
@@ -305,16 +320,6 @@ fn decide_scope_with_writer(
 
     if let Some(frozen) = &ownership.scope {
         if frozen.run_id.is_some() {
-            if stamped.and_then(|scope| scope.run_id.as_ref()) != frozen.run_id.as_ref() {
-                return Err(ScopeRefusal::RunMismatch {
-                    field: RunMismatchField::RunId,
-                });
-            }
-            if stamped.and_then(|scope| scope.agent_id.as_ref()) != frozen.agent_id.as_ref() {
-                return Err(ScopeRefusal::RunMismatch {
-                    field: RunMismatchField::AgentId,
-                });
-            }
             if !admitted_agent_run_sender(principal, frozen)
                 || principal != frozen.sender.as_ref()
                 || stamped.and_then(|scope| scope.sender.as_ref()) != frozen.sender.as_ref()
@@ -325,22 +330,8 @@ fn decide_scope_with_writer(
                 return Ok(ScopeDecision::Frozen(frozen.clone()));
             }
         }
-        if frozen.flow_id.is_some() {
-            if stamped.and_then(|scope| scope.flow_id.as_ref()) != frozen.flow_id.as_ref() {
-                return Err(ScopeRefusal::FlowMismatch {
-                    field: FlowMismatchField::FlowId,
-                });
-            }
-            if principal != frozen.sender.as_ref()
-                || stamped.and_then(|scope| scope.sender.as_ref()) != frozen.sender.as_ref()
-            {
-                return Err(ScopeRefusal::FlowMismatch {
-                    field: FlowMismatchField::Sender,
-                });
-            }
-            if stamped == Some(frozen) && principal.is_some() {
-                return Ok(ScopeDecision::Frozen(frozen.clone()));
-            }
+        if frozen.flow_id.is_some() && stamped == Some(frozen) && principal.is_some() {
+            return Ok(ScopeDecision::Frozen(frozen.clone()));
         }
         // Checked before the frozen-identity match below, so a send repeating the frozen epoch
         // is never taken for a reopen.
@@ -426,7 +417,62 @@ fn decide_scope_with_writer(
     if frozen.flow_id.is_some() || frozen.run_id.is_some() {
         frozen.sender = principal.cloned();
     }
+    if frozen.flow_id.is_some() {
+        frozen.agent_id_frozen = true;
+    }
     Ok(ScopeDecision::Freeze(frozen))
+}
+
+fn check_frozen_sender(
+    frozen: &SessionScope,
+    principal: Option<&BindPrincipal>,
+    stamped: Option<&SessionScope>,
+) -> Result<(), ScopeRefusal> {
+    use cortexkit_role_llm_runner::scope_admission::{check_frozen, FrozenSender, ScopeKind};
+    let Some(sender) = frozen
+        .sender
+        .as_ref()
+        .filter(|_| frozen.flow_id.is_some() || frozen.run_id.is_some())
+    else {
+        return Ok(());
+    };
+    fn kind(scope: &SessionScope) -> ScopeKind<'_> {
+        if let Some(flow_id) = scope.flow_id.as_deref() {
+            ScopeKind::Flow { flow_id }
+        } else if let Some(run_id) = scope.run_id.as_deref() {
+            ScopeKind::Run { run_id }
+        } else {
+            ScopeKind::Plain
+        }
+    }
+    let frozen_sender = FrozenSender::new(
+        &sender.as_owner_string(),
+        kind(frozen),
+        frozen.agent_id.as_deref(),
+    );
+    let result = check_frozen(
+        &frozen_sender,
+        &principal
+            .map(BindPrincipal::as_owner_string)
+            .unwrap_or_default(),
+        stamped.map(kind).unwrap_or(ScopeKind::Plain),
+        stamped.and_then(|scope| scope.agent_id.as_deref()),
+    );
+    result.map_err(|(_, field)| match field {
+        Some("sender") => ScopeRefusal::FlowMismatch {
+            field: FlowMismatchField::Sender,
+        },
+        Some("flow_id") => ScopeRefusal::FlowMismatch {
+            field: FlowMismatchField::FlowId,
+        },
+        Some("run_id") => ScopeRefusal::RunMismatch {
+            field: RunMismatchField::RunId,
+        },
+        Some("agent_id") => ScopeRefusal::RunMismatch {
+            field: RunMismatchField::AgentId,
+        },
+        _ => unreachable!("scope helper returned an unknown mismatch field"),
+    })
 }
 
 /// Test entry point for evaluating admission with agent-run scope writing enabled.
@@ -546,6 +592,7 @@ mod tests {
     fn scope(owner: BindPrincipal, epoch: u64) -> SessionScope {
         SessionScope {
             owner,
+            agent_id_frozen: false,
             scope_ref: "head-1".into(),
             scope_epoch: epoch,
             flow_id: None,
@@ -794,6 +841,7 @@ mod tests {
 
     fn flow(sender: Option<BindPrincipal>, id: &str) -> SessionScope {
         SessionScope {
+            agent_id_frozen: true,
             flow_id: Some(id.into()),
             sender,
             ..scope(core(), 3)
@@ -977,12 +1025,21 @@ mod agent_run_tests {
             module_id: "other".into(),
         };
         for principal in [Some(wrong), Some(scope().owner), None] {
-            for history in [SessionOwnershipV1::default(), frozen()] {
-                assert!(matches!(
-                    decide_scope_with_writer(&history, principal.as_ref(), &stamped(scope()), true),
-                    Err(ScopeRefusal::OwnerMismatch(_))
-                ));
-            }
+            assert!(matches!(
+                decide_scope_with_writer(
+                    &SessionOwnershipV1::default(),
+                    principal.as_ref(),
+                    &stamped(scope()),
+                    true
+                ),
+                Err(ScopeRefusal::OwnerMismatch(_))
+            ));
+            assert_eq!(
+                decide_scope_with_writer(&frozen(), principal.as_ref(), &stamped(scope()), true),
+                Err(ScopeRefusal::FlowMismatch {
+                    field: FlowMismatchField::Sender
+                })
+            );
         }
     }
 
@@ -1091,6 +1148,7 @@ mod owner_access_tests {
             Some(&reserved("basal")),
             Some(&SessionScope {
                 owner: reserved("prefrontal-core"),
+                agent_id_frozen: false,
                 scope_ref: "work".into(),
                 scope_epoch: 7,
                 flow_id: Some("flow".into()),
@@ -1211,5 +1269,76 @@ mod owner_access_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod flow_agent_freeze_tests {
+    use super::*;
+
+    fn flow(agent: Option<&str>) -> (BindPrincipal, SessionScope) {
+        let sender = BindPrincipal::Reserved {
+            module_id: "flow-carrier".into(),
+        };
+        let scope = serde_json::from_value(serde_json::json!({
+            "owner":{"kind":"reserved","module_id":"owner-module"},
+            "ref":"flow","scope_epoch":1,"flow_id":"flow",
+            "sender":{"kind":"reserved","module_id":"flow-carrier"},"agent_id":agent
+        }))
+        .unwrap();
+        (sender, scope)
+    }
+
+    fn send(scope: SessionScope) -> SendScope {
+        SendScope::Stamped(broca_protocol::BindScope {
+            scope,
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
+            owner_authorized: true,
+        })
+    }
+
+    #[test]
+    fn new_flow_freezes_agent_identity_including_absence() {
+        for original in [Some("agent-a"), None] {
+            let (sender, scope) = flow(original);
+            let decision =
+                decide_scope(&SessionOwnershipV1::default(), Some(&sender), &send(scope)).unwrap();
+            let frozen = decision.scope().unwrap();
+            assert!(frozen.agent_id_frozen);
+            assert_eq!(frozen.agent_id.as_deref(), original);
+            let mut ownership = SessionOwnershipV1::default();
+            ownership.fold_run_started(Some(&sender), Some(frozen));
+            let (_, changed) = flow(Some("agent-b"));
+            assert_eq!(
+                decide_scope(&ownership, Some(&sender), &send(changed)),
+                Err(ScopeRefusal::RunMismatch {
+                    field: RunMismatchField::AgentId
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_flow_keeps_agent_admission_while_new_flow_enforces_it() {
+        let (sender, scope) = flow(None);
+        let mut ownership = SessionOwnershipV1::default();
+        ownership.fold_run_started(Some(&sender), Some(&scope));
+        let (_, changed) = flow(Some("agent-b"));
+        assert_eq!(
+            decide_scope(&ownership, Some(&sender), &send(changed.clone())),
+            Ok(ScopeDecision::Frozen(scope.clone()))
+        );
+        let mut frozen = scope;
+        frozen.agent_id_frozen = true;
+        let mut ownership = SessionOwnershipV1::default();
+        ownership.fold_run_started(Some(&sender), Some(&frozen));
+        assert_eq!(
+            decide_scope(&ownership, Some(&sender), &send(changed)),
+            Err(ScopeRefusal::RunMismatch {
+                field: RunMismatchField::AgentId
+            })
+        );
     }
 }

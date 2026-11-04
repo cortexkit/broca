@@ -198,6 +198,7 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
         owner: broca_protocol::BindPrincipal::Reserved {
             module_id: OWNER.into(),
         },
+        agent_id_frozen: false,
         scope_ref: SCOPE_REF.into(),
         scope_epoch: SCOPE_EPOCH,
         flow_id: None,
@@ -1200,6 +1201,7 @@ async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity()
         frozen,
         [(
             Some(broca_protocol::SessionScope {
+                agent_id_frozen: false,
                 owner: owner_principal.clone(),
                 scope_ref: SCOPE_REF.into(),
                 scope_epoch: SCOPE_EPOCH,
@@ -1330,6 +1332,7 @@ async fn an_ordered_first_send_freezes_the_stamped_scope() {
     assert_eq!(
         scopes,
         [Some(broca_protocol::SessionScope {
+            agent_id_frozen: false,
             owner: broca_protocol::BindPrincipal::Reserved {
                 module_id: OWNER.into(),
             },
@@ -1420,6 +1423,7 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
         scopes,
         [(
             Some(broca_protocol::SessionScope {
+                agent_id_frozen: true,
                 owner: broca_protocol::BindPrincipal::Reserved {
                     module_id: OWNER.into()
                 },

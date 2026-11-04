@@ -39,6 +39,7 @@ async fn enabled_agent_run_refusals_write_no_wal_bytes() {
         "missing-agent",
         "changed-run",
         "changed-agent",
+        "flow-changed-agent",
         "foreign",
         "tools",
         "planned-tools",
@@ -55,7 +56,7 @@ async fn enabled_agent_run_refusals_write_no_wal_bytes() {
         );
         let frozen = matches!(
             case,
-            "changed-run" | "changed-agent" | "foreign" | "adoption"
+            "changed-run" | "changed-agent" | "flow-changed-agent" | "foreign" | "adoption"
         );
         let mut wal = wal_store.open(&key).unwrap();
         if frozen {
@@ -67,7 +68,13 @@ async fn enabled_agent_run_refusals_write_no_wal_bytes() {
             let scope = if matches!(case, "foreign" | "adoption") {
                 None
             } else {
-                Some(scope())
+                let mut scope = scope();
+                if case == "flow-changed-agent" {
+                    scope.run_id = None;
+                    scope.flow_id = Some("flow".into());
+                    scope.agent_id_frozen = true;
+                }
+                Some(scope)
             };
             let record: WalRecord = serde_json::from_value(serde_json::json!({
                 "type": "run_started", "run_id": "seed", "session": key,
@@ -105,8 +112,12 @@ async fn enabled_agent_run_refusals_write_no_wal_bytes() {
         if case == "changed-run" {
             stamp.run_id = Some("other-run".into());
         }
-        if case == "changed-agent" {
+        if matches!(case, "changed-agent" | "flow-changed-agent") {
             stamp.agent_id = Some("other-agent".into());
+        }
+        if case == "flow-changed-agent" {
+            stamp.run_id = None;
+            stamp.flow_id = Some("flow".into());
         }
         let principal = match case {
             "owner" => stamp.owner.clone(),
@@ -180,7 +191,7 @@ async fn enabled_agent_run_refusals_write_no_wal_bytes() {
                 ),
                 "{case}: {response:?}"
             ),
-            "changed-agent" => assert!(
+            "changed-agent" | "flow-changed-agent" => assert!(
                 matches!(
                     response,
                     Err(ServeError::ScopeRefused(

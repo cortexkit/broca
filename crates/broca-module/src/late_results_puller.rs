@@ -2867,6 +2867,7 @@ mod tests {
             owner: broca_protocol::BindPrincipal::Reserved {
                 module_id: "core".into(),
             },
+            agent_id_frozen: false,
             scope_ref: "ref".into(),
             scope_epoch: 1,
             flow_id: None,
@@ -3520,6 +3521,7 @@ mod tests {
             owner: broca_protocol::BindPrincipal::Reserved {
                 module_id: "core".into(),
             },
+            agent_id_frozen: false,
             scope_ref: "scope".into(),
             scope_epoch: 2,
             flow_id: None,
