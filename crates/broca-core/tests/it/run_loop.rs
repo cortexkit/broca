@@ -5000,23 +5000,28 @@ mod keep_warm_scheduler {
         let budget_limited = costs.bust == 3.0;
         let stop_reason = if missed { "warm_missed" } else { "budget" };
         let stops = Arc::new(AtomicUsize::new(0));
-        let run = broca_core::run_loop_on_writer_admitted(
-            request,
-            &writer,
-            StartMode::FreshOrResume,
-            &provider,
-            &plane,
-            &AllowAll,
-            &wal,
-            None,
-            control,
-            &tx,
-            None,
-        )
-        .with_subscriber(super::unsupported_warm_logging::Stops(
-            stops.clone(),
-            stop_reason,
-        ));
+        // The run loop's future is large in debug builds. Held inline in the test future, which
+        // the test runtime pins on the 2 MiB test thread's stack, it overflows that stack on the
+        // first poll. A spawned task in production lives on the heap, so box it here too.
+        let run = Box::pin(
+            broca_core::run_loop_on_writer_admitted(
+                request,
+                &writer,
+                StartMode::FreshOrResume,
+                &provider,
+                &plane,
+                &AllowAll,
+                &wal,
+                None,
+                control,
+                &tx,
+                None,
+            )
+            .with_subscriber(super::unsupported_warm_logging::Stops(
+                stops.clone(),
+                stop_reason,
+            )),
+        );
         let inspect = async {
             plane.started.notified().await;
             if hanging {
