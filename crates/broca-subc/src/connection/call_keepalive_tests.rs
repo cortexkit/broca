@@ -249,7 +249,7 @@ mod call_keepalive {
                     let identity =
                         broca_protocol::BindIdentity::new("/project", "broca", "session");
                     let open = conn.route_open_dispatch_single_attempt(
-                        "provider", &identity, None, result, held, keepalive,
+                        "provider", &identity, None, result, held, keepalive, false,
                     );
                     tokio::pin!(open);
                     let request = tokio::select! {

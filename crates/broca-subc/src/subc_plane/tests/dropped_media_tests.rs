@@ -301,6 +301,10 @@ async fn tool_result_v1_empty_content_is_a_named_terminal_error_once() {
     }
 }
 
+/// A route warmed before plan admission is opened without the role and without result
+/// formats. The batch's plan fetched the provider, so its dispatch reopens declaring
+/// `tool-provider: v1`, whatever format the provider declared, and reads `tool-result/v1`
+/// bodies only when the catalog declared that format.
 #[tokio::test]
 async fn tool_result_v1_requires_catalog_declaration_and_upgrades_a_warm_legacy_bind() {
     for format in [None, Some("tool-result/v1"), Some("content/v1")] {
@@ -323,11 +327,12 @@ async fn tool_result_v1_requires_catalog_declaration_and_upgrades_a_warm_legacy_
             .await
             .unwrap();
         let result = completed(plane.dispatch(&ctx, &call).await);
+        assert_eq!(*rig.opened_role.lock().unwrap(), vec![false, true]);
         let expected = if format == Some("tool-result/v1") {
             assert_eq!(*rig.opened_result.lock().unwrap(), vec![false, true]);
             "errorCode"
         } else {
-            assert_eq!(*rig.opened_result.lock().unwrap(), vec![false]);
+            assert_eq!(*rig.opened_result.lock().unwrap(), vec![false, false]);
             assert_eq!(result.output, ToolOutput::error("boom"));
             "boom"
         };

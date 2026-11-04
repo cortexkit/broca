@@ -313,6 +313,8 @@ pub struct RouteHandle {
     pub(crate) reads_tool_result: bool,
     pub(crate) reads_held_reply: bool,
     pub(crate) call_keepalive: bool,
+    /// The route was opened declaring `tool-provider: v1`.
+    pub(crate) tool_provider_v1: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -352,6 +354,7 @@ impl RouteHandle {
             reads_tool_result: false,
             reads_held_reply: false,
             call_keepalive: false,
+            tool_provider_v1: false,
         }
     }
 
@@ -1404,6 +1407,13 @@ impl SubcConnection {
         .await
     }
 
+    /// ONE `route.open` attempt for the route that carries a session's tool calls to
+    /// `module_id`. `tool_provider_v1` declares `tool-provider: v1` on it. A provider whose
+    /// catalog the session's plan fetch answered was fetched over such a route, and a module may
+    /// treat a route without the role as discovery-only, serving `role.describe` and
+    /// `tool.catalog` but refusing its tools (Magic Context does). A session admitted without a
+    /// plan fetch keeps a route without the role, so a provider it never fetched sees nothing new.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn route_open_dispatch_single_attempt(
         &self,
         module_id: &str,
@@ -1412,6 +1422,7 @@ impl SubcConnection {
         tool_result_v1: bool,
         provider_held_installed: bool,
         call_keepalive: bool,
+        tool_provider_v1: bool,
     ) -> ConnResult<RouteHandle> {
         let mut capabilities = if provider_held_installed {
             Some(vec![
@@ -1427,13 +1438,16 @@ impl SubcConnection {
                 .get_or_insert_with(Vec::new)
                 .push(cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY.into());
         }
+        let role_versions = tool_provider_v1.then(|| {
+            std::collections::BTreeMap::from([("tool-provider".to_owned(), "v1".to_owned())])
+        });
         self.route_open_target_with_capabilities(
             RouteTarget::ToolProvider {
                 module_id: module_id.into(),
             },
             identity,
             scope.cloned(),
-            None,
+            role_versions,
             capabilities,
         )
         .await
@@ -1784,6 +1798,9 @@ impl SubcConnection {
             caps.iter()
                 .any(|cap| cap == cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY)
         });
+        let tool_provider_v1 = role_versions
+            .as_ref()
+            .is_some_and(|roles| roles.contains_key("tool-provider"));
         let req = ClientControlRequest::RouteOpen {
             identity,
             target,
@@ -1797,8 +1814,9 @@ impl SubcConnection {
             // Scoped tool and management clients first check the daemon advertises `scopes/v1`:
             // an older daemon drops the field and would open an unscoped route instead.
             scope,
-            // Role routes declare their surface. A route that dispatches the model's tool
-            // calls declares none, so what a provider serves on it is unchanged.
+            // Role routes declare their surface. A dispatch route declares `tool-provider: v1`
+            // only for a provider the session's plan fetch answered (see
+            // `route_open_dispatch_single_attempt`).
             role_versions,
         };
         let body = serde_json::to_vec(&req).map_err(|e| ConnError::Transport(e.to_string()))?;
@@ -1814,6 +1832,7 @@ impl SubcConnection {
                         handle.reads_tool_result = reads_tool_result;
                         handle.reads_held_reply = reads_held_reply;
                         handle.call_keepalive = call_keepalive;
+                        handle.tool_provider_v1 = tool_provider_v1;
                         Ok(handle)
                     }
                     Ok(other) => Err(ConnError::Protocol(format!(
@@ -4880,6 +4899,36 @@ mod tests {
             Err(ConnError::StaleRouteHandle(_))
         ));
     }
+    /// A dispatch route for a provider the plan fetch answered declares exactly
+    /// `tool-provider: v1`, keeps the tool-module bind harness, and records the role on its
+    /// handle, so the route cache can tell it from a route without the role.
+    #[tokio::test]
+    async fn a_fetched_providers_dispatch_route_declares_tool_provider_v1() {
+        let (conn, mut write_rx, pending) = route_open_test_connection();
+        let identity = broca_protocol::BindIdentity {
+            project_root: "/project".into(),
+            harness: "broca".into(),
+            session: "session".into(),
+        };
+        let open = conn.route_open_dispatch_single_attempt(
+            "provider", &identity, None, false, false, false, true,
+        );
+        tokio::pin!(open);
+        let request = tokio::select! {
+            result = &mut open => panic!("premature result: {result:?}"),
+            request = write_rx.recv() => request.unwrap(),
+        };
+        let raw: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            raw["role_versions"],
+            serde_json::json!({"tool-provider": "v1"})
+        );
+        assert_eq!(raw["identity"]["harness"], TOOL_MODULE_HARNESS);
+        answer_route_open(&pending, &request, 7);
+        let route = open.await.unwrap();
+        assert!(route.tool_provider_v1);
+    }
+
     #[tokio::test]
     async fn dispatch_result_capability_is_independent_of_held_and_role_routes_stay_undeclared() {
         for (result_v1, installed) in [(false, false), (true, false), (false, true)] {
@@ -4890,7 +4939,7 @@ mod tests {
                 session: "session".into(),
             };
             let open = conn.route_open_dispatch_single_attempt(
-                "provider", &identity, None, result_v1, installed, false,
+                "provider", &identity, None, result_v1, installed, false, false,
             );
             tokio::pin!(open);
             let request = tokio::select! {
@@ -4916,10 +4965,14 @@ mod tests {
                         .as_bytes()
                 );
             }
+            assert!(raw
+                .get("role_versions")
+                .is_none_or(serde_json::Value::is_null));
             answer_route_open(&pending, &request, 7);
             let route = open.await.unwrap();
             assert_eq!(route.reads_held_reply, installed);
             assert_eq!(route.reads_tool_result, result_v1 || installed);
+            assert!(!route.tool_provider_v1);
         }
         let (conn, mut write_rx, pending) = route_open_test_connection();
         let identity = broca_protocol::BindIdentity {

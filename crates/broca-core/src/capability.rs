@@ -51,6 +51,9 @@ pub struct ToolManifest {
     /// Empty for a session admitted without one, and never filled from a live catalog: a
     /// resumed run must read replies by what its session actually admitted.
     provider_declarations: HashMap<String, broca_wal::FrozenProviderDeclarations>,
+    /// The providers whose catalog the plan fetch answered at admission. Each was fetched over
+    /// a route declaring `tool-provider: v1`, so its dispatch route declares the same role.
+    fetched_providers: HashSet<String>,
 }
 
 impl ToolManifest {
@@ -85,6 +88,7 @@ impl ToolManifest {
             provider_presets: HashMap::new(),
             provider_replies: HashMap::new(),
             provider_declarations: HashMap::new(),
+            fetched_providers: HashSet::new(),
         }
     }
 
@@ -105,6 +109,9 @@ impl ToolManifest {
             }
         }
         for fetch in &manifest.fetches {
+            if matches!(fetch.outcome, broca_wal::FetchOutcome::Answered { .. }) {
+                self.fetched_providers.insert(fetch.provider.clone());
+            }
             if let broca_wal::FetchOutcome::Answered {
                 declarations_frozen: Some(declarations),
                 ..
@@ -144,6 +151,12 @@ impl ToolManifest {
         provider: &str,
     ) -> Option<&broca_wal::FrozenProviderDeclarations> {
         self.provider_declarations.get(provider)
+    }
+
+    /// Whether the session's plan fetch answered `provider`'s catalog at admission. False for a
+    /// session admitted without a plan manifest.
+    pub fn provider_fetched(&self, provider: &str) -> bool {
+        self.fetched_providers.contains(provider)
     }
 
     /// The frozen tool item's preset for the provider a call actually routes to.
