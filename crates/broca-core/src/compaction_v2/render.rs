@@ -17,14 +17,13 @@ use cortexkit_role_compaction::{
     view::{Edit, EditOp, InsertAt, InsertedImage},
 };
 
-/// Assemble a mode-3 request from the durable transcript and the view applied to this step.
-/// The boundary options retain live-only settings and decorated tool outputs; callers rebuilding
-/// offline must restore those decorations before calling. Image capture belongs to the live
-/// boundary, so this pure renderer only recreates content-addressed image references.
+/// Rebuild a request offline for a log whose first run froze a compaction plan version.
+/// Boundary options must already contain restored tool-output decorations. Image capture belongs
+/// to the live boundary; offline rendering only recreates content-addressed image references.
 pub fn request_options(
     records: &[broca_wal::FramedRecord],
     lineage: &str,
-    boundary: &broca_protocol::CallOptions,
+    mut boundary: broca_protocol::CallOptions,
     applied: Option<&cortexkit_role_compaction::view::View>,
 ) -> Result<broca_protocol::CallOptions, String> {
     let transcript = super::transcript::project(records, lineage)?;
@@ -39,10 +38,22 @@ pub fn request_options(
     } else {
         deliveries_only(&boundary.prompt, &transcript.entries)?
     };
-    let mut opts = options(boundary, prompt);
-    opts.ephemeral_session |=
+    boundary.ephemeral_session |=
         crate::retention::is_retention_records(records.iter().map(|frame| &frame.record));
-    let globals = super::systems::frozen(true, &config, manifest)?;
+    finish(&boundary, prompt, &config, manifest)
+}
+
+/// Complete an already-rendered prompt with the frozen run's global system messages.
+/// Boundary options preserve the ephemeral-session flag and renderer-only settings. The live
+/// caller passes Prepared::Ready's prompt, so finishing never selects a different view.
+pub fn finish(
+    boundary: &broca_protocol::CallOptions,
+    prompt: Vec<Message>,
+    config: &broca_wal::RunConfig,
+    manifest: Option<&broca_wal::PlanManifest>,
+) -> Result<broca_protocol::CallOptions, String> {
+    let opts = options(boundary, prompt);
+    let globals = super::systems::frozen(true, config, manifest)?;
     Ok(super::systems::view(&opts, &globals)?.unwrap_or(opts))
 }
 

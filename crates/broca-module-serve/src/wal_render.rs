@@ -192,7 +192,7 @@ pub fn boundary_options_with_lineage(
         opts = broca_core::compaction_v2::render::request_options(
             frames,
             lineage,
-            &opts,
+            opts,
             state.view_for_step(step),
         )?;
     }

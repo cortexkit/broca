@@ -6468,10 +6468,14 @@ where
                 },
                 |image| crate::compaction_v2::host::image(writer, image),
                 |prompt| {
-                    let view = crate::compaction_v2::render::options(&opts, prompt.to_vec());
-                    let globals = crate::compaction_v2::systems::view(&view, &v2_globals)?;
+                    let view = crate::compaction_v2::render::finish(
+                        &opts,
+                        prompt.to_vec(),
+                        &config,
+                        manifest,
+                    )?;
                     provider
-                        .try_render_request(globals.as_ref().unwrap_or(&view))
+                        .try_render_request(&view)
                         .map(|bytes| {
                             crate::compaction::request_estimate(bytes.len(), &compaction_history).0
                         })
@@ -6504,17 +6508,13 @@ where
                     });
                     break RunFinishReason::ContextCeiling;
                 }
-                crate::compaction_v2::request::Prepared::Ready { applied, .. } => {
+                crate::compaction_v2::request::Prepared::Ready {
+                    prompt, applied, ..
+                } => {
                     provider.set_cache_evidence_view(applied.map(|view| view.version));
-                    let view = session.state.lock().await.view_for_step(step_id.0).cloned();
                     model_opts = Some(Arc::new(
-                        crate::compaction_v2::render::request_options(
-                            &frames,
-                            &lineage,
-                            &opts,
-                            view.as_ref(),
-                        )
-                        .map_err(RunError::Wal)?,
+                        crate::compaction_v2::render::finish(&opts, prompt, &config, manifest)
+                            .map_err(RunError::Wal)?,
                     ));
                 }
             }
@@ -6529,8 +6529,15 @@ where
                     RunError::Wal("mode-3 delivery rendering requires a WAL lineage".into())
                 })?
                 .to_string();
+            let transcript = crate::compaction_v2::transcript::project(&frames, &lineage)
+                .map_err(RunError::Wal)?;
+            let (config, manifest) =
+                crate::compaction_v2::host::frozen(&frames).map_err(RunError::Wal)?;
+            let prompt =
+                crate::compaction_v2::render::deliveries_only(&opts.prompt, &transcript.entries)
+                    .map_err(RunError::Wal)?;
             model_opts = Some(Arc::new(
-                crate::compaction_v2::render::request_options(&frames, &lineage, &opts, None)
+                crate::compaction_v2::render::finish(&opts, prompt, &config, manifest)
                     .map_err(RunError::Wal)?,
             ));
         }

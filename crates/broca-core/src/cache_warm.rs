@@ -1104,7 +1104,7 @@ pub fn last_recorded_request_with_lineage(
         opts = crate::compaction_v2::render::request_options(
             &frames,
             lineage,
-            &opts,
+            opts,
             state.view_for_step(step_id.0),
         )
         .map_err(RecordedRequestError::Unavailable)?;
