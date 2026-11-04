@@ -34,7 +34,7 @@ fn seed_admission_episode(wal: &FlakyReadWalStore, key: &BindIdentity, now: u64,
     }
     writer.append(1, &record, true).unwrap();
     let end = if restart {
-        WalRecord::RunPaused { run_id: RunId("prior".into()), ts_ms: Some(now),
+        WalRecord::RunPaused { account_limit: None, run_id: RunId("prior".into()), ts_ms: Some(now),
             reason: broca_protocol::PauseReason::Restart, error: None }
     } else {
         WalRecord::RunFinished { interrupt_reason: None, ts_ms: Some(now), reason: RunFinishReason::Completed,
@@ -189,4 +189,32 @@ async fn queued_restart_waiter_receives_explicit_error_on_failed_seal() {
     let _ = registry.stop_and_seal().await;
     let _ = tokio::time::timeout(Duration::from_secs(15), resume).await.unwrap().unwrap();
     let _ = std::fs::remove_dir_all(dir);
+}
+
+struct MissingCompactionLimitAdmission;
+#[async_trait]
+impl RunExecutor for MissingCompactionLimitAdmission {
+    async fn execute(&self, mut job: RunJob, _out: mpsc::Sender<OutputEvent>) -> Result<RunSummary, RunError> {
+        // The run loop refuses through the admission channel before it writes anything.
+        if let Some(reply) = job.on_admitted.take() {
+            let _ = reply.send(Err(RunError::CompactionContextLimitMissing));
+        }
+        Err(RunError::CompactionContextLimitMissing)
+    }
+}
+
+#[tokio::test]
+async fn compaction_v2_missing_limit_admission_keeps_the_invalid_params_field_and_writes_nothing() {
+    let dir = broca_test_support::scratch_root().join(format!("compaction-limit-admission-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = BindIdentity::new(dir.join("project"), "runner", "session");
+    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    let opener = Arc::new(crate::opener::DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), wal.clone(), Arc::new(MissingCompactionLimitAdmission)));
+    let registry = LineageRegistry::new_with_reader(opener, wal.clone(), None);
+    let result = registry.route_send(&key, text_req(&key, "limit"), RunKind::FreshOrResume).await.unwrap();
+    assert!(matches!(result, SendOutcome::DeliveryRefused { code:"invalid_params", field:"context_limit", .. }), "{result:?}");
+    assert!(wal.read_records(&key).unwrap().is_empty());
+    assert!(registry.stop_and_seal().await);
+    std::fs::remove_dir_all(dir).unwrap();
 }

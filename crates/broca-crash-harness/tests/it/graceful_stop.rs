@@ -148,7 +148,54 @@ async fn every_boundary_inside_a_stopped_resume_of_an_unsent_call() {
         "a call that never left is never outcome_unknown"
     );
     let nested = handle.every_boundary_inside_resume(&kill).await;
-    assert_eq!(nested.len(), appended.len());
+    assert_eq!(nested.len(), 2 * appended.len() + 1);
+    assert!(nested
+        .iter()
+        .any(|cut| matches!(cut.point, KillPoint::RecordBoundary { torn: true, .. })));
+    for cut in &nested {
+        let path =
+            broca_crash_harness::wal_path(&cut.state_root, &(handle.scenario.request)().session);
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            cut.durable.bytes,
+            "validating a cut must leave its returned root at the killed image"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_resume_from_an_advanced_root_cannot_claim_the_earlier_killed_prefix() {
+    let handle = RunnerHandle::new(scenarios::ONE_EDIT).await;
+    let kill = handle
+        .kill_at(
+            KillPoint::RecordBoundary {
+                records: 3,
+                torn: false,
+            },
+            KillTrigger::Truncate,
+        )
+        .await;
+    let first = handle.resume(&kill).await;
+    handle.check(&kill, &first);
+
+    let advanced = handle.resume(&kill).await;
+    let entry = &advanced.outcome.invocations[0].prefix;
+    assert_eq!(entry, &first.log.framed());
+    assert!(entry.starts_with(&kill.durable.framed()));
+    assert!(entry.len() > kill.durable.record_count());
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle.check(&kill, &advanced)
+    }))
+    .expect_err("a longer valid WAL is still the wrong claimed entry prefix");
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .unwrap();
+    assert!(
+        message.contains("the first invocation did not start from the killed prefix"),
+        "{message}"
+    );
 }
 
 fn restart_request() -> broca_core::RunRequest {
@@ -213,3 +260,5 @@ async fn restart_pause_and_resume_are_safe_at_every_record_boundary() {
     );
     continuing.every_boundary_inside_resume(&kill).await;
 }
+
+broca_crash_harness::require_process_kill!();

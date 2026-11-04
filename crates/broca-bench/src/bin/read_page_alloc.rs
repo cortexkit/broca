@@ -176,6 +176,11 @@ fn snapshot(shape: Shape) -> StorePageSnapshot {
         })
         .collect();
     StorePageSnapshot {
+        head: Some({
+            let mut head = broca_core::head::HeadProjection::default();
+            head.mode3 = Some(false);
+            head
+        }),
         prefix_len: shape.rows as u64,
         completed_steps: 1,
         rows,

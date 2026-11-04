@@ -812,6 +812,78 @@ fn install_live(
 }
 
 #[tokio::test]
+async fn cached_reader_ownership_is_unknown_when_cold_and_never_reads_storage() {
+    let fixture = Fixture::new();
+    fixture.append(&[
+        started(
+            &fixture.session,
+            Some(reserved("carrier")),
+            Some(scope("core")),
+        ),
+        finished(),
+    ]);
+    let snapshot = snapshot(&fixture);
+    let checkpoint = snapshot.checkpoint.clone().unwrap();
+    let (registry, wal, store) = registry(&fixture, Ok(Some(snapshot)));
+    assert_eq!(
+        registry.cached_session_owner(&fixture.session, Some(&reserved("core"))),
+        None
+    );
+    assert_eq!(store.reads.load(Ordering::Relaxed), 0);
+    assert!(wal.reads.lock().unwrap().is_empty());
+
+    let head = install_live(&registry, &fixture.session, &checkpoint);
+    for (principal, expected) in [
+        (Some(reserved("core")), true),
+        (Some(reserved("carrier")), true),
+        (Some(reserved("observer")), false),
+        (None, false),
+    ] {
+        assert_eq!(
+            registry.cached_session_owner(&fixture.session, principal.as_ref()),
+            Some(expected)
+        );
+    }
+    head.fetch_add(1, Ordering::Release);
+    assert_eq!(
+        registry.cached_session_owner(&fixture.session, Some(&reserved("core"))),
+        None
+    );
+    assert_eq!(store.reads.load(Ordering::Relaxed), 0);
+    assert!(wal.reads.lock().unwrap().is_empty());
+
+    registry
+        .inner
+        .slots
+        .lock()
+        .unwrap()
+        .remove(&fixture.session);
+    registry
+        .inner
+        .live_ownership
+        .lock()
+        .unwrap()
+        .remove(&fixture.session);
+    assert!(
+        decision(&registry, &fixture.session, Some(&reserved("core")))
+            .await
+            .is_ok()
+    );
+    let store_reads = store.reads.load(Ordering::Relaxed);
+    let wal_reads = wal.reads.lock().unwrap().len();
+    assert_eq!(
+        registry.cached_session_owner(&fixture.session, Some(&reserved("core"))),
+        Some(true)
+    );
+    assert_eq!(
+        registry.cached_session_owner(&fixture.session, Some(&reserved("observer"))),
+        Some(false)
+    );
+    assert_eq!(store.reads.load(Ordering::Relaxed), store_reads);
+    assert_eq!(wal.reads.lock().unwrap().len(), wal_reads);
+}
+
+#[tokio::test]
 async fn owner_sources_match_full_wal_without_opening_an_actor() {
     let fixture = Fixture::new();
     fixture.append(&[
@@ -1967,4 +2039,72 @@ async fn a_full_dispatch_cache_evicts_one_session_not_all() {
             .is_none(),
         "the session cached longest ago is the one evicted"
     );
+}
+
+/// Manual wall-time and syscall probe; no latency threshold belongs in CI.
+#[tokio::test]
+#[ignore = "manual check_session_log fast-path measurement"]
+async fn session_log_guard_available_fast_path_measurement() {
+    let fixture = Fixture::new();
+    fixture.append(&[started(&fixture.session, None, None), finished()]);
+    let store = fixture.sqlite();
+    let registry = LineageRegistry::new_with_reader(
+        Arc::new(NeverOpener),
+        fixture.wal.clone(),
+        Some(store.clone()),
+    );
+    registry.set_session_address_inventory(store);
+    broca_wal::migration::rebuild_fence_index(&fixture.root).unwrap();
+    let bytes = fixture
+        .wal
+        .live_wal_bytes(&fixture.session)
+        .unwrap()
+        .unwrap();
+    assert!(bytes > broca_wal::framing::LINEAGE_FRAME_LEN as u64);
+    for _ in 0..20 {
+        registry.check_session_log(&fixture.session).await.unwrap();
+    }
+    const ITERATIONS: usize = 1000;
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    eprintln!(
+        "CHECK_SESSION_LOG_BEGIN root={} iterations={ITERATIONS} wal_bytes={bytes}",
+        fixture.root.display()
+    );
+    let whole = std::time::Instant::now();
+    for _ in 0..ITERATIONS {
+        let start = std::time::Instant::now();
+        registry.check_session_log(&fixture.session).await.unwrap();
+        samples.push(start.elapsed().as_nanos());
+    }
+    let elapsed = whole.elapsed().as_nanos();
+    samples.sort_unstable();
+    eprintln!("CHECK_SESSION_LOG_END iterations={ITERATIONS} total_ns={elapsed} mean_ns={} p50_ns={} p99_ns={}",
+        elapsed / ITERATIONS as u128, samples[ITERATIONS / 2], samples[ITERATIONS * 99 / 100 - 1]);
+}
+
+#[test]
+fn log_state_inventory_io_keeps_proven_transient_class_and_cause() {
+    for error in [
+        broca_store::session_log_evidence::SessionLogError::Inventory(Box::new(
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "temporary inventory read"),
+        )),
+        broca_store::session_log_evidence::SessionLogError::Inventory(Box::new(
+            broca_store::db::DbError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "temporary inventory read",
+            )),
+        )),
+    ] {
+        let result = OpenError::from_log_state(error);
+        assert!(
+            matches!(result, OpenError::Classified { ref reason, class: broca_protocol::ErrorClass::Transient } if reason.contains("temporary inventory read")),
+            "{result:?}"
+        );
+    }
+    let opaque = OpenError::from_log_state(
+        broca_store::session_log_evidence::SessionLogError::Inventory(Box::new(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "opaque inventory failure"),
+        )),
+    );
+    assert!(matches!(opaque, OpenError::Open(_)), "{opaque:?}");
 }

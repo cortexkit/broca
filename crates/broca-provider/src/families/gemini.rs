@@ -163,11 +163,17 @@ pub(crate) fn build_request_body_with_media_and_provenance(
 ) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
+    let turn_system = crate::turn_system::prepare(frozen, opts);
+    let opts = turn_system.as_ref();
     let prepared = crate::structured_output::prepare(frozen, opts);
     let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
-    let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
+    let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
+        &opts.tools,
+        &opts.prompt,
+        &frozen.tool_name_aliases,
+    );
     let contents = convert_contents_with_provenance(
         &opts.prompt,
         frozen,
@@ -819,6 +825,7 @@ pub(crate) struct GeminiNormalizer {
     next_call_index: u32,
     usage: Usage,
     finish_reason: FinishReason,
+    raw_finish_reason: Option<String>,
     started: bool,
     terminal_observed: bool,
     emitted_final: bool,
@@ -847,6 +854,7 @@ impl GeminiNormalizer {
             next_call_index: 0,
             usage: Usage::default(),
             finish_reason: FinishReason::Other,
+            raw_finish_reason: None,
             started: false,
             terminal_observed: false,
             emitted_final: false,
@@ -1009,6 +1017,7 @@ impl GeminiNormalizer {
         };
 
         if let Some(fr) = candidate.get("finishReason").and_then(Value::as_str) {
+            self.raw_finish_reason = Some(fr.to_owned());
             self.finish_reason = map_finish_reason(fr);
             if let Some(evidence) = &self.response_evidence {
                 evidence.lock().unwrap().finish_reason = Some(self.finish_reason);
@@ -1273,6 +1282,7 @@ impl StreamNormalizer for GeminiNormalizer {
         out.extend([
             NormalizedEvent::Control(ProviderControl::AssistantMessage { message }),
             NormalizedEvent::Control(ProviderControl::StepFinished {
+                raw_finish_reason: self.raw_finish_reason.take(),
                 step_id: self.step_id,
                 usage: self.usage,
                 finish_reason: self.finish_reason,

@@ -147,8 +147,37 @@ pub fn one_text_step_scripts() -> Vec<Vec<NormalizedEvent>> {
     vec![assistant("m1", vec![text("done")], FinishReason::Stop)]
 }
 
+fn retry_attempt_scripts() -> Vec<Vec<NormalizedEvent>> {
+    let mut scripts = one_text_step_scripts();
+    for (attempt, outcome, status) in [(1, "complete", 200), (0, "http_error", 503)] {
+        scripts[0].insert(0, NormalizedEvent::Control(
+            broca_protocol::ProviderControl::AttemptFinished {
+                attempt: serde_json::from_value(json!({
+                    "attempt": attempt,
+                    "request_body_len": 2,
+                    "request_body_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                    "response_body_len": 2,
+                    "response_body_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                    "http_status": status,
+                    "outcome": outcome,
+                    "ts_ms": 100 + attempt,
+                })).unwrap(),
+            }
+        ));
+    }
+    if let Some(NormalizedEvent::Control(broca_protocol::ProviderControl::Finished {
+        retries_used,
+        ..
+    })) = scripts[0].last_mut()
+    {
+        *retries_used = 1;
+    }
+    scripts
+}
+
 pub fn edit_request() -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -278,6 +307,7 @@ pub const INHERITED_TOOL_SURFACE: Scenario = Scenario {
     scripts: two_edits_scripts,
     render: Render::Canonical,
     plane: edit_plane,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
 
@@ -289,6 +319,7 @@ pub const TWO_EDITS: Scenario = Scenario {
     scripts: two_edits_scripts,
     render: Render::Canonical,
     plane: edit_plane,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
 
@@ -300,6 +331,7 @@ pub const ONE_EDIT: Scenario = Scenario {
     scripts: one_edit_scripts,
     render: Render::Canonical,
     plane: edit_plane,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
 
@@ -311,6 +343,7 @@ pub const ANTIGRAVITY_IDENTITY: Scenario = Scenario {
     scripts: two_edits_scripts,
     render: Render::IdentityEmbedding,
     plane: edit_plane,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
 
@@ -322,6 +355,7 @@ pub const BUDGET_NUDGE: Scenario = Scenario {
     scripts: two_edits_scripts,
     render: Render::Canonical,
     plane: edit_plane,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
 
@@ -334,6 +368,7 @@ pub const INPUT_TOKEN_CAP: Scenario = Scenario {
     scripts: two_edits_scripts,
     render: Render::Canonical,
     plane: edit_plane,
+    extension: None,
     expected: RunFinishReason::BudgetExhausted,
 };
 
@@ -346,6 +381,7 @@ pub const INPUT_TOKEN_CAP_TOOLS: Scenario = Scenario {
     scripts: two_edits_scripts,
     render: Render::Canonical,
     plane: edit_plane,
+    extension: None,
     expected: RunFinishReason::BudgetExhausted,
 };
 
@@ -357,6 +393,7 @@ pub const REPETITION_GUIDANCE: Scenario = Scenario {
     scripts: repetition_scripts,
     render: Render::Canonical,
     plane: repetition_plane,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
 
@@ -369,19 +406,424 @@ pub const TEXT_ONLY_MAX_STEPS: Scenario = Scenario {
     scripts: one_text_step_scripts,
     render: Render::Canonical,
     plane: empty_plane,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
 
 pub const ALL: &[Scenario] = &[
     INHERITED_TOOL_SURFACE,
     TWO_EDITS,
+    ONE_EDIT,
     ANTIGRAVITY_IDENTITY,
     BUDGET_NUDGE,
     INPUT_TOKEN_CAP,
     INPUT_TOKEN_CAP_TOOLS,
     REPETITION_GUIDANCE,
     TEXT_ONLY_MAX_STEPS,
+    RETRY_ATTEMPTS,
+    STRUCTURED_FALLBACK,
+    REFUSAL_FALLBACK,
+    OUTPUT_RESERVATION,
+    CACHE_WARMED,
+    SESSION_CHANGES,
+    PROVIDER_HELD,
 ];
+
+/// A failed HTTP attempt followed by a successful retry within the same model step.
+pub const RETRY_ATTEMPTS: Scenario = Scenario {
+    name: "retry_attempts",
+    scripts: retry_attempt_scripts,
+    extension: Some(&AttemptOrdinals),
+    ..TEXT_ONLY_MAX_STEPS
+};
+
+struct AttemptOrdinals;
+
+impl broca_crash_harness::scenario::ScenarioExtension for AttemptOrdinals {
+    fn setup(
+        &self,
+        _: &std::path::Path,
+        _: &mut RunControl,
+        _: &mut broca_crash_harness::HarnessPlane,
+    ) {
+    }
+
+    fn check(
+        &self,
+        kill: &broca_crash_harness::KillReport,
+        resumed: &broca_crash_harness::Resumed,
+    ) {
+        let mut ordinals = std::collections::BTreeSet::new();
+        for record in resumed.log.records() {
+            if let broca_wal::WalRecord::ModelAttemptFinished {
+                step_id, attempt, ..
+            } = record
+            {
+                assert!(
+                    ordinals.insert((step_id, attempt)),
+                    "{}: attempt ordinal reused",
+                    kill.label()
+                );
+            }
+        }
+    }
+}
+
+fn structured_request() -> RunRequest {
+    let mut request = max_steps_request();
+    request.structured_output = Some(
+        serde_json::from_value(json!({
+            "mode": "final_text", "schema": {"type": "object"}
+        }))
+        .unwrap(),
+    );
+    request
+}
+
+fn structured_scripts() -> Vec<Vec<NormalizedEvent>> {
+    vec![assistant(
+        "structured",
+        vec![text(r#"{"answer":"ok"}"#)],
+        FinishReason::Stop,
+    )]
+}
+
+/// The strict grammar is refused once, and the unconstrained resend returns validated JSON.
+pub const STRUCTURED_FALLBACK: Scenario = Scenario {
+    name: "structured_fallback",
+    request: structured_request,
+    scripts: structured_scripts,
+    render: Render::GrammarFallback,
+    ..TEXT_ONLY_MAX_STEPS
+};
+
+pub const REFUSAL_FALLBACK: Scenario = Scenario {
+    name: "refusal_fallback",
+    render: Render::RefusalFallback,
+    ..TEXT_ONLY_MAX_STEPS
+};
+
+fn output_reservation_request() -> RunRequest {
+    let mut request = edit_request();
+    request.context_limit = Some(10_000);
+    request
+}
+
+fn output_reservation_control() -> RunControl {
+    RunControl {
+        admitted_context_limit: Some(10_000),
+        ..Default::default()
+    }
+}
+
+fn output_reservation_scripts() -> Vec<Vec<NormalizedEvent>> {
+    let mut scripts = two_edits_scripts();
+    let mut attempt = retry_attempt_scripts().remove(0).remove(1);
+    if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) = &mut attempt {
+        attempt.attempt = 0;
+    }
+    scripts[0].insert(0, attempt);
+    scripts
+}
+
+pub const OUTPUT_RESERVATION: Scenario = Scenario {
+    name: "output_reservation",
+    request: output_reservation_request,
+    control: output_reservation_control,
+    scripts: output_reservation_scripts,
+    render: Render::OutputReservation,
+    ..TWO_EDITS
+};
+
+struct ManualWarm;
+
+#[async_trait::async_trait]
+impl broca_crash_harness::scenario::ScenarioExtension for ManualWarm {
+    fn setup(
+        &self,
+        _: &std::path::Path,
+        _: &mut RunControl,
+        _: &mut broca_crash_harness::HarnessPlane,
+    ) {
+    }
+
+    fn check(
+        &self,
+        kill: &broca_crash_harness::KillReport,
+        resumed: &broca_crash_harness::Resumed,
+    ) {
+        assert_eq!(
+            resumed.provider.warm_count(),
+            0,
+            "a resume must not purchase another manual warm"
+        );
+        let count = |records: Vec<broca_wal::WalRecord>| {
+            records
+                .iter()
+                .filter(|record| matches!(record, broca_wal::WalRecord::CacheWarmed { .. }))
+                .count()
+        };
+        assert_eq!(count(resumed.log.records()), count(kill.durable.records()));
+    }
+
+    async fn complete_reference(
+        &self,
+        _: &std::path::Path,
+        store: &broca_crash_harness::wal::ObservedWalStore,
+        provider: &broca_crash_harness::ScriptedProvider,
+    ) {
+        use broca_core::{Provider, WalStore};
+        let request = max_steps_request();
+        let frames = store.read_records(&request.session).unwrap();
+        let records: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
+        let recorded = broca_core::cache_warm::last_recorded_request(&records).unwrap();
+        let bytes = provider.render_request(&recorded.opts);
+        assert_eq!(
+            broca_core::render::request_digest_hex(&bytes),
+            recorded.request_body_sha256
+        );
+        let sent = provider.warm(&bytes).await.unwrap();
+        store
+            .open(&request.session)
+            .unwrap()
+            .append(
+                frames.last().unwrap().fence,
+                &broca_wal::WalRecord::CacheWarmed {
+                    attempt_id: None,
+                    reservation: None,
+                    envelope: None,
+                    trigger: None,
+                    run_id: recorded.run_id,
+                    step_id: recorded.step_id,
+                    request_body_sha256: broca_core::render::request_digest_hex(&bytes),
+                    warm_body_sha256: sent.warm_body_sha256,
+                    usage: sent.usage,
+                    served_account_ref: sent.served_account_ref,
+                    ratelimit_headers: sent.ratelimit_headers.into_iter().collect(),
+                    sent_at_ms: sent.sent_at_ms,
+                    ttl_ms: Some(60_000),
+                    expires_at_ms: Some(sent.sent_at_ms + 60_000),
+                },
+                true,
+            )
+            .unwrap();
+    }
+}
+
+/// A manual cache warm completes after the episode, as legacy session warming records it.
+pub const CACHE_WARMED: Scenario = Scenario {
+    name: "cache_warmed",
+    scripts: retry_attempt_scripts,
+    render: Render::WarmCompletion,
+    extension: Some(&ManualWarm),
+    ..TEXT_ONLY_MAX_STEPS
+};
+
+struct MetadataOnlyExecutor;
+
+#[async_trait::async_trait]
+impl broca_module::executor::RunExecutor for MetadataOnlyExecutor {
+    async fn execute(
+        &self,
+        _: broca_module::executor::RunJob,
+        _: tokio::sync::mpsc::Sender<broca_core::OutputEvent>,
+    ) -> Result<broca_core::RunSummary, broca_core::RunError> {
+        panic!("session metadata operations must not start a model run")
+    }
+}
+
+struct SessionChanges;
+
+#[async_trait::async_trait]
+impl broca_crash_harness::scenario::ScenarioExtension for SessionChanges {
+    fn setup(
+        &self,
+        _: &std::path::Path,
+        _: &mut RunControl,
+        _: &mut broca_crash_harness::HarnessPlane,
+    ) {
+    }
+
+    async fn complete_reference(
+        &self,
+        root: &std::path::Path,
+        store: &broca_crash_harness::wal::ObservedWalStore,
+        _: &broca_crash_harness::ScriptedProvider,
+    ) {
+        use broca_module::actor::{
+            SessionFlushPrefixOutcome, SessionRefreshOutcome, SessionRefreshPolicyOutcome,
+        };
+        use std::sync::Arc;
+        let store = Arc::new(store.clone());
+        let opener = broca_module::DefaultOpener::new(
+            Arc::new(broca_core::FileLeaseStore::new(root.join("lease"))),
+            store.clone(),
+            Arc::new(MetadataOnlyExecutor),
+        );
+        let registry =
+            broca_module::LineageRegistry::new_with_reader(Arc::new(opener), store, None);
+        let request = planned_request();
+        let manifest = planned_manifest();
+        assert!(matches!(
+            registry
+                .route_session_refresh(
+                    &request.session,
+                    1,
+                    "on_prefix_rebuild".into(),
+                    Box::new(manifest)
+                )
+                .await
+                .unwrap(),
+            SessionRefreshOutcome::Accepted { .. }
+        ));
+        assert!(matches!(
+            registry
+                .route_session_refresh_policy(
+                    &request.session,
+                    1,
+                    "immediately".into(),
+                    "policy-change".into()
+                )
+                .await
+                .unwrap(),
+            SessionRefreshPolicyOutcome::Changed
+        ));
+        assert!(matches!(
+            registry
+                .route_session_flush_prefix(&request.session, "flush-prefix".into())
+                .await
+                .unwrap(),
+            SessionFlushPrefixOutcome::Flushed { .. }
+        ));
+        assert!(
+            registry.stop_and_seal().await,
+            "the metadata actor must release its writer"
+        );
+    }
+}
+
+/// After a planned episode, the idle session actor accepts a refreshed provider manifest,
+/// changes when it applies, and clears the frozen conversation prefix for the next run.
+pub const SESSION_CHANGES: Scenario = Scenario {
+    name: "session_changes",
+    extension: Some(&SessionChanges),
+    ..PLANNED_EDITS
+};
+
+struct HeldPlane;
+
+fn held_result(call: &ToolCall) -> broca_core::tool_plane::DispatchResult {
+    broca_core::tool_plane::DispatchResult::Completed(broca_protocol::ToolResult {
+        tool_call_id: call.tool_call_id.clone(),
+        output: ToolOutput::Text {
+            text: "held-completed".into(),
+        },
+        is_error: false,
+    })
+}
+
+#[async_trait::async_trait]
+impl broca_core::ToolPlane for HeldPlane {
+    async fn batch_started(
+        &self,
+        _: &broca_core::BatchCtx,
+        _: &[ToolCall],
+        _: &broca_core::ToolManifest,
+    ) -> Result<(), broca_core::ToolPlaneError> {
+        Ok(())
+    }
+    async fn batch_finished(
+        &self,
+        _: &broca_core::BatchCtx,
+    ) -> Result<(), broca_core::ToolPlaneError> {
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        _: &broca_core::BatchCtx,
+        _: &ToolCall,
+    ) -> broca_core::tool_plane::DispatchResult {
+        panic!("held dispatch must retain its key and recorder")
+    }
+    async fn dispatch_keyed(
+        &self,
+        _: &broca_core::BatchCtx,
+        call: &ToolCall,
+        key: broca_core::tool_plane::DispatchKey<'_>,
+    ) -> broca_core::tool_plane::DispatchResult {
+        key.held_recorder
+            .expect("core installs the held recorder")
+            .sync_held(&broca_core::tool_plane::ProviderHeldReply {
+                tool_call_id: call.tool_call_id.clone(),
+                call_key: key.call_key.into(),
+                module: "held-provider".into(),
+                reason: "waiting".into(),
+                detail_digest: None,
+            })
+            .await
+            .unwrap();
+        held_result(call)
+    }
+    fn dispatch_target(&self, _: &broca_core::BatchCtx, _: &ToolCallId) -> Option<String> {
+        Some("held-provider".into())
+    }
+}
+
+struct HeldLifecycle;
+
+#[async_trait::async_trait]
+impl broca_core::tool_plane::ProviderHeldLifecycle for HeldLifecycle {
+    async fn wait(
+        &self,
+        _: &broca_core::BatchCtx,
+        call: &ToolCall,
+        _: &broca_core::tool_plane::ProviderHeldReply,
+    ) -> broca_core::tool_plane::DispatchResult {
+        held_result(call)
+    }
+}
+
+struct HeldScenario;
+
+impl broca_crash_harness::scenario::ScenarioExtension for HeldScenario {
+    fn setup(
+        &self,
+        _: &std::path::Path,
+        control: &mut RunControl,
+        plane: &mut broca_crash_harness::HarnessPlane,
+    ) {
+        control.provider_held_lifecycle = Some(std::sync::Arc::new(HeldLifecycle));
+        plane.set_inner(std::sync::Arc::new(HeldPlane));
+    }
+}
+
+/// A provider's durable held marker promises a result is still pending. After a cut, fetch
+/// that result through its waiting slot without dispatching the original call again.
+pub const PROVIDER_HELD: Scenario = Scenario {
+    name: "provider_held",
+    extension: Some(&HeldScenario),
+    ..ONE_EDIT
+};
+
+/// A pre-call authentication pause resolves both its renderer config and credential selection.
+pub const AUTH_REFREEZE: Scenario = Scenario {
+    name: "auth_refreeze",
+    render: Render::AuthRefreeze,
+    ..TEXT_ONLY_MAX_STEPS
+};
+
+fn restart_refreeze_request() -> RunRequest {
+    let mut request = max_steps_request();
+    request.on_restart = Some(broca_protocol::request::OnRestart::Resume);
+    request
+}
+
+pub const RESTART_REFREEZE: Scenario = Scenario {
+    name: "restart_refreeze",
+    request: restart_refreeze_request,
+    render: Render::RestartRefreeze,
+    ..TEXT_ONLY_MAX_STEPS
+};
 
 /// The system text of [`planned_manifest`], as its provider answered it.
 pub const PLANNED_TEXT: &str = "Edit carefully.";
@@ -461,6 +903,7 @@ pub const PLANNED_EDITS: Scenario = Scenario {
     scripts: two_edits_scripts,
     render: Render::Canonical,
     plane: edit_plane,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
 
@@ -473,6 +916,7 @@ pub const STOPPED_ONE_EDIT: Scenario = Scenario {
     scripts: one_edit_scripts,
     render: Render::Canonical,
     plane: edit_plane,
+    extension: None,
     expected: RunFinishReason::Interrupted,
 };
 
@@ -485,6 +929,7 @@ pub const STOPPED_TWO_EDITS: Scenario = Scenario {
     scripts: two_edits_scripts,
     render: Render::Canonical,
     plane: edit_plane,
+    extension: None,
     expected: RunFinishReason::Interrupted,
 };
 
@@ -492,6 +937,6 @@ pub const STOPPED_TWO_EDITS: Scenario = Scenario {
 pub fn by_name(name: &str) -> Option<Scenario> {
     ALL.iter()
         .copied()
-        .chain([ONE_EDIT, PLANNED_EDITS])
+        .chain([ONE_EDIT, PLANNED_EDITS, AUTH_REFREEZE, RESTART_REFREEZE])
         .find(|scenario| scenario.name == name)
 }

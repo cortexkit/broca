@@ -68,6 +68,7 @@ impl HookPlane for Scripted {
         &self,
         provider: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         call: HookCall,
     ) -> Result<HookAnswer, HookUnavailable> {
         self.calls
@@ -190,6 +191,7 @@ fn runtime<'a>(
     writer: &'a WalHandle,
 ) -> HookRuntime<'a> {
     HookRuntime {
+        scope: None,
         plan,
         plane,
         bind,
@@ -457,6 +459,50 @@ async fn pre_tool_unavailable_refuse_is_a_single_completed_intentless_result() {
     let _ = writer.shutdown().await;
 }
 
+/// step-transform v2 decodes an answer it doesn't know into `HookAnswer::Unknown` instead of
+/// failing the call, so the plane returns it as a successful reply. The gate treats it as an
+/// unavailable hook, never as a pass of its own: the subscription's unavailability policy
+/// decides. `refuse` refuses the call; `pass` (the provider declared the check advisory) lets it
+/// run.
+#[tokio::test]
+async fn pre_tool_unknown_answer_is_unavailable_under_the_subscription_policy() {
+    for (policy, refused) in [("refuse", true), ("pass", false)] {
+        let manifest = frozen(
+            vec![vec![sub("pre_tool", Some("validate"), policy)]],
+            None,
+            false,
+        );
+        let plan = HookPlan::from_manifest(&manifest).unwrap();
+        let unknown: HookAnswer =
+            serde_json::from_value(json!({"answer": "a-future-answer"})).unwrap();
+        assert_eq!(unknown.name(), "a-future-answer");
+        let (hooks, _) = scripted(move |_, _| Reply::Answer(unknown.clone()));
+        let (writer, records) = writer();
+        let bind = BindIdentity::new("/project", "caller", "s");
+        let runtime = runtime(&plan, &hooks, &bind, &writer);
+        let plane = crate::StubToolPlane::new();
+        batch(
+            vec![call("c")],
+            &plane,
+            &crate::AllowAll,
+            &writer,
+            &runtime,
+            None,
+        )
+        .await;
+        let records = records.lock().unwrap().clone();
+        let unavailable = records.iter().filter(|r|matches!(r,WalRecord::ToolResult{outcome:DispatchOutcome::Completed,reason:Some(r),..}if r=="pre_tool_unavailable")).count();
+        let dispatched = plane
+            .log()
+            .iter()
+            .any(|event| matches!(event, crate::StubEvent::Dispatched(_)));
+        assert_eq!(unavailable, usize::from(refused), "policy {policy}");
+        assert_eq!(dispatched, !refused, "policy {policy}");
+        drop(records);
+        let _ = writer.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn pre_tool_cancel_stops_every_planned_dispatch_and_finishes_announced_batch() {
     let manifest = frozen(
@@ -503,14 +549,14 @@ async fn pre_tool_cancel_stops_every_planned_dispatch_and_finishes_announced_bat
 }
 
 #[tokio::test]
-async fn json_between_limits_stays_structured_with_zero_post_tool_calls() {
+async fn mapped_json_stays_structured_with_zero_post_tool_calls() {
     let manifest = frozen(vec![vec![sub("post_tool", None, "refuse")]], None, false);
     let plan = HookPlan::from_manifest(&manifest).unwrap();
     let (hooks, seen) = scripted(|_, _| Reply::Answer(append("!")));
     let (writer, _) = writer();
     let bind = BindIdentity::new("/project", "caller", "s");
     let runtime = runtime(&plan, &hooks, &bind, &writer);
-    let value = json!({"data":"x".repeat(TOOL_RESULT_MAX_BYTES-POST_TOOL_HEADROOM/2)});
+    let value = json!({"data":"x".repeat(1_040_384)});
     let expected = value.clone();
     let plane = crate::StubToolPlane::new().with_tool("edit", move |_| {
         crate::StubReply::Output(ToolOutput::Json {
@@ -535,13 +581,12 @@ async fn json_between_limits_stays_structured_with_zero_post_tool_calls() {
 }
 
 #[tokio::test]
-async fn headroom_subject_is_capped_once_before_hook_and_final_append_is_not_recapped() {
+async fn post_tool_does_not_truncate_already_mapped_output() {
     let manifest = frozen(vec![vec![sub("post_tool", None, "refuse")]], None, false);
     let plan = HookPlan::from_manifest(&manifest).unwrap();
     let (hooks, seen) = scripted(|_, call| {
         let blocks = call.subject.blocks().unwrap();
-        assert_eq!(blocks[0].len(), 1_032_192);
-        assert!(blocks[0].contains("POST_TOOL_HEADROOM"));
+        assert_eq!(blocks[0], "x".repeat(1_048_577));
         Reply::Answer(append(&"!".repeat(16_384)))
     });
     let (writer, records) = writer();
@@ -560,10 +605,10 @@ async fn headroom_subject_is_capped_once_before_hook_and_final_append_is_not_rec
     let ToolOutput::Text { text } = &result.results[0].output else {
         panic!()
     };
-    assert_eq!(text.len(), 1_048_576);
+    assert_eq!(text.len(), 1_048_577 + 16_384);
     assert!(text.ends_with(&"!".repeat(16_384)));
     assert_eq!(seen.lock().unwrap().len(), 1);
-    assert!(records.lock().unwrap().iter().any(|r|matches!(r,WalRecord::ToolResult{hooks:Some(h),..}if h.original.as_ref().unwrap()["output"]["text"].as_str().unwrap().len()==1_032_192)));
+    assert!(records.lock().unwrap().iter().any(|r|matches!(r,WalRecord::ToolResult{hooks:Some(h),..}if h.original.as_ref().unwrap()["output"]["text"].as_str().unwrap().len()==1_048_577)));
     let _ = writer.shutdown().await;
 }
 
@@ -605,11 +650,13 @@ fn replaced() -> HookAnswer {
     }
 }
 #[tokio::test]
-async fn final_post_tool_text_above_full_ceiling_is_unavailable() {
-    let (result, records) =
-        post_answer(append(&"x".repeat(TOOL_RESULT_MAX_BYTES)), None, false).await;
-    assert!(result.is_error);
-    assert!(records.iter().any(|r|matches!(r,WalRecord::ToolResult{reason:Some(reason),..}if reason=="post_tool_unavailable")));
+async fn post_tool_edits_are_not_subject_to_the_removed_intake_cut() {
+    let (result, records) = post_answer(append(&"x".repeat(1_048_576)), None, false).await;
+    assert!(!result.is_error);
+    assert!(
+        matches!(&result.output, ToolOutput::Text { text } if text.len() == "original".len() + 1_048_576)
+    );
+    assert!(!records.iter().any(|r| matches!(r, WalRecord::ToolResult { reason: Some(reason), .. } if reason == "post_tool_unavailable")));
 }
 #[tokio::test]
 async fn post_tool_replace_requires_both_frozen_catalog_permission_and_user_grant() {
@@ -817,7 +864,7 @@ async fn post_assistant_record_control_next_prompt_and_display_all_use_final_mes
             false,
         ));
         let (plane, seen) = scripted(move |_, call| {
-            assert_eq!(call.harness, "caller");
+            assert!(serde_json::to_value(call).unwrap().get("harness").is_none());
             assert_eq!(call.subject.blocks().unwrap(), ["answer"]);
             Reply::Answer(if changed {
                 append("+hook")
@@ -1308,6 +1355,7 @@ async fn seal_linearization_keeps_answered_slots_until_handover_and_orders_paral
         tool_call_id: "a".into(),
     };
     let model = WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -1449,6 +1497,7 @@ impl HookPlane for BlockingHooks {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         call: HookCall,
     ) -> Result<HookAnswer, HookUnavailable> {
         let id = match call.subject {
@@ -1658,7 +1707,7 @@ async fn parallel_post_tool_seal_writes_two_fallbacks_in_source_order() {
 }
 
 #[tokio::test]
-async fn first_pre_user_omits_lineage_then_recorded_session_supplies_it() {
+async fn pre_user_identity_stays_on_the_route_before_and_after_recording() {
     let scratch = scratch("hook-lineage");
     let wal = broca_wal::FileWal::open(scratch.as_path().join("session.wal")).unwrap();
     let writer = WalHandle::spawn(Box::new(wal), 1).unwrap();
@@ -1673,11 +1722,15 @@ async fn first_pre_user_omits_lineage_then_recorded_session_supplies_it() {
         blocks: vec!["user".into()],
         mark: None,
         delivery: None,
+        at_ms: None,
     };
     runtime
         .chain(subject.clone(), Trace::default(), |_| true)
         .await;
-    assert_eq!(seen.lock().unwrap()[0].1.lineage_id, None);
+    assert!(serde_json::to_value(&seen.lock().unwrap()[0].1)
+        .unwrap()
+        .get("lineage_id")
+        .is_none());
     writer.record(WalRecord::ToolBatchStarted {
         batch_id: BatchId("seed".into()),
         step_id: StepId(1),
@@ -1685,10 +1738,10 @@ async fn first_pre_user_omits_lineage_then_recorded_session_supplies_it() {
     });
     writer.sync().await.unwrap();
     runtime.chain(subject, Trace::default(), |_| true).await;
-    assert_eq!(
-        seen.lock().unwrap()[1].1.lineage_id,
-        Some(writer.lineage_id().unwrap().to_string())
-    );
+    let body = serde_json::to_value(&seen.lock().unwrap()[1].1).unwrap();
+    for field in ["session", "harness", "lineage_id", "descends_from"] {
+        assert!(body.get(field).is_none());
+    }
     let _ = writer.shutdown().await;
 }
 
@@ -1884,6 +1937,7 @@ async fn pre_user_seal_cancellation_returns_discardable_output_instead_of_parkin
             blocks: vec!["original".into()],
             mark: None,
             delivery: None,
+            at_ms: None,
         },
         Trace::default(),
         |_| true,
@@ -1936,6 +1990,7 @@ impl HookPlane for DropTracked {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _: HookCall,
     ) -> Result<HookAnswer, HookUnavailable> {
         struct OnDrop(Arc<std::sync::atomic::AtomicBool>);
@@ -2031,6 +2086,7 @@ async fn post_tool_subscriber_is_not_called_for_other_subjects() {
             blocks: vec!["user".into()],
             mark: None,
             delivery: None,
+            at_ms: None,
         },
         Subject::PostAssistant {
             step_id: "1".into(),
@@ -2498,7 +2554,7 @@ async fn actor_input_hooks_are_rendered_and_recorded_without_final_metadata() {
 async fn actor_input_refusal_is_durable_before_any_provider_request() {
     let error: ProviderError = serde_json::from_value(json!({"class":"permanent", "provider_code":"pre_user_unavailable", "message":"unavailable: p0"})).unwrap();
     let control = RunControl {
-        pre_user_error: Some(error.clone()),
+        pre_model_error: Some(error.clone()),
         ..Default::default()
     };
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -2666,10 +2722,10 @@ async fn post_hook_restream_counts_delta_less_stored_blocks() {
     assert_eq!(parts, vec![1, 2]);
 }
 
-/// Records the `late_results` declaration each batch's manifest carries for the tool's
+/// Records the late-results and keepalive declarations each batch's manifest carries for the tool's
 /// provider, and answers every call at once.
 struct DeclarationProbe {
-    seen: Mutex<Vec<Option<bool>>>,
+    seen: Mutex<Vec<(Option<bool>, Option<bool>)>>,
 }
 
 #[async_trait::async_trait]
@@ -2680,11 +2736,11 @@ impl ToolPlane for DeclarationProbe {
         _: &[ToolCall],
         manifest: &ToolManifest,
     ) -> Result<(), ToolPlaneError> {
-        self.seen.lock().unwrap().push(
-            manifest
-                .provider_declarations("aft")
-                .and_then(|declarations| declarations.late_results),
-        );
+        let declarations = manifest.provider_declarations("aft");
+        self.seen.lock().unwrap().push((
+            declarations.and_then(|declarations| declarations.late_results),
+            declarations.and_then(|declarations| declarations.call_keepalive),
+        ));
         Ok(())
     }
 
@@ -2701,7 +2757,7 @@ impl ToolPlane for DeclarationProbe {
     }
 }
 
-/// A plan manifest whose provider froze the `late_results` capability, or froze nothing.
+/// A plan manifest whose provider froze late-results and keepalive promises, or froze nothing.
 fn declaring(late_results: bool) -> broca_wal::PlanManifest {
     let mut manifest = frozen(Vec::new(), None, false);
     if let broca_wal::FetchOutcome::Answered {
@@ -2710,6 +2766,7 @@ fn declaring(late_results: bool) -> broca_wal::PlanManifest {
     } = &mut manifest.fetches[0].outcome
     {
         *declarations_frozen = late_results.then_some(broca_wal::FrozenProviderDeclarations {
+            call_keepalive: Some(true),
             result_formats: None,
             late_results: Some(true),
             schema_pins: None,
@@ -2755,7 +2812,7 @@ async fn a_batch_reads_provider_declarations_only_from_the_frozen_manifest() {
     .await
     .unwrap();
     let _ = seed_writer.shutdown().await;
-    assert_eq!(*fresh.seen.lock().unwrap(), [Some(true)]);
+    assert_eq!(*fresh.seen.lock().unwrap(), [(Some(true), Some(true))]);
 
     // Resume from the durable model step, with a caller that offers a manifest declaring
     // nothing: the resumed batch still routes by what the session froze.
@@ -2802,7 +2859,7 @@ async fn a_batch_reads_provider_declarations_only_from_the_frozen_manifest() {
     )
     .await
     .unwrap();
-    assert_eq!(*resumed.seen.lock().unwrap(), [Some(true)]);
+    assert_eq!(*resumed.seen.lock().unwrap(), [(Some(true), Some(true))]);
     let _ = writer.shutdown().await;
 }
 

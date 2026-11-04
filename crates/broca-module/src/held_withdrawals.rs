@@ -58,7 +58,7 @@ impl HeldWithdrawals {
             wal,
             transport,
             active: Mutex::default(),
-            health: Mutex::new(json!({"failed": 0, "pending": 0})),
+            health: Mutex::new(json!({"failed": 0, "pending": 0, "scope_gone": 0})),
             stopping: std::sync::OnceLock::new(),
             sweep: Mutex::default(),
         })
@@ -77,10 +77,23 @@ impl HeldWithdrawals {
     }
 
     fn refresh_health(&self) {
+        let details = |scope_gone, count| {
+            if count == 0 {
+                return Vec::new();
+            }
+            self.store
+                .withdrawal_details(scope_gone)
+                .unwrap_or_else(|error| vec![json!({"code": error})])
+                .into_iter()
+                .map(|body| json!({"code": body.get("code"), "answer": body.get("answer"), "reason": body.get("reason")}))
+                .collect::<Vec<_>>()
+        };
         let health = match self.store.withdrawal_counts() {
-            Ok((watching, pending, failed)) => json!({
+            Ok((watching, pending, failed, scope_gone)) => json!({
                 "failed": failed, "pending": pending, "watching": watching,
-                "failure_details": if failed > 0 { self.store.withdrawal_failure_details().unwrap_or_else(|error| vec![json!({"code": error})]).into_iter().map(|body| json!({"code": body.get("code"), "answer": body.get("answer"), "reason": body.get("reason")})).collect::<Vec<_>>() } else { Vec::new() },
+                "failure_details": details(false, failed),
+                "scope_gone": scope_gone,
+                "scope_gone_details": details(true, scope_gone),
             }),
             Err(error) => json!({"error": error}),
         };

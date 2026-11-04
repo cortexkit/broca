@@ -78,6 +78,7 @@ impl SendParamsExt for SendParams {
         run_id: RunId,
     ) -> Result<SendRequest, broca_core::RunError> {
         let SendParams {
+            route_decision_id,
             content,
             directives,
             session_class,
@@ -186,6 +187,7 @@ impl SendParamsExt for SendParams {
         user_message.cache_prefix_blocks = cache_prefix_blocks;
         input.push(user_message);
         let submission = SubmissionRequest {
+            route_decision_id,
             service_tier_level: None,
             staged_uploads: None,
             content,
@@ -369,6 +371,7 @@ mod tests {
 
     fn make_send_params(system: Option<String>, prompt: &str) -> SendParams {
         SendParams {
+            route_decision_id: None,
             content: Vec::new(),
             directives: None,
             session_class: None,
@@ -853,6 +856,7 @@ mod tests {
         });
         let fresh = AnthropicMessages.shape(&frozen, &CallOptions::new(submission.input.clone()));
         let queued = broca_wal::WalRecord::Queued {
+            sent_by: None,
             written_at_ms: None,
             retention: None,
             ts_ms: None,

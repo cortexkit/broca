@@ -250,7 +250,7 @@ fn bind_identity(args: &Args) -> Result<broca_protocol::BindIdentity, String> {
             return Err(format!("session {id:?} does not match --harness"));
         }
         if let Some(project) = &args.project_root {
-            let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.clone());
+            let project = local_storage_root(project);
             if project != bind.project_root {
                 return Err(format!("session {id:?} does not match --project-root; pass both --project-root and --harness for literal addressing"));
             }
@@ -261,6 +261,13 @@ fn bind_identity(args: &Args) -> Result<broca_protocol::BindIdentity, String> {
         return Ok(broca_protocol::BindIdentity::new(project, "broca", id));
     }
     Err("--project-root is required for this command".into())
+}
+
+fn local_storage_root(root: &std::path::Path) -> PathBuf {
+    if root.as_os_str() == std::ffi::OsStr::new(broca_protocol::session::UNSCOPED_SESSION_ROOT) {
+        return root.to_path_buf();
+    }
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
 fn cache_dump(args: CacheDumpArgs) -> Result<i32, String> {
@@ -339,6 +346,10 @@ enum Cmd {
         /// composition, composition_digest, and compaction_item.
         #[arg(long)]
         items: PathBuf,
+        /// Fetch catalogs as a Direct carrier under owner/ref/epoch. Requires the private
+        /// 64-hex-character bind proof on stdin; does not create or scope a session.
+        #[arg(long)]
+        scope: Option<broca_subc::carrier_scope::CarrierScope>,
     },
     /// The combined single-turn flow: subscribe, send a prompt, drain the control stream to
     /// the run's terminal. This is the single-client/single-turn proof.
@@ -774,8 +785,8 @@ async fn run(args: Args) -> Result<i32, String> {
     if let Cmd::CredentialAudit { .. } = &args.cmd {
         return Ok(credential_audit(&args, json).await);
     }
-    if let Cmd::ComposePlan { items } = &args.cmd {
-        return compose_plan(&args, items).await;
+    if let Cmd::ComposePlan { items, scope } = &args.cmd {
+        return compose_plan(&args, items, scope.as_ref(), &mut std::io::stdin().lock()).await;
     }
     let session = bind_identity(&args)?;
     session
@@ -792,37 +803,10 @@ async fn run(args: Args) -> Result<i32, String> {
     )
     .await
     .map_err(|e| format!("bind management surface '{}': {e}", args.module_id))?;
-    // PRINT THE WHOLE BIND TRIPLE, not just the session name.
-    //
-    // iceteaSA's issue #22: a client-side defect made --harness inert, so every command
-    // answered about a DIFFERENT session than the one named -- run.status Unknown,
-    // session.read 0 messages, status Idle. All three read as broca failing to report a
-    // cancelled run. What eventually gave it away was a 69-byte lineage file appearing on
-    // disk during a READ-ONLY check.
-    //
-    // The drop is fixed (efc40996). This line is the other half and is the one that
-    // generalises: the WAL name is FNV over project_root/harness/session, so any of the
-    // three differing silently addresses another session. Printing one component means a
-    // mismatch in the other two is invisible in the output and discoverable only by
-    // noticing a file appear.
-    //
-    // THE ROOT IS PRINTED AS THE DAEMON WILL KEY IT, not as it was typed, and that
-    // distinction cost me two probes within minutes of fixing the harness half.
-    //
-    // The daemon canonicalises `project_root`. On macOS /tmp is a symlink to /private/tmp,
-    // so a session bound as `/tmp/x` is keyed under `/private/tmp/x`. Reproducing the
-    // reporter's own diagnostic -- compute FNV over the triple, look for that file -- I used
-    // the typed path and got ABSENT for BOTH candidate harnesses. Two absences is not a
-    // wrong answer, it is an uninterpretable one: it reads as "neither identity was used",
-    // which is impossible, and there is nothing in it to say the root was the problem.
-    //
-    // So printing the typed string would have reproduced the very defect this line fixes,
-    // one component over. Canonicalised locally, which is not a promise that the daemon's
-    // canonicalisation agrees -- only the daemon knows that. When they differ the typed form
-    // is printed too, because a caller who typed a path and sees a different one needs to
-    // know it is the same path and not a silently redirected bind.
-    let keyed_root = std::fs::canonicalize(&session.project_root)
-        .unwrap_or_else(|_| session.project_root.clone());
+    // Show project_root/harness/session from local lookup or the caller's CLI flags.
+    // The root is not transmitted in the wire bind: the server's inventory decides the address.
+    // Canonicalize directory hints locally, but never interpret the namespace as a folder.
+    let keyed_root = local_storage_root(&session.project_root);
     let root_display = if keyed_root == session.project_root {
         keyed_root.display().to_string()
     } else {
@@ -1237,7 +1221,16 @@ async fn run(args: Args) -> Result<i32, String> {
     }
 }
 
-async fn compose_plan(args: &Args, path: &std::path::Path) -> Result<i32, String> {
+async fn compose_plan(
+    args: &Args,
+    path: &std::path::Path,
+    scope: Option<&broca_subc::carrier_scope::CarrierScope>,
+    proof_input: &mut impl std::io::Read,
+) -> Result<i32, String> {
+    let scope = scope
+        .map(|scope| scope.read_proof(proof_input))
+        .transpose()
+        .map_err(str::to_owned)?;
     let bytes =
         std::fs::read(path).map_err(|error| format!("read --items {}: {error}", path.display()))?;
     let items = serde_json::from_slice(&bytes)
@@ -1249,7 +1242,10 @@ async fn compose_plan(args: &Args, path: &std::path::Path) -> Result<i32, String
     let conn = SubcConnection::connect(subc_path(args)?)
         .await
         .map_err(|_| "cannot connect subc".to_string())?;
-    let fetcher = broca_subc::SubcPlanFetcher::new(std::sync::Arc::new(conn), identity, None);
+    let mut fetcher = broca_subc::SubcPlanFetcher::new(std::sync::Arc::new(conn), identity, None);
+    if let Some(scope) = scope {
+        fetcher = fetcher.with_direct_carrier_scope(scope);
+    }
     let result =
         broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE).await;
     fetcher.close().await;
@@ -1491,8 +1487,15 @@ impl<'a> RunTurnTracker<'a> {
         // So the rule is structural rather than a second instance fixed: ANY control unit
         // that names a run AND ends this client's interest in it belongs above this gate.
         // Adding one below it reintroduces the hang, which is why they are grouped.
-        if let ControlUnit::Paused { run_id, .. } = unit {
+        if let ControlUnit::Paused { run_id, reason, .. } = unit {
             if run_id.0.as_str() == self.target_run_id {
+                if *reason == broca_protocol::PauseReason::AccountLimit {
+                    // A timed account pause resumes itself on this subscription. Its run id
+                    // identifies the continuation even when a live attach saw no RunStarted.
+                    self.started = true;
+                    self.provisional_text.clear();
+                    return RunTurnAction::Continue;
+                }
                 return RunTurnAction::Paused;
             }
             self.provisional_text.clear();
@@ -2219,35 +2222,37 @@ fn emit_control_to(
             },
             output,
         ),
-        // A pause is terminal for this attach and breaks the run loop, so with no arm here the
-        // client exits non-zero having printed nothing since RUN_STARTED: a run waiting on
-        // re-authentication reads exactly like one that died. It is also the only terminal that
-        // is RESUMABLE under the same run id, which is the part an operator most needs told.
+        // Non-timed pauses end the attach and must say why. Timed account pauses are displayed
+        // here too, but RunTurnTracker keeps their subscription attached for the same-run resume.
         ControlUnit::Paused {
             run_id,
             reason,
             error,
-        } => emit_to(
-            json,
-            &serde_json::json!({
-                "event": "run_paused",
-                "wal_seq": wal_seq,
-                "run_id": run_id.0,
-                "reason": format!("{reason:?}"),
-                "error": error.as_ref().map(|e| e.message.clone()),
-            }),
-            || {
-                format!(
-                    "RUN_PAUSED seq={wal_seq} run_id={} reason={reason:?}{}",
-                    run_id.0,
-                    error
-                        .as_ref()
-                        .map(|e| format!(" msg={}", e.message.replace('\n', "\\n")))
-                        .unwrap_or_default()
-                )
-            },
-            output,
-        ),
+            resume_not_before_ms,
+        } => {
+            let mut value = serde_json::json!({
+                "event": "run_paused", "wal_seq": wal_seq, "run_id": run_id.0,
+                "reason": format!("{reason:?}"), "error": error.as_ref().map(|e| e.message.clone()),
+            });
+            if let Some(deadline) = resume_not_before_ms {
+                value["resume_not_before_ms"] = serde_json::json!(deadline);
+            }
+            emit_to(
+                json,
+                &value,
+                || {
+                    format!(
+                        "RUN_PAUSED seq={wal_seq} run_id={} reason={reason:?}{}",
+                        run_id.0,
+                        error
+                            .as_ref()
+                            .map(|e| format!(" msg={}", e.message.replace('\n', "\\n")))
+                            .unwrap_or_default()
+                    )
+                },
+                output,
+            )
+        }
         _ => {}
     }
 }
@@ -2354,6 +2359,178 @@ fn emit_to(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn compose_plan_without_scope_does_not_read_stdin() {
+        use clap::Parser;
+
+        struct Unreadable;
+        impl std::io::Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("unscoped compose-plan must not read stdin");
+            }
+        }
+
+        let args = super::Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "missing-connection.json",
+            "compose-plan",
+            "--items",
+            "missing-items.json",
+        ])
+        .unwrap();
+        let super::Cmd::ComposePlan { items, scope } = &args.cmd else {
+            panic!("expected compose-plan");
+        };
+        assert!(scope.is_none());
+        let error = super::compose_plan(&args, items, scope.as_ref(), &mut Unreadable)
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("read --items missing-items.json:"));
+    }
+
+    #[tokio::test]
+    async fn compose_plan_refuses_missing_and_malformed_proofs_before_connecting() {
+        use clap::Parser;
+
+        let args = super::Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "missing-connection.json",
+            "compose-plan",
+            "--items",
+            "missing-items.json",
+            "--scope",
+            "rig/run/1",
+        ])
+        .unwrap();
+        let super::Cmd::ComposePlan { items, scope } = &args.cmd else {
+            panic!("expected compose-plan");
+        };
+        for (input, expected) in [
+            (
+                String::new(),
+                "scope_bind_proof_required: --scope requires a private 64-hex-character proof on stdin",
+            ),
+            (
+                "f".repeat(63),
+                "scope_bind_proof_invalid: expected exactly 64 hex characters on stdin",
+            ),
+            (
+                "g".repeat(64),
+                "scope_bind_proof_invalid: expected exactly 64 hex characters on stdin",
+            ),
+        ] {
+            let error = super::compose_plan(&args, items, scope.as_ref(), &mut input.as_bytes())
+                .await
+                .unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(
+                error,
+                scope
+                    .as_ref()
+                    .unwrap()
+                    .read_proof(&mut input.as_bytes())
+                    .unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn scope_flag_is_only_accepted_by_compose_plan() {
+        use clap::Parser;
+
+        for command in ["send", "read", "status", "run"] {
+            let error = super::Args::try_parse_from([
+                "broca-session",
+                "--subc",
+                "connection.json",
+                command,
+                "--scope",
+                "rig/run/1",
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+        let error = super::Args::try_parse_from([
+            "broca-session",
+            "--scope",
+            "rig/run/1",
+            "compose-plan",
+            "--items",
+            "items.json",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn namespace_diagnostic_never_canonicalizes_a_cwd_directory() {
+        const CHILD: &str = "BROCA_NAMESPACE_DIAGNOSTIC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = broca_test_support::scratch_root()
+                .join(format!("namespace-diagnostic-{}", std::process::id()));
+            std::fs::create_dir_all(root.join("broca-unscoped-v1")).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("tests::namespace_diagnostic_never_canonicalizes_a_cwd_directory")
+                .arg("--exact")
+                .current_dir(&root)
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let namespace = std::path::Path::new("broca-unscoped-v1");
+        assert_eq!(
+            super::local_storage_root(namespace).as_os_str(),
+            namespace.as_os_str()
+        );
+        for spelling in ["./broca-unscoped-v1", "broca-unscoped-v1/"] {
+            let path = std::path::Path::new(spelling);
+            assert_eq!(
+                super::local_storage_root(path),
+                std::fs::canonicalize(path).unwrap()
+            );
+        }
+        let missing = std::path::Path::new("missing-directory");
+        assert_eq!(super::local_storage_root(missing), missing);
+    }
+    #[test]
+    fn read_resolver_uses_overhaul_inventory_without_a_legacy_database() {
+        use broca_core::{SessionInventory, SessionRefIndex};
+        let root = broca_test_support::scratch_root()
+            .join(format!("cli-overhaul-resolver-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+        let db = broca_store::db::OverhaulDb::open(&root).unwrap();
+        let bind = broca_protocol::BindIdentity::new("/project", "runner", "alfonso:task");
+        db.record_session(&broca_core::session_addr(&bind), &bind)
+            .unwrap();
+        let args = super::Args::try_parse_from([
+            "broca-session",
+            "--state-root",
+            root.to_str().unwrap(),
+            "read",
+            "task",
+        ])
+        .unwrap();
+        assert!(super::bind_identity(&args)
+            .unwrap_err()
+            .contains("incomplete"));
+        db.rebuild_inventory(&root).unwrap();
+        assert_eq!(super::bind_identity(&args).unwrap(), bind);
+        assert!(!root.join("run-index.db").exists());
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn cache_diagnose_accepts_task_ids_and_explicit_offline_binding() {
         use clap::Parser;
@@ -2562,6 +2739,8 @@ mod tests {
     #[test]
     fn read_page_event_carries_every_response_field() {
         let page = broca_wire::SessionReadResponse {
+            history_version: 1,
+            incarnation: "11111111-2222-4333-8444-555555555555".into(),
             next_late_after: None,
             deferred_calls: None,
             late_approvals: None,
@@ -2757,6 +2936,7 @@ mod tests {
     /// A pause naming its run. `Paused` has always carried one.
     fn paused_for(run_id: &str) -> ControlUnit {
         ControlUnit::Paused {
+            resume_not_before_ms: None,
             run_id: RunId(run_id.into()),
             reason: broca_protocol::PauseReason::AuthRequired,
             error: None,
@@ -2930,7 +3110,7 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            matches!(args.cmd, Cmd::ComposePlan { items } if items == std::path::Path::new("items.json"))
+            matches!(args.cmd, Cmd::ComposePlan { items, scope: None } if items == std::path::Path::new("items.json"))
         );
     }
 
@@ -3414,6 +3594,7 @@ mod tests {
         );
         assert_eq!(
             tracker.consume(&ControlUnit::Paused {
+                resume_not_before_ms: None,
                 run_id: RunId("foreign".into()),
                 reason: PauseReason::AuthRequired,
                 error: None,
@@ -3422,12 +3603,33 @@ mod tests {
         );
         assert_eq!(
             tracker.consume(&ControlUnit::Paused {
+                resume_not_before_ms: None,
                 run_id: RunId("ours".into()),
                 reason: PauseReason::AuthRequired,
                 error: None,
             }),
             RunTurnAction::Paused
         );
+    }
+
+    #[test]
+    fn timed_account_pause_keeps_the_same_turn_attached_until_resume_finishes() {
+        let mut tracker = RunTurnTracker::new("ours");
+        assert_eq!(
+            tracker.consume(&ControlUnit::Paused {
+                resume_not_before_ms: Some(61_000),
+                run_id: RunId("ours".into()),
+                reason: PauseReason::AccountLimit,
+                error: None,
+            }),
+            RunTurnAction::Continue
+        );
+        assert_eq!(
+            tracker.consume(&assistant("resumed answer")),
+            RunTurnAction::Continue
+        );
+        assert_eq!(tracker.final_text, "resumed answer");
+        assert_eq!(tracker.consume(&run_finished()), RunTurnAction::Finished);
     }
 
     fn unrecognized(body: &[u8]) -> UnrecognizedRunState {

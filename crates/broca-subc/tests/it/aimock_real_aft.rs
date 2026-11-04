@@ -126,6 +126,7 @@ async fn loop_drives_aimock_through_real_aft() {
     let provider = LiveProvider::new(OpenAiChat, frozen, auth);
 
     let req = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -147,6 +148,7 @@ async fn loop_drives_aimock_through_real_aft() {
         session: BindIdentity::new(&rig.dir, "runner", "spike-1"),
         model: ModelHandle::new(&module_id, &model),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

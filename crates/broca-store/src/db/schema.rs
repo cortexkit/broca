@@ -3,6 +3,11 @@
 use rusqlite::Connection;
 
 pub(super) const SESSION_TABLES: &[&str] = &[
+    "compaction_resolution_projection",
+    "compaction_resolution_source",
+    "withdrawal_projection",
+    "withdrawal_call",
+    "operational_run",
     "source_auth",
     "episode_seed",
     "projection_boundary",
@@ -12,6 +17,11 @@ pub(super) const SESSION_TABLES: &[&str] = &[
     "setup",
 ];
 pub(super) const REBUILDABLE_TABLES: &[&str] = &[
+    "compaction_resolution_projection",
+    "compaction_resolution_source",
+    "withdrawal_projection",
+    "withdrawal_call",
+    "operational_run",
     "source_auth",
     "episode_seed",
     "projection_boundary",
@@ -59,6 +69,7 @@ pub(super) fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             last_step_off INTEGER, terminal_off INTEGER, submission_id TEXT,
             request_identity_digest TEXT
         );
+        CREATE INDEX IF NOT EXISTS run_sid ON run(sid);
         CREATE TABLE IF NOT EXISTS setup (
             sid TEXT NOT NULL REFERENCES session(sid) ON DELETE CASCADE,
             digest TEXT NOT NULL, off INTEGER NOT NULL, PRIMARY KEY(sid,digest)

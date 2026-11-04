@@ -158,6 +158,7 @@ impl Provider for AllocationProbeProvider {
         ))
         .expect("provider channel has room");
         tx.try_send(NormalizedEvent::Control(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id,
             usage: Usage::default(),
             finish_reason: FinishReason::Stop,
@@ -197,6 +198,7 @@ impl Provider for TerminalAssistantAllocationProbeProvider {
         ))
         .expect("provider channel has room");
         tx.try_send(NormalizedEvent::Control(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id,
             usage: Usage::default(),
             finish_reason: FinishReason::Stop,
@@ -341,6 +343,7 @@ impl Provider for DispatchAllocationProbeProvider {
         ))
         .expect("provider channel has room");
         tx.try_send(NormalizedEvent::Control(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id,
             usage: Usage::default(),
             finish_reason,
@@ -567,6 +570,7 @@ impl ToolPlane for ToolResultAllocationProbePlane {
 async fn terminal_no_tool_step_does_not_retain_a_second_assistant_message_copy() {
     let _allocation_test_lock = ALLOCATION_TEST_LOCK.lock().await;
     let request = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -673,6 +677,7 @@ async fn terminal_no_tool_step_does_not_retain_a_second_assistant_message_copy()
 async fn tool_step_does_not_retain_a_second_assistant_message_copy() {
     let _allocation_test_lock = ALLOCATION_TEST_LOCK.lock().await;
     let request = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -802,6 +807,7 @@ async fn admitted_turn_does_not_retain_a_second_input_copy() {
         serde_json::from_slice(&serialized).expect("deserialize production-shaped input");
 
     let request = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -913,8 +919,36 @@ async fn admitted_turn_does_not_retain_a_second_tool_copy() {
     let serialized_tool_bytes = serde_json::to_vec(&tools)
         .expect("serialize production-shaped tools")
         .len();
+    // Compare against the same turn with no tools, so the guard measures only what the tool
+    // list itself retains: a second deep copy of the tools would add about their serialized
+    // size, while fields that every RunStarted carries cancel out.
+    let (with_tools, with_allocations) = retained_at_run_started(tools).await;
+    let (without_tools, without_allocations) = retained_at_run_started(Vec::new()).await;
+    let retained_bytes = with_tools - without_tools;
+    let retained_allocations = with_allocations - without_allocations;
+    eprintln!(
+        "retained while appending tool-bearing RunStarted: {retained_bytes} bytes in \
+         {retained_allocations} allocations; serialized tools: {serialized_tool_bytes} bytes"
+    );
+    // ONE-SIDED ON PURPOSE. Only retained growth can reveal a second manifest graph; a net
+    // decrease means unrelated frees outweighed allocations and cannot violate this ownership rule.
+    assert!(
+        retained_bytes < (serialized_tool_bytes / 4) as isize,
+        "RunStarted retained a deep tool copy: {retained_bytes} tracked bytes for \
+         {serialized_tool_bytes} serialized tool bytes"
+    );
+    assert!(
+        retained_allocations < 200,
+        "RunStarted retained a second tool allocation graph: {retained_allocations} live allocations"
+    );
+}
+
+/// Run one admitted turn carrying `tools` and return the bytes and allocations still live when
+/// its `RunStarted` reaches the WAL append seam.
+async fn retained_at_run_started(tools: Vec<Tool>) -> (isize, isize) {
     let policy_allowed = tools.iter().map(|tool| tool.name.clone()).collect();
     let request = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -986,21 +1020,7 @@ async fn admitted_turn_does_not_retain_a_second_tool_copy() {
     );
     let retained_bytes = snapshot.retained_bytes.load(Ordering::SeqCst);
     let retained_allocations = snapshot.retained_allocations.load(Ordering::SeqCst);
-    eprintln!(
-        "retained while appending tool-bearing RunStarted: {retained_bytes} bytes in \
-         {retained_allocations} allocations; serialized tools: {serialized_tool_bytes} bytes"
-    );
-    // ONE-SIDED ON PURPOSE. Only retained growth can reveal a second manifest graph; a net
-    // decrease means unrelated frees outweighed allocations and cannot violate this ownership rule.
-    assert!(
-        retained_bytes < (serialized_tool_bytes / 4) as isize,
-        "RunStarted retained a deep tool copy: {retained_bytes} tracked bytes for \
-         {serialized_tool_bytes} serialized tool bytes"
-    );
-    assert!(
-        retained_allocations < 200,
-        "RunStarted retained a second tool allocation graph: {retained_allocations} live allocations"
-    );
+    (retained_bytes, retained_allocations)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1015,6 +1035,7 @@ async fn dispatch_plan_does_not_retain_a_second_tool_call_copy() {
         reply: None,
     };
     let request = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -1142,6 +1163,7 @@ async fn dispatch_plan_does_not_retain_a_second_tool_call_copy() {
 async fn dispatched_tool_result_does_not_retain_a_second_payload_copy() {
     let _allocation_test_lock = ALLOCATION_TEST_LOCK.lock().await;
     let request = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -1264,6 +1286,7 @@ impl Provider for StepAllocationProbeProvider {
 
 fn append_probe_request(run_id: &str, input: Vec<Message>) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,

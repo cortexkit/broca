@@ -143,6 +143,7 @@ fn text(text: &str) -> Vec<Message> {
 
 fn request(dir: &std::path::Path, run: &str, input: &str) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -237,6 +238,7 @@ fn accept(dir: &std::path::Path, mode: DeliveryMode) -> [WalRecord; 2] {
             sent_by: None,
         },
         WalRecord::Queued {
+            sent_by: None,
             written_at_ms: None,
             retention: None,
             ts_ms: None,

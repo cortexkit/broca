@@ -1,0 +1,19 @@
+{
+  "source_commit": "ba14a1bce",
+  "scope": "prototype OwnedWriterWal with local unit-test tenure and RealFs trace backend",
+  "attempts": [
+    "metadata agent-data/write-fences/ready",
+    "read_dir agent-data/cuts",
+    "open r=true w=false a=false c=false n=false t=false ordinary=false wal/log.moved",
+    "open r=true w=false a=false c=false n=false t=false ordinary=false wal/log.moving",
+    "metadata wal",
+    "mkdir_all wal",
+    "open r=true w=false a=false c=false n=false t=false ordinary=false wal/log",
+    "file_metadata wal/log",
+    "read 8192 wal/log",
+    "read 8192 wal/log",
+    "metadata wal/log",
+    "open r=true w=false a=true c=false n=true t=false ordinary=false wal/log",
+    "open r=true w=false a=true c=false n=false t=false ordinary=false wal/log"
+  ]
+}

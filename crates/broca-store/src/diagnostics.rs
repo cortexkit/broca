@@ -61,11 +61,19 @@ pub struct RunEvidence {
 
 #[derive(Default)]
 pub struct Evidence {
+    pub pending_recovery: Vec<PendingRecovery>,
     pub live: Vec<RunEvidence>,
     pub errors: Vec<RunEvidence>,
     pub interruptions: Vec<RunEvidence>,
     pub untimed_errors: Vec<RunEvidence>,
     pub untimed_interruptions: Vec<RunEvidence>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingRecovery {
+    pub session: broca_protocol::BindIdentity,
+    pub cut_ids: Vec<String>,
+    pub evidence_unreadable: bool,
 }
 
 /// The exact statements are exposed for query-plan verification against deployment copies.
@@ -91,11 +99,41 @@ impl SqliteStore {
     pub fn diagnostic_evidence(&self, since: i64, now: i64) -> Result<Evidence, String> {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let pending_recovery = if self.wal_config.is_overhaul() {
+            super::wal_recovery::pending_diagnostics(&tx)?
+        } else {
+            Vec::new()
+        };
+        let pending_sessions = if pending_recovery.is_empty() {
+            None
+        } else {
+            let sessions = pending_recovery
+                .iter()
+                .map(|pending| serde_json::to_string(&pending.session))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            Some(serde_json::to_string(&sessions).map_err(|error| error.to_string())?)
+        };
         let queries = queries();
         let read = |query: &str,
                     parameters: &[&dyn rusqlite::ToSql]|
          -> Result<Vec<RunEvidence>, String> {
-            let mut stmt = tx.prepare(query).map_err(|e| e.to_string())?;
+            let mut bound = Vec::new();
+            let (sql, parameters) = if let Some(sessions) = &pending_sessions {
+                bound.extend_from_slice(parameters);
+                bound.push(sessions as &dyn rusqlite::ToSql);
+                let predicate = format!(
+                    " WHERE session NOT IN (SELECT value FROM json_each(?{})) AND ",
+                    parameters.len() + 1
+                );
+                (
+                    std::borrow::Cow::Owned(query.replacen(" WHERE ", &predicate, 1)),
+                    bound.as_slice(),
+                )
+            } else {
+                (std::borrow::Cow::Borrowed(query), parameters)
+            };
+            let mut stmt = tx.prepare(&sql).map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map(parameters, |r| {
                     Ok(RunEvidence {
@@ -115,6 +153,7 @@ impl SqliteStore {
         };
         let limit = (SCAN_LIMIT + 1) as i64;
         let evidence = Evidence {
+            pending_recovery,
             live: read(&queries[0], &[&limit])?,
             errors: read(&queries[1], &[&since, &now, &limit])?,
             interruptions: read(&queries[2], &[&since, &now, &limit])?,

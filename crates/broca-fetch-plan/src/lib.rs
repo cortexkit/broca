@@ -12,6 +12,8 @@
 //! [`refusal::Refusal`]. Nothing in this crate writes.
 
 pub mod admit;
+mod keepalive_discovery;
+pub use keepalive_discovery::health as keepalive_discovery_health;
 pub mod plan;
 pub mod refusal;
 pub mod session_change;
@@ -26,7 +28,8 @@ pub use admit::{
 };
 pub use plan::{
     check_later_plan, check_send_members, check_send_members_with, names_confined_preset,
-    parse_plan, parse_plan_with, plan_identity, plan_senders, CompactionSupport, OutputRefsSupport,
-    Plan, PlanSender, PlanTemplate, SlotType, CONFINED_TOOL_PRESET, SENDERS_MEMBER,
+    parse_plan, parse_plan_with, plan_identity, plan_senders, require_compaction_preset,
+    CompactionSupport, OutputRefsSupport, Plan, PlanSender, PlanTemplate, SlotType,
+    CONFINED_TOOL_PRESET, SENDERS_MEMBER,
 };
 pub use refusal::{Refusal, Unanswered};

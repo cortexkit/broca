@@ -25,10 +25,11 @@
 //!    that Codex does not name as terminal (its `RetryLimit`) and a `server_is_overloaded`
 //!    answer retry only when the server gave a retry time. Every other retryable error waits
 //!    for the server's time when there is one, and otherwise [`stream_backoff`].
-//! 2. A failure to connect waits 5 s, doubling to a 60 s cap, with no limit on the number of
-//!    retries. It ignores any server time and does not count against the stream retries
-//!    (`core/src/responses_retry.rs:93-118`; the `unbounded_connection_retries` feature is
-//!    Stable and on by default, `features/src/lib.rs:1467-1472`).
+//! 2. A failure to connect waits 5 s, doubling to a 60 s cap. It ignores any server time and
+//!    does not count against the stream retries (`core/src/responses_retry.rs:93-118`). Unlike
+//!    Codex's interactive CLI, broca bounds connection failures across both layers to
+//!    `MAX_ATTEMPTS` sends per step so a headless caller can retry or reroute instead of waiting
+//!    indefinitely. The last failed send ends the step without another wait.
 //! 3. Once `STREAM_MAX_RETRIES` retries are spent, a step still on the WebSocket switches the
 //!    rest of the run to HTTPS, waits out the server's deadline if one was given, and starts a
 //!    fresh retry count (`core/src/responses_retry.rs:120-139`).
@@ -69,7 +70,13 @@ pub(super) fn applies(family: Option<crate::spec::WireFamilyId>) -> bool {
 
 /// The jitter factor both Codex backoffs draw: uniform in `0.9..1.1`
 /// (`async-utils/src/backoff.rs:15`, `codex-client/src/retry.rs:50`).
-fn jitter() -> f64 {
+pub(super) fn jitter() -> f64 {
+    #[cfg(test)]
+    super::attempt_effect_hooks::at(super::attempt_effect_hooks::Boundary::Jitter);
+    #[cfg(test)]
+    if let Some(factor) = attempt_test_hooks::jitter(true) {
+        return factor;
+    }
     rand::rng().random_range(0.9..1.1)
 }
 
@@ -100,20 +107,24 @@ pub(super) fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<f
     crate::codex_retry_after::retry_after_value(value, SystemTime::now())
 }
 
-/// What one failed attempt tells the decision. Everything else about the failure (its class,
-/// `x-should-retry`, a repeated decode failure, the response deadline) has already been through
-/// the transport's vetoes, which end the step before this decision is asked.
-pub(super) struct CodexFailure<'a> {
-    pub(super) error: &'a ProviderError,
-    pub(super) outcome: &'a AttemptOutcome,
+/// What one failed attempt tells the decision. The attempt policy applies class, explicit retry
+/// and repeated-decode vetoes before this decision, and deadline vetoes after its effects.
+pub(crate) struct CodexFailure<'a> {
+    pub(crate) error: &'a ProviderError,
+    pub(crate) outcome: &'a AttemptOutcome,
     /// The attempt's request went out over HTTPS, the only transport Codex's request layer
     /// wraps.
-    pub(super) https: bool,
+    pub(crate) https: bool,
 }
 
 /// What to do after a failed attempt.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum CodexDecision {
+pub(crate) enum CodexDecision {
+    /// Request the actual switch result before resetting the stream retry counter.
+    SwitchToHttps {
+        delay: Duration,
+        server_advised: bool,
+    },
     /// Send the same request again after `delay`. `server_advised` says `delay` is the time
     /// the server asked for rather than a local backoff.
     Retry {
@@ -201,10 +212,11 @@ fn request_layer_retries(failure: &CodexFailure<'_>) -> bool {
 
 /// The retry counters for one step, Codex's `ResponsesStreamRetryState` plus the request
 /// layer's attempt counter.
-#[derive(Debug)]
-pub(super) struct CodexRetryState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodexRetryState {
     retries: u64,
     request_retries: u64,
+    connection_failures: usize,
     connection_retry_delay: Duration,
 }
 
@@ -213,29 +225,45 @@ impl Default for CodexRetryState {
         Self {
             retries: 0,
             request_retries: 0,
+            connection_failures: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
         }
     }
 }
 
 impl CodexRetryState {
-    /// Decide what follows `failure`. `try_switch_to_https` is asked only when the stream
-    /// retries are spent; it switches the run to HTTPS and answers whether this call made the
-    /// switch, as Codex's `try_switch_fallback_transport` does (`core/src/client.rs:2454-2464`).
-    pub(super) fn decide(
+    #[cfg(test)]
+    pub(crate) fn decide_with_jitter(
         &mut self,
         failure: &CodexFailure<'_>,
         try_switch_to_https: impl FnOnce() -> bool,
+        jitter: impl FnMut() -> f64,
     ) -> CodexDecision {
-        self.decide_with_jitter(failure, try_switch_to_https, jitter)
+        match self.decide_before_switch(failure, jitter) {
+            CodexDecision::SwitchToHttps {
+                delay,
+                server_advised,
+            } => self.resolve_switch(try_switch_to_https(), delay, server_advised),
+            decision => decision,
+        }
     }
 
-    pub(super) fn decide_with_jitter(
+    pub(crate) fn decide_before_switch(
         &mut self,
         failure: &CodexFailure<'_>,
-        try_switch_to_https: impl FnOnce() -> bool,
         mut jitter: impl FnMut() -> f64,
     ) -> CodexDecision {
+        // Count actual failed connects, not stream-layer rounds: HTTPS request retries also
+        // consume sends. Keep the budget across fallback and other failures within the step.
+        if *failure.outcome == AttemptOutcome::ConnectFailed {
+            self.connection_failures += 1;
+            if self.connection_failures >= MAX_ATTEMPTS {
+                return CodexDecision::Terminal {
+                    reason: "connection_attempt_limit",
+                };
+            }
+        }
+
         let server = failure
             .error
             .retry_after_secs
@@ -290,26 +318,38 @@ impl CodexRetryState {
         }
 
         // `core/src/responses_retry.rs:120-139`.
-        if self.retries >= STREAM_MAX_RETRIES && try_switch_to_https() {
-            self.retries = 0;
-            return CodexDecision::FallBackToHttps {
+        if self.retries >= STREAM_MAX_RETRIES {
+            return CodexDecision::SwitchToHttps {
                 delay: server.unwrap_or_default(),
                 server_advised: server.is_some(),
             };
         }
 
         // `core/src/responses_retry.rs:141-167`.
-        if self.retries < STREAM_MAX_RETRIES {
-            self.retries = retry_count;
-            return CodexDecision::Retry {
+        self.retries = retry_count;
+        CodexDecision::Retry {
+            delay,
+            server_advised,
+            reason: "transient_failure",
+        }
+    }
+
+    pub(crate) fn resolve_switch(
+        &mut self,
+        switched: bool,
+        delay: Duration,
+        server_advised: bool,
+    ) -> CodexDecision {
+        if switched {
+            self.retries = 0;
+            CodexDecision::FallBackToHttps {
                 delay,
                 server_advised,
-                reason: "transient_failure",
-            };
-        }
-
-        CodexDecision::Terminal {
-            reason: "attempt_limit",
+            }
+        } else {
+            CodexDecision::Terminal {
+                reason: "attempt_limit",
+            }
         }
     }
 }
@@ -553,32 +593,107 @@ mod tests {
     }
 
     #[test]
-    fn connect_failures_retry_without_limit_from_five_to_sixty_seconds() {
+    fn connect_failures_keep_the_backoff_until_the_sixth_failed_send() {
+        for https in [false, true] {
+            let mut state = CodexRetryState::default();
+            let refused = error(None, None, (!https).then_some(1.0));
+            let mut delays = Vec::new();
+            for _ in 0..5 {
+                let CodexDecision::Retry {
+                    delay,
+                    server_advised,
+                    ..
+                } = decide(
+                    &mut state,
+                    &refused,
+                    AttemptOutcome::ConnectFailed,
+                    https,
+                    false,
+                )
+                else {
+                    panic!("connect failures below the bound must still retry");
+                };
+                assert!(
+                    !server_advised,
+                    "a stream-layer connect retry ignores server time"
+                );
+                delays.push(delay);
+            }
+            let expected = if https {
+                [200, 400, 800, 1600, 5000].map(Duration::from_millis)
+            } else {
+                [5, 10, 20, 40, 60].map(Duration::from_secs)
+            };
+            assert_eq!(delays, expected);
+            assert_eq!(
+                decide(
+                    &mut state,
+                    &refused,
+                    AttemptOutcome::ConnectFailed,
+                    https,
+                    false
+                ),
+                CodexDecision::Terminal {
+                    reason: "connection_attempt_limit"
+                }
+            );
+            assert_eq!(
+                state.retries, 0,
+                "connect failures do not spend stream retries"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_budget_survives_other_errors_and_https_fallback() {
         let mut state = CodexRetryState::default();
-        let refused = error(None, None, Some(1.0));
-        let mut delays = Vec::new();
-        for _ in 0..40 {
-            if let CodexDecision::Retry {
-                delay,
-                reason: "connection_failed",
-                server_advised,
-            } = decide(
+        let refused = error(None, None, None);
+        for _ in 0..3 {
+            assert!(matches!(
+                decide(
+                    &mut state,
+                    &refused,
+                    AttemptOutcome::ConnectFailed,
+                    false,
+                    false
+                ),
+                CodexDecision::Retry { .. }
+            ));
+        }
+        let limited = error(Some(429), None, Some(7.0));
+        for _ in 0..STREAM_MAX_RETRIES {
+            assert!(matches!(
+                decide(&mut state, &limited, AttemptOutcome::HttpError, false, true),
+                CodexDecision::Retry { .. }
+            ));
+        }
+        assert!(matches!(
+            decide(&mut state, &limited, AttemptOutcome::HttpError, false, true),
+            CodexDecision::FallBackToHttps { .. }
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                decide(
+                    &mut state,
+                    &refused,
+                    AttemptOutcome::ConnectFailed,
+                    true,
+                    false
+                ),
+                CodexDecision::Retry { .. }
+            ));
+        }
+        assert_eq!(
+            decide(
                 &mut state,
                 &refused,
                 AttemptOutcome::ConnectFailed,
                 true,
-                true,
-            ) {
-                assert!(!server_advised, "a connect retry ignores the server's time");
-                delays.push(delay);
+                false
+            ),
+            CodexDecision::Terminal {
+                reason: "connection_attempt_limit"
             }
-        }
-        // Every fifth send reaches the stream layer; the four before it are request retries.
-        assert_eq!(delays.len(), 8);
-        assert_eq!(
-            delays,
-            [5, 10, 20, 40, 60, 60, 60, 60].map(Duration::from_secs)
         );
-        assert_eq!(state.retries, 0, "connect retries do not count");
     }
 }

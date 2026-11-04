@@ -562,6 +562,7 @@ mod tests {
             framed(
                 1,
                 broca_wal::WalRecord::RunStarted {
+                    sent_by: None,
                     written_at_ms: None,
                     tags: None,
                     session_class: None,
@@ -570,6 +571,7 @@ mod tests {
                     title: None,
                     on_restart: None,
                     keep_warm: None,
+                    compaction_plan_version: None,
                     marker_order_version: None,
                     manifest: None,
                     scope: None,
@@ -581,6 +583,9 @@ mod tests {
                     session: broca_protocol::BindIdentity::new("/tmp/project", "harness", "s"),
                     ts_ms: Some(100),
                     config: Box::new(broca_wal::RunConfig {
+                        global_system: None,
+                        route_decision_id: None,
+                        account_limit_pause: false,
                         turn_directives_v1: None,
                         render_tags: false,
                         computed_tags: None,

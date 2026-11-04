@@ -10,7 +10,7 @@
 use super::*;
 use broca_core::{
     run_loop_with_control, AllowAll, FileLeaseStore, FileWalStore, OutputEvent, RunControl,
-    RunRequest, RunSummary, StubProvider,
+    RunRequest, RunSummary, StubProvider, WalStore,
 };
 use broca_protocol::{
     caller::{ControlUnit, RunFinishReason},
@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 
 const UNAVAILABLE: &str = "target_unavailable — module_id 'aft' is unavailable";
 
-fn tool_step() -> Vec<NormalizedEvent> {
+pub(super) fn tool_step() -> Vec<NormalizedEvent> {
     vec![
         NormalizedEvent::Control(ProviderControl::AssistantMessage {
             message: AssistantMessage {
@@ -39,7 +39,7 @@ fn tool_step() -> Vec<NormalizedEvent> {
     ]
 }
 
-fn text_step(text: &str) -> Vec<NormalizedEvent> {
+pub(super) fn text_step(text: &str) -> Vec<NormalizedEvent> {
     vec![
         NormalizedEvent::Control(ProviderControl::AssistantMessage {
             message: AssistantMessage {
@@ -55,7 +55,7 @@ fn text_step(text: &str) -> Vec<NormalizedEvent> {
     ]
 }
 
-fn request(tag: &str, root: &std::path::Path) -> RunRequest {
+pub(super) fn request(tag: &str, root: &std::path::Path) -> RunRequest {
     let tool = Tool {
         name: "read".into(),
         description: "read".into(),
@@ -65,6 +65,7 @@ fn request(tag: &str, root: &std::path::Path) -> RunRequest {
         reply: None,
     };
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -145,6 +146,7 @@ struct CoreRun {
     summary: RunSummary,
     results: Vec<ToolResult>,
     elapsed: Duration,
+    records: Vec<broca_wal::WalRecord>,
 }
 
 /// Run one model turn that calls `read`, then answers, through the real Core loop.
@@ -171,28 +173,137 @@ async fn run_through_core(
         results
     });
     let started = Instant::now();
+    let request = request(tag, &root);
+    let bind = request.session.clone();
     let summary = run_loop_with_control(
-        request(tag, &root),
-        &provider,
-        &plane,
-        &leases,
-        &AllowAll,
-        &wal,
-        None,
-        control,
-        &tx,
+        request, &provider, &plane, &leases, &AllowAll, &wal, None, control, &tx,
     )
     .await
     .expect("the run is admitted");
     let elapsed = started.elapsed();
     drop(tx);
     let results = collector.await.unwrap();
+    let records = wal
+        .read_records(&bind)
+        .unwrap()
+        .into_iter()
+        .map(|frame| frame.record)
+        .collect();
     let _ = std::fs::remove_dir_all(&root);
     CoreRun {
         summary,
         results,
         elapsed,
+        records,
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unknown_batch_open_refusal_is_attributed_and_durable() {
+    let detail =
+        serde_json::json!({"reason": format!("root reader\nstill active {}", "x".repeat(2048))});
+    let refusal = RouteOpenScript::rejected_body(
+        &subc_protocol::ErrorBody::new(
+            "bind_blocked_by_reader",
+            "job illustrative-inspect holds a root reader; retry once it finishes or is cancelled",
+        )
+        .with_detail(detail.clone()),
+    );
+    let conn = outage_connection(vec![refusal], vec![], Duration::ZERO);
+    let run = run_through_core("unknown-batch-open", conn.clone(), RunControl::default()).await;
+    assert_eq!(run.summary.reason, RunFinishReason::Completed);
+    assert_eq!(
+        conn.route_open_calls.load(Ordering::SeqCst),
+        1,
+        "unknown codes are terminal"
+    );
+    assert_eq!(
+        conn.tool_calls.load(Ordering::SeqCst),
+        0,
+        "nothing was sent"
+    );
+    assert_eq!(run.results.len(), 1);
+    let ToolOutput::Error {
+        message,
+        module,
+        code,
+        detail: actual_detail,
+        nothing_sent,
+        ..
+    } = &run.results[0].output
+    else {
+        panic!("expected attributed no-dispatch: {:?}", run.results[0]);
+    };
+    assert_eq!(message, broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE);
+    assert_eq!(module.as_deref(), Some("aft"));
+    assert_eq!(code.as_deref(), Some("bind_blocked_by_reader"));
+    let expected_detail = broca_protocol::bound_module_unavailable_detail(&detail.to_string());
+    assert_eq!(actual_detail.as_deref(), Some(expected_detail.as_str()));
+    assert_eq!(
+        expected_detail.len(),
+        broca_protocol::MODULE_UNAVAILABLE_DETAIL_MAX_BYTES
+    );
+    assert!(!expected_detail.contains(['\n', '\r']));
+    assert_eq!(*nothing_sent, Some(true));
+    let terminals: Vec<_> = run
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            broca_wal::WalRecord::ToolNoDispatch {
+                tool_call_id,
+                reason,
+                ..
+            } => Some(broca_core::no_dispatch_result(tool_call_id, reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        terminals, run.results,
+        "replay reconstructs the exact live refusal"
+    );
+    assert!(
+        !run.records.iter().any(|record| matches!(
+            record,
+            broca_wal::WalRecord::ToolDispatchIntent { .. }
+                | broca_wal::WalRecord::ToolResult { .. }
+        )),
+        "a refused batch must not record a dispatch intent or a dispatched result"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn protocol_retryable_batch_open_clears_and_sends_once() {
+    let mut opens: Vec<_> = (0..25)
+        .map(|_| refused_after(Duration::from_secs(1)))
+        .collect();
+    opens.push(RouteOpenScript::default());
+    let conn = outage_connection(opens, vec![successful_tool_reply("served")], Duration::ZERO);
+    let run = run_through_core("retryable-batch-open", conn.clone(), RunControl::default()).await;
+    assert_eq!(run.summary.reason, RunFinishReason::Completed);
+    assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 26);
+    assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(run.results.len(), 1);
+    assert!(!run.results[0].is_error);
+    assert!(!run
+        .records
+        .iter()
+        .any(|record| matches!(record, broca_wal::WalRecord::ToolNoDispatch { .. })));
+}
+
+#[test]
+fn legacy_unavailable_replays_with_identical_result_bytes() {
+    let reason: broca_wal::NoDispatchReason =
+        serde_json::from_str(r#"{"kind":"unavailable","detail":"tool plane unavailable"}"#)
+            .unwrap();
+    assert_eq!(
+        serde_json::to_string(&reason).unwrap(),
+        r#"{"kind":"unavailable","detail":"tool plane unavailable"}"#
+    );
+    let result = broca_core::no_dispatch_result(&ToolCallId("call-old".into()), &reason);
+    assert_eq!(
+        serde_json::to_string(&result).unwrap(),
+        r#"{"tool_call_id":"call-old","output":{"kind":"error","message":"tool plane unavailable"},"is_error":true}"#
+    );
 }
 
 /// Wait until the call is in its re-open wait: the batch's open and at least two refused

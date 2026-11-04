@@ -26,6 +26,7 @@ use serde_json::Value;
 fn request() -> CallOptions {
     CallOptions::new(vec![
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -36,6 +37,7 @@ fn request() -> CallOptions {
             }],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

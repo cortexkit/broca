@@ -27,6 +27,45 @@ use broca_wal::{
     WalByteAnchor, WalError, WalRangeRead, WalRecord,
 };
 
+/// Generate records with a real FileWal, then retain its digest-verified record
+/// frames unchanged while omitting modern lineage metadata. This reproduces an
+/// older writer's layout without hand-encoding headers, payloads or checksums.
+pub fn write_legacy_filewal(path: &std::path::Path, records: &[WalRecord]) {
+    let mut writer = broca_wal::FileWal::open(path).unwrap();
+    for record in records {
+        writer.append(1, record, false).unwrap();
+    }
+    writer.sync().unwrap();
+    drop(writer);
+    let bytes = std::fs::read(path).unwrap();
+    let mut legacy = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let consumed = match broca_wal::framing::decode_next(&bytes[offset..]) {
+            broca_wal::framing::DecodeStep::Record { consumed, .. } => {
+                legacy.extend_from_slice(&bytes[offset..offset + consumed]);
+                consumed
+            }
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => consumed,
+            _ => panic!("FileWal fixture must contain only complete verified frames"),
+        };
+        offset += consumed;
+    }
+    std::fs::write(path, legacy).unwrap();
+    let verified = broca_wal::read_records_range(path, 1024 * 1024 * 1024, 0, None, None).unwrap();
+    assert!(verified.lineage_id.is_none());
+    let broca_wal::WalRangeRecords::Complete(decoded) = verified.records() else {
+        panic!("legacy fixture must remain complete");
+    };
+    assert_eq!(
+        decoded
+            .iter()
+            .map(|frame| &frame.record)
+            .collect::<Vec<_>>(),
+        records.iter().collect::<Vec<_>>()
+    );
+}
+
 pub mod migration_order;
 
 mod attribution;
@@ -759,6 +798,7 @@ where
         framed(
             seq,
             WalRecord::Steered {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 retention: None,
@@ -1276,6 +1316,7 @@ where
     let pause_tail = [framed(
         4,
         WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r".into()),
             ts_ms: None,
             reason: PauseReason::AuthRequired,
@@ -2231,6 +2272,7 @@ pub(crate) fn text_step(seq: u64, step: u64, text: &str) -> FramedRecord {
     framed(
         seq,
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -2266,13 +2308,14 @@ pub(crate) fn text_turn(seq_base: u64, step: u64, text: &str) -> Vec<FramedRecor
     ]
 }
 
-fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
+pub(crate) fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
     let batch_id = BatchId(format!("b{step}"));
     let tool_call_id = ToolCallId(format!("c{step}"));
     vec![
         framed(
             seq_base,
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -2379,6 +2422,8 @@ pub(crate) fn run_started(
     framed(
         seq,
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -2398,6 +2443,9 @@ pub(crate) fn run_started(
             run_id: RunId(run_id.into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                global_system: None,
+                route_decision_id: None,
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -2422,6 +2470,7 @@ pub(crate) fn run_started(
                 context_management: None,
             }),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,

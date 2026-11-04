@@ -54,6 +54,10 @@ pub struct FrozenResultFormat(pub String);
 /// declare it, so a manifest from a provider with no such declarations keeps its exact bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenProviderDeclarations {
+    /// The provider promised call keepalives in its manifest at admission. Missing on
+    /// older manifests and non-declaring providers, which retain legacy waits on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_keepalive: Option<bool>,
     /// Per-tool result formats, by tool name, frozen only for tools that opt in. Absent means no
     /// tool of this provider declared one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,7 +75,10 @@ pub struct FrozenProviderDeclarations {
 impl FrozenProviderDeclarations {
     /// Whether nothing was declared, so the declaration writes no bytes at all.
     pub fn is_empty(&self) -> bool {
-        self.result_formats.is_none() && self.late_results.is_none() && self.schema_pins.is_none()
+        self.call_keepalive.is_none()
+            && self.result_formats.is_none()
+            && self.late_results.is_none()
+            && self.schema_pins.is_none()
     }
 }
 
@@ -493,6 +500,7 @@ mod tests {
             }],
         )]));
         *declarations_frozen = Some(FrozenProviderDeclarations {
+            call_keepalive: None,
             result_formats: None,
             late_results: Some(true),
             schema_pins: None,
@@ -801,6 +809,7 @@ mod tests {
                 result_ops: None,
                 reply: None,
                 declarations_frozen: Some(FrozenProviderDeclarations {
+                    call_keepalive: None,
                     result_formats: Some(BTreeMap::from([(
                         "ask".to_owned(),
                         FrozenResultFormat("content/v1".into()),
@@ -853,6 +862,7 @@ mod tests {
             } = &mut fetch.outcome
             {
                 *declarations_frozen = Some(FrozenProviderDeclarations {
+                    call_keepalive: None,
                     result_formats: None,
                     late_results: Some(true),
                     schema_pins: None,

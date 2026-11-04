@@ -26,6 +26,7 @@ pub mod registry;
 pub mod retention;
 pub mod retention_withdrawals;
 mod send_fate;
+mod sender_admission;
 pub mod serve;
 pub mod session_class;
 mod uploads;
@@ -51,3 +52,6 @@ mod keep_warm;
 pub mod move_files;
 pub mod move_install;
 mod source_warm;
+
+#[cfg(test)]
+mod history_version_tests;

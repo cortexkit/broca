@@ -57,6 +57,10 @@ use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    attempt_policy::{
+        self, AttemptDecision, AttemptFacts, AttemptInputs, AttemptState, EndReason,
+        RejectedRefreshResult, BACKOFF_JITTER, MAX_ATTEMPTS,
+    },
     credential_refresh::CredentialRefresher,
     families::fresh_admission_config_error,
     normalize::classify_error_with_status_defaults,
@@ -66,8 +70,46 @@ use crate::{
 };
 
 #[cfg(test)]
-#[path = "transport_websocket_tests.rs"]
-mod websocket_tests;
+use crate::attempt_policy::{MAX_RETRY_AFTER_DELAY, RETRY_WALL_BUDGET};
+
+#[cfg(test)]
+mod websocket_tests {
+    include!("transport_websocket_tests.rs");
+    mod codex_error_code_regressions {
+        include!("transport/codex_error_code_regressions.rs");
+    }
+    mod attempt_equivalence {
+        include!("transport/attempt_equivalence_websocket.rs");
+    }
+    mod attempt_effect_boundaries {
+        include!("transport/attempt_effect_boundaries.rs");
+    }
+}
+
+#[cfg(test)]
+#[path = "transport/attempt_test_hooks.rs"]
+mod attempt_test_hooks;
+
+#[cfg(test)]
+#[path = "transport/attempt_effect_hooks.rs"]
+mod attempt_effect_hooks;
+
+#[cfg(test)]
+#[path = "transport/attempt_trace_cases.rs"]
+mod attempt_trace_cases;
+
+macro_rules! attempt_deadline_now {
+    () => {{
+        #[cfg(test)]
+        {
+            attempt_test_hooks::deadline_now()
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }};
+}
 
 #[cfg(test)]
 #[path = "transport_retention_tests.rs"]
@@ -86,7 +128,7 @@ mod cache_runtime;
 pub use responses_websocket::Connections as ChatgptConnections;
 
 #[path = "transport_codex_retry.rs"]
-mod codex_retry;
+pub(crate) mod codex_retry;
 
 #[path = "transport_request_gzip.rs"]
 pub mod request_gzip;
@@ -105,6 +147,9 @@ mod request_gzip_tests;
 /// with redirects disabled: a redirect must not re-POST under the original reservation.
 #[derive(Clone, Debug)]
 pub struct ProviderHttpClient {
+    // A run-local clone also sends prompt-cache warm requests reconstructed from a saved
+    // render config; those requests do not pass through the ordinary attempt loop.
+    warm_quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     /// Every host except `api.anthropic.com`. No response decoding and no `accept-encoding`.
     identity: reqwest::Client,
     /// `api.anthropic.com` only. Decodes gzip, deflate, brotli and zstd responses as they stream.
@@ -115,13 +160,13 @@ pub struct ProviderHttpClient {
     cache_sessions: cache_runtime::Sessions,
     #[cfg(feature = "test-harness")]
     warm_reply: Option<Bytes>,
-    /// Tests only: when set, every send fails at once with a refused connection, without
+    /// Tests only: the number of upcoming sends to refuse immediately, without
     /// opening a socket. A refused localhost connect takes seconds on some platforms, so a
     /// test that needs many connect failures in a bounded window cannot dial a real closed
     /// port; this keeps the failure and its `ConnectFailed` outcome while removing the
     /// operating system from the timing.
     #[cfg(test)]
-    fail_connects: bool,
+    fail_connects: Arc<AtomicUsize>,
 }
 
 struct JournaledHttpClients {
@@ -149,12 +194,24 @@ fn build_http_pool(builder: reqwest::ClientBuilder, decode: bool) -> reqwest::Cl
 }
 
 impl ProviderHttpClient {
+    /// Read accepted-attempt evidence without loading a session or reading its WAL.
+    /// `None` means not loaded in this process; `Some(None)` means loaded with no accepted
+    /// send on this account. This distinction lets admission count conservative cold starts.
+    pub fn session_last_accepted_at_ms(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        account: &str,
+    ) -> Option<Option<u64>> {
+        self.cache_sessions.accepted_at_ms(session, account)
+    }
+
     fn build(
         builder: impl Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
         request_gzip: request_gzip::RequestGzipPolicy,
     ) -> Self {
         Self {
             identity: build_http_pool(builder(), false),
+            warm_quota_observer: None,
             decoding: build_http_pool(builder(), true),
             journaled: Arc::new(JournaledHttpClients {
                 clients: OnceLock::new(),
@@ -166,7 +223,7 @@ impl ProviderHttpClient {
             #[cfg(feature = "test-harness")]
             warm_reply: None,
             #[cfg(test)]
-            fail_connects: false,
+            fail_connects: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -218,7 +275,7 @@ impl ProviderHttpClient {
     /// step's one escape attempt fails the same way the primary pool does.
     #[cfg(test)]
     fn with_test_hooks_from(mut self, source: &Self) -> Self {
-        self.fail_connects = source.fail_connects;
+        self.fail_connects = source.fail_connects.clone();
         self
     }
 
@@ -256,6 +313,7 @@ impl From<reqwest::Client> for ProviderHttpClient {
     fn from(client: reqwest::Client) -> Self {
         Self {
             identity: client.clone(),
+            warm_quota_observer: None,
             decoding: client,
             journaled: Arc::new(JournaledHttpClients {
                 clients: OnceLock::new(),
@@ -267,7 +325,7 @@ impl From<reqwest::Client> for ProviderHttpClient {
             #[cfg(feature = "test-harness")]
             warm_reply: None,
             #[cfg(test)]
-            fail_connects: false,
+            fail_connects: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -282,6 +340,7 @@ const ROUTE_FALLBACK: u8 = 1;
 /// loop runs every grammar.
 /// Media rendering is installed only when the immutable boot setting enables it.
 pub struct LiveProvider<F: WireFamily + 'static> {
+    quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     pub(crate) client: ProviderHttpClient,
     clock: Clock,
     pub(crate) family: Arc<F>,
@@ -317,6 +376,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
 /// Owns the rendered body behind a reference count so retry requests do not copy the prompt.
 #[derive(Clone)]
 struct PreparedHttpRequest {
+    quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     cache_session: Option<(Arc<cache_runtime::Session>, Arc<FrozenRenderConfig>)>,
     cache_model: Option<String>,
     cache_provenance: Option<Arc<broca_protocol::render_provenance::RenderProvenance>>,
@@ -353,6 +413,7 @@ type CompletedOutputRenderer =
 impl From<HttpRequest> for PreparedHttpRequest {
     fn from(request: HttpRequest) -> Self {
         Self {
+            quota_observer: None,
             attempt_hook: None,
             cache_session: None,
             cache_model: None,
@@ -380,6 +441,7 @@ impl From<HttpRequest> for PreparedHttpRequest {
 /// Immutable, whole-request input for one blocking render. All expensive input stays behind
 /// shared handles; the closure is the sole owner that releases its prompt snapshot.
 struct RenderJob<F: WireFamily + 'static> {
+    quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     cache_session: Option<Arc<cache_runtime::Session>>,
     cache_provider: Option<String>,
     subscription_auth: bool,
@@ -444,6 +506,7 @@ struct ChunkWarning {
 /// SSE adaptation, not compressed frames or control-frame payloads.
 #[derive(Clone, Default)]
 struct AttemptTrace {
+    quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     cache_work: cache_runtime::Pending,
     cache_evidence: Option<Box<Value>>,
     attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,
@@ -653,9 +716,20 @@ impl<F: WireFamily + 'static> RenderJob<F> {
         let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
         // This scan is deliberately in the same blocking job as rendering: it walks the entire
         // prompt to preserve aliases from historical tool calls on every resumed step.
-        let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build(
-            &self.opts.tools,
+        let mut tools = std::borrow::Cow::Borrowed(self.opts.tools.as_slice());
+        if let Some(so) = &self.frozen.structured_output {
+            if so.mode == broca_protocol::structured_output::Mode::SubmitTool {
+                // Family renderers append this declaration too. The reverse map must see the
+                // same names before the runner recognizes a structured-output submission.
+                tools
+                    .to_mut()
+                    .push(crate::structured_output::submit_tool(so.schema()));
+            }
+        }
+        let name_map = Arc::new(crate::tool_name_alias::ToolNameMap::build_with_aliases(
+            &tools,
             &self.opts.prompt,
+            &self.frozen.tool_name_aliases,
         ));
         let body = if let Some(renderer) = &self.media_renderer {
             renderer(
@@ -672,6 +746,7 @@ impl<F: WireFamily + 'static> RenderJob<F> {
         let mut request =
             PreparedHttpRequest::from(self.family.endpoint(&self.frozen, &self.auth, body));
         request.ephemeral_session = self.opts.ephemeral_session;
+        request.quota_observer = self.quota_observer;
         request.cache_provenance = Some(Arc::new(provenance));
         request.cache_session = self
             .cache_session
@@ -741,6 +816,9 @@ impl ToolNameRestoringNormalizer {
 }
 
 impl StreamNormalizer for ToolNameRestoringNormalizer {
+    fn set_raw_sse_observer(&mut self, observer: crate::wire::RawSseObserver) {
+        self.inner.set_raw_sse_observer(observer);
+    }
     fn observe_error_response(&mut self, response: &Value) {
         self.inner.observe_error_response(response);
     }
@@ -1014,6 +1092,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
     ) -> Self {
         Self {
             client,
+            quota_observer: None,
             clock,
             family: Arc::new(family),
             fallback: frozen
@@ -1051,6 +1130,15 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
     /// Use the module's shared clock for relative provider reset deadlines.
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    pub fn with_quota_observer(
+        mut self,
+        observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
+    ) -> Self {
+        self.client.warm_quota_observer = observer.clone();
+        self.quota_observer = observer;
         self
     }
 
@@ -1154,6 +1242,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             return rx;
         }
         let render_job = RenderJob {
+            quota_observer: self.quota_observer.clone(),
             cache_session: self.cache_session.lock().unwrap().clone(),
             cache_provider: if self.routed_fallback().is_some() {
                 self.frozen
@@ -1225,6 +1314,13 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
+    fn turn_system_possible(
+        &self,
+        preceding: Option<&broca_protocol::Message>,
+        followed_by_user: bool,
+    ) -> bool {
+        crate::turn_system::possible_after(&self.route_frozen(), preceding, followed_by_user)
+    }
     fn history_edit_cost(
         &self,
     ) -> Option<broca_core::compaction_provider::notice::HistoryEditCost> {
@@ -1312,6 +1408,14 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         if let Some(session) = self.cache_session.lock().unwrap().as_ref() {
             session.recorded(locator);
         }
+    }
+
+    fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {
+        self.cache_session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|session| session.last_accepted_at_ms(account))
     }
 
     fn reasoning_is_prefix_bound(&self) -> bool {
@@ -1643,7 +1747,12 @@ async fn send_warm_legacy(
             .map_err(|error| failed(format!("warm request failed: {error}")))?;
             let status = response.status();
             let header_map = response.headers().clone();
-            let body = read_warm_body_legacy(response, &failed).await?;
+            if let Some(observer) = &client.warm_quota_observer {
+                observer.headers(&header_map, now_millis());
+            }
+            let body =
+                read_warm_body_legacy(response, &failed, client.warm_quota_observer.as_deref())
+                    .await?;
             if gzip.is_some() {
                 if let Some(rejection) = request_gzip::classify_rejection(
                     status.as_u16(),
@@ -1727,15 +1836,24 @@ async fn send_warm_legacy(
 async fn read_warm_body_legacy(
     response: reqwest::Response,
     failed: &impl Fn(String) -> broca_core::WarmFailure,
+    observer: Option<&dyn crate::quota::QuotaObserver>,
 ) -> Result<Vec<u8>, broca_core::WarmFailure> {
+    let mut quota_sse = crate::quota::SseTap::new(observer);
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| failed(format!("warm answer unreadable: {error}")))?;
+        let received_at = quota_sse.as_ref().map(|_| now_millis());
         if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
             return Err(failed("warm answer exceeded its size limit".into()));
         }
         body.extend_from_slice(&chunk);
+        if let Some(tap) = &mut quota_sse {
+            tap.push(&body, received_at.expect("quota tap timestamp"));
+        }
+    }
+    if let Some(tap) = &mut quota_sse {
+        tap.finish(&body);
     }
     Ok(body)
 }
@@ -1847,7 +1965,16 @@ async fn send_warm_journaled(
             envelope.http_status = Some(status.as_u16());
             envelope.vendor_request_id = vendor_request_id(response.headers());
             let header_map = response.headers().clone();
-            let body = read_warm_body(response, &failed, &mut envelope).await?;
+            if let Some(observer) = &client.warm_quota_observer {
+                observer.headers(&header_map, now_millis());
+            }
+            let body = read_warm_body(
+                response,
+                &failed,
+                &mut envelope,
+                client.warm_quota_observer.as_deref(),
+            )
+            .await?;
             warm_billing_usage(&body, family, &mut envelope);
             if gzip.is_some() {
                 if let Some(rejection) = request_gzip::classify_rejection(
@@ -2026,7 +2153,9 @@ async fn read_warm_body(
     response: reqwest::Response,
     failed: &impl Fn(String) -> broca_core::WarmFailure,
     envelope: &mut broca_wal::record::AttemptEnvelope,
+    observer: Option<&dyn crate::quota::QuotaObserver>,
 ) -> Result<Vec<u8>, broca_core::WarmFailure> {
+    let mut quota_sse = crate::quota::SseTap::new(observer);
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -2035,11 +2164,18 @@ async fn read_warm_body(
             failed(format!("warm answer unreadable: {error}"))
         })?;
         envelope.response_bytes += chunk.len() as u64;
+        let received_at = quota_sse.as_ref().map(|_| now_millis());
         if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
             envelope.outcome = broca_wal::record::BillingAttemptOutcome::ByteLimit;
             return Err(failed("warm answer exceeded its size limit".into()));
         }
         body.extend_from_slice(&chunk);
+        if let Some(tap) = &mut quota_sse {
+            tap.push(&body, received_at.expect("quota tap timestamp"));
+        }
+    }
+    if let Some(tap) = &mut quota_sse {
+        tap.finish(&body);
     }
     Ok(body)
 }
@@ -2271,19 +2407,14 @@ impl StreamRateWindow {
 //
 // One exception adds a send: a 401 answered by a fresh token for the same credential is re-sent
 // once, outside MAX_ATTEMPTS but inside RETRY_WALL_BUDGET.
-// `drive_step_attempts` states the full rule where it applies it.
+// `attempt_policy` owns the counters and decisions; `drive_step_attempts` performs their effects.
 //
 // The two OpenAI Responses families (`openai_responses` and `openai_responses_chatgpt`) do not
 // use this schedule. They take Codex's retry decision instead: see `codex_retry`. For them
-// there is no MAX_ATTEMPTS, cap on the server's time or waiting budget. The permanent-class,
-// `x-should-retry: false`, exhausted-account and second-decode-failure vetoes and the 401
+// only connection failures share MAX_ATTEMPTS across both retry layers; there is no cap on
+// the server's time or waiting budget. The permanent-class, `x-should-retry: false`,
+// exhausted-account and second-decode-failure vetoes and the 401
 // re-send apply to them unchanged.
-const MAX_ATTEMPTS: usize = 6;
-const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
-const MAX_BACKOFF_DELAY: Duration = Duration::from_secs(30);
-const BACKOFF_JITTER: f64 = 0.2;
-const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(120);
-const RETRY_WALL_BUDGET: Duration = Duration::from_secs(240);
 // All observed ChatGPT response cuts fell in 901.1–901.3 s after send; allow a small
 // timing margin when recognizing the backend's 900 s response deadline.
 const CHATGPT_RESPONSE_DEADLINE_THRESHOLD: Duration = Duration::from_secs(895);
@@ -2311,6 +2442,8 @@ struct RetryClock {
 #[derive(Clone, Copy)]
 struct RetryMark {
     at: Instant,
+    #[cfg(test)]
+    virtual_at: Option<Instant>,
     #[cfg(any(test, feature = "test-harness"))]
     virtual_waits_before: usize,
 }
@@ -2319,17 +2452,21 @@ impl RetryClock {
     fn attempt_elapsed(&self, mark: RetryMark) -> Duration {
         #[cfg(test)]
         if let Some(attempts) = &self.virtual_retry_attempts {
-            return attempts
+            let elapsed = attempts
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("scripted attempt clock");
+            attempt_test_hooks::advance(elapsed);
+            return elapsed;
         }
         self.elapsed_since(mark)
     }
     fn mark(&self) -> RetryMark {
         RetryMark {
             at: Instant::now(),
+            #[cfg(test)]
+            virtual_at: attempt_test_hooks::virtual_now(),
             #[cfg(any(test, feature = "test-harness"))]
             virtual_waits_before: self
                 .virtual_waits
@@ -2339,6 +2476,10 @@ impl RetryClock {
     }
 
     fn elapsed_since(&self, mark: RetryMark) -> Duration {
+        #[cfg(test)]
+        if let Some(at) = mark.virtual_at {
+            return attempt_test_hooks::deadline_now().duration_since(at);
+        }
         let elapsed = mark.at.elapsed();
         #[cfg(test)]
         let elapsed = self.virtual_wait_overhead.unwrap_or(elapsed);
@@ -2353,6 +2494,10 @@ impl RetryClock {
     }
 
     async fn sleep(&self, delay: Duration) {
+        #[cfg(test)]
+        let delay = attempt_test_hooks::delay(delay);
+        #[cfg(test)]
+        attempt_test_hooks::record(attempt_test_hooks::Event::Wait(delay));
         // Keep the marker on the retry path even when no virtual waits were configured:
         // release admission must reject any linked test-harness transport.
         #[cfg(feature = "test-harness")]
@@ -2360,6 +2505,8 @@ impl RetryClock {
         #[cfg(any(test, feature = "test-harness"))]
         if let Some(waits) = &self.virtual_waits {
             waits.lock().unwrap().push(delay);
+            #[cfg(test)]
+            attempt_test_hooks::advance(delay);
             tokio::task::yield_now().await;
             return;
         }
@@ -2370,7 +2517,7 @@ impl RetryClock {
 /// Why a transient attempt failed. This tag stays inside the transport: public error classes do
 /// not distinguish a broken stream from deterministic response decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttemptCause {
+pub(crate) enum AttemptCause {
     TransportTransient,
     DeterministicDecode,
 }
@@ -2722,7 +2869,7 @@ fn dump_files_to_delete(
 use crate::request_dump::is_request_dump_filename;
 pub use crate::request_dump::request_dump_filename;
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     system_time_millis(SystemTime::now())
 }
 
@@ -2890,6 +3037,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
         let rebuild = |auth: &AuthHandle, sent: &PreparedHttpRequest| {
             let fresh = family.endpoint(frozen.as_ref(), auth, sent.body.to_vec());
             PreparedHttpRequest {
+                quota_observer: sent.quota_observer.clone(),
                 cache_session: sent.cache_session.clone(),
                 cache_model: sent.cache_model.clone(),
                 cache_provenance: sent.cache_provenance.clone(),
@@ -3010,41 +3158,24 @@ where
     NormalizerFactory: FnMut() -> Normalizer,
     Normalizer: StreamNormalizer + 'static,
 {
-    let mut previous_cause = None;
-    let mut decode_retries = 0usize;
-    let mut escape_used = false;
-    let mut retry_wait_spent = Duration::ZERO;
-    let mut refreshes = 0usize;
-    // How a token-refresh re-send counts (see the retry schedule above MAX_ATTEMPTS):
-    // - Attempts: it is ONE send on top of MAX_ATTEMPTS, so the budget grows by one and a
-    //   transient failure after the re-send still gets the full set of ordinary re-sends.
-    // - Backoff: computed from the ordinal among ordinary attempts, so the curve is the one a
-    //   step without a refresh would follow.
-    // - Waiting: NOT exempt. Asking for a fresh token consumes the waiting allowance.
+    let use_codex = codex_retry::applies(request.family);
+    let mut attempts = AttemptState::new(use_codex);
+    let mut use_escape_client = false;
     // `credential_refresh` is the evidence the next attempt's record carries when it goes out
     // with a token refreshed inside this step, by either the 401 path or the pre-send check.
-    // The OpenAI Responses families count their retries the way Codex does, in `codex_retry`;
-    // for them the loop itself sets no attempt limit.
-    let mut codex =
-        codex_retry::applies(request.family).then(codex_retry::CodexRetryState::default);
-    let mut attempt_budget = if codex.is_some() {
-        usize::MAX
-    } else {
-        MAX_ATTEMPTS
-    };
     let mut credential_refresh: Option<CredentialRefresh> = None;
-    // A step recovers from a 401 at most once, so a second 401 (even from the refreshed token)
-    // ends the step. The expiry check before each attempt is not counted against this: it
-    // replaces a token nobody rejected, and it runs at most once per attempt.
-    let mut rejection_recovered = false;
-
-    let mut attempt_index = 0usize;
-    while attempt_index < attempt_budget {
+    // Driver-kept exceptions: the model has no cancellation, receiver-close, shutdown-seal
+    // or top-of-loop deadline outcome. These remain quiet ends with zero retries. Journal
+    // settlement errors also bypass retry policy: a failed durability effect cannot be retried
+    // as a provider failure. Resending a rejected gzip body without compression stays inside
+    // one recorded attempt.
+    loop {
+        let attempt_index = attempts.attempt_index();
         let attempt_started = retry_clock.mark();
         if cancel.is_cancelled() || tx.is_closed() {
             return Ok((Vec::new(), 0));
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if deadline.is_some_and(|deadline| attempt_deadline_now!() >= deadline) {
             cancel.cancel();
             return Ok((Vec::new(), 0));
         }
@@ -3061,6 +3192,11 @@ where
                 _ = tx.closed() => return Ok((Vec::new(), 0)),
                 refreshed = recovery.recovery.refresher.refresh_expiring() => refreshed,
             };
+            #[cfg(test)]
+            attempt_test_hooks::record(attempt_test_hooks::Event::Refresh {
+                rejected: false,
+                credential: refreshed.is_some(),
+            });
             if let Some(refreshed) = refreshed {
                 recovery
                     .recovery
@@ -3070,7 +3206,8 @@ where
                     .auth_refreshed = true;
                 // The same account check as a 401 refresh: a token for another account is
                 // never sent. Nothing was sent since the previous attempt, so the retries
-                // used are those already spent.
+                // used are those already spent. This pre-send exception is not a rejected-token
+                // recovery in the model, and retains its separate attempt_index - 1 count.
                 if let Some(mut error) = refreshed_account_changed_error(
                     recovery.recovery.frozen_account_ref.as_deref(),
                     &recovery.sent_auth,
@@ -3093,14 +3230,11 @@ where
         }
         let normalizer = Box::new(normalizer_factory()) as Box<dyn StreamNormalizer>;
 
-        let use_escape_client =
-            !escape_used && previous_cause == Some(AttemptCause::TransportTransient);
-        if use_escape_client {
-            escape_used = true;
-        }
         let escape_client = use_escape_client.then(|| {
             #[cfg(test)]
             escape_client_builds.fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            attempt_test_hooks::record(attempt_test_hooks::Event::EscapeClient);
             shared_client.http1_escape()
         });
         let client = escape_client.as_ref().unwrap_or(shared_client);
@@ -3119,6 +3253,7 @@ where
         step_seal.note_sent(&request.body, request_digest);
         let mut trace = AttemptTrace {
             attempt_hook: request.attempt_hook.clone(),
+            quota_observer: request.quota_observer.clone(),
             auth_refreshed: request.attempt_hook.is_some()
                 && auth_recovery.as_ref().is_some_and(|recovery| {
                     recovery
@@ -3249,9 +3384,6 @@ where
                 return Err((error, attempt_index as u32));
             }
         }
-        if result.is_err() && trace.response_len == 0 {
-            retry_wait_spent += attempt_elapsed;
-        }
         publish_attempt(
             tx,
             trace.clone().into_attempt(
@@ -3265,225 +3397,239 @@ where
         // then proceeds knowing the record took the ordinary path and is not its to write.
         step_seal.end_attempt();
         match result {
-            Ok(completion) => return Ok((completion, attempt_index as u32)),
-            Err(failure) => {
-                if is_rejected_token(&failure.error) {
-                    let rejected_status = failure.error.status.unwrap_or(401);
-                    let Some(recovery) = auth_recovery.as_mut() else {
-                        warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
-                        return Err((failure.error, attempt_index as u32));
-                    };
-                    // Whatever happens next, a step recovers at most once, so a second rejection
-                    // (of the token the step just refreshed) ends the step. Nothing has reported
-                    // that token to the credential source yet, so hand it the rejection to report.
-                    if rejection_recovered {
-                        recovery
-                            .recovery
-                            .refresher
-                            .note_unrecovered_rejection(rejected_status);
-                        warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
-                        return Err((failure.error, attempt_index as u32));
+            Ok(completion) => return Ok((completion, attempts.retries_used())),
+            Err(mut failure) => {
+                #[cfg(test)]
+                attempt_effect_hooks::at(attempt_effect_hooks::Boundary::FailedAttempt);
+                let facts = AttemptFacts {
+                    error: &failure.error,
+                    cause: failure.cause,
+                    outcome: failure.outcome.clone(),
+                    retry_forbidden: failure.retry_forbidden,
+                    over_https: trace.transport.as_deref() != Some("websocket"),
+                    attempt_elapsed,
+                    got_response_bytes: trace.response_len != 0,
+                    can_refresh: auth_recovery.is_some(),
+                };
+                let mut inputs = AttemptInputs {
+                    until_deadline: || {
+                        deadline.map(|deadline| {
+                            deadline.saturating_duration_since(attempt_deadline_now!())
+                        })
+                    },
+                    jitter: || {
+                        if use_codex {
+                            codex_retry::jitter()
+                        } else {
+                            retry_jitter()
+                        }
+                    },
+                };
+                let mut decision =
+                    attempt_policy::decide_attempt(&mut attempts, &facts, &mut inputs);
+                if let AttemptDecision::SwitchToHttps(pending) = decision {
+                    // The configuration callback can change or block. Only the actual switch
+                    // result authorizes fallback; the deadline source runs after that effect.
+                    #[cfg(test)]
+                    attempt_effect_hooks::at(attempt_effect_hooks::Boundary::Switch);
+                    let switched = request.family
+                        == Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt)
+                        && websocket.is_some_and(|session| session.try_switch_to_https());
+                    #[cfg(test)]
+                    if switched {
+                        attempt_test_hooks::record(attempt_test_hooks::Event::SwitchToHttps);
                     }
-                    rejection_recovered = true;
+                    decision = attempt_policy::resolve_https_switch(
+                        &mut attempts,
+                        &facts,
+                        pending,
+                        switched,
+                        inputs.until_deadline,
+                    );
+                }
+                let recovering = matches!(decision, AttemptDecision::RefreshAndResend);
+                let mut account_changed_error = None;
+                if recovering {
+                    let recovery = auth_recovery
+                        .as_mut()
+                        .expect("the policy requires a refresher before requesting recovery");
                     let refresh_started = retry_clock.mark();
                     let refreshed = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
                         _ = tx.closed() => return Ok((Vec::new(), 0)),
-                        refreshed = recovery.recovery.refresher.refresh_rejected(rejected_status) => refreshed,
+                        refreshed = recovery.recovery.refresher.refresh_rejected(
+                            failure.error.status.unwrap_or(401)
+                        ) => refreshed,
                     };
-                    let Some(refreshed) = refreshed else {
-                        warn_attempt_retry(&failure, &trace, "not_retryable", "authentication");
-                        return Err((failure.error, attempt_index as u32));
+                    #[cfg(test)]
+                    attempt_test_hooks::record(attempt_test_hooks::Event::Refresh {
+                        rejected: true,
+                        credential: refreshed.is_some(),
+                    });
+                    let refresh_result = match refreshed.as_ref() {
+                        None => RejectedRefreshResult::NoCredential,
+                        Some(refreshed) => {
+                            recovery
+                                .recovery
+                                .current
+                                .write()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .auth_refreshed = true;
+                            account_changed_error = refreshed_account_changed_error(
+                                recovery.recovery.frozen_account_ref.as_deref(),
+                                &recovery.sent_auth,
+                                refreshed,
+                            );
+                            // Compare accounts before credentials; neither credential is formatted.
+                            if account_changed_error.is_some() {
+                                RejectedRefreshResult::AccountChanged
+                            } else if refreshed.auth == *recovery.sent_auth {
+                                RejectedRefreshResult::UnchangedCredential
+                            } else {
+                                RejectedRefreshResult::Refreshed
+                            }
+                        }
                     };
-                    recovery
-                        .recovery
-                        .current
-                        .write()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .auth_refreshed = true;
-                    if let Some(mut error) = refreshed_account_changed_error(
-                        recovery.recovery.frozen_account_ref.as_deref(),
-                        &recovery.sent_auth,
-                        &refreshed,
-                    ) {
-                        redact_chatgpt_account_error(&mut error, request.family);
-                        warn_attempt_retry(&failure, &trace, "not_retryable", "account_changed");
-                        return Err((error, attempt_index as u32));
+                    decision = attempt_policy::decide_rejected_refresh(
+                        &mut attempts,
+                        &facts,
+                        refresh_result,
+                    );
+                    if matches!(decision, AttemptDecision::Resend { .. }) {
+                        let refreshed =
+                            refreshed.expect("a resend requires a refreshed credential");
+                        recovery.adopt(
+                            refreshed.auth,
+                            refreshed.account_ref,
+                            &mut request,
+                            &mut served_account_ref,
+                        );
+                        credential_refresh = Some(refreshed.evidence);
+                        attempt_policy::note_refresh_elapsed(
+                            &mut attempts,
+                            retry_clock.elapsed_since(refresh_started),
+                        );
                     }
-                    // The same token again cannot succeed where it was just refused, so the
-                    // 401 stands. Compared as a boolean only; neither side is ever formatted.
-                    if refreshed.auth == *recovery.sent_auth {
+                }
+
+                let switch_to_https = match &decision {
+                    AttemptDecision::Resend {
+                        switch_to_https, ..
+                    }
+                    | AttemptDecision::EndStep {
+                        switch_to_https, ..
+                    } => *switch_to_https,
+                    AttemptDecision::RefreshAndResend | AttemptDecision::SwitchToHttps(_) => {
+                        unreachable!("pending effects were resolved above")
+                    }
+                };
+                match decision {
+                    AttemptDecision::EndStep {
+                        reason,
+                        retries_used,
+                        note_unrecovered_rejection,
+                        ..
+                    } => {
+                        if note_unrecovered_rejection {
+                            auth_recovery
+                                .as_ref()
+                                .expect("the policy requires a refresher to report a rejection")
+                                .recovery
+                                .refresher
+                                .note_unrecovered_rejection(failure.error.status.unwrap_or(401));
+                        }
+                        let (decision, warning_reason) = match reason {
+                            EndReason::Authentication => ("not_retryable", "authentication"),
+                            EndReason::AccountChanged => ("not_retryable", "account_changed"),
+                            EndReason::UnchangedCredential => {
+                                ("not_retryable", "unchanged_credential")
+                            }
+                            EndReason::RetryVeto => ("not_retryable", "retry_veto"),
+                            EndReason::AttemptLimit => ("attempts_exhausted", "attempt_limit"),
+                            EndReason::WaitingBudget => ("wall_exhausted", "waiting_budget"),
+                            EndReason::RetryAfterExceedsDeadline => {
+                                ("not_retryable", "retry_after_exceeds_deadline")
+                            }
+                            EndReason::CodexTerminal => ("not_retryable", "codex_terminal"),
+                            EndReason::NoServerRetryTime => {
+                                ("not_retryable", "no_server_retry_time")
+                            }
+                            EndReason::ConnectionAttemptLimit => {
+                                ("attempts_exhausted", "connection_attempt_limit")
+                            }
+                        };
+                        warn_attempt_retry(&failure, &trace, decision, warning_reason);
+                        if reason == EndReason::AccountChanged {
+                            let mut error = account_changed_error
+                                .expect("an account-change end requires the replacement error");
+                            redact_chatgpt_account_error(&mut error, request.family);
+                            return Err((error, retries_used));
+                        }
+                        if reason == EndReason::ConnectionAttemptLimit {
+                            failure.error.class = ErrorClass::Transient;
+                            failure.error.provider_code = Some("connection_failed".into());
+                            failure.error.message = format!(
+                                "connection failed after {MAX_ATTEMPTS} failed attempts: {}",
+                                failure.error.message
+                            );
+                        }
+                        return Err((failure.error, retries_used));
+                    }
+                    AttemptDecision::Resend {
+                        delay,
+                        escape_client,
+                        reason,
+                        ..
+                    } => {
+                        use_escape_client = escape_client;
                         warn_attempt_retry(
                             &failure,
                             &trace,
-                            "not_retryable",
-                            "unchanged_credential",
+                            if switch_to_https {
+                                "switching_to_https"
+                            } else {
+                                "retrying"
+                            },
+                            reason,
                         );
-                        return Err((failure.error, attempt_index as u32));
-                    }
-                    recovery.adopt(
-                        refreshed.auth,
-                        refreshed.account_ref,
-                        &mut request,
-                        &mut served_account_ref,
-                    );
-                    credential_refresh = Some(refreshed.evidence);
-                    attempt_budget = attempt_budget.saturating_add(1);
-                    refreshes += 1;
-                    retry_wait_spent += retry_clock.elapsed_since(refresh_started);
-                    warn_attempt_retry(&failure, &trace, "retrying", "credential_refresh");
-                    // A new token needs no backoff; only the partial display is reset.
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
-                        result = tx.send(NormalizedEvent::Display(DisplayEvent::DisplayReset)) => {
-                            if result.is_err() {
-                                return Ok((Vec::new(), 0));
+                        // A rejected-token resend resets the display without entering the sleep
+                        // effect, unlike an ordinary retry whose server-advised delay is zero.
+                        if !recovering {
+                            let wait_started = retry_clock.mark();
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
+                                _ = tx.closed() => return Ok((Vec::new(), 0)),
+                                // No attempt is in flight; the seal owns the terminal record.
+                                _ = step_seal.tripped() => {
+                                    tx.closed().await;
+                                    return Ok((Vec::new(), 0));
+                                }
+                                _ = retry_clock.sleep(delay) => {}
+                            }
+                            attempt_policy::note_waited(
+                                &mut attempts,
+                                retry_clock.elapsed_since(wait_started),
+                            );
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
+                            result = tx.send(NormalizedEvent::Display(DisplayEvent::DisplayReset)) => {
+                                if result.is_err() {
+                                    return Ok((Vec::new(), 0));
+                                }
                             }
                         }
                     }
-                    previous_cause = failure.cause;
-                    attempt_index += 1;
-                    continue;
-                }
-                // The ordinal among ordinary attempts, leaving out a token-refresh re-send, so
-                // the backoff curve is the same with or without one.
-                let ordinary_index = attempt_index - refreshes;
-                if !failure.error.class.step_reissuable()
-                    || failure.retry_forbidden
-                    || (failure.cause == Some(AttemptCause::DeterministicDecode)
-                        && decode_retries >= 1)
-                {
-                    warn_attempt_retry(&failure, &trace, "not_retryable", "retry_veto");
-                    return Err((failure.error, attempt_index as u32));
-                }
-
-                let delay = if let Some(codex) = codex.as_mut() {
-                    if failure.cause == Some(AttemptCause::DeterministicDecode) {
-                        decode_retries += 1;
-                    }
-                    let decision = codex.decide(
-                        &codex_retry::CodexFailure {
-                            error: &failure.error,
-                            outcome: &failure.outcome,
-                            https: trace.transport.as_deref() != Some("websocket"),
-                        },
-                        // Codex disables its WebSocket only where the transport could use one.
-                        || {
-                            request.family
-                                == Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt)
-                                && websocket.is_some_and(|session| session.try_switch_to_https())
-                        },
-                    );
-                    let (delay, server_advised, decision, reason) = match decision {
-                        codex_retry::CodexDecision::Terminal { reason } => {
-                            let decision = if reason == "attempt_limit" {
-                                "attempts_exhausted"
-                            } else {
-                                "not_retryable"
-                            };
-                            warn_attempt_retry(&failure, &trace, decision, reason);
-                            return Err((failure.error, attempt_index as u32));
-                        }
-                        codex_retry::CodexDecision::Retry {
-                            delay,
-                            server_advised,
-                            reason,
-                        } => (delay, server_advised, "retrying", reason),
-                        codex_retry::CodexDecision::FallBackToHttps {
-                            delay,
-                            server_advised,
-                        } => (
-                            delay,
-                            server_advised,
-                            "switching_to_https",
-                            "socket_attempt_limit",
-                        ),
-                    };
-                    // The server's time is waited out in full, never cut short, so a deadline
-                    // that comes first ends the step now rather than after a wait that cannot
-                    // lead to a send.
-                    if server_advised
-                        && deadline.is_some_and(|deadline| {
-                            delay >= deadline.saturating_duration_since(Instant::now())
-                        })
-                    {
-                        warn_attempt_retry(
-                            &failure,
-                            &trace,
-                            "not_retryable",
-                            "retry_after_exceeds_deadline",
-                        );
-                        return Err((failure.error, attempt_index as u32));
-                    }
-                    warn_attempt_retry(&failure, &trace, decision, reason);
-                    delay
-                } else {
-                    // Only the ChatGPT family, which takes the branch above, uses a socket, so
-                    // every attempt here went out over HTTPS.
-                    if attempt_index + 1 >= attempt_budget {
-                        warn_attempt_retry(&failure, &trace, "attempts_exhausted", "attempt_limit");
-                        return Err((failure.error, attempt_index as u32));
-                    }
-
-                    if failure.cause == Some(AttemptCause::DeterministicDecode) {
-                        decode_retries += 1;
-                    }
-                    let delay = retry_delay(&failure.error, ordinary_index);
-                    if failure.error.status == Some(429)
-                        && failure.error.retry_after_secs.is_some()
-                        && deadline.is_some_and(|deadline| {
-                            delay >= deadline.saturating_duration_since(Instant::now())
-                        })
-                    {
-                        warn_attempt_retry(
-                            &failure,
-                            &trace,
-                            "not_retryable",
-                            "retry_after_exceeds_deadline",
-                        );
-                        return Err((failure.error, attempt_index as u32));
-                    }
-                    if retry_wait_spent + delay > RETRY_WALL_BUDGET {
-                        warn_attempt_retry(&failure, &trace, "wall_exhausted", "waiting_budget");
-                        return Err((failure.error, attempt_index as u32));
-                    }
-
-                    warn_attempt_retry(&failure, &trace, "retrying", "transient_failure");
-                    delay
-                };
-
-                let wait_started = retry_clock.mark();
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
-                    _ = tx.closed() => return Ok((Vec::new(), 0)),
-                    // A shutdown during the wait seals the run Interrupted; no attempt is in
-                    // flight, so go quiet exactly as when the seal refuses the next attempt.
-                    _ = step_seal.tripped() => {
-                        tx.closed().await;
-                        return Ok((Vec::new(), 0));
-                    }
-                    _ = retry_clock.sleep(delay) => {}
-                }
-                retry_wait_spent += retry_clock.elapsed_since(wait_started);
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
-                    result = tx.send(NormalizedEvent::Display(DisplayEvent::DisplayReset)) => {
-                        if result.is_err() {
-                            return Ok((Vec::new(), 0));
-                        }
+                    AttemptDecision::RefreshAndResend | AttemptDecision::SwitchToHttps(_) => {
+                        unreachable!("pending effects were resolved above")
                     }
                 }
-                previous_cause = failure.cause;
             }
         }
-        attempt_index += 1;
     }
-
-    unreachable!("the fixed attempt set always returns from success or failure")
 }
 
 /// Whether a failed attempt means the provider rejected the token itself: an Auth-class HTTP
@@ -3491,6 +3637,7 @@ where
 /// upgrade, is not: an HTTPS 403 is an entitlement refusal, and a refused upgrade 403 is sent
 /// again over HTTPS before it is classified. A ChatGPT backend 401 about its own upstream API key
 /// is classified Transient before it gets here, so it does not qualify either.
+#[cfg(test)]
 fn is_rejected_token(error: &ProviderError) -> bool {
     error.class == ErrorClass::Auth && error.status == Some(401)
 }
@@ -3679,20 +3826,19 @@ impl StepSeal<'_> {
     }
 }
 
+#[cfg(test)]
 fn retry_delay(error: &ProviderError, failed_attempt_index: usize) -> Duration {
-    if let Some(seconds) = error.retry_after_secs {
-        let capped_seconds = seconds.max(0.0).min(MAX_RETRY_AFTER_DELAY.as_secs_f64());
-        return Duration::from_secs_f64(capped_seconds);
-    }
+    attempt_policy::generic_delay(error, failed_attempt_index, retry_jitter)
+}
 
-    let doublings = u32::try_from(failed_attempt_index)
-        .unwrap_or(u32::MAX)
-        .min(16);
-    let nominal = BASE_RETRY_DELAY
-        .saturating_mul(1u32 << doublings)
-        .min(MAX_BACKOFF_DELAY);
-    let factor = rand::rng().random_range((1.0 - BACKOFF_JITTER)..=(1.0 + BACKOFF_JITTER));
-    nominal.mul_f64(factor)
+fn retry_jitter() -> f64 {
+    #[cfg(test)]
+    attempt_effect_hooks::at(attempt_effect_hooks::Boundary::Jitter);
+    #[cfg(test)]
+    if let Some(factor) = attempt_test_hooks::jitter(false) {
+        return factor;
+    }
+    rand::rng().random_range((1.0 - BACKOFF_JITTER)..=(1.0 + BACKOFF_JITTER))
 }
 
 fn warn_attempt_retry(
@@ -3701,6 +3847,11 @@ fn warn_attempt_retry(
     decision: &str,
     reason: &str,
 ) {
+    #[cfg(test)]
+    attempt_test_hooks::record(attempt_test_hooks::Event::Decision {
+        action: decision.to_owned(),
+        reason: reason.to_owned(),
+    });
     if trace.ephemeral_session && trace.defer_failure_warning {
         // Ephemeral sessions prohibit retained content: log only typed error tags and local
         // timing, not provider-controlled stream diagnostics.
@@ -3769,6 +3920,11 @@ fn warn_retry_metadata(
 /// Send one attempt's evidence to the run loop. A closed receiver means nobody is left to
 /// record it, so the send error is ignored.
 async fn publish_attempt(tx: &mpsc::Sender<NormalizedEvent>, attempt: ModelAttempt) {
+    #[cfg(test)]
+    attempt_test_hooks::record(attempt_test_hooks::Event::Attempt {
+        ordinal: attempt.attempt,
+        outcome: attempt.outcome.clone(),
+    });
     let _ = tx
         .send(NormalizedEvent::Control(ProviderControl::AttemptFinished {
             attempt,
@@ -3991,6 +4147,7 @@ async fn drive_attempt(
             request.family,
             headers.get("x-amzn-errortype"),
         );
+        let observed_at_ms = clock.now_ms();
         let error = match request.family {
             Some(family) => {
                 let error = classify_chatgpt_upstream_key_rejection(family, code, &text, error);
@@ -4002,7 +4159,7 @@ async fn drive_attempt(
                     code,
                     &headers,
                     &text,
-                    UNIX_EPOCH + Duration::from_millis(clock.now_ms()),
+                    UNIX_EPOCH + Duration::from_millis(observed_at_ms),
                     error,
                 )
             }
@@ -4039,6 +4196,8 @@ async fn drive_attempt(
             || error.is_credit_insufficient();
         if error.is_account_limit_exhausted() {
             trace.account_observation.limit = Some(broca_protocol::AttemptAccountLimit {
+                disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+                observed_at_ms,
                 resets_at_ms: error.resets_at_ms,
                 resets_at_source: error.resets_at_source.clone(),
                 limit_window: error.limit_window.clone(),
@@ -4086,9 +4245,17 @@ async fn send_attempt(
     if trace.attempt_hook.is_some() {
         trace.reserve_send(request, body.len(), compressed).await?;
     }
+    #[cfg(test)]
+    attempt_test_hooks::send(trace.attempt_ordinal, trace.send_index, false);
     // A deterministic connect refusal still reserves an attempt, but never stamps a send.
     #[cfg(test)]
-    if client.fail_connects {
+    if client
+        .fail_connects
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+    {
         return Err(AttemptFailure::transport(
             transport_error("refused test connection (no socket opened)"),
             AttemptOutcome::ConnectFailed,
@@ -4123,6 +4290,9 @@ async fn send_attempt(
         })?;
     if trace.attempt_hook.is_some() {
         trace.vendor_request_id = vendor_request_id(response.headers());
+    }
+    if let Some(observer) = &trace.quota_observer {
+        observer.headers(response.headers(), now_millis());
     }
     Ok(response)
 }
@@ -4183,6 +4353,10 @@ async fn drive_selected_attempt(
 ) -> Result<Vec<NormalizedEvent>, AttemptFailure> {
     if request.family == Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt) {
         if let Some(websocket) = transport.websocket {
+            #[cfg(test)]
+            if attempt_test_hooks::is_active() && !websocket.forced_https() {
+                attempt_test_hooks::send(trace.attempt_ordinal, trace.send_index, true);
+            }
             return responses_websocket::drive(
                 websocket,
                 transport.client,
@@ -4513,6 +4687,16 @@ where
     tokio::pin!(content);
     let mut completion = Vec::new();
     let mut rate_window = stream_floor_from_env().map(StreamRateWindow::new);
+    // Socket frames are tapped by the receive pump. SSE borrows the normalizer's decoded
+    // payloads so ordinary deltas incur no second decoder or per-record allocation.
+    if let Some(observer) = trace.quota_observer.as_ref().filter(|observer| {
+        observer.wants_frames() && trace.transport.as_deref() != Some("websocket")
+    }) {
+        let observer = observer.clone();
+        normalizer.set_raw_sse_observer(Arc::new(move |frame| {
+            crate::quota::observe_frame(observer.as_ref(), frame);
+        }));
+    }
 
     loop {
         let next = tokio::select! {
@@ -6087,6 +6271,8 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
+    include!("transport_quota_tests.rs");
+
     use super::{
         build_provider_http_client, classify_account_limit_exhausted, classify_http_error,
         collect_error_body, drive_attempt, drive_body_stream, drive_body_stream_with_limit,
@@ -6142,6 +6328,10 @@ mod tests {
         include!("transport_openai_billing_tests.rs");
     }
 
+    mod attempt_equivalence {
+        include!("transport/attempt_equivalence_http.rs");
+    }
+
     async fn assert_offloaded_render_matches_direct<F>(
         family: F,
         frozen: crate::wire::FrozenRenderConfig,
@@ -6151,6 +6341,7 @@ mod tests {
     {
         let direct = family.render(&frozen, &opts);
         let job = super::RenderJob {
+            quota_observer: None,
             cache_session: None,
             cache_provider: None,
             subscription_auth: false,
@@ -6481,6 +6672,7 @@ mod tests {
             Ok(vec![
                 NormalizedEvent::Display(DisplayEvent::DisplayGap { dropped: 99 }),
                 NormalizedEvent::Control(ProviderControl::StepFinished {
+                    raw_finish_reason: None,
                     step_id: self.step_id,
                     usage: Usage {
                         output_tokens: Some(999),
@@ -7181,6 +7373,7 @@ mod tests {
         let mut frozen = crate::families::anthropic_frozen_config("m");
         frozen.speed = Some("fast".into());
         let rendered = super::RenderJob {
+            quota_observer: None,
             cache_session: None,
             cache_provider: None,
             subscription_auth: false,
@@ -7987,11 +8180,15 @@ mod tests {
         let floor = phase.join(broca_wal::FEATURE_FLOOR_FILENAME);
         broca_wal::floor::raise_floor(&floor, broca_wal::framing::KNOWN_FEATURES).unwrap();
         {
-            let mut wal = FileWal::open(phase.join(&log))
-                .unwrap()
-                .with_feature_floor(floor.clone())
-                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                .unwrap();
+            let mut wal = FileWal::open_with_recovery(
+                phase.join(&log),
+                broca_wal::WalConfig::OVERHAUL,
+                floor.clone(),
+            )
+            .unwrap()
+            .with_feature_floor(floor.clone())
+            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+            .unwrap();
             let opened = WalRecord::WriterOpened {
                 writer_id: wal.writer_id().unwrap(),
                 previous_writer_id: None,
@@ -8009,11 +8206,15 @@ mod tests {
         }
         let recording = Arc::new(RecordingFs::new(&phase).unwrap());
         broca_wal::fs_ops::with_fs_ops(recording.clone(), || {
-            let mut wal = FileWal::open(phase.join(&log))
-                .unwrap()
-                .with_feature_floor(floor)
-                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                .unwrap();
+            let mut wal = FileWal::open_with_recovery(
+                phase.join(&log),
+                broca_wal::WalConfig::OVERHAUL,
+                floor.clone(),
+            )
+            .unwrap()
+            .with_feature_floor(floor)
+            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+            .unwrap();
             wal.append_v4(
                 1,
                 &reservation,
@@ -8081,6 +8282,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     async fn run_recorded_attempt<P: broca_core::Provider>(
         root: &std::path::Path,
         provider: &P,
@@ -8278,7 +8480,9 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct LargeAttemptFamily;
+    #[cfg(unix)]
     impl WireFamily for LargeAttemptFamily {
         fn shape(&self, _frozen: &crate::wire::FrozenRenderConfig, _opts: &CallOptions) -> Value {
             serde_json::json!({"model":"m", "padding":"x".repeat(100_000)})
@@ -8414,6 +8618,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(all(feature = "portable-power-loss", target_os = "linux"))]
     fn raw_attempt_frames(mut bytes: &[u8]) -> Vec<broca_wal::FramedRecord> {
         use broca_wal::framing::{decode_next, DecodeStep};
         let mut frames = Vec::new();
@@ -8427,7 +8632,8 @@ mod tests {
                 DecodeStep::TornTail => break,
                 // Unsynced block holes can leave a zero version byte or a failed digest.
                 // Count only the intact prefix here; real FileWal recovery below must
-                // prove this is a repairable tail, not silently skip interior corruption.
+                // save every byte from the first damaged frame onward in a sidecar
+                // and append RecoveryCut, not silently skip damaged bytes.
                 DecodeStep::Corrupt(_) => break,
                 DecodeStep::NewerWriter { .. } => panic!("unsupported power-loss image"),
             }
@@ -8435,6 +8641,7 @@ mod tests {
         frames
     }
 
+    #[cfg(unix)]
     async fn reclaim_attempt_image(
         root: &std::path::Path,
         fs: Arc<dyn broca_wal::fs_ops::FsOps>,
@@ -8460,241 +8667,10 @@ mod tests {
         store.read_records(&session).unwrap()
     }
 
-    #[tokio::test]
-    #[ignore = "requires v4 unsynced-tail recovery: FileWal refuses a zero-filled unsynced append tail"]
-    async fn attempt_hook_power_loss_send_refusal_outcome_terminal_and_reclaim() {
-        use broca_crash_harness::power_loss::RecordingFs;
-        use broca_wal::{FileWal, PreparedV4Frame, Wal, WalRecord};
-        let server = ScriptedServer::start(vec![
-            ScriptResponse::Http {
-                status: 415,
-                headers: vec![],
-                body: b"",
-            },
-            ScriptResponse::Http {
-                status: 400,
-                headers: vec![],
-                body: b"invalid",
-            },
-        ])
-        .await;
-        let address: std::net::SocketAddr =
-            server.url.strip_prefix("http://").unwrap().parse().unwrap();
-        let client = ProviderHttpClient::resolving_anthropic_api_to(address, true);
-        let mut frozen = crate::families::anthropic_frozen_config("m");
-        frozen.base_url = Some(format!("http://api.anthropic.com:{}", address.port()));
-        let provider = LiveProvider::with_client_and_clock(
-            client,
-            LargeAttemptFamily,
-            frozen,
-            AuthHandle::None,
-            Clock::default(),
-        );
-        let root = attempt_scratch("attempt-power-loss");
-        let capture = root.join("capture");
-        std::fs::create_dir_all(&capture).unwrap();
-        let recording = Arc::new(RecordingFs::new(&capture).unwrap());
-        let frames = run_recorded_attempt(&capture, &provider, Default::default(), recording).await;
-        assert_eq!(assert_attempts_settled_or_superseded(&frames), 2);
-        let records: Vec<_> = frames
-            .into_iter()
-            .map(|frame| frame.record)
-            .filter(|record| {
-                matches!(
-                    record,
-                    WalRecord::AttemptReserved { .. }
-                        | WalRecord::ModelAttemptFinished {
-                            attempt_id: Some(_),
-                            ..
-                        }
-                        | WalRecord::RunFinished { .. }
-                )
-            })
-            .collect();
-        assert_eq!(records.len(), 5);
-        let log = PathBuf::from("wal").join(format!(
-            "{}.wal",
-            broca_core::wal_writer::session_addr(&attempt_session())
-        ));
-        let mut first_cuts = 0;
-        let mut second_cuts = 0;
-        let mut phases = std::collections::BTreeSet::new();
-        // Replay the real transport's records through the unmodified filesystem harness in
-        // bounded durability intervals. The channel tests prove when these appends occur;
-        // these intervals exhaust loss/tearing of each append, including both paired barriers.
-        for (phase, prefix, end) in [
-            ("before_first_send", 0, 1),
-            ("send_to_outcome", 1, 2),
-            ("refusal_to_resend", 1, 3),
-            ("resend_to_outcome", 3, 4),
-            ("outcome_to_terminal", 3, 5),
-        ] {
-            let phase_root = root.join(phase);
-            std::fs::create_dir_all(phase_root.join("wal")).unwrap();
-            broca_wal::floor::raise_floor(
-                &phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
-                broca_wal::framing::KNOWN_FEATURES,
-            )
-            .unwrap();
-            // Initial file creation/lineage recovery is covered separately. A send starts
-            // from a log with an authentic durable header, never a newly created zero hole.
-            let previous_writer_id = {
-                let mut wal = FileWal::open(phase_root.join(&log))
-                    .unwrap()
-                    .with_feature_floor(phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
-                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                    .unwrap();
-                let id = wal.writer_id().unwrap();
-                let record = WalRecord::WriterOpened {
-                    writer_id: id,
-                    previous_writer_id: None,
-                    recovered_through_seq: 0,
-                    cause: "test".into(),
-                };
-                wal.append_v4(
-                    1,
-                    &record,
-                    true,
-                    PreparedV4Frame::prepare(&record).unwrap(),
-                    1,
-                )
-                .unwrap();
-                id
-            };
-            let recording = Arc::new(RecordingFs::new(&phase_root).unwrap());
-            broca_wal::fs_ops::with_fs_ops(recording.clone(), || {
-                let mut wal = FileWal::open(phase_root.join(&log))
-                    .unwrap()
-                    .with_feature_floor(phase_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
-                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                    .unwrap();
-                let opened = WalRecord::WriterOpened {
-                    writer_id: wal.writer_id().unwrap(),
-                    previous_writer_id: Some(previous_writer_id),
-                    recovered_through_seq: wal.last_seq(),
-                    cause: "test".into(),
-                };
-                wal.append_v4(
-                    1,
-                    &opened,
-                    true,
-                    PreparedV4Frame::prepare(&opened).unwrap(),
-                    1,
-                )
-                .unwrap();
-                for (index, record) in records[..end].iter().enumerate() {
-                    let sync = index < prefix
-                        || index + 1 == end
-                            && matches!(
-                                record,
-                                WalRecord::AttemptReserved { .. } | WalRecord::RunFinished { .. }
-                            );
-                    wal.append_v4(
-                        1,
-                        record,
-                        sync,
-                        PreparedV4Frame::prepare(record).unwrap(),
-                        2 + index as u64,
-                    )
-                    .unwrap();
-                }
-            });
-            let cuts = recording.enumerate(100_000).unwrap();
-            first_cuts += cuts.len();
-            for (index, cut) in cuts.iter().enumerate() {
-                let bytes = cut
-                    .state
-                    .files
-                    .get(&log)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                let raw = raw_attempt_frames(bytes);
-                let reserved = raw
-                    .iter()
-                    .filter(|frame| matches!(frame.record, WalRecord::AttemptReserved { .. }))
-                    .count();
-                let finished = raw
-                    .iter()
-                    .filter(|frame| {
-                        matches!(
-                            frame.record,
-                            WalRecord::ModelAttemptFinished {
-                                attempt_id: Some(_),
-                                ..
-                            }
-                        )
-                    })
-                    .count();
-                phases.insert((
-                    reserved,
-                    finished,
-                    raw.iter()
-                        .any(|frame| matches!(frame.record, WalRecord::RunFinished { .. })),
-                ));
-                let recovered_root = root.join(format!("first-{phase}-{index}"));
-                cut.state.install(&recovered_root).unwrap();
-                let recovery = Arc::new(RecordingFs::new(&recovered_root).unwrap());
-                // Enumerate a second loss while the physical WAL recovers its torn tail.
-                // Writer identity/publication cuts are proved by the writer lifecycle tests;
-                // every image here then goes through the real reclaim opener and close.
-                broca_wal::fs_ops::with_fs_ops(recovery.clone(), || {
-                    match FileWal::open(recovered_root.join(&log)) {
-                        Ok(wal) => {
-                            wal.replay().unwrap();
-                        }
-                        Err(error) => {
-                            if let Some(output) =
-                                std::env::var_os("BROCA_ATTEMPT_FAILURE_FIXTURE_DIR")
-                            {
-                                let output = PathBuf::from(output);
-                                std::fs::create_dir_all(&output).unwrap();
-                                std::fs::write(output.join("v4-unsynced-tail.wal"), bytes).unwrap();
-                                std::fs::write(output.join("README.md"), format!(
-                                    "# Unsynced v4 append-tail recovery fixture\n\nSynthetic billing records captured from the real HTTP gzip-refusal/resend path.\n\n- Durability interval: `{phase}`.\n- H1 image: index `{index}`, filesystem cut `{:?}`, persistence family `{:?}`.\n- Existing `FileWal::open` refuses with `{error:?}`.\n- The intact prefix contains {reserved} reservation(s) and {finished} settlement(s).\n\nThe bytes contain synthetic identities only. No real credentials or message content is present.\n\nReproduce the generating acceptance test on Linux:\n\n```sh\ncargo test --locked -p broca-provider -F live -F test-harness attempt_hook_power_loss --lib -- --ignored --nocapture\n```\n\nThe recovery fix must distinguish this unsynced append-tail loss from damage in the synced prefix. Do not skip refused images or relax the H1 harness. After physical recovery, the test uses the real reclaim writer opener/close and checks each reservation has exactly one settlement or a superseding writer, never both counted as separate attempts.\n", cut.cut, cut.family)).unwrap();
-                            }
-                            panic!("power-loss interval={phase} image={index} cut={:?} family={:?}: {error:?}", cut.cut, cut.family);
-                        }
-                    }
-                });
-                let second_images = recovery.enumerate(100_000).unwrap();
-                let recovered =
-                    reclaim_attempt_image(&recovered_root, Arc::new(broca_wal::fs_ops::RealFs))
-                        .await;
-                assert_eq!(assert_attempts_settled_or_superseded(&recovered), reserved);
-                for second in second_images {
-                    second_cuts += 1;
-                    assert!(second_cuts <= 100_000, "recovery cut budget exceeded");
-                    let again_root = root.join("second");
-                    second.state.install(&again_root).unwrap();
-                    let recovered =
-                        reclaim_attempt_image(&again_root, Arc::new(broca_wal::fs_ops::RealFs))
-                            .await;
-                    assert_eq!(assert_attempts_settled_or_superseded(&recovered), reserved);
-                    std::fs::remove_dir_all(again_root).unwrap();
-                }
-                std::fs::remove_dir_all(recovered_root).unwrap();
-            }
-        }
-        assert!(
-            phases.contains(&(1, 0, false)),
-            "cut after reservation, before outcome"
-        );
-        assert!(
-            phases.contains(&(1, 1, false)),
-            "cut between refusal outcome and resend reservation"
-        );
-        assert!(
-            phases.contains(&(2, 1, false)),
-            "cut before resend and before its outcome"
-        );
-        assert!(
-            phases.contains(&(2, 2, false)),
-            "cut between outcomes and terminal"
-        );
-        println!(
-            "attempt power-loss cuts: first={first_cuts} second={second_cuts} phases={phases:?}"
-        );
-        std::fs::remove_dir_all(root).unwrap();
+    #[cfg(all(feature = "portable-power-loss", target_os = "linux"))]
+    mod attempt_hook_power_loss_portable {
+        use super::*;
+        include!("transport_power_loss_tests.rs");
     }
 
     async fn read_http_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
@@ -12422,84 +12398,123 @@ mod tests {
         }
     }
 
-    /// An endpoint that refuses every connection is retried without limit, as Codex's
-    /// `unbounded_connection_retries` does: each round is one send and four request-layer
-    /// re-sends at Codex's backoff, then a connect wait of 5 s doubling to 60 s. Every send
-    /// leaves its attempt record. Only the caller's cancel ends it, promptly and without an
-    /// error.
-    ///
-    /// The refusal is injected, not dialed: a refused localhost connect takes seconds on
-    /// some platforms, so forty real refusals cannot fit the bounded wait below. The seam
-    /// fails the connect before any socket opens, and the `ConnectFailed` outcome it feeds
-    /// the retry decision is the production refusal's.
+    /// A headless step must return an actionable transient failure instead of waiting for a
+    /// connection forever. Inject refusals and retry waits so no socket or real backoff is needed.
     #[tokio::test]
-    async fn codex_unreachable_endpoint_retries_until_cancelled() {
-        let address = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        };
-        let mut frozen = openai_chat_frozen_config("retry-test");
-        frozen.family_id = WireFamilyId::OpenAiResponses;
-        // Never dialed: the test client refuses the connect before any socket opens.
-        frozen.base_url = Some(format!("http://{address}"));
-        let mut provider = LiveProvider::new(RetryTestFamily::new(0), frozen, AuthHandle::None);
-        provider.client.fail_connects = true;
-        let waits = use_virtual_retry_waits(&mut provider);
-        let cancel = CancellationToken::new();
-        let mut rx = provider.start_step(
-            StepId(1),
-            Arc::new(CallOptions::new(Vec::new())),
-            cancel.clone(),
-            None,
-        );
-        const SENDS: usize = 40;
-        let mut recorded = 0;
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while recorded < SENDS {
-                match rx.recv().await {
-                    Some(NormalizedEvent::Control(ProviderControl::AttemptFinished {
-                        attempt,
-                    })) => {
+    async fn codex_connection_failures_end_the_step_after_six_attempts() {
+        for family in CODEX_FAMILIES {
+            let server = ScriptedServer::start(Vec::new()).await;
+            let mut provider = family_retry_test_provider(&server, family);
+            provider
+                .client
+                .fail_connects
+                .store(usize::MAX, Ordering::SeqCst);
+            let waits = use_virtual_retry_waits(&mut provider);
+            let mut rx = provider.start_step(
+                StepId(1),
+                Arc::new(CallOptions::new(Vec::new())),
+                CancellationToken::new(),
+                None,
+            );
+            let events = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut events = Vec::new();
+                let mut attempts = 0;
+                while let Some(event) = rx.recv().await {
+                    if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
+                        &event
+                    {
                         assert_eq!(attempt.outcome, AttemptOutcome::ConnectFailed);
-                        recorded += 1;
+                        assert_eq!(attempt.attempt, attempts);
+                        attempts += 1;
+                        assert!(attempts <= 6, "connection retry bound exceeded: {family:?}");
                     }
-                    Some(NormalizedEvent::Control(ProviderControl::Error { error, .. })) => {
-                        panic!("an unreachable endpoint must not end the step: {error:?}")
-                    }
-                    Some(_) => {}
-                    None => panic!("the step ended before it was cancelled"),
+                    events.push(event);
                 }
-            }
-        })
-        .await
-        .expect("connect failures keep being retried");
-        cancel.cancel();
-        let started = Instant::now();
-        let rest = tokio::time::timeout(Duration::from_secs(1), async {
-            let mut rest = Vec::new();
-            while let Some(event) = rx.recv().await {
-                rest.push(event);
-            }
-            rest
-        })
-        .await
-        .expect("the cancelled step stops promptly");
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(terminal_error_if_any(&rest).is_none(), "{rest:?}");
+                assert_eq!(attempts, 6);
+                events
+            })
+            .await
+            .expect("connection exhaustion must end the step without cancellation");
+            let error = terminal_error(&events);
+            assert_eq!(error.class, ErrorClass::Transient);
+            assert_eq!(error.provider_code.as_deref(), Some("connection_failed"));
+            assert!(error.message.contains("connection failed"), "{error:?}");
+            assert_eq!(provider.family.render_calls.load(Ordering::SeqCst), 1);
+            assert!(server.request_bodies().is_empty(), "no request was sent");
+            let digests = attempt_digests(&events);
+            assert_eq!(digests.len(), 6);
+            assert!(digests.iter().all(|digest| digest == &digests[0]));
 
-        let waits = waits.lock().unwrap().clone();
-        assert!(waits.len() >= SENDS - 1);
-        let connect_waits: Vec<_> = waits.iter().skip(4).step_by(5).copied().collect();
-        assert_eq!(
-            connect_waits[..7],
-            [5, 10, 20, 40, 60, 60, 60].map(Duration::from_secs)
-        );
-        for (index, wait) in waits.iter().enumerate().filter(|(index, _)| index % 5 != 4) {
-            let nominal = 200u64 << (index % 5);
-            let millis = wait.as_millis() as u64;
-            assert!(
-                millis >= nominal * 9 / 10 && millis < nominal * 11 / 10,
-                "request retry wait {index} was {wait:?}, not Codex's backoff around {nominal} ms"
+            let waits = waits.lock().unwrap();
+            assert_eq!(waits.len(), 5);
+            for (wait, nominal) in waits[..4].iter().zip([200, 400, 800, 1600]) {
+                let millis = wait.as_millis() as u64;
+                assert!(millis >= nominal * 9 / 10 && millis < nominal * 11 / 10);
+            }
+            assert_eq!(waits[4], Duration::from_secs(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_connection_failures_then_success_reset_the_next_step() {
+        for family in CODEX_FAMILIES {
+            let server = ScriptedServer::start(vec![
+                ScriptResponse::Http {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"success",
+                };
+                2
+            ])
+            .await;
+            let mut provider = family_retry_test_provider(&server, family);
+            let waits = use_virtual_retry_waits(&mut provider);
+            for _ in 0..2 {
+                provider.client.fail_connects.store(5, Ordering::SeqCst);
+                let events = collect_step_events(&provider, CancellationToken::new(), None).await;
+                assert!(terminal_error_if_any(&events).is_none(), "{events:?}");
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    NormalizedEvent::Control(ProviderControl::Finished {
+                        retries_used: 5,
+                        ..
+                    })
+                )));
+                let outcomes: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) => {
+                            Some(attempt.outcome.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    outcomes,
+                    [
+                        AttemptOutcome::ConnectFailed,
+                        AttemptOutcome::ConnectFailed,
+                        AttemptOutcome::ConnectFailed,
+                        AttemptOutcome::ConnectFailed,
+                        AttemptOutcome::ConnectFailed,
+                        AttemptOutcome::Complete,
+                    ]
+                );
+                let digests = attempt_digests(&events);
+                assert_eq!(digests.len(), 6);
+                assert!(digests.iter().all(|digest| digest == &digests[0]));
+            }
+            assert_eq!(provider.family.render_calls.load(Ordering::SeqCst), 2);
+            let bodies = server.request_bodies();
+            assert_eq!(bodies.len(), 2);
+            assert_eq!(bodies[0], bodies[1]);
+            let waits = waits.lock().unwrap();
+            assert_eq!(waits.len(), 10);
+            assert_eq!(waits[4], Duration::from_secs(5));
+            assert_eq!(
+                waits[9],
+                Duration::from_secs(5),
+                "backoff resets after success"
             );
         }
     }

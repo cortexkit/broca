@@ -65,6 +65,17 @@ fn capture_known_with_run(frame: &subc_protocol::Frame, name: &str, run: Option<
             "\"updated_at\":\"@UPDATED_AT@\"",
         );
     }
+    // A served history's version is allocated above every earlier one, so it is not stable
+    // across runs; 0 (never served) stays literal.
+    if let Some(version) = answer["history_version"]
+        .as_u64()
+        .filter(|version| *version > 0)
+    {
+        bytes = bytes.replace(
+            &format!("\"history_version\":{version}"),
+            "\"history_version\":\"@HISTORY_VERSION@\"",
+        );
+    }
     if let Some(run) = run {
         bytes = bytes.replace(run, "@RUN_ID@");
     }
@@ -273,7 +284,7 @@ async fn recorded_read_times_and_caller_head_grants_match_serve_goldens() {
             8,
             "owner",
             "session_head.owner.json",
-            vec!["tool_result", "steer", "idle_start"],
+            vec!["tool_result", "turn_system", "steer", "idle_start"],
             true,
             true,
         ),
@@ -281,7 +292,7 @@ async fn recorded_read_times_and_caller_head_grants_match_serve_goldens() {
             9,
             "named",
             "session_head.named.json",
-            vec!["tool_result", "steer"],
+            vec!["tool_result", "turn_system", "steer"],
             false,
             false,
         ),
@@ -297,7 +308,7 @@ async fn recorded_read_times_and_caller_head_grants_match_serve_goldens() {
             11,
             "starter",
             "session_head.starter.json",
-            vec!["tool_result", "steer", "idle_start"],
+            vec!["tool_result", "turn_system", "steer", "idle_start"],
             true,
             false,
         ),
@@ -319,7 +330,11 @@ async fn recorded_read_times_and_caller_head_grants_match_serve_goldens() {
             json!({"since":"r1","steps":1,"unreported_steps":0,"input_tokens":7,"output_tokens":3,
             "by_model":[{"provider":"p","model":"m","steps":1,"unreported_steps":0,"input_tokens":7,"output_tokens":3}]})
         );
-        assert_eq!(answer["incarnation"], answer["lineage_id"]);
+        assert!(answer["incarnation"].is_string());
+        assert!(
+            answer.get("lineage_id").is_none(),
+            "llm-runner 0.8 heads carry no lineage_id"
+        );
         if expected_modes.is_empty() {
             assert!(answer.get("sender").is_none());
         } else {
@@ -428,7 +443,7 @@ async fn planless_head_reports_a_grant_only_to_its_owner() {
         if caller == "owner" {
             assert_eq!(
                 head["sender"],
-                json!({"modes":["tool_result","steer","idle_start"],"interrupt":true,"owner":true})
+                json!({"modes":["tool_result","turn_system","steer","idle_start"],"interrupt":true,"owner":true})
             );
         } else {
             assert!(head.get("sender").is_none());
@@ -514,7 +529,7 @@ async fn ownerless_legacy_head_matches_permissive_real_send_admission() {
     );
     assert_eq!(
         head["sender"],
-        json!({"modes":["tool_result","steer","idle_start"],"interrupt":true,"owner":true})
+        json!({"modes":["tool_result","turn_system","steer","idle_start"],"interrupt":true,"owner":true})
     );
     rig.script.push(&[Step::Text("accepted legacy send")]);
     let send = rig
@@ -587,10 +602,11 @@ async fn retained_head_checkpoint_and_typical_read_cost_through_serve() {
             .await,
     );
     let cold_ms = cold.elapsed().as_secs_f64() * 1000.0;
-    assert_eq!(first["last_ordinal"], 31);
+    assert_eq!(first["last_ordinal"], 32);
     assert_eq!(first["usage"]["steps"], 16);
     let db = broca_store::SqliteStore::open(rig.dir.join("store.db")).unwrap();
-    let lineage = first["lineage_id"].as_str().unwrap();
+    // A framed log serves its lineage as the incarnation.
+    let lineage = first["incarnation"].as_str().unwrap();
     assert_eq!(
         db.read_retained_head(&rig.session, lineage)
             .unwrap()
@@ -700,6 +716,10 @@ async fn reasoning_tokens_are_an_output_breakdown_on_run_and_session_spend() {
     assert_eq!(answer["usage"]["reasoning_tokens"], 7);
     assert_eq!(answer["usage"]["input_tokens"], 16);
     assert_eq!(answer["usage"]["steps"], 2);
+    assert_eq!(
+        answer["sender"]["modes"],
+        json!(["tool_result", "turn_system", "steer", "idle_start"])
+    );
     capture_known_with_run(&head, "session_head.reasoning_usage.json", Some(&run));
     rig.finish().await;
 }

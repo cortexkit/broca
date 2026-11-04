@@ -699,6 +699,8 @@ mod tests {
 
     fn orphan_started(identity: &BindIdentity) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -1256,6 +1258,20 @@ mod tests {
     fn legacy_store_starts_no_reclaimer() {
         let root = Root::new();
         let store = Arc::new(FileWalStore::new(root.path.join("wal")));
+        #[cfg(unix)]
+        {
+            let recording =
+                Arc::new(broca_crash_harness::power_loss::RecordingFs::new(&root.path).unwrap());
+            let trace = Arc::new(broca_crash_harness::io_trace::IoTraceFs::new(
+                &root.path, recording,
+            ));
+            broca_wal::fs_ops::with_fs_ops(trace.clone(), || assert!(spawn(store).is_none()));
+            assert!(
+                trace.attempts().is_empty(),
+                "legacy reclaim must retain master's no-I/O early return"
+            );
+        }
+        #[cfg(not(unix))]
         assert!(spawn(store).is_none());
         assert!(!root.path.join("open-writers").exists());
     }
@@ -1297,8 +1313,13 @@ mod tests {
                 O,
                 O,
                 O,
+                O, // Streaming WAL checks before publishing the successor writer.
                 S,
                 D,
+                O, // Startup replay on the blocking startup thread is now recorded too.
+                O,
+                O,
+                O,
                 D,
                 Change(vec![SetEntry]), // Successor temporary marker.
                 Change(vec![Write]),
@@ -1362,7 +1383,7 @@ mod tests {
                 O,
                 Change(vec![RemoveEntry]), // Predecessor marker unlink.
             ],
-            "all 74 reclaim journal operations must complete in order"
+            "all 79 reclaim journal operations must complete in order"
         );
         fs.assert_all_cuts_covered(&states);
         assert!(states

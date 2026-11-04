@@ -54,7 +54,12 @@ impl OverhaulDb {
                 .query_row(
                     "SELECT indexed_seq,lineage_id FROM session WHERE sid=?1",
                     [&key],
-                    |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)),
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<u64>>(0)?.unwrap_or(0),
+                            r.get::<_, String>(1)?,
+                        ))
+                    },
                 )
                 .optional()?)
         })?;
@@ -153,7 +158,7 @@ impl DatabaseEpisodeReader {
             return Ok(None);
         };
         let encoded = encoded.ok_or_else(|| bad("historical episode continuation missing"))?;
-        let stored = ProjectionContinuation::decode(&encoded)
+        let stored = ProjectionContinuation::decode_for_execution(&encoded)
             .map_err(|_| bad("historical episode continuation unsupported"))?;
         let seed = EpisodeSeed::from_continuation(&stored);
         let matches: bool = tx.query_row("SELECT lineage_id IS ?3 AND frame_off=?4 AND frame_end=?5 AND frame_identity=?6 AND qualified=1 FROM projection_boundary WHERE sid=?1 AND seq=?2", params![key,seq,seed.boundary.lineage_id,seed.boundary.frame_off,seed.boundary.frame_end,seed.boundary.frame_identity], |r| r.get(0))?;
@@ -217,7 +222,8 @@ impl DatabaseEpisodeReader {
         {
             return Err(bad("episode cursor identity mismatch"));
         }
-        let continuation = ProjectionContinuation::decode(&tail).map_err(DbError::SeedFallback)?;
+        let continuation =
+            ProjectionContinuation::decode_for_execution(&tail).map_err(DbError::SeedFallback)?;
         let seed = EpisodeSeed::from_continuation(&continuation);
         let frames = self.read_range(seed.boundary.frame_end, end)?;
         broca_core::replay::replay_seeded_at_validated_boundary(
@@ -287,6 +293,9 @@ impl DatabaseEpisodeReader {
     }
 
     pub fn read_model_page(&self, request: &ModelPageRequest) -> Result<EpisodeModelPage, DbError> {
+        if self.sequence() == 0 {
+            return self.full_model_page(request, None);
+        }
         let key = super::index::sid(&self.session)?;
         let result = self.db.read_snapshot(|tx| {
             let mut snapshot = self.snapshot_in(tx,&key,true)?;
@@ -307,7 +316,9 @@ impl DatabaseEpisodeReader {
         });
         match result {
             Ok(result) => Ok(result),
-            Err(DbError::SeedFallback(reason)) => self.full_model_page(request, reason.reason),
+            Err(DbError::SeedFallback(reason)) => {
+                self.full_model_page(request, Some(reason.reason))
+            }
             Err(error) => Err(error),
         }
     }
@@ -315,7 +326,7 @@ impl DatabaseEpisodeReader {
     fn full_model_page(
         &self,
         request: &ModelPageRequest,
-        reason: &'static str,
+        reason: Option<&'static str>,
     ) -> Result<EpisodeModelPage, DbError> {
         let records = self.complete_read()?;
         let mut page = broca_core::read_session_model_page(
@@ -328,7 +339,7 @@ impl DatabaseEpisodeReader {
         page.lineage_id = Some(self.publication.lineage().to_string());
         Ok(EpisodeModelPage {
             page,
-            fallback: Some(reason),
+            fallback: reason,
         })
     }
 
@@ -337,6 +348,9 @@ impl DatabaseEpisodeReader {
         &self,
         at: u64,
     ) -> Result<Option<(IndexedEpisode, Option<EpisodeSeed>)>, DbError> {
+        if self.sequence() == 0 {
+            return Ok(None);
+        }
         let key = super::index::sid(&self.session)?;
         self.db.read_snapshot(|tx| {
             let lineage: String = tx.query_row("SELECT lineage_id FROM session WHERE sid=?1",[&key],|r|r.get(0))?;
@@ -364,6 +378,7 @@ impl DatabaseEpisodeReader {
 mod tests {
     use super::*;
     use broca_protocol::{ContentBlock, Message, Role};
+    use broca_wal::access_counter::{ReadClass, WalAccessCounter};
     use broca_wal::{Wal, WalRecord};
 
     struct Fixture {
@@ -371,16 +386,27 @@ mod tests {
         db: Arc<OverhaulDb>,
         wal: broca_wal::FileWal,
         bind: BindIdentity,
+        // Fields are dropped in order; remove the directory only after closing its files.
+        _scratch: Scratch,
     }
 
-    impl Drop for Fixture {
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
     fn text(value: &str) -> Message {
         Message::new(Role::User, vec![ContentBlock::Text { text: value.into() }])
+    }
+
+    #[test]
+    fn fixture_cleanup_closes_database_and_wal() {
+        let fixture = Fixture::new(&corpus(0));
+        let root = fixture.root.clone();
+        drop(fixture);
+        assert!(!root.exists(), "fixture left its scratch directory behind");
     }
 
     fn corpus(prefix: usize) -> Vec<WalRecord> {
@@ -445,15 +471,18 @@ mod tests {
                 unreachable!()
             };
             let bind = session.clone();
-            let wal = broca_wal::FileWal::open(root.join("session.wal"))
-                .unwrap()
-                .with_feature_floor(root.join("wal-floor"))
-                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                .unwrap();
+            let wal = broca_wal::FileWal::open_with_recovery(
+                root.join("session.wal"),
+                broca_wal::WalConfig::OVERHAUL,
+                root.join("wal-floor"),
+            )
+            .unwrap()
+            .with_feature_floor(root.join("wal-floor"));
             Self {
                 db: Arc::new(OverhaulDb::open(&root).unwrap()),
                 wal,
                 bind,
+                _scratch: Scratch(root.clone()),
                 root,
             }
         }
@@ -666,6 +695,131 @@ mod tests {
             .0;
         records.splice(at..at, [setup, answer.clone(), answer]);
         records
+    }
+
+    fn modern_compacted_raw_records() -> Vec<WalRecord> {
+        let mut records = with_noop_compaction(corpus(8));
+        records.push(setup(3));
+        if let WalRecord::CompactionMessage { tag_checkpoint, .. } = records.last_mut().unwrap() {
+            *tag_checkpoint = Some(broca_wal::SetupTagCheckpoint {
+                tag_checkpoint: 50,
+                cut: "m4".into(),
+            });
+        }
+        for (n, record) in records.iter_mut().enumerate() {
+            match record {
+                WalRecord::RunStarted {
+                    written_at_ms,
+                    config,
+                    ..
+                } => {
+                    *written_at_ms = Some(1_000 + n as u64);
+                    config.render_tags = true;
+                    config.computed_tags = Some(broca_wal::ComputedTagRules { checkpoint: 0 });
+                    config.frozen_render_config["media"] = serde_json::json!({"images":{"max":4}});
+                }
+                WalRecord::ModelStepFinished { written_at_ms, .. }
+                | WalRecord::SendDelivered { written_at_ms, .. } => {
+                    *written_at_ms = Some(1_000 + n as u64)
+                }
+                _ => {}
+            }
+        }
+        records
+    }
+
+    fn raw_page(fixture: &Fixture, from: Option<u64>) -> super::super::RawPageSnapshot {
+        fixture
+            .db
+            .read_raw_page(
+                &fixture.bind,
+                "episode",
+                LogLocation::Live,
+                &fixture.wal.durable_publication().unwrap(),
+                super::super::RawPageRequest {
+                    from_ordinal: from,
+                    limit: Some(2),
+                    include_tools: true,
+                },
+            )
+            .unwrap()
+    }
+
+    fn assert_raw_full_replay(
+        fixture: &Fixture,
+        actual: &super::super::RawPageSnapshot,
+        from: Option<u64>,
+    ) {
+        let frames = fixture.wal.replay().unwrap();
+        let mut expected = broca_core::read_session_page(
+            &broca_core::StorePageSnapshot::empty(),
+            &frames,
+            from,
+            Some(2),
+        )
+        .unwrap();
+        expected.lineage_id = Some(fixture.wal.durable_publication().unwrap().lineage());
+        assert_eq!(actual.page, expected);
+        let checkpoint = broca_core::AdmissionCheckpointV1::from_frames(&frames).unwrap();
+        assert_eq!(actual.head, checkpoint.head.unwrap());
+        let episode = checkpoint.last_episode.unwrap();
+        let media = actual.head_media.as_ref().unwrap();
+        assert_eq!(media.run_id, episode.run_id);
+        assert_eq!(
+            media.media,
+            episode.config.frozen_render_config.get("media").cloned()
+        );
+    }
+
+    #[test]
+    fn database_compacted_raw_pages_equal_full_replay_at_every_cut() {
+        let records = modern_compacted_raw_records();
+        let mut fixture = Fixture::new(&records);
+        let mut compacted = false;
+        for (cut, record) in records.iter().enumerate() {
+            fixture.append(record);
+            compacted |= matches!(record, WalRecord::CompactionMessage { .. });
+            for from in [None, Some(0), Some(3), Some(8)] {
+                let counter = WalAccessCounter::default();
+                let actual = counter
+                    .operation("compacted raw publication cut")
+                    .run(|| raw_page(&fixture, from));
+                assert_raw_full_replay(&fixture, &actual, from);
+                let op = counter.snapshot().remove(0);
+                if compacted {
+                    assert!(
+                        op.seed_fallbacks.is_empty(),
+                        "cut {cut}: {:?}",
+                        op.seed_fallbacks
+                    );
+                    assert!(
+                        op.reads.iter().all(|r| r.class != ReadClass::Origin),
+                        "cut {cut}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn database_compacted_raw_locators_fail_closed_by_name() {
+        for sql in [
+            "UPDATE source_auth SET frame_identity=zeroblob(32)",
+            "DELETE FROM source_auth",
+            "UPDATE session SET locator_seed=json_set(locator_seed,'$[1].admission.compaction',json('[]'))",
+        ] {
+            let records = modern_compacted_raw_records();
+            let mut fixture = Fixture::new(&records);
+            for record in &records { fixture.append(record); }
+            fixture.db.authoritative_transaction(|tx| { tx.execute_batch(sql)?; Ok(()) }).unwrap();
+            let counter = WalAccessCounter::default();
+            let actual = counter.operation("invalid raw compaction source").run(|| raw_page(&fixture, None));
+            assert_raw_full_replay(&fixture, &actual, None);
+            assert!(!actual.index_validated);
+            let op = counter.snapshot().remove(0);
+            assert_eq!(op.seed_fallbacks, ["raw page requires compaction source hydration"]);
+            assert_eq!(op.reads.iter().filter(|r| r.class == ReadClass::Origin).count(), 1);
+        }
     }
 
     #[test]

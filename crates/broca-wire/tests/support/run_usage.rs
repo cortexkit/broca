@@ -23,7 +23,7 @@ pub fn legacy_bytes(actual: &[u8], golden: &[u8]) -> Vec<u8> {
         .unwrap_or(golden_body);
     if golden_body.usage.is_some_and(|usage| {
         let object: serde_json::Value = serde_json::from_str(usage.get()).unwrap();
-        ["steps", "unreported_steps", "by_model"]
+        ["steps", "unreported_steps", "by_model", "generation"]
             .iter()
             .any(|key| object.get(key).is_some())
     }) {
@@ -37,7 +37,7 @@ pub fn legacy_bytes(actual: &[u8], golden: &[u8]) -> Vec<u8> {
         let fields: std::collections::BTreeMap<&str, &RawValue> =
             serde_json::from_str(usage.get()).unwrap();
         let mut kept = usage.get().to_owned();
-        for key in ["by_model", "steps", "unreported_steps"] {
+        for key in ["by_model", "steps", "unreported_steps", "generation"] {
             if let Some(value) = fields.get(key) {
                 let member = format!("\"{key}\":{}", value.get());
                 let with_comma = format!("{member},");
@@ -84,5 +84,18 @@ mod tests {
         assert_eq!(legacy_bytes(actual, golden), golden);
         let changed = br#"{"state":"completed","usage":{"steps":3,"output_tokens":8,"input_tokens":12,"unexpected":1},"retries_used":4}"#;
         assert_eq!(legacy_bytes(changed, golden), br#"{"state":"completed","usage":{"output_tokens":8,"input_tokens":12,"unexpected":1},"retries_used":4}"#);
+    }
+
+    #[test]
+    fn generation_block_is_a_new_usage_member() {
+        // A pre-generation golden ignores the measured timing block, whose values vary run to
+        // run, while every token count and unrelated byte is still compared.
+        let golden = br#"{"state":"completed","usage":{"input_tokens":3,"output_tokens":2},"retries_used":0}"#;
+        let actual = br#"{"state":"completed","usage":{"input_tokens":3,"output_tokens":2,"generation":[{"model":"m","model_calls":1,"output_tokens":2,"sent_to_last_content_ms":3,"first_to_last_content_ms":0}]},"retries_used":0}"#;
+        assert_eq!(legacy_bytes(actual, golden), golden);
+        let changed = br#"{"state":"completed","usage":{"input_tokens":3,"output_tokens":5,"generation":[]},"retries_used":0}"#;
+        assert_ne!(legacy_bytes(changed, golden), golden);
+        let generation_golden = br#"{"state":"completed","usage":{"generation":[]}}"#;
+        assert_eq!(legacy_bytes(changed, generation_golden), changed);
     }
 }

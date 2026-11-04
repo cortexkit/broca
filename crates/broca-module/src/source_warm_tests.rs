@@ -27,6 +27,7 @@ struct Executor {
     provider: TestProvider,
     costs: broca_core::keep_warm::WarmCosts,
     quota: AtomicBool,
+    warm_configs: Mutex<Vec<RunConfig>>,
 }
 
 struct TestProvider {
@@ -171,6 +172,7 @@ impl RunExecutor for Executor {
         &self,
         job: crate::executor::WarmJob,
     ) -> Result<broca_core::WarmSent, crate::executor::WarmError> {
+        self.warm_configs.lock().unwrap().push(job.config.clone());
         let result =
             crate::executor::send_warm_with_hook(&self.provider, job.base, job.attempt_hook).await;
         assert!(result.is_ok(), "source warm failed: {result:?}");
@@ -246,6 +248,7 @@ impl Fixture {
             },
             costs: broca_core::keep_warm::WarmCosts { warm: 1.0, bust },
             quota: AtomicBool::new(true),
+            warm_configs: Mutex::new(Vec::new()),
         });
         let mut started = crate::move_install::tests::started(&key, "r");
         if let WalRecord::RunStarted {
@@ -737,6 +740,7 @@ async fn source_schedule_rebuilds_from_log_after_shutdown_and_restart_pause() {
     f.start().await;
     f.warm(2).await;
     f.record(WalRecord::RunPaused {
+        account_limit: None,
         run_id: RunId("r".into()),
         reason: broca_protocol::PauseReason::Restart,
         error: None,
@@ -876,6 +880,7 @@ impl Fixture {
 
     async fn pause_resume(&mut self) {
         self.record(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r".into()),
             reason: broca_protocol::PauseReason::Restart,
             error: None,
@@ -971,6 +976,187 @@ async fn source_review_repeated_resumes_do_not_replenish_replayed_rent_budget() 
 }
 
 #[tokio::test(start_paused = true)]
+async fn paused_source_warm_resume_uses_refrozen_auth_and_running_budget() {
+    for reason in [
+        broca_protocol::PauseReason::AuthRequired,
+        broca_protocol::PauseReason::Restart,
+    ] {
+        let f = Fixture::new(true, false, 300_000, 1000.0).await;
+        let mut records = f.records.clone();
+        let refusal = records.pop().unwrap();
+        let completed = records.last().unwrap().clone();
+        if let WalRecord::ModelAttemptFinished {
+            outcome,
+            http_status,
+            ..
+        } = records.last_mut().unwrap()
+        {
+            *outcome = broca_protocol::AttemptOutcome::HttpError;
+            *http_status = Some(401);
+        }
+        let mut state = State::default();
+        for (at, record) in records.iter().enumerate() {
+            state.observe(at, record);
+        }
+        let ttl = f.ttl;
+        let runtime = Runtime {
+            session: f.key.clone(),
+            writer: f.writer.clone(),
+            store: f.store.clone(),
+            executor: f.executor.clone(),
+            declare: Arc::new(move |_| {
+                Some(crate::CacheDeclaration {
+                    ttl_ms: Some(ttl),
+                    ttl_options_ms: vec![],
+                    read_refreshes_ttl: Some(true),
+                    warm: Ok(()),
+                    basis: None,
+                })
+            }),
+            slot: WarmSlot::default(),
+            stopping: CancellationToken::new(),
+            export: None,
+        };
+        for record in [
+            WalRecord::RunPaused {
+                account_limit: None,
+                run_id: RunId("r".into()),
+                reason,
+                error: None,
+                ts_ms: Some(epoch_ms()),
+            },
+            WalRecord::RunAuthRefrozen {
+                ts_ms: Some(epoch_ms()),
+                auth_selection: serde_json::from_value(serde_json::json!({
+                    "credential_id":"source:resolved", "account_ref":"resolved-account"
+                }))
+                .unwrap(),
+            },
+            WalRecord::ResumeStarted {
+                episode: RunId("r".into()),
+                resumed_from_seq: 5,
+                replayed: Default::default(),
+                redone: vec![],
+                indeterminate: vec![],
+            },
+        ] {
+            state.observe(records.len(), &record);
+            records.push(record);
+            assert!(
+                rebuild(&records, &state, &runtime).is_none(),
+                "no old candidate may warm across a refreeze"
+            );
+        }
+        assert!(
+            state.running,
+            "resumed source warming must use the running budget"
+        );
+        assert!(!state.paused);
+        let mut completed = completed;
+        if let WalRecord::ModelAttemptFinished { attempt, .. } = &mut completed {
+            *attempt = 1;
+        }
+        records.push(completed);
+        state.observe(records.len(), &refusal);
+        records.push(refusal);
+        let prefix = rebuild(&records, &state, &runtime).unwrap();
+        let outcome = drive(
+            prefix
+                .warmer
+                .warm(&prefix.request.config, &prefix.request.run_id),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            WarmTick::SentWithCost { .. } | WarmTick::Sent
+        ));
+        let configs = f.executor.warm_configs.lock().unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(
+            configs[0].auth_selection.as_ref().unwrap().credential_id,
+            "source:resolved"
+        );
+        drop(configs);
+        records.extend(f.warms());
+        let after = rebuild(&records, &state, &runtime).unwrap();
+        assert_eq!(after.spent, 1.0);
+        assert_eq!(
+            after.idle_spent, 0.0,
+            "a resumed run must not spend the idle allowance"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_compaction_wait_clears_warmable_prefix_in_fold_and_live_events() {
+    for live in [false, true] {
+        let mut f = Fixture::new(true, false, 300_000, 1000.0).await;
+        f.start().await;
+        f.warm(1).await;
+        assert_eq!(f.executor.provider.bodies.lock().unwrap().len(), 1);
+        if !live {
+            f.stop().await;
+        }
+        f.record(WalRecord::CompactionAnswer {
+            provider: "old-compactor".into(),
+            request_id: "old-wait".into(),
+            cursor: broca_wal::CompactionCursor {
+                lineage_id: f.writer.lineage_id().unwrap().to_string(),
+                after_ordinal: None,
+            },
+            disposition: broca_wal::CompactionDisposition::Wait,
+            rejected: None,
+            wait: Some(broca_wal::CompactionWait {
+                reason: "work".into(),
+                bound_ms: 10,
+            }),
+        })
+        .await;
+        f.record(WalRecord::ResumeStarted {
+            episode: RunId("r".into()),
+            resumed_from_seq: f.writer.durable_head().load(Ordering::Acquire),
+            replayed: Default::default(),
+            redone: vec![],
+            indeterminate: vec![],
+        })
+        .await;
+        f.record(WalRecord::RunFinished {
+            interrupt_reason: None,
+            reason: broca_protocol::RunFinishReason::Interrupted,
+            ts_ms: Some(epoch_ms()),
+            usage: Usage {
+                cached_input_tokens: Some(1000),
+                ..Default::default()
+            },
+            error: None,
+            retries_used: 0,
+        })
+        .await;
+        if !live {
+            f = f.restart().await;
+            f.start().await;
+        }
+        tokio::time::advance(Duration::from_secs(270)).await;
+        f.stopped_or_warmed(1).await;
+        assert_eq!(
+            f.warms().len(),
+            1,
+            "a legacy wait must discard the old warm candidate (live={live})"
+        );
+        assert_eq!(
+            f.executor.provider.bodies.lock().unwrap().len(),
+            1,
+            "no unrecorded warm may be sent after the wait"
+        );
+        assert!(
+            !f.task.as_ref().unwrap().holds_idle.load(Ordering::Acquire),
+            "the candidate must stay cleared after sealing"
+        );
+        f.stop().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn source_review_direct_compaction_message_permanently_stops_the_prefix() {
     let mut f = Fixture::new(true, false, 300_000, 1000.0).await;
     f.start().await;
@@ -996,4 +1182,41 @@ async fn source_review_direct_compaction_message_permanently_stops_the_prefix() 
     f.stopped_or_warmed(1).await;
     assert_eq!(f.warms().len(), 1);
     f.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn compaction_v2_applied_view_clears_warmable_prefix_live_and_after_restart() {
+    for live in [false, true] {
+        let mut fixture = Fixture::new(true, false, 300_000, 1000.0).await;
+        fixture.start().await;
+        fixture.warm(1).await;
+        if !live {
+            fixture.stop().await;
+        }
+        fixture
+            .record(WalRecord::CompactionViewAppliedV2 {
+                step_id: 1,
+                version: 1,
+                checksum: "a".repeat(64),
+            })
+            .await;
+        if !live {
+            fixture = fixture.restart().await;
+            fixture.start().await;
+        }
+        tokio::time::advance(Duration::from_secs(270)).await;
+        fixture.stopped_or_warmed(1).await;
+        assert_eq!(
+            fixture.warms().len(),
+            1,
+            "the old applied-view request must not warm (live={live})"
+        );
+        assert!(!fixture
+            .task
+            .as_ref()
+            .unwrap()
+            .holds_idle
+            .load(Ordering::Acquire));
+        fixture.stop().await;
+    }
 }

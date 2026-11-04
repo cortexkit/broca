@@ -36,6 +36,30 @@ pub const TOOLS_RUNGS: &[&str] = &["on_prefix_rebuild", "immediately"];
 /// together on the applying `RunStarted`.
 pub const SYSTEM_TEXT_RUNGS: &[&str] = &["on_prefix_rebuild", "immediately"];
 
+/// Compaction authority and preset state are session-lived. Refreshes may change
+/// composition, tools and system text, but never the compaction item itself.
+pub fn check_compaction_item(
+    current: Option<&PlanManifest>,
+    next: &serde_json::Value,
+) -> Result<(), crate::Refusal> {
+    let current = current
+        .map(|manifest| {
+            serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
+                .expect("frozen plan is JSON")
+        })
+        .unwrap_or(serde_json::Value::Null);
+    let item = |plan: &serde_json::Value| {
+        plan.get("compaction_item")
+            .filter(|item| !item.is_null())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    if crate::plan_identity(&item(&current))? != crate::plan_identity(&item(next))? {
+        return Err(crate::Refusal::invalid("plan.compaction_item"));
+    }
+    Ok(())
+}
+
 /// Name the first changed surface that cannot detect the requested rebuild point. Removing
 /// all items changes a surface too; testing only nonempty new lists would miss that case.
 pub fn unsupported_surface(
@@ -48,6 +72,10 @@ pub fn unsupported_surface(
     }
     let tools_changed = current.is_none_or(|old| old.tools != next.tools);
     let system_changed = current.is_none_or(|old| old.system_text != next.system_text);
+    // Sender changes affect admission policy, not the model-facing tools or system text.
+    if !tools_changed && !system_changed {
+        return None;
+    }
     Some(if tools_changed || !system_changed {
         "tools"
     } else {
@@ -205,7 +233,8 @@ impl SessionChangeState {
                     rebuild_since_accept = true;
                     flushed_since_accept = true;
                 }
-                WalRecord::CompactionViewApplied { .. } => {
+                WalRecord::CompactionViewApplied { .. }
+                | WalRecord::CompactionViewAppliedV2 { .. } => {
                     rebuild_since_accept = true;
                     state.prefix_manifest = state.current_manifest.clone();
                 }
@@ -309,6 +338,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compaction_provider_preset_and_params_cannot_refresh() {
+        let mut current = test_manifest("old", "c");
+        let plan = serde_json::json!({"compaction_item":{"provider":"ck-mc","preset":"head","params":{"n":1}},"composition":{"generation":1}});
+        current.plan = broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+        for (field, replacement) in [
+            ("provider", serde_json::json!("other")),
+            ("preset", serde_json::json!("worker")),
+            ("params", serde_json::json!({"n":2})),
+        ] {
+            let mut next = plan.clone();
+            next["compaction_item"][field] = replacement;
+            let refusal = check_compaction_item(Some(&current), &next).unwrap_err();
+            assert_eq!(refusal.code(), "invalid_params");
+            assert_eq!(
+                refusal.detail(),
+                serde_json::json!({"field":"plan.compaction_item"})
+            );
+        }
+        let mut removed = plan.clone();
+        removed.as_object_mut().unwrap().remove("compaction_item");
+        assert!(check_compaction_item(Some(&current), &removed).is_err());
+        assert!(check_compaction_item(None, &plan).is_err());
+    }
+
+    #[test]
+    fn compaction_composition_only_refresh_keeps_the_item() {
+        let mut current = test_manifest("old", "c");
+        let plan = serde_json::json!({"compaction_item":{"provider":"ck-mc","preset":"head","params":{"n":1}},"composition":{"generation":1}});
+        current.plan = broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+        let mut next = plan;
+        next["composition"] = serde_json::json!({"generation":2,"other":"changed"});
+        next["compaction_item"]["params"]["n"] = serde_json::json!(1.0);
+        check_compaction_item(Some(&current), &next).unwrap();
+    }
+
     fn accepted(generation: u64, policy: &str, identity: &str) -> WalRecord {
         WalRecord::SessionRefreshAccepted {
             generation,
@@ -317,6 +382,33 @@ mod tests {
             applies_from_next_run: policy == "immediately",
             manifest: Box::new(test_manifest(identity, "c")),
         }
+    }
+
+    #[test]
+    fn sender_only_refresh_never_requires_a_surface_rung() {
+        let current = test_manifest("old", "c");
+        let mut next = current.clone();
+        next.plan = broca_wal::OpaqueJson::from_json_text(
+            r#"{"senders":[{"module":"occipital","idle_start":true}]}"#,
+        )
+        .unwrap();
+        for policy in [
+            "immediately",
+            "on_prefix_rebuild",
+            "on_system_rebuild",
+            "on_history_rebuild",
+        ] {
+            assert_eq!(
+                unsupported_surface(Some(&current), &next, policy),
+                None,
+                "{policy}"
+            );
+        }
+        next.system_text = "changed".into();
+        assert_eq!(
+            unsupported_surface(Some(&current), &next, "on_system_rebuild"),
+            Some("system_text")
+        );
     }
 
     /// A `RunStarted` freezing `identity` (or none), with a fixed mock model so consecutive

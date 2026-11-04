@@ -1,4 +1,7 @@
 use super::*;
+#[cfg(unix)]
+#[path = "retention_recovery_tests.rs"]
+mod recovery_artifacts;
 use broca_core::{ExportIndex, MaterializedStore, RunIndex, RunIndexState};
 use broca_protocol::{RunFinishReason, RunId};
 use broca_wal::Wal;
@@ -188,6 +191,7 @@ async fn archived_expiry_cache_keeps_tombstones_and_newer_lineages_authoritative
             .unwrap();
     }
     let stone = Tombstone {
+        recovery_artifacts: Vec::new(),
         next_tag: None,
         next_notice_seq: None,
         lineage_id: id,
@@ -334,6 +338,7 @@ fn archived_expiry_cache_invalidates_on_publication_conflict_and_corruption() {
 
 fn large_expiry_step() -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -552,13 +557,17 @@ async fn periodic_sweep_repairs_stale_discovery_without_new_wal_bytes() {
 /// past this window instead of waiting for it.
 const RETAINED_SECONDS: u64 = 3600;
 
-struct Rig {
+struct Rig<I = SqliteStore> {
     root: PathBuf,
     key: BindIdentity,
     service: Arc<RetentionService>,
-    store: Arc<SqliteStore>,
+    store: Arc<I>,
     leases: Arc<broca_core::FileLeaseStore>,
 }
+
+#[cfg(any(unix, windows))]
+#[path = "retention_log_guard_tests.rs"]
+mod log_guard;
 
 #[test]
 fn retention_deletion_drops_media_manifest_after_wal_unlink_and_leaves_collection_to_sweep() {
@@ -600,29 +609,39 @@ fn retention_deletion_drops_media_manifest_after_wal_unlink_and_leaves_collectio
 }
 impl Rig {
     #[cfg(any(unix, windows))]
-    fn overhaul() -> Self {
-        let mut rig = Self::new();
+    fn overhaul() -> Rig<broca_store::db::OverhaulDb> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = broca_test_support::scratch_root().join(format!(
+            "module-retention-overhaul-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
         fs::write(
-            rig.root.join(broca_wal::state_format::MARKER_FILENAME),
+            root.join(broca_wal::state_format::MARKER_FILENAME),
             b"broca-state/2\n",
         )
         .unwrap();
+        let key = BindIdentity::new(root.join("project"), "runner", "session");
+        let store = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        let leases = Arc::new(broca_core::FileLeaseStore::new(root.join("leases")));
         let wal = Arc::new(FileWalStore::with_config(
-            rig.root.join("wal"),
+            root.join("wal"),
             broca_wal::WalConfig::OVERHAUL,
         ));
-        let resolver = Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1));
-        rig.service = Arc::new(
-            RetentionService::new(
-                wal,
-                rig.store.clone(),
-                rig.leases.clone(),
-                rig.store.clone(),
-                resolver,
-            )
-            .unwrap(),
+        let service = Arc::new(
+            RetentionService::without_usage_export(wal, store.clone(), leases.clone()).unwrap(),
         );
-        rig
+        for name in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
+            assert!(!root.join(name).exists());
+        }
+        Rig {
+            root,
+            key,
+            service,
+            store,
+            leases,
+        }
     }
 
     fn new() -> Self {
@@ -650,6 +669,9 @@ impl Rig {
             leases,
         }
     }
+}
+
+impl<I> Rig<I> {
     fn seed(&self, seconds: u64, start: u64, finish: Option<u64>) -> String {
         self.seed_run("r1", seconds, start, finish)
     }
@@ -668,6 +690,9 @@ impl Rig {
         self.service.remember_session(&self.key).unwrap();
         wal.lineage_id().unwrap().to_string()
     }
+}
+
+impl Rig {
     fn registry(&self, index: Option<Arc<dyn RunIndex>>) -> crate::registry::LineageRegistry {
         self.registry_with_reply(index, "done".into())
     }
@@ -679,7 +704,7 @@ impl Rig {
         let executor = Arc::new(RealExecutor {
             reply,
             wal: self.service.wal.clone(),
-            store: self.store.clone(),
+            store: Some(self.store.clone()),
         });
         let opener = if self.service.wal.wal_config().is_overhaul() {
             crate::opener::DefaultOpener::with_file_leases(
@@ -711,6 +736,35 @@ impl Rig {
     }
 }
 
+impl Rig<broca_store::db::OverhaulDb> {
+    fn registry(&self, index: Option<Arc<dyn RunIndex>>) -> crate::registry::LineageRegistry {
+        let executor = Arc::new(RealExecutor {
+            reply: "done".into(),
+            wal: self.service.wal.clone(),
+            store: None,
+        });
+        let mut opener = crate::opener::DefaultOpener::with_file_leases(
+            self.root.join("leases"),
+            self.service.wal.clone(),
+            executor,
+        )
+        .with_lease_domain(broca_core::lease::WalLeaseDomain::new(
+            self.root.join("leases"),
+        ))
+        .unwrap();
+        if let Some(index) = index {
+            opener = opener.with_run_index(index);
+        }
+        let registry = crate::registry::LineageRegistry::new_with_reader(
+            Arc::new(opener),
+            self.service.wal.clone(),
+            None,
+        );
+        registry.set_retention_service(self.service.clone());
+        registry
+    }
+}
+
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn relocation_incomplete_preflight_never_expires_or_completes_deletion() {
@@ -731,6 +785,7 @@ async fn relocation_incomplete_preflight_never_expires_or_completes_deletion() {
         .write_tombstone(
             &rig.key,
             &Tombstone {
+                recovery_artifacts: Vec::new(),
                 lineage_id: id.clone(),
                 expired_at_ms: 1,
                 seq: 1,
@@ -797,7 +852,7 @@ async fn legacy_same_inode_conflicts_keep_the_existing_retention_error_class() {
     assert_eq!(rig.service.relocation_incomplete_skips(), 0);
     assert!(source.exists() && alias.exists());
 }
-impl Drop for Rig {
+impl<I> Drop for Rig<I> {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
@@ -836,7 +891,7 @@ async fn phase_one_overhaul_retention_defers_expiry_and_deletion() {
 
 #[cfg(all(unix, feature = "test-clock"))]
 async fn due_overhaul_writer(
-    rig: &Rig,
+    rig: &Rig<broca_store::db::OverhaulDb>,
     fs: Arc<dyn broca_wal::fs_ops::FsOps>,
 ) -> broca_core::WalHandle {
     let lease = rig.service.lease(&rig.key).unwrap();
@@ -1113,7 +1168,7 @@ fn request(key: &BindIdentity, run: &str) -> broca_core::RunRequest {
 struct RealExecutor {
     reply: String,
     wal: Arc<FileWalStore>,
-    store: Arc<SqliteStore>,
+    store: Option<Arc<SqliteStore>>,
 }
 #[async_trait::async_trait]
 impl crate::executor::RunExecutor for RealExecutor {
@@ -1153,7 +1208,9 @@ impl crate::executor::RunExecutor for RealExecutor {
             &broca_core::StubToolPlane::new(),
             &broca_core::AllowAll,
             self.wal.as_ref(),
-            Some(self.store.clone()),
+            self.store
+                .clone()
+                .map(|store| store as Arc<dyn broca_core::SessionStore>),
             job.control,
             &out,
             job.on_admitted,
@@ -1200,6 +1257,7 @@ fn maintenance_is_not_activity_and_nonterminal_runs_never_expire() {
     let paused = framed(vec![
         started(&rig.key, "r1", Some(1), 100),
         WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r1".into()),
             ts_ms: Some(200),
             reason: broca_protocol::PauseReason::AuthRequired,
@@ -1997,6 +2055,7 @@ async fn status_of_expired_large_session_refuses_in_the_status_opener() {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -2051,6 +2110,7 @@ fn sidecar_removal_failure_leaves_completion_retryable() {
         .with_extension("session");
     let temp = side.with_extension("session.tmp");
     let stone = Tombstone {
+        recovery_artifacts: Vec::new(),
         next_tag: None,
         next_notice_seq: None,
         lineage_id: id.clone(),
@@ -2088,6 +2148,7 @@ fn matching_tombstone_precedes_the_clock_and_latest_sequence_wins() {
     let rig = Rig::new();
     let id = rig.seed(30, 100, Some(200));
     let stone = Tombstone {
+        recovery_artifacts: Vec::new(),
         next_tag: None,
         next_notice_seq: None,
         lineage_id: id.clone(),
@@ -2107,6 +2168,7 @@ fn matching_tombstone_precedes_the_clock_and_latest_sequence_wins() {
         .write_tombstone(
             &rig.key,
             &Tombstone {
+                recovery_artifacts: Vec::new(),
                 next_tag: None,
                 next_notice_seq: None,
                 lineage_id: "a".repeat(32),
@@ -2163,6 +2225,7 @@ fn unfinished_deletion_resumes_each_disk_boundary_and_never_moves_a_new_lineage(
         let rig = Rig::new();
         let id = rig.seed(1, 100, Some(200));
         let stone = Tombstone {
+            recovery_artifacts: Vec::new(),
             next_tag: None,
             next_notice_seq: None,
             lineage_id: id.clone(),
@@ -2829,6 +2892,7 @@ impl crate::executor::RunExecutor for QuotaRefusalExecutor {
             .await;
         self.observed.send(tick).await.unwrap();
         job.writer.record(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r1".into()),
             reason: broca_protocol::PauseReason::AuthRequired,
             error: None,
@@ -3143,6 +3207,7 @@ async fn expiry_frees_cached_sender_and_ownership_for_the_next_lineage() {
         .write_tombstone(
             &rig.key,
             &Tombstone {
+                recovery_artifacts: Vec::new(),
                 next_tag: None,
                 next_notice_seq: None,
                 lineage_id: id,
@@ -3256,6 +3321,7 @@ fn seed_owed_question_with_scope_at(
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -3455,6 +3521,7 @@ fn interrupted_retention_deletion_exports_owed_identity_without_restoring_wal() 
     let _lease = rig.service.lease(&rig.key).unwrap();
     rig.service.rederive(&rig.key).unwrap();
     let stone = Tombstone {
+        recovery_artifacts: Vec::new(),
         next_tag: None,
         next_notice_seq: None,
         lineage_id: lineage.clone(),
@@ -4421,6 +4488,7 @@ async fn assert_tight_crash_recovery(open_batch: bool) {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -4725,6 +4793,7 @@ fn readable_record_first_legacy_deletion_accepts_live_and_moved_layouts() {
         );
         if moved {
             let stone = Tombstone {
+                recovery_artifacts: Vec::new(),
                 next_tag: None,
                 next_notice_seq: None,
                 lineage_id: id.clone(),
@@ -5027,6 +5096,7 @@ async fn missing_materialized_history_is_not_known_empty_ownership() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -5091,6 +5161,7 @@ async fn zero_record_wal_does_not_hide_materialized_ownership_history() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -5162,6 +5233,7 @@ async fn append_repairs_inferred_prior_terminal_before_refusing_new_admission_at
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -5301,6 +5373,12 @@ async fn cold_forever_status_uses_bounded_wal_without_opening_actor() {
         fn wal_present(&self, key: &BindIdentity) -> Option<bool> {
             self.inner.wal_present(key)
         }
+        fn wal_present_checked(
+            &self,
+            key: &BindIdentity,
+        ) -> Result<Option<bool>, broca_wal::WalError> {
+            self.inner.wal_present_checked(key)
+        }
     }
     let rig = Rig::new();
     let mut wal = rig.service.wal.open(&rig.key).unwrap();
@@ -5309,6 +5387,7 @@ async fn cold_forever_status_uses_bounded_wal_without_opening_actor() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -5362,7 +5441,7 @@ async fn cold_forever_status_uses_bounded_wal_without_opening_actor() {
             Arc::new(RealExecutor {
                 reply: "done".into(),
                 wal: rig.service.wal.clone(),
-                store: rig.store.clone(),
+                store: Some(rig.store.clone()),
             }),
         )
         .with_run_index(rig.store.clone())
@@ -5662,6 +5741,7 @@ fn deletion_recovery_isolates_persistent_bad_tombstone_and_evicts_good_keys() {
             .write_tombstone(
                 &rig.key,
                 &Tombstone {
+                    recovery_artifacts: Vec::new(),
                     next_tag: None,
                     next_notice_seq: None,
                     lineage_id: id.clone(),
@@ -5922,4 +6002,144 @@ async fn default_raw_writer_placement_also_enqueues_retention() {
         .lookup_live_retention_lineage(&rig.key)
         .unwrap()
         .is_some());
+}
+
+#[tokio::test]
+async fn missing_expired_log_keeps_expired_answer_with_history_guard() {
+    let rig = Rig::new();
+    rig.seed(1, 1000, Some(1000));
+    let lease = rig.service.lease(&rig.key).unwrap();
+    rig.service.delete_expired(&rig.key, 2001).unwrap().unwrap();
+    drop(lease);
+    let registry = rig.registry(None);
+    registry.set_session_address_inventory(rig.store.clone());
+    let evidence = rig.store.session_log_evidence(&rig.key).unwrap();
+    assert!(evidence.content && evidence.removed);
+    assert!(matches!(
+        registry.route_read(&rig.key, None, Some(20)).await,
+        Err(crate::registry::OpenError::Expired { .. })
+    ));
+    let (sink, _received) = tokio::sync::mpsc::channel(16);
+    assert!(matches!(
+        registry
+            .route_subscribe(&rig.key, crate::fanout::FromCursor::Start, sink)
+            .await,
+        Err(crate::registry::OpenError::Expired { .. })
+    ));
+    assert!(!rig.service.wal.wal_path(&rig.key).exists());
+    assert!(!rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+}
+
+#[tokio::test]
+async fn interrupted_expiry_removal_remains_recoverable_with_history_guard() {
+    let rig = Rig::new();
+    let id = rig.seed(1, 100, Some(200));
+    let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let read = rig.service.read_path(&path).unwrap();
+    let (row, runs) = derive(
+        &rig.key,
+        id.clone(),
+        frames(&read),
+        fs::metadata(&path).unwrap().len(),
+        None,
+    )
+    .unwrap();
+    rig.service.index.upsert(&row, &runs).unwrap();
+    rig.service
+        .write_tombstone(
+            &rig.key,
+            &Tombstone {
+                lineage_id: id.clone(),
+                expired_at_ms: 1200,
+                seq: 1,
+                completed_at_ms: None,
+                next_tag: None,
+                next_notice_seq: None,
+                recovery_artifacts: Vec::new(),
+            },
+        )
+        .unwrap();
+    fs::rename(&path, rig.service.deleting(&rig.key, &id)).unwrap();
+    assert!(rig.store.session_log_evidence(&rig.key).unwrap().removed);
+    let registry = rig.registry(None);
+    registry.set_session_address_inventory(rig.store.clone());
+    assert!(registry.check_session_log(&rig.key).await.is_ok());
+    assert!(matches!(
+        registry.route_read(&rig.key, None, Some(20)).await,
+        Err(crate::registry::OpenError::Expired { .. })
+    ));
+}
+
+#[tokio::test]
+async fn expired_history_allows_a_fresh_subscriber_lineage() {
+    let rig = Rig::new();
+    let old = rig.seed(1, 100, Some(200));
+    let lease = rig.service.lease(&rig.key).unwrap();
+    rig.service.delete_expired(&rig.key, 1200).unwrap().unwrap();
+    drop(lease);
+    let wal = rig
+        .service
+        .wal
+        .open_with_retention(&rig.key, Some(RETAINED_SECONDS))
+        .unwrap();
+    let fresh = wal.lineage_id().unwrap().to_string();
+    assert_ne!(old, fresh);
+    drop(wal);
+    let registry = rig.registry(None);
+    registry.set_session_address_inventory(rig.store.clone());
+    assert!(registry.check_session_log(&rig.key).await.is_ok());
+    let page = registry.route_read(&rig.key, None, Some(20)).await.unwrap();
+    assert_eq!(page.lineage_id.unwrap().to_string(), fresh);
+    assert!(page.messages.is_empty());
+    let now = rig.service.clock.now_ms();
+    assert_eq!(
+        rig.seed_run("fresh", RETAINED_SECONDS, now, Some(now)),
+        fresh
+    );
+    assert!(registry.route_read(&rig.key, None, Some(20)).await.is_ok());
+}
+
+#[tokio::test]
+async fn older_expiry_cannot_mask_an_unidentified_new_run_missing_log() {
+    let rig = Rig::new();
+    rig.seed(1, 1000, Some(1000));
+    let lease = rig.service.lease(&rig.key).unwrap();
+    rig.service.delete_expired(&rig.key, 2001).unwrap().unwrap();
+    drop(lease);
+    broca_core::RunIndex::index_run_active(
+        rig.store.as_ref(),
+        &broca_core::RunIndexRow {
+            run_id: "new-after-expiry".into(),
+            session: rig.key.clone(),
+            submission_id: None,
+            request_identity_digest: None,
+            state: broca_core::RunIndexState::Active,
+            usage: None,
+            final_step_finish_reason: None,
+            retries_used: 0,
+            title: None,
+            withdrawals_owed: false,
+        },
+    )
+    .unwrap();
+    let registry = rig.registry(None);
+    registry.set_session_address_inventory(rig.store.clone());
+    assert!(matches!(
+        registry.check_session_log(&rig.key).await,
+        Err(crate::registry::OpenError::SessionLogMissing { .. })
+    ));
+    assert!(matches!(
+        registry.check_expired(&rig.key, Some("r1")).await,
+        Err(crate::registry::OpenError::Expired {
+            expired_at_ms: 2000
+        })
+    ));
+    let read = registry.route_read(&rig.key, None, Some(20)).await;
+    assert!(
+        matches!(
+            &read,
+            Err(crate::registry::OpenError::SessionLogMissing { .. })
+        ),
+        "{read:?}"
+    );
 }

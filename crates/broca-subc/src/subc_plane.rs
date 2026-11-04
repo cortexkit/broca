@@ -18,7 +18,7 @@
 //! per-route in-flight to the window via a per-route semaphore (permit held from
 //! send to terminal). A Serial provider therefore serializes instead of erroring.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -46,10 +46,10 @@ use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::{
-    is_module_availability_refusal, retry_route_open, retry_route_open_waiting_out_outage,
-    retry_route_open_with_scope_hold, route_failure_is_known_dead, ConnError, GateTarget,
-    ModuleGate, OutageWait, RouteHandle, RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection,
-    ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL, ROUTE_OPEN_RETRY_MAX_INTERVAL,
+    retry_route_open, retry_route_open_waiting_out_outage, retry_route_open_with_scope_hold,
+    route_failure_is_known_dead, ConnError, GateTarget, ModuleGate, OutageWait, RouteHandle,
+    RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection, ROUTE_OPEN_RETRY_DEADLINE,
+    ROUTE_OPEN_RETRY_INTERVAL, ROUTE_OPEN_RETRY_MAX_INTERVAL,
 };
 use crate::scope_describe::{DescribedScope, ScopeDescriber};
 use crate::tool_deadline::tool_reply_deadline;
@@ -417,6 +417,7 @@ trait ToolPlaneConnection: Send + Sync {
         scope: Option<&ScopeSelector>,
         _tool_result_v1: bool,
         _provider_held_installed: bool,
+        _call_keepalive: bool,
     ) -> Result<RouteHandle, ConnError> {
         self.route_open(module_id, identity, scope).await
     }
@@ -445,7 +446,7 @@ trait ToolPlaneConnection: Send + Sync {
         &self,
         _route: &RouteHandle,
         _call: &ToolCall,
-        _deadline: Duration,
+        _deadline: crate::connection::ToolReplyDeadline,
         _preset: Option<&str>,
         _args: &ApprovedArgs,
         _schema_pin: Option<&str>,
@@ -463,7 +464,7 @@ trait ToolPlaneConnection: Send + Sync {
         &self,
         route: &RouteHandle,
         call: &ToolCall,
-        deadline: Duration,
+        deadline: crate::connection::ToolReplyDeadline,
         preset: Option<&str>,
         _call_key: Option<&str>,
         schema_pin: Option<&str>,
@@ -484,7 +485,7 @@ trait ToolPlaneConnection: Send + Sync {
             &call.tool_name,
             &call.input,
             Some(&call.tool_call_id.0),
-            deadline,
+            deadline.duration,
             preset,
         )
         .await
@@ -521,6 +522,7 @@ impl ToolPlaneConnection for SubcConnection {
         scope: Option<&ScopeSelector>,
         tool_result_v1: bool,
         provider_held_installed: bool,
+        call_keepalive: bool,
     ) -> Result<RouteHandle, ConnError> {
         self.route_open_dispatch_single_attempt(
             module_id,
@@ -528,6 +530,7 @@ impl ToolPlaneConnection for SubcConnection {
             scope,
             tool_result_v1,
             provider_held_installed,
+            call_keepalive,
         )
         .await
     }
@@ -536,7 +539,7 @@ impl ToolPlaneConnection for SubcConnection {
         &self,
         route: &RouteHandle,
         call: &ToolCall,
-        deadline: Duration,
+        deadline: crate::connection::ToolReplyDeadline,
         preset: Option<&str>,
         call_key: Option<&str>,
         schema_pin: Option<&str>,
@@ -555,7 +558,8 @@ impl ToolPlaneConnection for SubcConnection {
             &call.tool_name,
             &args,
             Some(&call.tool_call_id.0),
-            deadline,
+            deadline.duration,
+            deadline.declared,
             preset,
             call_key,
             schema_pin,
@@ -583,7 +587,7 @@ impl ToolPlaneConnection for SubcConnection {
         &self,
         route: &RouteHandle,
         call: &ToolCall,
-        deadline: Duration,
+        deadline: crate::connection::ToolReplyDeadline,
         preset: Option<&str>,
         args: &ApprovedArgs,
         schema_pin: Option<&str>,
@@ -593,7 +597,8 @@ impl ToolPlaneConnection for SubcConnection {
             &call.tool_name,
             &args.bytes,
             Some(&call.tool_call_id.0),
-            deadline,
+            deadline.duration,
+            deadline.declared,
             preset,
             Some(&args.key),
             schema_pin,
@@ -705,6 +710,11 @@ pub struct SubcToolPlane {
     closer: Arc<RouteCloser>,
     owns_closer: bool,
     default_module_id: Option<String>,
+    /// Private routing for a single Direct carrier; never stored in the durable conversation identity.
+    direct_carrier_scope: Option<ScopeSelector>,
+    /// Standalone callers select one provider's preset without changing daemon plan admission.
+    direct_tool_item: Option<broca_fetch_plan::plan::Item>,
+    direct_schema_pins: Mutex<BTreeMap<String, broca_core::tool_plane::DispatchSchemaPin>>,
     routes: Mutex<HashMap<RouteKey, RouteState>>,
     batch_routes: Mutex<BatchRouteMap>,
     batch_presets: Mutex<HashMap<BatchRouteKey, ToolManifest>>,
@@ -766,12 +776,13 @@ impl Drop for SubcToolPlane {
     }
 }
 
-/// What the batch's frozen plan declared about one provider: whether it serves the `content/v1`
-/// result body, and whether it may settle a call after its reply. Read from the session's
+/// What the batch's frozen plan declared about one provider: result formats, keepalives,
+/// and whether it may settle a call after its reply. Read from the session's
 /// admitted plan alone, never from a live catalog or caller-declared tools, so a provider whose
 /// catalog changed after admission cannot change how a resumed run reads a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrozenContract {
+    pub call_keepalive: bool,
     pub content_v1: bool,
     pub tool_result_v1: bool,
     pub late_results: bool,
@@ -810,6 +821,9 @@ impl SubcToolPlane {
         };
         let declarations = manifest.provider_declarations(module);
         FrozenContract {
+            call_keepalive: declarations
+                .and_then(|declarations| declarations.call_keepalive)
+                .unwrap_or(false),
             late_results: declarations
                 .and_then(|declarations| declarations.late_results)
                 .unwrap_or(false),
@@ -873,6 +887,10 @@ impl SubcToolPlane {
                 .ok()
             });
         let late_results = self.frozen_contract(ctx, module).late_results;
+        let deadline = crate::connection::ToolReplyDeadline {
+            duration: deadline,
+            declared: self.declared_reply(ctx, module, call).is_some(),
+        };
         let plain_key = key.filter(|_| {
             self.held_reply_declared() && late_results && self.conn.consumer_module_id().is_some()
         });
@@ -957,7 +975,38 @@ impl SubcToolPlane {
         Self::with_connection(Arc::new(conn), module_id)
     }
 
+    /// Route a standalone Direct caller's tool calls under an owner's carrier grant.
+    /// The selector (including its private proof) lives only in this plane. Constructing a
+    /// separate plane keeps its cached routes from mixing with ordinary unscoped routes.
+    pub fn new_with_direct_carrier_scope(
+        conn: SubcConnection,
+        module_id: impl Into<String>,
+        selector: ScopeSelector,
+    ) -> Self {
+        let mut plane = Self::new(conn, module_id);
+        plane.direct_carrier_scope = Some(selector);
+        plane
+    }
+
+    /// Select a standalone caller's default provider preset. Other providers keep their own
+    /// frozen plan presets; the selection never becomes a process-wide default.
+    pub fn with_direct_tool_preset(mut self, preset: impl Into<String>) -> Self {
+        self.direct_schema_pins.get_mut().unwrap().clear();
+        self.direct_tool_item =
+            self.default_module_id
+                .as_ref()
+                .map(|provider| broca_fetch_plan::plan::Item {
+                    provider: provider.clone(),
+                    preset: Some(preset.into()),
+                    params: Default::default(),
+                    optional: false,
+                    output_refs: false,
+                });
+        self
+    }
+
     fn with_connection(conn: Arc<dyn ToolPlaneConnection>, module_id: impl Into<String>) -> Self {
+        std::sync::LazyLock::force(&crate::tool_result_diagnostics::TOOL_RESULT_JSON_DUMPS);
         let module_id = module_id.into();
         let default_module_id = (!module_id.trim().is_empty()).then_some(module_id);
         let shared = conn.shared_route_closer();
@@ -971,6 +1020,9 @@ impl SubcToolPlane {
             owns_closer,
             conn,
             default_module_id,
+            direct_carrier_scope: None,
+            direct_tool_item: None,
+            direct_schema_pins: Mutex::new(BTreeMap::new()),
             routes: Mutex::new(HashMap::new()),
             batch_routes: Mutex::new(HashMap::new()),
             batch_presets: Mutex::new(HashMap::new()),
@@ -1049,6 +1101,12 @@ impl SubcToolPlane {
             .unwrap()
             .get(&Self::batch_route_key(ctx))
             .and_then(|manifest| manifest.provider_preset(module_id).map(str::to_owned))
+            .or_else(|| {
+                self.direct_tool_item
+                    .as_ref()
+                    .filter(|item| item.provider == module_id)
+                    .and_then(|item| item.preset.clone())
+            })
     }
 
     /// Override only this runner plane's wait in the test process, not the remote daemon.
@@ -1071,25 +1129,36 @@ impl SubcToolPlane {
         }
     }
 
-    fn reply_deadline(&self, ctx: &BatchCtx, module_id: &str, call: &ToolCall) -> Duration {
+    fn declared_reply(
+        &self,
+        ctx: &BatchCtx,
+        module_id: &str,
+        call: &ToolCall,
+    ) -> Option<cortexkit_role_tool_provider::catalog::Reply> {
         let manifests = self.batch_presets.lock().unwrap();
         // A deadline the frozen fetch plan's provider declared wins; otherwise the one the caller
         // declared on the tool when it sent it. Both go through the role's deadline arithmetic,
         // which never lowers the runner's fallback and is never lowered by it.
-        let reply = manifests
+        manifests
             .get(&Self::batch_route_key(ctx))
             .and_then(|manifest| {
                 manifest
                     .provider_reply(module_id, &call.tool_name)
                     .cloned()
                     .or_else(|| manifest.declared_reply(&call.tool_name))
-            });
-        if let Some(reply) = reply {
+            })
+    }
+
+    fn reply_deadline(&self, ctx: &BatchCtx, module_id: &str, call: &ToolCall) -> Duration {
+        let reply = self.declared_reply(ctx, module_id, call);
+        let keepalive = self.frozen_contract(ctx, module_id).call_keepalive;
+        if reply.is_some() || keepalive {
             return Duration::from_millis(
-                cortexkit_role_tool_provider::catalog::reply_deadline_ms(
-                    Some(&reply),
+                cortexkit_role_tool_provider::catalog::reply_deadline_ms_with_keepalive(
+                    reply.as_ref(),
                     &call.input,
                     self.reply_fallback_ms(),
+                    keepalive,
                 ),
             );
         }
@@ -1211,6 +1280,46 @@ impl SubcToolPlane {
                 _ = sleep(warm_bind_backoff(attempt)) => {}
             }
         }
+    }
+
+    /// Discover a standalone preset's tools on its tool route. Without a preset, preserve
+    /// registration-based discovery, which does not require a provider catalog RPC.
+    pub async fn tools_from_catalog_for_bind(
+        &self,
+        bind: &BindIdentity,
+        bind_timeout: Duration,
+    ) -> Result<Vec<broca_protocol::request::Tool>, ToolPlaneError> {
+        let Some(item) = &self.direct_tool_item else {
+            return self.tools_from_catalog().await;
+        };
+        self.warm_bind(bind, bind_timeout).await?;
+        let (route, _) = self
+            .ensure_route(bind, None, &item.provider, &ToolOpenGuard::default())
+            .await?;
+        let request = broca_fetch_plan::admit::tool_catalog_request(Some(item));
+        let arguments = serde_json::to_value(request)
+            .map_err(|error| ToolPlaneError::Unavailable(error.to_string()))?;
+        let answer = self
+            .conn
+            .tool_call(
+                &route,
+                broca_fetch_plan::CATALOG_OP,
+                &arguments,
+                None,
+                broca_fetch_plan::ADMISSION_DEADLINE,
+                item.preset.as_deref(),
+            )
+            .await
+            .map_err(conn_to_plane)?;
+        let catalog = broca_fetch_plan::admit::decode_tool_catalog(&item.provider, answer)
+            .map_err(|error| {
+                ToolPlaneError::Unavailable(format!(
+                    "read {} tool.catalog: {error:?}",
+                    item.provider
+                ))
+            })?;
+        *self.direct_schema_pins.lock().unwrap() = catalog.schema_pins;
+        Ok(catalog.tools)
     }
 
     /// Build the loop's tool set from what the target module ACTUALLY registers in
@@ -1552,6 +1661,7 @@ impl SubcToolPlane {
                 guard,
                 patience,
                 self.frozen_contract(ctx, module_id).tool_result_v1,
+                self.frozen_contract(ctx, module_id).call_keepalive,
             )
             .await
             .map_err(|error| map_tool_open_refusal(error, module_id))
@@ -1659,9 +1769,17 @@ impl SubcToolPlane {
                         raw.clone(),
                     )
                     .map_err(|error| error.to_string())
-                    .and_then(|reply| {
-                        cortexkit_role_tool_provider::result::validate(&reply)
-                            .map_err(|error| error.to_string())?;
+                    .and_then(|mut reply| {
+                        if reply.held().is_some() {
+                            cortexkit_role_llm_runner::tool_result_limit::enforce(&mut reply);
+                        }
+                        if reply.held().is_some()
+                            || cortexkit_role_tool_provider::result::model_visible_bytes(&reply)
+                                <= cortexkit_role_tool_provider::result::MAX_MODEL_VISIBLE_BYTES
+                        {
+                            cortexkit_role_tool_provider::result::validate(&reply)
+                                .map_err(|error| error.to_string())?;
+                        }
                         Ok(reply)
                     })
                 });
@@ -1768,13 +1886,24 @@ impl SubcToolPlane {
                             )
                         });
                     let captures = if ctx.media_capture.is_some()
-                        && decoded.as_ref().is_some_and(Result::is_ok)
-                    {
+                        && decoded.as_ref().is_some_and(|reply| {
+                            reply.as_ref().is_ok_and(|reply| {
+                                cortexkit_role_tool_provider::result::model_visible_bytes(reply)
+                                    <= cortexkit_role_tool_provider::result::MAX_MODEL_VISIBLE_BYTES
+                            })
+                        }) {
                         tool_capture::content_v1_captures(&mut result, &raw)
                     } else {
                         Vec::new()
                     };
                     (result, captures)
+                } else if let Some(error) =
+                    cortexkit_role_llm_runner::tool_result_limit::legacy_size_error(&raw)
+                {
+                    (
+                        crate::content_v1::size_error_result(&call.tool_call_id, error),
+                        Vec::new(),
+                    )
                 } else if ctx.media_capture.is_some() {
                     map_call_tool_result(&call.tool_call_id, &raw)
                 } else {
@@ -1784,6 +1913,13 @@ impl SubcToolPlane {
                     )
                 };
                 let result = tool_capture::capture(ctx, result, captures).await;
+                crate::tool_result_diagnostics::observe_inline_result(
+                    ctx,
+                    call,
+                    module_id,
+                    key.map(|key| key.call_key),
+                    &result,
+                );
                 // Build the fence copy before taking the process-wide guard. Tool payloads can be
                 // large, while the critical section only needs to update the bounded maps.
                 let fenced_result = result.clone();
@@ -1811,6 +1947,20 @@ impl SubcToolPlane {
                     self.remove_batch_call_route(ctx, &call.tool_call_id);
                     let _ = self.invalidate_route_for_module(&ctx.bind, scope, module_id, sent_on);
                 }
+                if let Some(output) =
+                    crate::content_v1::oversized_refusal(msg.code(), msg.message())
+                {
+                    let result = ToolResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        output,
+                        is_error: true,
+                    };
+                    self.fence
+                        .lock()
+                        .unwrap()
+                        .insert(&ctx.batch_id, fence_key, result.clone());
+                    return DispatchResult::Completed(result);
+                }
                 // `module_reloading` here answers the one re-send after a re-open: the module
                 // began draining again. The protocol refuses it before the request reaches the
                 // tool, so nothing was sent, and the call is reported exactly like a module that
@@ -1835,9 +1985,10 @@ impl SubcToolPlane {
                 // it does not authorize a retry after a provider received the call. Only a
                 // route.open refusal, where nothing was sent, is held and retried. A test
                 // (`a_provider_scope_not_synced_refusal_is_recorded_and_never_resent`) pins this.
+                let output = ToolOutput::error(format!("tool/route rejected: {msg}"));
                 let result = ToolResult {
                     tool_call_id: call.tool_call_id.clone(),
-                    output: ToolOutput::error(format!("tool/route rejected: {msg}")),
+                    output,
                     is_error: true,
                 };
                 self.fence
@@ -1928,6 +2079,47 @@ impl SubcToolPlane {
             reason: reason.to_owned(),
             sent: true,
         })
+    }
+
+    async fn direct_carrier_selector(&self) -> Result<Option<ScopeSelector>, RouteEnsureError> {
+        let Some(selector) = &self.direct_carrier_scope else {
+            return Ok(None);
+        };
+        let refused = |code: &str, detail: &str| {
+            RouteEnsureError::Plane(ToolPlaneError::ScopeRefused {
+                code: code.into(),
+                detail: detail.into(),
+            })
+        };
+        if self.conn.consumer_module_id().is_some() {
+            return Err(refused(
+                SCOPE_UNSUPPORTED,
+                "a private carrier selector requires a Direct connection",
+            ));
+        }
+        if selector.bind_proof.is_none() {
+            return Err(refused(
+                subc_protocol::error_codes::SCOPE_BIND_PROOF_REQUIRED,
+                "a Direct carrier must supply its private bind proof",
+            ));
+        }
+        let capabilities = self.conn.server_capabilities().await.map_err(|_| {
+            refused(
+                SCOPE_UNVERIFIABLE,
+                "could not read the daemon's scope capabilities",
+            )
+        })?;
+        if !capabilities.iter().any(|cap| cap == CAP_SCOPES_V1)
+            || !capabilities
+                .iter()
+                .any(|cap| cap == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1)
+        {
+            return Err(refused(
+                SCOPE_UNSUPPORTED,
+                "the daemon must advertise scopes/v1 and scope-bind-proof/v1 for a Direct carrier",
+            ));
+        }
+        Ok(Some(selector.clone()))
     }
 
     /// The selector a scoped route opens under, after checking the daemon admits scoped routes
@@ -2096,7 +2288,8 @@ impl SubcToolPlane {
         module_id: &str,
         guard: &ToolOpenGuard,
     ) -> Result<(RouteHandle, Arc<Semaphore>), ToolPlaneError> {
-        if !self.frozen_contract(ctx, module_id).tool_result_v1 {
+        let contract = self.frozen_contract(ctx, module_id);
+        if !contract.tool_result_v1 && !contract.call_keepalive {
             return self
                 .ensure_route(&ctx.bind, ctx.scope.as_ref(), module_id, guard)
                 .await;
@@ -2110,7 +2303,8 @@ impl SubcToolPlane {
             guard.deadline,
             guard,
             TOOL_DISPATCH_PATIENCE,
-            true,
+            contract.tool_result_v1,
+            contract.call_keepalive,
         )
         .await
         .map_err(|error| map_tool_open_refusal(error, module_id))
@@ -2131,6 +2325,7 @@ impl SubcToolPlane {
         guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
         tool_result_v1: bool,
+        call_keepalive: bool,
     ) -> Result<(RouteHandle, Option<ScopeStamp>), RouteEnsureError> {
         // One computed deadline keeps the caller budget authoritative while retaining a short
         // per-iteration cap. Using either bound alone would either overshoot a short warm timeout
@@ -2166,13 +2361,15 @@ impl SubcToolPlane {
             }))
         };
         let Some(scope) = scope else {
+            let selector = self.direct_carrier_selector().await?;
             let attempt = || {
                 self.conn.route_open_dispatch(
                     module_id,
                     bind,
-                    None,
+                    selector.as_ref(),
                     tool_result_v1,
                     self.held_reply_declared(),
+                    call_keepalive,
                 )
             };
             return match outage {
@@ -2190,10 +2387,25 @@ impl SubcToolPlane {
             }
             .map(|handle| (handle, None))
             .map_err(|error| match error {
+                // A refusal may quote a request. Keep its code, but never expose a private proof
+                // through diagnostic bodies returned by the daemon or transport.
+                RouteOpenError::Conn(error) if selector.is_some() => {
+                    RouteEnsureError::Plane(ToolPlaneError::ScopeRefused {
+                        code: error.code().unwrap_or(SCOPE_UNVERIFIABLE).into(),
+                        detail: "the Direct carrier route could not be opened".into(),
+                    })
+                }
                 RouteOpenError::Conn(error) => RouteEnsureError::Connection(error),
                 RouteOpenError::Cancelled => cancelled(),
             });
         };
+        if self.direct_carrier_scope.is_some() {
+            return Err(RouteEnsureError::Plane(ToolPlaneError::ScopeRefused {
+                code: SCOPE_UNSUPPORTED.into(),
+                detail: "a private Direct carrier selector cannot replace a frozen session scope"
+                    .into(),
+            }));
+        }
         let selector = self.scoped_selector(scope).await?;
         // The hold is bounded by the scope hold and by the caller's own deadline, whichever
         // comes first. Inside a run there is no caller deadline, so the hold alone bounds it; a
@@ -2249,6 +2461,7 @@ impl SubcToolPlane {
                     Some(&selector),
                     tool_result_v1,
                     self.held_reply_declared(),
+                    call_keepalive,
                 )
             };
             let opened = match outage {
@@ -2347,6 +2560,7 @@ impl SubcToolPlane {
             guard,
             patience,
             false,
+            false,
         )
         .await
     }
@@ -2362,6 +2576,7 @@ impl SubcToolPlane {
         guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
         tool_result_v1: bool,
+        call_keepalive: bool,
     ) -> Result<(RouteHandle, Arc<Semaphore>), RouteEnsureError> {
         let key = Self::route_key(bind, scope, module_id);
         if lifecycle.is_cancelled() {
@@ -2387,7 +2602,9 @@ impl SubcToolPlane {
         let obsolete = {
             let mut routes = self.routes.lock().unwrap();
             if let Some(r) = routes.get_mut(&key) {
-                if r.handle.reads_tool_result == (tool_result_v1 || self.held_reply_declared()) {
+                if r.handle.reads_tool_result == (tool_result_v1 || self.held_reply_declared())
+                    && r.handle.call_keepalive == call_keepalive
+                {
                     r.last_used = Instant::now();
                     return Ok((r.handle, Arc::clone(&r.sem)));
                 }
@@ -2415,6 +2632,7 @@ impl SubcToolPlane {
                 guard,
                 patience,
                 tool_result_v1,
+                call_keepalive,
             )
             .await?;
         let sem = Arc::new(Semaphore::new(window));
@@ -3140,6 +3358,7 @@ impl SubcToolPlane {
                 guard,
                 TOOL_DISPATCH_PATIENCE,
                 self.frozen_contract(ctx, &module_id).tool_result_v1,
+                self.frozen_contract(ctx, &module_id).call_keepalive,
             )
             .await
             .map_err(|error| map_tool_open_refusal(error, &module_id))
@@ -3394,6 +3613,7 @@ impl SubcToolPlane {
                     Some(&selector),
                     self.frozen_contract(ctx, &module).tool_result_v1,
                     self.held_reply_declared(),
+                    self.frozen_contract(ctx, &module).call_keepalive,
                 )
             },
         )
@@ -3499,18 +3719,22 @@ impl ToolPlane for SubcToolPlane {
         tool: &str,
     ) -> Option<broca_core::tool_plane::DispatchSchemaPin> {
         let module = self.dispatch_target_inner(ctx, id)?;
-        // Only an admitted plan supplies the provider's schema digest and semantics.
-        // Legacy direct tools and old manifests keep an unknown pin; consulting a
-        // later catalog would invent history and add a new refusing RPC to dispatch.
+        // Use the admitted plan or standalone discovery snapshot, never a catalog fetched
+        // during dispatch: a later schema must not change the identity of a composed call.
         self.batch_manifests
             .lock()
             .unwrap()
-            .get(&Self::batch_route_key(ctx))?
-            .provider_declarations(&module)?
-            .schema_pins
-            .as_ref()?
-            .get(tool)
+            .get(&Self::batch_route_key(ctx))
+            .and_then(|manifest| manifest.provider_declarations(&module))
+            .and_then(|declarations| declarations.schema_pins.as_ref())
+            .and_then(|pins| pins.get(tool))
             .cloned()
+            .or_else(|| {
+                self.direct_tool_item
+                    .as_ref()
+                    .filter(|item| item.provider == module)?;
+                self.direct_schema_pins.lock().unwrap().get(tool).cloned()
+            })
     }
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
         self.dispatch_inner(ctx, call, None, &ToolOpenGuard::default())
@@ -3811,16 +4035,13 @@ fn conn_to_plane(e: ConnError) -> ToolPlaneError {
     ToolPlaneError::Unavailable(e.to_string())
 }
 
-/// Map a tool-dispatch route-open failure to the plane error the loop reports. A refusal
-/// the daemon attributed to the module (`target_unavailable`, `module_reloading`,
-/// `module_warming`, `module_timeout`) that outlasted the tool-dispatch patience becomes
-/// [`ToolPlaneError::ModuleUnavailable`]: proven undelivered, carrying the module, the
-/// daemon's code and its detail. Everything else keeps today's mapping.
+/// Preserve every tool-dispatch route-open refusal, including terminal codes the protocol
+/// does not know. Refusal attribution is independent of retryability: no tool request was
+/// sent, and the model needs the module, code and bounded detail to understand why.
+/// Scoped refusals have already taken their separate scope-specific path.
 fn map_tool_open_refusal(error: RouteEnsureError, module_id: &str) -> ToolPlaneError {
     match error {
-        RouteEnsureError::Connection(ConnError::Rejected(message))
-            if is_module_availability_refusal(message.code()) =>
-        {
+        RouteEnsureError::Connection(ConnError::Rejected(message)) => {
             ToolPlaneError::ModuleUnavailable {
                 module: module_id.to_owned(),
                 code: message.code().to_owned(),
@@ -4062,7 +4283,9 @@ fn legacy_non_text_tool_content_placeholder(block: &serde_json::Value) -> String
 
 #[cfg(test)]
 mod tests {
+    include!("subc_plane/direct_carrier_tests.rs");
     include!("subc_plane/route_close_followup_tests.rs");
+    include!("subc_plane/call_keepalive_tests.rs");
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
@@ -4175,6 +4398,7 @@ mod tests {
         /// request counts as sent and its route closes under it.
         close_during_call: Mutex<bool>,
         dispatched_presets: Mutex<Vec<Option<String>>>,
+        dispatched_schema_pins: Mutex<Vec<Option<String>>>,
         dispatched_deadlines: Mutex<Vec<Duration>>,
         dispatched_arguments: Mutex<Vec<serde_json::Value>>,
         /// Real per-module availability gates, installed by tests that prove waiting
@@ -4221,6 +4445,7 @@ mod tests {
                 closed: Mutex::new(Default::default()),
                 close_during_call: Mutex::new(false),
                 dispatched_presets: Mutex::new(Vec::new()),
+                dispatched_schema_pins: Mutex::new(Vec::new()),
                 dispatched_deadlines: Mutex::new(Vec::new()),
                 dispatched_arguments: Mutex::new(Vec::new()),
                 gates: Mutex::new(HashMap::new()),
@@ -4412,6 +4637,37 @@ mod tests {
                 .expect("test must script every tool-call response")
         }
 
+        async fn tool_call_staged(
+            &self,
+            route: &RouteHandle,
+            call: &ToolCall,
+            deadline: crate::connection::ToolReplyDeadline,
+            preset: Option<&str>,
+            _call_key: Option<&str>,
+            schema_pin: Option<&str>,
+            signals: &broca_core::tool_plane::DispatchSignals,
+        ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+            if signals.interrupted() {
+                return Err(crate::connection::ApprovedCallError::BeforePush(
+                    crate::connection::ApprovedSetupError::Interrupted,
+                ));
+            }
+            self.dispatched_schema_pins
+                .lock()
+                .unwrap()
+                .push(schema_pin.map(str::to_owned));
+            self.tool_call(
+                route,
+                &call.tool_name,
+                &call.input,
+                Some(&call.tool_call_id.0),
+                deadline.duration,
+                preset,
+            )
+            .await
+            .map_err(crate::connection::ApprovedCallError::AfterPush)
+        }
+
         async fn server_capabilities(&self) -> Result<Vec<String>, ConnError> {
             Ok(self.capabilities.lock().unwrap().clone())
         }
@@ -4420,7 +4676,7 @@ mod tests {
             &self,
             route: &RouteHandle,
             call: &ToolCall,
-            deadline: Duration,
+            deadline: crate::connection::ToolReplyDeadline,
             preset: Option<&str>,
             args: &ApprovedArgs,
             _schema_pin: Option<&str>,
@@ -4436,7 +4692,7 @@ mod tests {
                 &call.tool_name,
                 &arguments,
                 Some(&call.tool_call_id.0),
-                deadline,
+                deadline.duration,
                 preset,
             )
             .await
@@ -6265,6 +6521,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_reloading_refusal_keeps_its_code_and_discards_its_message() {
+        let refusal = |message: &str| {
+            Err(ConnError::Rejected(crate::connection::decode_error_body(
+                &serde_json::to_vec(
+                    &serde_json::json!({"code":"module_reloading", "message":message}),
+                )
+                .unwrap(),
+            )))
+        };
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![Vec::new(), Vec::new(), Vec::new()],
+            vec![refusal("draining endpoint"), refusal(&"x".repeat(65_537))],
+        );
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("batch-oversized-refusal");
+        let tool_call = call("read");
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&tool_call),
+                &ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]),
+            )
+            .await
+            .unwrap();
+        let DispatchResult::Completed(result) = plane.dispatch(&ctx, &tool_call).await else {
+            panic!("a final refusal must complete the call");
+        };
+        let ToolOutput::Error {
+            code,
+            message,
+            detail,
+            ..
+        } = result.output
+        else {
+            panic!("an oversized refusal must remain an error");
+        };
+        assert_eq!(code.as_deref(), Some("module_reloading"));
+        assert!(
+            message.contains("refused") && message.contains("discarded"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("tool ran"),
+            "a refusal must not claim execution"
+        );
+        let detail: serde_json::Value = serde_json::from_str(detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["bytes"], 65_537);
+        assert_eq!(detail["limit"], 65_536);
+        assert_eq!(
+            conn.dispatched_ids.lock().unwrap().len(),
+            2,
+            "no resend after the final refusal"
+        );
+    }
+
+    #[tokio::test]
     async fn module_reloading_prose_and_other_codes_do_not_trigger_resend() {
         let mut refusals = vec![ConnError::Rejected(
             "module_reloading — legacy prose".into(),
@@ -7118,6 +7430,43 @@ mod tests {
 
     #[async_trait]
     impl ToolPlaneConnection for InProcessWireConnection {
+        async fn tool_call_staged(
+            &self,
+            route: &RouteHandle,
+            call: &ToolCall,
+            deadline: crate::connection::ToolReplyDeadline,
+            preset: Option<&str>,
+            call_key: Option<&str>,
+            schema_pin: Option<&str>,
+            signals: &broca_core::tool_plane::DispatchSignals,
+        ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+            <SubcConnection as ToolPlaneConnection>::tool_call_staged(
+                &self.conn, route, call, deadline, preset, call_key, schema_pin, signals,
+            )
+            .await
+        }
+
+        async fn route_open_dispatch(
+            &self,
+            module_id: &str,
+            identity: &BindIdentity,
+            scope: Option<&ScopeSelector>,
+            tool_result_v1: bool,
+            provider_held_installed: bool,
+            call_keepalive: bool,
+        ) -> Result<RouteHandle, ConnError> {
+            self.conn
+                .route_open_dispatch_single_attempt(
+                    module_id,
+                    identity,
+                    scope,
+                    tool_result_v1,
+                    provider_held_installed,
+                    call_keepalive,
+                )
+                .await
+        }
+
         async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
             Ok(Vec::new())
         }
@@ -7190,7 +7539,8 @@ mod tests {
         };
         let ctx = batch_ctx("batch-slow");
         let fake_module = tokio::spawn(async move {
-            let request = module.next_request().await;
+            let (request, keepalive) = call_keepalive::bound_request(&mut module).await;
+            assert!(!keepalive);
             sleep(reply_after).await;
             module.reply(
                 &request,
@@ -8308,7 +8658,10 @@ mod approval_digest_contract_tests {
                 &conn,
                 &route,
                 &call,
-                Duration::from_secs(1),
+                crate::connection::ToolReplyDeadline {
+                    duration: Duration::from_secs(1),
+                    declared: false
+                },
                 Some("head"),
                 &args,
                 None
@@ -8416,6 +8769,7 @@ mod approved_queue_contract_tests {
                     args,
                     Some("approved"),
                     Duration::from_millis(20),
+                    false,
                     None,
                     Some("call-key"),
                     None,

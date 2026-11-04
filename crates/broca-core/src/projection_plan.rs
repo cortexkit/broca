@@ -50,6 +50,9 @@ pub fn u64_to_i64(value: u64) -> Result<i64, ProjectionPlanError> {
 
 #[derive(Debug, Clone)]
 pub struct ProjectionSnapshot {
+    pub context_epoch: i64,
+    /// A durable recovery fence rejects projections captured before the cut.
+    pub required_recovery_cuts: Vec<String>,
     pub attribution_complete: bool,
     pub seed: Option<ProjectionSeed>,
     pub watermark: u64,
@@ -142,6 +145,7 @@ impl ProjectionPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedProjection {
+    pub refusal_json: String,
     pub head_json: String,
     pub message_times: Vec<Option<u64>>,
     pub episode_spans: Vec<std::ops::Range<u64>>,
@@ -164,6 +168,9 @@ pub struct PreparedProjection {
     /// `message_json`: the store keeps them in their own column, since a message's own
     /// serialized form never carries them.
     pub message_tags_json: Vec<Option<String>>,
+    pub message_compaction_json: Vec<Option<String>>,
+    pub message_compaction_compact_json: Vec<Option<String>>,
+    pub compaction_delivery_updates: Vec<crate::compaction_v2::metadata::DeliveryUpdate>,
     pub final_run_json: Vec<(i64, String)>,
     pub completed_steps: i64,
     pub usage_json: String,
@@ -197,7 +204,40 @@ pub fn plan_projection(
     let incoming_lineage_id = range
         .and_then(|range| range.lineage_id)
         .map(|lineage_id| lineage_id.to_string());
+    let incoming_cuts: std::collections::BTreeSet<_> = records
+        .iter()
+        .filter_map(|frame| match &frame.record {
+            WalRecord::RecoveryCut { recovery } => Some(recovery.cut_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    if snapshot
+        .required_recovery_cuts
+        .iter()
+        .any(|cut| !incoming_cuts.contains(cut.as_str()))
+    {
+        return Err(ProjectionPlanError::InconsistentSnapshot(
+            "recovery projection requires the complete post-cut WAL",
+        ));
+    }
+    let compaction_cache_repair = snapshot.seed.as_ref().is_some_and(|seed| {
+        let head = seed.admission_checkpoint.head.as_ref();
+        matches!(
+            seed.admission_checkpoint.lineage_retention,
+            Some(crate::LineageRetention::Forever)
+        ) && head.and_then(|head| head.mode3) == Some(true)
+            && crate::compaction_v2::projection::configured(
+                true,
+                seed.admission_checkpoint.ownership.as_ref(),
+            )
+            && head
+                .and_then(|head| head.compaction_metadata.as_ref())
+                .is_none_or(|metadata| !metadata.is_current())
+    });
     let reset = !snapshot.attribution_complete
+        || compaction_cache_repair
+        || !snapshot.required_recovery_cuts.is_empty()
+        || !incoming_cuts.is_empty()
         || snapshot
             .seed
             .as_ref()
@@ -360,27 +400,66 @@ pub fn plan_projection(
         .and_then(crate::projection::ControlProjectionState::from_projection_seed)
         .map(|state| state.placement().clone())
         .unwrap_or_default();
-    let times = crate::message_times::written_times_with_queued(
-        records
-            .iter()
-            .filter(|frame| {
-                frame.seq <= new_watermark
-                    && incremental_seed
-                        .as_ref()
-                        .is_none_or(|seed| seed.prefix_len == 0 || frame.seq > seed.watermark_seq)
-            })
-            .map(|frame| &frame.record),
-        time_placement,
-        incremental_seed
+    let timing_head = incremental_seed
+        .as_ref()
+        .and_then(|seed| seed.admission_checkpoint.head.as_ref());
+    let compaction_metadata = timing_head.and_then(|head| head.compaction_metadata.clone());
+    let compaction_newest = timing_head.and_then(|head| head.compaction_newest.clone());
+    let mode3 = match timing_head.and_then(|head| head.mode3) {
+        Some(mode3) => mode3,
+        None if incremental_seed
             .as_ref()
-            .and_then(|seed| seed.admission_checkpoint.head.as_ref())
-            .map(|head| head.queued_times().clone())
-            .unwrap_or_default(),
-    )
-    .map_err(|_| ProjectionPlanError::InconsistentSnapshot("message time placement failed"))?;
+            .is_none_or(|seed| seed.prefix_len == 0)
+            || records.first().is_some_and(|frame| frame.seq == 1) =>
+        {
+            crate::is_mode3_log(records.iter().map(|frame| &frame.record))
+        }
+        None => {
+            return Err(ProjectionPlanError::InconsistentSnapshot(
+                "first-run history mode is not known",
+            ))
+        }
+    };
+    let time_records: Vec<_> = records
+        .iter()
+        .filter(|frame| {
+            frame.seq <= new_watermark
+                && incremental_seed
+                    .as_ref()
+                    .is_none_or(|seed| seed.prefix_len == 0 || frame.seq > seed.watermark_seq)
+        })
+        .map(|frame| &frame.record)
+        .collect();
+    let queued_times = timing_head
+        .map(|head| head.queued_times().clone())
+        .unwrap_or_default();
+    let (times, mode3_times) = if mode3 {
+        let folded = crate::message_times::mode3_written_times(
+            time_records,
+            time_placement,
+            queued_times,
+            timing_head
+                .and_then(|head| head.mode3_times.clone())
+                .unwrap_or_default(),
+        )
+        .map_err(|_| ProjectionPlanError::InconsistentSnapshot("message time placement failed"))?;
+        (folded.times, Some(folded.seed))
+    } else {
+        (
+            crate::message_times::written_times_with_queued(
+                time_records,
+                time_placement,
+                queued_times,
+            )
+            .map_err(|_| {
+                ProjectionPlanError::InconsistentSnapshot("message time placement failed")
+            })?,
+            None,
+        )
+    };
     let (
         truncate_prefix_to,
-        new_messages,
+        mut new_messages,
         message_runs,
         completed_steps,
         usage,
@@ -388,10 +467,11 @@ pub fn plan_projection(
         last_step_finish_reason,
         retries_used,
         last_run_id,
-        admission_checkpoint,
+        mut admission_checkpoint,
         episode_spans,
         open_episode_span,
         episode_metadata,
+        refusal,
     ) = if let Some(seed) = incremental_seed {
         // A seed stored before the ownership summary existed (or before it recorded the frozen
         // plan manifest) cannot carry it forward: the summary covers every episode, and the
@@ -418,6 +498,7 @@ pub fn plan_projection(
             delta.episode_spans,
             delta.open_episode_span,
             delta.episodes,
+            delta.refusal,
         )
     } else {
         // Legacy or malformed checkpoint metadata asks the caller for a complete WAL read;
@@ -467,6 +548,10 @@ pub fn plan_projection(
             episode_spans,
             open_episode_span,
             Some(episode_metadata),
+            crate::refusal_fallback::RefusalReplayState {
+                schedule: prefix_state.refusal_fallback,
+                refused_steps: prefix_state.refused_steps,
+            },
         )
     };
 
@@ -481,6 +566,12 @@ pub fn plan_projection(
         ));
     }
 
+    if let Some(seed) = mode3_times {
+        if let Some(head) = &mut admission_checkpoint.head {
+            head.mode3 = Some(true);
+            head.mode3_times = Some(seed);
+        }
+    }
     // Every record up to the new watermark that this batch carries: the seeded tail and the
     // full-replay prefix both lie inside it, and a record at or below the old watermark repeats
     // a title the store already folded, so including one cannot make the answer older.
@@ -494,6 +585,52 @@ pub fn plan_projection(
     let truncate_prefix_to = truncate_prefix_to.map(u64_to_i64).transpose()?;
     if let Some(truncate_to) = truncate_prefix_to {
         next_ord = truncate_to;
+    }
+    let lineage_id = incoming_lineage_id
+        .clone()
+        .or_else(|| expected_lineage_id.clone());
+    let mut message_compaction_json = Vec::new();
+    let mut message_compaction_compact_json = Vec::new();
+    let mut compaction_delivery_updates = Vec::new();
+    let mut compaction_tags = None;
+    if crate::compaction_v2::projection::configured(mode3, admission_checkpoint.ownership.as_ref())
+    {
+        let continuation = match compaction_metadata {
+            Some(metadata) => metadata,
+            None if next_ord == 0 => Default::default(),
+            None => {
+                return Err(ProjectionPlanError::InconsistentSnapshot(
+                    "mode-3 compaction projection requires a complete WAL rebuild",
+                ))
+            }
+        };
+        let from = if reset || next_ord == 0 { 0 } else { watermark };
+        let compaction_frames: Vec<_> = records
+            .iter()
+            .filter(|frame| frame.seq > from && frame.seq <= new_watermark)
+            .cloned()
+            .collect();
+        let projected = crate::compaction_v2::projection::prepare(
+            continuation,
+            compaction_newest,
+            &compaction_frames,
+            u64::try_from(next_ord)?,
+            &mut new_messages,
+            |position| crate::message_mid(true, lineage_id.as_deref(), position),
+        )
+        .map_err(|error| {
+            tracing::warn!(target:"store", %error, "mode-3 compaction projection failed");
+            ProjectionPlanError::InconsistentSnapshot("mode-3 compaction entry projection failed")
+        })?;
+        let head = admission_checkpoint
+            .head
+            .get_or_insert_with(Default::default);
+        head.compaction_metadata = Some(projected.continuation);
+        head.compaction_newest = projected.newest;
+        message_compaction_json = projected.full;
+        message_compaction_compact_json = projected.compact;
+        compaction_delivery_updates = projected.deliveries;
+        compaction_tags = Some(projected.tags);
     }
     let message_json = new_messages
         .iter()
@@ -510,10 +647,12 @@ pub fn plan_projection(
         .iter()
         .map(|message| message.part_tags().map(serde_json::to_string).transpose())
         .collect::<Result<Vec<_>, _>>()?;
+    let message_tags_json = compaction_tags.unwrap_or(message_tags_json);
     // Keep RunFinished beyond the last materialized record: older resume code reads it
     // from the WAL to know the run ended. Replay those unmaterialized records too, persisting
     // their final-message metadata without moving the watermark past that terminal record.
     let final_seed = ProjectionSeed {
+        refusal: refusal.clone(),
         watermark_seq: new_watermark,
         prefix_len: (next_ord as u64).saturating_add(new_messages.len() as u64),
         completed_steps,
@@ -531,7 +670,7 @@ pub fn plan_projection(
         .cloned()
         .collect();
     let episode = final_seed.admission_checkpoint.last_episode.as_ref();
-    let final_state = crate::replay::replay_seeded(
+    let final_state = crate::replay::replay_seeded_with_refusal(
         suffix.iter().map(|frame| &frame.record),
         episode.map(|episode| episode.config.model.clone()),
         final_seed.last_run_id.clone(),
@@ -542,7 +681,15 @@ pub fn plan_projection(
         // metadata is persisted here; the ordinary body projection still validates new firings.
         false,
         // Only run metadata of this replay is persisted, never its messages or their tags.
-        crate::tags::TagSeed::default(),
+        crate::replay::TranscriptSeed {
+            tags: crate::tags::TagSeed::default(),
+            mode3: final_seed
+                .admission_checkpoint
+                .head
+                .as_ref()
+                .and_then(|head| head.mode3),
+        },
+        final_seed.refusal,
     )?;
     let final_run_json = final_state
         .run_finals
@@ -590,9 +737,12 @@ pub fn plan_projection(
     if let Some(cursor) = control_head {
         u64_to_i64(cursor.wal_seq)?;
     }
-    let lineage_id = incoming_lineage_id.or_else(|| expected_lineage_id.clone());
 
     Ok(ProjectionPlan::Write(Box::new(PreparedProjection {
+        refusal_json: serde_json::to_string(&crate::refusal_fallback::RefusalReplayCheckpoint {
+            at_seq: new_watermark,
+            state: refusal,
+        })?,
         message_times,
         head_json: serde_json::to_string(&admission_checkpoint.head)?,
         episode_spans,
@@ -605,6 +755,9 @@ pub fn plan_projection(
         new_watermark,
         next_ord,
         truncate_prefix_to,
+        message_compaction_json,
+        message_compaction_compact_json,
+        compaction_delivery_updates,
         message_json,
         message_run_json,
         message_tags_json,
@@ -706,6 +859,9 @@ impl ProjectionBoundaryState {
             WalRecord::WriterOpened { .. }
                 | WalRecord::WriterClosed { .. }
                 | WalRecord::VisibilityLate { .. }
+                | WalRecord::CompactionViewV2 { .. }
+                | WalRecord::CompactionMarker { .. }
+                | WalRecord::CompactionViewAppliedV2 { .. }
         ) {
             return Vec::new();
         }
@@ -925,13 +1081,31 @@ impl ProjectionContinuation {
     }
 
     pub fn decode(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        Self::decode_inner(encoded, true)
+    }
+
+    /// Execution and indexing can preserve an unknown sender-policy fold until admission
+    /// needs it, without rebuilding an otherwise complete projection continuation.
+    pub fn decode_for_execution(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        Self::decode_inner(encoded, false)
+    }
+
+    fn decode_inner(
+        encoded: &str,
+        require_sender_policy: bool,
+    ) -> Result<Self, crate::replay::SeedFallback> {
         let bad = || crate::replay::SeedFallback::new("unsupported projection continuation");
         let value: serde_json::Value = serde_json::from_str(encoded).map_err(|_| bad())?;
         if value["version"] != 1 && value["version"] != 2 && value["version"] != 3 {
             return Err(bad());
         }
-        let admission =
-            crate::admission::AdmissionContinuation::decode(&value["admission"].to_string())?;
+        let admission = if require_sender_policy {
+            crate::admission::AdmissionContinuation::decode(&value["admission"].to_string())
+        } else {
+            crate::admission::AdmissionContinuation::decode_for_execution(
+                &value["admission"].to_string(),
+            )
+        }?;
         if value["version"] != admission.wire_version()
             && !(value["version"] == 3 && admission.wire_version() == 2)
         {
@@ -1174,9 +1348,10 @@ impl ProjectionContinuation {
         tail: &[crate::replay::PositionedFrame],
     ) -> Result<Self, crate::replay::SeedFallback> {
         let prior = self.hydrate(read_at, tail, boundary.seq)?;
-        let delta = replay_projection_tail(
+        let delta = crate::replay::replay_projection_tail_with(
             &prior,
             &tail.iter().map(|p| p.framed.clone()).collect::<Vec<_>>(),
+            crate::replay::LeadingInterrupted::RetainKnownEpisode,
         )
         .map_err(|_| crate::replay::SeedFallback::new("projection continuation tail invalid"))?;
         let tags = if delta.messages.is_empty() {
@@ -1411,6 +1586,15 @@ pub struct OffsetDelta {
 }
 
 impl OffsetSeed {
+    /// A current empty locator that can be persisted even before the first record.
+    /// Missing head folds still mean stale state when decoding existing locators.
+    pub fn empty() -> Self {
+        Self {
+            head_fold: Some(Default::default()),
+            ..Default::default()
+        }
+    }
+
     pub fn head_ord(&self) -> u64 {
         self.placement.next_ordinal()
     }

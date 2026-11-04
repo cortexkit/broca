@@ -170,3 +170,5 @@ async fn a_reopened_planned_session_redrives_its_first_episode_and_admits_a_late
         );
     }
 }
+
+broca_crash_harness::require_process_kill!();

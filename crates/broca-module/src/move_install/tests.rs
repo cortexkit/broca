@@ -10,6 +10,8 @@ fn root(tag: &str) -> std::path::PathBuf {
 }
 pub(crate) fn started(session: &BindIdentity, id: &str) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -29,6 +31,9 @@ pub(crate) fn started(session: &BindIdentity, id: &str) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(1),
         config: Box::new(RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -114,10 +119,17 @@ fn whole_ref_set_divergence_refuses_before_any_installation_or_floor() {
     ];
     let export = broca_store::SqliteStore::open_in_memory().unwrap();
     let drops = std::sync::atomic::AtomicUsize::new(0);
-    let result = install_verified(&root, "cut", &specs, &export, |_| {
-        drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    });
+    let result = install_verified(
+        &root,
+        "cut",
+        &specs,
+        &export,
+        |_| Ok(()),
+        |_| {
+            drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    );
     assert!(
         !live_a.exists(),
         "ref A was installed before checking ref B"
@@ -127,6 +139,73 @@ fn whole_ref_set_divergence_refuses_before_any_installation_or_floor() {
     assert_eq!(export.high_water(), 0);
     assert_eq!(result.unwrap_err().code.as_str(), "local_advanced");
     assert_eq!(std::fs::read(live_b).unwrap(), b"advanced");
+}
+
+#[test]
+fn operational_overhaul_activation_recovery_keeps_exclusions_across_the_rename_cut() {
+    let root = root("overhaul-floor");
+    std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+    let session = BindIdentity::new("/receiver", "runner", "moved");
+    let wal_root = root.join("wal");
+    broca_wal::migration::durable_dir(&root, &wal_root).unwrap();
+    let staged = broca_wal::migration::staging_path(&wal_root, "cut", "moved").unwrap();
+    let incoming_path = root.join("incoming.wal");
+    {
+        let mut writer = broca_wal::FileWal::open(&incoming_path).unwrap();
+        episode(&mut writer, &session, "foreign-run");
+    }
+    let incoming = std::fs::read(incoming_path).unwrap();
+    let digest = broca_wal::migration::digest(&incoming);
+    broca_wal::migration::stage(&root, &staged, &incoming, &digest).unwrap();
+    let live = wal_root.join(format!("{}.wal", broca_core::session_addr(&session)));
+    let specs = [Installation {
+        session: &session,
+        staged: &staged,
+        live: &live,
+        local_archive: None,
+        end_offset: incoming.len() as u64,
+        digest: &digest,
+    }];
+    let db = broca_store::db::OverhaulDb::open(&root).unwrap();
+    let error = install_verified(
+        &root,
+        "cut",
+        &specs,
+        &db,
+        |_| Ok(()),
+        |_| Err("cut after rename".into()),
+    )
+    .unwrap_err();
+    assert_eq!(error.code.as_str(), "unavailable");
+    assert_eq!(std::fs::read(&live).unwrap(), incoming);
+    assert!(!staged.exists());
+    drop(db);
+    let db = broca_store::db::OverhaulDb::open(&root).unwrap();
+    assert!(broca_core::ImportedRunExclusions::is_imported_run(
+        &db,
+        &session,
+        &RunId("foreign-run".into())
+    )
+    .unwrap());
+    install_verified(
+        &root,
+        "cut",
+        &specs,
+        &db,
+        |_| Ok(()),
+        |session| db.forget_session(session).map_err(|e| e.to_string()),
+    )
+    .unwrap();
+    assert!(broca_core::ImportedRunExclusions::is_imported_run(
+        &db,
+        &session,
+        &RunId("foreign-run".into())
+    )
+    .unwrap());
+    assert!(!root.join("run-index.db").exists());
+    // Windows cannot remove the scratch directory while SQLite still has open files.
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -169,15 +248,20 @@ fn imported_floor_excludes_foreign_runs_and_preserves_local_billing_after_recove
         digest: &digest,
     }];
     let export = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-    let result = install_verified(&root, "cut", &specs, &export, |_| {
-        Err("crash after rename".into())
-    });
+    let result = install_verified(
+        &root,
+        "cut",
+        &specs,
+        &export,
+        |_| Ok(()),
+        |_| Err("crash after rename".into()),
+    );
     assert_eq!(result.unwrap_err().code.as_str(), "unavailable");
     assert_eq!(std::fs::read(&live).unwrap(), incoming);
     assert!(!staged.exists());
     drop(export);
     let export = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-    install_verified(&root, "cut", &specs, &export, |_| Ok(())).unwrap();
+    install_verified(&root, "cut", &specs, &export, |_| Ok(()), |_| Ok(())).unwrap();
     assert!(!live.with_extension("moved").exists());
     let records = broca_wal::replay_file(&live, broca_wal::DEFAULT_MAX_READ_BYTES).unwrap();
     let resolver = |_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1);
@@ -347,6 +431,7 @@ fn mixed_identity_import_excludes_every_historical_run_and_bills_fresh_receiver_
         }],
         &receiver,
         |_| Ok(()),
+        |_| Ok(()),
     )
     .unwrap();
     drop(receiver);
@@ -419,10 +504,17 @@ fn already_renamed_activation_repays_the_staging_source_barrier() {
             }
             Ok(())
         });
-        assert!(install_verified(&root, "cut", &specs, &export, |_| {
-            drops.set(drops.get() + 1);
-            Ok(())
-        })
+        assert!(install_verified(
+            &root,
+            "cut",
+            &specs,
+            &export,
+            |_| Ok(()),
+            |_| {
+                drops.set(drops.get() + 1);
+                Ok(())
+            }
+        )
         .is_err());
     }
     assert!(!staged.exists());
@@ -438,10 +530,17 @@ fn already_renamed_activation_repays_the_staging_source_barrier() {
             }
             Ok(())
         });
-        let error = install_verified(&root, "cut", &specs, &export, |_| {
-            drops.set(drops.get() + 1);
-            Ok(())
-        })
+        let error = install_verified(
+            &root,
+            "cut",
+            &specs,
+            &export,
+            |_| Ok(()),
+            |_| {
+                drops.set(drops.get() + 1);
+                Ok(())
+            },
+        )
         .unwrap_err();
         assert!(error
             .message
@@ -460,14 +559,21 @@ fn already_renamed_activation_repays_the_staging_source_barrier() {
         }
         Ok(())
     });
-    install_verified(&root, "cut", &specs, &export, |_| {
-        assert!(
-            synced.get(),
-            "recovery must finish staging removal before projection cleanup"
-        );
-        drops.set(drops.get() + 1);
-        Ok(())
-    })
+    install_verified(
+        &root,
+        "cut",
+        &specs,
+        &export,
+        |_| Ok(()),
+        |_| {
+            assert!(
+                synced.get(),
+                "recovery must finish staging removal before projection cleanup"
+            );
+            drops.set(drops.get() + 1);
+            Ok(())
+        },
+    )
     .unwrap();
     assert_eq!(drops.get(), 1);
     assert_eq!(std::fs::read(&live).unwrap(), bytes);

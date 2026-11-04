@@ -50,6 +50,8 @@ static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 #[test]
 fn stateful_caller_message_serializer_uses_borrowed_content() {
     let response = SessionReadMessage {
+        client_message_id: None,
+        tool_times: Vec::new(),
         rich_ui: None,
         written_at: None,
         ordinal: 0,
@@ -66,7 +68,7 @@ fn stateful_caller_message_serializer_uses_borrowed_content() {
         ),
         run: None,
         tool_calls: Vec::new(),
-        tags: Vec::new(),
+        part_keys: None,
         delivered_as: None,
         digest: None,
         part_digests: None,

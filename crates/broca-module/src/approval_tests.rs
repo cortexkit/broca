@@ -160,6 +160,8 @@ struct Rig {
     executor: Arc<Executor>,
     registry: LineageRegistry,
     full_reads: Arc<std::sync::atomic::AtomicUsize>,
+    // Fields are dropped in order; remove the directory only after closing its files.
+    _scratch: Scratch,
 }
 impl Rig {
     fn new(writer: bool) -> Self {
@@ -194,6 +196,7 @@ impl Rig {
         let registry =
             LineageRegistry::new_with_reader(Arc::new(opener), counted, Some(store.clone()));
         Self {
+            _scratch: Scratch(root.clone()),
             root,
             key,
             wal,
@@ -225,8 +228,8 @@ impl Rig {
         .unwrap();
         let mut file = self.wal.open(&self.key).unwrap();
         let records = vec![
-            WalRecord::RunStarted { written_at_ms: None, tags: None, session_class: None, retention: None, hooks: None, title: None, on_restart: on_restart.then_some(broca_protocol::request::OnRestart::Resume), keep_warm: None, marker_order_version: None, manifest: None, scope: Some(scope.clone()), send_id: None, request_identity_digest: None, project_id: None, principal: None, ts_ms: None, run_id: RunId("r".into()), session: self.key.clone(), config: Box::new(config), input: req.input.into(), origin: broca_wal::RunOrigin::Fresh, submission_id: None },
-            WalRecord::ModelStepFinished {
+            WalRecord::RunStarted { compaction_plan_version: None, sent_by: None, written_at_ms: None, tags: None, session_class: None, retention: None, hooks: None, title: None, on_restart: on_restart.then_some(broca_protocol::request::OnRestart::Resume), keep_warm: None, marker_order_version: None, manifest: None, scope: Some(scope.clone()), send_id: None, request_identity_digest: None, project_id: None, principal: None, ts_ms: None, run_id: RunId("r".into()), session: self.key.clone(), config: Box::new(config), input: req.input.into(), origin: broca_wal::RunOrigin::Fresh, submission_id: None },
+            WalRecord::ModelStepFinished { raw_finish_reason: None,
  fallback: Default::default(), written_at_ms: None, tags: None, hooks: None, step_id: StepId(1), assistant_message: broca_protocol::AssistantMessage { message_id: broca_protocol::MessageId("m".into()), content: vec![broca_protocol::ContentBlock::ToolCall(ToolCall { thought_signature: None, tool_call_id: ToolCallId("c".into()), tool_name: "edit".into(), input: serde_json::json!({}) })] }.into(), usage: Default::default(), finish_reason: Some(broca_protocol::FinishReason::ToolCalls), retries_used: 0, service_tier_used: None, speed_used: None },
             WalRecord::ToolBatchStarted { batch_id: broca_protocol::BatchId("b".into()), step_id: StepId(1), planned_calls: vec![ToolCallId("c".into())] },
             WalRecord::ToolCallDeferred { deferred_at_ms: None, batch_id: broca_protocol::BatchId("b".into()), call_id: ToolCallId("c".into()), executor: broca_wal::DeferredExecutor::Broca, module: None, tool: "edit".into(), schema_pin: None, args_jcs: "{}".into(), args_hash: "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(), scope, ask: serde_json::from_value(serde_json::json!({"prompt":"Allow?","expires_at_ms":expiry,"on_expiry":"deny","material_damage":false,"late_execution":"notify_only"})).unwrap() },
@@ -259,6 +262,7 @@ impl Rig {
         }
         if paused {
             self.append(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r".into()),
                 ts_ms: None,
                 reason: broca_protocol::PauseReason::Restart,
@@ -640,10 +644,20 @@ fn stale_marker_cannot_reopen_an_approved_or_closed_call() {
     assert!(crate::approval::awaiting_approval(&projection, &RunId("r".into())).is_none());
 }
 
-impl Drop for Rig {
+struct Scratch(std::path::PathBuf);
+impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[tokio::test]
+async fn rig_cleanup_closes_store_after_registry() {
+    let rig = Rig::new(false);
+    let root = rig.root.clone();
+    assert!(rig.registry.stop_and_seal().await);
+    drop(rig);
+    assert!(!root.exists(), "fixture left its scratch directory behind");
 }
 
 #[tokio::test]
@@ -867,6 +881,84 @@ async fn retry_keeps_discovery_flag_until_full_wal_debt_is_empty() {
     assert!(pass().await.unwrap());
     assert_eq!(questions.withdrawals.lock().unwrap().len(), 2);
     let _ = Arc::try_unwrap(writer).ok().unwrap().shutdown().await;
+}
+
+#[tokio::test]
+async fn operational_withdrawal_candidates_enter_the_existing_service_once() {
+    use broca_core::RecoveryDiscovery;
+    use broca_store::db::{LogLocation, OverhaulDb, PublishedSession};
+    for overhaul in [false, true] {
+        for approved in [false, true] {
+            let rig = Rig::new(true);
+            rig.seed(true, false, approved, true);
+            rig.store
+                .index_run_terminal("r", RunIndexState::Interrupted, None, None, 0)
+                .unwrap();
+            rig.store
+                .index_run_withdrawals_owed("r", !approved)
+                .unwrap();
+            std::fs::write(rig.root.join("state-format"), b"broca-state/2\n").unwrap();
+            let db = OverhaulDb::open(&rig.root).unwrap();
+            let publish = || {
+                let bytes = std::fs::read(rig.wal.wal_path(&rig.key)).unwrap();
+                db.index(&PublishedSession {
+                    bind: &rig.key,
+                    session_ref: "approval",
+                    location: LogLocation::Live,
+                    bytes: &bytes,
+                })
+                .unwrap();
+            };
+            publish();
+            let port: &dyn RecoveryDiscovery = if overhaul { &db } else { rig.store.as_ref() };
+            assert_eq!(
+                port.withdrawal_candidates().unwrap().len(),
+                usize::from(!approved)
+            );
+            let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+            let questions = rig.executor.questions.as_ref().unwrap();
+            let index = if overhaul {
+                None
+            } else {
+                Some(rig.store.clone() as Arc<dyn RunIndex>)
+            };
+            for _ in 0..2 {
+                assert!(crate::approval::service_pass(
+                    rig.wal.clone(),
+                    rig.key.clone(),
+                    writer.clone(),
+                    index.clone(),
+                    Arc::new(Mutex::new(())),
+                    questions.as_ref(),
+                    &broca_core::Clock::default()
+                )
+                .await
+                .unwrap());
+                publish();
+                assert!(port.withdrawal_candidates().unwrap().is_empty());
+            }
+            assert_eq!(
+                questions.withdrawals.lock().unwrap().len(),
+                usize::from(!approved)
+            );
+            assert_eq!(
+                rig.frames()
+                    .iter()
+                    .filter(|f| matches!(
+                        f.record,
+                        WalRecord::QuestionWithdrawalAcknowledged { .. }
+                    ))
+                    .count(),
+                usize::from(!approved)
+            );
+            Arc::try_unwrap(writer)
+                .ok()
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+        }
+    }
 }
 
 struct UnknownRead {
@@ -1401,6 +1493,9 @@ impl WalStore for CountedWal {
     fn wal_present(&self, key: &LineageKey) -> Option<bool> {
         self.wal.wal_present(key)
     }
+    fn wal_present_checked(&self, key: &LineageKey) -> Result<Option<bool>, broca_wal::WalError> {
+        self.wal.wal_present_checked(key)
+    }
     fn lineage_exists(
         &self,
         key: &LineageKey,
@@ -1662,6 +1757,112 @@ async fn missing_origin_is_expired_without_blocking_other_owed_calls() {
     assert!(rig.frames().iter().any(|frame| matches!(&frame.record, WalRecord::QuestionWithdrawalAcknowledged { call_key, answer: broca_wal::WithdrawalAnswer::Acknowledged, .. } if call_key == &good_key)));
 }
 
+#[tokio::test]
+async fn overhaul_ownerless_withdrawal_does_not_hide_or_acquire_a_later_owner() {
+    use broca_core::RecoveryDiscovery;
+    use broca_store::db::{LogLocation, OverhaulDb, PublishedSession};
+    let rig = Rig::new(true);
+    rig.seed(true, false, false, true);
+    let source = rig.frames();
+    let started = source[0].record.clone();
+    let mut ownerless = source[3].record.clone();
+    if let WalRecord::ToolCallDeferred { call_id, ask, .. } = &mut ownerless {
+        *call_id = ToolCallId("ownerless".into());
+        ask.expires_at_ms = 1;
+    }
+    std::fs::remove_file(rig.wal.wal_path(&rig.key)).unwrap();
+    let mut file = rig.wal.open(&rig.key).unwrap();
+    file.append(1, &ownerless, true).unwrap();
+    let ownerless_key = format!("{}:1", file.lineage_id().unwrap());
+    file.append(
+        1,
+        &WalRecord::ToolResult {
+            finished_at_ms: None,
+            tags: None,
+            batch_id: broca_protocol::BatchId("b".into()),
+            result: broca_core::not_dispatched_result(&ToolCallId("ownerless".into())).into(),
+            outcome: broca_wal::DispatchOutcome::Interrupted,
+            hooks: None,
+            reason: None,
+            withdraw_elicitation: Some(broca_wal::WithdrawElicitation {
+                call_key: ownerless_key.clone(),
+                elicitation_id: None,
+            }),
+            provider_held: None,
+        },
+        true,
+    )
+    .unwrap();
+    file.append(1, &started, true).unwrap();
+    file.append(1, &source[3].record, true).unwrap();
+    let owned_key = format!("{}:4", file.lineage_id().unwrap());
+    file.append(1, &Rig::closed_result(&owned_key, true), true)
+        .unwrap();
+    drop(file);
+    std::fs::write(rig.root.join("state-format"), b"broca-state/2\n").unwrap();
+    let db = OverhaulDb::open(&rig.root).unwrap();
+    let publish = || {
+        let bytes = std::fs::read(rig.wal.wal_path(&rig.key)).unwrap();
+        db.index(&PublishedSession {
+            bind: &rig.key,
+            session_ref: "mixed-owner",
+            location: LogLocation::Live,
+            bytes: &bytes,
+        })
+        .unwrap();
+    };
+    publish();
+    let candidates = db
+        .withdrawal_candidates()
+        .expect("ownerless debt must not fail the owned candidate scan");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].run_id.0, "r");
+    assert_eq!(candidates[0].session, rig.key);
+    db.read_snapshot(|tx| {
+        let owners: Vec<Option<String>> = tx
+            .prepare("SELECT run_id FROM withdrawal_call ORDER BY call_key")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(owners, vec![None, Some("r".into())]);
+        Ok(())
+    })
+    .unwrap();
+    let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());
+    assert!(crate::approval::service_pass(
+        rig.wal.clone(),
+        rig.key.clone(),
+        writer.clone(),
+        None,
+        Arc::new(Mutex::new(())),
+        rig.executor.questions.as_ref().unwrap().as_ref(),
+        &broca_core::Clock::default()
+    )
+    .await
+    .unwrap());
+    Arc::try_unwrap(writer)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    publish();
+    assert!(db.withdrawal_candidates().unwrap().is_empty());
+    assert_eq!(
+        rig.executor
+            .questions
+            .as_ref()
+            .unwrap()
+            .withdrawals
+            .lock()
+            .unwrap()
+            .len(),
+        1
+    );
+    let frames = rig.frames();
+    assert!(frames.iter().any(|f| matches!(&f.record,WalRecord::QuestionWithdrawalAcknowledged { call_key,reason:Some(reason),.. } if call_key==&ownerless_key && reason=="expired")));
+    assert!(frames.iter().any(|f| matches!(&f.record,WalRecord::QuestionWithdrawalAcknowledged { call_key,answer:broca_wal::WithdrawalAnswer::Acknowledged,.. } if call_key==&owned_key)));
+}
+
 struct FailingLookup(Arc<broca_store::SqliteStore>);
 impl RunIndex for FailingLookup {
     fn index_run_active(&self, row: &RunIndexRow) -> Result<(), String> {
@@ -1875,7 +2076,8 @@ async fn late_read_pages_are_atomic_bounded_and_nonrepeating() {
     assert!(last.next_late_after.is_none());
     let ordinary = rig
         .registry
-        .read(SessionReadRequest::new(rig.key.clone(), Some(1), Some(1)))
+        // Ordinals start at 1 (0 and 1 both name the first page), so 2 is a continuation.
+        .read(SessionReadRequest::new(rig.key.clone(), Some(2), Some(1)))
         .await
         .unwrap();
     assert!(

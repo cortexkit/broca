@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod fact_session;
+
 /// When installing a session WAL received from another machine, select its
 /// `RunStarted` ids that are absent from this machine's current session WAL.
 /// `incoming` contains the verified source WAL prefix through the move's frozen
@@ -157,7 +159,8 @@ pub struct SpendSegment {
     /// The scope's agent run, distinct from broca's episode `run_id` and not part of `fact_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_run_id: Option<String>,
-    /// The complete bind triple that scopes the fact.
+    /// The storage identity; its namespace root is omitted from exported project attribution.
+    #[serde(with = "fact_session")]
     pub session: BindIdentity,
     pub segment_ordinal: u64,
     pub fact_id: String,
@@ -801,6 +804,7 @@ fn credential_id_method(id: &str) -> Option<&str> {
 /// Stable SHA-256 fact identity over the source instance, bind triple, run, and
 /// segment ordinal. Length-prefixing makes the tuple encoding injective, and the
 /// digest is independent of timestamps and usage so a rebuild can reconcile facts.
+/// Namespace-backed sessions still hash their storage namespace, not a project placeholder.
 fn fact_id(
     source_instance_id: &str,
     session: &BindIdentity,
@@ -910,6 +914,7 @@ fn append_len_prefixed(output: &mut Vec<u8>, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    include!("billing/project_identity_tests.rs");
     use super::*;
     use broca_protocol::{
         content::{AssistantMessage, ContentBlock, FinishReason, Message, Role},
@@ -929,6 +934,9 @@ mod tests {
 
     fn config(provider: &str, model: &str, credential_id: Option<&str>) -> RunConfig {
         RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -974,6 +982,8 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -1010,6 +1020,7 @@ mod tests {
         frame(
             seq,
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -1777,6 +1788,8 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -2096,6 +2109,7 @@ mod tests {
             frame(
                 seq,
                 WalRecord::ModelAttemptFinished {
+                    account_limit_disposition: None,
                     attempt_id: None,
                     reservation: None,
                     envelope: None,

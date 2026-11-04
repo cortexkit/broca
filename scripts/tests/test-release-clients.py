@@ -34,6 +34,8 @@ class StageClientsTests(unittest.TestCase):
             scripts.mkdir()
             for name in ("stage-release.sh", "dsym.sh", "wal-floor.sh", "running-image.sh", "signing-posture.sh", "nonshipping-markers.sh"):
                 shutil.copy2(ROOT / "scripts" / name, scripts / name)
+            (scripts / "lib").mkdir()
+            shutil.copy2(ROOT / "scripts/lib/artifact-probe.sh", scripts / "lib/artifact-probe.sh")
             script = scripts / "stage-release.sh"
             source = script.read_text()
             anchor = "BUILD_SCRATCH=/tmp/broca-release-staging"
@@ -191,6 +193,100 @@ class ClientPlacementTests(gate.GateBase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse((self.bindir / "broca-session").exists())
         self.assertFalse((self.bindir / "broca-run").exists())
+
+
+class HealthSnapshotTests(gate.GateBase):
+    deploy = gate.PlacementGateTests.deploy
+    restart_fixture = gate.PlacementGateTests.restart_fixture
+
+    def test_health_snapshot_precedes_restart_warns_on_failure_and_keeps_newest_50(self):
+        home = self.tmp / "home"
+        snapshots = home / ".local/state/cortexkit/broca/health-before-restart"
+        restarted = self.tmp / "restarted"
+        health = json.dumps({
+            "module_id": "broca", "status": "ok", "detail": None,
+            "metrics": {"session_readers": {"entries": [{"principal": "direct", "count": 37}]},
+                        "management_ops": {"session.read": 91}},
+            "extra": {"future_field": [1, 2, 3]},
+        }, indent=2) + "\n"
+        for mode, failure in (("--restart", ""), ("--restart-only", ""),
+                              ("--restart-only", "ck"), ("--restart-only", "directory"),
+                              ("--restart-only", "json")):
+            with self.subTest(mode=mode, failure=failure):
+                env = self.restart_fixture()
+                env["HOME"] = str(home)
+                restarted.unlink(missing_ok=True)
+                if snapshots.is_file():
+                    snapshots.unlink()
+                else:
+                    shutil.rmtree(snapshots, ignore_errors=True)
+                snapshots.parent.mkdir(parents=True, exist_ok=True)
+                seeded = []
+                if failure == "directory":
+                    snapshots.write_text("not a directory")
+                else:
+                    snapshots.mkdir(mode=0o755)
+                    for index in range(55):
+                        path = snapshots / f"20000101T0000{index:02d}.000000Z-1.json"
+                        path.write_text("{}\n")
+                        seeded.append(path)
+                ck = Path(env["PLACE_RELEASE_CK"])
+                ck.write_text(f'''#!/usr/bin/env python3
+import os, pathlib, stat, sys
+directory = pathlib.Path({str(snapshots)!r})
+restarted = pathlib.Path({str(restarted)!r})
+health = {health!r}
+failure = {failure!r}
+if sys.argv[1:] == ["--json", "health", "broca"]:
+    assert not restarted.exists(), "health was requested after restart"
+    assert not list(directory.glob("*-4242.json")), "snapshot published before health completed"
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(os.fstat(1).st_mode) == 0o600
+    sys.stdout.write(health[:20])
+    sys.stdout.flush()
+    assert not list(directory.glob("*-4242.json")), "partial reply must stay private"
+    if failure == "ck":
+        print("health unavailable\\ntry later", file=sys.stderr)
+        sys.exit(7)
+    if failure != "json":
+        sys.stdout.write(health[20:])
+elif sys.argv[1:] == ["module", "restart", "broca"]:
+    if failure == "directory":
+        assert directory.is_file()
+    else:
+        saved = list(directory.glob("*-4242.json"))
+        assert not list(directory.glob(".health-*")), "temporary reply leaked"
+        if failure:
+            assert not saved, "failed health must not publish a snapshot"
+            assert len(list(directory.glob("*.json"))) == 55
+        else:
+            assert len(saved) == 1, "full health must be saved before restarting"
+            assert saved[0].read_bytes() == health.encode(), "health reply was changed"
+            assert stat.S_IMODE(saved[0].stat().st_mode) == 0o600
+            assert len(list(directory.glob("*.json"))) == 50
+    restarted.touch()
+else:
+    raise AssertionError(sys.argv)
+''')
+                result = self.place(mode, **env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(restarted.exists(), result.stderr)
+                if failure:
+                    warnings = result.stderr.splitlines()
+                    self.assertEqual(len(warnings), 1, result.stderr)
+                    self.assertIn("warning: could not save pre-restart health:", warnings[0])
+                    if failure == "ck":
+                        self.assertIn("exited 7: health unavailable try later", warnings[0])
+                    elif failure == "directory":
+                        self.assertIn("File exists", warnings[0])
+                    else:
+                        self.assertIn("Unterminated string", warnings[0])
+                else:
+                    self.assertEqual(result.stderr, "")
+                    saved = list(snapshots.glob("*-4242.json"))
+                    self.assertEqual(len(saved), 1)
+                    self.assertRegex(saved[0].name, r"^\d{8}T\d{6}\.\d{6}Z-4242\.json$")
+                    self.assertEqual(sorted(snapshots.glob("*.json")), sorted([*seeded[6:], *saved]))
 
 
 class ClientVerificationTests(gate.GateBase):

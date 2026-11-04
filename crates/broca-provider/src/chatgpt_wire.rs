@@ -74,6 +74,7 @@ impl ChatgptWire {
         &self,
         body: &mut Value,
         opts: &broca_protocol::CallOptions,
+        aliases: &std::collections::BTreeMap<String, String>,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) {
         let instructions = body.as_object_mut().unwrap().remove("instructions");
@@ -112,7 +113,11 @@ impl ChatgptWire {
         let object = body.as_object_mut().unwrap();
         object.entry("tools").or_insert_with(|| json!([]));
         object.entry("tool_choice").or_insert_with(|| {
-            let names = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
+            let names = crate::tool_name_alias::ToolNameMap::build_with_aliases(
+                &opts.tools,
+                &opts.prompt,
+                aliases,
+            );
             crate::families::openai_responses::convert_tool_choice(&opts.tool_choice, &names)
         });
         // The catalog has no authoritative summary/default effort/verbosity facts. Keep

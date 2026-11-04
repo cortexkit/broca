@@ -15,6 +15,9 @@ required-features = ["live"]
 test-attachments = ["broca-core/test-attachments"]
 # E2E-only virtual retry waits; keeps transport retry decisions real without waiting out backoff.
 test-harness = []
+# Exhaustive in-process power-loss matrix. Linux preflight runs libtest on 16 cores;
+# native release lanes leave this feature off.
+portable-power-loss = ["live", "test-harness"]
 # The (A) cross-process bench fixture (arm3 producer). OFF by default so the
 # production provider binary carries neither the bench code nor broca-replay.
 bench = ["dep:broca-replay", "dep:subc-protocol", "dep:subc-transport"]
@@ -78,6 +81,7 @@ tokio-tungstenite = { workspace = true, optional = true }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
 
 [dev-dependencies]
+proptest = { version = "1.11", default-features = false, features = ["std"] }
 broca-wal-reader = { path = "../broca-wal-reader" }
 broca-module-serve = { path = "../broca-module-serve" }
 broca-crash-harness = { path = "../broca-crash-harness" }

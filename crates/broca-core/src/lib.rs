@@ -20,11 +20,14 @@ pub mod cache_warm;
 pub mod capability;
 pub mod clock;
 pub mod compaction;
+pub mod compaction_v2;
 pub mod consent;
 pub mod context;
 pub mod delivery_order;
+pub mod display_facts;
 pub mod durability_counters;
 pub mod head;
+pub use head::{is_mode3_log, mode3_log_from_wal};
 pub mod hooks;
 pub mod import;
 pub mod input_budget;
@@ -34,7 +37,9 @@ pub mod media_request;
 pub mod media_store;
 pub mod media_uploads;
 pub mod media_validation;
+pub mod message_id;
 pub mod message_times;
+pub use message_id::{message_mid, position_of_mid};
 pub mod output_reservation;
 pub mod placement;
 pub mod projection;
@@ -44,9 +49,13 @@ pub mod projection_plan;
 mod projection_plan_tests;
 pub mod provider;
 pub mod queue;
+pub mod recovery_close_out;
 pub mod refusal_fallback;
 pub mod render;
 pub mod replay;
+pub mod served_history;
+pub use served_history::ServedHistory;
+
 pub use context::StorePageReadError;
 pub use replay::RunAttribution;
 pub mod resume;
@@ -91,9 +100,10 @@ pub use context::{
     read_session_page_owned_with_dispatches, record_time_ms, replay_transcript,
     resume_state_from_store, select_held_episodes, tool_call_dispatches, tool_call_key,
     AdmissionStoreSnapshot, ExportCursor, ExportError, ExportFact, ExportIndex, ExportPage,
-    HeldEpisode, HeldPrefix, HeldRowsRequest, MaterializedStore, MissingExportRun, Persister,
-    RunIndex, RunIndexAttribution, RunIndexRow, RunIndexState, SessionReadLineageState,
-    SessionReadMessage, SessionReadPage, SessionReadReason, SessionReadStateKind, SessionStore,
+    HeldEpisode, HeldPrefix, HeldRowsRequest, ImportedRunExclusions, MaterializedStore,
+    MissingExportRun, Persister, RecoveryDiscovery, RunIndex, RunIndexAttribution, RunIndexRow,
+    RunIndexState, SessionInventory, SessionReadLineageState, SessionReadMessage, SessionReadPage,
+    SessionReadReason, SessionReadStateKind, SessionRefResolver, SessionRefs, SessionStore,
     StorePageRow, StorePageSnapshot, StorePrefix, TagLocation, ToolCallDispatch, WithdrawalRun,
     SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
@@ -170,6 +180,11 @@ pub use wal_writer::{
     SESSION_PROJECTION_INCOMPLETE,
 };
 
+mod account_limit_pause;
+pub use account_limit_pause::{
+    account_limit_pause_declined, account_limit_stale_resets, session_account_cache_expiry_ms,
+    SameAccountWait,
+};
 pub mod keep_warm;
 pub mod keep_warm_wait;
 mod plan_system;

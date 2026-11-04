@@ -135,6 +135,8 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -154,6 +156,9 @@ impl Fixture {
                 session: session.clone(),
                 ts_ms: ts,
                 config: Box::new(RunConfig {
+                    global_system: None,
+                    route_decision_id: None,
+                    account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,
                     computed_tags: None,
@@ -1294,6 +1299,7 @@ async fn fold_send_age_refold_reads_post_append_member() {
         }),
     ]]);
     let req = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -1977,6 +1983,7 @@ fn a_steered_session_folds_and_extracts_with_its_gate() {
         wal.append(
             1,
             &WalRecord::Steered {
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 retention: None,

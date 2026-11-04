@@ -21,7 +21,8 @@ case "$mode" in
       echo 'integration inventory is empty or differs from independent libtest discovery' >&2
       exit 1
     fi
-    cargo nextest archive --locked --workspace "${cargo_feature_args[@]}" "${target_args[@]}" --archive-file "$archive"
+    # Bash 3.2 treats an empty array as unset under nounset; omit optional words.
+    cargo nextest archive --locked --workspace "${cargo_feature_args[@]}" ${target_args[@]+"${target_args[@]}"} --archive-file "$archive"
     ;;
   run)
     partition="${3:-}"

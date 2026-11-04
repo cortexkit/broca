@@ -20,13 +20,15 @@ pub const LLM_RUNNER_V1: &str = "llm-runner/v1";
 pub use cortexkit_role_llm_runner::ops::SEND_STATUS as OP_SEND_STATUS;
 pub use cortexkit_role_llm_runner::send_status::SendStatusRequest;
 
+/// Alias for `send.status`, allowing llm-runner 0.8 callers to use its renamed operation
+/// while broca retains the pinned request and reply contract.
+pub const OP_SESSION_SEND_STATUS: &str = "session.send_status";
+
 pub const OP_ROLE_DESCRIBE: &str = "role.describe";
 pub const OP_SESSION_HEAD: &str = "session.head";
 pub const OP_RUN_RESULT: &str = "run.result";
 pub const OP_RUN_TOOL_CALLS: &str = "run.tool_calls";
 pub const OP_SESSION_BASELINE: &str = "session.baseline";
-/// The capability group of a runner that tags every stored part and serves `session.resolve`.
-pub use cortexkit_role_llm_runner::capabilities::TAGS as TAGS_CAPABILITY;
 
 /// The `role.describe` capability (a broca extension; the llm-runner role has no group for it)
 /// saying a tool declared directly on `session.send` may carry `reply: {max_ms}`, and that broca
@@ -34,10 +36,6 @@ pub use cortexkit_role_llm_runner::capabilities::TAGS as TAGS_CAPABILITY;
 /// value frozen with the run. A caller whose tool holds a call for minutes refuses to start on a runner that does
 /// not list it, since such a runner would cut those calls and end the run interrupted.
 pub const SEND_TOOL_REPLY_BOUND_CAPABILITY: &str = "send_tool_reply_bound";
-/// `session.resolve` names a tag no part of the session's transcript holds.
-pub use cortexkit_role_llm_runner::errors::UNKNOWN_TAG;
-/// Answer one runner-tagged part's stored text, or a character range of it.
-pub use cortexkit_role_llm_runner::ops::SESSION_RESOLVE as OP_SESSION_RESOLVE;
 
 pub use broca_protocol::READ_REPLY_MAX_BYTES;
 /// The `session.read` byte cap a page stops at when the request names none.
@@ -48,12 +46,11 @@ pub const READ_MAXIMUM_MAX_BYTES: u64 = READ_REPLY_MAX_BYTES;
 /// A send whose delivery mode, or every mode in its ordered list, is undeclared.
 /// `detail.delivery` preserves the delivery value the caller sent.
 pub use cortexkit_role_llm_runner::errors::DELIVERY_UNSUPPORTED;
+/// A paging version no longer names the session's active history.
+pub use cortexkit_role_llm_runner::errors::HISTORY_CHANGED;
 /// A request member is malformed, unknown, or combined with one it excludes. `detail.field`
 /// names it.
 pub use cortexkit_role_llm_runner::errors::INVALID_PARAMS;
-/// A read names a lineage that is not the session's current one. The caller re-reads from the
-/// tail.
-pub use cortexkit_role_llm_runner::errors::LINEAGE_CHANGED;
 /// A terminal refusal when an indivisible `session.read` reply exceeds the transport frame
 /// limit. The detail is `cortexkit_role_llm_runner::errors::ReplyTooLargeDetail`.
 pub use cortexkit_role_llm_runner::errors::REPLY_TOO_LARGE;
@@ -128,33 +125,24 @@ pub struct LastRunState {
     pub reason: Option<String>,
 }
 
-/// `session.head`: a session's head without message bodies. A session never written has no
-/// lineage yet and answers every member absent; an answer with `lineage_id` carries
-/// `updated_at`, the time of the session's newest durable write in milliseconds since the Unix
-/// epoch.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `session.head`: snapshot identity is always present, even before the first log exists.
+/// Other metadata describes the session's newest durable write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadResponse {
+    #[serde(skip)]
+    pub mode3: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_rich_ui: Option<cortexkit_role_llm_runner::rich_ui::RichUiStamp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub lineage_id: Option<String>,
     /// The ordinal of the newest message; absent on an empty transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_ordinal: Option<u64>,
-    /// The current lineage's first ordinal (llm-runner 0.5.0 §4.3, §4.5). Present whenever
-    /// `lineage_id` is. broca never applies a compaction view that carries a cut (it refuses
-    /// such a view `cut_unsupported`), so its lineage always starts at ordinal 0 and the answer
-    /// never carries a `cut`.
+    /// Public ordinals start at 1; model compaction never cuts read visibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_ordinal: Option<u64>,
-    /// The version of the session's visible history (llm-runner 0.5.0 §4.3). Present whenever
-    /// `lineage_id` is. Always 0: within one WAL broca has no revert and no recovery that
-    /// rewrites a written message, so nothing it has served is ever taken back or changed (an
-    /// append does not move the version). A session
-    /// whose WAL was deleted and later written again is the one case this misstates; see
-    /// `.cortexkit/internal-docs/designs/lineage-and-history-0.5.md`, "history_version floor".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub history_version: Option<u64>,
+    /// A high-water version of the active history; appends never change it.
+    pub history_version: u64,
     /// The last durable control unit, the same cursor a `session.read` page carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<CursorWire>,
@@ -182,12 +170,35 @@ pub struct HeadResponse {
     pub usage: Option<cortexkit_role_llm_runner::usage::SessionUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<cortexkit_role_llm_runner::read::HeadSender>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub incarnation: Option<String>,
+    pub incarnation: String,
     /// Content-free retry metadata from the terminal error of `last_run_state`.
     /// Paused, interrupted and successful runs never carry an error summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_error: Option<cortexkit_role_llm_runner::read::LastRunError>,
+}
+
+impl Default for HeadResponse {
+    fn default() -> Self {
+        Self {
+            mode3: false,
+            last_run_rich_ui: None,
+            lineage_id: None,
+            last_ordinal: None,
+            first_ordinal: None,
+            history_version: 0,
+            head: None,
+            last_run_state: None,
+            updated_at: None,
+            cache: None,
+            title: None,
+            input: None,
+            model: None,
+            usage: None,
+            sender: None,
+            incarnation: "unwritten".into(),
+            last_run_error: None,
+        }
+    }
 }
 
 /// Default-off `session.head.input`. Modalities and MIME types are omitted because
@@ -214,8 +225,8 @@ pub struct FinalMessage {
     pub text: String,
 }
 
-/// Accept older status fixtures that predate the usage counters while keeping the published
-/// role type as the only representation of run usage.
+/// Accept older status fixtures that predate the usage counters. The shared role totals
+/// retain their representation, with broca's optional generation measurements alongside them.
 pub(crate) fn deserialize_optional_run_usage<'de, D>(
     deserializer: D,
 ) -> Result<Option<broca_protocol::usage::RunUsage>, D::Error>
@@ -260,6 +271,8 @@ fn deserialize_run_usage_value(
 /// as an open string. A run that has not ended carries no `final_message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResultResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<cortexkit_role_llm_runner::finish::Finish>,
     /// The credential id frozen at admission, as in `run.status`; never an empty string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_selection: Option<String>,
@@ -337,6 +350,7 @@ pub use cortexkit_role_llm_runner::capabilities::RUN_TOOL_CALLS as RUN_TOOL_CALL
 /// Discovery and caller grants use the same supported delivery modes.
 pub const DELIVERY_MODES: &[cortexkit_role_llm_runner::delivery_order::Mode] = &[
     cortexkit_role_llm_runner::delivery_order::Mode::ToolResult,
+    cortexkit_role_llm_runner::delivery_order::Mode::TurnSystem,
     cortexkit_role_llm_runner::delivery_order::Mode::Steer,
     cortexkit_role_llm_runner::delivery_order::Mode::IdleStart,
 ];
@@ -345,7 +359,7 @@ pub const DELIVERY_MODES: &[cortexkit_role_llm_runner::delivery_order::Mode] = &
 /// compaction, retention or hook records alone does not promise to execute those writers.
 pub fn broca_role_describe_with_writers(
     implementation_version: &str,
-    compaction_writer: bool,
+    _compaction_writer: bool,
     retention_writer: bool,
     hook_writer: bool,
 ) -> RoleDescribeResponse {
@@ -368,8 +382,9 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::ops::SESSION_REFRESH,
         cortexkit_role_llm_runner::ops::SESSION_REFRESH_POLICY,
         cortexkit_role_llm_runner::ops::SESSION_FLUSH_PREFIX,
-        OP_SESSION_RESOLVE,
+        cortexkit_role_llm_runner::ops::SESSION_SEND_STATUS,
         OP_SEND_STATUS,
+        OP_SESSION_SEND_STATUS,
     ]
     .map(String::from)
     .to_vec();
@@ -380,15 +395,18 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::HOST_HISTORY,
         cortexkit_role_llm_runner::capabilities::HISTORY_DISPLAY,
         cortexkit_role_llm_runner::capabilities::RICH_UI_STAMP,
+        cortexkit_role_llm_runner::capabilities::READ_DISPLAY_FACTS,
         cortexkit_role_llm_runner::capabilities::CALL_IDENTITY,
         cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
         cortexkit_role_llm_runner::capabilities::RUN_STATUS,
+        cortexkit_role_llm_runner::capabilities::FINISH_REASON,
         cortexkit_role_llm_runner::capabilities::HELD_CALLS,
         cortexkit_role_llm_runner::capabilities::RUN_USAGE,
         cortexkit_role_llm_runner::capabilities::SESSION_USAGE,
         cortexkit_role_llm_runner::capabilities::HEAD_SENDER,
         cortexkit_role_llm_runner::capabilities::RUN_CANCEL,
+        cortexkit_role_llm_runner::capabilities::RUN_CANCEL_BY_INTERRUPT,
         cortexkit_role_llm_runner::capabilities::RETRACT,
         cortexkit_role_llm_runner::capabilities::RETRACT_OWN_SEND,
         "dispatch_attribution",
@@ -409,25 +427,20 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::SEND_STATUS,
         cortexkit_role_llm_runner::capabilities::MAX_STEPS,
         cortexkit_role_llm_runner::capabilities::NO_TOOLS,
-        TAGS_CAPABILITY,
         RUN_TOOL_CALLS_GROUP,
         // A mid-session plan change: refresh, its policy and a prefix flush. All three
         // ops are served together, owner-only; the group is declared only then.
         cortexkit_role_llm_runner::capabilities::SESSION_CHANGE,
-        // Ordered sends can land beside tool results, at a running step boundary, or when an
-        // idle session starts. `turn_system` has no renderer and is deliberately not advertised.
+        // Ordered sends can land beside tool results, as turn-scoped template text on a
+        // confirmed route, at a running step boundary, or when an idle session starts.
         DELIVERY_ORDER_GROUP,
-        // A send's client_message_id lives beside its body and is exposed only on display rows.
+        cortexkit_role_llm_runner::capabilities::SENDER_SUCCESSION,
+        // Client identity belongs to the display envelope, never to a model-visible message.
         cortexkit_role_llm_runner::capabilities::CLIENT_MESSAGE_ID,
+        cortexkit_role_llm_runner::capabilities::MESSAGE_SENDERS,
     ]
     .map(String::from)
     .to_vec();
-    if compaction_writer {
-        capabilities.extend(["compaction".into(), "model_view".into()]);
-        // A compaction provider's Setup checkpoint for a session moved from standalone Magic
-        // Context (as `ck-import` moves OpenCode sessions) anchors the session's tag numbers.
-        capabilities.push(cortexkit_role_llm_runner::capabilities::TAG_CHECKPOINT.into());
-    }
     if hook_writer {
         capabilities.push(cortexkit_role_llm_runner::capabilities::ORDERED_HOOK_PHASES.into());
     }
@@ -477,6 +490,12 @@ pub fn broca_role_describe_with_writers(
             2_592_000, 3_600_000,
         ));
     }
+    if broca_protocol::service_tier_enabled() {
+        describe
+            .capabilities
+            .push(cortexkit_role_llm_runner::capabilities::SERVICE_TIER.into());
+        describe = describe.with_service_tiers(service_tiers());
+    }
     let mut response = RoleDescribeResponse {
         role: describe,
         session_class: SessionClassCapability {
@@ -497,9 +516,29 @@ pub fn broca_role_describe_with_writers(
     response
 }
 
-pub use cortexkit_role_llm_runner::tags::{
-    CharRange, ResolveReply as ResolveResponse, ResolveRequest as ResolveParams, RANGE_FIELD,
-};
+/// Family support is an upper bound; admission also requires that model's priced mode.
+fn service_tiers() -> cortexkit_role_llm_runner::service_tier::ServiceTiers {
+    use cortexkit_role_llm_runner::service_tier::{Served, ServiceTier, Support};
+    [
+        (
+            "openai.responses",
+            vec![ServiceTier::Fast, ServiceTier::Ultrafast],
+        ),
+        (
+            "openai.chatgpt_responses",
+            vec![ServiceTier::Fast, ServiceTier::Ultrafast],
+        ),
+        (
+            "openai.chat_completions",
+            vec![ServiceTier::Fast, ServiceTier::Ultrafast],
+        ),
+        ("anthropic.messages", vec![ServiceTier::Fast]),
+        ("google.generate_content", vec![ServiceTier::Fast]),
+    ]
+    .into_iter()
+    .map(|(wire, levels)| (wire.into(), Support::new(levels, Served::Reported)))
+    .collect()
+}
 
 /// A dropped ordered send is a terminal send state, not a request refusal: retries must
 /// report the durable outcome without inviting the sender to submit the text again.
@@ -508,11 +547,6 @@ pub fn ordered_send_ended_reply(
     outcome: &str,
 ) -> cortexkit_role_llm_runner::send::SendReply {
     cortexkit_role_llm_runner::send::SendReply::new(outcome).with_submission_id(submission_id)
-}
-
-/// `text`, or its `range` of characters. `None` when the range is inverted or ends past the text.
-pub fn resolve_range(text: &str, range: Option<CharRange>) -> Option<String> {
-    cortexkit_role_llm_runner::tags::slice(text, range.as_ref()).ok()
 }
 
 /// `session.baseline` params: none. Strict.
@@ -730,16 +764,17 @@ mod pinned_reply_bytes {
     fn session_head_bytes_are_pinned() {
         assert_golden(
             HeadResponse {
+                mode3: false,
                 last_run_rich_ui: None,
                 model: None,
                 usage: None,
                 sender: None,
-                incarnation: None,
+                incarnation: "00112233445566778899aabbccddeeff".into(),
                 title: None,
-                lineage_id: Some("lin-1".into()),
-                last_ordinal: Some(3),
-                first_ordinal: None,
-                history_version: None,
+                lineage_id: None,
+                last_ordinal: Some(4),
+                first_ordinal: Some(1),
+                history_version: 1,
                 head: Some(CursorWire {
                     wal_seq: 12,
                     sub_index: 0,
@@ -765,16 +800,17 @@ mod pinned_reply_bytes {
     fn session_head_with_a_title_bytes_are_pinned() {
         assert_golden(
             HeadResponse {
+                mode3: false,
                 last_run_rich_ui: None,
                 model: None,
                 usage: None,
                 sender: None,
-                incarnation: None,
+                incarnation: "00112233445566778899aabbccddeeff".into(),
                 title: Some("Fix the login bug".into()),
-                lineage_id: Some("lin-1".into()),
-                last_ordinal: Some(3),
-                first_ordinal: None,
-                history_version: None,
+                lineage_id: None,
+                last_ordinal: Some(4),
+                first_ordinal: Some(1),
+                history_version: 1,
                 head: Some(CursorWire {
                     wal_seq: 12,
                     sub_index: 0,
@@ -794,23 +830,21 @@ mod pinned_reply_bytes {
         );
     }
 
-    /// `session.head` as this build serves a written session (llm-runner 0.5.1 §4.3): the
-    /// lineage starts at ordinal 0 with no cut, `history_version` is 0 (see the field's comment
-    /// for the one case it misstates), and `input` says no send can carry an attachment. The
-    /// answer is `HeadMeta::lineage_consistent`, and decodes as the role's `HeadMeta`.
+    /// Written heads carry the required snapshot pair and one-based ordinal bounds.
     #[test]
-    fn session_head_lineage_members_are_pinned() {
+    fn session_head_snapshot_members_are_pinned() {
         let head = HeadResponse {
+            mode3: false,
             last_run_rich_ui: None,
             model: None,
             usage: None,
             sender: None,
-            incarnation: None,
+            incarnation: "00112233445566778899aabbccddeeff".into(),
             title: None,
-            lineage_id: Some("lin-1".into()),
-            last_ordinal: Some(3),
-            first_ordinal: Some(0),
-            history_version: Some(0),
+            lineage_id: None,
+            last_ordinal: Some(4),
+            first_ordinal: Some(1),
+            history_version: 1,
             head: Some(CursorWire {
                 wal_seq: 12,
                 sub_index: 0,
@@ -828,14 +862,13 @@ mod pinned_reply_bytes {
         assert_golden(
             head.clone(),
             "session_head.lineage.json",
-            "ee91bd7075fde2a4871ddc490585fd1d9975838ba8f2dae9759f445a12233b45",
+            "8a8c4852b0c2330444aa8b58203db1ca3f64488a246a02b1e346d6e9fdc7af91",
         );
         let meta: cortexkit_role_llm_runner::read::HeadMeta =
             serde_json::from_value(serde_json::to_value(&head).unwrap()).unwrap();
-        assert!(meta.lineage_consistent(), "{meta:?}");
-        assert_eq!(meta.first_ordinal, Some(0));
-        assert_eq!(meta.cut, None);
-        assert_eq!(meta.history_version, Some(0));
+        assert!(meta.snapshot_consistent(), "{meta:?}");
+        assert_eq!(meta.first_ordinal, Some(1));
+        assert_eq!(meta.history_version, 1);
         assert_eq!(
             meta.input.and_then(|input| input.carries_attachments()),
             Some(false)
@@ -1125,6 +1158,9 @@ mod pinned_reply_bytes {
         use cortexkit_role_llm_runner::{capabilities, describe::check_describe};
         let encoded = serde_json::to_value(broca_role_describe("test")).unwrap();
         let role = check_describe(&encoded).unwrap();
+        for op in [OP_SEND_STATUS, OP_SESSION_SEND_STATUS] {
+            assert!(role.majors[0].ops.iter().any(|name| name == op), "{op}");
+        }
         for group in [
             capabilities::SEND_STATUS,
             capabilities::MAX_STEPS,
@@ -1143,7 +1179,7 @@ mod pinned_reply_bytes {
         let encoded = serde_json::to_value(broca_role_describe("test")).unwrap();
         assert_eq!(
             encoded["delivery_order_modes"],
-            serde_json::json!(["tool_result", "steer", "idle_start"])
+            serde_json::json!(["tool_result", "turn_system", "steer", "idle_start"])
         );
     }
 
@@ -1216,7 +1252,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "307b50e8217d3a2d21ed6a03455f35c13dcc2ca64aefb23c873df5f2b114222d",
+            "3882df4442ce703fd39aa886adc82df4282e0c977ade5f5f172e56dad689b176",
         );
     }
 
@@ -1261,15 +1297,17 @@ mod pinned_reply_bytes {
     }
 
     #[test]
-    fn compaction_and_model_view_follow_the_installed_bus_writer() {
+    fn retired_compaction_groups_are_not_advertised_with_the_writer_installed() {
+        // llm-runner 0.8 retired the `compaction` and `model_view` groups: a compaction
+        // provider finds broca through the `compaction-runner/v1` module role instead.
         use cortexkit_role_llm_runner::describe::check_describe;
         let encoded =
             serde_json::to_value(broca_role_describe_with_writers("test", true, false, false))
                 .unwrap();
         check_describe(&encoded).unwrap_or_else(|error| panic!("{error:?}"));
         let capabilities = encoded["capabilities"].as_array().unwrap();
-        assert!(capabilities.contains(&serde_json::json!("compaction")));
-        assert!(capabilities.contains(&serde_json::json!("model_view")));
+        assert!(!capabilities.contains(&serde_json::json!("compaction")));
+        assert!(!capabilities.contains(&serde_json::json!("model_view")));
         assert!(!encoded["majors"][0]["ops"]
             .as_array()
             .unwrap()
@@ -1309,8 +1347,8 @@ mod pinned_reply_bytes {
                     } else {
                         assert!(encoded.get("step_hooks").is_none(), "{encoded}");
                     }
-                    assert_eq!(caps.contains(&serde_json::json!("compaction")), compaction);
-                    assert_eq!(caps.contains(&serde_json::json!("model_view")), compaction);
+                    assert!(!caps.contains(&serde_json::json!("compaction")));
+                    assert!(!caps.contains(&serde_json::json!("model_view")));
                     assert!(!encoded["majors"][0]["ops"]
                         .as_array()
                         .unwrap()
@@ -1327,16 +1365,17 @@ mod pinned_reply_bytes {
     fn cache_facts_on_head_and_baseline_are_pinned() {
         assert_golden(
             HeadResponse {
+                mode3: false,
                 last_run_rich_ui: None,
                 model: None,
                 usage: None,
                 sender: None,
-                incarnation: None,
+                incarnation: "00112233445566778899aabbccddeeff".into(),
                 title: None,
-                lineage_id: Some("lin-1".into()),
-                last_ordinal: Some(3),
-                first_ordinal: None,
-                history_version: None,
+                lineage_id: None,
+                last_ordinal: Some(4),
+                first_ordinal: Some(1),
+                history_version: 1,
                 head: Some(CursorWire {
                     wal_seq: 12,
                     sub_index: 0,
@@ -1376,13 +1415,13 @@ mod pinned_reply_bytes {
     }
 
     const SESSION_HEAD_CACHE_SHA256: &str =
-        "cabd121e8604ed081860ea7ed7f5f35879797212a069ddda2f612cefc621d740";
+        "889e38341e781a06dbd65a9c4eb59155ca628238a4d41ed1aa207986fad64985";
     const SESSION_BASELINE_CACHE_SHA256: &str =
         "653da81354c090f96432d86dc52cc7a43f346b0eea6289dbff47a001778a54d6";
     const SESSION_HEAD_TITLE_SHA256: &str =
-        "96eeaa6374e9f8820c01ea8d4e7366dea00b1a8dc190af701fbf8c86e4c4b37b";
+        "596b86b8f2ce89e99a82094677717c62d4fbdf7302523a92c668b46bebaca6ea";
     const SESSION_HEAD_SHA256: &str =
-        "aec01aab3542523cb8dacf5407a659a9b822e836cac01f00125caa253614467a";
+        "ca9502e1b2d457284d515de64d12895c64917d1e60fe1bb39e99d21a71ff6452";
     const SESSION_BASELINE_SHA256: &str =
         "e450a5b79e0b17af513f8c7c07a9be821e87134d03359e27e75c11e8282c7df1";
     const ADMISSION_REPLY_SHA256: &str =
@@ -1394,7 +1433,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "48e03e316d1d829bb6686fd45734713150e5c41171d3834c8e146978dea11b0b";
+        "5180347a01e1e3264e72546475b746aad42dc76c23e34f6a71c077c919536a29";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

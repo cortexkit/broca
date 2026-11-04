@@ -54,7 +54,9 @@ struct Script {
 }
 impl Script {
     fn records(&self) -> Vec<FramedRecord> {
-        self.wal.read_records(&self.session).unwrap()
+        let state = self.wal.root().parent().expect("the rig's state root");
+        let identity = broca_test_support::resolve_session_address(state, &self.session).unwrap();
+        self.wal.read_records(&identity).unwrap()
     }
     fn log(&self, event: Value) {
         if !matches!(
@@ -102,7 +104,7 @@ impl ModuleHandler for Tools {
         self.0.log(json!({"event":method, "params":params}));
         match method {
             "role.describe" => response(json!({"majors":[
-                {"version":"step-transform-provider/v1", "ops":["role.describe","transform.declare","transform.hook"], "stability":"alpha"},
+                {"version":"step-transform-provider/v2", "ops":["role.describe","transform.declare","transform.hook"], "stability":"alpha"},
                 {"version":"tool-provider/v1", "ops":["role.describe","tool.catalog"], "stability":"alpha"}
             ], "implementation_version":"test", "capabilities":[]})),
             "transform.declare" => response(json!({"subscriptions":subscriptions()})),

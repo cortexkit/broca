@@ -553,6 +553,77 @@ fn released_envelope<'de, D: serde::Deserializer<'de>>(
     Ok(Box::new(envelope))
 }
 
+/// An accepted mode-3 view. Edits stay raw JSON so provider extensions, key order and number
+/// spellings survive a reader round trip without depending on the compaction library.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactionViewV2 {
+    pub version: u64,
+    pub checksum: String,
+    pub edits: Vec<StoredViewEdit>,
+}
+
+/// One edit in rebuilt view order. A previous index names the latest earlier accepted view,
+/// whether or not it was applied. The writer may reference only byte-identical edits.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StoredViewEdit {
+    Full {
+        edit: Box<serde_json::value::RawValue>,
+    },
+    Previous {
+        index: u32,
+    },
+}
+
+impl PartialEq for StoredViewEdit {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Full { edit: a }, Self::Full { edit: b }) => a.get() == b.get(),
+            (Self::Previous { index: a }, Self::Previous { index: b }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredViewEdit {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Internally tagged enum buffering cannot retain RawValue bytes. Parse the outer
+        // object directly from its raw JSON instead of buffering the edit into serde values.
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        struct Kind {
+            kind: String,
+        }
+        let kind: Kind = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+        match kind.kind.as_str() {
+            "full" => {
+                #[derive(Deserialize)]
+                struct Full {
+                    edit: Box<serde_json::value::RawValue>,
+                }
+                let full: Full =
+                    serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+                Ok(Self::Full { edit: full.edit })
+            }
+            "previous" => {
+                #[derive(Deserialize)]
+                struct Previous {
+                    index: u32,
+                }
+                let previous: Previous =
+                    serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+                Ok(Self::Previous {
+                    index: previous.index,
+                })
+            }
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["full", "previous"],
+            )),
+        }
+    }
+}
+
 /// One durable record. Internally tagged (`{"type": …}`) for a self-describing,
 /// debuggable log.
 ///
@@ -581,9 +652,47 @@ fn released_envelope<'de, D: serde::Deserializer<'de>>(
 /// sites pick out a few variants and end in `_ =>`; those skip `Unknown` by construction and
 /// will also say nothing when a variant is added. Do not add new wildcard arms to silence
 /// the compiler at an exhaustive site: name the variant.
+// The gap between the largest variant (`RunStarted`, with its frozen config and scope) and the
+// small ones exceeds clippy's threshold on the Windows target, where some of those fields are
+// larger. Boxing `RunStarted` would touch every constructor of the most-written record; the
+// cost it would save is the full enum size held per record during a whole-log replay, which
+// predates this allow and belongs to the replay redesign, not to a field-by-field patch.
+#[allow(clippy::large_enum_variant)]
+// cost it would save is the full enum size held per record during a whole-log replay. That
+// memory tradeoff needs a replay-wide change, not a field-by-field patch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(remote = "Self", tag = "type", rename_all = "snake_case")]
 pub enum WalRecord {
+    /// Durable attribution of data removed by overhaul recovery. Readers must
+    /// retain these call tombstones even when a later episode starts.
+    RecoveryCut {
+        #[serde(flatten)]
+        recovery: Box<crate::recovery::RecoveryCut>,
+    },
+    /// A prompt-free Unknown terminal for an attributed call whose model turn
+    /// was removed. Ownership comes from preserved recovery evidence, never a
+    /// reconstructed RunStarted or the episode current when this is appended.
+    /// Unknown batch/step identities remain separate entries. When their exact
+    /// effect cannot be proven, duplicate Unknown results are safer than losing
+    /// an attributable call by merging it with another step's same-ID terminal.
+    RecoveryCallClosed {
+        cut_id: String,
+        run_id: RunId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<BatchId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_id: Option<StepId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_key: Option<String>,
+        tool_call_id: ToolCallId,
+        outcome: crate::recovery::RecoveryOutcome,
+        /// A plain outcome_unknown error, never restored media or successful output.
+        #[serde(
+            serialize_with = "serialize_recovery_unknown",
+            deserialize_with = "deserialize_recovery_unknown"
+        )]
+        result: Arc<ToolResult>,
+    },
     /// A new writer has durably taken responsibility for this log's recovered prefix.
     WriterOpened {
         writer_id: [u8; 16],
@@ -615,6 +724,9 @@ pub enum WalRecord {
     /// into the immutable conversation prefix and opens a new one. It is
     /// run_id-authoritative.
     RunStarted {
+        /// Attested route sender for display only, independent of the execution principal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_by: Option<BindPrincipal>,
         /// Admission time of the input, preserved across queue drain and restart.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         written_at_ms: Option<u64>,
@@ -746,6 +858,11 @@ pub enum WalRecord {
         /// can ignore this optional field and continue rendering in their original order.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         marker_order_version: Option<u32>,
+        /// The compaction render-plan version frozen for a mode-3 run. Reader support ships
+        /// before writing: this release decodes but does not apply it. When present it requires
+        /// `compaction-v2/v1`, so a build without the reader refuses the log by feature name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_plan_version: Option<u32>,
         /// The tool catalogs and system text the session's first send fetched from its
         /// providers, frozen and repeated on every later episode, because a fold can take the
         /// first `RunStarted` out of the live WAL and every episode must render from the same
@@ -783,6 +900,9 @@ pub enum WalRecord {
         /// Optional so an older-shaped record still deserializes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish_reason: Option<FinishReason>,
+        /// Provider-native terminal token for display only; absent on older records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_finish_reason: Option<String>,
         #[serde(default)]
         retries_used: u32,
         /// The service tier the provider REPORTED serving this step at, verbatim as it spelled
@@ -855,6 +975,9 @@ pub enum WalRecord {
     /// skip [`WalRecord::Unknown`], so a WAL with these records removed reads as the same
     /// session. `retries_used` on `ModelStepFinished` stays the authoritative retry count.
     ModelAttemptFinished {
+        /// Source classification retained only on runs admitted with timed account recovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_limit_disposition: Option<broca_protocol::provider::AccountLimitDisposition>,
         /// The only billing join key; absent on legacy, non-billing records.
         #[serde(
             default,
@@ -1233,11 +1356,9 @@ pub enum WalRecord {
         at: RunCancelAt,
     },
     /// Episode PAUSE — a NON-terminal durable record (distinct from `RunFinished`).
-    /// Written when a run cannot proceed but is RESUMABLE: a mid-run auth failure
-    /// (`needs_reauth`/revoke) pauses the episode rather than ending it, so replay
-    /// continues the SAME run_id after the cause is resolved. Replay treats this as
-    /// `AuthRequired`, never terminal (a terminal would seal a resumable run). Always
-    /// the last record of its episode (no new episode starts until the pause resolves).
+    /// Written when a run cannot proceed but remains resumable: authentication, restart,
+    /// held tools or a timed account limit. Replay continues the same run_id after the cause
+    /// clears; no new episode starts until the pause resolves or is cancelled.
     RunPaused {
         run_id: RunId,
         /// Wall-clock pause time, used as the terminal time when this is the final record.
@@ -1247,6 +1368,9 @@ pub enum WalRecord {
         /// The error detail behind the pause, persisted for `run.status`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ProviderError>,
+        /// Recovery evidence for a timed account pause; absent on every older pause.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_limit: Option<Box<AccountLimitPause>>,
     },
     /// Replaces the episode's initially frozen provider render config after an auth-at-start
     /// pause. This is legal only before the first provider call: the initial credential lookup
@@ -1326,6 +1450,9 @@ pub enum WalRecord {
     /// dropping path. Consume/retract is unambiguous across a crash: the pending set is
     /// `Queued − Retracted − consumed-by-a-RunStarted`.
     Queued {
+        /// Attested route sender for display only; never grants queue ownership.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_by: Option<BindPrincipal>,
         /// Admission time carried into the input record when this send is delivered.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         written_at_ms: Option<u64>,
@@ -1403,6 +1530,9 @@ pub enum WalRecord {
     /// gated frame requiring [`crate::framing::STEER_QUEUE_FEATURE`] (see
     /// [`WalRecord::required_features`]), which such a build refuses as a newer writer.
     Steered {
+        /// Attested route sender for display only; never used to authorize a retry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_by: Option<BindPrincipal>,
         /// Admission time of this input, not the later boundary that places it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         written_at_ms: Option<u64>,
@@ -1463,12 +1593,16 @@ pub enum WalRecord {
         decision: ApprovalDecision,
     },
 
-    /// Written once by each resume of an episode that has no durable terminal, before the
-    /// resume writes anything else or calls anyone: which episode it resumed, from which
+    /// Written once by every resume of an episode that has no durable terminal, including
+    /// after a pause, before any step, tool intent, result or terminal the resume writes.
+    /// Only the resume's own `RunConfigRefrozen` and `RunAuthRefrozen` may precede it: the
+    /// background cache warmer reads this record as "the run is active again" and must already
+    /// have applied the refrozen configuration before sending a warm request. The record says
+    /// which episode resumed, from which
     /// durable record, what it rebuilt from the log without calling a provider or a tool, what
     /// it is about to do again, and which tool calls it found with no recorded outcome.
     ///
-    /// PURELY INFORMATIONAL under the skip contract on this enum: replay, the reconstructed
+    /// Replay, the reconstructed
     /// prompt, projection, the control stream, billing and export all skip it exactly as they
     /// skip [`WalRecord::Unknown`], so an older build that does not know the kind reads the
     /// same session. It never enters a rendered request. The tool results a resume writes for
@@ -1644,6 +1778,27 @@ pub enum WalRecord {
         seq: u64,
         /// The notice's headers, as the contract names and encodes them.
         headers: std::collections::BTreeMap<String, String>,
+    },
+
+    /// A mode-3 view delta, reserved for a later writer. This reader preserves the provider's
+    /// JSON edits and checksum without interpreting them or changing the transcript.
+    CompactionViewV2(CompactionViewV2),
+    /// A mode-3 cut marker, reserved for a later writer. This reader ignores it in all session
+    /// and run projections; its coordinates never renumber transcript messages.
+    CompactionMarker {
+        harness: String,
+        session: String,
+        view_version: u64,
+        first_kept_mid: String,
+        first_kept_ordinal: u64,
+        checkpoint: u64,
+    },
+    /// The accepted mode-3 view selected for a step, including a view the compaction provider
+    /// returned for that request. Content lives in `CompactionViewV2`; this reader applies neither record.
+    CompactionViewAppliedV2 {
+        step_id: u64,
+        version: u64,
+        checksum: String,
     },
 
     // ── calls held for a human's approval (feature `deferred-call/v1`) ──
@@ -1892,6 +2047,66 @@ pub enum WalRecord {
     Unknown,
 }
 
+impl Serialize for WalRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WalRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        struct Tag {
+            #[serde(rename = "type")]
+            kind: String,
+        }
+        let tag: Tag = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+        if tag.kind == "compaction_view_v2" {
+            serde_json::from_str(raw.get())
+                .map(Self::CompactionViewV2)
+                .map_err(serde::de::Error::custom)
+        } else {
+            // Keep the existing tagged decoder for every older record shape. The raw-view
+            // branch bypasses its value buffer, which would discard the edits' original bytes.
+            Self::deserialize(&mut serde_json::Deserializer::from_str(raw.get()))
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+fn is_recovery_unknown(result: &ToolResult) -> bool {
+    result.is_error
+        && matches!(&result.output, broca_protocol::ToolOutput::Error {
+        message, module, code: _, detail, nothing_sent, retry,
+    } if message.starts_with("outcome_unknown") && module.is_none() && detail.is_none()
+        && nothing_sent.is_none() && retry.is_none())
+}
+
+fn serialize_recovery_unknown<S: serde::Serializer>(
+    result: &Arc<ToolResult>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if !is_recovery_unknown(result) {
+        return Err(<S::Error as serde::ser::Error>::custom(
+            "recovery completion result must be a plain outcome_unknown error",
+        ));
+    }
+    result.serialize(serializer)
+}
+
+fn deserialize_recovery_unknown<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Arc<ToolResult>, D::Error> {
+    let result = Arc::<ToolResult>::deserialize(deserializer)?;
+    if !is_recovery_unknown(&result) {
+        return Err(<D::Error as serde::de::Error>::custom(
+            "recovery completion result must be a plain outcome_unknown error",
+        ));
+    }
+    Ok(result)
+}
+
 impl WalRecord {
     /// The WAL record for one provider attempt of `step_id`.
     pub fn model_attempt_finished(step_id: StepId, attempt: ModelAttempt) -> Self {
@@ -1920,6 +2135,7 @@ impl WalRecord {
             account_observation: _,
         } = attempt;
         WalRecord::ModelAttemptFinished {
+            account_limit_disposition: None,
             attempt_id: None,
             reservation: None,
             envelope: None,
@@ -1947,7 +2163,7 @@ impl WalRecord {
         }
     }
 
-    /// Whether every session reader skips this record: a type from a newer build
+    /// Whether conversation and admission readers skip this record: a type from a newer build
     /// ([`WalRecord::Unknown`]) or one this build knows but that carries no session semantics
     /// ([`WalRecord::ModelAttemptFinished`], [`WalRecord::ResumeStarted`]). Sites that pick
     /// "the first/next record that matters" filter on this so an informational record can
@@ -1959,6 +2175,9 @@ impl WalRecord {
                 | WalRecord::WriterOpened { .. }
                 | WalRecord::WriterClosed { .. }
                 | WalRecord::VisibilityLate { .. }
+                | WalRecord::CompactionViewV2 { .. }
+                | WalRecord::CompactionMarker { .. }
+                | WalRecord::CompactionViewAppliedV2 { .. }
                 | WalRecord::ModelAttemptFinished { .. }
                 | WalRecord::AttemptReserved { .. }
                 | WalRecord::AttemptFinished { .. }
@@ -1988,6 +2207,12 @@ impl WalRecord {
     /// on its own, so no caller can write a must-understand value into a frame an older build
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
+        if matches!(
+            self,
+            Self::RecoveryCut { .. } | Self::RecoveryCallClosed { .. }
+        ) {
+            return &[crate::recovery::FEATURE];
+        }
         if matches!(self, Self::VisibilityLate { .. }) {
             return &[crate::head_proof::VISIBILITY_LATE_FEATURE];
         }
@@ -2174,6 +2399,30 @@ impl WalRecord {
         } else {
             base
         };
+        let frozen = match self {
+            Self::RunStarted { config, .. } => Some(&config.frozen_render_config),
+            Self::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => Some(frozen_render_config),
+            _ => None,
+        };
+        let aliases = |config: &Value| {
+            config
+                .get("tool_name_aliases")
+                .and_then(Value::as_object)
+                .is_some_and(|map| !map.is_empty())
+        };
+        let base = if frozen.is_some_and(|config| {
+            aliases(config)
+                || config
+                    .pointer("/refusal_fallback/frozen")
+                    .is_some_and(aliases)
+        }) {
+            with_feature(base, crate::framing::TOOL_NAME_ALIASES_FEATURE)
+        } else {
+            base
+        };
         let base = if self.carries_openrouter_reasoning() {
             with_feature(base, crate::framing::OPENROUTER_REASONING_FEATURE)
         } else {
@@ -2292,6 +2541,44 @@ impl WalRecord {
         };
         let base = if self.carries_billing_vault_facts() {
             with_feature(base, crate::framing::BILL_VAULT_FACTS_FEATURE)
+        } else {
+            base
+        };
+        let base = if matches!(
+            self,
+            Self::RunPaused {
+                reason: PauseReason::AccountLimit,
+                ..
+            } | Self::RunPaused {
+                account_limit: Some(_),
+                ..
+            }
+        ) || matches!(self, Self::RunStarted { config, .. } if config.account_limit_pause)
+            || matches!(
+                self,
+                Self::ModelAttemptFinished {
+                    account_limit_disposition: Some(_),
+                    ..
+                }
+            ) {
+            with_feature(base, crate::framing::ACCOUNT_LIMIT_PAUSE_FEATURE)
+        } else {
+            base
+        };
+        let base = if self.carries_turn_system() {
+            with_feature(base, crate::framing::TURN_SYSTEM_FEATURE)
+        } else {
+            base
+        };
+        let base = if matches!(
+            self,
+            Self::RunStarted {
+                compaction_plan_version,
+                config,
+                ..
+            } if compaction_plan_version.is_some() || config.global_system.is_some()
+        ) {
+            with_feature(base, crate::framing::COMPACTION_V2_FEATURE)
         } else {
             base
         };
@@ -2531,6 +2818,9 @@ impl WalRecord {
             | Self::CompactionRideWait { .. }
             | Self::CompactionRideWaitEnded { .. }
             | Self::CompactionNotice { .. }
+            | Self::CompactionViewV2 { .. }
+            | Self::CompactionMarker { .. }
+            | Self::CompactionViewAppliedV2 { .. }
             | Self::ToolCallDeferred { .. }
             | Self::AwaitingApproval { .. }
             | Self::LateApprovalRecorded { .. }
@@ -2542,6 +2832,8 @@ impl WalRecord {
             | Self::WriterOpened { .. }
             | Self::WriterClosed { .. }
             | Self::VisibilityLate { .. }
+            | Self::RecoveryCut { .. }
+            | Self::RecoveryCallClosed { .. }
             | Self::Unknown => false,
         }
     }
@@ -2650,6 +2942,40 @@ impl WalRecord {
             } => blocks(&assistant_message.content),
             Self::Queued { request, .. } => messages(&request.input),
             Self::Steered { input, .. } => messages(input),
+            Self::CompactionMessage { replacement, .. } => messages(replacement),
+            _ => false,
+        }
+    }
+
+    fn carries_turn_system(&self) -> bool {
+        let messages = |input: &[Message]| input.iter().any(|message| message.turn_system);
+        let hooks_carry = |hooks: &Option<Box<Hooks>>| {
+            hooks.as_ref().is_some_and(|hooks| {
+                hooks
+                    .original
+                    .iter()
+                    .chain(hooks.final_value.iter())
+                    .any(|value| {
+                        value.as_array().is_some_and(|messages| {
+                            messages.iter().any(|message| {
+                                message
+                                    .get("turn_system")
+                                    .and_then(serde_json::Value::as_bool)
+                                    == Some(true)
+                            })
+                        })
+                    })
+            })
+        };
+        match self {
+            Self::RunStarted { input, hooks, .. } | Self::Steered { input, hooks, .. } => {
+                messages(input) || hooks_carry(hooks)
+            }
+            Self::Queued { request, hooks, .. } => messages(&request.input) || hooks_carry(hooks),
+            Self::SendDelivered { input, mode, .. } => {
+                *mode == broca_protocol::DeliveryMode::TurnSystem
+                    || input.as_deref().is_some_and(|input| messages(input))
+            }
             Self::CompactionMessage { replacement, .. } => messages(replacement),
             _ => false,
         }
@@ -2778,6 +3104,9 @@ impl WalRecord {
             WalRecord::CompactionRideWait { .. } | WalRecord::CompactionRideWaitEnded { .. } => {
                 &[crate::framing::COMPACTION_RIDE_WAIT_FEATURE]
             }
+            WalRecord::CompactionViewV2 { .. }
+            | WalRecord::CompactionMarker { .. }
+            | WalRecord::CompactionViewAppliedV2 { .. } => &[crate::framing::COMPACTION_V2_FEATURE],
             WalRecord::ContextCeilingWait { .. }
             | WalRecord::ContextCeilingDecided { .. }
             | WalRecord::RunFinished {
@@ -3111,6 +3440,36 @@ fn view_carries_media_content(view: &OpaqueJson) -> bool {
 
 /// Cancellation points recorded in the WAL. The run.cancel endpoint rejects all other strings
 /// before writing, rather than interpreting an unknown point as immediate cancellation.
+/// The failed request boundary and selection retained by an account-limit pause. The WAL
+/// sequence identifies its failed physical attempt even when no billing reservation is recorded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountLimitPause {
+    pub failed_step: StepId,
+    pub failed_attempt_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<AttemptId>,
+    pub attempt: u32,
+    pub paused_at_ms: u64,
+    pub observed_at_ms: u64,
+    pub auth_method: String,
+    pub credential_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_ref: Option<String>,
+    pub disposition: broca_protocol::provider::AccountLimitDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<f64>,
+    pub resume_not_before_ms: u64,
+    pub request_body_len: u64,
+    pub request_body_sha256: String,
+    pub selection_round: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_routing_check_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunCancelAt {
@@ -3573,6 +3932,12 @@ pub enum SeedOriginKind {
 /// across a run and its resume.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunConfig {
+    /// Caller-owned decision fixed for the run; AuthSelection holds routing's own decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_decision_id: Option<String>,
+    /// Frozen operator consent to automatic same-selection recovery. Omitted on legacy runs.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub account_limit_pause: bool,
     /// Opts a run into the role crate's stable wake-directive grammar. Replay always uses
     /// that grammar with `parse_trailing`; a grammar change needs a new versioned field/name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3658,6 +4023,12 @@ pub struct RunConfig {
     /// run. Must-understand when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computed_tags: Option<ComputedTagRules>,
+    /// Frozen global instructions for a mode-3 run without a fetch plan. Planned
+    /// runs use their own manifest.system_text; legacy runs keep their input layout.
+    /// The compaction-v2 feature protects rollback execution while older readers
+    /// ignore this optional member and continue to read only transcript input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_system: Option<Arc<Vec<Message>>>,
 }
 
 /// A run's frozen computed tag rules (`runner-tags/v2`).
@@ -4073,6 +4444,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4132,6 +4504,9 @@ mod schema_tests {
     #[test]
     fn run_config_tools_arc_keeps_existing_wal_bytes() {
         let config = RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -4233,6 +4608,7 @@ mod schema_tests {
 
     fn user_msg(text: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
@@ -4244,6 +4620,9 @@ mod schema_tests {
 
     fn min_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -4267,6 +4646,38 @@ mod schema_tests {
             stop_when: Vec::new(),
             context_management: None,
         })
+    }
+
+    #[test]
+    fn account_limit_pause_consent_is_optional_and_requires_its_reader() {
+        let mut config = min_config();
+        let legacy = serde_json::to_string(&config).unwrap();
+        assert!(!legacy.contains("account_limit_pause"));
+        assert!(
+            !serde_json::from_str::<RunConfig>(&legacy)
+                .unwrap()
+                .account_limit_pause
+        );
+        config.account_limit_pause = true;
+        assert_eq!(
+            serde_json::to_string(&config).unwrap(),
+            format!("{{\"account_limit_pause\":true,{}", &legacy[1..])
+        );
+        let mut record: WalRecord = serde_json::from_str(
+            include_str!("../tests/fixtures/pre_compaction_records.jsonl")
+                .lines()
+                .find(|line| line.contains("\"type\":\"run_started\""))
+                .unwrap(),
+        )
+        .unwrap();
+        if let WalRecord::RunStarted { config: stored, .. } = &mut record {
+            *stored = config;
+        } else {
+            panic!("fixture has a run start");
+        }
+        assert!(record
+            .required_features()
+            .contains(&crate::framing::ACCOUNT_LIMIT_PAUSE_FEATURE));
     }
 
     #[test]
@@ -4301,6 +4712,8 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4358,6 +4771,8 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4436,6 +4851,7 @@ mod schema_tests {
         // reported. A step whose response reported no tier must keep exactly these bytes, and
         // these bytes must keep decoding to the same record.
         let full = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4459,6 +4875,7 @@ mod schema_tests {
             speed_used: None,
         };
         let bare = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4491,6 +4908,7 @@ mod schema_tests {
     #[test]
     fn old_records_default_retries_used_to_zero() {
         let model = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4533,6 +4951,8 @@ mod schema_tests {
     #[test]
     fn pre_fix_run_started_omits_ts_ms_and_decodes_as_none() {
         let record = WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4587,6 +5007,8 @@ mod schema_tests {
     #[test]
     fn pre_work_class_run_started_bytes_are_pinned() {
         let record = WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4625,6 +5047,8 @@ mod schema_tests {
     #[test]
     fn pre_context_management_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4680,6 +5104,8 @@ mod schema_tests {
     #[test]
     fn pre_variant_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4739,6 +5165,8 @@ mod schema_tests {
     #[test]
     fn pre_service_tier_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4852,6 +5280,8 @@ mod schema_tests {
             let mut config = min_config();
             config.frozen_render_config = frozen_render_config;
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -5016,6 +5446,8 @@ mod schema_tests {
         };
         let records = vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -5040,6 +5472,7 @@ mod schema_tests {
                 submission_id: Some(SubmissionId("sub1".into())),
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -5078,6 +5511,7 @@ mod schema_tests {
                 retries_used: 0,
             },
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r1".into()),
                 ts_ms: None,
                 reason: PauseReason::AuthRequired,
@@ -5109,6 +5543,7 @@ mod schema_tests {
                 caller_text: Some("nudge text".into()),
             },
             WalRecord::Queued {
+                sent_by: None,
                 written_at_ms: None,
                 retention: None,
                 ts_ms: None,
@@ -5120,6 +5555,7 @@ mod schema_tests {
                 delivery: None,
                 submission_id: SubmissionId("sub2".into()),
                 request: Box::new(SubmissionRequest {
+                    route_decision_id: None,
                     service_tier_level: None,
                     staged_uploads: None,
                     content: Vec::new(),
@@ -5216,6 +5652,7 @@ mod schema_tests {
             retries_used: 1,
         };
         let paused = WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r1".into()),
             ts_ms: Some(1_790_000_000_001),
             reason: PauseReason::AuthRequired,
@@ -5361,6 +5798,7 @@ mod schema_tests {
             ),
             (
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r2".into()),
                     ts_ms: Some(1_790_000_000_005),
                     reason: PauseReason::AuthRequired,
@@ -5672,6 +6110,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_preserves_signed_tool_call() {
         let rec = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -5717,6 +6156,7 @@ mod schema_tests {
         assert_eq!(decoded_call, call);
 
         let rec = WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

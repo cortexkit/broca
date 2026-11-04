@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -21,7 +21,7 @@ use broca_protocol::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// How the scripted provider renders a request into the bytes it records.
+/// The scripted provider's rendering and response behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Render {
     /// The shared canonical request bytes.
@@ -33,11 +33,27 @@ pub enum Render {
     /// The canonical bytes, from a provider that binds signed reasoning to the bytes before it
     /// (as Anthropic's thinking signatures are), so compaction views strip or defer it.
     CanonicalPrefixBound,
+    /// Refuse a strict schema once, then answer the same step without a grammar constraint.
+    GrammarFallback,
+    /// Resolve a credential-bound renderer after a durable pre-call authentication pause.
+    AuthRefreeze,
+    /// Change a credential-bound renderer across a pre-call restart pause.
+    RestartRefreeze,
+    /// Pause after a deferred tool turn, then resume to reconcile an answer arriving after expiry.
+    DeferredAuthResume,
+    /// The source model refuses and the same step is resent to a fallback model.
+    RefusalFallback,
+    /// Estimate a later request from measured input and clamp its output reservation.
+    OutputReservation,
+    /// A provider that also supports a manual scripted cache warm after the run.
+    WarmCompletion,
+    /// Ask for one compaction opportunity before the first model request.
+    CompactionChainReset,
 }
 
 /// One scripted run: the request, its controls, the provider's step scripts and the tools.
 ///
-/// Every part is a plain function so a spawned runner process can rebuild the same scenario
+/// Factory functions and stateless extensions let a spawned runner rebuild the same scenario
 /// from its name alone.
 #[derive(Clone, Copy)]
 pub struct Scenario {
@@ -53,6 +69,36 @@ pub struct Scenario {
     pub plane: fn() -> StubToolPlane,
     /// How the uninterrupted run ends.
     pub expected: RunFinishReason,
+    /// Extra planes and assertions for scenarios that exercise more than tool dispatch.
+    pub extension: Option<&'static dyn ScenarioExtension>,
+}
+
+/// Rebuild external planes for each copied state root, without sharing in-memory state
+/// between the uninterrupted run, the killed process, and its resume.
+#[async_trait]
+pub trait ScenarioExtension: Sync {
+    /// Fixed historical input for a recovery-only scenario. Fresh scenarios return zero.
+    fn seed_reference(
+        &self,
+        _store: &crate::wal::ObservedWalStore,
+        _request: &RunRequest,
+    ) -> usize {
+        0
+    }
+
+    fn setup(&self, root: &Path, control: &mut RunControl, plane: &mut HarnessPlane);
+
+    fn check(&self, _kill: &crate::KillReport, _resumed: &crate::Resumed) {}
+
+    /// Complete an external action after the reference run releases its writer. Resuming a
+    /// copied log must not repeat that action merely because its completion was lost.
+    async fn complete_reference(
+        &self,
+        _root: &Path,
+        _store: &crate::wal::ObservedWalStore,
+        _provider: &ScriptedProvider,
+    ) {
+    }
 }
 
 /// Where the runner blocks forever so a process kill can land while it is inside a call.
@@ -102,8 +148,13 @@ pub struct ScriptedProvider {
     render: Render,
     sent: Arc<Mutex<BTreeMap<usize, Vec<u8>>>>,
     requests: Arc<AtomicUsize>,
+    warm_requests: Arc<AtomicUsize>,
     rejected: Arc<Mutex<Vec<String>>>,
     block_at: Option<(u64, PathBuf)>,
+    grammar_downgraded: Arc<AtomicBool>,
+    auth_resolved: Arc<AtomicBool>,
+    chain_prepared: Arc<AtomicBool>,
+    first_attempt: u32,
 }
 
 impl ScriptedProvider {
@@ -113,13 +164,54 @@ impl ScriptedProvider {
             render,
             sent: Arc::default(),
             requests: Arc::default(),
+            warm_requests: Arc::default(),
             rejected: Arc::default(),
             block_at: None,
+            grammar_downgraded: Arc::default(),
+            auth_resolved: Arc::default(),
+            chain_prepared: Arc::default(),
+            first_attempt: 0,
         }
     }
 
     pub fn for_scenario(scenario: &Scenario) -> Self {
         Self::new((scenario.scripts)(), scenario.render)
+    }
+
+    pub(crate) fn restore(&self, log: &crate::wal::LogImage) {
+        if self.render == Render::GrammarFallback {
+            self.grammar_downgraded.store(
+                log.records().iter().any(|record| {
+                    matches!(
+                        record,
+                        broca_wal::WalRecord::StructuredOutputDowngraded { .. }
+                    )
+                }),
+                Ordering::SeqCst,
+            );
+        }
+        if self.render == Render::DeferredAuthResume {
+            self.auth_resolved.store(
+                log.records().iter().any(|record| {
+                    matches!(
+                        record,
+                        broca_wal::WalRecord::RunPaused {
+                            reason: broca_protocol::PauseReason::AuthRequired,
+                            ..
+                        }
+                    )
+                }),
+                Ordering::SeqCst,
+            );
+        }
+        if self.render == Render::CompactionChainReset {
+            self.chain_prepared.store(
+                log.records().iter().any(|record| {
+                    matches!(record, broca_wal::WalRecord::CompactionRideWaitEnded { .. })
+                }),
+                Ordering::SeqCst,
+            );
+        }
     }
 
     pub(crate) fn blocking_at(mut self, step: u64, marker: PathBuf) -> Self {
@@ -135,6 +227,10 @@ impl ScriptedProvider {
     /// How many provider calls were made, refused ones included.
     pub fn request_count(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    pub fn warm_count(&self) -> usize {
+        self.warm_requests.load(Ordering::SeqCst)
     }
 
     /// Why each refused request was refused.
@@ -198,6 +294,42 @@ pub fn check_tool_pairing(prompt: &[Message]) -> Result<(), String> {
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    fn history_edit_cost(
+        &self,
+    ) -> Option<broca_core::compaction_provider::notice::HistoryEditCost> {
+        (self.render == Render::CompactionChainReset)
+            .then_some(broca_core::compaction_provider::notice::HistoryEditCost::FullResend)
+    }
+    fn prepare_chain_reset(&self) -> bool {
+        self.render == Render::CompactionChainReset
+            && !self.chain_prepared.swap(true, Ordering::SeqCst)
+    }
+    async fn warm(&self, base: &[u8]) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
+        self.warm_requests.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(self.render, Render::WarmCompletion);
+        Ok(broca_core::WarmSent {
+            warm_body_sha256: broca_core::render::request_digest_hex(base),
+            sent_at_ms: broca_core::run::epoch_millis().unwrap(),
+            usage: broca_protocol::Usage {
+                cached_input_tokens: Some(100),
+                ..Default::default()
+            },
+            served_account_ref: None,
+            ratelimit_headers: Vec::new(),
+            http_status: 200,
+        })
+    }
+    async fn step_with_runtime(
+        &self,
+        step_id: StepId,
+        opts: Arc<CallOptions>,
+        runtime: broca_core::provider::StepRuntime,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        let mut provider = self.clone();
+        provider.first_attempt = runtime.first_attempt;
+        provider.step(step_id, &opts).await
+    }
+
     async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         self.requests.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel(64);
@@ -215,7 +347,69 @@ impl Provider for ScriptedProvider {
                 announce_and_block(marker).await;
             }
         }
-        let script = self.scripts.get(idx).cloned().unwrap_or_default();
+        let mut script =
+            if self.render == Render::RefusalFallback
+                && !opts
+                    .target_model
+                    .as_ref()
+                    .is_some_and(|model| model.model_id == "fallback")
+            {
+                vec![
+                    NormalizedEvent::Control(broca_protocol::ProviderControl::AssistantMessage {
+                        message: broca_protocol::AssistantMessage {
+                            message_id: broca_protocol::MessageId("discarded-refusal".into()),
+                            content: vec![ContentBlock::Text {
+                                text: "refused".into(),
+                            }],
+                        },
+                    }),
+                    NormalizedEvent::Control(broca_protocol::ProviderControl::Finished {
+                        usage: broca_protocol::Usage::default(),
+                        finish_reason: broca_protocol::FinishReason::ContentFilter,
+                        retries_used: 0,
+                    }),
+                ]
+            } else if self.render == Render::DeferredAuthResume
+                && idx == 1
+                && !self.auth_resolved.load(Ordering::SeqCst)
+            {
+                vec![NormalizedEvent::Control(broca_protocol::ProviderControl::Error {
+                error: serde_json::from_value(serde_json::json!({
+                    "class": "auth_required", "message": "credential needs reauthentication",
+                })).unwrap(), retries_used: 0,
+            })]
+            } else if self.render == Render::GrammarFallback
+                && !self.grammar_downgraded.load(Ordering::SeqCst)
+            {
+                vec![NormalizedEvent::Control(
+                    broca_protocol::ProviderControl::Error {
+                        error: serde_json::from_value(serde_json::json!({
+                            "class": "permanent", "message": "schema compiler rejected the grammar",
+                            "status": 400, "provider_code": "grammar_too_large",
+                        }))
+                        .unwrap(),
+                        retries_used: 0,
+                    },
+                )]
+            } else {
+                self.scripts.get(idx).cloned().unwrap_or_default()
+            };
+        for event in &mut script {
+            if let NormalizedEvent::Control(broca_protocol::ProviderControl::AttemptFinished {
+                attempt,
+            }) = event
+            {
+                attempt.attempt += self.first_attempt;
+                if matches!(
+                    self.render,
+                    Render::OutputReservation | Render::WarmCompletion
+                ) {
+                    let bytes = self.render_request(opts);
+                    attempt.request_body_len = bytes.len() as u64;
+                    attempt.request_body_sha256 = broca_core::render::request_digest_hex(&bytes);
+                }
+            }
+        }
         tokio::spawn(async move {
             for event in script {
                 let _ = tx.send(event).await;
@@ -226,6 +420,48 @@ impl Provider for ScriptedProvider {
 
     fn reasoning_is_prefix_bound(&self) -> bool {
         self.render == Render::CanonicalPrefixBound
+    }
+
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::ModelHandle> {
+        (self.render == Render::RefusalFallback)
+            .then(|| broca_protocol::ModelHandle::new("stub", "fallback"))
+    }
+
+    fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
+        (self.render == Render::OutputReservation).then_some(
+            broca_core::output_reservation::OutputLimits {
+                max: 10_000,
+                floor: 1,
+            },
+        )
+    }
+
+    fn structured_output_grammar_rejection(&self, error: &broca_protocol::ProviderError) -> bool {
+        self.render == Render::GrammarFallback
+            && error.provider_code.as_deref() == Some("grammar_too_large")
+    }
+
+    fn downgrade_structured_output(&self) {
+        self.grammar_downgraded.store(true, Ordering::SeqCst);
+    }
+
+    fn render_config_blob(&self) -> serde_json::Value {
+        if matches!(self.render, Render::AuthRefreeze | Render::RestartRefreeze) {
+            return serde_json::json!({"project_id": self.auth_resolved.load(Ordering::SeqCst).then_some("resolved-project")});
+        }
+        if self.render != Render::GrammarFallback {
+            return serde_json::json!({"render_config": "stateless"});
+        }
+        let mut config = serde_json::json!({"structured_output": {
+            "mode": "final_text", "name": "result", "schema_jcs": r#"{"type":"object"}"#,
+            "enforcement": "enforced", "delivery": "strict"
+        }});
+        if self.grammar_downgraded.load(Ordering::SeqCst) {
+            broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(
+                &mut config,
+            );
+        }
+        config
     }
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
@@ -247,7 +483,7 @@ impl Provider for ScriptedProvider {
 /// own repeated-id fence can hide a second one.
 #[derive(Clone)]
 pub struct HarnessPlane {
-    inner: Arc<StubToolPlane>,
+    inner: Arc<dyn ToolPlane>,
     dispatched: Arc<Mutex<Vec<ToolCallId>>>,
     block_at: Option<(ToolCallId, PathBuf)>,
     /// Tripped when a call is dispatched, standing in for the module's stop request arriving
@@ -267,6 +503,11 @@ impl HarnessPlane {
 
     pub fn for_scenario(scenario: &Scenario) -> Self {
         Self::new((scenario.plane)())
+    }
+
+    /// Replace routing while retaining the harness's dispatch counter and kill point.
+    pub fn set_inner(&mut self, inner: Arc<dyn ToolPlane>) {
+        self.inner = inner;
     }
 
     pub(crate) fn blocking_at(mut self, call: ToolCallId, marker: PathBuf) -> Self {
@@ -293,10 +534,111 @@ impl HarnessPlane {
             .filter(|dispatched| *dispatched == id)
             .count()
     }
+
+    async fn note_dispatch(&self, call: &ToolCall) {
+        self.dispatched
+            .lock()
+            .unwrap()
+            .push(call.tool_call_id.clone());
+        if let Some((id, marker)) = &self.block_at {
+            if *id == call.tool_call_id {
+                announce_and_block(marker).await;
+            }
+        }
+        if let Some(stop) = &self.stop_on_dispatch {
+            stop.cancel();
+        }
+    }
 }
 
 #[async_trait]
 impl ToolPlane for HarnessPlane {
+    async fn register_dispatch_group(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[broca_core::tool_plane::DispatchRegistration],
+    ) -> Result<(), ToolPlaneError> {
+        self.inner.register_dispatch_group(ctx, calls).await
+    }
+
+    async fn dispatch_keyed(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: broca_core::tool_plane::DispatchKey<'_>,
+    ) -> DispatchResult {
+        self.note_dispatch(call).await;
+        self.inner.dispatch_keyed(ctx, call, key).await
+    }
+
+    async fn dispatch_guarded(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+        guard: &broca_core::tool_plane::ToolOpenGuard,
+    ) -> DispatchResult {
+        self.note_dispatch(call).await;
+        self.inner.dispatch_guarded(ctx, call, key, guard).await
+    }
+
+    async fn dispatch_approved_keyed(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        args: &str,
+        key: broca_core::tool_plane::DispatchKey<'_>,
+        signals: &broca_core::tool_plane::DispatchSignals,
+    ) -> DispatchResult {
+        self.note_dispatch(call).await;
+        self.inner
+            .dispatch_approved_keyed(ctx, call, args, key, signals)
+            .await
+    }
+
+    fn dispatch_target(&self, ctx: &BatchCtx, id: &ToolCallId) -> Option<String> {
+        self.inner.dispatch_target(ctx, id)
+    }
+
+    fn dispatch_schema_pin(
+        &self,
+        ctx: &BatchCtx,
+        id: &ToolCallId,
+        tool: &str,
+    ) -> Option<broca_wal::DispatchSchemaPin> {
+        self.inner.dispatch_schema_pin(ctx, id, tool)
+    }
+    async fn recheck_approval_scope(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        module: Option<&str>,
+    ) -> Result<(), ToolPlaneError> {
+        self.inner.recheck_approval_scope(ctx, call, module).await
+    }
+
+    async fn dispatch_approved(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        args: &str,
+        key: &str,
+        signals: &broca_core::tool_plane::DispatchSignals,
+    ) -> DispatchResult {
+        self.dispatched
+            .lock()
+            .unwrap()
+            .push(call.tool_call_id.clone());
+        if let Some((id, marker)) = &self.block_at {
+            if *id == call.tool_call_id {
+                announce_and_block(marker).await;
+            }
+        }
+        self.inner
+            .dispatch_approved(ctx, call, args, key, signals)
+            .await
+    }
+
     async fn batch_started(
         &self,
         ctx: &BatchCtx,
@@ -331,7 +673,70 @@ impl ToolPlane for HarnessPlane {
 pub struct RunOutcome {
     pub reason: RunFinishReason,
     pub events: Vec<OutputEvent>,
+    /// Each real-loop invocation, including a resume after a pause made during this drive.
+    pub invocations: Vec<Invocation>,
 }
+
+pub struct Invocation {
+    pub prefix: Vec<broca_wal::FramedRecord>,
+    pub auth_resolved: bool,
+}
+
+fn invocation<W: WalStore>(
+    store: &W,
+    request: &RunRequest,
+    state_root: &Path,
+    auth_resolved: bool,
+) -> Invocation {
+    let prefix = match store.read_records(&request.session) {
+        Ok(frames) => frames,
+        Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Vec::new()
+        }
+        Err(error)
+            if store.wal_config().is_overhaul()
+                && store.wal_config().recovery == broca_wal::recovery::RecoveryPolicy::Repair
+                && matches!(
+                    &error,
+                    broca_wal::WalError::Corrupt { .. }
+                        | broca_wal::WalError::SequenceGap { .. }
+                        | broca_wal::WalError::NonMonotonic { .. }
+                ) =>
+        {
+            // The writer has not opened yet. Use production recovery's kept prefix
+            // without repairing the file or substituting the stricter ordinary reader rule.
+            let bytes = std::fs::read(crate::wal_path(state_root, &request.session))
+                .unwrap_or_else(|read_error| panic!("read invocation image: {read_error}"));
+            let kept = broca_wal::recovery::test_recovery_prefix(&bytes).unwrap_or_else(
+                |recovery_error| panic!("read invocation prefix: {recovery_error}"),
+            );
+            crate::LogImage::parse(bytes[..kept.valid_end as usize].to_vec()).framed()
+        }
+        Err(error) => panic!("read invocation prefix: {error}"),
+    };
+    Invocation {
+        prefix,
+        auth_resolved,
+    }
+}
+
+fn next_invocation<W: WalStore>(
+    first: &mut Option<Invocation>,
+    store: &W,
+    request: &RunRequest,
+    state_root: &Path,
+    auth_resolved: bool,
+) -> Invocation {
+    match first.take() {
+        Some(mut invocation) => {
+            invocation.auth_resolved = auth_resolved;
+            invocation
+        }
+        None => invocation(store, request, state_root, auth_resolved),
+    }
+}
+
+crate::require_process_kill!();
 
 /// Run `request` through the real run loop against the log under `state_root`: a fresh start
 /// on an empty log, a resume on one that holds an unfinished episode.
@@ -343,6 +748,9 @@ pub async fn drive<W: WalStore>(
     provider: &ScriptedProvider,
     plane: &HarnessPlane,
 ) -> RunOutcome {
+    // Legacy compaction admission can seed its Setup before entering the loop. Include that
+    // prelude in the first observed call, rather than treating it as state present at the kill.
+    let mut first_invocation = Some(invocation(wal_store, &request, state_root, false));
     #[cfg(test)]
     let control = {
         let mut control = control;
@@ -351,6 +759,7 @@ pub async fn drive<W: WalStore>(
         control
     };
     let lease = FileLeaseStore::new(state_root.join("lease"));
+    let mut invocations = Vec::new();
     let (tx, mut rx) = mpsc::channel(512);
     let collector = tokio::spawn(async move {
         let mut events = Vec::new();
@@ -359,10 +768,156 @@ pub async fn drive<W: WalStore>(
         }
         events
     });
-    let summary = run_loop_with_control(
-        request, provider, plane, &lease, &AllowAll, wal_store, None, control, &tx,
-    )
-    .await
+    let summary = if matches!(
+        provider.render,
+        Render::AuthRefreeze | Render::RestartRefreeze
+    ) {
+        let mut control = control;
+        let frames = match wal_store.read_records(&request.session) {
+            Ok(frames) => frames,
+            Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Vec::new()
+            }
+            Err(error) => panic!("read authentication pause: {error}"),
+        };
+        if !frames
+            .iter()
+            .any(|frame| matches!(frame.record, broca_wal::WalRecord::RunPaused { .. }))
+        {
+            let mut initial = RunControl::default();
+            let reason = if provider.render == Render::AuthRefreeze {
+                initial.pause_for_auth_at_start = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "class": "auth_required", "message": "credential unresolved"
+                    }))
+                    .unwrap(),
+                );
+                broca_protocol::PauseReason::AuthRequired
+            } else {
+                let stop = CancellationToken::new();
+                stop.cancel();
+                initial.stop_requested = Some(stop);
+                broca_protocol::PauseReason::Restart
+            };
+            invocations.push(next_invocation(
+                &mut first_invocation,
+                wal_store,
+                &request,
+                state_root,
+                false,
+            ));
+            let paused = run_loop_with_control(
+                request.clone(),
+                provider,
+                plane,
+                &lease,
+                &AllowAll,
+                wal_store,
+                None,
+                initial,
+                &tx,
+            )
+            .await
+            .expect("pause before resolving credentials");
+            assert_eq!(paused.paused, Some(reason));
+        }
+        provider.auth_resolved.store(true, Ordering::SeqCst);
+        control.auth_selection = Some(broca_core::AuthSelection {
+            billing_vault_facts: None,
+            auth_method: None,
+            credential_id: "provider:key".into(),
+            account_ref: Some("account".into()),
+            resolved_credential_id: None,
+            vault_request: None,
+            account_decision: None,
+        });
+        if provider.render == Render::AuthRefreeze {
+            invocations.push(next_invocation(
+                &mut first_invocation,
+                wal_store,
+                &request,
+                state_root,
+                true,
+            ));
+            broca_core::run_loop_resume_after_auth_with_control(
+                request, provider, plane, &lease, &AllowAll, wal_store, None, control, &tx,
+            )
+            .await
+        } else {
+            invocations.push(next_invocation(
+                &mut first_invocation,
+                wal_store,
+                &request,
+                state_root,
+                false,
+            ));
+            run_loop_with_control(
+                request, provider, plane, &lease, &AllowAll, wal_store, None, control, &tx,
+            )
+            .await
+        }
+    } else if provider.render == Render::DeferredAuthResume {
+        invocations.push(next_invocation(
+            &mut first_invocation,
+            wal_store,
+            &request,
+            state_root,
+            false,
+        ));
+        let first = broca_test_support::event_timeout(
+            "deferred approval turn",
+            run_loop_with_control(
+                request.clone(),
+                provider,
+                plane,
+                &lease,
+                &AllowAll,
+                wal_store,
+                None,
+                control.clone(),
+                &tx,
+            ),
+            || format!("{:?}", wal_store.read_records(&request.session)),
+        )
+        .await
+        .expect("deferred approval turn completed");
+        if first
+            .as_ref()
+            .is_ok_and(|summary| summary.paused == Some(broca_protocol::PauseReason::AuthRequired))
+        {
+            provider.auth_resolved.store(true, Ordering::SeqCst);
+            invocations.push(next_invocation(
+                &mut first_invocation,
+                wal_store,
+                &request,
+                state_root,
+                true,
+            ));
+            broca_test_support::event_timeout(
+                "late approval admission",
+                broca_core::run_loop_resume_after_auth_with_control(
+                    request, provider, plane, &lease, &AllowAll, wal_store, None, control, &tx,
+                ),
+                || "late admission did not complete".to_owned(),
+            )
+            .await
+            .expect("late approval admission completed")
+        } else {
+            first
+        }
+    } else {
+        invocations.push(next_invocation(
+            &mut first_invocation,
+            wal_store,
+            &request,
+            state_root,
+            false,
+        ));
+        run_loop_with_control(
+            request, provider, plane, &lease, &AllowAll, wal_store, None, control, &tx,
+        )
+        .await
+    }
     .unwrap_or_else(|error| {
         panic!(
             "the run loop failed under {}: {error}",
@@ -373,6 +928,215 @@ pub async fn drive<W: WalStore>(
     RunOutcome {
         reason: summary.reason,
         events: collector.await.expect("event collector"),
+        invocations,
+    }
+}
+
+#[cfg(test)]
+mod invocation_tests {
+    use super::*;
+    use broca_core::FileWalStore;
+    use broca_wal::{FileWal, FramedRecord, Wal, WalConfig, WalError, WalRecord};
+
+    struct Image {
+        root: PathBuf,
+        request: RunRequest,
+        store: FileWalStore,
+        kept: Vec<FramedRecord>,
+        damaged: Vec<u8>,
+    }
+
+    impl Image {
+        fn new(retained: usize, zero_version: bool) -> Self {
+            Self::with_first_step(retained, zero_version, 1)
+        }
+
+        fn with_first_step(retained: usize, zero_version: bool, first_step: u64) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let root = broca_test_support::scratch_root().join(format!(
+                "invocation-prefix-{}",
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let request = (crate::process_kill_probe().request)();
+            let store = FileWalStore::with_config(root.join("wal"), WalConfig::OVERHAUL);
+            let path = store.wal_path(&request.session);
+            let floor = root.join(broca_wal::FEATURE_FLOOR_FILENAME);
+            let mut wal = FileWal::open_with_recovery(&path, WalConfig::OVERHAUL, floor.clone())
+                .unwrap()
+                .with_feature_floor(floor);
+            for step in 1..=retained {
+                wal.append(
+                    1,
+                    &WalRecord::StepStarted {
+                        step_id: StepId(if step == 1 { first_step } else { step as u64 }),
+                    },
+                    true,
+                )
+                .unwrap();
+            }
+            let kept = wal.replay().unwrap();
+            wal.append(
+                1,
+                &WalRecord::StepStarted {
+                    step_id: StepId(50),
+                },
+                true,
+            )
+            .unwrap();
+            wal.append(
+                1,
+                &WalRecord::StepStarted {
+                    step_id: StepId(51),
+                },
+                true,
+            )
+            .unwrap();
+            drop(wal);
+            let clean = crate::LogImage::read(&path);
+            let frame = clean.record_frame(retained).unwrap();
+            let at = if zero_version {
+                frame.start + 4
+            } else {
+                frame.end - 1
+            };
+            let mut damaged = clean.bytes;
+            if zero_version {
+                damaged[at] = 0;
+            } else {
+                damaged[at] ^= 1;
+            }
+            std::fs::write(&path, &damaged).unwrap();
+            Self {
+                root,
+                request,
+                store,
+                kept,
+                damaged,
+            }
+        }
+
+        fn observe(&self) -> Invocation {
+            invocation(&self.store, &self.request, &self.root, false)
+        }
+    }
+
+    impl Drop for Image {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn panic_message(failure: Box<dyn std::any::Any + Send>) -> String {
+        failure
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                failure
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn invocation_observes_kept_prefix_without_repairing_damaged_image() {
+        for zero_version in [false, true] {
+            let image = Image::new(1, zero_version);
+            let observed = image.observe();
+            assert_eq!(observed.prefix, image.kept);
+            crate::invariants::check_first_invocation(&image.kept, &[observed], "kept input");
+            assert_eq!(
+                std::fs::read(image.store.wal_path(&image.request.session)).unwrap(),
+                image.damaged
+            );
+        }
+    }
+
+    #[test]
+    fn kept_prefix_check_rejects_a_different_recoverable_entry() {
+        let expected = Image::new(1, false);
+        for (retained, first_step) in [(0, 1), (1, 99), (2, 1)] {
+            let other = Image::with_first_step(retained, true, first_step);
+            let observed = other.observe();
+            assert_eq!(observed.prefix, other.kept);
+            assert_ne!(observed.prefix, expected.kept);
+            if retained == 2 {
+                assert!(observed.prefix.starts_with(&expected.kept));
+            }
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::invariants::check_first_invocation(
+                    &expected.kept,
+                    &[observed],
+                    "wrong kept input",
+                )
+            }))
+            .expect_err("another valid kept prefix must not satisfy the exact entry check");
+            assert!(panic_message(failure)
+                .contains("the first invocation did not start from the killed prefix"));
+        }
+    }
+
+    struct ReadFailure(u8);
+
+    impl WalStore for ReadFailure {
+        fn open(&self, _: &broca_protocol::BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
+            panic!("observation must never open a writer")
+        }
+        fn read_records(
+            &self,
+            _: &broca_protocol::BindIdentity,
+        ) -> Result<Vec<FramedRecord>, WalError> {
+            Err(match self.0 {
+                0 => WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "observer-permission-denied",
+                )),
+                1 => WalError::NewerWriter {
+                    offset: 0,
+                    ver: 3,
+                    missing: vec!["observer-future-feature".into()],
+                },
+                _ => WalError::Corrupt {
+                    offset: 5,
+                    source: broca_wal::framing::FrameError::NonTailIncompleteFrame,
+                },
+            })
+        }
+        fn wal_config(&self) -> WalConfig {
+            if self.0 == 2 {
+                WalConfig {
+                    recovery: broca_wal::recovery::RecoveryPolicy::Refuse,
+                    ..WalConfig::OVERHAUL
+                }
+            } else {
+                WalConfig::OVERHAUL
+            }
+        }
+    }
+
+    #[test]
+    fn invocation_still_panics_on_io_newer_writer_and_refuse_policy_errors() {
+        let request = (crate::process_kill_probe().request)();
+        for kind in 0..=2 {
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                invocation(
+                    &ReadFailure(kind),
+                    &request,
+                    Path::new("unused-observer-root"),
+                    false,
+                )
+            }))
+            .err()
+            .expect("a non-recoverable read must stay fatal");
+            let message = panic_message(failure);
+            assert!(message.contains("read invocation prefix:"));
+            if kind == 0 {
+                assert!(message.contains("observer-permission-denied"));
+            }
+            if kind == 1 {
+                assert!(message.contains("observer-future-feature"));
+            }
+        }
     }
 }
 

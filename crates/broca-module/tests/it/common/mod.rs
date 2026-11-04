@@ -231,6 +231,7 @@ impl FakeExecutor {
                     let _ = ack.send(Ok(job.req.run_id.clone()));
                 }
                 job.writer.record(broca_wal::WalRecord::RunPaused {
+                    account_limit: None,
                     ts_ms: None,
                     run_id: job.req.run_id.clone(),
                     reason: PauseReason::AuthRequired,
@@ -256,6 +257,7 @@ impl FakeExecutor {
                     let _ = rx.recv().await;
                 }
                 job.writer.record(broca_wal::WalRecord::RunPaused {
+                    account_limit: None,
                     ts_ms: None,
                     run_id: job.req.run_id.clone(),
                     reason: PauseReason::AuthRequired,
@@ -398,6 +400,8 @@ impl FakeExecutor {
 
     async fn write_started(&self, job: &RunJob) {
         let _seq = job.writer.record(broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -419,6 +423,8 @@ impl FakeExecutor {
             run_id: job.req.run_id.clone(),
             session: job.req.session.clone(),
             config: Box::new(broca_wal::RunConfig {
+                route_decision_id: job.req.route_decision_id.clone(),
+                account_limit_pause: false,
                 turn_directives_v1: job.req.directives.clone(),
                 tools: job.req.tools.clone().into(),
                 tools_were_omitted: job.control.tools_were_omitted,
@@ -515,6 +521,9 @@ impl RunExecutor for FakeExecutor {
 
 fn min_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -606,6 +615,7 @@ fn unique() -> u64 {
 pub fn req(key: &BindIdentity, run: &str) -> RunRequest {
     use broca_protocol::content::{ContentBlock, Message, Role};
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -622,6 +632,7 @@ pub fn req(key: &BindIdentity, run: &str) -> RunRequest {
         session: key.clone(),
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

@@ -7,6 +7,7 @@ impl broca_core::compaction::CompactionPlane for NoCompaction {
         &self,
         _: &str,
         _: &broca_protocol::BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _: broca_core::compaction_provider::setup::SetupRequest,
     ) -> Result<
         broca_core::compaction_provider::setup::SetupAnswer,

@@ -228,6 +228,9 @@ pub struct CompactionState {
     /// spuriously nor misses a change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announced_account: Option<String>,
+    /// Recovered from the frozen render bundle before each model step; not checkpointed.
+    #[serde(skip)]
+    pub current_service_tier: Option<String>,
 }
 impl CompactionState {
     /// Send admission uses the last durable request estimate plus the new native messages,
@@ -967,6 +970,7 @@ pub(crate) fn model_options_indexed(
     // The renderer's episode coordinates are indexes, unlike transcript ordinals. Map only
     // retained raw messages; replacement messages must not inherit episode decorations.
     view.render_episodes = Arc::new(broca_protocol::request::RenderHistory {
+        raw_ordinals: false,
         compaction_prefix_len: Some(applied.thinking_prefix_len),
         episodes: retained_episodes(opts, &view.prompt, tail_start),
     });
@@ -1082,13 +1086,13 @@ pub fn estimate_tokens(rendered_bytes: usize, previous: Option<(u64, usize)>) ->
     )
 }
 
-pub(crate) type CompactionItem = (
+pub type CompactionItem = (
     String,
     Option<String>,
     Map<String, Value>,
     Map<String, Value>,
 );
-pub(crate) fn item(manifest: &broca_wal::PlanManifest) -> Result<Option<CompactionItem>, String> {
+pub fn item(manifest: &broca_wal::PlanManifest) -> Result<Option<CompactionItem>, String> {
     let plan: Value =
         serde_json::from_str(manifest.plan.as_json_text()).map_err(|e| e.to_string())?;
     let Some(item) = plan.get("compaction_item").filter(|item| !item.is_null()) else {

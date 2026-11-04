@@ -2399,6 +2399,7 @@ async fn paused_run(provider: &impl Provider, label: &str) -> Vec<broca_wal::Fra
     let dir = broca_test_support::scratch_root().join(label);
     let bind = BindIdentity::new(dir.join("project"), "websocket-auth", label);
     let request = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -2415,6 +2416,7 @@ async fn paused_run(provider: &impl Provider, label: &str) -> Vec<broca_wal::Fra
         session: bind.clone(),
         model: ModelHandle::new("openai", "m"),
         input: vec![Message {
+            turn_system: false,
             role: Role::User,
             content: vec![ContentBlock::Text { text: "hi".into() }],
             cache_prefix_blocks: None,
@@ -2947,15 +2949,17 @@ async fn websocket_over_age_socket_is_retired_before_the_next_send() {
 }
 
 fn tool_run_request(bind: &BindIdentity) -> RunRequest {
-    RunRequest { input_written_at_ms: None, directives: None, session_class: None, retention: None,
+    RunRequest { route_decision_id: None,
+    input_written_at_ms: None, directives: None, session_class: None, retention: None,
     on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None, title: None,
     project_id: None, principal: None, scope: None, run_id: RunId("ws-run".into()), session: bind.clone(),
     model: ModelHandle::new("openai", "m"),
-    input: vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: "lookup".into() }], cache_prefix_blocks: None, origin: None, ordinal: None, tags: Default::default() }],
+    input: vec![Message { turn_system: false, role: Role::User, content: vec![ContentBlock::Text { text: "lookup".into() }], cache_prefix_blocks: None, origin: None, ordinal: None, tags: Default::default() }],
     tools: vec![serde_json::from_value(serde_json::json!({"name":"lookup","description":"lookup","input_schema":{"type":"object","properties":{"x":{"type":"integer"}}},"execution_mode":"parallel"})).unwrap()],
     policy_allowed: std::collections::HashSet::from(["lookup".into()]), tool_choice: ToolChoice::Auto, generation: GenerationConfig::default(),
     cache: None, stop_when: vec![StopCondition::StepCount { n: 4 }], submission_id: None,
-    budget: None, context_limit: None, work_class: None, context_management: None, variant: None, service_tier: None, inherit_frozen_cache: false, structured_output: None, }
+    budget: None, context_limit: None, work_class: None, context_management: None, variant: None, service_tier: None, inherit_frozen_cache: false, structured_output: None,
+    }
 }
 
 #[tokio::test]
@@ -3163,6 +3167,7 @@ async fn trailing_tool_whitespace_closes_websocket_and_next_step_uses_a_new_sock
 /// rejection is transient rather than a failure of the token broca sent.
 #[test]
 fn wrapped_chatgpt_refusals_keep_their_classes() {
+    let before = now_millis();
     let usage = serde_json::json!({"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1790021043,"eligible_promo":null,"resets_in_seconds":441721}});
     let mut trace = AttemptTrace::default();
     let failure = responses_websocket::wrapped_error(usage.to_string().as_bytes(), &mut trace)
@@ -3173,9 +3178,18 @@ fn wrapped_chatgpt_refusals_keep_their_classes() {
     assert_eq!(failure.error.resets_at_source.as_deref(), Some("body"));
     assert!(failure.retry_forbidden);
     assert_eq!(trace.http_status, Some(429));
+    let observed_at_ms = trace
+        .account_observation
+        .limit
+        .as_ref()
+        .unwrap()
+        .observed_at_ms;
+    assert!((before..=now_millis()).contains(&observed_at_ms));
     assert_eq!(
         trace.account_observation.limit,
         Some(broca_protocol::AttemptAccountLimit {
+            disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+            observed_at_ms,
             resets_at_ms: Some(1_790_021_043_000),
             resets_at_source: Some("body".into()),
             limit_window: None,
@@ -3621,4 +3635,7 @@ async fn codex_cancel_during_a_long_retry_after_wait_ends_the_run_cancelled() {
     assert_eq!(seen.handshakes, 1, "no re-send before the server's time");
     assert!(seen.http_bodies.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
+}
+mod generated_streams {
+    include!("transport_websocket_generated_tests.rs");
 }

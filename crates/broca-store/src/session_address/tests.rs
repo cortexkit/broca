@@ -13,6 +13,16 @@ fn bind(root: &str) -> BindIdentity {
 }
 
 #[test]
+fn new_unscoped_pair_uses_fixed_storage_namespace() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    complete(&store);
+    let resolved = store
+        .resolve_session_address(&bind("/obsolete/connection/project"), None)
+        .unwrap();
+    assert_eq!(resolved, bind("broca-unscoped-v1"));
+}
+
+#[test]
 fn existing_unscoped_pair_keeps_legacy_root_after_rebind_and_scope_adoption() {
     let store = SqliteStore::open_in_memory().unwrap();
     complete(&store);
@@ -33,10 +43,10 @@ fn existing_unscoped_pair_keeps_legacy_root_after_rebind_and_scope_adoption() {
 }
 
 #[test]
-fn new_scoped_pair_uses_workdir_but_new_unscoped_pair_retains_route_root() {
+fn new_scoped_pair_uses_workdir_and_unscoped_pair_uses_namespace() {
     for (workdir, expected) in [
         (Some(Path::new("/stamped/worktree")), "/stamped/worktree"),
-        (None, "/route/checkout"),
+        (None, "broca-unscoped-v1"),
     ] {
         let store = SqliteStore::open_in_memory().unwrap();
         complete(&store);
@@ -158,7 +168,8 @@ fn only_the_resolved_root_is_validated_as_a_storage_key() {
             .unwrap(),
         bind("/worktree")
     );
-    let invalid_unscoped = BindIdentity::new("/route\u{1f}root", "athena", "invalid-unscoped");
+    let invalid_unscoped =
+        BindIdentity::new("/route/root", "athena\u{1f}other", "invalid-unscoped");
     let before = store.conn.lock().unwrap().total_changes();
     assert!(matches!(
         store.resolve_session_address(&invalid_unscoped, None),
@@ -180,7 +191,7 @@ fn first_bind_reservation_survives_restart_without_a_wal_append() {
             store
                 .resolve_session_address(&bind("/first/route"), None)
                 .unwrap(),
-            bind("/first/route")
+            bind("broca-unscoped-v1")
         );
     }
     let store = SqliteStore::open(&db).unwrap();
@@ -188,7 +199,7 @@ fn first_bind_reservation_survives_restart_without_a_wal_append() {
         store
             .resolve_session_address(&bind("/later/route"), None)
             .unwrap(),
-        bind("/first/route")
+        bind("broca-unscoped-v1")
     );
     drop(store);
     std::fs::remove_dir_all(root).unwrap();

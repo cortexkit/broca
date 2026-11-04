@@ -543,10 +543,14 @@ fn lease_free_lookup_between_link_and_unlink_preserves_both_names() {
         .unwrap();
     *probe.lookup_on_link.lock().unwrap() = Some((Arc::new(store), session));
     with_fs_ops(fs, || {
-        let mut wal = FileWal::open(&normal)
-            .unwrap()
-            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-            .unwrap();
+        let mut wal = FileWal::open_with_recovery(
+            &normal,
+            broca_wal::WalConfig::OVERHAUL,
+            root.0.join(broca_wal::FEATURE_FLOOR_FILENAME),
+        )
+        .unwrap()
+        .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+        .unwrap();
         wal.relocate_unstarted(&ephemeral).unwrap();
         // Exercise the reverse placement too: discovery must not pick a direction.
         wal.relocate_unstarted(&normal).unwrap();
@@ -1192,10 +1196,14 @@ fn interrupted_relocation_validates_pairing_and_discovery() {
                 probe: probe.clone(),
             });
             with_fs_ops(fs, || {
-                let mut wal = FileWal::open(&source)
-                    .unwrap()
-                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                    .unwrap();
+                let mut wal = FileWal::open_with_recovery(
+                    &source,
+                    broca_wal::WalConfig::OVERHAUL,
+                    root.0.join(broca_wal::FEATURE_FLOOR_FILENAME),
+                )
+                .unwrap()
+                .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+                .unwrap();
                 wal.relocate_unstarted(&destination).unwrap();
                 assert_eq!(wal.log_path(), Some(destination.as_path()));
             });
@@ -1336,3 +1344,4 @@ fn interrupted_relocation_validates_pairing_and_discovery() {
     assert!(pairing_window_seen && moved_proof_seen && orphan_rejected);
     eprintln!("interrupted relocation: {states_checked} power-loss states");
 }
+crate::require_process_kill!();

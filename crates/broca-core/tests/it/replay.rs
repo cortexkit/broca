@@ -45,6 +45,9 @@ use tokio::sync::mpsc;
 
 fn run_config() -> RunConfig {
     RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -73,6 +76,8 @@ fn run_config() -> RunConfig {
 /// The ONE atomic run-start record (config + input).
 fn start(run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -93,6 +98,7 @@ fn start(run: &str, text: &str) -> WalRecord {
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(run_config()),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -120,6 +126,7 @@ fn assistant_tool_call(id: &str, name: &str) -> AssistantMessage {
 
 fn step_with_call(step: u64, id: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -153,6 +160,7 @@ fn usage_with_cache(input_tokens: u64, cached_input_tokens: u64, output_tokens: 
 
 fn step_text_with_usage(step: u64, text: &str, usage: Usage) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -393,6 +401,7 @@ fn paused_episode_with_open_intent_fails_closed_to_interrupted() {
         batch_started("b1", 1, &["t1"]),
         intent("b1", "t1"),
         WalRecord::RunPaused {
+            account_limit: None,
             ts_ms: None,
             run_id: RunId("r".into()),
             reason: broca_protocol::PauseReason::AuthRequired,
@@ -696,6 +705,7 @@ fn tool_then_text() -> Vec<Vec<NormalizedEvent>> {
 
 fn demo_request(run: &str, dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -712,6 +722,7 @@ fn demo_request(run: &str, dir: &std::path::Path) -> RunRequest {
         session: BindIdentity::new(dir, "crashcut", "s1"),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -801,6 +812,8 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -835,6 +848,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                     ..run_config()
                 }),
                 input: vec![Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,
@@ -847,6 +861,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -916,6 +931,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
     });
     let lease = FileLeaseStore::new(dir.join("lease"));
     let req = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -932,6 +948,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1282,6 +1299,7 @@ async fn a_record_type_from_a_newer_build_changes_nothing_replay_reads() {
 /// A provider attempt record as the live loop writes it.
 fn attempt_record(step_id: StepId, attempt: u32, outcome: AttemptOutcome) -> WalRecord {
     WalRecord::ModelAttemptFinished {
+        account_limit_disposition: None,
         attempt_id: None,
         reservation: None,
         envelope: None,
@@ -1506,6 +1524,7 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
 /// A text-only request that runs one model step and ends `Completed`.
 fn text_request(run: &str, session: &broca_protocol::BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -1522,6 +1541,7 @@ fn text_request(run: &str, session: &broca_protocol::BindIdentity, prompt: &str)
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1559,6 +1579,7 @@ fn text_request_with_system(
     req.input.insert(
         0,
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1914,6 +1935,8 @@ async fn append_seals_an_inferred_natural_end_before_starting_the_next_episode()
     let mut file = wal.open(&session).expect("open WAL for crash cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -2014,6 +2037,8 @@ async fn append_seals_an_inferred_hard_stop_before_starting_the_next_episode() {
     let mut file = wal.open(&session).expect("open WAL for hard-stop cut");
     let crash_cut = [
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -2424,6 +2449,7 @@ async fn cross_episode_resume_is_exactly_once() {
 
     // A tool request whose model calls `edit` once, then answers.
     let req1 = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -2440,6 +2466,7 @@ async fn cross_episode_resume_is_exactly_once() {
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -2511,6 +2538,8 @@ async fn cross_episode_resume_is_exactly_once() {
         let mut wal = FileWal::open(&wal_path).unwrap();
         let recs = vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -2542,6 +2571,7 @@ async fn cross_episode_resume_is_exactly_once() {
                     ..run_config()
                 }),
                 input: vec![Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,
@@ -2556,6 +2586,7 @@ async fn cross_episode_resume_is_exactly_once() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -2909,6 +2940,7 @@ async fn append_episode_cannot_introduce_a_system_prompt_mid_lineage() {
 /// resume, so this id is only the caller's handle).
 fn req2(session: &BindIdentity) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -2925,6 +2957,7 @@ fn req2(session: &BindIdentity) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -3079,6 +3112,7 @@ async fn recreated_retry_reports_omitted_vs_explicit_tools_difference() {
 #[test]
 fn post_pause_step_boundary_clears_auth_classification_at_every_cut() {
     let paused = WalRecord::RunPaused {
+        account_limit: None,
         ts_ms: None,
         run_id: RunId("r".into()),
         reason: broca_protocol::PauseReason::AuthRequired,
@@ -3150,6 +3184,8 @@ fn budgeted_start(run: &str) -> WalRecord {
             submission_id,
             ..
         } => WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -3231,6 +3267,7 @@ fn budget_fired_semantic_validation_rejects_wrong_early_reordered_and_duplicate_
     let mut reordered = vec![
         budgeted_start("r"),
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -3443,7 +3480,9 @@ async fn first_send_after_import_can_introduce_its_harness_system_prompt() {
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        vec!["imported question", "new harness rules", "next question"]
+        // An imported session is a mode-3 log: the run's system prompt is not a transcript
+        // entry, so it renders ahead of the imported history.
+        vec!["new harness rules", "imported question", "next question"]
     );
 
     let _ = std::fs::remove_dir_all(dir);
@@ -3492,6 +3531,8 @@ async fn a_new_episode_appends_onto_a_lineage_sealed_by_an_interrupt() {
         w.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -3512,6 +3553,7 @@ async fn a_new_episode_appends_onto_a_lineage_sealed_by_an_interrupt() {
                 session: session.clone(),
                 config: Box::new(run_config()),
                 input: vec![Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,

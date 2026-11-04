@@ -192,12 +192,17 @@ fn usage() -> (u64, u64) {
 
 fn run_started(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         run_id: RunId(run_id.into()),
         session: session.clone(),
         ts_ms: Some(ts_ms),
         config: Box::new(broca_wal::RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,

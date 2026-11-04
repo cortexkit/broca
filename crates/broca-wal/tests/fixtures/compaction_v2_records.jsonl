@@ -1,0 +1,4 @@
+{"type":"compaction_view_v2","version":2,"checksum":"w7-provider-checksum","edits":[{"kind":"previous","index":1},{"kind":"full","edit":{"since":2, "vendor":{"z":1e+02,"a":"\u0061"},"text":"summary"}},{"kind":"previous","index":0}]}
+{"type":"compaction_marker","harness":"runner","session":"s","view_version":2,"first_kept_mid":"m7","first_kept_ordinal":7,"checkpoint":3}
+{"type":"compaction_view_applied_v2","step_id":4,"version":2,"checksum":"w7-provider-checksum"}
+{"type":"run_started","run_id":"r","session":{"project_root":"/project","harness":"runner","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"},"compaction_plan_version":1}

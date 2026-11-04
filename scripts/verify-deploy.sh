@@ -226,10 +226,12 @@ fi
 # a valid one (`run_index.db`) matches `run_indexXdb`, inflating the count instead. Both end
 # with a verification that did not verify.
 count_in_binary() {
-    s="$(strings "$1" 2>/dev/null | grep -F -c -- "$2" || true)"
-    n="$(nm -a "$1" 2>/dev/null | grep -F -c -- "$2" || true)"
+    local hits s n
+    hits="$(broca_artifact_hits "$1" "$2" best-effort)"
+    read -r s n <<<"$hits"
     echo $(( ${s:-0} + ${n:-0} ))
 }
+source "$(dirname "${BASH_SOURCE[0]}")/lib/artifact-probe.sh"
 m_count="$(count_in_binary "$BIN" "$MARKER")"
 c_count="$(count_in_binary "$BIN" "$CONTROL")"
 printf "  marker   %-44s %s\n" "$MARKER" "$m_count"

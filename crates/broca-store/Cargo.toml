@@ -10,8 +10,11 @@ description = "broca materialized store: SqliteStore (the MaterializedStore impl
 [features]
 default = []
 test-conformance = []
+# Non-shipping process-kill seam after descriptor sync, before database commit.
+publication-faults = []
 
 [dependencies]
+getrandom = "0.3"
 broca-owner-only.workspace = true
 broca-core = { path = "../broca-core" }
 broca-protocol = { path = "../broca-protocol" }
@@ -30,6 +33,8 @@ tracing.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
+# Enable tracing for transaction-completion tests and hooks for recovery-fence tests.
+rusqlite = { version = "0.32", features = ["hooks", "trace"] }
 broca-crash-harness = { path = "../broca-crash-harness" }
 broca-owner-only = { workspace = true, features = ["test-support"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.

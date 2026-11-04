@@ -30,6 +30,9 @@ use broca_wal::{
 };
 use rusqlite::{config::DbConfig, Connection, OptionalExtension};
 
+mod history_mode;
+mod served_history;
+
 const STORE_SCHEMA_VERSION: i64 = 1;
 
 mod busy;
@@ -40,17 +43,192 @@ pub mod compaction_facts;
 pub mod compaction_receipts;
 pub mod db;
 pub mod diagnostics;
+mod display_facts;
 pub mod export_index;
 mod fold_identities;
 pub mod grants;
 pub mod late_results_store;
+#[cfg(test)]
+mod legacy_sql_trace_tests;
 mod retained_head;
 pub mod retention;
 pub mod retention_withdrawals;
 pub mod session_address;
+pub mod session_log_evidence;
+pub mod session_ref_audit;
 pub mod session_refs;
+pub mod session_root_repair;
 pub mod system_one;
-pub use fold_identities::fold_identities;
+mod wal_recovery;
+pub use fold_identities::{fold_identities, require_legacy_operator_root, LegacyOnlyOperator};
+
+/// Reserve a logical session's storage address and verify its history through
+/// the format-selected inventory.
+pub trait SessionAddressResolver: Send + Sync {
+    fn resolve_session_address(
+        &self,
+        bind: &BindIdentity,
+        workdir: Option<&Path>,
+    ) -> Result<BindIdentity, session_address::SessionAddressError>;
+
+    /// Check history without opening a writer. Evidence failures must remain
+    /// errors; an unreadable inventory cannot certify a new or available log.
+    fn session_log_state(
+        &self,
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError>;
+}
+
+impl SessionAddressResolver for SqliteStore {
+    fn session_log_state(
+        &self,
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError> {
+        SqliteStore::checked_session_log_state(self, session, wal)
+    }
+
+    fn resolve_session_address(
+        &self,
+        bind: &BindIdentity,
+        workdir: Option<&Path>,
+    ) -> Result<BindIdentity, session_address::SessionAddressError> {
+        SqliteStore::resolve_session_address(self, bind, workdir)
+    }
+}
+
+impl SessionAddressResolver for db::OverhaulDb {
+    fn session_log_state(
+        &self,
+        session: &BindIdentity,
+        wal: &dyn broca_core::WalStore,
+    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError> {
+        db::OverhaulDb::session_log_state(self, session, wal)
+    }
+
+    fn resolve_session_address(
+        &self,
+        bind: &BindIdentity,
+        workdir: Option<&Path>,
+    ) -> Result<BindIdentity, session_address::SessionAddressError> {
+        use session_address::{InventoryUnavailable, SessionAddressError};
+        let known = self
+            .read_snapshot(|tx| known_overhaul_address(tx, bind))
+            .map_err(SessionAddressError::store_error)??;
+        if let Some(identity) = known {
+            return Ok(identity);
+        }
+        let mut gap_during_reservation = false;
+        let mut reserved_root = None;
+        let result = self
+            .authoritative_transaction(|tx| {
+                match known_overhaul_address(tx, bind)? {
+                    Ok(Some(identity)) => return Ok(Ok(identity)),
+                    Err(error) => return Ok(Err(error)),
+                    Ok(None) => {}
+                }
+                let root = tx.path().and_then(|path| Path::new(path).parent());
+                if session_refs::projection_gap(root)
+                    .map_err(|e| db::DbError::Invalid(e.to_string()))?
+                {
+                    return Ok(Err(SessionAddressError::Unavailable(
+                        InventoryUnavailable::GapMarker,
+                    )));
+                }
+                let complete: bool = tx.query_row(
+                    "SELECT complete FROM inventory_status WHERE id=1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if !complete {
+                    return Ok(Err(SessionAddressError::Unavailable(
+                        InventoryUnavailable::IncompleteInventory,
+                    )));
+                }
+                let identity = BindIdentity::new(
+                    workdir.unwrap_or(&bind.project_root),
+                    &bind.harness,
+                    &bind.session,
+                );
+                if let Err(error) = identity.validate_keyable() {
+                    return Ok(Err(SessionAddressError::Invalid(error)));
+                }
+                tx.execute(
+                    "INSERT INTO session_identity VALUES(?1,?2,?3,?4,?5,?6)",
+                    rusqlite::params![
+                        broca_core::session_addr(&identity),
+                        identity.project_root.to_string_lossy(),
+                        identity.harness,
+                        identity.session,
+                        broca_core::wal_writer::legacy_session_ref(
+                            &identity.harness,
+                            &identity.project_root.to_string_lossy(),
+                            &identity.session
+                        ),
+                        broca_core::agent_session_ref(&identity),
+                    ],
+                )?;
+                if session_refs::projection_gap(root)
+                    .map_err(|e| db::DbError::Invalid(e.to_string()))?
+                {
+                    gap_during_reservation = true;
+                    return Err(db::DbError::Invalid(
+                        "session inventory gap during address reservation".into(),
+                    ));
+                }
+                reserved_root = root.map(Path::to_path_buf);
+                Ok(Ok(identity))
+            })
+            .map_err(|error| {
+                if gap_during_reservation {
+                    SessionAddressError::Unavailable(InventoryUnavailable::GapMarker)
+                } else {
+                    SessionAddressError::store_error(error)
+                }
+            })?;
+        if reserved_root.is_some()
+            && session_refs::projection_gap(reserved_root.as_deref())
+                .map_err(SessionAddressError::store_error)?
+        {
+            return Err(SessionAddressError::Unavailable(
+                InventoryUnavailable::GapMarker,
+            ));
+        }
+        result
+    }
+}
+
+fn known_overhaul_address(
+    conn: &Connection,
+    bind: &BindIdentity,
+) -> Result<Result<Option<BindIdentity>, session_address::SessionAddressError>, db::DbError> {
+    use session_address::SessionAddressError;
+    let mut stmt = conn.prepare("SELECT DISTINCT project_root FROM session_identity WHERE session_ref=?1 AND harness=?2 AND session_key=?3 LIMIT 2")?;
+    let roots = stmt
+        .query_map(
+            rusqlite::params![
+                broca_core::agent_session_ref(bind),
+                bind.harness,
+                bind.session
+            ],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if roots.len() > 1 {
+        return Ok(Err(SessionAddressError::Ambiguous));
+    }
+    Ok(roots
+        .first()
+        .map(|root| {
+            let identity = BindIdentity::new(root, &bind.harness, &bind.session);
+            identity
+                .validate_keyable()
+                .map(|()| identity)
+                .map_err(SessionAddressError::Invalid)
+        })
+        .transpose())
+}
 
 pub use system_one::SystemOneStore;
 
@@ -189,8 +367,10 @@ pub enum StoreError {
     /// The WAL being projected is a corrupt lineage (replay refused to fabricate a
     /// prefix). Surfaced rather than silently materializing a wrong projection.
     Replay(broca_core::ReplayError),
+    AttributionStale,
     InconsistentSnapshot(&'static str),
     BusEvent(String),
+    LegacyOnly(LegacyOnlyOperator),
 }
 
 impl std::fmt::Display for StoreError {
@@ -204,7 +384,11 @@ impl std::fmt::Display for StoreError {
             StoreError::Sqlite(e) => write!(f, "sqlite: {e}"),
             StoreError::Json(e) => write!(f, "json: {e}"),
             StoreError::Replay(e) => write!(f, "replay: {e}"),
+            StoreError::AttributionStale => {
+                std::fmt::Display::fmt(&broca_core::StorePageReadError::AttributionStale, f)
+            }
             StoreError::BusEvent(e) => write!(f, "run event: {e}"),
+            StoreError::LegacyOnly(e) => write!(f, "{e}"),
             StoreError::InconsistentSnapshot(message) => {
                 write!(f, "inconsistent snapshot: {message}")
             }
@@ -252,6 +436,7 @@ impl From<broca_core::ReplayError> for StoreError {
 /// only for the short snapshot and commit phases.
 pub struct SqliteStore {
     conn: Mutex<Connection>,
+    wal_config: broca_wal::WalConfig,
     bus_events: bus_events::State,
     pub(crate) export_high_water: AtomicU64,
     pub(crate) export_source_instance_id: String,
@@ -296,14 +481,18 @@ const OPTIMISTIC_PROJECTION_ATTEMPTS: usize = 3;
 
 enum ProjectionPlan {
     NoChange {
+        expected_epoch: i64,
         expected_watermark: u64,
         expected_lineage_id: Option<String>,
     },
     Reset {
+        expected_epoch: i64,
+        preserve_recovery_fence: bool,
         expected_watermark: u64,
         expected_lineage_id: Option<String>,
     },
     RetentionMetadata {
+        expected_epoch: i64,
         expected_watermark: u64,
         expected_lineage_id: Option<String>,
         metadata: broca_core::projection_plan::RetainedWithdrawalProjection,
@@ -312,30 +501,46 @@ enum ProjectionPlan {
 }
 
 impl ProjectionPlan {
-    fn expected_state(&self) -> (u64, Option<&str>) {
+    fn expected_state(&self) -> (u64, Option<&str>, i64) {
         match self {
             Self::NoChange {
                 expected_watermark,
                 expected_lineage_id,
+                expected_epoch,
             }
             | Self::Reset {
                 expected_watermark,
                 expected_lineage_id,
+                expected_epoch,
+                ..
             }
             | Self::RetentionMetadata {
                 expected_watermark,
                 expected_lineage_id,
+                expected_epoch,
                 ..
-            } => (*expected_watermark, expected_lineage_id.as_deref()),
+            } => (
+                *expected_watermark,
+                expected_lineage_id.as_deref(),
+                *expected_epoch,
+            ),
             Self::Write(prepared) => (
                 prepared.expected_watermark,
                 prepared.expected_lineage_id.as_deref(),
+                prepared.expected_epoch,
             ),
         }
     }
 }
 
+mod compaction_v2;
+#[cfg(test)]
+mod refusal_materialized_tests;
+
 struct PreparedProjection {
+    refusal_json: String,
+    expected_epoch: i64,
+    recovery_epoch: Option<i64>,
     head_json: String,
     message_times: Vec<Option<u64>>,
     episode_spans: Vec<std::ops::Range<u64>>,
@@ -353,6 +558,9 @@ struct PreparedProjection {
     message_json: Vec<String>,
     message_run_json: Vec<String>,
     message_tags_json: Vec<Option<String>>,
+    message_compaction_json: Vec<Option<String>>,
+    message_compaction_compact_json: Vec<Option<String>>,
+    compaction_delivery_updates: Vec<broca_core::compaction_v2::metadata::DeliveryUpdate>,
     final_run_json: Vec<(i64, String)>,
     completed_steps: i64,
     usage_json: String,
@@ -531,6 +739,19 @@ impl SqliteStore {
     /// Open an existing projection for inspection without creating a database or running migrations.
     /// Read-only SQLite connections still read committed WAL frames not yet checkpointed into the database.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        require_legacy_operator_root(path.parent().unwrap_or(Path::new(".")), "SqliteStore")
+            .map_err(StoreError::LegacyOnly)?;
+        Self::open_read_only_decided(path)
+    }
+
+    pub fn open_boot_legacy_read_only(
+        root: broca_wal::state_format::LegacyStateRoot<'_>,
+    ) -> Result<Self, StoreError> {
+        Self::open_read_only_decided(&root.root().join("run-index.db"))
+    }
+
+    fn open_read_only_decided(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let (source_instance_id, source_epoch, high_water) = conn.query_row(
@@ -540,6 +761,7 @@ impl SqliteStore {
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: bus_events::State::default(),
             export_source_instance_id: source_instance_id,
             export_source_epoch: source_epoch,
@@ -561,6 +783,19 @@ impl SqliteStore {
     /// file nobody thinks to look at.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
+        require_legacy_operator_root(path.parent().unwrap_or(Path::new(".")), "SqliteStore")
+            .map_err(StoreError::LegacyOnly)?;
+        Self::open_decided(path)
+    }
+
+    /// Boot has already classified this exact root; operator opens remain guarded.
+    pub fn open_boot_legacy(
+        root: broca_wal::state_format::LegacyStateRoot<'_>,
+    ) -> Result<Self, StoreError> {
+        Self::open_decided(&root.root().join("run-index.db"))
+    }
+
+    fn open_decided(path: &Path) -> Result<Self, StoreError> {
         #[cfg(windows)]
         prepare_private_sqlite(path).map_err(|source| StoreError::PrivateAccess {
             path: path.to_path_buf(),
@@ -572,6 +807,7 @@ impl SqliteStore {
         restrict_to_owner(path);
         Ok(Self {
             conn: Mutex::new(conn),
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             export_high_water: AtomicU64::new(high_water),
             export_source_instance_id: source_instance_id,
@@ -585,11 +821,19 @@ impl SqliteStore {
         let (source_instance_id, source_epoch, high_water) = Self::init(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             export_high_water: AtomicU64::new(high_water),
             export_source_instance_id: source_instance_id,
             export_source_epoch: source_epoch,
         })
+    }
+
+    /// Supply the root format decided by the caller before sharing this connection.
+    /// Unconfigured stores retain legacy SQL and never probe the root for recovery.
+    pub fn with_wal_config(mut self, config: broca_wal::WalConfig) -> Self {
+        self.wal_config = config;
+        self
     }
 
     /// Discard one session's derived transcript and its last projected WAL sequence
@@ -600,6 +844,10 @@ impl SqliteStore {
         let key = Self::key(session);
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM display_fact WHERE session=?1", [&key])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM display_fact_seed WHERE session=?1", [&key])
+            .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM message WHERE session=?1", [&key])
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM message_tag WHERE session=?1", [&key])
@@ -1016,6 +1264,7 @@ impl SqliteStore {
         let schema_tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         let conn = &schema_tx;
+        crate::served_history::initialize(conn)?;
         let from_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let has_existing_schema: bool = conn.query_row(
             "SELECT EXISTS(
@@ -1057,8 +1306,17 @@ impl SqliteStore {
                  session TEXT NOT NULL,
                  ord     INTEGER NOT NULL,
                  json    TEXT NOT NULL,
-                 PRIMARY KEY (session, ord)
-             );
+                  PRIMARY KEY (session, ord)
+              );
+              CREATE TABLE IF NOT EXISTS display_fact_seed (
+                  session TEXT NOT NULL, lineage TEXT NOT NULL, state TEXT NOT NULL,
+                  PRIMARY KEY(session,lineage)
+              );
+              CREATE TABLE IF NOT EXISTS display_fact (
+                  session TEXT NOT NULL, lineage TEXT NOT NULL, ord INTEGER NOT NULL,
+                  seq INTEGER NOT NULL, facts TEXT NOT NULL,
+                  PRIMARY KEY(session,lineage,ord,seq)
+              );
               CREATE TABLE IF NOT EXISTS run_index (
                   run_id                       TEXT PRIMARY KEY,
                    -- SAME NAME AND TYPE AS meta.session, DIFFERENT ENCODING: this one is the
@@ -1151,6 +1409,9 @@ impl SqliteStore {
             // value is a projection that advanced without recomputing it, so its metadata reads
             // as absent and the session replays from the WAL.
             ("episode_metadata_seq", "INTEGER"),
+            // NULL is an older writer's unknown state; a JSON object records even an empty
+            // schedule. No default or constraints: adding this column never rewrites rows.
+            ("refusal_replay_json", "TEXT"),
         ] {
             if !columns.contains(column) {
                 conn.execute(
@@ -1182,6 +1443,16 @@ impl SqliteStore {
         if !message_columns.contains("written_at_ms") {
             conn.execute("ALTER TABLE message ADD COLUMN written_at_ms INTEGER", [])?;
         }
+        if !message_columns.contains("compaction_json") {
+            conn.execute("ALTER TABLE message ADD COLUMN compaction_json TEXT", [])?;
+        }
+        if !message_columns.contains("compaction_compact_json") {
+            conn.execute(
+                "ALTER TABLE message ADD COLUMN compaction_compact_json TEXT",
+                [],
+            )?;
+        }
+        conn.execute("CREATE INDEX IF NOT EXISTS message_compaction_mid_idx ON message(session,json_extract(compaction_compact_json,'$.mid')) WHERE compaction_compact_json IS NOT NULL", [])?;
         // The one-time index build scans existing messages during upgrade. Thereafter
         // completeness probes visit only this session's unattributed rows, not its bodies.
         conn.execute("CREATE INDEX IF NOT EXISTS message_unattributed_session_idx ON message(session) WHERE run_json IS NULL", [])?;
@@ -1287,6 +1558,7 @@ impl SqliteStore {
         diagnostics::init_schema(conn)?;
         compaction_receipts::init_schema(conn)?;
         compaction_facts::init_schema(conn)?;
+        session_log_evidence::indexes::install(conn)?;
         let source = export_index::init_schema(conn).map_err(StoreError::from)?;
         if from_version < STORE_SCHEMA_VERSION {
             // `user_version` provides one global checkpoint for this idempotent schema path.
@@ -1466,6 +1738,23 @@ impl SqliteStore {
         records: &[FramedRecord],
         range: Option<&WalRangeRead>,
     ) -> Result<u64, StoreError> {
+        self.project_records_with_sender_policy(session, records, range, false)
+    }
+
+    fn project_records_with_sender_policy(
+        &self,
+        session: &BindIdentity,
+        records: &[FramedRecord],
+        range: Option<&WalRangeRead>,
+        repair_sender_policy: bool,
+    ) -> Result<u64, StoreError> {
+        let key = Self::key(session);
+        if repair_sender_policy && self.wal_config.is_overhaul() {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction()?;
+            self.check_sender_repair_fence(&tx, &key, true)?;
+            tx.commit()?;
+        }
         if records
             .iter()
             .any(|r| compaction_facts::is_compaction_record(&r.record))
@@ -1474,11 +1763,13 @@ impl SqliteStore {
                 self.project_compaction_facts(session, range)?;
             }
         }
-        let key = Self::key(session);
         for _ in 0..OPTIMISTIC_PROJECTION_ATTEMPTS {
-            let snapshot = self.projection_snapshot(&key)?;
+            let mut snapshot = self.projection_snapshot(&key)?;
+            if repair_sender_policy {
+                snapshot.attribution_complete = false;
+            }
             let plan = Self::prepare_projection(snapshot, records, range)?;
-            match self.try_commit_projection(&key, plan)? {
+            match self.try_commit_projection(&key, plan, repair_sender_policy)? {
                 ProjectionCommit::Applied(watermark) => return Ok(watermark),
                 ProjectionCommit::Conflict => continue,
             }
@@ -1489,13 +1780,13 @@ impl SqliteStore {
         // therefore limited to direct store callers or an external writer; different sessions do
         // not conflict. Bound retries anyway so unusual contention cannot starve projection, then
         // preserve correctness by computing once under the lock held through commit.
-        self.project_records_locked(&key, records, range)
+        self.project_records_locked(&key, records, range, repair_sender_policy)
     }
 
     fn projection_snapshot(&self, key: &str) -> Result<ProjectionSnapshot, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let snapshot = Self::projection_snapshot_from_tx(&tx, key)?;
+        let snapshot = Self::projection_snapshot_from_tx(&tx, key, self.wal_config.is_overhaul())?;
         tx.commit()?;
         Ok(snapshot)
     }
@@ -1503,13 +1794,22 @@ impl SqliteStore {
     fn projection_snapshot_from_tx(
         tx: &rusqlite::Transaction<'_>,
         key: &str,
+        overhaul: bool,
     ) -> Result<ProjectionSnapshot, StoreError> {
         let complete = attribution_complete(tx, key)?;
         let seed = projection_seed_from_complete_tx(tx, key, complete)?;
         let (watermark, next_ord) = current_projection_position(tx, key)?;
-        let lineage_id = current_projection_lineage_id(tx, key)?;
+        let (lineage_id, context_epoch, checkpoint) =
+            current_projection_metadata(tx, key, seed.is_none(), overhaul)?;
+        let required_recovery_cuts = if overhaul {
+            wal_recovery::required_cut_ids(checkpoint.as_deref(), seed.as_ref())?
+        } else {
+            Vec::new()
+        };
         let previous_control_head = current_control_head(tx, key)?;
         Ok(ProjectionSnapshot {
+            context_epoch,
+            required_recovery_cuts,
             attribution_complete: complete,
             seed,
             watermark,
@@ -1525,12 +1825,37 @@ impl SqliteStore {
         range: Option<&WalRangeRead>,
     ) -> Result<ProjectionPlan, StoreError> {
         use broca_core::projection_plan::ProjectionPlan as NeutralPlan;
+        let expected_epoch = snapshot.context_epoch;
+        let recovery = !snapshot.required_recovery_cuts.is_empty()
+            || records
+                .iter()
+                .any(|frame| matches!(frame.record, broca_wal::WalRecord::RecoveryCut { .. }));
+        let new_cut = records.iter().any(|frame| match &frame.record {
+            broca_wal::WalRecord::RecoveryCut { recovery } => {
+                !snapshot.required_recovery_cuts.contains(&recovery.cut_id)
+            }
+            _ => false,
+        });
+        let recovery_epoch = recovery
+            .then(|| {
+                if new_cut {
+                    expected_epoch
+                        .checked_add(1)
+                        .ok_or(StoreError::InconsistentSnapshot(
+                            "recovery context epoch overflow",
+                        ))
+                } else {
+                    Ok(expected_epoch)
+                }
+            })
+            .transpose()?;
         Ok(
             match broca_core::projection_plan::plan_projection(snapshot, records, range)? {
                 NeutralPlan::NoChange {
                     expected_watermark,
                     expected_lineage_id,
                 } => ProjectionPlan::NoChange {
+                    expected_epoch,
                     expected_watermark,
                     expected_lineage_id,
                 },
@@ -1538,6 +1863,8 @@ impl SqliteStore {
                     expected_watermark,
                     expected_lineage_id,
                 } => ProjectionPlan::Reset {
+                    expected_epoch,
+                    preserve_recovery_fence: recovery,
                     expected_watermark,
                     expected_lineage_id,
                 },
@@ -1546,12 +1873,16 @@ impl SqliteStore {
                     expected_lineage_id,
                     metadata,
                 } => ProjectionPlan::RetentionMetadata {
+                    expected_epoch,
                     expected_watermark,
                     expected_lineage_id,
                     metadata,
                 },
                 NeutralPlan::Write(prepared) => {
                     ProjectionPlan::Write(Box::new(PreparedProjection {
+                        refusal_json: prepared.refusal_json,
+                        expected_epoch,
+                        recovery_epoch,
                         message_times: prepared.message_times,
                         head_json: prepared.head_json,
                         episode_spans: prepared.episode_spans,
@@ -1572,6 +1903,9 @@ impl SqliteStore {
                         message_json: prepared.message_json,
                         message_run_json: prepared.message_run_json,
                         message_tags_json: prepared.message_tags_json,
+                        message_compaction_json: prepared.message_compaction_json,
+                        message_compaction_compact_json: prepared.message_compaction_compact_json,
+                        compaction_delivery_updates: prepared.compaction_delivery_updates,
                         final_run_json: prepared.final_run_json,
                         completed_steps: prepared.completed_steps,
                         usage_json: prepared.usage_json,
@@ -1610,12 +1944,14 @@ impl SqliteStore {
         &self,
         key: &str,
         plan: ProjectionPlan,
+        repair_sender_policy: bool,
     ) -> Result<ProjectionCommit, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         // A deferred read-to-write upgrade can return SQLITE_BUSY immediately,
         // bypassing the busy timeout even for a short migration transaction.
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let current_state = current_projection_state(&tx, key)?;
+        self.check_sender_repair_fence(&tx, key, repair_sender_policy)?;
+        let current_state = current_projection_state(&tx, key, self.wal_config.is_overhaul())?;
         #[cfg(test)]
         PROJECTION_AFTER_STATE_READ_HOOK.with(|slot| {
             if let Some(hook) = slot.borrow_mut().take() {
@@ -1624,7 +1960,9 @@ impl SqliteStore {
         });
         let conflict = {
             let expected_state = plan.expected_state();
-            current_state.0 != expected_state.0 || current_state.1.as_deref() != expected_state.1
+            current_state.0 != expected_state.0
+                || current_state.1.as_deref() != expected_state.1
+                || current_state.2 != expected_state.2
         };
         if conflict {
             tx.commit()?;
@@ -1633,15 +1971,38 @@ impl SqliteStore {
         Self::commit_projection_plan(tx, key, plan).map(ProjectionCommit::Applied)
     }
 
+    fn check_sender_repair_fence(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        key: &str,
+        repair_sender_policy: bool,
+    ) -> Result<(), StoreError> {
+        // Sender-policy migration cannot publish recovery's projection. Recheck in
+        // the writing transaction even when the earlier read saw no pending fence.
+        if repair_sender_policy
+            && self.wal_config.is_overhaul()
+            && wal_recovery::read_fence(tx, key)?.is_some_and(|fence| fence.pending)
+        {
+            return Err(StoreError::AttributionStale);
+        }
+        Ok(())
+    }
+
     fn project_records_locked(
         &self,
         key: &str,
         records: &[FramedRecord],
         range: Option<&WalRangeRead>,
+        repair_sender_policy: bool,
     ) -> Result<u64, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let snapshot = Self::projection_snapshot_from_tx(&tx, key)?;
+        self.check_sender_repair_fence(&tx, key, repair_sender_policy)?;
+        let mut snapshot =
+            Self::projection_snapshot_from_tx(&tx, key, self.wal_config.is_overhaul())?;
+        if repair_sender_policy {
+            snapshot.attribution_complete = false;
+        }
         let plan = Self::prepare_projection(snapshot, records, range)?;
         Self::commit_projection_plan(tx, key, plan)
     }
@@ -1651,19 +2012,32 @@ impl SqliteStore {
         key: &str,
         plan: ProjectionPlan,
     ) -> Result<u64, StoreError> {
+        let result = Self::apply_projection_plan(&tx, key, plan)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn apply_projection_plan(
+        tx: &rusqlite::Transaction<'_>,
+        key: &str,
+        plan: ProjectionPlan,
+    ) -> Result<u64, StoreError> {
         let prepared = match plan {
             ProjectionPlan::NoChange {
                 expected_watermark, ..
             } => {
-                tx.commit()?;
                 return Ok(expected_watermark);
             }
-            ProjectionPlan::Reset { .. } => {
+            ProjectionPlan::Reset {
+                preserve_recovery_fence,
+                ..
+            } => {
                 tx.execute("DELETE FROM episode_span WHERE session=?1", [key])?;
                 tx.execute("DELETE FROM message WHERE session=?1", [key])?;
                 tx.execute("DELETE FROM message_tag WHERE session=?1", [key])?;
-                tx.execute("DELETE FROM meta WHERE session=?1", [key])?;
-                tx.commit()?;
+                if !preserve_recovery_fence {
+                    tx.execute("DELETE FROM meta WHERE session=?1", [key])?;
+                }
                 return Ok(0);
             }
             ProjectionPlan::RetentionMetadata {
@@ -1671,11 +2045,15 @@ impl SqliteStore {
                 metadata,
                 ..
             } => {
-                Self::commit_retention_metadata(&tx, key, &metadata)?;
-                tx.commit()?;
+                Self::commit_retention_metadata(tx, key, &metadata)?;
                 return Ok(expected_watermark);
             }
             ProjectionPlan::Write(prepared) => *prepared,
+        };
+        let recovery_fence = if prepared.recovery_epoch.is_some() {
+            wal_recovery::read_fence(tx, key)?
+        } else {
+            None
         };
 
         if prepared.reset {
@@ -1714,6 +2092,8 @@ impl SqliteStore {
         }
         let mut tags_json = prepared.message_tags_json.into_iter();
         let mut message_times = prepared.message_times.into_iter();
+        let mut compaction_json = prepared.message_compaction_json.into_iter();
+        let mut compaction_compact_json = prepared.message_compaction_compact_json.into_iter();
         for (json, run_json) in prepared
             .message_json
             .into_iter()
@@ -1735,11 +2115,12 @@ impl SqliteStore {
                 }
             }
             tx.execute(
-                "INSERT OR REPLACE INTO message (session, ord, json, run_json, tags_json, written_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![key, next_ord, json, run_json, tags_json, message_times.next().flatten().map(broca_core::projection_plan::u64_to_i64).transpose()?],
+                "INSERT OR REPLACE INTO message (session, ord, json, run_json, tags_json, written_at_ms, compaction_json, compaction_compact_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![key, next_ord, json, run_json, tags_json, message_times.next().flatten().map(broca_core::projection_plan::u64_to_i64).transpose()?, compaction_json.next().flatten(), compaction_compact_json.next().flatten()],
             )?;
             next_ord += 1;
         }
+        compaction_v2::apply_deliveries(tx, key, prepared.compaction_delivery_updates)?;
         for (ordinal, run_json) in prepared.final_run_json {
             let run: broca_core::RunAttribution = serde_json::from_str(&run_json)?;
             // A terminal-only tail knows the final ordinal, but not the stored row's delivery
@@ -1757,9 +2138,10 @@ impl SqliteStore {
                  last_episode_usage_json, prefix_len, admission_checkpoint_json, wal_anchor_file_id,
                  wal_anchor_seq, wal_anchor_byte_end, control_head_wal_seq, control_head_sub_index,
                   last_title, compaction_setup_seen, head_json
-               ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                ) VALUES (?1, ?2, ?3, ?21, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
               ON CONFLICT(session) DO UPDATE SET
-                 watermark_seq=?2, lineage_id=?3, completed_steps=?4, usage_json=?5,
+                  watermark_seq=?2, lineage_id=?3, completed_steps=?4, usage_json=?5,
+                  context_epoch=CASE WHEN ?22 THEN ?21 ELSE meta.context_epoch END,
                  retries_used=?6, last_step_usage_json=?7, last_step_finish_reason_json=?8,
                  last_run_id=?9, last_episode_usage_json=?10, prefix_len=?11,
                  admission_checkpoint_json=?12, wal_anchor_file_id=?13, wal_anchor_seq=?14,
@@ -1793,11 +2175,13 @@ impl SqliteStore {
                 prepared.last_title,
                 prepared.compaction_setup_seen,
                 prepared.head_json,
+                prepared.recovery_epoch.unwrap_or(0),
+                prepared.recovery_epoch.is_some(),
             ],
         )?;
         tx.execute(
-            "UPDATE meta SET deferred_calls_json=?2, run_attribution_version=?3 WHERE session=?1",
-            rusqlite::params![key, prepared.deferred_calls_json, RUN_ATTRIBUTION_VERSION],
+            "UPDATE meta SET deferred_calls_json=?2, run_attribution_version=?3, refusal_replay_json=?4 WHERE session=?1",
+            rusqlite::params![key, prepared.deferred_calls_json, RUN_ATTRIBUTION_VERSION, prepared.refusal_json],
         )?;
         tx.execute(
             "UPDATE meta SET episode_spans_complete=1, open_episode_span=?2, episode_spans_seq=?3, \
@@ -1819,7 +2203,9 @@ impl SqliteStore {
                 [run_id],
             )?;
         }
-        tx.commit()?;
+        if let Some(fence) = recovery_fence {
+            wal_recovery::preserve_fence(tx, key, &fence)?;
+        }
         Ok(prepared.new_watermark)
     }
 
@@ -1874,7 +2260,7 @@ impl SqliteStore {
                 },
                 Some(complete_wal),
             )?;
-            match self.try_commit_projection(&key, plan)? {
+            match self.try_commit_projection(&key, plan, false)? {
                 ProjectionCommit::Applied(_) => return Ok(()),
                 ProjectionCommit::Conflict => continue,
             }
@@ -1882,7 +2268,7 @@ impl SqliteStore {
 
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let snapshot = Self::projection_snapshot_from_tx(&tx, &key)?;
+        let snapshot = Self::projection_snapshot_from_tx(&tx, &key, self.wal_config.is_overhaul())?;
         if snapshot.lineage_id.as_deref() != stale_lineage_id {
             tx.commit()?;
             return Ok(());
@@ -1903,6 +2289,76 @@ impl SqliteStore {
 }
 
 impl MaterializedStore for SqliteStore {
+    fn served_history(&self) -> Option<&dyn broca_core::ServedHistory> {
+        Some(self)
+    }
+
+    fn cache_history_mode(&self, session: &BindIdentity, mode3: bool) -> Result<(), String> {
+        crate::history_mode::cache(&mut self.conn.lock().unwrap(), &Self::key(session), mode3)
+    }
+
+    fn read_compaction_page(
+        &self,
+        session: &BindIdentity,
+        request: &broca_core::compaction_v2::protocol::read::ReadRequest,
+    ) -> Result<Option<broca_core::context::CompactionStorePage>, String> {
+        compaction_v2::read_page(self, session, request).map(Some)
+    }
+
+    fn read_display_facts_cache(
+        &self,
+        session: &BindIdentity,
+        lineage: &str,
+        at_seq: u64,
+        ordinals: &[u64],
+    ) -> Result<Option<broca_core::display_facts::DisplayFactsCache>, String> {
+        self.display_cache_read(session, lineage, at_seq, ordinals)
+            .map(Some)
+    }
+
+    fn publish_display_facts(
+        &self,
+        session: &BindIdentity,
+        lineage: &str,
+        expected_seq: Option<u64>,
+        expected_epoch: Option<i64>,
+        seed: &broca_core::display_facts::DisplayFactsSeed,
+        versions: &[broca_core::display_facts::DisplayFactVersion],
+    ) -> Result<(), String> {
+        self.display_cache_publish(
+            session,
+            lineage,
+            expected_seq,
+            expected_epoch,
+            seed,
+            versions,
+        )
+    }
+
+    fn invalidate_wal_recovery(
+        &self,
+        session: &BindIdentity,
+        cut: &broca_wal::recovery::RecoveryCut,
+    ) -> Result<(), String> {
+        self.invalidate_wal_recovery_inner(session, cut)
+            .map_err(|e| e.to_string())
+    }
+    fn needs_wal_recovery_projection(
+        &self,
+        session: &BindIdentity,
+        cut_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<bool, String> {
+        self.needs_wal_recovery_projection_inner(session, cut_ids)
+            .map_err(|e| e.to_string())
+    }
+    fn reproject_wal_recovery(
+        &self,
+        session: &BindIdentity,
+        range: &WalRangeRead,
+    ) -> Result<(), String> {
+        self.reproject_wal_recovery_inner(session, range)
+            .map_err(|e| e.to_string())
+    }
     fn read_retained_head(
         &self,
         session: &BindIdentity,
@@ -1956,7 +2412,7 @@ impl MaterializedStore for SqliteStore {
         let meta = tx
             .query_row(
                 "SELECT watermark_seq, context_epoch, completed_steps, usage_json, \
-                  retries_used, last_step_usage_json, last_step_finish_reason_json, lineage_id \
+                  retries_used, last_step_usage_json, last_step_finish_reason_json, lineage_id, refusal_replay_json \
                   FROM meta WHERE session=?1",
                 [&key],
                 |r| {
@@ -1969,6 +2425,7 @@ impl MaterializedStore for SqliteStore {
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, Option<String>>(6)?,
                         r.get::<_, Option<String>>(7)?,
+                        r.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -1992,7 +2449,10 @@ impl MaterializedStore for SqliteStore {
                 last_step_usage_json,
                 last_step_finish_reason_json,
                 lineage_id,
+                refusal_json,
             )) => StorePrefix {
+                refusal: decode_refusal_replay(refusal_json.as_deref(), watermark_seq)
+                    .map_err(|e| e.to_string())?,
                 lineage_id,
                 prefix,
                 completed_steps,
@@ -2078,7 +2538,7 @@ impl MaterializedStore for SqliteStore {
         limit: u64,
         view: broca_core::context::ReadView,
     ) -> Result<StorePageSnapshot, String> {
-        self.read_page_with_attribution(session, from_ordinal, limit, view)
+        self.read_page_internal(session, from_ordinal, limit, view, false)
             .map_err(|error| error.to_string())
     }
 
@@ -2119,6 +2579,29 @@ impl MaterializedStore for SqliteStore {
         from_ordinal: Option<u64>,
         limit: u64,
         view: broca_core::context::ReadView,
+    ) -> Result<StorePageSnapshot, broca_core::StorePageReadError> {
+        self.read_page_internal(session, from_ordinal, limit, view, true)
+    }
+
+    fn reproject_if_lineage_mismatch(
+        &self,
+        session: &BindIdentity,
+        stale_lineage_id: Option<&str>,
+        complete_wal: &WalRangeRead,
+    ) -> Result<(), String> {
+        self.reproject_if_lineage_mismatch_inner(session, stale_lineage_id, complete_wal)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl SqliteStore {
+    fn read_page_internal(
+        &self,
+        session: &BindIdentity,
+        from_ordinal: Option<u64>,
+        limit: u64,
+        view: broca_core::context::ReadView,
+        require_sender_policy: bool,
     ) -> Result<StorePageSnapshot, broca_core::StorePageReadError> {
         let key = Self::key(session);
         let conn = self.conn.lock().unwrap();
@@ -2430,7 +2913,7 @@ impl MaterializedStore for SqliteStore {
             .optional()
             .map_err(|e| e.to_string())?
             .flatten();
-        let head = head_json
+        let mut head: Option<broca_core::head::HeadProjection> = head_json
             .as_deref()
             .map(serde_json::from_str)
             .transpose()
@@ -2438,6 +2921,19 @@ impl MaterializedStore for SqliteStore {
             .flatten();
         if watermark_seq > 0 && head.is_none() {
             return Err(broca_core::StorePageReadError::AttributionStale);
+        }
+        if let Some(facts) = &head {
+            if !retained_head::sender_admission_current(&tx, &key, facts)
+                .map_err(|e| e.to_string())?
+            {
+                if !require_sender_policy {
+                    // Execution page reads need transcript/approval metadata, not sender
+                    // permissions. Omit the unknown head rather than forcing a policy replay.
+                    head = None;
+                } else {
+                    return Err(broca_core::StorePageReadError::AttributionStale);
+                }
+            }
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(StorePageSnapshot {
@@ -2460,19 +2956,21 @@ impl MaterializedStore for SqliteStore {
             tag_seed,
         })
     }
-
-    fn reproject_if_lineage_mismatch(
-        &self,
-        session: &BindIdentity,
-        stale_lineage_id: Option<&str>,
-        complete_wal: &WalRangeRead,
-    ) -> Result<(), String> {
-        self.reproject_if_lineage_mismatch_inner(session, stale_lineage_id, complete_wal)
-            .map_err(|error| error.to_string())
-    }
 }
 
 impl Persister for SqliteStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &WalRangeRead,
+    ) -> Result<u64, String> {
+        let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
+            return Err("sender policy repair requires a complete WAL prefix".into());
+        };
+        self.project_records_with_sender_policy(session, records, Some(range), true)
+            .map_err(|error| error.to_string())
+    }
+
     fn project_retained_head(
         &self,
         session: &BindIdentity,
@@ -2501,7 +2999,7 @@ impl Persister for SqliteStore {
             .map_err(|error| error.to_string())?;
         let seed = projection_seed_from_tx(&tx, &key).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(seed)
+        Ok(seed.filter(|seed| seed.admission_checkpoint.recovery_cuts.is_empty()))
     }
 
     fn project(&self, session: &BindIdentity, records: &[FramedRecord]) -> Result<u64, String> {
@@ -2704,7 +3202,16 @@ impl RunIndex for SqliteStore {
 
     fn lookup_run(&self, run_id: &str) -> Result<Option<RunIndexRow>, String> {
         let conn = self.conn.lock().unwrap();
-        let row = conn
+        let tx = if self.wal_config.is_overhaul() {
+            Some(
+                conn.unchecked_transaction()
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+        let connection = tx.as_deref().unwrap_or(&conn);
+        let row = connection
             .query_row(
                 "SELECT session, submission_id, request_identity_digest, state, usage_json, \
                            final_step_finish_reason_json, retries_used, title, withdrawals_owed \
@@ -2741,6 +3248,18 @@ impl RunIndex for SqliteStore {
             )) => {
                 let session: BindIdentity =
                     serde_json::from_str(&session_json).map_err(|e| e.to_string())?;
+                if tx
+                    .as_ref()
+                    .map(|tx| wal_recovery::read_fence(tx, &Self::key(&session)))
+                    .transpose()
+                    .map_err(|error| error.to_string())?
+                    .flatten()
+                    .is_some_and(|fence| fence.pending)
+                {
+                    return Err(format!(
+                        "WAL recovery is pending for run {run_id}; run summary is unavailable"
+                    ));
+                }
                 let state = RunIndexState::parse(&state_str)
                     .ok_or_else(|| format!("unknown run-index state '{state_str}'"))?;
                 let usage = usage_json
@@ -2806,34 +3325,58 @@ fn current_control_head(
 fn current_projection_state(
     tx: &rusqlite::Transaction<'_>,
     key: &str,
-) -> Result<(u64, Option<String>), StoreError> {
+    overhaul: bool,
+) -> Result<(u64, Option<String>, i64), StoreError> {
+    if !overhaul {
+        return Ok(tx
+            .query_row(
+                "SELECT watermark_seq, lineage_id FROM meta WHERE session=?1",
+                [key],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, 0)),
+            )
+            .optional()?
+            .unwrap_or((0, None, 0)));
+    }
     Ok(tx
         .query_row(
-            "SELECT watermark_seq, lineage_id FROM meta WHERE session=?1",
+            "SELECT watermark_seq, lineage_id, context_epoch FROM meta WHERE session=?1",
             [key],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)? as u64,
                     row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
                 ))
             },
         )
         .optional()?
-        .unwrap_or((0, None)))
+        .unwrap_or((0, None, 0)))
 }
 
-fn current_projection_lineage_id(
+fn current_projection_metadata(
     tx: &rusqlite::Transaction<'_>,
     key: &str,
-) -> Result<Option<String>, StoreError> {
+    read_checkpoint: bool,
+    overhaul: bool,
+) -> Result<(Option<String>, i64, Option<String>), StoreError> {
+    if !overhaul {
+        return Ok(tx
+            .query_row(
+                "SELECT lineage_id FROM meta WHERE session=?1",
+                [key],
+                |row| Ok((row.get(0)?, 0, None)),
+            )
+            .optional()?
+            .unwrap_or((None, 0, None)));
+    }
     Ok(tx
         .query_row(
-            "SELECT lineage_id FROM meta WHERE session=?1",
-            [key],
-            |row| row.get::<_, Option<String>>(0),
+            "SELECT lineage_id,context_epoch,CASE WHEN ?2 THEN admission_checkpoint_json ELSE NULL END FROM meta WHERE session=?1",
+            rusqlite::params![key, read_checkpoint],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
         )
         .optional()?
-        .flatten())
+        .unwrap_or((None, 0, None)))
 }
 
 /// An older projector can advance the transcript without knowing the episode-span columns.
@@ -2973,7 +3516,7 @@ fn projection_seed_from_complete_tx(
         .query_row(
              "SELECT completed_steps, usage_json, COALESCE(retries_used, 0), last_run_id, wal_anchor_file_id, \
               wal_anchor_seq, wal_anchor_byte_end, last_step_usage_json, \
-              last_step_finish_reason_json, admission_checkpoint_json \
+              last_step_finish_reason_json, admission_checkpoint_json, refusal_replay_json \
               FROM meta WHERE session=?1",
             [key],
             |row| {
@@ -2991,6 +3534,7 @@ fn projection_seed_from_complete_tx(
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             },
         )
@@ -3005,10 +3549,17 @@ fn projection_seed_from_complete_tx(
         last_step_usage_json,
         last_step_finish_reason_json,
         admission_checkpoint_json,
+        refusal_json,
     )) = meta
     else {
         return Ok((prefix_len == 0).then(ProjectionSeed::empty));
     };
+    let refusal = decode_refusal_replay(refusal_json.as_deref(), watermark_seq)?;
+    if watermark_seq > 0 && refusal.is_none() {
+        // An older projection never recorded refusal state. Rebuild it from the complete
+        // WAL once rather than writing a tail's empty state over an unknown prefix.
+        return Ok(None);
+    }
     let Some(admission_checkpoint) = admission_checkpoint_json
         .as_deref()
         .and_then(decode_admission_checkpoint)
@@ -3067,6 +3618,7 @@ fn projection_seed_from_complete_tx(
         })
         .unwrap_or_default();
     Ok(Some(ProjectionSeed {
+        refusal: refusal.unwrap_or_default(),
         open_episode_span,
         open_episode,
         earlier_episodes,
@@ -3281,6 +3833,7 @@ fn read_held_prefix(
             None => newest_origin_from_tx(&tx, key)?,
         }
     };
+    let refusal = refusal_replay_from_tx(&tx, key)?;
     let tag_seed = tag_seed_from_tx(&tx, key)?;
     let episodes_json = episode_projection_json(&tx, key)?;
     tx.commit()?;
@@ -3296,6 +3849,7 @@ fn read_held_prefix(
         broca_core::select_held_episodes(&json, rows.iter().filter_map(|message| message.ordinal))
     });
     Ok(broca_core::HeldPrefix {
+        refusal,
         lineage_id,
         watermark_seq,
         prefix_len,
@@ -3316,6 +3870,37 @@ fn read_held_prefix(
         tag_seed,
         episodes,
     })
+}
+
+fn refusal_replay_from_tx(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> Result<Option<broca_core::refusal_fallback::RefusalReplayState>, StoreError> {
+    let meta: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT watermark_seq, refusal_replay_json FROM meta WHERE session=?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match meta {
+        Some((at_seq, encoded)) => {
+            decode_refusal_replay(encoded.as_deref(), at_seq as u64).map_err(StoreError::Json)
+        }
+        None => Ok(None),
+    }
+}
+
+fn decode_refusal_replay(
+    encoded: Option<&str>,
+    watermark_seq: u64,
+) -> Result<Option<broca_core::refusal_fallback::RefusalReplayState>, serde_json::Error> {
+    let checkpoint = encoded
+        .map(serde_json::from_str::<broca_core::refusal_fallback::RefusalReplayCheckpoint>)
+        .transpose()?;
+    Ok(checkpoint
+        .filter(|checkpoint| checkpoint.at_seq == watermark_seq)
+        .map(|checkpoint| checkpoint.state))
 }
 
 /// The origin of the newest materialized message that has one, read back row by row.
@@ -3395,6 +3980,187 @@ fn stored_prefix_messages_carry_row_ordinals_and_refuse_gaps() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn boot_selected_legacy_opens_do_not_read_the_marker_again() {
+        use broca_wal::fs_ops::{self, FsOps};
+        use std::{
+            path::{Path, PathBuf},
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+        };
+        struct CountMarker {
+            marker: PathBuf,
+            reads: Arc<AtomicUsize>,
+        }
+        impl FsOps for CountMarker {
+            fn open(
+                &self,
+                path: &Path,
+                options: &fs_ops::OpenOptions,
+            ) -> std::io::Result<Box<dyn fs_ops::FileOps>> {
+                if path == self.marker {
+                    self.reads.fetch_add(1, Ordering::Relaxed);
+                    return Err(std::io::Error::other("marker unavailable after boot"));
+                }
+                fs_ops::RealFs.open(path, options)
+            }
+            fn metadata(&self, p: &Path) -> std::io::Result<std::fs::Metadata> {
+                fs_ops::RealFs.metadata(p)
+            }
+            fn create_dir_all(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.create_dir_all(p)
+            }
+            fn rename(&self, a: &Path, b: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.rename(a, b)
+            }
+            fn remove_file(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.remove_file(p)
+            }
+            fn sync_dir(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.sync_dir(p)
+            }
+            fn create_dir(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.create_dir(p)
+            }
+            fn hard_link(&self, a: &Path, b: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.hard_link(a, b)
+            }
+            fn canonicalize(&self, p: &Path) -> std::io::Result<PathBuf> {
+                fs_ops::RealFs.canonicalize(p)
+            }
+            fn read_dir(&self, p: &Path) -> std::io::Result<fs_ops::ReadDir> {
+                fs_ops::RealFs.read_dir(p)
+            }
+            fn validate_if_exists(&self, p: &Path) -> std::io::Result<()> {
+                fs_ops::RealFs.validate_if_exists(p)
+            }
+        }
+        let root = broca_test_support::scratch_root()
+            .join(format!("boot-open-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("run-index.db");
+        drop(super::SqliteStore::open(&path).unwrap());
+        let decision = broca_wal::state_format::decide_state_root(&root).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        fs_ops::with_fs_ops(
+            Arc::new(CountMarker {
+                marker: root.join("state-format"),
+                reads: reads.clone(),
+            }),
+            || {
+                drop(super::SqliteStore::open_boot_legacy(decision.legacy().unwrap()).unwrap());
+                drop(
+                    super::SqliteStore::open_boot_legacy_read_only(decision.legacy().unwrap())
+                        .unwrap(),
+                );
+                assert_eq!(reads.load(Ordering::Relaxed), 0);
+                assert!(super::SqliteStore::open(&path).is_err());
+                assert!(super::SqliteStore::open_read_only(&path).is_err());
+                assert_eq!(reads.load(Ordering::Relaxed), 2);
+            },
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overhaul_known_address_does_not_compete_with_a_held_writer() {
+        use super::SessionAddressResolver;
+        let root = broca_test_support::scratch_root()
+            .join(format!("known-address-reader-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        let db = super::db::OverhaulDb::open(&root).unwrap();
+        db.reconcile_inventory().unwrap();
+        let bind = broca_protocol::BindIdentity::new("/route", "runner", "known");
+        let expected = db
+            .resolve_session_address(&bind, Some(std::path::Path::new("/first")))
+            .unwrap();
+        let writer = rusqlite::Connection::open(root.join("broca.db")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            db.resolve_session_address(&bind, Some(std::path::Path::new("/later")))
+                .unwrap(),
+            expected
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+        drop(writer);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overhaul_address_reservations_keep_first_workdir_and_refuse_ambiguous_pairs() {
+        use super::SessionAddressResolver;
+        use broca_core::SessionRefIndex;
+        let root = broca_test_support::scratch_root()
+            .join(format!("overhaul-address-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        let db = super::db::OverhaulDb::open(&root).unwrap();
+        let bind = broca_protocol::BindIdentity::new("/route", "runner", "seat");
+        assert!(matches!(
+            db.resolve_session_address(&bind, None),
+            Err(super::session_address::SessionAddressError::Unavailable(_))
+        ));
+        db.reconcile_inventory().unwrap();
+        let first = db
+            .resolve_session_address(&bind, Some(std::path::Path::new("/first")))
+            .unwrap();
+        assert_eq!(first.project_root, std::path::Path::new("/first"));
+        assert_eq!(
+            db.resolve_session_address(&bind, Some(std::path::Path::new("/later")))
+                .unwrap(),
+            first
+        );
+        let other = broca_protocol::BindIdentity::new("/other", "runner", "seat");
+        db.record_session(&broca_core::session_addr(&other), &other)
+            .unwrap();
+        assert!(matches!(
+            db.resolve_session_address(&bind, None),
+            Err(super::session_address::SessionAddressError::Ambiguous)
+        ));
+        for file in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
+            assert!(!root.join(file).exists());
+        }
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_store_refuses_overhaul_destinations_without_touching_files() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("legacy-store-overhaul-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
+        let path = root.join("run-index.db");
+        assert!(matches!(
+            super::SqliteStore::open(&path),
+            Err(super::StoreError::LegacyOnly(_))
+        ));
+        assert!(!path.exists());
+        let files = ["run-index.db", "run-index.db-wal", "run-index.db-shm"];
+        for name in files {
+            std::fs::write(root.join(name), format!("untouched {name}")).unwrap();
+        }
+        assert!(matches!(
+            super::SqliteStore::open(&path),
+            Err(super::StoreError::LegacyOnly(_))
+        ));
+        assert!(matches!(
+            super::SqliteStore::open_read_only(&path),
+            Err(super::StoreError::LegacyOnly(_))
+        ));
+        for name in files {
+            assert_eq!(
+                std::fs::read(root.join(name)).unwrap(),
+                format!("untouched {name}").as_bytes()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     struct RepairReadProbe<'a> {
         store: &'a SqliteStore,
         wal: &'a broca_core::FileWalStore,
@@ -4317,6 +5083,7 @@ mod tests {
         let (source_instance_id, source_epoch, high_water) =
             SqliteStore::init(&conn).expect("migrate legacy store");
         let store = SqliteStore {
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             conn: std::sync::Mutex::new(conn),
             export_high_water: AtomicU64::new(high_water),
@@ -4375,6 +5142,7 @@ mod tests {
             assert_eq!(present, 1, "{table}.{column} is added");
         }
         let store = SqliteStore {
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             conn: std::sync::Mutex::new(conn),
             export_high_water: AtomicU64::new(high_water),
@@ -5032,6 +5800,7 @@ mod tests {
         )
         .unwrap();
         let store = SqliteStore {
+            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             conn: std::sync::Mutex::new(conn),
             export_high_water: AtomicU64::new(high_water),
@@ -5118,7 +5887,9 @@ mod tests {
         records.extend(crate::conformance::text_turn(6, 3, "third"));
         assert_eq!(store.project(&session, &records).unwrap(), 7);
         assert!(matches!(
-            store.try_commit_projection(&key, stale_plan).unwrap(),
+            store
+                .try_commit_projection(&key, stale_plan, false)
+                .unwrap(),
             ProjectionCommit::Conflict
         ));
         let prefix = MaterializedStore::read_prefix_with_watermark(&store, &session).unwrap();
@@ -5437,6 +6208,7 @@ mod tests {
             }),
             latest_manifest: None,
             session_change_recorded: false,
+            sender_admission: None,
             plan_manifest_folded: true,
         };
         let snapshot =
@@ -5541,6 +6313,325 @@ mod tests {
         );
         crate::conformance::projection_range_co_commits_anchor(sqlite_store());
         crate::conformance::failed_projection_keeps_checkpoint_and_messages_atomic(sqlite_store());
+    }
+
+    #[test]
+    fn old_sender_checkpoint_rebuilds_once_and_repairs_head() {
+        let root = broca_test_support::scratch_root().join(format!(
+            "sender-checkpoint-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let wal_store = CountingWalStore::new(root.clone());
+        let session = crate::conformance::session("sender-checkpoint");
+        let mut records = crate::conformance::base_records(&session);
+        let manifest: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
+            "plan":"{\"senders\":[{\"module\":\"occipital\",\"idle_start\":true}]}",
+            "plan_identity":"refresh", "composition_digest":"composition", "fetches":[],
+            "tools":[], "system_text":"", "system_digest":"system", "join_version":1, "role_versions":{}
+        })).unwrap();
+        if let broca_wal::WalRecord::RunStarted { principal, .. } = &mut records[0].record {
+            *principal = Some(broca_protocol::BindPrincipal::Reserved {
+                module_id: "owner".into(),
+            });
+        }
+        let mut wal = wal_store.open(&session).unwrap();
+        wal.append(1, &records[0].record, true).unwrap();
+        wal.append(
+            1,
+            &broca_wal::WalRecord::SessionRefreshAccepted {
+                generation: 1,
+                policy: "on_prefix_rebuild".into(),
+                manifest: Box::new(manifest),
+                run_in_progress: true,
+                applies_from_next_run: false,
+            },
+            true,
+        )
+        .unwrap();
+        for frame in crate::conformance::text_turn(3, 1, "projected") {
+            wal.append(1, &frame.record, true).unwrap();
+        }
+        let safe_head = wal.replay().unwrap().last().unwrap().seq;
+        drop(wal);
+        let store = SqliteStore::open_in_memory().unwrap();
+        let range = wal_store
+            .inner
+            .read_records_range(&session, 0, Some(safe_head), None)
+            .unwrap();
+        Persister::project_range(&store, &session, &range).unwrap();
+        let mut legacy = MaterializedStore::read_admission_snapshot(&store, &session)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        legacy.ownership.as_mut().unwrap().sender_admission = None;
+        let mut old_head = broca_core::head::HeadProjection::default();
+        old_head.observe(&records[0].record);
+        legacy.head = Some(old_head.clone());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET admission_checkpoint_json=?2, head_json=?3 WHERE session=?1",
+                rusqlite::params![
+                    SqliteStore::key(&session),
+                    broca_core::encode_admission_checkpoint(&legacy).unwrap(),
+                    serde_json::to_string(&old_head).unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            MaterializedStore::read_page_with_attribution(
+                &store,
+                &session,
+                Some(0),
+                100,
+                broca_core::context::ReadView::Raw
+            ),
+            Err(broca_core::StorePageReadError::AttributionStale)
+        ));
+        let execution_metadata = MaterializedStore::read_page_with_watermark(
+            &store,
+            &session,
+            Some(0),
+            0,
+            broca_core::context::ReadView::Raw,
+        )
+        .unwrap();
+        assert!(execution_metadata.watermark_seq > 0);
+        assert!(
+            execution_metadata.head.is_none(),
+            "unknown sender permissions must not escape through metadata-only reads"
+        );
+        let execution_page = MaterializedStore::read_page_with_watermark(
+            &store,
+            &session,
+            Some(0),
+            100,
+            broca_core::context::ReadView::Raw,
+        )
+        .unwrap();
+        assert!(!execution_page.rows.is_empty());
+        assert!(
+            execution_page.head.is_none(),
+            "execution pages must not replay the WAL for unknown sender permissions"
+        );
+        Persister::project_range(&store, &session, &range).unwrap();
+        assert!(
+            !MaterializedStore::read_admission_snapshot(&store, &session)
+                .unwrap()
+                .unwrap()
+                .checkpoint
+                .unwrap()
+                .ownership
+                .unwrap()
+                .sender_admission_complete(),
+            "ordinary projection must not migrate sender policy at an unchanged boundary"
+        );
+        broca_core::run::repair_sender_admission_checkpoint(
+            &wal_store,
+            &session,
+            safe_head,
+            Some(&store),
+        )
+        .unwrap();
+        let repaired_reads = wal_store.range_reads.load(Ordering::SeqCst);
+        assert_eq!(repaired_reads, 1);
+        broca_core::run::repair_sender_admission_checkpoint(
+            &wal_store,
+            &session,
+            safe_head,
+            Some(&store),
+        )
+        .unwrap();
+        assert_eq!(wal_store.range_reads.load(Ordering::SeqCst), repaired_reads);
+        let snapshot =
+            broca_core::load_prior_wal_snapshot(&wal_store, &session, safe_head, Some(&store))
+                .unwrap();
+        assert!(snapshot.base_watermark > 0);
+        assert_eq!(
+            snapshot
+                .checkpoint_at_head
+                .ownership
+                .unwrap()
+                .effective_senders()[0]
+                .module,
+            "occipital"
+        );
+        assert_eq!(wal_store.full_reads.load(Ordering::SeqCst), 0);
+        let page = MaterializedStore::read_page_with_attribution(
+            &store,
+            &session,
+            Some(0),
+            100,
+            broca_core::context::ReadView::Raw,
+        )
+        .unwrap();
+        assert!(page
+            .head
+            .unwrap()
+            .sender(
+                Some(&broca_protocol::BindPrincipal::Reserved {
+                    module_id: "occipital".into()
+                }),
+                &broca_protocol::SendScope::Internal,
+                &[broca_protocol::DeliveryMode::IdleStart]
+            )
+            .is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn sender_first_open_cost(messages: usize, refreshed: bool) {
+        let root = broca_test_support::scratch_root().join(format!(
+            "sender-first-open-{}-{:?}-{messages}-{refreshed}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let wal_store = CountingWalStore::new(root.clone());
+        let session = crate::conformance::session("sender-first-open");
+        let mut start = crate::conformance::base_records(&session).remove(0).record;
+        let baseline: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
+            "plan":"{\"senders\":[{\"module\":\"baseline\",\"idle_start\":true}]}",
+            "plan_identity":"baseline", "composition_digest":"composition", "fetches":[],
+            "tools":[], "system_text":"", "system_digest":"system", "join_version":1,"role_versions":{}
+        })).unwrap();
+        if let broca_wal::WalRecord::RunStarted { manifest, .. } = &mut start {
+            *manifest = Some(Box::new(baseline.clone()));
+        }
+        let mut wal = wal_store.open(&session).unwrap();
+        wal.append(1, &start, false).unwrap();
+        if refreshed {
+            let mut next = baseline;
+            next.plan = broca_wal::OpaqueJson::from_json_text(
+                r#"{"senders":[{"module":"latest","idle_start":true}]}"#,
+            )
+            .unwrap();
+            next.plan_identity = "latest".into();
+            wal.append(
+                1,
+                &broca_wal::WalRecord::SessionRefreshAccepted {
+                    generation: 1,
+                    policy: "on_prefix_rebuild".into(),
+                    manifest: Box::new(next),
+                    run_in_progress: true,
+                    applies_from_next_run: false,
+                },
+                false,
+            )
+            .unwrap();
+        }
+        for n in 1..messages {
+            for frame in crate::conformance::text_turn(0, n as u64, "measurement message") {
+                wal.append(1, &frame.record, false).unwrap();
+            }
+        }
+        let finished = serde_json::from_value(serde_json::json!({"type":"run_finished","reason":"completed","usage":{},"retries_used":0})).unwrap();
+        let safe_head = wal.append(1, &finished, true).unwrap();
+        drop(wal);
+        let store = SqliteStore::open_in_memory().unwrap();
+        let range = wal_store
+            .inner
+            .read_records_range(&session, 0, Some(safe_head), None)
+            .unwrap();
+        Persister::project_range(&store, &session, &range).unwrap();
+        drop(range);
+        let mut old = MaterializedStore::read_admission_snapshot(&store, &session)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        old.ownership.as_mut().unwrap().sender_admission = None;
+        let old = broca_core::encode_admission_checkpoint(&old).unwrap();
+        store.conn.lock().unwrap().execute_batch("CREATE TABLE sender_repair_writes(n INTEGER); INSERT INTO sender_repair_writes VALUES(0); CREATE TRIGGER observe_sender_repair AFTER UPDATE OF admission_checkpoint_json ON meta BEGIN UPDATE sender_repair_writes SET n=n+1; END; CREATE TRIGGER observe_sender_repair_insert AFTER INSERT ON meta BEGIN UPDATE sender_repair_writes SET n=n+1; END;").unwrap();
+        for mode in ["before", "after_owner", "after_sender"] {
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute("UPDATE meta SET admission_checkpoint_json=?1", [&old])
+                    .unwrap();
+                conn.execute("UPDATE sender_repair_writes SET n=0", [])
+                    .unwrap();
+            }
+            wal_store.full_reads.store(0, Ordering::SeqCst);
+            wal_store.range_reads.store(0, Ordering::SeqCst);
+            wal_store.range_records.store(0, Ordering::SeqCst);
+            let started = std::time::Instant::now();
+            if mode != "after_owner" {
+                broca_core::run::repair_sender_admission_checkpoint(
+                    &wal_store,
+                    &session,
+                    safe_head,
+                    Some(&store),
+                )
+                .unwrap();
+            }
+            let snapshot =
+                broca_core::load_prior_wal_snapshot(&wal_store, &session, safe_head, Some(&store))
+                    .unwrap();
+            let elapsed = started.elapsed();
+            let reads = wal_store.range_reads.load(Ordering::SeqCst);
+            let records = wal_store.range_records.load(Ordering::SeqCst);
+            let full = wal_store.full_reads.load(Ordering::SeqCst);
+            let writes: u64 = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT n FROM sender_repair_writes", [], |row| row.get(0))
+                .unwrap();
+            let needs_policy = mode != "after_owner";
+            assert_eq!(full, 0);
+            assert_eq!(reads, if refreshed && needs_policy { 2 } else { 1 });
+            assert_eq!(
+                records,
+                if refreshed && needs_policy {
+                    usize::try_from(safe_head + 1).unwrap()
+                } else {
+                    1
+                }
+            );
+            assert_eq!(writes, u64::from(refreshed && needs_policy));
+            if needs_policy || !refreshed {
+                assert_eq!(
+                    snapshot
+                        .checkpoint_at_head
+                        .ownership
+                        .unwrap()
+                        .effective_senders()[0]
+                        .module,
+                    if refreshed { "latest" } else { "baseline" }
+                );
+                broca_core::run::repair_sender_admission_checkpoint(
+                    &wal_store,
+                    &session,
+                    safe_head,
+                    Some(&store),
+                )
+                .unwrap();
+                assert_eq!(
+                    wal_store.range_reads.load(Ordering::SeqCst),
+                    reads,
+                    "a second policy check must read no WAL"
+                );
+            }
+            println!("sender_first_open messages={messages} refreshed={refreshed} mode={mode} elapsed_ms={:.3} range_reads={reads} records_read={records} full_reads={full} reprojections={writes}", elapsed.as_secs_f64()*1000.0);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_refresh_prefield_sender_policy_needs_no_repair_reads() {
+        sender_first_open_cost(8, false);
+    }
+
+    #[test]
+    #[ignore = "explicit sender admission first-open measurement at 1k and 150k messages"]
+    fn sender_admission_first_open_cost_at_1k_and_150k_messages() {
+        for messages in [1_000, 150_000] {
+            for refreshed in [false, true] {
+                sender_first_open_cost(messages, refreshed);
+            }
+        }
     }
 
     #[test]
@@ -5813,6 +6904,8 @@ mod projection_planner_tests {
         // independent unknown-policy refusal.
         seed.admission_checkpoint.lineage_retention = Some(broca_core::LineageRetention::Forever);
         let snapshot = ProjectionSnapshot {
+            context_epoch: 0,
+            required_recovery_cuts: Vec::new(),
             attribution_complete: true,
             seed: Some(seed),
             watermark: 0,
@@ -5966,3 +7059,6 @@ mod windows_acl_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod message_time_tests;

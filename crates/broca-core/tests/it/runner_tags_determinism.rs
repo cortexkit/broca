@@ -90,6 +90,7 @@ impl Provider for TurnModel {
                 },
             }),
             NormalizedEvent::Control(ProviderControl::StepFinished {
+                raw_finish_reason: None,
                 step_id: StepId(0),
                 usage: Usage::default(),
                 finish_reason: reason,
@@ -207,6 +208,7 @@ impl SteerOnce {
         let writer = self.writer.lock().unwrap().clone().expect("writer set");
         let input = vec![Message::new(Role::User, vec![self::text(text)])];
         let record = WalRecord::Steered {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             retention: None,

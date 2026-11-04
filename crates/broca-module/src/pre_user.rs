@@ -5,6 +5,7 @@ use broca_core::hooks::{HookPlan, HookRuntime, Subject, Trace};
 use broca_protocol::content::{ContentBlock, Role};
 
 pub(super) struct PreparedInput {
+    pub at_ms: Option<u64>,
     pub input: Vec<broca_protocol::Message>,
     pub hooks: Option<Box<broca_wal::Hooks>>,
     pub refused: Option<String>,
@@ -28,8 +29,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         input: Vec<broca_protocol::Message>,
         delivery: broca_protocol::Delivery,
         manifest: Option<Arc<broca_wal::PlanManifest>>,
+        scope: Option<&broca_protocol::SessionScope>,
+        at_ms: Option<u64>,
     ) -> Result<PreparedInput, SendOutcome> {
         let mut prepared = PreparedInput {
+            at_ms,
             input,
             hooks: None,
             refused: None,
@@ -49,7 +53,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .expect("writer live while preparing input"),
         );
         let bind = self.key.clone();
+        // A first send has not recorded its scope yet; its admission supplies that scope.
+        // Steering messages and queued inputs use the scope the session already froze.
+        let frozen_scope = match scope {
+            Some(scope) => Some(scope.clone()),
+            None => {
+                self.load_ownership()
+                    .await
+                    .map_err(SendOutcome::Transient)?
+                    .scope
+            }
+        };
         let runtime = HookRuntime {
+            scope: frozen_scope.as_ref(),
             plan: &plan,
             plane: &plane,
             bind: &bind,
@@ -81,6 +97,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 blocks,
                 mark: None,
                 delivery: Some(delivery.as_str().to_owned()),
+                at_ms,
             };
             let output = tokio::select! {
                 biased;

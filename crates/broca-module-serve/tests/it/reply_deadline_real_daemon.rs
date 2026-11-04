@@ -95,6 +95,7 @@ async fn register_held(rig: &Rig, gate: Arc<Gate>) -> tokio::task::JoinHandle<()
 
 fn request(session: BindIdentity, frozen: &broca_wal::PlanManifest) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -111,6 +112,7 @@ fn request(session: BindIdentity, frozen: &broca_wal::PlanManifest) -> RunReques
         session,
         model: ModelHandle::new("test", "test"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -321,6 +323,12 @@ impl WalStore for HeldStore {
 
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
         WalStore::wal_present(&self.inner, session)
+    }
+    fn wal_present_checked(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<bool>, broca_wal::WalError> {
+        WalStore::wal_present_checked(&self.inner, session)
     }
 
     fn live_wal_last_write(

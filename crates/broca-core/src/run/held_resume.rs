@@ -40,6 +40,7 @@ pub(super) enum HeldLoad {
 
 /// Everything a held resume reads besides the store, captured by admission.
 pub(super) struct HeldInput {
+    pub mode3: Option<bool>,
     pub store: Arc<dyn SessionStore>,
     pub session: BindIdentity,
     pub view: CompactionView,
@@ -115,6 +116,8 @@ fn load_held(input: &HeldInput) -> Result<Option<ReplayState>, String> {
         .episodes
         .ok_or("store keeps no usable episode projection")?;
     let seed = PrefixSeed {
+        mode3: input.mode3,
+        refusal: prefix.refusal,
         prefix_len: prefix.prefix_len,
         completed_steps: prefix.completed_steps,
         usage: prefix.usage,

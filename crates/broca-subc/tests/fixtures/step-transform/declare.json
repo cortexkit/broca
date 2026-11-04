@@ -8,7 +8,7 @@
         "composition": {
           "providers": [
             {
-              "provider": "aft",
+              "provider": "example-tools",
               "tools": [
                 {
                   "name": "read",
@@ -25,7 +25,7 @@
               ]
             },
             {
-              "provider": "magic-context",
+              "provider": "example-compaction",
               "tools": []
             }
           ]
@@ -245,9 +245,7 @@
         ]
       },
       "problem": "zero_budget"
-    }
-  ],
-  "undecodable": [
+    },
     {
       "name": "unknown hook",
       "declaration": {
@@ -260,7 +258,8 @@
             "budget_ms": 100
           }
         ]
-      }
+      },
+      "problem": "unknown_value"
     },
     {
       "name": "camel-case hook",
@@ -274,7 +273,8 @@
             "budget_ms": 100
           }
         ]
-      }
+      },
+      "problem": "unknown_value"
     },
     {
       "name": "unknown phase",
@@ -287,7 +287,8 @@
             "budget_ms": 100
           }
         ]
-      }
+      },
+      "problem": "unknown_value"
     },
     {
       "name": "unknown op",
@@ -301,7 +302,8 @@
             "budget_ms": 100
           }
         ]
-      }
+      },
+      "problem": "unknown_value"
     },
     {
       "name": "unknown on_unavailable",
@@ -316,8 +318,11 @@
             "budget_ms": 100
           }
         ]
-      }
-    },
+      },
+      "problem": "unknown_value"
+    }
+  ],
+  "undecodable": [
     {
       "name": "no budget",
       "declaration": {

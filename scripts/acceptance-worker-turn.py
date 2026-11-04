@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""Send a fetch plan with a session class; verify completion and both required WAL features."""
+"""Verify a worker completed after admission recorded how providers can return tool results."""
 import argparse
+from collections import Counter
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 from lib.archive_read import ArchiveRefusal, read_records
-from lib.state_root import default_state_root
+from lib.acceptance_contract import bind_no_project
+from lib.state_root import StateRootError, default_state_root
 
 ROOT = Path(__file__).resolve().parents[1]
 PLAN = ROOT / "scripts/fixtures/acceptance-reader-plan.json"
 CLASS = "acceptance"
+# Core labels its worker and research sessions mason and sidekick.
+WORKER_CLASSES = ("mason", "sidekick")
 REQUIRED = ("session-class/v1", "provider-declarations/v1")
 MODELS_FILE = ROOT / "scripts/lib/acceptance-models.txt"
+ADDRESS = re.compile(r"[0-9a-f]{16}")
+# Only RunFinishReason spellings from broca-protocol may reach diagnostic output.
+FINISH_REASONS = frozenset(("completed", "max_steps", "budget_exhausted", "context_ceiling",
+                            "cancelled", "interrupted", "error", "transform_unavailable"))
 
 
 def wal_name(project_root, harness, session):
@@ -26,6 +36,26 @@ def wal_name(project_root, harness, session):
     return f"{value:016x}.wal"
 
 
+def check_start(start, session_class):
+    missing = [feature for feature in REQUIRED if feature not in start.requires]
+    if missing:
+        raise ValueError("RunStarted missing required WAL feature(s): " + ", ".join(missing))
+    if start.record.get("session_class") != session_class:
+        raise ValueError(f"RunStarted session_class is not {session_class}")
+    fetches = (start.record.get("manifest") or {}).get("fetches", [])
+    declarations = [fetch.get("declarations_frozen") or {} for fetch in fetches]
+    if not any(item.get("late_results") is True or item.get("result_formats") for item in declarations):
+        raise ValueError("RunStarted manifest has no frozen result formats or late_results declaration")
+
+
+def aft_fetches(record):
+    manifest = record.get("manifest")
+    fetches = manifest.get("fetches", []) if isinstance(manifest, dict) else []
+    if not isinstance(fetches, list):
+        return []
+    return [fetch for fetch in fetches if isinstance(fetch, dict) and fetch.get("provider") == "aft"]
+
+
 def checked_run(path, run_id, *, finish_reason):
     frames = read_records(path)
     starts = [frame for frame in frames if frame.record["type"] == "run_started"
@@ -33,15 +63,7 @@ def checked_run(path, run_id, *, finish_reason):
     if len(starts) != 1:
         raise ValueError(f"expected one RunStarted for {run_id}, found {len(starts)} in {path}")
     start = starts[0]
-    missing = [feature for feature in REQUIRED if feature not in start.requires]
-    if missing:
-        raise ValueError("RunStarted missing required WAL feature(s): " + ", ".join(missing))
-    if start.record.get("session_class") != CLASS:
-        raise ValueError(f"RunStarted session_class is not {CLASS}")
-    fetches = (start.record.get("manifest") or {}).get("fetches", [])
-    declarations = [fetch.get("declarations_frozen") or {} for fetch in fetches]
-    if not any(item.get("late_results") is True or item.get("result_formats") for item in declarations):
-        raise ValueError("RunStarted manifest has no frozen result formats or late_results declaration")
+    check_start(start, CLASS)
     episode = []
     for frame in frames:
         if frame.seq <= start.seq:
@@ -57,6 +79,137 @@ def checked_run(path, run_id, *, finish_reason):
 
 def check_wal(path, run_id):
     return checked_run(path, run_id, finish_reason="completed")[0]
+
+
+def worker_summaries(frames, after_ms):
+    summaries, active = [], None
+    for frame in frames:
+        record = frame.record
+        if record["type"] == "run_started":
+            active = None
+            timestamp, session_class = record.get("ts_ms"), record.get("session_class")
+            if (session_class not in WORKER_CLASSES or not isinstance(timestamp, int)
+                    or isinstance(timestamp, bool) or timestamp <= after_ms):
+                continue
+            fetches = aft_fetches(record)
+            active = {"ts_ms": timestamp, "seq": frame.seq, "class": session_class,
+                      "candidate": bool(fetches), "reason": None, "error": None}
+            summaries.append(active)
+            # The aft tool provider always declares support for late tool results.
+            # Sessions without an aft fetch need not freeze any declarations, so
+            # plan-less sessions and other providers' plans are counted, not checked.
+            if not fetches:
+                active = None
+                continue
+            try:
+                check_start(frame, session_class)
+                declarations = [fetch.get("declarations_frozen") or {} for fetch in fetches]
+                if not all(item.get("late_results") is True or item.get("result_formats") for item in declarations):
+                    raise ValueError("RunStarted AFT fetch has no frozen result formats or late_results declaration")
+            except ValueError as error:
+                active["error"] = str(error)
+            except (TypeError, AttributeError):
+                active["error"] = "RunStarted manifest has invalid provider declarations"
+        elif active is not None and record["type"] == "run_finished":
+            reason = record.get("reason")
+            if active["reason"] is not None:
+                active["reason"] = "invalid_terminal"
+            else:
+                active["reason"] = (reason if isinstance(reason, str) and reason in FINISH_REASONS
+                                    else "unclassified_terminal")
+    return summaries
+
+
+def scan_workers(state_root, after_ms, cache):
+    summaries, unavailable = {}, set()
+    # Worker WALs can be backed up or automatically expired, placing them in
+    # different live trees. Cold archives cannot contain a newly admitted worker.
+    for folder in ("wal", "wal-durable", "wal-ephemeral"):
+        for path in sorted((state_root / folder).glob("*.wal")):
+            if not ADDRESS.fullmatch(path.stem):
+                continue
+            try:
+                stat = path.stat()
+                if stat.st_mtime_ns // 1_000_000 < after_ms:
+                    continue
+                identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+                if cache.get(path, (None,))[0] != identity:
+                    cache[path] = (identity, worker_summaries(read_records(path), after_ms))
+                if cache[path][1]:
+                    summaries[path] = cache[path][1]
+            except FileNotFoundError:
+                continue
+            except (ArchiveRefusal, ValueError, KeyError, TypeError, AttributeError):
+                # A partially written append is retried, never partially certified or printed.
+                unavailable.add("unverified_wal")
+            except OSError:
+                unavailable.add("unreadable_wal")
+    return summaries, unavailable
+
+
+def worker_counts(observed):
+    candidates = [summary for summary in observed.values() if summary["candidate"]]
+    classes = Counter(summary["class"] for summary in candidates)
+    ignored = Counter(summary["class"] for summary in observed.values() if not summary["candidate"])
+    reasons = Counter(summary["reason"] for summary in candidates if summary["reason"] is not None)
+    class_counts = ",".join(f"{name}:{classes[name]}" for name in WORKER_CLASSES)
+    ignored_counts = ",".join(f"{name}:{ignored[name]}" for name in WORKER_CLASSES)
+    terminal_counts = ",".join(f"{reason}:{reasons[reason]}" for reason in sorted(set(reasons) | {"completed"}))
+    return (f"classes={','.join(WORKER_CLASSES)} candidates={len(candidates)} "
+            f"class_counts={class_counts} pending={len(candidates) - sum(reasons.values())} "
+            f"terminal_counts={terminal_counts} ignored_counts={ignored_counts}")
+
+
+def wait_for_worker(state_root, after_ms, timeout=600, poll=5):
+    deadline = time.monotonic() + timeout
+    cache, observed = {}, {}
+    while True:
+        summaries, unavailable = scan_workers(state_root, after_ms, cache)
+        for path, candidates in summaries.items():
+            for summary in candidates:
+                key = (path.stem, summary["seq"], summary["ts_ms"])
+                observed[key] = dict(summary, address=path.stem)
+        counts = worker_counts(observed)
+        # Validate every candidate that fetched the aft tool provider before passing.
+        # A long-running worker need not finish, but a bad later start cannot hide
+        # behind an earlier success in the same session log or another session's log.
+        for summary in observed.values():
+            if summary["error"] is not None:
+                print(f"acceptance-worker-turn: FAILED -- session={summary['address']} "
+                      f"class={summary['class']} start_seq={summary['seq']}; {summary['error']}; {counts}",
+                      file=sys.stderr)
+                return 1
+        completed = next((summary for summary in observed.values()
+                          if summary["candidate"] and summary["reason"] == "completed"), None)
+        if completed is not None:
+            print(f"acceptance-worker-turn: PASS -- admitted, completed; session={completed['address']} "
+                  f"class={completed['class']} start_seq={completed['seq']}; "
+                  f"RunStarted requires {', '.join(REQUIRED)}; {counts}", flush=True)
+            return 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll, remaining))
+    has_candidates = any(summary["candidate"] for summary in observed.values())
+    failure = "worker_completion_timeout" if has_candidates else "no_worker_candidate"
+    evidence = f"; evidence={','.join(sorted(unavailable))}" if unavailable else ""
+    print(f"acceptance-worker-turn: FAILED -- {failure}; no completed post-restart AFT candidate "
+          f"within {timeout:g}s; {worker_counts(observed)}{evidence}", file=sys.stderr)
+    return 1
+
+
+def observe_worker(args, state_root):
+    timeout = args.timeout if args.timeout is not None else 600
+    try:
+        after_ms = json.loads(args.placement_report.read_text())["restart_observed_at_ms"]
+        if not isinstance(after_ms, int) or isinstance(after_ms, bool) or after_ms <= 0:
+            raise ValueError
+        if not 0 <= timeout <= 600:
+            raise ValueError
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        raise ValueError("project-free worker acceptance requires a valid placement report "
+                         "restart boundary and a timeout between 0 and 600 seconds") from None
+    return wait_for_worker(state_root, after_ms, timeout)
 
 
 class ClientFailure(ValueError):
@@ -176,14 +329,18 @@ def main():
     parser.add_argument("--session-bin", type=Path, default=target_dir / "release/broca-session")
     parser.add_argument("--subc", type=Path, default=Path.home() / ".local/share/cortexkit/run/subc-connection.json")
     parser.add_argument("--state-root", type=Path)
+    parser.add_argument("--placement-report", type=Path,
+                        help="restart boundary required when observing project-free worker traffic")
     parser.add_argument("--project-root", type=Path, default=ROOT)
     parser.add_argument("--model", default=os.environ.get("ACCEPTANCE_WORKER_MODEL"),
                         help="pin one model instead of rotating the shared acceptance candidates")
-    parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--timeout", type=float,
+                        help="seconds to observe traffic (default 600, max 600), or per client call (default 120)")
     parser.add_argument("--compose-only", action="store_true",
                         help="fetch the live composition and print provider/tool counts and digest; send nothing")
     args = parser.parse_args()
     try:
+        request_timeout = args.timeout if args.timeout is not None else 120
         state_root = args.state_root or default_state_root()
         project_root = args.project_root.resolve(strict=True)
         base = [str(args.session_bin), "--subc", str(args.subc), "--project-root", str(project_root),
@@ -191,7 +348,13 @@ def main():
         # The class exercises the WAL gate without adding acceptance transcripts to Engram's backup.
         # Ask the serving daemon: a checkout's config (or its absence) cannot establish placement.
         description = json.loads(invoke(base + ["--session", "acceptance-plan-" + uuid.uuid4().hex,
-                                                "describe"], args.timeout))["result"]
+                                                "describe"], request_timeout))["result"]
+        if bind_no_project(description):
+            if args.compose_only:
+                raise ValueError("compose-only requires a project-bearing build; "
+                                 "project-free worker acceptance observes traffic without fetching")
+            return observe_worker(args, state_root)
+        args.timeout = request_timeout
         backup_classes = description["session_class"]["backup_classes"]
         if not isinstance(backup_classes, list) or not all(isinstance(item, str) for item in backup_classes):
             raise ValueError("role.describe returned invalid session_class.backup_classes")
@@ -205,14 +368,16 @@ def main():
                 print("acceptance-worker-turn: COMPOSE ONLY -- no send", flush=True)
                 return 0
             return run_models(base, args, state_root, project_root, plan_path)
-    except (ArchiveRefusal, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+    except (ArchiveRefusal, OSError, ValueError, KeyError, TypeError, StateRootError,
+            subprocess.TimeoutExpired) as error:
         print(f"acceptance-worker-turn: FAILED -- {error}", file=sys.stderr)
         return 1
 
 
 def run_models(base, args, state_root, project_root, plan_path):
     models = candidates(args.model)
-    # The reader fetch-plan preset is legal unscoped; worker requires a daemon-attested session scope.
+    # AFT's reader tool preset needs project authority, which a project-free
+    # acceptance connection lacks. Only project-bearing builds reach this path.
     # No tool call is needed: declarations freeze during admission, before the model turn.
     # The output cap must exceed the largest thinking budget an auth method can switch on
     # (Anthropic OAuth enables 1024 tokens), or admission refuses the send before any model

@@ -178,8 +178,9 @@ PY
     checkout_pin subconscious "$SUBC_REV" "$subc_source"
     checkout_pin claustrum "$CLAUSTRUM_REV" "$vault_source"
   fi
-  cargo build --locked "${subc_config[@]}" --manifest-path "$subc_source/Cargo.toml" -p subc-core --bins
-  cargo build --locked "${vault_config[@]}" --manifest-path "$vault_source/Cargo.toml" -p credentials-module --bins
+  # Linux has no offline override; preserve zero arguments on Bash 3.2 with nounset.
+  cargo build --locked ${subc_config[@]+"${subc_config[@]}"} --manifest-path "$subc_source/Cargo.toml" -p subc-core --bins
+  cargo build --locked ${vault_config[@]+"${vault_config[@]}"} --manifest-path "$vault_source/Cargo.toml" -p credentials-module --bins
   suffix=''
   [[ "$lane" != windows ]] || suffix=.exe
   mkdir -p "$scratch/package/fixtures/bin" "$scratch/package/fixtures/claustrum/crates/credentials-module/tests/fixtures"
@@ -219,14 +220,13 @@ rig_environment() {
 }
 
 broker() {
-  local args=()
   if [[ "$platform" == windows ]]; then
     CK_NATS_SERVER_BIN="$(cygpath -m "$(command -v nats-server)")"
     export CK_NATS_SERVER_BIN
     printf 'CK_NATS_SERVER_BIN=%s\n' "$CK_NATS_SERVER_BIN" > "$scratch/nats.env"
     return
   fi
-  RUNNER_TEMP="$scratch" GITHUB_ENV="$scratch/nats.env" python3 scripts/install-ci-nats.py "${args[@]}"
+  RUNNER_TEMP="$scratch" GITHUB_ENV="$scratch/nats.env" python3 scripts/install-ci-nats.py
 }
 
 aimock() {

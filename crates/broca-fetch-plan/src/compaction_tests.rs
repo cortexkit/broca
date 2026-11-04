@@ -75,6 +75,25 @@ fn compaction_and_step_items_preserve_an_absent_preset() {
 }
 
 #[test]
+fn mode3_compaction_item_requires_a_string_preset_before_fetching() {
+    let mut raw = raw_plan("magic-context", Some("magic-context"), "replace");
+    raw["compaction_item"]
+        .as_object_mut()
+        .unwrap()
+        .remove("preset");
+    let parsed = parse_plan(&raw, CompactionSupport::Supported).unwrap();
+    let refusal = crate::require_compaction_preset(&parsed).unwrap_err();
+    assert_eq!(refusal.code(), "invalid_params");
+    assert_eq!(
+        refusal.detail(),
+        json!({"field":"plan.compaction_item.preset"})
+    );
+    raw["compaction_item"]["preset"] = json!("head");
+    let parsed = parse_plan(&raw, CompactionSupport::Supported).unwrap();
+    crate::require_compaction_preset(&parsed).unwrap();
+}
+
+#[test]
 fn parser_preserves_the_matching_compaction_composition_in_catalog_requests() {
     let mut raw = raw_plan("magic-context", Some("magic-context"), "replace");
     raw["composition"]["compaction"]["opaque"] = json!({"nested": [null, false, 7]});
@@ -264,14 +283,14 @@ async fn admission_freezes_compaction_config_and_role_version() {
     let plan = parse_plan(&raw, CompactionSupport::Supported).unwrap();
     let fetcher = Declaration::answering(Ok(serving_describe()));
     let manifest = admission_with(&plan, &fetcher).await.unwrap().manifest;
-    assert_eq!(fetcher.describes(), ["magic-context"]);
+    assert!(fetcher.describes().is_empty());
     assert_eq!(manifest.plan.as_json_text(), raw.to_string());
     assert_eq!(
         manifest
             .role_versions
             .get("compaction-provider")
             .map(String::as_str),
-        Some("v1")
+        Some("v2")
     );
     assert_eq!(
         manifest
@@ -332,114 +351,61 @@ fn compaction_plan() -> Plan {
 }
 
 #[tokio::test]
-async fn a_provider_whose_describe_lacks_the_role_is_refused_invalid_params_naming_it() {
+async fn compaction_admission_does_not_probe_a_legacy_role_description() {
     let cases = [
-        (
-            json!({"majors": [{"version": "step-transform-provider/v1",
-                "ops": ["role.describe", "transform.declare", "transform.hook"]}],
-                "implementation_version": "mc"}),
-            json!([{"problem": "missing_major", "found": ["step-transform-provider/v1"]}]),
-        ),
-        (
-            json!({"majors": [{"version": "compaction-provider/v1",
-                "ops": ["role.describe", "compaction.setup"]}], "implementation_version": "mc"}),
-            json!([{"problem": "missing_op", "op": "view.get"}, {"problem": "missing_op", "op": "compaction.ride"}]),
-        ),
+        json!({"majors": [{"version": "step-transform-provider/v1",
+            "ops": ["role.describe", "transform.declare", "transform.hook"]}],
+            "implementation_version": "mc"}),
+        json!({"majors": [{"version": "compaction-provider/v1",
+            "ops": ["role.describe", "compaction.setup"]}], "implementation_version": "mc"}),
     ];
-    for (describe, problems) in cases {
+    for describe in cases {
         let fetcher = Declaration::answering(Ok(describe));
-        let refusal = admission_with(&compaction_plan(), &fetcher)
-            .await
-            .unwrap_err();
-        assert_eq!(refusal.code(), "invalid_params");
-        assert_eq!(
-            refusal.detail(),
-            json!({"field": "plan.compaction_item", "provider": "magic-context",
-                "problems": problems})
-        );
+        let admitted = admission_with(&compaction_plan(), &fetcher).await.unwrap();
+        assert_eq!(admitted.manifest.role_versions["compaction-provider"], "v2");
         assert!(
-            !refusal.retryable(),
-            "a provider that said no says no again"
+            fetcher.describes().is_empty(),
+            "v2 availability belongs to Setup"
         );
-        assert_eq!(fetcher.describes(), ["magic-context"]);
     }
 }
 
-/// A provider that refuses `role.describe` itself with a typed code that does not clear on retry
-/// (live Magic Context answers `unknown_method`) has said it does not serve the role: the same
-/// permanent refusal, naming the code it refused with.
+/// Compaction v2 does not define role.describe; its refusal cannot gate admission.
 #[tokio::test]
-async fn a_provider_refusing_its_describe_for_good_is_refused_invalid_params_naming_the_code() {
+async fn compaction_admission_does_not_call_a_provider_that_refuses_describe() {
     for code in ["unknown_method", "invalid_request"] {
         let fetcher = Declaration::describing(Ok(DescribeAnswer::Refused { code: code.into() }));
-        let refusal = admission_with(&compaction_plan(), &fetcher)
-            .await
-            .unwrap_err();
-        assert_eq!(refusal.code(), "invalid_params");
-        assert_eq!(
-            refusal.detail(),
-            json!({"field": "plan.compaction_item", "provider": "magic-context",
-                "problems": [{"problem": "describe_refused", "code": code}]})
-        );
-        assert!(!refusal.retryable(), "{code}");
-        assert_eq!(
-            fetcher.describes(),
-            ["magic-context"],
-            "asked once, not retried"
+        admission_with(&compaction_plan(), &fetcher).await.unwrap();
+        assert!(
+            fetcher.describes().is_empty(),
+            "no legacy call, including a retry"
         );
     }
 }
 
-/// A provider that could not be asked, that refused its describe with a code that may clear, or
-/// whose answer is not a describe, has not said it lacks the role. Each is the runner role's
-/// retryable `fetch_unavailable`, naming the provider, and never the permanent refusal above.
+/// Provider liveness is tested by Setup on the session-bound v2 route, after
+/// admission. Neither transport loss nor an unreadable v1 describe is consulted.
 #[tokio::test(start_paused = true)]
-async fn a_provider_that_could_not_be_asked_is_fetch_unavailable_not_a_role_refusal() {
+async fn compaction_admission_does_not_call_an_unreachable_provider() {
     let cases = [
-        (
-            Err(FetchError::Lost("route closed".into())),
-            json!({"provider": "magic-context", "reason": "timeout"}),
-        ),
-        (
-            Err(FetchError::Refused {
-                code: "module_warming".into(),
-                detail: None,
-                retryable: true,
-            }),
-            json!({"provider": "magic-context", "reason": "refused",
-                "provider_code": "module_warming"}),
-        ),
-        (
-            Err(FetchError::Refused {
-                code: "transient".into(),
-                detail: None,
-                retryable: true,
-            }),
-            json!({"provider": "magic-context", "reason": "refused",
-                "provider_code": "transient"}),
-        ),
-        (
-            Err(FetchError::UnknownModule),
-            json!({"provider": "magic-context", "reason": "unknown_module"}),
-        ),
-        (
-            Ok(json!("not a describe")),
-            json!({"provider": "magic-context", "reason": "refused",
-                "provider_code": "invalid_answer", "op": "role.describe", "retryable": false}),
-        ),
-        (
-            Ok(json!({"majors": []})),
-            json!({"provider": "magic-context", "reason": "refused",
-                "provider_code": "invalid_answer", "op": "role.describe", "retryable": false}),
-        ),
+        Err(FetchError::Lost("route closed".into())),
+        Err(FetchError::Refused {
+            code: "module_warming".into(),
+            detail: None,
+            retryable: true,
+        }),
+        Err(FetchError::Refused {
+            code: "transient".into(),
+            detail: None,
+            retryable: true,
+        }),
+        Err(FetchError::UnknownModule),
+        Ok(json!("not a describe")),
+        Ok(json!({"majors": []})),
     ];
-    for (describe, detail) in cases {
+    for describe in cases {
         let fetcher = Declaration::answering(describe);
-        let refusal = admission_with(&compaction_plan(), &fetcher)
-            .await
-            .unwrap_err();
-        assert_eq!(refusal.code(), "fetch_unavailable", "{detail}");
-        assert_eq!(refusal.detail(), detail);
-        assert!(refusal.retryable(), "{detail}");
+        admission_with(&compaction_plan(), &fetcher).await.unwrap();
+        assert!(fetcher.describes().is_empty());
     }
 }

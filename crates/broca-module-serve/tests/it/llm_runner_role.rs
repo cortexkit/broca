@@ -17,9 +17,7 @@ use subc_protocol::{Frame, FrameType};
 /// `body` with the run id and lineage id it names replaced by placeholders, so the rest of its
 /// bytes can be pinned: both are minted per run from a per-process scratch directory.
 fn normalized(body: &[u8], run_id: &str, lineage_id: &str) -> String {
-    String::from_utf8_lossy(body)
-        .replace(run_id, "@RUN_ID@")
-        .replace(lineage_id, "@LINEAGE_ID@")
+    normalize_snapshot_bytes(body, run_id, lineage_id)
 }
 
 /// The pinned text of `file`, without its trailing newline.
@@ -42,6 +40,634 @@ async fn one_tool_turn(tag: &str) -> (Rig, String) {
     (rig, run_id)
 }
 
+fn native_finish_events(
+    raw: Option<&str>,
+    legacy: broca_protocol::FinishReason,
+    content: Vec<ContentBlock>,
+) -> Vec<broca_protocol::NormalizedEvent> {
+    use broca_protocol::{AssistantMessage, MessageId, NormalizedEvent, ProviderControl, Usage};
+    vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: AssistantMessage {
+                message_id: MessageId("native-finish".into()),
+                content,
+            },
+        }),
+        NormalizedEvent::Control(
+            serde_json::from_value(serde_json::json!({
+                "type":"step_finished", "step_id":1, "usage":{},
+                "finish_reason":legacy, "raw_finish_reason":raw,
+            }))
+            .unwrap(),
+        ),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: Usage::default(),
+            finish_reason: legacy,
+            retries_used: 0,
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn message_senders_preserve_attested_owner_on_fresh_and_steered_rows() {
+    let mut rig = Rig::start("message-sender-steer").await;
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "actual-route".into(),
+        }),
+    )
+    .await;
+    rig.script
+        .push(&[Step::Call("sender-call"), Step::Text("answer")]);
+    rig.script.hold_tool(true);
+    let started = rig.send("sender-start", "fresh", None).await;
+    assert_eq!(result(&started)["state"], "active");
+    rig.wait_entered().await;
+    let joined = rig.send("sender-join", "steered", Some("steer")).await;
+    assert_eq!(result(&joined)["state"], "active");
+    rig.script.hold_tool(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig = rig.restart().await;
+    let history = call(
+        &mut rig,
+        "session.history",
+        serde_json::json!({"form":"display"}),
+    )
+    .await;
+    let page = result(&history);
+    let users: Vec<_> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["row"]["role"] == "user")
+        .collect();
+    assert_eq!(users.len(), 2);
+    for user in users {
+        assert_eq!(user["row"]["sender"], "actual-route", "{user}");
+    }
+    for entry in page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["row"]["role"] != "user")
+    {
+        assert!(entry["row"].get("sender").is_none());
+    }
+    capture_sender_samples(&rig, &page, "owner-steer");
+    let read = call(&mut rig, "session.read", serde_json::json!({})).await;
+    assert!(!String::from_utf8(read.body).unwrap().contains("\"sender\""));
+    rig.finish().await;
+}
+
+struct DisplaySenderPlan;
+
+#[async_trait::async_trait]
+impl broca_fetch_plan::PlanAdmitter for DisplaySenderPlan {
+    async fn admit(
+        &self,
+        plan: &broca_fetch_plan::Plan,
+        _session: &broca_protocol::BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
+    ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
+        Ok(broca_fetch_plan::Admitted {
+            manifest: broca_wal::PlanManifest {
+                rich_ui: None,
+                plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+                plan_identity: plan.identity.clone(),
+                composition_digest: plan.composition_digest.clone(),
+                fetches: vec![],
+                tools: std::sync::Arc::new(vec![]),
+                system_text: String::new(),
+                system_digest: String::new(),
+                join_version: 1,
+                role_versions: Default::default(),
+                declarations: vec![],
+            },
+        })
+    }
+}
+
+async fn sender_history(rig: &mut Rig) -> serde_json::Value {
+    let frame = call(
+        rig,
+        "session.history",
+        serde_json::json!({"form":"display"}),
+    )
+    .await;
+    result(&frame)
+}
+
+fn assert_display_sender(page: &serde_json::Value, text: &str, sender: &str) {
+    let rows: Vec<_> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["row"]["role"] == "user" && entry["row"]["text"] == text)
+        .collect();
+    assert_eq!(rows.len(), 1, "{text}: {page}");
+    assert_eq!(rows[0]["row"]["sender"], sender, "{text}: {page}");
+}
+
+fn capture_sender_samples(rig: &Rig, page: &serde_json::Value, name: &str) {
+    let Some(root) = std::env::var_os("BROCA_SENDER_SAMPLES") else {
+        return;
+    };
+    use sha2::{Digest, Sha256};
+    let root = std::path::PathBuf::from(root).join(name);
+    std::fs::create_dir_all(&root).unwrap();
+    let bytes = serde_json::to_vec(page).unwrap();
+    std::fs::write(root.join("history.json"), &bytes).unwrap();
+    let mut sums = format!("{:x}  history.json\n", Sha256::digest(&bytes));
+    let mut written = std::collections::BTreeSet::new();
+    for record in rig.records().into_iter().rev() {
+        if name == "matrix"
+            && !matches!(&record,
+            broca_wal::WalRecord::RunStarted { sent_by: Some(broca_protocol::BindPrincipal::Reserved { module_id }), .. }
+            | broca_wal::WalRecord::Queued { sent_by: Some(broca_protocol::BindPrincipal::Reserved { module_id }), .. }
+            if module_id == "named")
+        {
+            continue;
+        }
+        let kind = match &record {
+            broca_wal::WalRecord::RunStarted {
+                sent_by: Some(_), ..
+            } => "run-started",
+            broca_wal::WalRecord::Queued {
+                sent_by: Some(_), ..
+            } => "queued",
+            broca_wal::WalRecord::Steered {
+                sent_by: Some(_), ..
+            } => "steered",
+            _ => continue,
+        };
+        if !written.insert(kind) {
+            continue;
+        }
+        let json = serde_json::to_vec(&record).unwrap();
+        let frame = broca_wal::framing::encode_v4(
+            broca_wal::framing::v4::Metadata {
+                seq: 7,
+                fence: 3,
+                appended_ms: 123,
+                writer_id: [5; 16],
+            },
+            &[],
+            &record,
+        )
+        .unwrap();
+        for (extension, bytes) in [("json", json), ("v4", frame)] {
+            let filename = format!("{kind}.{extension}");
+            std::fs::write(root.join(&filename), &bytes).unwrap();
+            sums.push_str(&format!("{:x}  {filename}\n", Sha256::digest(&bytes)));
+        }
+    }
+    std::fs::write(root.join("SHA256SUMS"), sums).unwrap();
+}
+
+#[tokio::test]
+async fn message_senders_cover_named_start_join_interrupt_template_and_queue_restart() {
+    use cortexkit_role_llm_runner::delivery_order::{template_digest, Template};
+    let mut rig = Rig::start("message-sender-matrix").await;
+    rig.registry()
+        .set_plan_admitter(std::sync::Arc::new(DisplaySenderPlan));
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "owner".into(),
+        }),
+    )
+    .await;
+    rig.bind_as(
+        13,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "named".into(),
+        }),
+    )
+    .await;
+    let template = Template::new("plain", "template text", Default::default());
+    let composition = serde_json::json!({"providers":[]});
+    let digest = cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap();
+    let plan = serde_json::json!({"tool_items":[],"system_text_items":[],"step_transform_items":[],"composition":composition,"composition_digest":digest,"senders":[{"module":"named","idle_start":true,"interrupt":true,"templates":[template]}]});
+    let baseline = call(&mut rig, "session.send", serde_json::json!({"prompt":"baseline","send_id":"baseline","model":{"provider":"fake","model":"fake"},"plan":plan})).await;
+    assert_eq!(result(&baseline)["state"], "active");
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    for (id, prompt, delivery) in [
+        (
+            "named-start",
+            "named fresh",
+            serde_json::json!(["idle_start"]),
+        ),
+        (
+            "idle-interrupt",
+            "idle interrupt",
+            serde_json::json!("interrupt"),
+        ),
+    ] {
+        let sent = rig.request(13, serde_json::json!({"method":"session.send","params":{"send_id":id,"model":{"provider":"fake","model":"fake"},"prompt":prompt,"delivery":delivery}})).await;
+        assert_eq!(result(&sent)["state"], "active", "{sent:?}");
+        rig.wait_for_finished(if id == "named-start" { 2 } else { 3 })
+            .await;
+        rig.wait_idle().await;
+    }
+    rig.script.hold_model(true);
+    let active = call(
+        &mut rig,
+        "session.send",
+        serde_json::json!({"send_id":"owner-active","prompt":"owner active","model":{"provider":"fake","model":"fake"}}),
+    )
+    .await;
+    assert_eq!(result(&active)["state"], "active");
+    rig.wait_entered().await;
+    let joined = rig.request(13, serde_json::json!({"method":"session.send","params":{"send_id":"named-join","prompt":"named join","delivery":["steer"]}})).await;
+    assert!(matches!(
+        result(&joined)["state"].as_str(),
+        Some("pending" | "active")
+    ));
+    rig.script.hold_model(false);
+    rig.wait_for_finished(4).await;
+    rig.wait_idle().await;
+    rig.script.hold_model(true);
+    let active = call(
+        &mut rig,
+        "session.send",
+        serde_json::json!({"send_id":"before-interrupt","prompt":"before interrupt","model":{"provider":"fake","model":"fake"}}),
+    )
+    .await;
+    assert_eq!(result(&active)["state"], "active");
+    rig.wait_entered().await;
+    let interrupted = rig.request(13, serde_json::json!({"method":"session.send","params":{"send_id":"active-interrupt","model":{"provider":"fake","model":"fake"},"prompt":"active interrupt","delivery":"interrupt"}})).await;
+    assert!(matches!(
+        result(&interrupted)["state"].as_str(),
+        Some("pending" | "active")
+    ));
+    rig.script.hold_model(false);
+    rig.wait_for_finished(6).await;
+    rig.wait_idle().await;
+    let templated = rig.request(13, serde_json::json!({"method":"session.send","params":{"send_id":"template","model":{"provider":"fake","model":"fake"},"delivery":["idle_start"],"template":{"id":"plain","digest":template_digest(&template),"slots":{}}}})).await;
+    assert_eq!(result(&templated)["state"], "active");
+    rig.wait_for_finished(7).await;
+    rig.wait_idle().await;
+    rig.script.hold_model(true);
+    let active = call(
+        &mut rig,
+        "session.send",
+        serde_json::json!({"send_id":"before-restart","prompt":"before restart","model":{"provider":"fake","model":"fake"}}),
+    )
+    .await;
+    assert_eq!(result(&active)["state"], "active");
+    rig.wait_entered().await;
+    let queued = rig.request(13, serde_json::json!({"method":"session.send","params":{"send_id":"queued-restart","model":{"provider":"fake","model":"fake"},"prompt":"queued after restart","delivery":["idle_start"]}})).await;
+    assert_eq!(result(&queued)["state"], "pending");
+    let (sealed, ()) = tokio::join!(rig.registry().stop_and_seal(), async {
+        rig.script.hold_model(false);
+    });
+    assert!(sealed);
+    rig = rig.restart().await;
+    rig.registry()
+        .set_plan_admitter(std::sync::Arc::new(DisplaySenderPlan));
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "owner".into(),
+        }),
+    )
+    .await;
+    let wake = call(&mut rig, "session.send", serde_json::json!({"send_id":"reopen","prompt":"reopen","model":{"provider":"fake","model":"fake"}})).await;
+    assert!(matches!(
+        result(&wake)["state"].as_str(),
+        Some("pending" | "active")
+    ));
+    rig.wait_for_finished(10).await;
+    rig.wait_idle().await;
+    let page = sender_history(&mut rig).await;
+    for text in [
+        "named fresh",
+        "named join",
+        "idle interrupt",
+        "active interrupt",
+        "template text",
+        "queued after restart",
+    ] {
+        assert_display_sender(&page, text, "named");
+    }
+    for record in rig.records() {
+        if let broca_wal::WalRecord::RunStarted {
+            input,
+            sent_by,
+            principal,
+            ..
+        } = record
+        {
+            if input.iter().any(|message| message.content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "queued after restart"))) {
+                assert_eq!(sent_by, Some(broca_protocol::BindPrincipal::Reserved { module_id: "named".into() }));
+                assert_eq!(principal, Some(broca_protocol::BindPrincipal::Reserved { module_id: "owner".into() }));
+            }
+        }
+    }
+    capture_sender_samples(&rig, &page, "matrix");
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn finish_reason_reports_provider_limits_without_a_caller_cap_on_every_family() {
+    use broca_provider::spec::WireFamilyId as Family;
+    let mut missing = Vec::new();
+    for (family, raw) in [
+        (Family::AnthropicMessages, "max_tokens"),
+        (Family::OpenAiChat, "length"),
+        (Family::OpenAiResponses, "incomplete:max_output_tokens"),
+        (
+            Family::OpenAiResponsesChatgpt,
+            "incomplete:max_output_tokens",
+        ),
+        (Family::Gemini, "MAX_TOKENS"),
+        (Family::GoogleCodeAssist, "MAX_TOKENS"),
+        (Family::BedrockConverse, "max_tokens"),
+    ] {
+        let mut rig = Rig::start(&format!("native-limit-{family:?}")).await;
+        let mut frozen = broca_provider::families::frozen_config_for_family(family, "fake");
+        frozen.project_id = Some("fixture-project".into());
+        *rig.script.media_frozen.lock().unwrap() = Some(frozen);
+        rig.script
+            .normalized_steps
+            .lock()
+            .unwrap()
+            .push_back(native_finish_events(
+                Some(raw),
+                broca_protocol::FinishReason::Length,
+                vec![ContentBlock::Text {
+                    text: "provider-limited reply".into(),
+                }],
+            ));
+        let sent = rig.send("native-limit", "no caller output cap", None).await;
+        let run = result(&sent)["run_id"].as_str().unwrap().to_owned();
+        rig.wait_for_finished(1).await;
+        rig.wait_idle().await;
+        let output_frame = call(&mut rig, "run.result", serde_json::json!({"run_id":run})).await;
+        let status_frame = call(&mut rig, "run.status", serde_json::json!({"run_id":run})).await;
+        let output = result(&output_frame);
+        let status = result(&status_frame);
+        assert_eq!(
+            status["final_step_finish_reason"], "length",
+            "legacy field: {family:?}"
+        );
+        if output["finish"] != "length" || status["finish"] != "length" {
+            missing.push(format!(
+                "{family:?}: result={} status={}",
+                output["finish"], status["finish"]
+            ));
+        }
+        if let Some(path) = std::env::var_os("BROCA_FINISH_SAMPLES") {
+            use sha2::{Digest, Sha256};
+            let path = std::path::PathBuf::from(path).join(format!("{family:?}"));
+            std::fs::create_dir_all(&path).unwrap();
+            let step = rig
+                .records()
+                .into_iter()
+                .find(|record| matches!(record, broca_wal::WalRecord::ModelStepFinished { .. }))
+                .unwrap();
+            let json = serde_json::to_vec(&step).unwrap();
+            let frame = broca_wal::framing::encode_v4(
+                broca_wal::framing::v4::Metadata {
+                    seq: 7,
+                    fence: 3,
+                    appended_ms: 123,
+                    writer_id: [5; 16],
+                },
+                &[],
+                &step,
+            )
+            .unwrap();
+            let mut sums = String::new();
+            for (name, bytes) in [
+                ("run-result.json", output_frame.body.as_slice()),
+                ("run-status.json", status_frame.body.as_slice()),
+                ("model-step.json", json.as_slice()),
+                ("model-step.v4", frame.as_slice()),
+            ] {
+                std::fs::write(path.join(name), bytes).unwrap();
+                sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(bytes)));
+            }
+            std::fs::write(path.join("SHA256SUMS"), sums).unwrap();
+        }
+        rig.finish().await;
+    }
+    assert!(
+        missing.is_empty(),
+        "provider length evidence was not served: {missing:?}"
+    );
+}
+
+#[tokio::test]
+async fn finish_reason_uses_only_the_last_native_step_and_survives_restart() {
+    use broca_protocol::{FinishReason, ToolCall, ToolCallId};
+    let mut rig = Rig::start("native-finish-absence").await;
+    *rig.script.media_frozen.lock().unwrap() =
+        Some(broca_provider::families::openai_chat_frozen_config("fake"));
+    let tool = ContentBlock::ToolCall(ToolCall {
+        tool_call_id: ToolCallId("native-tool".into()),
+        tool_name: "work".into(),
+        input: serde_json::json!({}),
+        thought_signature: None,
+    });
+    let oversized = "x".repeat(65);
+    let mut receipts = Vec::new();
+    for (index, raw, expected) in [
+        (0, Some("stop"), Some("stop")),
+        (1, None, None),
+        (2, Some("future_reason"), Some("other")),
+        (3, Some(oversized.as_str()), None),
+    ] {
+        if index == 1 {
+            rig.script.hold_tool(true);
+            rig.script
+                .normalized_steps
+                .lock()
+                .unwrap()
+                .push_back(native_finish_events(
+                    Some("tool_calls"),
+                    FinishReason::ToolCalls,
+                    vec![tool.clone()],
+                ));
+        }
+        rig.script
+            .normalized_steps
+            .lock()
+            .unwrap()
+            .push_back(native_finish_events(
+                raw,
+                FinishReason::Stop,
+                vec![ContentBlock::Text {
+                    text: "answer".into(),
+                }],
+            ));
+        let sent = rig.send(&format!("native-{index}"), "answer", None).await;
+        let run = result(&sent)["run_id"].as_str().unwrap().to_owned();
+        if index == 1 {
+            rig.wait_entered().await;
+            for op in ["run.result", "run.status"] {
+                let frame = call(&mut rig, op, serde_json::json!({"run_id":run})).await;
+                assert!(result(&frame).get("finish").is_none(), "active {op}");
+            }
+            rig.script.hold_tool(false);
+        }
+        rig.wait_for_finished(index + 1).await;
+        rig.wait_idle().await;
+        for op in ["run.result", "run.status"] {
+            let frame = call(&mut rig, op, serde_json::json!({"run_id":run})).await;
+            assert_eq!(
+                result(&frame)
+                    .get("finish")
+                    .and_then(serde_json::Value::as_str),
+                expected,
+                "{op}: {index}"
+            );
+        }
+        receipts.push((run, expected));
+    }
+    rig = rig.restart().await;
+    for (run, expected) in receipts {
+        for op in ["run.result", "run.status"] {
+            let frame = call(&mut rig, op, serde_json::json!({"run_id":run})).await;
+            assert_eq!(
+                result(&frame)
+                    .get("finish")
+                    .and_then(serde_json::Value::as_str),
+                expected,
+                "recovered {op}: {run}"
+            );
+        }
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn display_facts_opt_in_preserves_default_and_matches_stored_times() {
+    let mut rig = Rig::start("read-display-facts").await;
+    *rig.script.schema_pin.lock().unwrap() = Some(broca_wal::DispatchSchemaPin {
+        schema_digest: "a".repeat(64),
+        semantics: 7,
+    });
+    rig.script
+        .push(&[Step::Call("facts-call"), Step::Text("answer")]);
+    let active = rig
+        .send_with(
+            "facts-turn",
+            "hi",
+            None,
+            serde_json::json!({"client_message_id":"phone_facts_1"}),
+        )
+        .await;
+    let run = result(&active)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let default = call(&mut rig, "session.read", serde_json::json!({})).await;
+    let plain = result(&default);
+    let lineage = plain["incarnation"].as_str().unwrap();
+    let mut baseline = normalized(&default.body, &run, lineage);
+    for entry in plain["messages"].as_array().unwrap() {
+        if let Some(at) = entry["written_at"].as_u64() {
+            baseline = baseline.replace(
+                &format!("\"written_at\":{at},"),
+                "\"written_at\":\"@RECORDED_TIME@\",",
+            );
+        }
+        assert!(entry.get("client_message_id").is_none());
+        assert!(entry.get("tool_times").is_none());
+    }
+    if std::env::var_os("BROCA_CAPTURE_DISPLAY_BASELINE").is_some() {
+        std::fs::write(
+            golden_path("session_read.default_display_facts_baseline.json"),
+            &baseline,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        baseline,
+        pinned("session_read.default_display_facts_baseline.json")
+    );
+    let decorated = call(
+        &mut rig,
+        "session.read",
+        serde_json::json!({"include_display_facts":true}),
+    )
+    .await;
+    let facts = result(&decorated);
+    assert_eq!(facts["messages"][0]["client_message_id"], "phone_facts_1");
+    let mut stripped = facts.clone();
+    for entry in stripped["messages"].as_array_mut().unwrap() {
+        let entry = entry.as_object_mut().unwrap();
+        entry.remove("client_message_id");
+        entry.remove("tool_times");
+    }
+    assert_eq!(plain, stripped);
+    let records = rig.records();
+    let started = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::ToolDispatchIntent {
+                tool_call_id,
+                dispatched_at_ms,
+                ..
+            } if tool_call_id.0 == "facts-call" => *dispatched_at_ms,
+            _ => None,
+        })
+        .unwrap();
+    let finished = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::ToolResult {
+                result,
+                finished_at_ms,
+                ..
+            } if result.tool_call_id.0 == "facts-call" => *finished_at_ms,
+            _ => None,
+        })
+        .unwrap();
+    let times = &facts["messages"][1]["tool_times"];
+    assert_eq!(times.as_array().unwrap().len(), 1);
+    assert_eq!(times[0]["tool_call_id"], "facts-call");
+    assert_eq!(times[0]["started_at"], started);
+    assert_eq!(times[0]["finished_at"], finished);
+    let history = call(
+        &mut rig,
+        "session.history",
+        serde_json::json!({"form":"display"}),
+    )
+    .await;
+    let history_page = result(&history);
+    let tool = &history_page["messages"][1]["row"]["parts"][0];
+    assert_eq!(tool["started_at"], started);
+    assert_eq!(tool["finished_at"], finished);
+    assert!(tool.get("unanswered").is_none());
+    assert!(tool["call_key"].is_string());
+    assert!(tool["schema_pin"].is_string());
+    assert_eq!(times[0]["call_key"], tool["call_key"]);
+    assert_eq!(times[0]["schema_pin"], tool["schema_pin"]);
+    if let Some(path) = std::env::var_os("BROCA_DISPLAY_FACTS_SAMPLES") {
+        use sha2::{Digest, Sha256};
+        let path = std::path::PathBuf::from(path);
+        std::fs::create_dir_all(&path).unwrap();
+        let mut sums = String::new();
+        for (name, bytes) in [
+            ("default-read.json", default.body.as_slice()),
+            ("opt-in-read.json", decorated.body.as_slice()),
+            ("history.json", history.body.as_slice()),
+        ] {
+            std::fs::write(path.join(name), bytes).unwrap();
+            sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(bytes)));
+        }
+        let row = serde_json::to_vec(&history_page["messages"][1]).unwrap();
+        std::fs::write(path.join("history-row.json"), &row).unwrap();
+        sums.push_str(&format!("{:x}  history-row.json\n", Sha256::digest(&row)));
+        std::fs::write(path.join("SHA256SUMS"), sums).unwrap();
+    }
+    rig.finish().await;
+}
+
 /// A `session.read` and a `session.subscribe` from the start, each with no params, of a session
 /// whose one run called a tool. Existing member and cursor/unit bytes remain pinned separately
 /// from the default read-entry times, dispatch attribution, live metadata and message boundaries.
@@ -55,7 +681,7 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
         )
         .await;
     let page = result(&read);
-    let lineage_id = page["lineage_id"].as_str().unwrap().to_owned();
+    let lineage_id = page["incarnation"].as_str().unwrap().to_owned();
     // Times are intentional default envelope additions. Require each one, then remove only
     // its envelope spelling to compare the older member bytes; new shape goldens pin the additions.
     let mut body = normalized(&read.body, &run_id, &lineage_id);
@@ -118,7 +744,7 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
         })
         .collect();
     assert_eq!(
-        legacy.join("\n"),
+        legacy.join("\n").replace("m@LINEAGE_PREFIX@.", "m"),
         pinned("session_subscribe.tool_turn.legacy.jsonl")
     );
     for (index, body) in events.iter().enumerate() {
@@ -210,30 +836,30 @@ async fn tagged_open_tool_turn_read_bytes_are_pinned() {
         )
         .await;
     let page = result(&read);
-    let lineage_id = page["lineage_id"].as_str().unwrap();
+    let lineage_id = page["incarnation"].as_str().unwrap();
     assert_eq!(page["messages"].as_array().unwrap().len(), 4);
     assert_eq!(
-        page["messages"][0]["tags"],
-        serde_json::json!([{"part": "m0#0", "tag": "§1§"}])
+        page["messages"][0]["part_keys"],
+        serde_json::json!(["m0#0"])
     );
     assert_eq!(
-        page["messages"][1]["tags"],
-        serde_json::json!([{"part": "m1#0", "tag": "§2§"}, {"part": "m1#1"}])
+        page["messages"][1]["part_keys"],
+        serde_json::json!(["m1#0", "m1#1"])
     );
     assert_eq!(
-        page["messages"][2]["tags"],
-        serde_json::json!([{"part": "m2#0", "tag": "§3§"}])
+        page["messages"][2]["part_keys"],
+        serde_json::json!(["m2#0"])
     );
     assert_eq!(
-        page["messages"][3]["tags"],
-        serde_json::json!([{"part": "m3#0"}])
+        page["messages"][3]["part_keys"],
+        serde_json::json!(["m3#0"])
     );
     assert_eq!(
         page["messages"][3]["tool_calls"][0]["tool_call_id"],
         "call-open"
     );
     let mut body = normalized(&read.body, &run_id, lineage_id);
-    // Entry times are pinned by session_read.written_at.json. This golden pins the tag rows, so
+    // Entry times are pinned by session_read.written_at.json. This golden pins part identity, so
     // remove each recorded time from the envelope (the user message must carry one) and compare
     // the rest.
     for entry in page["messages"].as_array().unwrap() {
@@ -260,11 +886,10 @@ async fn tagged_open_tool_turn_read_bytes_are_pinned() {
 }
 
 /// A read held between a tool turn's write and its batch commit (the tool provider holds the
-/// call) exposes the turn's text. llm-runner §9.6 lets an exposed part change its number only
-/// on a new lineage, so the number that read shows must be the one the finished run shows: an
-/// unnumbered row there, numbered after commit, is a renumbering on the same lineage.
+/// call) exposes stable part identity. The public read no longer exposes the former `tags`
+/// field's rendered `§N§` labels; committing the batch must not change keys a reader holds.
 #[tokio::test]
-async fn a_held_tool_turns_text_keeps_the_number_a_read_exposed() {
+async fn a_held_tool_turn_keeps_the_part_keys_a_read_exposed() {
     let (mut rig, _) = crate::plan_admission::plan_rig("held-turn-text-number").await;
     rig.script.push(&[
         Step::Usage {
@@ -313,10 +938,10 @@ async fn a_held_tool_turns_text_keeps_the_number_a_read_exposed() {
         )
         .await;
     let held = result(&held).clone();
-    let expected = serde_json::json!([{"part": "m1#0", "tag": "§2§"}, {"part": "m1#1"}]);
+    let expected = serde_json::json!(["m1#0", "m1#1"]);
     assert_eq!(
-        held["messages"][1]["tags"], expected,
-        "the held turn's text shows its final number: {held}"
+        held["messages"][1]["part_keys"], expected,
+        "the held turn's parts already have stable keys: {held}"
     );
 
     rig.script.hold_tool(false);
@@ -329,10 +954,11 @@ async fn a_held_tool_turns_text_keeps_the_number_a_read_exposed() {
         )
         .await;
     let after = result(&after).clone();
-    assert_eq!(after["lineage_id"], held["lineage_id"]);
+    assert_eq!(after["incarnation"], held["incarnation"]);
+    assert_eq!(after["history_version"], held["history_version"]);
     assert_eq!(
-        after["messages"][1]["tags"], held["messages"][1]["tags"],
-        "a number a read exposed is unchanged on the same lineage"
+        after["messages"][1]["part_keys"], held["messages"][1]["part_keys"],
+        "part identity exposed by a read is unchanged after commit"
     );
     rig.finish().await;
 }
@@ -603,19 +1229,17 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
 
 // ---- session.read ---------------------------------------------------------------------------
 
-/// A session never written answers an empty page with no `lineage_id`, and `session.head` with
-/// every member absent; neither writes anything.
+/// A never-written session exposes the unwritten snapshot without creating a log.
 #[tokio::test]
-async fn a_never_written_session_has_no_lineage_page_or_head() {
+async fn a_never_written_session_has_an_unwritten_page_and_head() {
     let mut rig = Rig::start("unwritten").await;
     let page = read(&mut rig, serde_json::json!({})).await;
-    assert_eq!(page, ReadPage::no_lineage());
+    assert_eq!(page, ReadPage::empty(0, "unwritten"));
     let head: HeadMeta = serde_json::from_value(result(
         &call(&mut rig, "session.head", serde_json::json!({})).await,
     ))
     .unwrap();
-    // §4.3 would let it state `input`, but the conformance kit requires every member absent.
-    assert_eq!(head, HeadMeta::no_lineage());
+    assert_eq!(head, HeadMeta::empty(0, "unwritten"));
     assert!(
         rig.wal_bytes().is_empty(),
         "a read of an unwritten session wrote"
@@ -624,39 +1248,40 @@ async fn a_never_written_session_has_no_lineage_page_or_head() {
 }
 
 /// The tail is the newest page, a range stops at its limit with a cursor, and `after_mid` reads
-/// strictly after the message it names; every page carries the session's lineage.
+/// strictly after the message it names; every page carries the same snapshot identity.
 #[tokio::test]
 async fn tail_range_and_after_mid_reads() {
     let mut rig = three_turns("modes").await;
     let all = read(&mut rig, serde_json::json!({})).await;
-    assert_eq!(ordinals(&all), [0, 1, 2, 3, 4, 5]);
-    let lineage = all
-        .lineage_id
-        .clone()
-        .expect("a written session has a lineage");
+    assert_eq!(ordinals(&all), [1, 2, 3, 4, 5, 6]);
+    assert!(all.history_version > 0);
+    assert_ne!(all.incarnation, "unwritten");
 
     let tail = read(&mut rig, serde_json::json!({"limit": 2})).await;
-    assert_eq!(ordinals(&tail), [4, 5], "the tail is the newest page");
+    assert_eq!(ordinals(&tail), [5, 6], "the tail is the newest page");
     assert_eq!(tail.next_from_ordinal, None);
 
     let range = read(&mut rig, serde_json::json!({"from_ordinal": 0, "limit": 2})).await;
-    assert_eq!(ordinals(&range), [0, 1]);
-    assert_eq!(range.next_from_ordinal, Some(2));
+    assert_eq!(ordinals(&range), [1, 2]);
+    assert_eq!(range.next_from_ordinal, Some(3));
+    let first = read(&mut rig, serde_json::json!({"from_ordinal": 1, "limit": 2})).await;
+    assert_eq!(first, range, "zero aliases the first ordinal");
 
     let after = read(
         &mut rig,
-        serde_json::json!({"after_mid": "m1", "lineage_id": lineage}),
+        serde_json::json!({"after_mid": all.messages[1].mid, "history_version": all.history_version}),
     )
     .await;
-    assert_eq!(ordinals(&after), [2, 3, 4, 5]);
+    assert_eq!(ordinals(&after), [3, 4, 5, 6]);
     let past_end = read(
         &mut rig,
-        serde_json::json!({"after_mid": "m5", "lineage_id": lineage}),
+        serde_json::json!({"after_mid": all.messages[5].mid, "history_version": all.history_version}),
     )
     .await;
     assert!(past_end.messages.is_empty());
     for page in [&tail, &range, &after, &past_end] {
-        assert_eq!(page.lineage_id.as_deref(), Some(lineage.as_str()));
+        assert_eq!(page.incarnation, all.incarnation);
+        assert_eq!(page.history_version, all.history_version);
     }
     // Broca runs no hooks, so asking for originals adds nothing.
     let with_originals = read(&mut rig, serde_json::json!({"include_originals": true})).await;
@@ -665,38 +1290,40 @@ async fn tail_range_and_after_mid_reads() {
 }
 
 /// Each refusal of a read is by name, writes nothing, and is never answered from the tail: a
-/// lineage other than the session's, a mid the lineage does not hold, and every misuse of the
+/// stale snapshot version, a mid the session does not hold, and every misuse of the
 /// request, naming the member at fault.
 #[tokio::test]
 async fn read_refusals_are_named_and_write_nothing() {
     let mut rig = three_turns("refusals").await;
-    let lineage = read(&mut rig, serde_json::json!({}))
-        .await
-        .lineage_id
-        .unwrap();
+    let page = read(&mut rig, serde_json::json!({})).await;
+    let version = page.history_version;
     for params in [
-        serde_json::json!({"lineage_id": "not-this-lineage"}),
-        serde_json::json!({"from_ordinal": 0, "lineage_id": "not-this-lineage"}),
-        serde_json::json!({"after_mid": "m1", "lineage_id": "not-this-lineage"}),
-        // Naming another lineage is refused `lineage_changed` even when the mid is malformed.
-        serde_json::json!({"after_mid": "bogus", "lineage_id": "not-this-lineage"}),
+        serde_json::json!({"history_version": version - 1}),
+        serde_json::json!({"from_ordinal": 0, "history_version": version - 1}),
+        serde_json::json!({"after_mid": page.messages[1].mid, "history_version": version - 1}),
+        // Version mismatch is checked before even a malformed mid.
+        serde_json::json!({"after_mid": "bogus", "history_version": version - 1}),
     ] {
         let body = refused_writing_nothing(&mut rig, "session.read", params).await;
-        assert_eq!(body["code"], "lineage_changed", "{body}");
+        assert_eq!(body["code"], "history_changed", "{body}");
     }
     for mid in ["m6", "m99", "bogus", "m01", "m"] {
         let body = refused_writing_nothing(
             &mut rig,
             "session.read",
-            serde_json::json!({"after_mid": mid, "lineage_id": lineage}),
+            serde_json::json!({"after_mid": mid, "history_version": version}),
         )
         .await;
         assert_eq!(body["code"], "unknown_mid", "{mid}: {body}");
     }
     for (params, field) in [
-        (serde_json::json!({"after_mid": "m1"}), "lineage_id"),
+        (serde_json::json!({"after_mid": "m1"}), "history_version"),
         (
-            serde_json::json!({"after_mid": "m1", "lineage_id": lineage, "from_ordinal": 0}),
+            serde_json::json!({"after_mid": "m1", "lineage_id": "legacy"}),
+            "history_version",
+        ),
+        (
+            serde_json::json!({"after_mid": page.messages[1].mid, "history_version": version, "from_ordinal": 0}),
             "from_ordinal",
         ),
         (serde_json::json!({"from_ordinl": 0}), "from_ordinl"),
@@ -706,6 +1333,13 @@ async fn read_refusals_are_named_and_write_nothing() {
         let body = refused_writing_nothing(&mut rig, "session.read", params.clone()).await;
         assert_eq!(body["code"], "invalid_params", "{params}: {body}");
         assert_eq!(body["detail"]["field"], field, "{params}: {body}");
+    }
+    for legacy in [
+        serde_json::Value::Null,
+        serde_json::json!("ignored-lineage"),
+    ] {
+        let compatible = read(&mut rig, serde_json::json!({"lineage_id": legacy})).await;
+        assert_eq!(compatible, page, "legacy lineage selectors are input-only");
     }
     let body =
         refused_writing_nothing(&mut rig, "session.head", serde_json::json!({"x": true})).await;
@@ -730,15 +1364,15 @@ async fn pages_are_capped_by_bytes() {
     rig.wait_for_finished(2).await;
     rig.wait_idle().await;
     let all = read(&mut rig, serde_json::json!({})).await;
-    assert_eq!(ordinals(&all), [0, 1, 2, 3]);
+    assert_eq!(ordinals(&all), [1, 2, 3, 4]);
 
     let one = read(
         &mut rig,
-        serde_json::json!({"from_ordinal": 1, "limit": 100, "max_bytes": 1}),
+        serde_json::json!({"from_ordinal": 2, "limit": 100, "max_bytes": 1}),
     )
     .await;
     assert_eq!(one.messages, all.messages[1..2]);
-    assert_eq!(one.next_from_ordinal, Some(2));
+    assert_eq!(one.next_from_ordinal, Some(3));
 
     let oversize = read(
         &mut rig,
@@ -751,7 +1385,7 @@ async fn pages_are_capped_by_bytes() {
         "the big message comes alone"
     );
     assert!(oversize.messages[0].message.to_string().contains(&big));
-    assert_eq!(oversize.next_from_ordinal, Some(1));
+    assert_eq!(oversize.next_from_ordinal, Some(2));
 
     let tail = read(&mut rig, serde_json::json!({"max_bytes": 1})).await;
     assert_eq!(
@@ -780,7 +1414,7 @@ async fn every_call_has_its_own_key_and_module() {
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
     let page = read(&mut rig, serde_json::json!({})).await;
-    let lineage = page.lineage_id.clone().unwrap();
+    let lineage = page.incarnation.clone();
     let entries: Vec<_> = page
         .messages
         .iter()
@@ -814,7 +1448,7 @@ async fn every_call_has_its_own_key_and_module() {
         assert!(!entry.indeterminate);
     }
     // A page holding only part of the transcript reports the same keys for the calls it holds.
-    let later = read(&mut rig, serde_json::json!({"from_ordinal": 3, "limit": 1})).await;
+    let later = read(&mut rig, serde_json::json!({"from_ordinal": 4, "limit": 1})).await;
     assert_eq!(
         later.messages[0].tool_calls[0].call_key.as_ref(),
         Some(&keys[2])
@@ -889,7 +1523,7 @@ async fn an_intent_without_a_module_reads_with_no_dispatched_to() {
         .unwrap()
         .seq;
     let page = read(&mut rig, serde_json::json!({})).await;
-    let lineage = page.lineage_id.clone().unwrap();
+    let lineage = page.incarnation.clone();
     let entry = &page.messages[1].tool_calls[0];
     assert_eq!(entry.tool_call_id, "call-1");
     assert_eq!(entry.call_key, Some(format!("{lineage}:{intent_seq}")));
@@ -900,7 +1534,7 @@ async fn an_intent_without_a_module_reads_with_no_dispatched_to() {
 
 // ---- session.head ---------------------------------------------------------------------------
 
-/// `session.head` names the lineage, the newest ordinal, the control head and the last run,
+/// `session.head` names the snapshot, the newest ordinal, the control head and the last run,
 /// with the time of the newest write, and no message body.
 #[tokio::test]
 async fn head_reports_the_session_without_bodies() {
@@ -908,23 +1542,22 @@ async fn head_reports_the_session_without_bodies() {
     let page = read(&mut rig, serde_json::json!({})).await;
     let raw = result(&call(&mut rig, "session.head", serde_json::json!({})).await);
     let head: HeadMeta = serde_json::from_value(raw.clone()).unwrap();
-    assert!(head.lineage_consistent(), "{raw}");
-    assert_eq!(head.lineage_id, page.lineage_id);
-    assert_eq!(head.last_ordinal, Some(5));
+    assert!(head.snapshot_consistent(), "{raw}");
+    assert_eq!(head.incarnation, page.incarnation);
+    assert_eq!(head.history_version, page.history_version);
+    assert!(raw.get("lineage_id").is_none());
+    assert_eq!(head.last_ordinal, Some(6));
     assert_eq!(head.head, page.head);
     let last = head.last_run_state.unwrap();
     assert_eq!(last.state, "completed");
     assert!(head.updated_at.is_some_and(|at| at > 1_700_000_000_000));
     assert!(raw.get("messages").is_none() && !raw.to_string().contains("prompt 0"));
-    // llm-runner 0.5.0 §4.3, §4.5: broca applies no view with a cut, so its one lineage
-    // starts at ordinal 0 and the head names no cut.
-    assert_eq!(head.first_ordinal, Some(0));
+    assert_eq!(head.first_ordinal, Some(1));
     assert_eq!(head.cut, None);
-    // Always 0 within one WAL: broca has no revert and no recovery that rewrites a written
-    // message. The one case it misstates (a session whose WAL was deleted and later written
-    // again) is the "history_version floor" section of
-    // .cortexkit/internal-docs/designs/lineage-and-history-0.5.md.
-    assert_eq!(head.history_version, Some(0));
+    assert!(
+        head.history_version > 0,
+        "first 0.8 serve supersedes version zero"
+    );
     // A send's prompt is text only, a known fact, so `no` rather than `unknown`.
     assert_eq!(
         head.input
@@ -976,7 +1609,9 @@ async fn run_result_answers_the_final_text() {
     assert_eq!(one.state, "completed");
     let message = one.final_message.unwrap();
     assert_eq!(message.text, "{\"answer\":\"yes\",\"n\":1}");
-    assert_eq!((message.ordinal, message.mid.as_str()), (3, "m3"));
+    let page = read(&mut rig, serde_json::json!({"from_ordinal": 4, "limit": 1})).await;
+    assert_eq!(message.ordinal, 4);
+    assert_eq!(message.mid, page.messages[0].mid);
 
     let two: RunResult = serde_json::from_value(result(
         &call(&mut rig, "run.result", serde_json::json!({"run_id": run_2})).await,
@@ -1030,7 +1665,7 @@ async fn run_result_refuses_a_final_message_that_exceeds_the_frame_limit() {
     assert_eq!(body["detail"]["limit"], broca_wire::SUBC_MAX_FRAME_BYTES);
     assert_eq!(body["detail"]["subject"]["kind"], "message");
     assert_eq!(body["detail"]["subject"]["session"], rig.session.session);
-    assert_eq!(body["detail"]["subject"]["ordinal"], 1);
+    assert_eq!(body["detail"]["subject"]["ordinal"], 2);
     rig.finish().await;
 }
 
@@ -1213,6 +1848,52 @@ async fn run_status_falls_back_to_the_terminal_index_when_the_wal_is_absent() {
     assert_eq!(status["state"], "completed");
     assert!(status.get("undelivered_steers").is_none());
     assert!(status.get("directives").is_none());
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn cancelled_run_result_keeps_the_terminal_index_answer_without_a_wal() {
+    let mut rig =
+        Rig::start_with_idle_ttl("cancelled-result-absent", Duration::from_millis(100)).await;
+    rig.script.hold_model(true);
+    rig.script.push(&[Step::Text("not delivered")]);
+    let sent = rig.send("turn-0", "go", None).await;
+    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_entered().await;
+    rig.cancel(&run_id).await;
+    rig.script.hold_model(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig.wait_closed().await;
+    std::fs::remove_file(&rig.wal_path).unwrap();
+    let answer = result(&call(&mut rig, "run.result", serde_json::json!({"run_id":run_id})).await);
+    assert_eq!(answer["state"], "cancelled");
+    assert!(answer["final_message"].is_null());
+    assert!(!rig.wal_path.exists());
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn completed_run_result_without_a_wal_keeps_its_unreadable_start_refusal() {
+    let mut rig =
+        Rig::start_with_idle_ttl("completed-result-absent", Duration::from_millis(100)).await;
+    rig.script.push(&[Step::Text("answer")]);
+    let sent = rig.send("turn-0", "go", None).await;
+    let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig.wait_closed().await;
+    std::fs::remove_file(&rig.wal_path).unwrap();
+    let reply = call(&mut rig, "run.result", serde_json::json!({"run_id":run_id})).await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+    let error: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(error["code"], "open_failed");
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("has no readable RunStarted"));
+    assert!(error.get("detail").is_none());
+    assert!(!rig.wal_path.exists());
     rig.finish().await;
 }
 
@@ -1896,17 +2577,17 @@ async fn assert_projected_control_mids_match_read(rig: &mut Rig) {
         if let Some(ordinal) = frame.message_ordinal {
             let (entry, _) = stored
                 .iter()
-                .find(|(entry, message)| matches(&entry.mid, message))
+                .find(|(entry, message)| matches(&format!("m{}", entry.ordinal - 1), message))
                 .unwrap_or_else(|| {
                     panic!(
                         "control payload has no session.read message: {:?}",
                         frame.unit
                     )
                 });
-            assert_eq!(ordinal, entry.ordinal, "{:?}", frame.unit);
+            assert_eq!(ordinal + 1, entry.ordinal, "{:?}", frame.unit);
             assert_eq!(
                 frame.mid().as_deref(),
-                Some(entry.mid.as_str()),
+                Some(format!("m{}", entry.ordinal - 1).as_str()),
                 "{:?}",
                 frame.unit
             );
@@ -1931,6 +2612,38 @@ async fn assert_projected_control_mids_match_read(rig: &mut Rig) {
     assert!(
         checked >= 8,
         "the comparison must reach the complete tool turn"
+    );
+    // Core projection keeps native positions. The public stream must translate them to
+    // exactly the mids a reader already holds, for both boundaries and lifecycle events.
+    let frames = rig
+        .subscribe_collect(
+            20,
+            serde_json::json!({"from":"start"}),
+            Duration::from_millis(100),
+        )
+        .await;
+    let mut public_mids = 0;
+    for frame in frames {
+        let value: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        for mid in [
+            value["event"]["mid"].as_str(),
+            (value["unit"]["type"] == "message_boundary")
+                .then(|| value["unit"]["mid"].as_str())
+                .flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                page.messages.iter().any(|entry| entry.mid == mid),
+                "unreadable public mid {mid}: {value}"
+            );
+            public_mids += 1;
+        }
+    }
+    assert!(
+        public_mids >= 8,
+        "the public stream must include message identities"
     );
 }
 
@@ -2011,6 +2724,24 @@ async fn unsupported_output_refs_precedes_plan_overrides_and_never_writes() {
     assert!(describe.declares(groups::OUTPUT_REFS));
     // This rig installs no plan admitter. Even though production discovery advertises the
     // reader, a handler without an output-reference admitter must refuse before overrides.
+    // A plan-less send, sent first so the session has a baseline: `session.refresh` below
+    // refuses a session with no baseline before it ever reaches the plan, and this test is
+    // about the plan check's place, not about that refusal.
+    rig.script.push(&[Step::Text("baseline")]);
+    let baseline = call(
+        &mut rig,
+        ops::SESSION_SEND,
+        serde_json::json!({
+            "send_id":"unsupported-baseline","prompt":"baseline",
+            "model":{"provider":"fake","model":"fake"},"tools":[]
+        }),
+    )
+    .await;
+    assert_eq!(result(&baseline)["state"], "active", "baseline send");
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    // The checks below compare against this head and this WAL, so nothing they claim to have
+    // refused may have written.
     for flag in [true, false] {
         let before = result(&call(&mut rig, ops::SESSION_HEAD, serde_json::json!({})).await);
         let wal = rig.wal_bytes();
@@ -2308,7 +3039,7 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
         assert_eq!(live.unit.get().as_bytes(), replay.unit.get().as_bytes());
         assert_eq!(
             live.event,
-            serde_json::json!({"type":"message_finished","mid":"m1"})
+            serde_json::json!({"type":"message_finished","mid":page.messages[1].mid})
         );
         assert_eq!(replay.event, live.event);
         cortexkit_role_llm_runner::live::LiveEvent::decode_strict(&live.event).unwrap();
@@ -2323,13 +3054,13 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
         let entry = page
             .messages
             .iter()
-            .find(|entry| entry.mid == "m1")
+            .find(|entry| entry.ordinal == 2)
             .unwrap();
         assert_eq!(entry.message["content"], expected);
         let entry = descriptors
             .messages
             .iter()
-            .find(|entry| entry.mid == "m1")
+            .find(|entry| entry.ordinal == 2)
             .unwrap();
         assert_eq!(entry.message["content"], expected);
     }
@@ -2337,7 +3068,7 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
 
 async fn pin_live_sample(rig: &mut Rig, frames: &[Frame], run_id: &str, file: &str) {
     let page = read(rig, serde_json::json!({})).await;
-    let lineage = page.lineage_id.as_ref().unwrap();
+    let lineage = &page.incarnation;
     let values = assert_stream_sequences(frames);
     let mut lines = Vec::new();
     for (frame, value) in frames.iter().zip(&values) {
@@ -2443,11 +3174,13 @@ async fn live_display_samples_match_stored_parts_and_attach_replays_current_step
         };
         rig.wait_for_finished(1).await;
         rig.wait_idle().await;
+        let page = read(&mut rig, serde_json::json!({"from_ordinal":2, "limit":1})).await;
+        let mid = &page.messages[0].mid;
         assert!(frames
             .iter()
             .any(
                 |f| serde_json::from_slice::<serde_json::Value>(&f.body).unwrap()["event"]["mid"]
-                    == "m1"
+                    == *mid
             ));
         pin_live_sample(
             &mut rig,
@@ -2500,6 +3233,8 @@ async fn live_display_mid_after_reopen_comes_from_seeded_placement() {
         .find(|v| v["event"]["type"] == "text_delta")
         .unwrap();
     assert_eq!(delta["event"]["mid"], stored.mid);
+    assert_eq!(stored.ordinal, 4);
+    // A session without a compaction provider keeps the established positional message ids.
     assert_eq!(delta["event"]["mid"], "m3");
     rig.finish().await;
 }
@@ -2636,6 +3371,8 @@ async fn live_display_after_steer_uses_the_next_step_placement() {
         .find(|v| v["event"]["type"] == "text_delta" && v["event"]["delta"] == "after steer")
         .unwrap();
     let page = read(&mut rig, serde_json::json!({})).await;
+    assert_eq!(page.messages.last().unwrap().ordinal, 5);
+    // A session without a compaction provider keeps the established positional message ids.
     assert_eq!(page.messages.last().unwrap().mid, "m4");
     assert_eq!(delta["event"]["mid"], page.messages.last().unwrap().mid);
     rig.finish().await;
@@ -2711,10 +3448,10 @@ async fn late_subscriber_gets_context_captured_before_the_step_streamed() {
         .map(|f| serde_json::from_slice::<serde_json::Value>(&f.body).unwrap())
         .find(|v| v["event"]["type"] == "text_delta")
         .expect("late attach replays the streamed part");
-    assert_eq!(delta["event"]["mid"], "m1");
     assert_eq!(delta["event"]["part"], "0");
     assert_eq!(delta["event"]["delta"], "before attach");
     let page = read(&mut rig, serde_json::json!({})).await;
+    assert_eq!(page.messages.last().unwrap().ordinal, 2);
     assert_eq!(delta["event"]["mid"], page.messages.last().unwrap().mid);
     rig.finish().await;
 }
@@ -3002,5 +3739,36 @@ async fn debug_pdf_send_is_refused_before_any_session_write() {
     let describe = call(&mut rig, "role.describe", serde_json::json!({})).await;
     let checked = cortexkit_role_llm_runner::describe::check_describe(&result(&describe)).unwrap();
     assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
+    rig.finish().await;
+}
+
+/// A refused first send can leave a log holding only its lineage frame (the actor opened its
+/// writer). Locating that log's first run must end at the log's end, so the read answers at
+/// once with no messages instead of scanning forward forever.
+#[tokio::test]
+async fn a_read_after_a_refused_first_send_answers_unwritten() {
+    let mut rig = Rig::start("refused-then-read").await;
+    let refused = call(
+        &mut rig,
+        "session.send",
+        serde_json::json!({
+            "prompt": "x", "send_id": "refused",
+            "model": {"provider": "fake", "model": "fake"},
+            "structured_output": {"mode": "submit_tool", "schema": {"type": "object"}},
+            "tools": [{"name": "submit_result", "description": "d", "input_schema": {"type": "object"}}]
+        }),
+    )
+    .await;
+    assert_eq!(refusal(&refused)["code"], "invalid_params");
+    let page = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read(&mut rig, serde_json::json!({})),
+    )
+    .await
+    .expect("a read after a refused first send must not hang");
+    assert!(
+        page.messages.is_empty(),
+        "a refused send wrote messages: {page:?}"
+    );
     rig.finish().await;
 }

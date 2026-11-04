@@ -477,6 +477,49 @@ async fn send_status_unknown_send_is_terminal_and_strict() {
 }
 
 #[tokio::test]
+async fn session_send_status_alias_preserves_reply_bytes_for_known_and_unknown_sends() {
+    let mut rig = Rig::start("send-status-alias").await;
+    rig.script.push(&[Step::Text("done")]);
+    rig.send("known", "hi", None).await;
+    rig.wait_for_finished(1).await;
+
+    for (params, expected_type) in [
+        (
+            serde_json::json!({"send_id": "known"}),
+            subc_protocol::FrameType::Response,
+        ),
+        (
+            serde_json::json!({"send_id": "absent"}),
+            subc_protocol::FrameType::Error,
+        ),
+        (
+            serde_json::json!({"send_id": "known", "typo": true}),
+            subc_protocol::FrameType::Error,
+        ),
+    ] {
+        let legacy = rig
+            .request(
+                7,
+                serde_json::json!({"method": "send.status", "params": params}),
+            )
+            .await;
+        let alias = rig
+            .request(
+                7,
+                serde_json::json!({"method": "session.send_status", "params": params}),
+            )
+            .await;
+        assert_eq!(legacy.header.ty, expected_type, "{params}");
+        assert_eq!(alias.header.ty, legacy.header.ty, "{params}");
+        assert_eq!(alias.body, legacy.body, "{params}");
+        if params["send_id"] == "absent" {
+            pin_resend(&legacy, "send_status.unknown_send.json", "");
+        }
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
 async fn send_status_pending_answers_resend_bytes_after_restart() {
     let mut rig = Rig::start_with_idle_ttl("send-status-pending", IDLE_TTL).await;
     rig.send("first", "hi", None).await;

@@ -44,6 +44,7 @@ mod gated {
 
     fn opts() -> CallOptions {
         let mut o = CallOptions::new(vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -77,6 +78,7 @@ mod gated {
                         2048,
                         &AuthMode::Bearer(CHATGPT_JWT.into()),
                         &ResolveOptions {
+                            quota_observer: None,
                             media,
                             family_override,
                             ..Default::default()
@@ -142,6 +144,7 @@ mod gated {
         // account claim, which no dummy credential can satisfy; the limit is read from the catalog
         // before any of that, so this reaches the code under test without a live credential.
         let opts = ResolveOptions {
+            tool_name_aliases: None,
             media: false,
             media_profile: None,
             family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -202,6 +205,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    quota_observer: None,
+                    tool_name_aliases: None,
                     media: false,
                     media_profile: None,
                     claude_code_persona: None,
@@ -249,6 +254,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    quota_observer: None,
+                    tool_name_aliases: None,
                     media: false,
                     media_profile: None,
                     claude_code_persona: None,
@@ -290,6 +297,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    quota_observer: None,
+                    tool_name_aliases: None,
                     media: false,
                     media_profile: None,
                     claude_code_persona: None,
@@ -324,6 +333,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    quota_observer: None,
+                    tool_name_aliases: None,
                     media: false,
                     media_profile: None,
                     claude_code_persona: None,
@@ -360,6 +371,8 @@ mod gated {
                 None,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    quota_observer: None,
+                    tool_name_aliases: None,
                     media: false,
                     media_profile: None,
                     claude_code_persona: None,
@@ -397,6 +410,8 @@ mod gated {
     fn chatgpt_ids_resolve_verbatim_with_no_tier_suffixes() {
         common::install_snapshot();
         let options = ResolveOptions {
+            quota_observer: None,
+            tool_name_aliases: None,
             media: false,
             media_profile: None,
             claude_code_persona: None,
@@ -481,6 +496,8 @@ mod gated {
                     2048,
                     &AuthMode::Bearer(CHATGPT_JWT.into()),
                     &ResolveOptions {
+                        quota_observer: None,
+                        tool_name_aliases: None,
                         media: false,
                         media_profile: None,
                         claude_code_persona: None,
@@ -537,6 +554,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    quota_observer: None,
+                    tool_name_aliases: None,
                     media: false,
                     media_profile: None,
                     claude_code_persona: None,
@@ -575,6 +594,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    quota_observer: None,
+                    tool_name_aliases: None,
                     media: false,
                     media_profile: None,
                     claude_code_persona: None,
@@ -615,6 +636,8 @@ mod gated {
     fn chatgpt_pause_only_construction_skips_auth_but_ordinary_none_stays_strict() {
         common::install_snapshot();
         let options = ResolveOptions {
+            quota_observer: None,
+            tool_name_aliases: None,
             media: false,
             media_profile: None,
             claude_code_persona: None,
@@ -675,6 +698,8 @@ mod gated {
             2048,
             &AuthMode::Bearer("not-a-codex-token".into()),
             &ResolveOptions {
+                quota_observer: None,
+                tool_name_aliases: None,
                 media: false,
                 media_profile: None,
                 claude_code_persona: None,
@@ -733,6 +758,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy".into()),
                 &ResolveOptions {
+                    quota_observer: None,
+                    tool_name_aliases: None,
                     media: false,
                     media_profile: None,
                     cache_policy: Some(CachePolicy {
@@ -754,6 +781,7 @@ mod gated {
 
         let bytes = resolved.provider.render_request(&CallOptions::new(vec![
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -764,6 +792,7 @@ mod gated {
                 }],
             },
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -774,6 +803,7 @@ mod gated {
                 }],
             },
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,

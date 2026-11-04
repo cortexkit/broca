@@ -207,6 +207,8 @@ pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
 /// as [`DecodeStep::NewerWriter`]. `ck-broca --wal-known-features` prints this list so
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
+    ACCOUNT_LIMIT_PAUSE_FEATURE,
+    crate::recovery::FEATURE,
     BILL_ATTEMPTS_FEATURE,
     BILL_VAULT_FACTS_FEATURE,
     crate::head_proof::VISIBILITY_LATE_FEATURE,
@@ -219,6 +221,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     CHATGPT_CODEX_WIRE_FEATURE,
     CLIENT_MESSAGE_ID_FEATURE,
     COMPACTION_RIDE_WAIT_FEATURE,
+    COMPACTION_V2_FEATURE,
     COMPACTION_VIEW_NEGOTIATION_FEATURE,
     COMPACTION_VIEW_FEATURE,
     COMPACTION_WAIT_FEATURE,
@@ -226,6 +229,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     CONTEXT_CEILING_FEATURE,
     DEFERRED_CALL_FEATURE,
     DELIVERY_ORDER_FEATURE,
+    TURN_SYSTEM_FEATURE,
     DISPATCH_MODULE_FEATURE,
     FLOW_SCOPE_FEATURE,
     FRAME_STAMPS_FEATURE,
@@ -257,9 +261,37 @@ pub const KNOWN_FEATURES: &[&str] = &[
     STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
     STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
     TOOL_REPLY_FEATURE,
+    TOOL_NAME_ALIASES_FEATURE,
     TOOL_TIMES_FEATURE,
     MESSAGE_TIMES_FEATURE,
 ];
+
+/// A timed account pause must not be mistaken for a terminal error or an authentication pause.
+pub const ACCOUNT_LIMIT_PAUSE_FEATURE: &str = "account-limit-pause/v1";
+
+/// Mode-3 accepted views, applied-view selections, cut markers and the frozen plan version.
+pub const COMPACTION_V2_FEATURE: &str = "compaction-v2/v1";
+
+/// Whether this build runs `compaction-v2/v1` sessions. A reader-only build sets it false: it
+/// decodes those frames but marks the log read-only, so a rollback never runs a mode-3 session.
+pub const RUNS_COMPACTION_V2: bool = true;
+
+/// Writer opens verify the same framing as reads. This build writes `compaction-v2/v1` sessions,
+/// so a writer accepts every feature a reader knows. (The 0.3.306 reader release refused that
+/// one feature here, which keeps a rollback from running mode-3 sessions.)
+pub(crate) fn decode_next_for_writer(buf: &[u8]) -> DecodeStep {
+    decode_projected_for_writer(buf, |seq, fence, payload| {
+        let record = serde_json::from_slice(payload)?;
+        Ok(FramedRecord { seq, fence, record })
+    })
+}
+
+pub(crate) fn decode_projected_for_writer<T>(
+    buf: &[u8],
+    project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
+) -> DecodeStep<T> {
+    decode_projected_with(buf, KNOWN_FEATURES, project)
+}
 
 /// Physical-send reservation and settlement evidence for billing readers.
 pub const BILL_ATTEMPTS_FEATURE: &str = "bill-attempts/v1";
@@ -403,6 +435,8 @@ pub const STRUCTURED_OUTPUT_PARAGRAPH_FEATURE: &str = "structured-output-paragra
 /// such a WAL: decoding the tool would silently drop the deadline, and the resumed or drained
 /// run would cut that tool's long calls at the default wait and end the run interrupted.
 pub const TOOL_REPLY_FEATURE: &str = "tool-reply/v1";
+/// Frozen operator aliases change request identity and must not be dropped by an older reader.
+pub const TOOL_NAME_ALIASES_FEATURE: &str = "tool-name-aliases/v1";
 
 /// Preserve the tool timestamps subscriptions replay after a restart; older readers refuse
 /// these frames rather than silently discarding the observations.
@@ -479,6 +513,9 @@ pub const DEFERRED_CALL_FEATURE: &str = "deferred-call/v1";
 /// would start a run from a queued send that may never start one, deliver a send that was
 /// replaced or expired, or render a prompt without a send that was delivered into it.
 pub const DELIVERY_ORDER_FEATURE: &str = "delivery-order/v1";
+
+/// Turn-scoped system entries must not be hoisted into legacy global instructions.
+pub const TURN_SYSTEM_FEATURE: &str = "turn-system/v1";
 
 /// A feature name that test builds treat as known, in addition to [`KNOWN_FEATURES`].
 ///
@@ -933,6 +970,23 @@ fn decode_projected_with<T>(
     known: &[&str],
     project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
 ) -> DecodeStep<T> {
+    decode_projected_with_requirements(buf, known, |seq, fence, payload, _| {
+        project(seq, fence, payload)
+    })
+}
+
+pub(crate) fn decode_with_run_requirement(buf: &[u8]) -> DecodeStep<(FramedRecord, bool)> {
+    decode_projected_with_requirements(buf, KNOWN_FEATURES, |seq, fence, payload, read_only| {
+        let record = serde_json::from_slice(payload)?;
+        Ok((FramedRecord { seq, fence, record }, read_only))
+    })
+}
+
+fn decode_projected_with_requirements<T>(
+    buf: &[u8],
+    known: &[&str],
+    project: impl FnOnce(u64, u64, &[u8], bool) -> Result<T, serde_json::Error>,
+) -> DecodeStep<T> {
     if buf.get(4) == Some(&V4_FRAMING_VERSION) {
         return decode_v4_projected(buf, known, project);
     }
@@ -974,11 +1028,16 @@ fn decode_projected_with<T>(
         };
     }
 
-    let payload = if ver == GATED_FRAMING_VERSION {
+    let (payload, read_only) = if ver == GATED_FRAMING_VERSION {
         let envelope = match serde_json::from_slice::<GatedRequires>(payload) {
             Ok(envelope) => envelope,
             Err(e) => return DecodeStep::Corrupt(FrameError::Deserialize(e)),
         };
+        let read_only = !RUNS_COMPACTION_V2
+            && envelope
+                .requires
+                .iter()
+                .any(|name| name == COMPACTION_V2_FEATURE);
         let mut missing: Vec<String> = envelope
             .requires
             .into_iter()
@@ -992,11 +1051,11 @@ fn decode_projected_with<T>(
             missing.dedup();
             return DecodeStep::NewerWriter { ver, missing };
         }
-        envelope.record.get().as_bytes()
+        (envelope.record.get().as_bytes(), read_only)
     } else {
-        payload
+        (payload, false)
     };
-    match project(seq, fence, payload) {
+    match project(seq, fence, payload, read_only) {
         Ok(record) => DecodeStep::Record {
             framed: Box::new(record),
             consumed: total,
@@ -1008,7 +1067,7 @@ fn decode_projected_with<T>(
 fn decode_v4_projected<T>(
     buf: &[u8],
     known: &[&str],
-    project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
+    project: impl FnOnce(u64, u64, &[u8], bool) -> Result<T, serde_json::Error>,
 ) -> DecodeStep<T> {
     use broca_wal_reader::features::Policy;
     use broca_wal_reader::frame::{decode_next_with_policy, DecodeStep as V4Step};
@@ -1028,7 +1087,13 @@ fn decode_v4_projected<T>(
         }
         Ok(V4Step::Frame(frame)) => {
             let metadata = frame.header.metadata;
-            match project(metadata.seq, metadata.fence, frame.payload) {
+            let read_only = !RUNS_COMPACTION_V2
+                && frame
+                    .header
+                    .requires
+                    .iter()
+                    .any(|name| name == COMPACTION_V2_FEATURE);
+            match project(metadata.seq, metadata.fence, frame.payload, read_only) {
                 Ok(record) => DecodeStep::Record {
                     framed: Box::new(record),
                     consumed: frame.consumed,
@@ -1088,6 +1153,33 @@ mod service_tier_queue_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_completion_requires_the_recovery_reader_feature() {
+        use super::*;
+        let record: WalRecord = serde_json::from_str(
+            r#"{"type":"recovery_call_closed","cut_id":"cut-1","run_id":"removed-r","call_key":"lineage:4","tool_call_id":"call_0","outcome":"unknown","result":{"tool_call_id":"call_0","output":{"kind":"error","message":"outcome_unknown"},"is_error":true}}"#,
+        ).unwrap();
+        let bytes = encode_v4(
+            v4::Metadata {
+                seq: 1,
+                fence: 1,
+                appended_ms: 0,
+                writer_id: [1; 16],
+            },
+            &[FRAME_STAMPS_FEATURE],
+            &record,
+        )
+        .unwrap();
+        assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|feature| *feature != crate::recovery::FEATURE)
+            .collect();
+        assert!(matches!(decode_next_with(&bytes, &older),
+            DecodeStep::NewerWriter { missing, .. } if missing == [crate::recovery::FEATURE]));
+    }
+
     #[test]
     fn message_times_require_an_understanding_reader() {
         use super::*;
@@ -1518,6 +1610,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recovery_cut_is_a_must_understand_overhaul_record() {
+        let record: WalRecord = serde_json::from_value(serde_json::json!({
+            "type":"recovery_cut", "cut_id":"cut", "sidecar_basename":"log.cut-1",
+            "cut_offset":69, "removed_len":1, "removed_sha256":"digest",
+            "reason":"unproven_corruption", "active_run":null, "runs":[], "unattributed_tool_risk":true
+        })).unwrap();
+        assert_eq!(record.required_features(), &[crate::recovery::FEATURE]);
+        let frame = PreparedV4Frame::prepare(&record)
+            .unwrap()
+            .stamp(v4::Metadata {
+                seq: 1,
+                fence: 1,
+                appended_ms: 1,
+                writer_id: [1; 16],
+            })
+            .unwrap();
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != crate::recovery::FEATURE)
+            .collect();
+        assert!(
+            matches!(decode_next_with(&frame, &older), DecodeStep::NewerWriter { missing, .. }
+            if missing == [crate::recovery::FEATURE])
+        );
+        assert!(
+            matches!(decode_next(&frame), DecodeStep::Record { framed, .. } if framed.record == record)
+        );
+    }
+
     /// The production `KNOWN_FEATURES` table holds exactly the features this build interprets.
     /// A name enters it only with the release that reads its records, so a build never claims
     /// to understand a frame it would misread; the test-only name is never in it.
@@ -1526,6 +1649,8 @@ mod tests {
         assert_eq!(
             KNOWN_FEATURES,
             &[
+                ACCOUNT_LIMIT_PAUSE_FEATURE,
+                crate::recovery::FEATURE,
                 BILL_ATTEMPTS_FEATURE,
                 BILL_VAULT_FACTS_FEATURE,
                 crate::head_proof::VISIBILITY_LATE_FEATURE,
@@ -1538,6 +1663,7 @@ mod tests {
                 CHATGPT_CODEX_WIRE_FEATURE,
                 CLIENT_MESSAGE_ID_FEATURE,
                 COMPACTION_RIDE_WAIT_FEATURE,
+                COMPACTION_V2_FEATURE,
                 COMPACTION_VIEW_NEGOTIATION_FEATURE,
                 COMPACTION_VIEW_FEATURE,
                 COMPACTION_WAIT_FEATURE,
@@ -1545,6 +1671,7 @@ mod tests {
                 CONTEXT_CEILING_FEATURE,
                 DEFERRED_CALL_FEATURE,
                 DELIVERY_ORDER_FEATURE,
+                TURN_SYSTEM_FEATURE,
                 DISPATCH_MODULE_FEATURE,
                 FLOW_SCOPE_FEATURE,
                 FRAME_STAMPS_FEATURE,
@@ -1576,6 +1703,7 @@ mod tests {
                 STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
                 STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
                 TOOL_REPLY_FEATURE,
+                TOOL_NAME_ALIASES_FEATURE,
                 TOOL_TIMES_FEATURE,
                 MESSAGE_TIMES_FEATURE,
             ]
@@ -1588,6 +1716,7 @@ mod tests {
         assert_eq!(RUNNER_TAGS_V2_FEATURE, "runner-tags/v2");
         assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
         assert_eq!(COMPACTION_FEATURE, "compaction/v1");
+        assert_eq!(COMPACTION_V2_FEATURE, "compaction-v2/v1");
         assert_eq!(COMPACTION_WAIT_FEATURE, "compaction-wait/v1");
         assert_eq!(DEFERRED_CALL_FEATURE, "deferred-call/v1");
         assert_eq!(DISPATCH_MODULE_FEATURE, "dispatch-module/v1");
@@ -1730,6 +1859,44 @@ mod tests {
                 }
                 let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
                 assert_eq!(record.required_features(), &[STRUCTURED_OUTPUT_FEATURE]);
+            }
+        }
+    }
+
+    #[test]
+    fn tool_name_aliases_feature_is_required_only_for_nonempty_frozen_maps() {
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != TOOL_NAME_ALIASES_FEATURE)
+            .collect();
+        for aliases in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"bash":"client_bash"})),
+        ] {
+            let mut frozen = serde_json::json!({"family_id":"openai_responses"});
+            if let Some(aliases) = &aliases {
+                frozen["tool_name_aliases"] = aliases.clone();
+            }
+            let run = serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":frozen},"input":[],"origin":{"kind":"fresh"}});
+            let refrozen = serde_json::json!({"type":"run_config_refrozen","renderer_version":1,"frozen_render_config":frozen});
+            for value in [run, refrozen] {
+                let record: WalRecord = serde_json::from_value(value).unwrap();
+                let bytes = encode(1, 1, &record).unwrap();
+                if aliases
+                    .as_ref()
+                    .is_some_and(|map| !map.as_object().unwrap().is_empty())
+                {
+                    assert_eq!(record.required_features(), &[TOOL_NAME_ALIASES_FEATURE]);
+                    assert!(
+                        matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [TOOL_NAME_ALIASES_FEATURE])
+                    );
+                } else {
+                    assert!(record.required_features().is_empty());
+                    assert_eq!(bytes[4], FRAMING_VERSION);
+                }
+                assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
             }
         }
     }
@@ -3178,4 +3345,10 @@ mod view_negotiation_tests {
 }
 
 #[cfg(test)]
+#[path = "framing/account_limit_pause_tests.rs"]
+mod account_limit_pause_tests;
+#[cfg(test)]
 mod vault_facts_tests;
+
+#[cfg(test)]
+mod turn_system_tests;

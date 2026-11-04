@@ -71,6 +71,7 @@ pub fn submission_difference(
     requested: &SubmissionRequest,
 ) -> Option<&'static str> {
     let SubmissionRequest {
+        route_decision_id: existing_route_decision_id,
         staged_uploads: _,
         content: existing_content,
         directives: existing_directives,
@@ -102,6 +103,7 @@ pub fn submission_difference(
         client_message_id: _,
     } = existing;
     let SubmissionRequest {
+        route_decision_id: requested_route_decision_id,
         staged_uploads: _,
         content: requested_content,
         directives: requested_directives,
@@ -132,6 +134,10 @@ pub fn submission_difference(
     } = requested;
 
     [
+        (
+            existing_route_decision_id != requested_route_decision_id,
+            "route_decision_id",
+        ),
         (existing_content != requested_content, "content"),
         (existing_directives != requested_directives, "directives"),
         (
@@ -198,6 +204,8 @@ fn inherited_difference(
 
 #[derive(Serialize, Deserialize)]
 struct SubmissionIdentityDigestV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route_decision_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     directives: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,6 +313,7 @@ fn identity_digest_v1(
     conversation_key: Option<&str>,
 ) -> SubmissionIdentityDigestV1 {
     let SubmissionRequest {
+        route_decision_id,
         staged_uploads: _,
         content,
         directives,
@@ -336,6 +345,7 @@ fn identity_digest_v1(
     let mut policy_allowed: Vec<&str> = policy_allowed.iter().map(String::as_str).collect();
     policy_allowed.sort_unstable();
     SubmissionIdentityDigestV1 {
+        route_decision_id: route_decision_id.clone(),
         content: (!content.is_empty()).then(|| digest_json(serde_json::json!(content))),
         directives: directives
             .as_ref()
@@ -412,6 +422,10 @@ pub fn send_identity_difference_with_conversation_key(
     let requested = identity_digest_v1(requested, delivery, conversation_key);
     [
         (
+            stored.route_decision_id != requested.route_decision_id,
+            "route_decision_id",
+        ),
+        (
             stored.client_message_id != requested.client_message_id,
             "client_message_id",
         ),
@@ -478,6 +492,9 @@ pub use crate::budget_kernel::{BudgetReplayStateV1, BUDGET_REPLAY_STATE_VERSION}
 /// Admission facts for the last episode at a materialization watermark.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LastEpisodeV1 {
+    /// Timed pause evidence restored from a checkpoint; waking still requires validation against the WAL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_at: Option<broca_wal::record::RunCancelAt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -557,6 +574,10 @@ pub struct SessionOwnershipV1 {
     /// retain their old checkpoint bytes and admission need not probe for change records.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_change_recorded: bool,
+    /// Versioned sender-policy fold, present only for histories with session-change records.
+    /// Missing on an older refreshed checkpoint means the complete WAL must be folded again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_admission: Option<SenderAdmissionV1>,
     /// Whether this summary was folded by a build that records the first episode's frozen
     /// plan manifest (`FirstEpisodeV1::manifest`). A summary stored by an older build, or
     /// re-stored by one after a rollback, lacks it and may have dropped a manifest, so it is
@@ -578,6 +599,7 @@ impl Default for SessionOwnershipV1 {
             first_episode: None,
             latest_manifest: None,
             session_change_recorded: false,
+            sender_admission: None,
             plan_manifest_folded: true,
         }
     }
@@ -595,7 +617,50 @@ pub struct FirstEpisodeV1 {
     pub manifest: Option<Arc<broca_wal::PlanManifest>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SenderAdmissionV1 {
+    pub version: u32,
+    pub accepted_senders: Option<Vec<cortexkit_role_llm_runner::delivery_order::PlanSender>>,
+}
+
+pub(crate) fn manifest_senders(
+    manifest: &broca_wal::PlanManifest,
+) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
+    serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
+        .ok()
+        .and_then(|plan| {
+            plan.as_object()
+                .and_then(|plan| cortexkit_role_llm_runner::delivery_order::plan_senders(plan).ok())
+        })
+        .unwrap_or_default()
+}
+
 impl SessionOwnershipV1 {
+    /// Admission policy changes at durable refresh acceptance, independently of when the
+    /// execution manifest applies. Already admitted queued submissions keep their admission.
+    pub fn effective_senders(&self) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
+        self.sender_admission
+            .as_ref()
+            .and_then(|fold| fold.accepted_senders.clone())
+            .unwrap_or_else(|| {
+                self.latest_manifest
+                    .as_deref()
+                    .or_else(|| self.first_episode.as_ref()?.manifest.as_deref())
+                    .map(manifest_senders)
+                    .unwrap_or_default()
+            })
+    }
+
+    pub fn sender_admission_complete(&self) -> bool {
+        match &self.sender_admission {
+            Some(fold) => fold.version == 1,
+            // Manifest-aware checkpoints have folded session-change records since those
+            // records were introduced. A false presence bit proves the first plan still
+            // supplies sender policy; no WAL read or checkpoint rewrite is needed.
+            None => self.plan_manifest_folded && !self.session_change_recorded,
+        }
+    }
+
     /// Identity-only state for cancel/retract checks. The first episode also carries tool
     /// names and provider-supplied text, so it must not enter a long-lived owner cache.
     pub fn for_owner_access(&self) -> Self {
@@ -608,6 +673,7 @@ impl SessionOwnershipV1 {
             first_episode: None,
             latest_manifest: None,
             session_change_recorded: false,
+            sender_admission: None,
             plan_manifest_folded: false,
         }
     }
@@ -618,6 +684,7 @@ impl SessionOwnershipV1 {
         self.first_episode = None;
         self.latest_manifest = None;
         self.session_change_recorded = false;
+        self.sender_admission = None;
         self.plan_manifest_folded = false;
         for frame in records {
             if let WalRecord::RunStarted {
@@ -688,6 +755,8 @@ impl EffortHistoryV1 {
 /// Version-one admission projection at an exact WAL sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionCheckpointV1 {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_cuts: Vec<broca_wal::recovery::RecoveryCut>,
     /// Reference-only media resume state, omitted for media-free histories. A captured-reference
     /// index without a valid matching seed requires a named, counted full-replay repair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -778,6 +847,11 @@ impl AdmissionCheckpointV1 {
     /// A newly applied record in a tail needs canonical replay to recover its
     /// message count. Missing compaction state is checked separately at the seed.
     pub(crate) fn compaction_boundary_complete(&self) -> bool {
+        // Repaired histories must reconstruct call attribution from the whole WAL,
+        // not from a message seed predating physical suffix removal.
+        if !self.recovery_cuts.is_empty() {
+            return false;
+        }
         if !self.media_seed_complete() {
             return false;
         }
@@ -789,6 +863,7 @@ impl AdmissionCheckpointV1 {
 
     pub fn empty() -> Self {
         Self {
+            recovery_cuts: Vec::new(),
             media: None,
             head: Some(crate::head::HeadProjection::default()),
             has_deferred_calls: Some(false),
@@ -931,6 +1006,54 @@ impl AdmissionCheckpointV1 {
             None => (None, None),
         };
         match record {
+            WalRecord::RecoveryCut { recovery } => {
+                if !self
+                    .recovery_cuts
+                    .iter()
+                    .any(|cut| cut.cut_id == recovery.cut_id)
+                {
+                    self.recovery_cuts.push((**recovery).clone());
+                }
+            }
+            WalRecord::RecoveryCallClosed {
+                cut_id,
+                run_id,
+                batch_id,
+                step_id,
+                call_key,
+                tool_call_id,
+                result,
+                ..
+            } => {
+                let terminal = broca_wal::recovery::RecoveryCall {
+                    tool_call_id: tool_call_id.clone(),
+                    batch_id: batch_id.clone(),
+                    step_id: *step_id,
+                    call_keys: call_key.iter().cloned().collect(),
+                };
+                let attributed = self.recovery_cuts.iter().any(|cut| {
+                    cut.cut_id == *cut_id
+                        && cut.runs.iter().any(|run| {
+                            run.run_id == *run_id
+                                && run.calls.iter().any(|call| {
+                                    call.tool_call_id == *tool_call_id
+                                        && call_key
+                                            .as_ref()
+                                            .is_none_or(|key| call.call_keys.contains(key))
+                                        && (call.terminal_matches(&terminal)
+                                            || (!call.has_effect_identity()
+                                                && !terminal.has_effect_identity()))
+                                })
+                        })
+                });
+                if !attributed || result.tool_call_id != *tool_call_id {
+                    return Err(ReplayError::CorruptLineage {
+                        episode_run_id: run_id.clone(),
+                        reason: "recovery completion does not match its durable cut attribution"
+                            .into(),
+                    });
+                }
+            }
             WalRecord::RunStarted {
                 session_class,
                 retention,
@@ -990,6 +1113,7 @@ impl AdmissionCheckpointV1 {
                     history.observe(&config.frozen_render_config);
                 }
                 self.last_episode = Some(LastEpisodeV1 {
+                    account_limit_pause: None,
                     cancel_at: None,
                     on_restart: *on_restart,
                     pause_reason: None,
@@ -1066,13 +1190,19 @@ impl AdmissionCheckpointV1 {
                     if episode.disposition == EpisodeDisposition::Paused {
                         episode.disposition = EpisodeDisposition::Running;
                         episode.pause_reason = None;
+                        episode.account_limit_pause = None;
                     }
                 }
             }
-            WalRecord::RunPaused { reason, .. } => {
+            WalRecord::RunPaused {
+                reason,
+                account_limit,
+                ..
+            } => {
                 if let Some(episode) = self.last_episode.as_mut() {
                     episode.disposition = EpisodeDisposition::Paused;
                     episode.pause_reason = Some(*reason);
+                    episode.account_limit_pause = account_limit.clone();
                 }
             }
             WalRecord::RunFinished {
@@ -1082,6 +1212,7 @@ impl AdmissionCheckpointV1 {
             } => {
                 if let Some(episode) = self.last_episode.as_mut() {
                     episode.disposition = EpisodeDisposition::Finished;
+                    episode.account_limit_pause = None;
                     episode.usage = Some(*usage);
                     episode.retries_used = *retries_used;
                 }
@@ -1109,6 +1240,7 @@ impl AdmissionCheckpointV1 {
             }
             WalRecord::Queued {
                 keep_warm,
+                sent_by: display_sent_by,
                 written_at_ms,
                 ts_ms,
                 submission_id,
@@ -1124,6 +1256,7 @@ impl AdmissionCheckpointV1 {
             } => crate::queue::insert_in_drain_order(
                 Arc::make_mut(&mut self.pending_fifo),
                 PendingSubmission {
+                    display_sent_by: display_sent_by.clone(),
                     admitted_at_ms: written_at_ms.or(*ts_ms),
                     hooks: hooks.clone(),
                     conversation_key: conversation_key.clone(),
@@ -1161,6 +1294,9 @@ impl AdmissionCheckpointV1 {
             WalRecord::WriterOpened { .. }
             | WalRecord::WriterClosed { .. }
             | WalRecord::VisibilityLate { .. }
+            | WalRecord::CompactionViewV2 { .. }
+            | WalRecord::CompactionMarker { .. }
+            | WalRecord::CompactionViewAppliedV2 { .. }
             | WalRecord::Unknown => {}
             // Compaction state is folded below; it does not change admission's episode counters.
             WalRecord::CompactionRequest { .. }
@@ -1205,12 +1341,23 @@ impl AdmissionCheckpointV1 {
             | WalRecord::InputTokenBudgetExhausted { .. }
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
-            // Only a presence bit is needed here; the session-change projection folds the payload.
-            WalRecord::SessionRefreshAccepted { .. }
-            | WalRecord::SessionRefreshPolicyChanged { .. }
+            WalRecord::SessionRefreshAccepted { manifest, .. } => {
+                if let Some(ownership) = &mut self.ownership {
+                    ownership.session_change_recorded = true;
+                    ownership.sender_admission = Some(SenderAdmissionV1 {
+                        version: 1,
+                        accepted_senders: Some(manifest_senders(manifest)),
+                    });
+                }
+            }
+            WalRecord::SessionRefreshPolicyChanged { .. }
             | WalRecord::SessionPrefixFlushed { .. } => {
                 if let Some(ownership) = &mut self.ownership {
                     ownership.session_change_recorded = true;
+                    ownership.sender_admission.get_or_insert(SenderAdmissionV1 {
+                        version: 1,
+                        accepted_senders: None,
+                    });
                 }
             }
         }
@@ -1405,6 +1552,9 @@ pub fn encode_admission_checkpoint(
     })
 }
 
+/// A recovery fence is not an admission seed, even when it wraps a partial checkpoint.
+pub const WAL_RECOVERY_FENCE_PREFIX: &str = "{\"wal_recovery_fence\":";
+
 /// Decode a supported checkpoint. Unknown versions and malformed payloads are unavailable rather
 /// than an empty lineage, so callers take the full-WAL repair path.
 ///
@@ -1412,6 +1562,9 @@ pub fn encode_admission_checkpoint(
 /// the admission snapshot and the projection seed refuse to build on it (their full-WAL path
 /// repairs it), while readers that only want its last episode may still use it.
 pub fn decode_admission_checkpoint(encoded: &str) -> Option<AdmissionCheckpointV1> {
+    if encoded.starts_with(WAL_RECOVERY_FENCE_PREFIX) {
+        return None;
+    }
     let envelope: AdmissionCheckpointEnvelope = serde_json::from_str(encoded).ok()?;
     if envelope.version != 1 {
         return None;
@@ -1495,6 +1648,8 @@ impl AdmissionSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AdmissionEpisodeSeed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     start: AdmissionSource,
     run_id: RunId,
     refreezes: Vec<AdmissionSource>,
@@ -1536,6 +1691,8 @@ pub struct AdmissionSeed {
     qualified: bool,
     scalars: AdmissionCheckpointV1,
     first_run: Option<AdmissionSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_refresh: Option<AdmissionSource>,
     episode: Option<AdmissionEpisodeSeed>,
     queued: Vec<AdmissionQueueSeed>,
     staged: Option<AdmissionSource>,
@@ -1661,6 +1818,7 @@ impl AdmissionSeed {
                 provider_call_started: episode.provider_call_started,
                 disposition: episode.disposition,
                 pause_reason: episode.pause_reason,
+                account_limit_pause: episode.account_limit_pause.clone(),
                 cancel_at: episode.cancel_at,
                 usage: episode.usage,
                 retries_used: episode.retries_used,
@@ -1682,6 +1840,9 @@ impl AdmissionSeed {
         }).transpose()?;
         if let Some(ownership) = &mut scalars.ownership {
             ownership.latest_manifest = None;
+            if let Some(fold) = &mut ownership.sender_admission {
+                fold.accepted_senders = None;
+            }
             if let Some(first) = &mut ownership.first_episode {
                 first.manifest = None;
             }
@@ -1702,6 +1863,11 @@ impl AdmissionSeed {
             qualified: boundary.qualified,
             scalars,
             first_run: first.map(source).transpose()?,
+            latest_refresh: frames
+                .iter()
+                .rposition(|frame| matches!(frame.record, WalRecord::SessionRefreshAccepted { .. }))
+                .map(source)
+                .transpose()?,
             episode,
             queued,
             staged,
@@ -1778,6 +1944,7 @@ impl AdmissionSeed {
         episode.provider_call_started = seed.provider_call_started;
         episode.disposition = seed.disposition;
         episode.pause_reason = seed.pause_reason;
+        episode.account_limit_pause = seed.account_limit_pause.clone();
         episode.cancel_at = seed.cancel_at;
         episode.usage = seed.usage;
         episode.retries_used = seed.retries_used;
@@ -1889,6 +2056,21 @@ impl AdmissionSeed {
             return Err(bad());
         }
         let mut checkpoint = self.scalars.clone();
+        if let Some(source) = &self.latest_refresh {
+            let WalRecord::SessionRefreshAccepted { manifest, .. } =
+                source.read(read_at, &self.boundary)?.record
+            else {
+                return Err(bad());
+            };
+            checkpoint
+                .ownership
+                .as_mut()
+                .ok_or_else(bad)?
+                .sender_admission = Some(SenderAdmissionV1 {
+                version: 1,
+                accepted_senders: Some(manifest_senders(&manifest)),
+            });
+        }
         if let Some(HydratedAdmissionEpisode { episode, manifest }) = hydrated {
             checkpoint.last_episode = Some(episode);
             // The episode's authenticated RunStarted already supplied this manifest.
@@ -1931,6 +2113,9 @@ impl AdmissionSeed {
                     .and_then(|first| first.manifest.as_deref())
             {
                 ownership.latest_manifest = None;
+            }
+            if let Some(head) = &mut checkpoint.head {
+                head.restore_sender_admission(ownership);
             }
         }
         let pending = self.queued.iter().map(|seed| {
@@ -2086,11 +2271,45 @@ impl ContinuationCompactionFold {
 }
 
 impl AdmissionContinuation {
+    /// Authenticate the bounded WAL source of the latest accepted admission policy.
+    pub fn restore_head_sender_admission(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        head: &mut crate::head::HeadProjection,
+    ) -> Result<(), crate::replay::SeedFallback> {
+        let ownership =
+            self.seed.scalars.ownership.as_ref().ok_or_else(|| {
+                crate::replay::SeedFallback::new("sender admission summary missing")
+            })?;
+        if !ownership.sender_admission_complete() {
+            return Err(crate::replay::SeedFallback::new(
+                "sender admission summary predates refresh folding",
+            ));
+        }
+        head.restore_sender_marker(ownership);
+        if let Some(source) = &self.seed.latest_refresh {
+            let record = source.read(read_at, &self.seed.boundary)?.record;
+            if !matches!(record, WalRecord::SessionRefreshAccepted { .. }) {
+                return Err(crate::replay::SeedFallback::new(
+                    "sender admission source is not a refresh",
+                ));
+            }
+            head.observe(&record);
+        }
+        Ok(())
+    }
+
     /// A full WAL read preserves unanswered deferred calls, late results and
     /// requests to withdraw outstanding approval questions when the raw prefix
     /// cannot reconstruct those actions.
-    pub fn raw_read_ownership(&self) -> Result<SessionOwnershipV1, crate::replay::SeedFallback> {
-        if self.compaction.is_some() {
+    pub fn raw_read_ownership(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    ) -> Result<SessionOwnershipV1, crate::replay::SeedFallback> {
+        // Compaction payloads stay in the log. Authenticate the continuation's
+        // dependencies before deciding whether its pending actions need replay.
+        let compaction = self.hydrate_compaction_fold(read_at)?;
+        if compaction.session && compaction.checkpoint.state().is_none() {
             return Err(crate::replay::SeedFallback::new(
                 "raw page requires compaction source hydration",
             ));
@@ -2100,19 +2319,12 @@ impl AdmissionContinuation {
                 "raw page deferred prefix state",
             ));
         }
-        if self
-            .seed
-            .scalars
-            .compaction
-            .as_ref()
-            .and_then(|c| c.state())
-            .is_some_and(|state| {
-                matches!(
-                    state.ceiling_check,
-                    Some(crate::compaction::CeilingCheck::Waiting { .. })
-                ) || state.ride_wait.is_some()
-            })
-        {
+        if compaction.checkpoint.state().is_some_and(|state| {
+            matches!(
+                state.ceiling_check,
+                Some(crate::compaction::CeilingCheck::Waiting { .. })
+            ) || state.ride_wait.is_some()
+        }) {
             return Err(crate::replay::SeedFallback::new(
                 "raw page compaction wait prefix state",
             ));
@@ -2191,6 +2403,19 @@ impl AdmissionContinuation {
 
     /// Unsupported versions and missing media metadata are cache misses, never partial state.
     pub fn decode(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        Self::decode_inner(encoded, true)
+    }
+
+    /// Execution needs episode state, not named-sender policy. Keep older refresh-aware
+    /// continuations usable until a sender or template actually needs the newer fold.
+    pub fn decode_for_execution(encoded: &str) -> Result<Self, crate::replay::SeedFallback> {
+        Self::decode_inner(encoded, false)
+    }
+
+    fn decode_inner(
+        encoded: &str,
+        require_sender_policy: bool,
+    ) -> Result<Self, crate::replay::SeedFallback> {
         let bad = || crate::replay::SeedFallback::new("unsupported admission continuation");
         let value: serde_json::Value = serde_json::from_str(encoded).map_err(|_| bad())?;
         if value["version"] != 1 && value["version"] != 2 {
@@ -2205,6 +2430,17 @@ impl AdmissionContinuation {
             serde_json::from_value(value["state"].clone()).map_err(|_| bad())?;
         if seed.version != 1 {
             return Err(bad());
+        }
+        if require_sender_policy
+            && seed
+                .scalars
+                .ownership
+                .as_ref()
+                .is_none_or(|ownership| !ownership.sender_admission_complete())
+        {
+            return Err(crate::replay::SeedFallback::new(
+                "sender admission summary predates refresh folding",
+            ));
         }
         let sources = serde_json::from_value(value["sources"].clone()).map_err(|_| bad())?;
         let media_sources = value
@@ -2280,8 +2516,8 @@ impl AdmissionContinuation {
     }
 
     fn accounting_source(record: &WalRecord) -> bool {
-        // These sources rebuild head facts, token budgets, output reservations and media
-        // profile/boundary history. Every new record must explicitly choose whether its
+        // These sources rebuild head facts, token budgets, output reservations, recovery
+        // evidence and media profile/boundary history. Every new record must choose whether its
         // effects need a source; an implicit false would silently lose new fold inputs.
         match record {
             WalRecord::RunStarted { .. }
@@ -2295,10 +2531,11 @@ impl AdmissionContinuation {
             | WalRecord::ModelAttemptFinished { .. }
             | WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::OutputReservationClamped { .. }
-            | WalRecord::RunFinished { .. } => true,
-            // Session changes only set ownership.session_change_recorded, which is kept
-            // in the scalars. Capture/advance strip ownership.latest_manifest and hydration
-            // rebuilds it from the episode's RunStarted, not from these change records.
+            | WalRecord::RunFinished { .. }
+            | WalRecord::RecoveryCut { .. }
+            | WalRecord::RecoveryCallClosed { .. } => true,
+            // Execution manifests come from episode starts; admission policy has its own
+            // bounded latest-refresh source, independent of accounting history.
             WalRecord::SessionRefreshAccepted { .. }
             | WalRecord::SessionRefreshPolicyChanged { .. }
             | WalRecord::SessionPrefixFlushed { .. } => false,
@@ -2338,6 +2575,9 @@ impl AdmissionContinuation {
             | WalRecord::CompactionWait { .. }
             | WalRecord::CompactionViewApplied { .. }
             | WalRecord::CompactionNotice { .. }
+            | WalRecord::CompactionViewV2 { .. }
+            | WalRecord::CompactionMarker { .. }
+            | WalRecord::CompactionViewAppliedV2 { .. }
             | WalRecord::ToolCallDeferred { .. }
             | WalRecord::ApprovalRecorded { .. }
             | WalRecord::AwaitingApproval { .. }
@@ -2429,6 +2669,9 @@ impl AdmissionContinuation {
         read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     ) -> Result<AdmissionSeed, crate::replay::SeedFallback> {
         let mut seed = self.seed.clone();
+        // Recovery evidence is reconstructed from authenticated log records, not
+        // trusted from copied checkpoint scalars in the content-free form.
+        seed.scalars.recovery_cuts.clear();
         if let Some(crate::media_request::DurableMediaSeed::Ready(media)) = &mut seed.scalars.media
         {
             media.prepare_content_free_continuation();
@@ -2438,6 +2681,16 @@ impl AdmissionContinuation {
         let mut output = crate::output_reservation::OutputReservationHistory::default();
         let mut has_model_attempt = false;
         for frame in self.accounting_frames(read_at)? {
+            if let WalRecord::RecoveryCut { recovery } = &frame.record {
+                if !seed
+                    .scalars
+                    .recovery_cuts
+                    .iter()
+                    .any(|cut| cut.cut_id == recovery.cut_id)
+                {
+                    seed.scalars.recovery_cuts.push((**recovery).clone());
+                }
+            }
             has_model_attempt |= matches!(frame.record, WalRecord::ModelAttemptFinished { .. });
             head.observe(&frame.record);
             input.fold(&frame.record).map_err(|_| {
@@ -2726,9 +2979,11 @@ impl AdmissionContinuation {
                     .push(source.clone());
             }
             match &p.framed.record {
+                WalRecord::SessionRefreshAccepted { .. } => next.seed.latest_refresh = Some(source),
                 WalRecord::RunStarted { .. } => {
                     next.seed.first_run.get_or_insert(source.clone());
                     next.seed.episode = Some(AdmissionEpisodeSeed {
+                        account_limit_pause: None,
                         start: source,
                         run_id: scalars
                             .last_episode
@@ -2799,6 +3054,7 @@ impl AdmissionContinuation {
             episode.provider_call_started = current.provider_call_started;
             episode.disposition = current.disposition;
             episode.pause_reason = current.pause_reason;
+            episode.account_limit_pause = current.account_limit_pause.clone();
             episode.cancel_at = current.cancel_at;
             episode.usage = current.usage;
             episode.retries_used = current.retries_used;
@@ -2808,6 +3064,9 @@ impl AdmissionContinuation {
         scalars.pending_order = None;
         if let Some(ownership) = &mut scalars.ownership {
             ownership.latest_manifest = None;
+            if let Some(fold) = &mut ownership.sender_admission {
+                fold.accepted_senders = None;
+            }
             if let Some(first) = &mut ownership.first_episode {
                 first.manifest = None;
             }
@@ -2855,6 +3114,7 @@ mod tests {
 
     fn message(text: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
@@ -2866,6 +3126,9 @@ mod tests {
 
     fn config(model: &str) -> RunConfig {
         RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -3053,6 +3316,7 @@ mod tests {
 
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
+            route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
@@ -3095,6 +3359,8 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -3129,6 +3395,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -3216,6 +3483,7 @@ mod tests {
         frame(
             seq,
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3304,6 +3572,7 @@ mod tests {
             frame(
                 6,
                 WalRecord::Queued {
+                    sent_by: None,
                     submission_id: SubmissionId("q".into()),
                     request: Box::new(request("private queued input")),
                     request_identity_digest: None,
@@ -3322,6 +3591,7 @@ mod tests {
             frame(
                 7,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r1".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -3358,6 +3628,7 @@ mod tests {
             frame(
                 13,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r2".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -3473,8 +3744,9 @@ mod tests {
 
     fn exhaustive_checkpoint_fields(full: AdmissionCheckpointV1) -> AdmissionCheckpointV1 {
         // A new checkpoint field must be added to this exhaustive literal and exercised
-        // by the populated roundtrip fixture.
+        // by the populated roundtrip or an explicit unsupported-seed case.
         AdmissionCheckpointV1 {
+            recovery_cuts: full.recovery_cuts,
             has_model_attempt: full.has_model_attempt,
             media: full.media,
             head: full.head,
@@ -3614,27 +3886,87 @@ mod tests {
         assert_eq!(head, full);
     }
 
+    #[test]
+    fn continuation_restores_recovery_evidence_and_requires_full_replay() {
+        let recovery = broca_wal::recovery::RecoveryCut {
+            cut_id: "private-recovery-cut".into(),
+            sidecar_basename: "private-recovery-sidecar".into(),
+            cut_offset: 42,
+            removed_len: 17,
+            removed_sha256: "d".repeat(64),
+            reason: broca_wal::recovery::CutReason::UnpublishedTail,
+            active_run: None,
+            runs: vec![broca_wal::recovery::RecoveryRun {
+                run_id: broca_protocol::RunId("earlier-recovery-run".into()),
+                calls: vec![broca_wal::recovery::RecoveryCall {
+                    tool_call_id: broca_protocol::ToolCallId("private-recovery-call".into()),
+                    step_id: Some(StepId(1)),
+                    batch_id: Some(broca_protocol::BatchId("earlier-batch".into())),
+                    call_keys: Vec::new(),
+                }],
+            }],
+            unattributed_tool_risk: false,
+            unowned_calls: Vec::new(),
+        };
+        let mut frames = offset_corpus()[..4].to_vec();
+        for seq in [5, 6] {
+            frames.push(frame(
+                seq,
+                WalRecord::RecoveryCut {
+                    recovery: Box::new(recovery.clone()),
+                },
+            ));
+        }
+        let (bytes, positions) = offset_log(&frames);
+        let read_at = offset_reader(&bytes);
+        let boundary = offset_boundary(&bytes, &positions, positions.len());
+        let stored = AdmissionContinuation::capture(&read_at, &boundary, &positions).unwrap();
+        let encoded = stored.encode().unwrap();
+        assert_content_free_form(&encoded);
+        for secret in [
+            "private-recovery-cut",
+            "private-recovery-sidecar",
+            "private-recovery-call",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+        let restored = AdmissionContinuation::decode(&encoded).unwrap();
+        let hydrated = restored.hydrated_seed(&read_at).unwrap();
+        assert_eq!(hydrated.scalars.recovery_cuts, vec![recovery]);
+        assert!(
+            restored.hydrate(&read_at, &[], boundary.seq).is_err(),
+            "recovery-marked histories must still use canonical full replay"
+        );
+    }
+
     fn continuation_oracle(records: &[FramedRecord]) {
+        continuation_oracle_at(records, &[4, 12]);
+    }
+
+    fn continuation_oracle_at(records: &[FramedRecord], cuts: &[usize]) {
         use crate::projection_plan::ProjectionContinuation;
         let (bytes, positions) = offset_log(records);
         let read_at = offset_reader(&bytes);
+        let first_cut = cuts[0];
         let mut stored = ProjectionContinuation::capture(
             &read_at,
-            &offset_boundary(&bytes, &positions, 4),
-            &positions[..4],
+            &offset_boundary(&bytes, &positions, first_cut),
+            &positions[..first_cut],
         )
         .unwrap();
-        for boundary_cut in [4, 12] {
-            if boundary_cut != 4 {
+        let mut previous_cut = first_cut;
+        for &boundary_cut in cuts {
+            if boundary_cut != first_cut {
                 stored = ProjectionContinuation::decode(&stored.encode().unwrap())
                     .unwrap()
                     .advance(
                         &read_at,
                         &offset_boundary(&bytes, &positions, boundary_cut),
-                        &positions[4..boundary_cut],
+                        &positions[previous_cut..boundary_cut],
                     )
                     .unwrap();
             }
+            previous_cut = boundary_cut;
             let encoded = stored.encode().unwrap();
             assert_content_free_form(&encoded);
             assert_content_free_form(&stored.admission().encode().unwrap());
@@ -3713,6 +4045,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn compaction_v2_metadata_records_do_not_change_replay_admission_or_continuations() {
+        let mut plain = offset_corpus();
+        // Hold the log's first-run mode constant while checking that metadata is informational.
+        for source in &mut plain {
+            if let WalRecord::RunStarted {
+                compaction_plan_version,
+                ..
+            } = &mut source.record
+            {
+                *compaction_plan_version = Some(u32::MAX);
+            }
+        }
+        let metadata: Vec<WalRecord> =
+            include_str!("../../broca-wal/tests/fixtures/compaction_v2_records.jsonl")
+                .lines()
+                .take(3)
+                .map(|bytes| serde_json::from_str(bytes).unwrap())
+                .collect();
+        assert!(metadata.iter().all(WalRecord::is_informational));
+        let mut with = Vec::new();
+        for source in &plain {
+            let record = source.record.clone();
+            for record in std::iter::once(record).chain(metadata.iter().cloned()) {
+                with.push(frame(with.len() as u64 + 1, record));
+            }
+            let expected = crate::replay::replay(
+                &plain[..source.seq as usize]
+                    .iter()
+                    .map(|f| f.record.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let actual =
+                crate::replay::replay(&with.iter().map(|f| f.record.clone()).collect::<Vec<_>>())
+                    .unwrap();
+            assert_eq!(
+                format!("{actual:?}"),
+                format!("{expected:?}"),
+                "replay at {}",
+                source.seq
+            );
+            let mut actual = AdmissionCheckpointV1::from_frames(&with).unwrap();
+            let expected =
+                AdmissionCheckpointV1::from_frames(&plain[..source.seq as usize]).unwrap();
+            assert_eq!(actual.at_seq, expected.at_seq * 4);
+            actual.at_seq = expected.at_seq;
+            assert_eq!(actual, expected, "admission at {}", source.seq);
+            let units = |frames: &[FramedRecord]| {
+                crate::project_control(frames)
+                    .into_iter()
+                    .map(|(_, unit)| unit)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(units(&with), units(&plain[..source.seq as usize]));
+        }
+        // Publication cuts still name model-step frames, not the metadata following them.
+        // The oracle checks every crash suffix after capture and after checkpoint advancement.
+        continuation_oracle_at(&with, &[13, 45]);
     }
 
     #[test]
@@ -3863,6 +4256,14 @@ mod tests {
         }
         let baseline = manifest("baseline", "PRIVATE-BASELINE-MANIFEST");
         let refreshed = manifest("refreshed", "PRIVATE-REFRESHED-MANIFEST");
+        let mut refreshed = refreshed;
+        refreshed.plan = broca_wal::OpaqueJson::from_json_text(
+            serde_json::json!({
+                "senders": [{"module":"occipital", "idle_start":true}]
+            })
+            .to_string(),
+        )
+        .unwrap();
         let mut records = offset_corpus();
         for frame in &mut records {
             if let WalRecord::RunStarted {
@@ -3898,6 +4299,29 @@ mod tests {
             assert!(!AdmissionContinuation::accounting_source(change));
         }
         records.splice(10..10, changes.into_iter().map(|r| frame(0, r)));
+        let mut pending = manifest("pending", "PRIVATE-PENDING-MANIFEST");
+        pending.plan = broca_wal::OpaqueJson::from_json_text(
+            serde_json::json!({
+                "senders":[{"module":"pending-sender","idle_start":true,"templates":[{
+                    "id":"context","text":"PRIVATE-PENDING-TEMPLATE","slots":{}
+                }]}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        records.insert(
+            records.len() - 2,
+            frame(
+                0,
+                WalRecord::SessionRefreshAccepted {
+                    generation: 2,
+                    policy: "on_prefix_rebuild".into(),
+                    manifest: Box::new(pending),
+                    run_in_progress: true,
+                    applies_from_next_run: false,
+                },
+            ),
+        );
         for (i, frame) in records.iter_mut().enumerate() {
             frame.seq = i as u64 + 1;
         }
@@ -3918,6 +4342,7 @@ mod tests {
         let full = AdmissionCheckpointV1::from_frames(&records).unwrap();
         let ownership = full.ownership.as_ref().unwrap();
         assert!(ownership.session_change_recorded);
+        assert_eq!(ownership.effective_senders()[0].module, "pending-sender");
         assert_eq!(ownership.latest_manifest.as_deref(), Some(&refreshed));
         assert_eq!(
             ownership
@@ -3941,7 +4366,12 @@ mod tests {
         for stored in [captured, advanced] {
             let encoded = stored.encode().unwrap();
             assert_content_free_form(&encoded);
-            for payload in ["PRIVATE-BASELINE-MANIFEST", "PRIVATE-REFRESHED-MANIFEST"] {
+            for payload in [
+                "PRIVATE-BASELINE-MANIFEST",
+                "PRIVATE-REFRESHED-MANIFEST",
+                "PRIVATE-PENDING-MANIFEST",
+                "PRIVATE-PENDING-TEMPLATE",
+            ] {
                 assert!(!encoded.contains(payload));
             }
             let wire: serde_json::Value = serde_json::from_str(&encoded).unwrap();
@@ -4626,6 +5056,7 @@ mod tests {
             records.push(frame(
                 0,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r1".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -4856,6 +5287,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -4904,6 +5336,7 @@ mod tests {
             frame(
                 5,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -5047,6 +5480,7 @@ mod tests {
             frame(
                 1,
                 WalRecord::Queued {
+                    sent_by: None,
                     written_at_ms: None,
                     retention: None,
                     ts_ms: None,
@@ -5065,6 +5499,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::Queued {
+                    sent_by: None,
                     written_at_ms: None,
                     retention: None,
                     ts_ms: None,
@@ -5093,6 +5528,7 @@ mod tests {
             frame(
                 6,
                 WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("r1".into()),
                     ts_ms: None,
                     reason: PauseReason::AuthRequired,
@@ -5121,6 +5557,7 @@ mod tests {
             frame(
                 10,
                 WalRecord::Queued {
+                    sent_by: None,
                     written_at_ms: None,
                     retention: None,
                     ts_ms: None,
@@ -5140,6 +5577,7 @@ mod tests {
             frame(
                 12,
                 WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -5232,6 +5670,7 @@ mod tests {
             frame(
                 19,
                 WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -5637,6 +6076,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -5712,6 +6152,7 @@ mod tests {
         };
         config.budget = Some(budget.clone());
         let step = |id, content| WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -5833,6 +6274,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            recovery_cuts: Vec::new(),
             has_model_attempt: None,
             media: None,
             output_reservation: None,
@@ -5849,6 +6291,7 @@ mod tests {
             at_seq: 7,
             last_episode: None,
             pending_fifo: Arc::new(vec![PendingSubmission {
+                display_sent_by: None,
                 admitted_at_ms: None,
                 order: None,
                 sent_by: None,
@@ -5895,6 +6338,45 @@ mod tests {
         assert!(AdmissionCheckpointV1::empty().ownership_complete());
     }
 
+    #[test]
+    fn sender_admission_checkpoint_requires_versioned_refresh_fold() {
+        let mut checkpoint = AdmissionCheckpointV1::empty();
+        let ownership = checkpoint.ownership.as_mut().unwrap();
+        ownership.session_change_recorded = true;
+        assert!(
+            checkpoint.ownership_complete(),
+            "execution metadata remains usable"
+        );
+        assert!(!checkpoint
+            .ownership
+            .as_ref()
+            .unwrap()
+            .sender_admission_complete());
+        checkpoint
+            .fold_record(
+                1,
+                &WalRecord::SessionPrefixFlushed {
+                    send_id: "flush".into(),
+                    pending_generation: None,
+                },
+            )
+            .unwrap();
+        assert!(checkpoint.ownership_complete());
+        checkpoint
+            .ownership
+            .as_mut()
+            .unwrap()
+            .sender_admission
+            .as_mut()
+            .unwrap()
+            .version = 2;
+        assert!(!checkpoint
+            .ownership
+            .as_ref()
+            .unwrap()
+            .sender_admission_complete());
+    }
+
     /// The ownership summary folds every episode: the first principal, whether any episode
     /// recorded none, each distinct principal in order, and the latest frozen scope. An
     /// episode that reopened the scope at a later epoch replaces it, and an episode without a
@@ -5932,6 +6414,7 @@ mod tests {
                 first_episode: None,
                 latest_manifest: None,
                 session_change_recorded: false,
+                sender_admission: None,
                 plan_manifest_folded: true,
             }
         );

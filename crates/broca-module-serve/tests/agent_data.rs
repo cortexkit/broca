@@ -186,6 +186,7 @@ impl Rig {
         let mut records = vec![
             started(session, run),
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -342,6 +343,7 @@ impl Rig {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -385,6 +387,8 @@ impl Rig {
 }
 fn started(session: &BindIdentity, run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -404,6 +408,9 @@ fn started(session: &BindIdentity, run: &str) -> WalRecord {
         session: session.clone(),
         ts_ms: Some(1),
         config: Box::new(RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -787,13 +794,15 @@ async fn move_and_move_back_replays_and_rejoins_only_a_prefix() {
     assert_eq!(receiver.bytes(&session), original);
     let mut receiver_reader = Wire::new(&receiver, Value::Null, false).await;
     receiver_reader.bind_session(&session).await;
-    assert_eq!(
-        receiver_reader
-            .management("session.read", json!({"include_tools":true}))
-            .await
-            .unwrap(),
-        transcript
-    );
+    let mut received = receiver_reader
+        .management("session.read", json!({"include_tools":true}))
+        .await
+        .unwrap();
+    // The receiver serves the same incarnation under a history version above any the source
+    // served, so clients reload; every other byte of the page is the source's.
+    assert!(received["history_version"].as_u64() > transcript["history_version"].as_u64());
+    received["history_version"] = transcript["history_version"].clone();
+    assert_eq!(received, transcript);
     receiver
         .index
         .emit_run(
@@ -927,6 +936,7 @@ async fn retention_marker_never_reaches_the_door() {
     {
         *retention = Some(60_000);
         *input = vec![Message {
+            turn_system: false,
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: marker.into(),
@@ -2135,6 +2145,7 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
     let session = rig.session("queued");
     rig.seed(&session, "complete", true);
     let queued = WalRecord::Queued {
+        sent_by: None,
         written_at_ms: None,
         retention: None,
         ts_ms: None,
@@ -2148,6 +2159,7 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
         request_identity_digest: None,
         principal: None,
         request: Box::new(broca_protocol::request::SubmissionRequest {
+            route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
@@ -2159,6 +2171,7 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
             principal: None,
             model: broca_protocol::ModelHandle::new("stub", "m"),
             input: vec![Message {
+                turn_system: false,
                 role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: "queued input".into(),

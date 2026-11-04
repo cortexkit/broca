@@ -41,20 +41,22 @@ fn refused(code: &'static str, message: impl Into<String>) -> HistoryError {
 }
 
 // A boundary names the first entry of a forward page or the exclusive end of a backward page.
-// Lineage binding makes a cursor from a removed/recreated session expire, not read an empty page.
+// Snapshot binding makes a cursor from removed or rewritten history expire.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
-    lineage: String,
+    incarnation: String,
+    history_version: u64,
     boundary: u64,
     backward: bool,
 }
 
-fn cursor(lineage: &str, boundary: u64, backward: bool) -> String {
+fn cursor(incarnation: &str, history_version: u64, boundary: u64, backward: bool) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&Cursor {
-            lineage: lineage.into(),
+            incarnation: incarnation.into(),
+            history_version,
             boundary,
             backward,
         })
@@ -75,12 +77,6 @@ fn parse_cursor(token: &str) -> Result<Cursor, HistoryError> {
             }
             .into()
         })
-}
-
-fn ordinal(mid: &str) -> Option<u64> {
-    let text = mid.strip_prefix('m')?;
-    let number: u64 = text.parse().ok()?;
-    (number.to_string() == text).then_some(number)
 }
 
 fn media(media: &MediaRef) -> Reference {
@@ -140,21 +136,25 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, RowMetadat
                 senders.insert(submission_id.0.clone(), sent_by.clone());
             }
             WalRecord::Queued {
+                sent_by,
                 submission_id,
                 request_identity_digest,
                 principal,
                 ..
             } => {
-                let principal = senders
-                    .get(&submission_id.0)
-                    .and_then(Option::as_ref)
-                    .or(principal.as_ref());
+                let principal = sent_by.as_ref().or_else(|| {
+                    senders
+                        .get(&submission_id.0)
+                        .and_then(Option::as_ref)
+                        .or(principal.as_ref())
+                });
                 queued.insert(
                     submission_id.0.clone(),
                     send_metadata(request_identity_digest.as_deref(), principal),
                 );
             }
             WalRecord::RunStarted {
+                sent_by,
                 request_identity_digest,
                 principal,
                 submission_id,
@@ -169,18 +169,22 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, RowMetadat
                         .and_then(|id| queued.get(&id.0))
                         .cloned()
                         .unwrap_or_else(|| {
-                            send_metadata(request_identity_digest.as_deref(), principal.as_ref())
+                            send_metadata(
+                                request_identity_digest.as_deref(),
+                                sent_by.as_ref().or(principal.as_ref()),
+                            )
                         });
                 }
             }
             WalRecord::Steered {
+                sent_by,
                 request_identity_digest,
                 input,
                 ..
             } => {
-                // Legacy steers have no recorded principal; do not guess the session owner's.
+                // Legacy steers have no display stamp; do not guess the session owner's.
                 pending.extend(std::iter::repeat_n(
-                    send_metadata(request_identity_digest.as_deref(), None),
+                    send_metadata(request_identity_digest.as_deref(), sent_by.as_ref()),
                     input.len(),
                 ));
             }
@@ -259,7 +263,7 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, RowMetadat
 }
 
 /// The pure projection for broca's canonical stored message schema. Part keys are the same
-/// stable keys served by session.read's tag rows, including unnumbered tool calls.
+/// stable part keys served by session.read, including unnumbered tool calls.
 pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRow {
     let parts = entry
         .message
@@ -267,7 +271,14 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
         .iter()
         .enumerate()
         .map(|(index, block)| {
-            let key = broca_protocol::tags::part_key(entry.ordinal, index);
+            let key = entry
+                .part_keys
+                .as_ref()
+                .and_then(|keys| keys.get(index))
+                .cloned()
+                .unwrap_or_else(|| {
+                    broca_protocol::tags::part_key(entry.ordinal.saturating_sub(1), index)
+                });
             match block {
                 ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
                     DisplayPart::Text(TextPart::new(key, text))
@@ -297,6 +308,17 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
                         .iter()
                         .find(|fact| fact.tool_call_id == call.tool_call_id.0)
                         .and_then(|fact| fact.call_key.clone());
+                    if let Some(time) = entry
+                        .tool_times
+                        .iter()
+                        .find(|time| time.tool_call_id == call.tool_call_id.0)
+                    {
+                        part.call_key = time.call_key.clone();
+                        part.schema_pin = time.schema_pin.clone();
+                        part.started_at = time.started_at;
+                        part.finished_at = time.finished_at;
+                        part.unanswered = time.unanswered.clone();
+                    }
                     DisplayPart::ToolCall(part)
                 }
                 ContentBlock::ToolResult(result) => {
@@ -376,7 +398,7 @@ pub async fn read<H: ServeHandler + ?Sized>(
         message: format!("session.history does not accept {field} in this request"),
     })?;
     let head = handler.head(session).await?;
-    let Some(lineage) = head.lineage_id else {
+    if head.incarnation == "unwritten" {
         if let HistoryMode::Cursor(token) = mode {
             parse_cursor(token)?;
             return Err(refused(
@@ -399,14 +421,20 @@ pub async fn read<H: ServeHandler + ?Sized>(
                 "session.history ordinal is not retained",
             ));
         }
-        return Ok(serde_json::json!({"messages": []}));
-    };
-    let end = head.last_ordinal.map_or(0, |last| last.saturating_add(1));
+        return Ok(
+            serde_json::json!({"messages": [], "incarnation": head.incarnation, "history_version": head.history_version}),
+        );
+    }
+    let lineage = head.incarnation.clone();
+    let end = head.last_ordinal.map_or(1, |last| last.saturating_add(1));
     let (boundary, backward) = match mode {
         HistoryMode::Newest => (end, true),
         HistoryMode::Cursor(token) => {
             let position = parse_cursor(token)?;
-            if position.lineage != lineage || position.boundary > end {
+            if position.incarnation != lineage
+                || position.history_version != head.history_version
+                || position.boundary > end
+            {
                 return Err(refused(
                     "cursor_expired",
                     "session.history cursor is not in this session's surviving history",
@@ -415,15 +443,19 @@ pub async fn read<H: ServeHandler + ?Sized>(
             (position.boundary, position.backward)
         }
         HistoryMode::FromMid(mid) | HistoryMode::BeforeMid(mid) => {
-            let at = ordinal(mid).filter(|at| *at < end).ok_or_else(|| {
-                refused(
-                    "unknown_mid",
-                    format!("session.history mid {mid} is not retained"),
-                )
-            })?;
+            let at = broca_core::position_of_mid(mid, head.mode3, head.lineage_id.as_deref())
+                .map(|position| position + 1)
+                .filter(|at| *at < end)
+                .ok_or_else(|| {
+                    refused(
+                        "unknown_mid",
+                        format!("session.history mid {mid} is not retained"),
+                    )
+                })?;
             (at, matches!(mode, HistoryMode::BeforeMid(_)))
         }
         HistoryMode::FromOrdinal(at) | HistoryMode::BeforeOrdinal(at) => {
+            let at = at.max(1);
             if at >= end {
                 return Err(refused(
                     "unknown_ordinal",
@@ -438,7 +470,7 @@ pub async fn read<H: ServeHandler + ?Sized>(
         .unwrap_or(100)
         .min(broca_core::SESSION_READ_MAX_LIMIT);
     let start = if backward {
-        boundary.saturating_sub(limit)
+        boundary.saturating_sub(limit).max(1)
     } else {
         boundary
     };
@@ -452,8 +484,9 @@ pub async fn read<H: ServeHandler + ?Sized>(
     let mut from = start;
     while from < stop {
         let mut read = SessionReadRequest::new(session.clone(), Some(from), Some(stop - from));
-        read.lineage_id = Some(lineage.clone());
+        read.history_version = Some(head.history_version);
         read.include_rich_ui = request.form() == HistoryForm::Display;
+        read.include_display_facts = request.form() == HistoryForm::Display;
         read.max_bytes = Some(broca_wire::READ_MAXIMUM_MAX_BYTES);
         // Display needs stored payloads; raw history honors the caller's descriptor choice.
         read.media = if request.form() == HistoryForm::Display {
@@ -502,7 +535,15 @@ pub async fn read<H: ServeHandler + ?Sized>(
         .transpose()?
         .unwrap_or_default();
     let refs = if request.form() == HistoryForm::Display {
-        crate::output_refs::page_output_refs(handler, session, &lineage, &entries, records).await?
+        crate::output_refs::page_output_refs(
+            handler,
+            session,
+            &lineage,
+            head.history_version,
+            &entries,
+            records,
+        )
+        .await?
     } else {
         Default::default()
     };
@@ -513,8 +554,15 @@ pub async fn read<H: ServeHandler + ?Sized>(
             if entry.message.role == Role::Assistant {
                 row.rich_ui = entry.rich_ui.clone();
             }
-            if let Some(metadata) = metadata.get(&entry.ordinal) {
+            if let Some(metadata) = metadata.get(&entry.ordinal.saturating_sub(1)) {
                 for call in row.tool_calls_mut() {
+                    if entry
+                        .tool_times
+                        .iter()
+                        .any(|time| time.tool_call_id == call.tool_call_id)
+                    {
+                        continue;
+                    }
                     call.schema_pin = metadata.tool_pins.get(&call.tool_call_id).and_then(|pin| {
                         cortexkit_role_tool_provider::call::SchemaPin::new(
                             &call.name,
@@ -527,18 +575,17 @@ pub async fn read<H: ServeHandler + ?Sized>(
                 }
             }
             if entry.message.role == Role::User {
-                if let Some(metadata) = metadata.get(&entry.ordinal) {
+                if let Some(metadata) = metadata.get(&entry.ordinal.saturating_sub(1)) {
                     row.client_message_id = metadata.client_message_id.clone();
                     row.sender = metadata.sender.clone();
                 }
             }
-            if let Some(refs) = refs.get(&entry.ordinal) {
+            if let Some(refs) = refs.get(&entry.ordinal.saturating_sub(1)) {
                 row = refs.attach(row);
             }
             serde_json::to_value(
-                DisplayEntry::new(&entry.mid, written_at, row)
-                    .with_ordinal(entry.ordinal)
-                    .with_tags(entry.tags.clone()),
+                DisplayEntry::new(entry.ordinal, &entry.mid, written_at, row)
+                    .with_part_keys(entry.part_keys.clone().unwrap_or_default()),
             )
             .expect("display entry JSON")
         } else {
@@ -563,12 +610,12 @@ pub async fn read<H: ServeHandler + ?Sized>(
             .last()
             .and_then(|entry| entry["ordinal"].as_u64())
             .map_or(stop, |last| last + 1);
-        let mut page = serde_json::json!({"messages": messages, "lineage_id": lineage, "history_version": head.history_version.unwrap_or(0)});
-        if first > 0 {
-            page["older"] = cursor(&lineage, first, true).into();
+        let mut page = serde_json::json!({"messages": messages, "incarnation": lineage, "history_version": head.history_version});
+        if first > 1 {
+            page["older"] = cursor(&lineage, head.history_version, first, true).into();
         }
         if after < end {
-            page["newer"] = cursor(&lineage, after, false).into();
+            page["newer"] = cursor(&lineage, head.history_version, after, false).into();
         }
         if messages.len() <= 1
             || (broca_protocol::serialized_json_bytes(&page) <= cap
@@ -608,7 +655,8 @@ mod tests {
     #[test]
     fn projection_preserves_native_part_order_keys_media_and_utf8_limits() {
         let entry: SessionReadMessage = serde_json::from_value(json!({
-            "ordinal": 7, "mid":"m7", "written_at":123,
+            "ordinal": 8, "mid":"mdeadbeef.7", "written_at":123,
+            "part_keys": (0..6).map(|n| format!("m7#{n}")).collect::<Vec<_>>(),
             "message":{"role":"assistant", "origin":{"provider_module_id":"mock", "model_id":"model"}, "content":[
                 {"type":"text","text":"first"},
                 {"type":"reasoning","text":"thinking"},

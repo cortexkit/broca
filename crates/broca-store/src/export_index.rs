@@ -560,6 +560,23 @@ fn classify_collision(stored: &str, current: &str) -> CollisionKind {
 }
 
 impl ExportIndex for SqliteStore {
+    fn is_imported_run(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        run_id: &RunId,
+    ) -> Result<bool, ExportError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM export_imported_runs WHERE session=?1 AND run_id=?2)",
+            rusqlite::params![
+                serde_json::to_string(session).map_err(|e| ExportError::Storage(e.to_string()))?,
+                run_id.0
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|e| ExportError::Storage(e.to_string()))
+    }
+
     fn record_imported_runs(
         &self,
         session: &broca_protocol::BindIdentity,
@@ -654,7 +671,7 @@ impl ExportIndex for SqliteStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A process-unique suffix for a test fixture path.
@@ -710,8 +727,11 @@ mod tests {
         });
     }
 
-    fn config(usage_policy: &str) -> RunConfig {
+    pub(crate) fn config(usage_policy: &str) -> RunConfig {
         RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -774,6 +794,8 @@ mod tests {
             seq: 1,
             fence: 1,
             record: WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -818,6 +840,7 @@ mod tests {
                 seq: records.len() as u64 + 1,
                 fence: 1,
                 record: WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,

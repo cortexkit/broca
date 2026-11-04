@@ -222,6 +222,13 @@ pub async fn run_import_with_store<W: WalStore>(
     wal_store: &W,
     store: Option<Arc<dyn SessionStore>>,
 ) -> Result<ImportOutcome, ImportError> {
+    let history_store = store.clone();
+    let wal_history = wal_store.served_history();
+    let history = history_store
+        .as_ref()
+        .and_then(|store| store.served_history())
+        .or(wal_history.as_deref());
+
     if !request
         .origin
         .source_ref
@@ -317,6 +324,11 @@ pub async fn run_import_with_store<W: WalStore>(
                 crate::run::project_committed(wal_store, store, &request.session, safe_h, false)
                     .await;
             }
+            if let Some(history) = history {
+                history
+                    .history_rewrite_finished(&request.session)
+                    .map_err(ImportError::Wal)?;
+            }
             return Ok(ImportOutcome {
                 run_id: request.run_id,
                 synthesized_tool_results: counts.synthesized_tool_results,
@@ -342,6 +354,14 @@ pub async fn run_import_with_store<W: WalStore>(
         let dangling_seed =
             repairable_import_prefix(&frames)?.ok_or(ImportError::LineageNotEmpty)?;
         if dangling_seed {
+            if let Some(history) = history {
+                history
+                    .history_rewritten(
+                        &request.session,
+                        writer.lineage_id().map(|id| id.to_string()).as_deref(),
+                    )
+                    .map_err(ImportError::Wal)?;
+            }
             writer.record(WalRecord::RunFinished {
                 interrupt_reason: None,
                 ts_ms: epoch_millis(),
@@ -355,6 +375,8 @@ pub async fn run_import_with_store<W: WalStore>(
 
     let session = request.session.clone();
     writer.record(WalRecord::RunStarted {
+        compaction_plan_version: Some(cortexkit_compaction_view::PLAN_VERSION),
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -409,6 +431,11 @@ pub async fn run_import_with_store<W: WalStore>(
         crate::run::project_committed(wal_store, store, &session, safe_h, false).await;
     }
 
+    if let Some(history) = history {
+        history
+            .history_rewrite_finished(&session)
+            .map_err(ImportError::Wal)?;
+    }
     Ok(ImportOutcome {
         run_id: request.run_id,
         synthesized_tool_results: counts.synthesized_tool_results,
@@ -420,6 +447,9 @@ pub async fn run_import_with_store<W: WalStore>(
 
 fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig {
     RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: Some(broca_wal::ComputedTagRules {
@@ -434,7 +464,7 @@ fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig 
         cache_tiers: serde_json::Value::Null,
         context_epoch: 0,
         renderer_version: 0,
-        // Null is deliberate: the W3-B frozen-render guard refuses to resume this marker as
+        // Null is deliberate: the frozen-render guard refuses to resume this marker as
         // a provider run. Replay classifies a dangling zero-step SeededFrom episode as
         // Interrupted before any provider can be selected.
         frozen_render_config: serde_json::Value::Null,
@@ -446,8 +476,8 @@ fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig 
         variant: None,
         service_tier: None,
         stop_when: Vec::new(),
-        // An import seed chooses no context management: the first harness episode after it is
-        // the session's first real admission, and binds the value then.
+        // An import seed leaves context management unset; the session's first
+        // real admission binds the value.
         context_management: None,
     }
 }
@@ -477,6 +507,9 @@ fn repairable_import_prefix(
             WalRecord::WriterOpened { .. }
             | WalRecord::WriterClosed { .. }
             | WalRecord::VisibilityLate { .. }
+            | WalRecord::CompactionViewV2 { .. }
+            | WalRecord::CompactionMarker { .. }
+            | WalRecord::CompactionViewAppliedV2 { .. }
             | WalRecord::Unknown => {}
             // This reader release decodes compaction records but does not act on them yet.
             WalRecord::CompactionRequest { .. }
@@ -718,6 +751,60 @@ mod tests {
             output: ToolOutput::Text { text: label.into() },
             is_error: false,
         })
+    }
+
+    #[test]
+    fn compaction_v2_does_not_change_import_prefix_repairability() {
+        let mut shapes: Vec<WalRecord> =
+            include_str!("../../broca-wal/tests/fixtures/compaction_v2_records.jsonl")
+                .lines()
+                .map(|bytes| serde_json::from_str(bytes).unwrap())
+                .collect();
+        let mut start = shapes.pop().unwrap();
+        if let WalRecord::RunStarted { origin, .. } = &mut start {
+            *origin = RunOrigin::SeededFrom {
+                origin_kind: SeedOriginKind::Import,
+                source_ref: "source".into(),
+                origin_device_pseudonym: None,
+                base_seq: None,
+            };
+        }
+        let mut plain = vec![start.clone()];
+        let mut with = vec![start];
+        with.extend(shapes);
+        let frames = |records: &[WalRecord]| {
+            records
+                .iter()
+                .enumerate()
+                .map(|(i, record)| broca_wal::FramedRecord {
+                    seq: i as u64 + 1,
+                    fence: 1,
+                    record: record.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            repairable_import_prefix(&frames(&plain)).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            repairable_import_prefix(&frames(&with)).unwrap(),
+            Some(true)
+        );
+        let terminal: WalRecord = serde_json::from_str(
+            r#"{"type":"run_finished","reason":"interrupted","usage":{},"retries_used":0}"#,
+        )
+        .unwrap();
+        plain.push(terminal.clone());
+        with.push(terminal);
+        assert_eq!(
+            repairable_import_prefix(&frames(&plain)).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            repairable_import_prefix(&frames(&with)).unwrap(),
+            Some(false)
+        );
     }
 
     #[test]

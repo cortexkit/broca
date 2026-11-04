@@ -10,12 +10,10 @@ use async_trait::async_trait;
 use broca_core::compaction_provider::setup::{SetupAnswer, SetupRequest};
 use broca_core::{
     AllowAll, CompactionPlane, CompactionUnavailable, FileLeaseStore, FileWalStore, OutputEvent,
-    Provider, RunError, RunSummary, StartMode, StubReply, StubToolPlane,
+    Provider, RunError, RunSummary, StartMode, StubReply, StubToolPlane, WalStore,
 };
 use broca_module::actor::{SendKey, SendOutcome, SendPlan};
-use broca_module::{
-    DefaultOpener, LineageRegistry, RunExecutor, RunJob, RunKind, ServeHandler, SessionReadRequest,
-};
+use broca_module::{DefaultOpener, LineageRegistry, RunExecutor, RunJob, RunKind};
 use broca_protocol::{
     AssistantMessage, BindIdentity, CallOptions, ContentBlock, FinishReason, Message, MessageId,
     NormalizedEvent, ProviderControl, Role, RunId, StepId, ToolCall, ToolCallId,
@@ -37,6 +35,7 @@ impl CompactionPlane for Compactor {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         Ok(serde_json::from_value(
@@ -89,6 +88,7 @@ impl Provider for Model {
                 },
             },
             ProviderControl::StepFinished {
+                raw_finish_reason: None,
                 step_id: step,
                 usage: Default::default(),
                 finish_reason,
@@ -106,35 +106,6 @@ impl Provider for Model {
             tx.send(NormalizedEvent::Control(control)).await.unwrap();
         }
         rx
-    }
-}
-
-/// A compaction provider whose Setup waits until the test releases it, then answers with a
-/// head and a tag checkpoint of 500 cut at the newest message, as a provider does for a
-/// session it moved from standalone Magic Context.
-struct HeldCompactor {
-    arrived: Semaphore,
-    release: Semaphore,
-}
-
-#[async_trait]
-impl CompactionPlane for HeldCompactor {
-    async fn setup(
-        &self,
-        _: &str,
-        _: &BindIdentity,
-        request: SetupRequest,
-    ) -> Result<SetupAnswer, CompactionUnavailable> {
-        self.arrived.add_permits(1);
-        self.release.acquire().await.unwrap().forget();
-        let cut = request.newest.as_ref().map(|newest| newest.mid.clone());
-        Ok(serde_json::from_value(
-            json!({"answer":"ready","request_id":request.request_id,"initial":{
-                "compaction_id":"c1","version":1,"range":{"from":0,"to":0},
-                "replacement":[text(Role::User, "head")]
-            },"checkpoint":{"tag_checkpoint":500,"cut":cut}}),
-        )
-        .unwrap())
     }
 }
 
@@ -165,6 +136,8 @@ impl RunExecutor for Exec {
         let tools =
             StubToolPlane::new().with_tool("lookup", |_| StubReply::ExecError("failed".into()));
         let store = job.materialized_store(self.store.clone());
+        let mut control = job.control;
+        control.admitted_context_limit = job.req.context_limit;
         let result = broca_core::run_loop_on_writer_admitted_with_prior_snapshot(
             job.req,
             &job.writer,
@@ -174,7 +147,7 @@ impl RunExecutor for Exec {
             &AllowAll,
             self.wal.as_ref(),
             store,
-            job.control,
+            control,
             &out,
             job.on_admitted,
             Some(&job.prior_snapshot),
@@ -188,13 +161,10 @@ impl RunExecutor for Exec {
 struct Rig {
     dir: std::path::PathBuf,
     wal: Arc<FileWalStore>,
-    store: Arc<broca_store::SqliteStore>,
     registry: LineageRegistry,
-    opener: Arc<dyn broca_module::registry::LineageOpener>,
     key: BindIdentity,
     model: Arc<Model>,
     prompts: Mutex<mpsc::UnboundedReceiver<Vec<Message>>>,
-    completed: Arc<Semaphore>,
 }
 
 fn manifest() -> Arc<PlanManifest> {
@@ -264,19 +234,15 @@ impl Rig {
             .with_run_index(store.clone())
             .with_materialized_store(store.clone()),
         );
-        let registry =
-            LineageRegistry::new_with_reader(opener.clone(), wal.clone(), Some(store.clone()));
+        let registry = LineageRegistry::new_with_reader(opener, wal.clone(), Some(store));
         let key = BindIdentity::new(dir.clone(), "caller", "session");
         Self {
             dir,
             wal,
-            store,
             registry,
-            opener,
             key,
             model,
             prompts: Mutex::new(prompt_rx),
-            completed,
         }
     }
 
@@ -342,45 +308,6 @@ impl Drop for Rig {
     }
 }
 
-/// Setup's head is the first message the model sees, and the advance notice announcing the
-/// session's transcript is durable in the WAL before the model call, so the bus publisher,
-/// which projects notices from the durable WAL, can never publish one the WAL does not hold.
-#[tokio::test]
-async fn setup_head_renders_and_the_notice_is_durable_before_the_model_call() {
-    let rig = Rig::new(0);
-    assert!(rig.registry.compaction_supported());
-    rig.send(true).await;
-    let prompt = rig.prompt().await;
-    assert_eq!(prompt[0].content, text(Role::User, "head").content);
-    // The model is holding its answer, so the WAL holds exactly what preceded the call.
-    let records: Vec<_> = broca_core::WalStore::read_records(rig.wal.as_ref(), &rig.key)
-        .unwrap()
-        .into_iter()
-        .map(|frame| frame.record)
-        .collect();
-    let notice = records
-        .iter()
-        .position(|record| matches!(record, broca_wal::WalRecord::CompactionNotice { .. }))
-        .expect("a notice before the first model call");
-    let setup = records
-        .iter()
-        .position(|record| matches!(record, broca_wal::WalRecord::CompactionMessage { .. }))
-        .expect("Setup recorded");
-    assert!(setup < notice, "Setup is recorded before the first notice");
-    let broca_wal::WalRecord::CompactionNotice { seq, headers } = &records[notice] else {
-        unreachable!()
-    };
-    assert_eq!(*seq, 1);
-    assert_eq!(headers["seq"], "1");
-    assert_eq!(headers["through_ordinal"], "0");
-    assert!(
-        !headers.contains_key("applied_view_version"),
-        "no view applies before the first one arrives"
-    );
-    assert!(!headers.contains_key("descends_from"));
-    rig.close().await;
-}
-
 /// A session enrolls in compaction only on its first episode, when it has no stored messages
 /// yet: a session whose first episode ran without a plan cannot take one naming a compaction
 /// provider later. Its send is refused `plan_drift` (no frozen plan, the plan it sent) and writes
@@ -443,224 +370,142 @@ async fn an_imported_session_cannot_enroll_in_compaction() {
     rig.close().await;
 }
 
-/// While a run that renders tags waits for its first Setup answer, which may anchor its numbers
-/// at a checkpoint, `session.read` and `session.resolve` refuse `transient` and write nothing.
-/// Once the answer is durable they answer, with the checkpoint's numbers: no read ever shows a
-/// number a later read changes.
-#[tokio::test]
-async fn reads_wait_out_the_setup_answer_and_never_show_a_number_that_changes() {
-    let held = Arc::new(HeldCompactor {
-        arrived: Semaphore::new(0),
-        release: Semaphore::new(0),
-    });
-    let rig = Rig::with_compactor(0, held.clone());
-    rig.send_manifest(Some(manifest_rendering(true))).await;
-    broca_test_support::event_timeout("setup call", held.arrived.acquire(), || {
-        format!("session={:?}", rig.key)
-    })
-    .await
-    .expect("Setup is called")
-    .unwrap()
-    .forget();
-    let read = || {
-        rig.registry
-            .read(SessionReadRequest::new(rig.key.clone(), Some(0), Some(100)))
-    };
-    let before = read().await;
-    assert!(
-        matches!(before, Err(broca_module::ServeError::TagsAwaitSetup)),
-        "a read inside the Setup window is refused: {before:?}"
-    );
-    let resolve = rig
-        .registry
-        .resolve(&rig.key, &broca_wire::ResolveParams::new("§1§"))
-        .await;
-    assert!(
-        matches!(resolve, Err(broca_module::ServeError::TagsAwaitSetup)),
-        "a resolve inside the Setup window is refused: {resolve:?}"
-    );
-    held.release.add_permits(1);
-    rig.prompt().await;
-    let after = read().await.expect("the Setup answer is durable");
-    let shown: Vec<_> = after
-        .messages
-        .iter()
-        .flat_map(|entry| entry.tags.iter().filter_map(|row| row.tag.clone()))
-        .collect();
-    assert_eq!(
-        shown,
-        vec!["§501§".to_owned()],
-        "the prompt shows the checkpoint's number"
-    );
-    rig.close().await;
-}
-
-#[tokio::test]
-async fn reads_after_projected_setup_do_not_wait_again_in_a_later_run() {
-    use broca_core::MaterializedStore;
-
-    let rig = Rig::new(0);
-    rig.send_manifest(Some(manifest_rendering(true))).await;
-    rig.prompt().await;
-    rig.model.finish.add_permits(1);
-    broca_test_support::event_timeout("first run completion", rig.completed.acquire(), || {
-        format!("session={:?}", rig.key)
-    })
-    .await
-    .expect("first run completes")
-    .unwrap()
-    .forget();
-
-    let setup_seq = rig
-        .records()
-        .iter()
-        .find_map(|frame| {
-            matches!(
-                frame.record,
-                broca_wal::WalRecord::CompactionMessage {
-                    kind: broca_wal::CompactionMessageKind::Setup,
-                    ..
-                }
-            )
-            .then_some(frame.seq)
-        })
-        .expect("Setup is durable");
-    let snapshot = rig
-        .store
-        .read_page_with_watermark(&rig.key, Some(0), 1, broca_core::ReadView::Raw)
-        .unwrap();
-    assert!(snapshot.watermark_seq >= setup_seq);
-
-    let outcome = rig.submit("run2", None).await;
-    assert!(
-        matches!(
-            outcome,
-            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
-        ),
-        "{outcome:?}"
-    );
-    rig.prompt().await;
-    let snapshot = rig
-        .store
-        .read_page_with_watermark(&rig.key, Some(0), 1, broca_core::ReadView::Raw)
-        .unwrap();
-    let tail: Vec<_> = rig
-        .records()
-        .into_iter()
-        .filter(|frame| frame.seq > snapshot.watermark_seq)
-        .collect();
-    assert!(tail.iter().any(|frame| matches!(
-        &frame.record,
-        broca_wal::WalRecord::RunStarted { run_id, .. } if run_id.0 == "run2"
-    )));
-    assert!(!tail.iter().any(|frame| matches!(
-        frame.record,
-        broca_wal::WalRecord::CompactionMessage {
-            kind: broca_wal::CompactionMessageKind::Setup,
-            ..
-        }
-    )));
-    let read = rig
-        .registry
-        .read(SessionReadRequest::new(rig.key.clone(), Some(0), Some(1)))
-        .await;
-    assert!(
-        read.is_ok(),
-        "a durable Setup cannot become pending again: {read:?}"
-    );
-    let read = read.unwrap();
-    assert_eq!(read.messages.len(), 1);
-    assert_eq!(
-        read.messages[0]
-            .tags
-            .iter()
-            .filter_map(|row| row.tag.as_deref())
-            .collect::<Vec<_>>(),
-        vec!["§1§"]
-    );
-    let closed = LineageRegistry::new_with_reader(
-        rig.opener.clone(),
-        rig.wal.clone(),
-        Some(rig.store.clone()),
-    );
-    let read = closed
-        .read(SessionReadRequest::new(rig.key.clone(), Some(0), Some(1)))
-        .await;
-    assert!(
-        read.is_ok(),
-        "the closed-actor read must use the same Setup fact: {read:?}"
-    );
-    assert_eq!(closed.slot_counts().open, 0, "reads must not open an actor");
-    rig.close().await;
-}
-
-#[tokio::test]
-async fn model_read_without_compaction_rejects_after_mid() {
-    let rig = Rig::new(0);
-    rig.send(false).await;
-    rig.prompt().await;
-    let mut req = SessionReadRequest::new(rig.key.clone(), Some(0), Some(100));
-    req.after_mid = Some("m0".into());
-    assert!(matches!(rig.registry.read_model(req).await,
-        Err(broca_module::ServeError::InvalidParams { field, .. }) if field == "view"));
-    let req = SessionReadRequest::new(rig.key.clone(), Some(0), Some(100));
-    let raw = rig.registry.read(req.clone()).await.unwrap();
-    let model = rig.registry.read_model(req).await.unwrap();
-    assert_eq!(model.compaction_id, None);
-    assert_eq!(model.version, None);
-    assert_eq!(
-        serde_json::to_vec(&raw.messages[0].message).unwrap(),
-        serde_json::to_vec(&model.messages[0].message).unwrap()
-    );
-    rig.close().await;
-}
-
-#[tokio::test]
-async fn store_backed_model_page_matches_sent_guidance_tail_under_setups_head() {
-    let rig = Rig::new(8);
-    rig.send(true).await;
-    let mut sent = Vec::new();
-    for _ in 0..9 {
-        sent = rig.prompt().await;
+fn seed_mode3(rig: &Rig) {
+    let mut start: broca_wal::WalRecord = serde_json::from_str(
+        include_str!("../../../broca-wal/tests/fixtures/compaction_v2_records.jsonl")
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    if let broca_wal::WalRecord::RunStarted {
+        session,
+        run_id,
+        config,
+        manifest: plan,
+        input,
+        submission_id,
+        ..
+    } = &mut start
+    {
+        *session = rig.key.clone();
+        *run_id = RunId("seed".into());
+        config.model = broca_protocol::ModelHandle::new("stub", "model");
+        config.global_system = None;
+        config.context_limit = Some(100_000);
+        *plan = Some(Box::new(manifest().as_ref().clone()));
+        *input = Arc::new(vec![text(Role::User, "stored question")]);
+        *submission_id = None;
     }
-    let req = SessionReadRequest::new(rig.key.clone(), Some(0), Some(100));
-    let raw = rig.registry.read(req.clone()).await.unwrap();
-    let page = rig.registry.read_model(req.clone()).await.unwrap();
-    assert_eq!(page.compaction_id.as_deref(), Some("c1"));
-    assert_eq!(page.version, Some(1));
-    let messages: Vec<_> = page
-        .messages
+    let mut wal = rig.wal.open(&rig.key).unwrap();
+    wal.append(1, &start, false).unwrap();
+    let finish = serde_json::from_value(
+        json!({"type":"run_finished","reason":"completed","usage":{},"retries_used":0}),
+    )
+    .unwrap();
+    wal.append(1, &finish, true).unwrap();
+}
+
+#[tokio::test]
+async fn compaction_v2_bound_ops_check_provider_and_store_before_accepted_without_applying_mid_run()
+{
+    use broca_core::compaction_v2::protocol::{
+        read::{Detail, ReadPage, ReadRequest, Select},
+        view::View,
+    };
+    let rig = Rig::new(0);
+    seed_mode3(&rig);
+    let raw = |value: serde_json::Value| serde_json::value::to_raw_value(&value).unwrap();
+    let before = rig.wal.read_records(&rig.key).unwrap().len();
+    for method in [
+        "bind",
+        "session.entries",
+        "session.apply_view",
+        "session.applied_view",
+    ] {
+        let refused = rig
+            .registry
+            .route_compaction_v2(
+                &rig.key,
+                Some("another-provider".into()),
+                method.into(),
+                raw(json!({})),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "compaction_not_permitted");
+    }
+    assert_eq!(rig.wal.read_records(&rig.key).unwrap().len(), before);
+    let entries = ReadRequest::new(
+        Select::After {
+            after_ordinal: None,
+            limit: Some(1),
+        },
+        Detail::Full,
+    );
+    let page = rig
+        .registry
+        .route_compaction_v2(
+            &rig.key,
+            Some("provider".into()),
+            "session.entries".into(),
+            serde_json::value::to_raw_value(&entries).unwrap(),
+        )
+        .await
+        .unwrap();
+    let page: ReadPage = serde_json::from_str(page.get()).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].ordinal, 1);
+    assert!(page.entries[0].mid.starts_with('m') && page.entries[0].mid.contains('.'));
+    let view = View::seal(1, vec![]);
+    let accepted = rig
+        .registry
+        .route_compaction_v2(
+            &rig.key,
+            Some("provider".into()),
+            "session.apply_view".into(),
+            raw(json!({"view":view})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(accepted.get()).unwrap(),
+        json!({"answer":"accepted"})
+    );
+    assert!(rig
+        .wal
+        .read_records(&rig.key)
+        .unwrap()
         .iter()
-        .map(|entry| entry.message.clone())
-        .collect();
+        .any(|frame| matches!(frame.record, broca_wal::WalRecord::CompactionViewV2(_))));
+    let applied = rig
+        .registry
+        .route_compaction_v2(
+            &rig.key,
+            Some("provider".into()),
+            "session.applied_view".into(),
+            raw(json!({})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.get(), "{}");
+    let result = rig.submit("next", Some(manifest())).await;
+    assert!(matches!(result, SendOutcome::Active { .. }), "{result:?}");
+    let _ = rig.prompt().await;
+    let applied = rig
+        .registry
+        .route_compaction_v2(
+            &rig.key,
+            Some("provider".into()),
+            "session.applied_view".into(),
+            raw(json!({})),
+        )
+        .await
+        .unwrap();
     assert_eq!(
-        serde_json::to_vec(&messages).unwrap(),
-        serde_json::to_vec(&sent).unwrap(),
-        "model read must match the native values actually sent, not undecorated store rows"
+        serde_json::from_str::<serde_json::Value>(applied.get()).unwrap()["view"]["version"],
+        1
     );
-    assert_eq!(
-        serde_json::to_value(&page.messages[0].source).unwrap(),
-        json!({
-        "kind":"replacement","compaction_id":"c1","version":1,"from_ordinal":0,"to_ordinal":0})
-    );
-    assert_eq!(
-        serde_json::to_value(&page.messages[1].source).unwrap(),
-        json!({
-        "kind":"message","ordinal":0,"mid":"m0"})
-    );
-    assert_ne!(
-        page.messages.last().unwrap().message.content,
-        raw.messages.last().unwrap().message.content,
-        "the tail must actually contain model-only repetition guidance"
-    );
-    assert_eq!(page.messages[0].message.ordinal, None);
-    let mut tail_req = req;
-    tail_req.from_ordinal = Some(15);
-    let tail = rig.registry.read_model(tail_req).await.unwrap();
-    assert_eq!(
-        serde_json::to_vec(&tail.messages[0].message).unwrap(),
-        serde_json::to_vec(&sent[16]).unwrap(),
-        "a range starting mid-episode keeps replaced counters"
-    );
+    rig.model.finish.add_permits(1);
     rig.close().await;
 }

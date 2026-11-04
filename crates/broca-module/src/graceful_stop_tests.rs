@@ -831,6 +831,7 @@ async fn restart_stop_after_call_result_pauses_at_the_durable_boundary() {
 #[test]
 fn restart_pause_is_valid_even_if_teardown_outlasts_grace() {
     let records = [WalRecord::RunPaused {
+        account_limit: None,
         ts_ms: None,
         run_id: RunId("restart-run".into()),
         reason: broca_protocol::PauseReason::Restart,
@@ -853,6 +854,7 @@ fn restart_stop_rejects_premature_interruption_and_other_outcomes() {
         retries_used: 0,
     };
     let other_pause = WalRecord::RunPaused {
+        account_limit: None,
         ts_ms: None,
         run_id: RunId("restart-run".into()),
         reason: broca_protocol::PauseReason::AuthRequired,
@@ -994,6 +996,7 @@ async fn restart_boot_unknown_feature_logs_refusal_without_touching_wal_or_block
             1,
             &["future-restart/v99"],
             &WalRecord::RunPaused {
+                account_limit: None,
                 ts_ms: None,
                 run_id: RunId("restart-run".into()),
                 reason: broca_protocol::PauseReason::Restart,
@@ -1200,4 +1203,47 @@ async fn the_stop_grace_waits_for_batches_but_never_past_its_end() {
         waited < Duration::from_secs(2),
         "a batch that outlives the grace held the stop open: {waited:?}"
     );
+}
+
+#[tokio::test]
+async fn route_decision_is_run_fixed_and_omitted_joining_sends_inherit_without_rewriting() {
+    let f = Fixture::new(Hold::UntilReleased, vec![edit_step()]);
+    let mut first = f.edit_req("decision-run");
+    first.route_decision_id = Some("decision-a".into());
+    assert!(matches!(
+        f.registry
+            .route_send(&f.key, first, RunKind::FreshOrResume)
+            .await
+            .unwrap(),
+        SendOutcome::Active { .. }
+    ));
+    tokio::time::timeout(Duration::from_secs(10), f.plane.entered.notified())
+        .await
+        .unwrap();
+    let before = f.records();
+    assert!(before.iter().any(|record| matches!(record, WalRecord::RunStarted { config, .. } if config.route_decision_id.as_deref() == Some("decision-a"))));
+    let mut different = text_req(&f.key, "different-decision");
+    different.route_decision_id = Some("decision-b".into());
+    assert_eq!(
+        f.registry
+            .route_send(&f.key, different, RunKind::FreshOrResume)
+            .await
+            .unwrap(),
+        SendOutcome::RouteDecisionFixed
+    );
+    assert_eq!(
+        f.records(),
+        before,
+        "a different decision must refuse before any WAL record"
+    );
+    let omitted = text_req(&f.key, "inherited-decision");
+    assert!(matches!(
+        f.registry
+            .route_send(&f.key, omitted, RunKind::FreshOrResume)
+            .await
+            .unwrap(),
+        SendOutcome::Pending { .. }
+    ));
+    assert!(f.records().iter().any(|record| matches!(record, WalRecord::Queued { request, .. } if request.route_decision_id.as_deref() == Some("decision-a"))));
+    let _ = f.stop_releasing_the_call(GRACE).await;
 }

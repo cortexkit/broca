@@ -190,6 +190,7 @@ impl Provider for WindowProvider {
 
 fn request(dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -206,6 +207,7 @@ fn request(dir: &std::path::Path) -> RunRequest {
         session: broca_protocol::BindIdentity::new(dir, "window", "s1"),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -570,6 +572,7 @@ impl MeasuredPrefixStore {
         let lineage_id = range.lineage_id.map(|id| id.to_string());
         Self {
             prefix: StorePrefix {
+                refusal: Some(Default::default()),
                 lineage_id: lineage_id.clone(),
                 prefix: state.prompt,
                 completed_steps: state.completed_steps,

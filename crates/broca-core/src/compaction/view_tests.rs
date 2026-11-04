@@ -423,6 +423,7 @@ fn indexed_render_keeps_interior_system_messages_and_episode_coordinates() {
     ]);
     let mut opts = CallOptions::new(prompt.clone());
     opts.render_episodes = std::sync::Arc::new(broca_protocol::request::RenderHistory {
+        raw_ordinals: false,
         compaction_prefix_len: None,
         episodes: (0..4)
             .map(|i| broca_protocol::request::EpisodeRenderInput {
@@ -629,6 +630,7 @@ async fn mismatched_views_are_never_applied() {
         let control = crate::RunControl::default();
         let bind = bind();
         let runtime = Runtime {
+            scope: None,
             provider: "provider",
             bind: &bind,
             plane: None,
@@ -780,6 +782,7 @@ async fn apply_over(
     let control = crate::RunControl::default();
     let bind = bind();
     let runtime = Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: None,
@@ -1101,6 +1104,7 @@ async fn a_recorded_notice_is_durable_before_it_returns() {
     let control = crate::RunControl::default();
     let bind = bind();
     let runtime = Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: None,

@@ -30,6 +30,8 @@ class FixedQuickcheck(unittest.TestCase):
             shutil.copy2(ROOT / "scripts/lib" / name, scripts / "lib")
         (scripts / "quickcheck-feature-tests.list").write_text("alpha|fixtures|-\n")
         (scripts / "quickcheck-guards.list").write_text("alpha|it|guard::|-\nbeta|it|outside::|-\n")
+        (scripts / "quickcheck-slow-tests.list").write_text(
+            "# comment\nalpha|sweep::all_images|2000\nbeta|other::sweep|90\n")
         bins = self.root / ".cargo/bin"
         bins.mkdir(parents=True)
         self.events = self.root / "events"
@@ -122,10 +124,30 @@ if os.environ.get('FAIL_DOC') and any('/' + os.environ['FAIL_DOC'] + '/' in arg 
         expression = LANE.test_filter
         with patch.object(LANE, "ROOT", self.root):
             selected = expression({"alpha"})
-        self.assertIn("package(=alpha) & (kind(lib) | kind(bin))", selected)
+        self.assertIn("package(=alpha) & (kind(lib) | kind(bin)) & not ((package(=alpha) & test(=sweep::all_images)))",
+                      selected)
         self.assertIn("binary(=fixtures)", selected)
         self.assertIn("binary(=it) & test(guard::)", selected)
         self.assertNotIn("beta", selected)
+
+    def test_slow_sweeps_are_excluded_only_for_their_own_package(self):
+        with patch.object(LANE, "ROOT", self.root):
+            both = LANE.test_filter({"alpha", "beta"})
+            only_beta = LANE.test_filter({"beta"})
+        self.assertIn("test(=sweep::all_images)", both)
+        self.assertIn("test(=other::sweep)", both)
+        self.assertNotIn("sweep::all_images", only_beta)
+        self.assertIn("package(=beta) & (kind(lib) | kind(bin)) & not ((package(=beta) & test(=other::sweep)))",
+                      only_beta)
+
+    def test_the_real_slow_list_names_existing_workspace_packages(self):
+        packages = {p.name for p in (ROOT / "crates").iterdir() if (p / "Cargo.toml").exists()}
+        listed = list(LANE.rows("quickcheck-slow-tests.list"))
+        self.assertTrue(listed)
+        for package, name, seconds in listed:
+            self.assertIn(package, packages)
+            self.assertIn("::", name)
+            self.assertGreater(int(seconds), 60)
 
     def test_outside_lint_and_doctest_failures_do_not_fail_attestation(self):
         result, _ = self.run_lane(LINT_PACKAGE="beta", FAIL_DOC="beta")
@@ -151,6 +173,37 @@ if os.environ.get('FAIL_DOC') and any('/' + os.environ['FAIL_DOC'] + '/' in arg 
         result, _ = self.run_lane(("missing",))
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("unknown workspace packages", result.stderr)
+
+    def run_filtered(self, *args, **env):
+        self.events.unlink(missing_ok=True)
+        result = subprocess.run([sys.executable, "scripts/lib/linux-quickcheck.py", "--tests", *args],
+                                cwd=self.root, env=dict(self.env, **env), capture_output=True, text=True, timeout=20)
+        events = ([json.loads(line) for line in self.events.read_text().splitlines()]
+                  if self.events.exists() else [])
+        return result, events
+
+    def test_filtered_mode_reuses_the_attestation_build_and_runs_only_the_filter(self):
+        _, attest_events = self.run_lane(("alpha",))
+        attest_list = next(e["args"] for e in attest_events if e["args"][:2] == ["nextest", "list"])
+        result, events = self.run_filtered("test(/restart_writes/)")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = [e["args"] for e in events]
+        self.assertIn(attest_list, commands)
+        execution = next(c for c in commands if c[:2] == ["nextest", "run"])
+        self.assertEqual(execution[execution.index("-E") + 1], "test(/restart_writes/)")
+        self.assertEqual(execution[execution.index("--no-tests") + 1], "fail")
+        self.assertFalse(any(c[0] in ("fmt", "clippy", "test") for c in commands))
+        self.assertIn("no attestation written", result.stdout)
+
+    def test_filtered_mode_fails_on_a_failing_test_and_refuses_an_empty_filter(self):
+        result, _ = self.run_filtered("test(x)", FAIL_TEST="1")
+        self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+        self.assertNotIn("filtered tests OK", result.stdout)
+        result, events = self.run_filtered("  ")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(any(e["args"][:2] == ["nextest", "run"] for e in events))
+        result, _ = self.run_filtered("test(a)", "test(b)")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
     def test_unrecognized_doctest_source_fails_closed(self):
         env = dict(self.env, BROCA_ATTEST_RUSTDOC="rustdoc", BROCA_ATTEST_DOC_SOURCES="{}")

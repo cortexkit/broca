@@ -70,11 +70,12 @@ pub fn reconstruct_from_offsets(
     snapshot: OffsetResumeSnapshot,
     safe_head: u64,
 ) -> Result<OffsetResumeState, crate::replay::SeedFallback> {
-    use crate::replay::{
-        replay_projection_tail, replay_seeded_at_validated_boundary, SeedFallback,
-    };
+    use crate::replay::{replay_seeded_at_validated_boundary, SeedFallback};
     let bad = |reason| SeedFallback::new(reason);
     let mut seed = snapshot.projection;
+    if !seed.admission_checkpoint.recovery_cuts.is_empty() {
+        return Err(bad("recovery tombstones require complete WAL replay"));
+    }
     let window = snapshot.window;
     if seed.watermark_seq != snapshot.boundary.seq
         || seed.admission_checkpoint.at_seq != seed.watermark_seq
@@ -166,8 +167,12 @@ pub fn reconstruct_from_offsets(
     }
     // Projection composition retains the existing counter/reset and episode-coordinate rules.
     // Only the checked WAL tail is folded; the hydrated request-message prefix is reused.
-    let delta = replay_projection_tail(&seed, &frames)
-        .map_err(|_| bad("offset resume projection composition failed"))?;
+    let delta = crate::replay::replay_projection_tail_with(
+        &seed,
+        &frames,
+        crate::replay::LeadingInterrupted::RetainKnownEpisode,
+    )
+    .map_err(|_| bad("offset resume projection composition failed"))?;
     let checkpoint = delta.admission_checkpoint;
     // A tail can introduce the first media capture into a previously media-free prefix.
     // Recheck its folded state: a valid selected window is not a media-state completeness proof.
@@ -282,6 +287,8 @@ pub fn reconstruct_from_offsets(
     Ok(OffsetResumeState {
         prior: state,
         snapshot: crate::run::PriorWalSnapshot {
+            lineage_id: None,
+            anchor: None,
             base_watermark: seed.watermark_seq,
             head_seq: safe_head,
             checkpoint_at_base: Some(seed.admission_checkpoint),
@@ -317,6 +324,7 @@ mod offset_resume_tests {
 
     fn step(id: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             hooks: None,
@@ -462,6 +470,36 @@ mod offset_resume_tests {
         assert_eq!(
             resume_started_record(actual, 8, planned_redo(actual)),
             resume_started_record(expected, 8, planned_redo(expected))
+        );
+    }
+
+    #[test]
+    fn recovery_cut_offset_seed_requires_complete_replay() {
+        let records = corpus();
+        let (bytes, positions, ends) = encode(&records);
+        let mut snap = snapshot(&bytes, &positions, &ends, 0);
+        snap.projection.admission_checkpoint.recovery_cuts.push(
+            serde_json::from_value(serde_json::json!({
+                "cut_id":"cut", "sidecar_basename":"log.cut-1", "cut_offset":69, "removed_len":1,
+                "removed_sha256":"digest", "reason":"unproven_corruption", "active_run":null,
+                "runs":[], "unattributed_tool_risk":true
+            }))
+            .unwrap(),
+        );
+        assert!(!snap
+            .projection
+            .admission_checkpoint
+            .compaction_boundary_complete());
+        assert!(crate::ControlProjectionState::from_projection_seed(&snap.projection).is_none());
+        assert!(crate::replay::replay_projection_tail(&snap.projection, &[]).is_err());
+        let result = reconstruct_from_offsets(
+            &|_, _| panic!("unsafe seed must refuse before offset reads"),
+            snap,
+            positions.last().unwrap().framed.seq,
+        );
+        assert_eq!(
+            result.err().expect("recovery seed must fall back").reason,
+            "recovery tombstones require complete WAL replay"
         );
     }
 
@@ -1378,6 +1416,13 @@ pub(crate) fn prepared_resume_refusal() -> crate::run::RunError {
 /// result for one call.
 pub fn close_out_open_batch(
     prior: &ReplayState,
+    deferred_close: impl FnMut(&ToolCallId) -> DeferredCloseKind,
+) -> Vec<WalRecord> {
+    close_out_surviving_batch(prior, deferred_close)
+}
+
+fn close_out_surviving_batch(
+    prior: &ReplayState,
     mut deferred_close: impl FnMut(&ToolCallId) -> DeferredCloseKind,
 ) -> Vec<WalRecord> {
     let Some(batch) = &prior.open_tool_batch else {
@@ -1402,6 +1447,13 @@ pub fn close_out_open_batch(
         broca_protocol::RunFinishReason::Interrupted
     };
     let mut records = Vec::with_capacity(batch.calls.len() + 2);
+    if batch.needs_start {
+        records.push(WalRecord::ToolBatchStarted {
+            batch_id: batch.batch_id.clone(),
+            step_id: batch.step_id,
+            planned_calls: batch.calls.iter().map(|(id, _)| id.clone()).collect(),
+        });
+    }
     for (tool_call_id, state) in &batch.calls {
         let withdraw_elicitation = if *state == OpenCallState::Deferred {
             match deferred_close(tool_call_id) {
@@ -1607,6 +1659,106 @@ mod tests {
     };
     use broca_protocol::{BatchId, PauseReason, RunFinishReason, RunId};
     use broca_wal::DeferredDecision;
+
+    #[test]
+    fn recovery_close_out_keeps_removed_batch_results_out_of_the_surviving_prompt() {
+        use broca_wal::recovery::{CutReason, RecoveryCall, RecoveryCut, RecoveryRun};
+
+        let mut records = batch(&["kept"]);
+        records.push(terminal("kept", None));
+        let recovered = |id: &str, batch: &str| RecoveryCall {
+            tool_call_id: ToolCallId(id.into()),
+            step_id: Some(broca_protocol::StepId(2)),
+            batch_id: Some(BatchId(batch.into())),
+            call_keys: Vec::new(),
+        };
+        records.push(WalRecord::RecoveryCut {
+            recovery: Box::new(RecoveryCut {
+                cut_id: "cut".into(),
+                sidecar_basename: "cut-bytes".into(),
+                cut_offset: 42,
+                removed_len: 17,
+                removed_sha256: "d".repeat(64),
+                reason: CutReason::PublishedRegionCorruption,
+                active_run: Some(RunId("r".into())),
+                runs: vec![RecoveryRun {
+                    run_id: RunId("r".into()),
+                    calls: vec![
+                        recovered("removed-a", "later-a"),
+                        recovered("removed-b", "later-b"),
+                    ],
+                }],
+                unattributed_tool_risk: false,
+                unowned_calls: Vec::new(),
+            }),
+        });
+        let marker = records.last().unwrap().clone();
+        records.push(marker.clone());
+        let plan = |records: &[WalRecord]| {
+            let frames: Vec<_> = records
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, record)| broca_wal::FramedRecord {
+                    seq: index as u64 + 1,
+                    fence: 1,
+                    record,
+                })
+                .collect();
+            crate::recovery_close_out::plan(&frames, "lineage", frames.len() as u64).unwrap()
+        };
+        let close = plan(&records);
+        for cut in 0..=close.len() {
+            let mut partial = records.clone();
+            partial.extend_from_slice(&close[..cut]);
+            partial.push(marker.clone());
+            let retry = plan(&partial);
+            partial.extend(retry);
+            for (id, batch) in [("removed-a", "later-a"), ("removed-b", "later-b")] {
+                let results: Vec<_> = partial
+                    .iter()
+                    .filter_map(|record| match record {
+                        WalRecord::RecoveryCallClosed {
+                            result,
+                            run_id,
+                            tool_call_id,
+                            ..
+                        } if tool_call_id.0 == id => Some((run_id, result)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    results.len(),
+                    1,
+                    "one Unknown per removed call after close-out cut {cut}"
+                );
+                assert_eq!(results[0].0, &RunId("r".into()));
+                assert_eq!(
+                    results[0].1.as_ref(),
+                    &outcome_unknown_result(&ToolCallId(id.into()))
+                );
+                assert!(records.iter().any(
+                    |record| matches!(record, WalRecord::RecoveryCut { recovery }
+                    if recovery.runs.iter().any(|run| run.calls.iter().any(|call|
+                        call.tool_call_id.0 == id && call.batch_id == Some(BatchId(batch.into())))))
+                ));
+            }
+            let closed = replay(&partial).unwrap();
+            broca_crash_harness::check_tool_pairing(&closed.prompt).unwrap();
+            assert!(closed.open_tool_batch.is_none());
+            assert!(plan(&partial).is_empty());
+            assert_eq!(
+                closed
+                    .prompt
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .filter(|block| matches!(block, broca_protocol::ContentBlock::ToolResult(_)))
+                    .count(),
+                1,
+                "removed model steps must not add unpaired results to the prompt"
+            );
+        }
+    }
 
     #[test]
     fn seal_closes_prepared_calls_whatever_the_resolution() {
@@ -1981,6 +2133,7 @@ mod tests {
                 records.push(approval("call", "key-call", DeferredDecision::Approved));
             }
             records.push(WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r".into()),
                 ts_ms: Some(1),
                 reason: PauseReason::Restart,
@@ -2010,6 +2163,7 @@ mod tests {
             drop(file);
             let before = std::fs::read(store.wal_path(&session)).unwrap();
             let request = RunRequest {
+                route_decision_id: None,
                 input_written_at_ms: None,
                 directives: None,
                 session_class: None,

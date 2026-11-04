@@ -231,7 +231,11 @@ fn render_prepared_body_with_provenance(
 ) -> Value {
     let view = crate::families::compaction_view(frozen.family_id, prepared);
     let opts = view.as_ref();
-    let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
+    let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
+        &opts.tools,
+        &opts.prompt,
+        &frozen.tool_name_aliases,
+    );
     let input = convert_input_items_with_provenance(
         &opts.prompt,
         frozen.system_prompt.clone(),
@@ -347,7 +351,7 @@ fn instructions_from_policy(prompt: &[Message], policy: SystemPromptPolicy) -> O
     }
     let mut parts = Vec::new();
     for m in prompt {
-        if m.role == Role::System {
+        if m.role == Role::System && !m.turn_system {
             let t = text_content(&m.content);
             if !t.is_empty() {
                 parts.push(t);
@@ -434,7 +438,7 @@ fn convert_input_items_with_provenance(
                 }
             }
         }
-        if skip_system && message.role == Role::System {
+        if skip_system && message.role == Role::System && !message.turn_system {
             continue;
         }
         let start = provenance.as_ref().map(|_| out.len());
@@ -560,6 +564,12 @@ fn convert_easy_message(
     m: &Message,
     media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Value {
+    if m.turn_system {
+        return json!({
+            "role": "developer",
+            "content": [{"type": "input_text", "text": crate::turn_system::text(m)}],
+        });
+    }
     let role = match m.role {
         Role::System => "system",
         Role::User => "user",
@@ -865,6 +875,7 @@ struct ResponsesOutputTokenDetails {
 }
 
 pub struct OpenAiResponsesNormalizer {
+    raw_sse_observer: Option<crate::wire::RawSseObserver>,
     response_evidence: Option<crate::normalize::SharedResponseEvidence>,
     display_parts: crate::display_parts::DisplayParts,
     arguments_guard: crate::wire::ToolArgsGuard,
@@ -895,6 +906,7 @@ pub struct OpenAiResponsesNormalizer {
     tool_calls: BTreeMap<u64, ToolCallBuf>,
     usage: Usage,
     finish_reason: FinishReason,
+    raw_finish_reason: Option<String>,
     /// The terminal `incomplete_details.reason`, verbatim. Only `max_output_tokens` proves an
     /// output-ceiling cut; a bare `status: incomplete` does not say why.
     incomplete_reason: Option<String>,
@@ -920,6 +932,7 @@ impl OpenAiResponsesNormalizer {
     ) -> Self {
         Self {
             response_evidence: None,
+            raw_sse_observer: None,
             display_parts: Default::default(),
             arguments_guard: Default::default(),
             completed_items: Default::default(),
@@ -941,6 +954,7 @@ impl OpenAiResponsesNormalizer {
             tool_calls: BTreeMap::new(),
             usage: Usage::default(),
             finish_reason: FinishReason::Stop,
+            raw_finish_reason: None,
             incomplete_reason: None,
             max_output_tokens: None,
             started: false,
@@ -1378,6 +1392,16 @@ impl OpenAiResponsesNormalizer {
                         self.merge_usage(u);
                     }
                     if let Some(status) = resp.get("status").and_then(Value::as_str) {
+                        self.raw_finish_reason = Some(
+                            match (
+                                status,
+                                resp.pointer("/incomplete_details/reason")
+                                    .and_then(Value::as_str),
+                            ) {
+                                ("incomplete", Some(reason)) => format!("incomplete:{reason}"),
+                                _ => status.to_owned(),
+                            },
+                        );
                         self.finish_reason = map_response_status(status);
                     }
                     if let Some(tier) = resp.get("service_tier").and_then(Value::as_str) {
@@ -1446,6 +1470,18 @@ impl OpenAiResponsesNormalizer {
         }
         if let Some(status) = response.status {
             self.finish_reason = map_response_status(&status);
+            self.raw_finish_reason = Some(
+                match (
+                    status.as_str(),
+                    response
+                        .incomplete_details
+                        .as_ref()
+                        .and_then(|details| details.reason.as_deref()),
+                ) {
+                    ("incomplete", Some(reason)) => format!("incomplete:{reason}"),
+                    _ => status,
+                },
+            );
         }
         if let Some(tier) = response.service_tier {
             self.service_tier_used = Some(tier);
@@ -1474,6 +1510,7 @@ impl OpenAiResponsesNormalizer {
                 ProviderControl::AssistantMessage { message },
             ));
             out.push(NormalizedEvent::Control(ProviderControl::StepFinished {
+                raw_finish_reason: self.raw_finish_reason.take(),
                 step_id: self.step_id,
                 usage: self.usage,
                 finish_reason: self.finish_reason,
@@ -1644,6 +1681,9 @@ impl OpenAiResponsesNormalizer {
 }
 
 impl StreamNormalizer for OpenAiResponsesNormalizer {
+    fn set_raw_sse_observer(&mut self, observer: crate::wire::RawSseObserver) {
+        self.raw_sse_observer = Some(observer);
+    }
     fn observe_error_response(&mut self, response: &Value) {
         let response = response.get("response").unwrap_or(response);
         if let Some(usage) = response.get("usage") {
@@ -1668,6 +1708,9 @@ impl StreamNormalizer for OpenAiResponsesNormalizer {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
         for payload in self.sse.push(chunk)? {
+            if let Some(observer) = &self.raw_sse_observer {
+                observer(&payload);
+            }
             self.handle_event(&payload, &mut out)?;
         }
         Ok(out)
@@ -1696,6 +1739,9 @@ impl StreamNormalizer for OpenAiResponsesNormalizer {
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
         for payload in self.sse.flush()? {
+            if let Some(observer) = &self.raw_sse_observer {
+                observer(&payload);
+            }
             self.handle_event(&payload, &mut out)?;
         }
         Ok(out)

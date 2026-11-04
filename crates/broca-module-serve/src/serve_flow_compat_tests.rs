@@ -10,6 +10,12 @@ use broca_module::serve::{
 
 struct EmptyFlowHistory;
 impl broca_core::WalStore for EmptyFlowHistory {
+    fn wal_present(&self, _: &BrocaBindIdentity) -> Option<bool> {
+        Some(true)
+    }
+    fn live_wal_bytes(&self, _: &BrocaBindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+        Ok(Some(0))
+    }
     fn open(
         &self,
         _: &BrocaBindIdentity,
@@ -165,11 +171,7 @@ impl FlowFrames {
             target: subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(
-                project.to_string_lossy().into_owned(),
-                "runner",
-                format!("flow-{channel}"),
-            ),
+            identity: SubcBindIdentity::new("runner", format!("flow-{channel}")),
             principal: Some(principal),
             scope,
             role_versions: None,
@@ -177,6 +179,8 @@ impl FlowFrames {
             admission_facts: None,
             call_mode: None,
         };
+        let mut request = serde_json::to_value(request).unwrap();
+        request["identity"]["project_root"] = serde_json::json!(project);
         self.frame(
             Frame::build(
                 FrameType::Request,

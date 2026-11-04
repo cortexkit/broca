@@ -829,11 +829,22 @@ fn billed_item(
         kind,
         status,
         copied_in: a.copied_in,
-        reservation: a.reservation.clone(),
+        reservation: project_reservation(&a.reservation),
         envelope,
         correction_id,
         appended_ms: terminal.map_or(a.appended_ms, |m| m.appended_ms),
     }
+}
+
+fn project_reservation(reservation: &Value) -> Value {
+    let mut projected = reservation.clone();
+    if let Some(session) = projected.get_mut("session").and_then(Value::as_object_mut) {
+        // The WAL retains its storage identity; billing consumers must not group this namespace as a project.
+        if session.get("project_root").and_then(Value::as_str) == Some("broca-unscoped-v1") {
+            session.remove("project_root");
+        }
+    }
+    projected
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1034,6 +1045,7 @@ fn validate_usage(v: &Value) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
+    include!("billing/project_identity_tests.rs");
     use super::*;
     use sha2::{Digest, Sha256};
     use std::cell::Cell;

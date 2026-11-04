@@ -340,6 +340,7 @@ pub async fn run_live<F: WireFamily + 'static>(
     // fresh run) followed by this run's user prompt.
     let mut input = spec.seed_history.clone();
     input.push(Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::User,
         content: vec![ContentBlock::Text {
@@ -351,6 +352,7 @@ pub async fn run_live<F: WireFamily + 'static>(
     });
     let req_input = input.clone();
     let req = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -494,6 +496,7 @@ fn flush_tool_results(
         return;
     }
     history.push(Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         role: Role::Tool,
         content: std::mem::take(pending)
@@ -572,6 +575,7 @@ impl LiveOutcome {
                     // A new assistant turn closes any prior turn's tool-result batch.
                     flush_tool_results(&mut history, &mut pending_results);
                     history.push(Message {
+                        turn_system: false,
                         cache_prefix_blocks: None,
                         role: Role::Assistant,
                         content: message.content.clone(),

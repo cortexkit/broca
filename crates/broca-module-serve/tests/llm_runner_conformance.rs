@@ -74,6 +74,80 @@ fn caller_module_nonce<'a>(
     };
     Ok(Some((module, nonce)))
 }
+
+fn reset_caller_nonce_files(owner_nonce: &Path) -> Result<(), HarnessError> {
+    // Every stand-in is supervised and receives a new launch nonce after restart. A file
+    // left by the previous process must not satisfy the next caller's readiness check.
+    for module in [
+        OWNER_MODULE,
+        SENDER_MODULE,
+        HEAD_SENDER_MODULE,
+        STRANGER_MODULE,
+        "magic-context",
+    ] {
+        let principal = format!("reserved:{module}");
+        let (_, path) = caller_module_nonce(&principal, owner_nonce)?.expect("known caller module");
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(HarnessError::new(format!(
+                    "resetting {module} caller nonce before launch: {error}"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn caller_nonce_reset_discards_every_previous_supervised_launch() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("caller-nonce-reset-{}", std::process::id()));
+    broca_test_support::remove_rig_dir(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let owner_nonce = root.join("owner.nonce");
+    let mut paths = Vec::new();
+    for module in [
+        OWNER_MODULE,
+        SENDER_MODULE,
+        HEAD_SENDER_MODULE,
+        STRANGER_MODULE,
+        "magic-context",
+    ] {
+        let (_, path) = caller_module_nonce(&format!("reserved:{module}"), &owner_nonce)
+            .unwrap()
+            .unwrap();
+        std::fs::write(&path, "previous-supervised-launch").unwrap();
+        paths.push(path);
+    }
+    std::fs::write(root.join("unrelated.nonce"), "keep").unwrap();
+    reset_caller_nonce_files(&owner_nonce).unwrap();
+    for path in paths {
+        assert!(
+            !path.exists(),
+            "a restarted rig could read an old caller identity from {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read(root.join("unrelated.nonce")).unwrap(),
+        b"keep"
+    );
+    reset_caller_nonce_files(&owner_nonce).unwrap();
+    broca_test_support::remove_rig_dir(&root);
+}
+
+#[test]
+fn caller_nonce_reset_fails_before_launch_if_a_publication_cannot_be_removed() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("caller-nonce-reset-error-{}", std::process::id()));
+    broca_test_support::remove_rig_dir(&root);
+    std::fs::create_dir_all(root.join("sender.nonce")).unwrap();
+    let error = reset_caller_nonce_files(&root.join("owner.nonce")).unwrap_err();
+    assert!(error.to_string().contains(SENDER_MODULE), "{error}");
+    broca_test_support::remove_rig_dir(&root);
+}
 const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 /// The system-prompt marker naming the session a model request belongs to.
 const SESSION_MARKER: &str = "conformance-session:";
@@ -127,16 +201,8 @@ const OWN_STRUCTURED: &str = "$broca_structured";
 #[cfg(feature = "test-clock")]
 #[path = "llm_runner_conformance/bus.rs"]
 mod bus;
-#[path = "llm_runner_conformance/compaction.rs"]
-mod compaction;
-#[cfg(feature = "test-clock")]
-#[path = "llm_runner_conformance/mc_e2e.rs"]
-mod mc_e2e;
-
-fn require_compaction_test_clock() {
-    #[cfg(not(feature = "test-clock"))]
-    panic!("real compaction conformance requires the debug-only test-clock feature");
-}
+#[path = "llm_runner_conformance/catalog.rs"]
+mod catalog;
 
 #[path = "llm_runner_conformance/attribution.rs"]
 mod attribution;
@@ -231,6 +297,10 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    service_tier_sessions: Mutex<BTreeSet<String>>,
+    service_tier_keys: Mutex<HashMap<String, String>>,
+    service_tier_rides: Mutex<HashMap<String, Vec<Value>>>,
+    service_tier_request_rides: Mutex<HashMap<String, Vec<u64>>>,
     fixture_connection: Mutex<Option<PathBuf>>,
     default_text_module: Mutex<Option<String>>,
     default_text_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -246,6 +316,8 @@ struct Shared {
     /// The `mid` of every message a `session.read` answered, keyed by the message's JSON: broca
     /// keys a part `<mid>#<index>`, so naming a message's parts needs the message's `mid`.
     read_mids: Mutex<HashMap<String, String>>,
+    read_part_keys: Mutex<HashMap<String, Vec<String>>>,
+    read_entries: Mutex<HashMap<(String, String), Value>>,
     plan_sessions: Mutex<BTreeSet<String>>,
     output_refs_sessions: Mutex<BTreeSet<String>>,
     model_id_marker_sessions: Mutex<BTreeSet<String>>,
@@ -253,10 +325,8 @@ struct Shared {
     stream_holds: Mutex<HashMap<String, usize>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
     attachment_models: Mutex<HashMap<String, bool>>,
-    compaction: Mutex<HashMap<String, compaction::Session>>,
     session_roots: Mutex<HashMap<String, PathBuf>>,
     session_bindings: Mutex<HashMap<String, broca_protocol::BindIdentity>>,
-    compaction_clocks: Mutex<HashMap<PathBuf, u64>>,
     /// Each session's scripted model.
     scripts: Mutex<HashMap<String, Script>>,
     /// Each scripted call's result, by its arguments' JSON text.
@@ -424,6 +494,12 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
         };
         models.insert(format!("xai/conformance-media-{accepts}"), facts);
     }
+    let mut tier = row(None);
+    tier["rate.input.mode.priority"] =
+        json!({"currency":"USD","exponent":9,"state":"priced","units":2_000_000_000_u64});
+    tier["rate.output.mode.priority"] =
+        json!({"currency":"USD","exponent":9,"state":"priced","units":4_000_000_000_u64});
+    models.insert("xai/conformance-service-tier".into(), tier);
     models.insert(
         format!("{}/{}", output_refs::PROVIDER, output_refs::MODEL),
         output_refs::catalog_row(),
@@ -591,20 +667,18 @@ async fn serve_model_request(
     let messages = request["messages"].as_array().cloned().unwrap_or_default();
     let model = request["model"].as_str().unwrap_or_default();
     let model = model.strip_prefix("mock/").unwrap_or(model);
-    let session = if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
+    let tier_session = request["prompt_cache_key"]
+        .as_str()
+        .and_then(|key| shared.service_tier_keys.lock().unwrap().get(key).cloned());
+    let session = if let Some(session) = tier_session {
+        Some(session)
+    } else if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
         shared
             .scripts
             .lock()
             .unwrap()
             .contains_key(session)
             .then(|| session.to_owned())
-    } else if let Some(session) = request["model"].as_str().and_then(|model| {
-        model
-            .strip_prefix("mock/")
-            .unwrap_or(model)
-            .strip_prefix(compaction::MODEL_PREFIX)
-    }) {
-        self::compaction::known_session(&shared, session).then(|| session.to_owned())
     } else {
         std::iter::once(&request["system"])
             .chain(
@@ -622,7 +696,6 @@ async fn serve_model_request(
                     .collect();
                 Some(name)
             })
-            .filter(|session| !compaction::known_session(&shared, session))
     };
     let refusal = session
         .as_ref()
@@ -647,19 +720,7 @@ async fn serve_model_request(
     let turn_index = session
         .as_ref()
         .and_then(|session| shared.failure_turns.lock().unwrap().get(session).copied())
-        .or_else(|| {
-            session
-                .as_ref()
-                .and_then(|session| {
-                    shared
-                        .compaction
-                        .lock()
-                        .unwrap()
-                        .get(session)
-                        .map(|state| state.emitted)
-                })
-                .or(counted)
-        })
+        .or(counted)
         .unwrap_or_else(|| {
             messages
                 .iter()
@@ -699,6 +760,26 @@ async fn serve_model_request(
         return Ok(());
     };
     let session = session.expect("a turn was found for it");
+    if shared
+        .service_tier_sessions
+        .lock()
+        .unwrap()
+        .contains(&session)
+    {
+        let rides = shared
+            .service_tier_rides
+            .lock()
+            .unwrap()
+            .get(&session)
+            .map_or(0, |rides| rides.len() as u64);
+        shared
+            .service_tier_request_rides
+            .lock()
+            .unwrap()
+            .entry(session.clone())
+            .or_default()
+            .push(rides);
+    }
     if let Some(served) = shared.failure_turns.lock().unwrap().get_mut(&session) {
         *served += 1;
     }
@@ -763,13 +844,6 @@ async fn serve_model_request(
         return Ok(());
     }
 
-    if let Some(gate) = compaction::capture(&shared, &session, &messages) {
-        tokio::select! {
-            () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
-            () = shared.released.notified() => return Ok(()),
-        }
-    }
-
     *shared.last_session.lock().unwrap() = Some(session.clone());
     let id = format!("chatcmpl-{session}-{turn_index}");
     if model.ends_with(output_refs::MODEL) {
@@ -791,6 +865,7 @@ async fn serve_model_request(
         .and_then(Value::as_u64)
         .unwrap_or(u64::MAX);
     let mut remaining = output_cap;
+    let mut truncated = false;
     let mut events = vec![chunk(json!({"role": "assistant"}), None)];
     let mut calls = 0;
     for part in &turn.parts {
@@ -798,6 +873,7 @@ async fn serve_model_request(
             ScriptedPart::Text(text) => {
                 let words: Vec<_> = text.split_whitespace().collect();
                 let content = if words.len() as u64 > remaining {
+                    truncated = true;
                     words[..remaining as usize].join(" ")
                 } else {
                     text.clone()
@@ -819,7 +895,11 @@ async fn serve_model_request(
     }
     events.push(chunk(
         json!({}),
-        Some(if calls > 0 { "tool_calls" } else { "stop" }),
+        if truncated {
+            Some("length")
+        } else {
+            turn.finish_reason.as_deref()
+        },
     ));
     if let Some(usage) = &turn.usage {
         events.push(scripted_usage_chunk(&id, usage, output_cap));
@@ -850,9 +930,6 @@ async fn serve_model_request(
     } else {
         stream.write_all(body.as_bytes()).await?;
     }
-    if let Some(state) = shared.compaction.lock().unwrap().get_mut(&session) {
-        state.emitted += 1;
-    }
     stream.shutdown().await
 }
 
@@ -873,7 +950,7 @@ impl ToolProvider {
             .get(&route)
             .cloned()
             .unwrap_or_default();
-        let mut answer = compaction::catalog(request);
+        let mut answer = catalog::catalog(request);
         held_late_results::declare_in_catalog(&self.shared, &session, &mut answer);
         answer
     }
@@ -1078,7 +1155,6 @@ struct Live {
     state_root: PathBuf,
     logs_dir: PathBuf,
     tools: tokio::task::JoinHandle<()>,
-    compactions: tokio::task::JoinHandle<()>,
     #[cfg(feature = "test-clock")]
     bus_credentials: Option<tokio::task::JoinHandle<()>>,
     connections: tokio::sync::Mutex<HashMap<String, Arc<SubcConnection>>>,
@@ -1135,7 +1211,6 @@ impl Live {
             broca_test_support::kill_and_reap_tree(&mut daemon);
         }
         self.tools.abort();
-        self.compactions.abort();
         #[cfg(feature = "test-clock")]
         if let Some(task) = self.bus_credentials.take() {
             task.abort();
@@ -1184,7 +1259,7 @@ impl Drop for Live {
 struct BrocaSubject {
     shared: Arc<Shared>,
     model_url: String,
-    /// The project root every session is bound under, the same across restarts.
+    /// The project root for legacy seeds; routed identities use the session-ref inventory.
     project_root: PathBuf,
     /// Where `ck-broca` writes rendered request dumps (`BROCA_DUMP_REQUEST_DIR`), when a test
     /// turns dumps on. The retention scenarios scan it for content that must never be dumped.
@@ -1193,12 +1268,10 @@ struct BrocaSubject {
     backup_classes: Option<Vec<String>>,
     bus_events_enabled: bool,
     process_kills_disabled: bool,
-    media_enabled: bool,
+    service_tier_enabled: bool,
     reserved_reader: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
-    #[cfg(feature = "test-clock")]
-    mc: Option<mc_e2e::McConfig>,
 }
 
 impl BrocaSubject {
@@ -1217,22 +1290,53 @@ impl BrocaSubject {
             backup_classes: None,
             bus_events_enabled: true,
             process_kills_disabled: false,
-            media_enabled: std::env::var_os("BROCA_CONFORMANCE_MEDIA").is_some()
-                || cfg!(feature = "test-attachments"),
+            service_tier_enabled: std::env::var_os("BROCA_CONFORMANCE_SERVICE_TIER").is_some(),
             reserved_reader: false,
             #[cfg(feature = "test-clock")]
             bus: None,
-            #[cfg(feature = "test-clock")]
-            mc: None,
         }
     }
 
-    fn bind_identity(&self, session: &str) -> broca_protocol::BindIdentity {
-        #[cfg(feature = "test-clock")]
-        if self.mc.is_some() {
-            return broca_protocol::BindIdentity::new(self.project_root.clone(), "broca", session);
-        }
+    fn raw_bind_identity(&self, session: &str) -> broca_protocol::BindIdentity {
         broca_protocol::BindIdentity::new(self.project_root.clone(), HARNESS, session)
+    }
+
+    fn bind_identity(&self, session: &str) -> broca_protocol::BindIdentity {
+        let identity = self.raw_bind_identity(session);
+        let root = self
+            .shared
+            .session_roots
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned();
+        match root {
+            Some(root) => broca_test_support::resolve_session_address(&root, &identity)
+                .expect("resolve the conformance session's storage identity"),
+            // Before routing, fixtures may author a legacy seed at this identity.
+            None => identity,
+        }
+    }
+
+    async fn fixture_identity(
+        &self,
+        handle: &Live,
+        session: &str,
+    ) -> Result<broca_protocol::BindIdentity, HarnessError> {
+        let connection = self.connection(handle, &self.owner_stamp()).await?;
+        let route = self
+            .open(&connection, &self.raw_bind_identity(session))
+            .await?;
+        let identity = broca_test_support::resolve_session_address(
+            &handle.state_root,
+            &self.raw_bind_identity(session),
+        )
+        .map_err(HarnessError::new);
+        connection
+            .route_close(&route)
+            .await
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        identity
     }
 
     async fn start(&self, root: &Path) -> Result<Live, HarnessError> {
@@ -1248,7 +1352,7 @@ impl BrocaSubject {
         std::fs::create_dir_all(config_path.parent().unwrap()).map_err(|e| fail(e.to_string()))?;
         std::fs::create_dir_all(&runtime_dir).map_err(|e| fail(e.to_string()))?;
         let owner_nonce = root.join("owner.nonce");
-        let _ = std::fs::remove_file(&owner_nonce);
+        reset_caller_nonce_files(&owner_nonce)?;
         let connection_file = runtime_dir.join("subc-connection.json");
         let _ = std::fs::remove_file(&connection_file);
         let config = json!({
@@ -1324,11 +1428,6 @@ impl BrocaSubject {
                 "reserved": true,
             });
         }
-        #[cfg(feature = "test-clock")]
-        if let Some(mc) = &self.mc {
-            config["modules"]["magic-context"] = mc.module();
-            mc_e2e::scope_config(&mut config, root);
-        }
         let broca_config = config_home.join("cortexkit/broca.jsonc");
         std::fs::write(
             &broca_config,
@@ -1336,8 +1435,8 @@ impl BrocaSubject {
                 &self
                     .backup_classes
                     .as_ref()
-                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled}))
-                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled})),
+                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled,"service_tier":{"enabled":self.service_tier_enabled}}))
+                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled,"service_tier":{"enabled":self.service_tier_enabled}})),
             )
             .unwrap(),
         )
@@ -1393,19 +1492,6 @@ impl BrocaSubject {
         let tools = tokio::spawn(async move {
             let _ = serve.await;
         });
-        let (_, serve) = subc_client_rs::serve_with_handle(
-            &connection_file,
-            compaction::manifest(),
-            compaction::Provider {
-                shared: self.shared.clone(),
-                binds: Mutex::new(HashMap::new()),
-            },
-        )
-        .await
-        .map_err(|e| fail(format!("registering compaction provider: {e}")))?;
-        let compactions = tokio::spawn(async move {
-            let _ = serve.await;
-        });
         #[cfg(feature = "test-clock")]
         let bus_credentials = match &self.bus {
             Some(bus) => Some(bus.register(&connection_file).await),
@@ -1419,7 +1505,6 @@ impl BrocaSubject {
             state_root,
             logs_dir: data_home.join("cortexkit/broca/logs"),
             tools,
-            compactions,
             #[cfg(feature = "test-clock")]
             bus_credentials,
             connections: tokio::sync::Mutex::new(HashMap::new()),
@@ -1565,13 +1650,10 @@ impl BrocaSubject {
     fn holds_point(&self, live: &Live, session: &str, point: &str) -> Result<(), String> {
         use broca_wal::WalRecord as R;
         let all = self.records(live, session);
-        let current = if [points::FOLD_RECORDED, points::COMPACTION_APPLIED].contains(&point) {
-            0
-        } else {
-            all.iter()
-                .rposition(|r| matches!(r, R::RunStarted { .. }))
-                .unwrap_or(0)
-        };
+        let current = all
+            .iter()
+            .rposition(|r| matches!(r, R::RunStarted { .. }))
+            .unwrap_or(0);
         let (earlier, records) = all.split_at(current);
         let earlier_started = earlier
             .iter()
@@ -1599,37 +1681,6 @@ impl BrocaSubject {
             points::DISPATCH_INTENT => intents == 1 && results == 0,
             points::TOOL_RESULT_RECORDED => results == 1 && steps == 1,
             points::TERMINAL => finished == 1,
-            points::FOLD_RECORDED => {
-                started == 1
-                    && finished == 0
-                    && steps == 0
-                    && intents == 0
-                    && count(|r| matches!(r, R::StepStarted { .. })) == 1
-                    && count(|r| matches!(r, R::CompactionNotice { .. })) >= 1
-                    && count(|r| {
-                        matches!(
-                            r,
-                            R::CompactionMessage {
-                                kind: broca_wal::CompactionMessageKind::Setup,
-                                ..
-                            }
-                        )
-                    }) == 1
-            }
-            points::COMPACTION_APPLIED => {
-                count(|r| {
-                    matches!(
-                        r,
-                        R::CompactionMessage {
-                            kind: broca_wal::CompactionMessageKind::Step,
-                            version: 2,
-                            cursor: Some(_),
-                            ..
-                        }
-                    )
-                }) == 1
-                    && steps == 1
-            }
             _ => false,
         };
         if ok {
@@ -1690,13 +1741,6 @@ impl Harness for BrocaSubject {
         let points = {
             let mut points = points;
             points.push(PointDeclaration {
-                point: KillPoint::new(points::FOLD_RECORDED),
-                mechanisms: vec![KillMechanism::ProcessSignal],
-                note: "Setup's initial compaction message and its notice are durable at the \
-                    pre-model FoldRecorded barrier. The rig verifies one Setup and no model \
-                    step or captured model request before SIGKILL; restart must not call Setup again.".into(),
-            });
-            points.push(PointDeclaration {
                 point: KillPoint::new(points::RETENTION_TOMBSTONED),
                 mechanisms: vec![KillMechanism::ProcessSignal],
                 note: "A directory at the deletion rename destination prevents content removal. \
@@ -1724,9 +1768,6 @@ impl Harness for BrocaSubject {
         point: &KillPoint,
         trigger: Trigger<'_>,
     ) -> Result<KillReport, HarnessError> {
-        if [points::COMPACTION_APPLIED, points::FOLD_RECORDED].contains(&point.as_str()) {
-            return self.kill_compaction(handle, point, trigger).await;
-        }
         #[cfg(feature = "test-clock")]
         if point.as_str() == points::RETENTION_TOMBSTONED {
             return self.kill_retention(handle, point, trigger).await;
@@ -1809,20 +1850,10 @@ impl Harness for BrocaSubject {
 
 #[tokio::test]
 #[cfg(feature = "test-clock")]
-async fn setup_fold_recorded_is_declared_as_a_real_process_kill() {
+async fn no_kill_mode_changes_only_points_not_capabilities() {
     let root = broca_test_support::scratch_root().join("fold-recorded-declaration");
     std::fs::create_dir_all(&root).unwrap();
     let mut subject = BrocaSubject::new(&root).await;
-    let points = subject.declared_points();
-    let fold = points
-        .iter()
-        .find(|p| p.point.as_str() == points::FOLD_RECORDED);
-    if skip_crash_kills() {
-        assert!(fold.is_none());
-    } else {
-        let fold = fold.expect("compaction Setup needs its durable pre-model kill point");
-        assert_eq!(fold.mechanisms, vec![KillMechanism::ProcessSignal]);
-    }
     let capabilities = subject.capabilities();
     subject.process_kills_disabled = true;
     assert_eq!(
@@ -1834,6 +1865,35 @@ async fn setup_fold_recorded_is_declared_as_a_real_process_kill() {
         subject.declared_points().is_empty(),
         "the no-kill kit subset declared a kill"
     );
+}
+
+/// Numbers come from captured model-request prefixes, never from entry ordinals or keys.
+/// Matching against the observed read body rejects changed or ambiguous fixture content.
+fn captured_part_numbers(message: &Value) -> (Value, Vec<Option<u64>>) {
+    fn strip(value: &mut Value) -> Option<u64> {
+        let text = value.as_str()?;
+        let (number, rest) = text.strip_prefix('§')?.split_once("§ ")?;
+        let number: u64 = number.parse().ok()?;
+        if number == 0 {
+            return None;
+        }
+        *value = rest.to_owned().into();
+        Some(number)
+    }
+    let mut cleaned = message.clone();
+    let numbers = cleaned["content"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .map(|part| {
+            if part["type"] == "tool_result" {
+                strip(&mut part["output"]["text"])
+            } else {
+                strip(&mut part["text"])
+            }
+        })
+        .collect();
+    (cleaned, numbers)
 }
 
 /// A session-bound management route to the real `ck-broca`, through the real daemon.
@@ -1943,7 +2003,6 @@ impl BrocaRoute {
 #[async_trait]
 impl RunnerRoute for BrocaRoute {
     async fn request(&self, method: &str, params: Value) -> Result<Reply, RouteFailure> {
-        let send_id = params["send_id"].as_str().map(str::to_owned);
         let polled_run = (method == "run.result")
             .then(|| params["run_id"].as_str().map(str::to_owned))
             .flatten();
@@ -1987,32 +2046,6 @@ impl RunnerRoute for BrocaRoute {
             Ok(response) => {
                 let value: Value = serde_json::from_slice(&response)
                     .map_err(|e| RouteFailure::new(format!("an undecodable response: {e}")))?;
-                if method == "session.send"
-                    && self
-                        .subject
-                        .shared
-                        .compaction
-                        .lock()
-                        .unwrap()
-                        .contains_key(&self.session.session)
-                {
-                    if let Some(send_id) = &send_id {
-                        self.subject
-                            .wait_compaction_send_record(&self.session.session, send_id)
-                            .await
-                            .map_err(|e| RouteFailure::new(e.to_string()))?;
-                    }
-                    self.subject
-                        // Own live run: the actor synced this run's terminal before
-                        // replying, so it cannot be mistaken for a terminal left by
-                        // a crashed run.
-                        .settle_compaction(
-                            &self.session.session,
-                            compaction::file_terminal_is_enough(),
-                        )
-                        .await
-                        .map_err(|e| RouteFailure::new(e.to_string()))?;
-                }
                 if let Some(run_id) = &polled_run {
                     self.observe_run_result(run_id, &value["result"]).await;
                 }
@@ -2021,6 +2054,35 @@ impl RunnerRoute for BrocaRoute {
                     for entry in value["result"]["messages"].as_array().into_iter().flatten() {
                         if let Some(mid) = entry["mid"].as_str() {
                             mids.insert(entry["message"].to_string(), mid.to_owned());
+                            let keys = entry["part_keys"]
+                                .as_array()
+                                .map(|keys| {
+                                    keys.iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_owned)
+                                        .collect::<Vec<_>>()
+                                })
+                                .or_else(|| {
+                                    entry["part_digests"].as_array().map(|parts| {
+                                        parts
+                                            .iter()
+                                            .filter_map(|part| part["part"].as_str())
+                                            .map(str::to_owned)
+                                            .collect()
+                                    })
+                                });
+                            if let Some(keys) = keys {
+                                self.subject
+                                    .shared
+                                    .read_part_keys
+                                    .lock()
+                                    .unwrap()
+                                    .insert(entry["message"].to_string(), keys);
+                            }
+                            self.subject.shared.read_entries.lock().unwrap().insert(
+                                (self.session.session.clone(), mid.to_owned()),
+                                entry.clone(),
+                            );
                         }
                     }
                 }
@@ -2074,6 +2136,34 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    fn model_finish_reason_source(&self) -> Option<&'static str> {
+        Some("openai.chat_completions")
+    }
+
+    async fn configure_service_tier(
+        &self,
+        session: &str,
+        _case: &str,
+    ) -> Result<bool, HarnessError> {
+        if !self.service_tier_enabled {
+            return Ok(false);
+        }
+        self.shared
+            .service_tier_sessions
+            .lock()
+            .unwrap()
+            .insert(session.to_owned());
+        self.shared.service_tier_keys.lock().unwrap().insert(
+            broca_provider::hash::clamp_prompt_cache_key(&format!("tier-fixture-{session}")),
+            session.to_owned(),
+        );
+        self.shared
+            .failure_turns
+            .lock()
+            .unwrap()
+            .insert(session.to_owned(), 0);
+        Ok(true)
+    }
     fn attachment_model_fields(&self, session: &str, accepts: bool) -> Option<Map<String, Value>> {
         self.shared
             .attachment_models
@@ -2138,7 +2228,7 @@ impl LlmRunnerSubject for BrocaSubject {
             ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
         };
         let fail = |e: String| HarnessError::new(e);
-        let identity = self.bind_identity(session);
+        let identity = self.fixture_identity(handle, session).await?;
         let seed_root = handle.state_root.join(format!("untimed-fixture-{session}"));
         let source = FileWalStore::new(&seed_root);
         let writer = WalHandle::spawn(source.open(&identity).map_err(|e| fail(e.to_string()))?, 1)
@@ -2288,6 +2378,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::MaxSteps,
             Capability::NoTools,
             Capability::RunStatus,
+            Capability::FinishReason,
             Capability::RunUsage,
             Capability::SessionUsage,
             Capability::RunCancel,
@@ -2301,12 +2392,11 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::InterruptReason,
             Capability::TurnDirectives,
             Capability::HoldToolCalls,
-            Capability::Tags,
-            Capability::TagCheckpoint,
+            Capability::Plans,
             Capability::RenderedModelInput,
             Capability::DeliveryOrder,
-            Capability::Compaction,
-            Capability::ModelView,
+            Capability::SenderSuccession,
+            Capability::ReadDisplayFacts,
             Capability::ClientMessageId,
             // The adapter implements the three session_change subject hooks (a tool-free
             // refresh plan, model request observations and holdable tool calls), so the kit
@@ -2325,9 +2415,7 @@ impl LlmRunnerSubject for BrocaSubject {
         if broca_module_serve::RETENTION_WRITER_ENABLED {
             capabilities.extend([Capability::Retention, Capability::RetentionClock]);
         }
-        if self.media_enabled {
-            capabilities.insert(Capability::Attachments);
-        }
+        capabilities.insert(Capability::Attachments);
         capabilities
     }
 
@@ -2378,32 +2466,14 @@ impl LlmRunnerSubject for BrocaSubject {
             .lock()
             .unwrap()
             .insert(session.to_owned(), handle.state_root.clone());
-        let identity = self.bind_identity(session);
+        let identity = self.raw_bind_identity(session);
+        let started = Instant::now();
+        let route = self.open(&connection, &identity).await?;
         self.shared
             .session_bindings
             .lock()
             .unwrap()
-            .insert(session.into(), identity.clone());
-        let started = Instant::now();
-        let route = self.open(&connection, &identity).await?;
-        if self.shared.compaction.lock().unwrap().contains_key(session)
-            && !self.records(handle, session).is_empty()
-        {
-            // After a restart the startup sealer appends the crash-orphan
-            // terminal before its fsync publishes the actor's durable head.
-            // A terminal that is only visible in the WAL file must not release
-            // this route: the kit reads `session.head` once and would see the
-            // previous `active` prefix and never send its continuation. Wait
-            // for the same run to report terminal through the public head.
-            let head_connection = connection.clone();
-            let head_route = route;
-            let mut probe = move || -> compaction::HeadFuture {
-                let head_connection = head_connection.clone();
-                let head_route = head_route;
-                Box::pin(async move { Self::public_head_run(&head_connection, &head_route).await })
-            };
-            self.settle_compaction(session, Some(&mut probe)).await?;
-        }
+            .insert(session.into(), self.bind_identity(session));
         eprintln!(
             "route.open session={} channel={} epoch={} elapsed_us={}",
             session,
@@ -2422,6 +2492,32 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if self
+            .shared
+            .service_tier_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+        {
+            let mut fields = Map::new();
+            fields.insert(
+                "model".into(),
+                json!({"provider":"xai","model":"conformance-service-tier"}),
+            );
+            // Cache scope carries fixture identity without adding system text beside a plan.
+            fields.insert(
+                "cache".into(),
+                json!({"key":format!("tier-fixture-{session}")}),
+            );
+            return fields;
+        }
+        if session.contains("tool_result_too_large")
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
+        }
         if session_change_kit_session(session)
             && !self.shared.plan_sessions.lock().unwrap().contains(session)
         {
@@ -2443,7 +2539,7 @@ impl LlmRunnerSubject for BrocaSubject {
             .unwrap()
             .get(session)
             .copied()
-            .or_else(|| (self.media_enabled && session.contains("attachments")).then_some(true))
+            .or_else(|| session.contains("attachments").then_some(true))
         {
             let mut fields =
                 json!({"model":{"provider":"xai","model":format!("conformance-media-{accepts}")}});
@@ -2477,9 +2573,6 @@ impl LlmRunnerSubject for BrocaSubject {
         if self.shared.plan_sessions.lock().unwrap().contains(session) {
             return json!({"model":{"provider":"mock","model":format!("{PLAN_MODEL_PREFIX}{session}")}})
                 .as_object().unwrap().clone();
-        }
-        if let Some(fields) = self.compaction_fields(session, first) {
-            return fields;
         }
         // Legacy cases name tools directly; compaction cases use the plan-aware catalogue.
         let markerless = self
@@ -2523,15 +2616,6 @@ impl LlmRunnerSubject for BrocaSubject {
                 }
             }
         }
-        // A session with a scripted compaction provider keeps its compaction plan, the extra
-        // members beside the plan's own.
-        if compaction::known_session(&self.shared, session) {
-            let mut fields = self.compaction_fields(session, first)?;
-            if let Some(plan) = fields.get_mut("plan").and_then(Value::as_object_mut) {
-                plan.extend(members.clone());
-            }
-            return Some(fields);
-        }
         self.shared
             .plan_sessions
             .lock()
@@ -2567,6 +2651,12 @@ impl LlmRunnerSubject for BrocaSubject {
                 SENDER_MODULE,
             ),
         )
+    }
+
+    fn turn_system_supported(&self) -> bool {
+        // The kit's scripted mock route speaks OpenAI Chat, not Responses. Its template
+        // cases therefore exercise the required user-authority fall-through, without skips.
+        false
     }
 
     /// A plan for `session.refresh` of `session`. `ChangedTools` is a tool-free plan: the
@@ -2797,12 +2887,10 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn output_refs_fields(&self, session: &str) -> Result<Map<String, Value>, HarnessError> {
+        // llm-runner 0.8 numbers parts only under a compaction item (§9.6), so the fixture no
+        // longer asks for the retired `render_tags`.
         let mut fields = self
-            .send_fields_with_plan(
-                session,
-                true,
-                json!({"render_tags": true}).as_object().unwrap(),
-            )
+            .send_fields_with_plan(session, true, &Map::new())
             .ok_or_else(|| HarnessError::new("output references need a scripted tool plan"))?;
         fields["plan"]["tool_items"][0]["output_refs"] = json!(true);
         fields["model"] = json!({"provider":output_refs::PROVIDER,"model":output_refs::MODEL});
@@ -2823,7 +2911,7 @@ impl LlmRunnerSubject for BrocaSubject {
         tools: &[&str],
     ) -> Option<Map<String, Value>> {
         let mut fields = self.send_fields(session, first);
-        if first && tools.is_empty() && !compaction::known_session(&self.shared, session) {
+        if first && tools.is_empty() {
             // A tool-free session runs under a real plan that offers no tools. The plan
             // replaces `system`, so its system-text item carries the session marker the
             // scripted model identifies the session by.
@@ -2915,7 +3003,13 @@ impl LlmRunnerSubject for BrocaSubject {
             .map(|body| {
                 let request: Value = serde_json::from_slice(body)
                     .map_err(|e| HarnessError::new(format!("a model request is not JSON: {e}")))?;
-                Ok(observe_model_request(&request))
+                let mut observation = observe_model_request(&request);
+                observation.service_tier_applied = request
+                    .get("service_tier")
+                    .and_then(Value::as_str)
+                    .filter(|tier| *tier != "default")
+                    .map(|tier| if tier == "priority" { "fast" } else { tier }.to_owned());
+                Ok(observation)
             })
             .collect()
     }
@@ -2976,6 +3070,59 @@ impl LlmRunnerSubject for BrocaSubject {
         Ok(())
     }
 
+    fn oversized_tool_result(
+        &self,
+        message: &Value,
+        tool_call_id: &str,
+    ) -> Option<cortexkit_role_llm_runner_conformance::ToolResultLimitObservation> {
+        let block = message["content"]
+            .as_array()?
+            .iter()
+            .find(|block| block["tool_call_id"].as_str() == Some(tool_call_id))?;
+        let output = &block["output"];
+        let detail: Value = serde_json::from_str(output["detail"].as_str()?).ok()?;
+        Some(
+            cortexkit_role_llm_runner_conformance::ToolResultLimitObservation::new(
+                output["code"].as_str()?,
+                detail["bytes"].as_u64()?,
+                detail["limit"].as_u64()?,
+                output["message"].as_str()?,
+                block["is_error"].as_bool()?,
+            ),
+        )
+    }
+
+    fn shown_part_number(&self, session: &str, mid: &str, part: &str) -> Option<u64> {
+        let entry = self
+            .shared
+            .read_entries
+            .lock()
+            .unwrap()
+            .get(&(session.to_owned(), mid.to_owned()))
+            .cloned()?;
+        let keys = self
+            .shared
+            .read_part_keys
+            .lock()
+            .unwrap()
+            .get(&entry["message"].to_string())
+            .cloned()?;
+        let index = keys.iter().position(|key| key == part)?;
+        let requests = self.shared.requests.lock().unwrap();
+        let mut numbers = BTreeSet::new();
+        for message in requests.get(session)?.iter().flatten() {
+            let (cleaned, shown) = captured_part_numbers(message);
+            if cleaned["role"] == entry["message"]["role"]
+                && cleaned["content"] == entry["message"]["content"]
+            {
+                if let Some(Some(number)) = shown.get(index) {
+                    numbers.insert(*number);
+                }
+            }
+        }
+        (numbers.len() == 1).then(|| *numbers.iter().next().unwrap())
+    }
+
     async fn tool_invocations(&self, arguments: &Value) -> usize {
         self.shared
             .invocations
@@ -2999,72 +3146,21 @@ impl LlmRunnerSubject for BrocaSubject {
             .ok_or_else(|| HarnessError::new("the tool provider did not observe these arguments"))
     }
 
-    /// A read message's top-level parts, keyed as broca keys them: `<mid>#<index>`, the `mid`
-    /// being the one the read that served the message gave it.
     fn read_parts(&self, message: &Value) -> Vec<(String, Value)> {
-        let mid = self
+        let keys = self
             .shared
-            .read_mids
+            .read_part_keys
             .lock()
             .unwrap()
             .get(&message.to_string())
             .cloned()
-            .unwrap_or_else(|| "unread".into());
-        message["content"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .enumerate()
-            .map(|(index, part)| (format!("{mid}#{index}"), part.clone()))
+            .unwrap_or_default();
+        keys.into_iter()
+            .zip(message["content"].as_array().into_iter().flatten().cloned())
             .collect()
     }
 
-    /// Preserve the supplied blocks exactly. Media-only and empty results have nowhere to
-    /// store arbitrary locator text, so the kit must locate them through `run.tool_calls`.
-    fn numbering_tool_result(
-        &self,
-        marker: &str,
-        blocks: &[cortexkit_role_llm_runner::tags::ToolResultBlock<'_>],
-    ) -> Option<Value> {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        use cortexkit_role_llm_runner::tags::ToolResultBlock;
-        if !self.media_enabled
-            && blocks
-                .iter()
-                .any(|block| matches!(block, ToolResultBlock::Image | ToolResultBlock::Media))
-        {
-            return None;
-        }
-        if blocks.is_empty() {
-            return Some(json!({OWN_STRUCTURED: {"marker": marker}}));
-        }
-        let png_hex = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
-        let png: Vec<_> = png_hex
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-            .collect();
-        let content: Vec<_> = blocks
-            .iter()
-            .map(|block| match block {
-                ToolResultBlock::Text(text) => json!({"type":"text", "text":text}),
-                ToolResultBlock::Image => {
-                    json!({"type":"image", "mimeType":"image/png", "data":STANDARD.encode(&png)})
-                }
-                ToolResultBlock::Media => json!({"type":"resource", "resource":{
-                    "uri":"fixture:///invented.pdf", "mimeType":"application/pdf",
-                    "blob":STANDARD.encode(b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n"),
-                }}),
-                _ => panic!("unmapped numbering fixture block"),
-            })
-            .collect();
-        Some(json!({OWN_CONTENT: content}))
-    }
-
-    /// Resolve identity only from the listed call and the actual read entry. Its tag row
-    /// supplies the part key; fixture markers and the adapter's remembered messages do not.
+    /// Resolve identity from the listed call and the keys of the actual read entry.
     fn tool_result_part(
         &self,
         call: &cortexkit_role_llm_runner::tool_calls::RunToolCall,
@@ -3087,16 +3183,14 @@ impl LlmRunnerSubject for BrocaSubject {
         if matching.next().is_some() {
             return None;
         }
-        result.tags.get(index).map(|row| row.part.clone())
+        result
+            .served_part_keys()?
+            .get(index)
+            .map(|key| (*key).to_owned())
     }
 
-    /// The older image fixture requires marker text in the stored payload. Captured references
-    /// cannot carry arbitrary text; the marker-free numbering fixture checks those images.
-    /// Without capture, the legacy placeholder's MIME type can carry the marker.
+    /// Legacy image fixture: invalid bytes keep the marker in a stored media-failure notice.
     fn image_tool_result(&self, marker: &str) -> Option<Value> {
-        if self.media_enabled {
-            return None;
-        }
         Some(json!({ OWN_CONTENT: [{
             "type": "image",
             "mimeType": format!("image/png; name={marker}"),
@@ -3218,7 +3312,7 @@ impl LlmRunnerSubject for BrocaSubject {
         session: &str,
     ) -> Result<cortexkit_role_llm_runner_conformance::AttributionFixture, HarnessError> {
         use broca_core::{FileLeaseStore, FileWalStore, LeaseStore, WalHandle, WalStore};
-        let identity = self.bind_identity(session);
+        let identity = self.fixture_identity(handle, session).await?;
         let marker = format!("unattributable-import-{session}");
         let seed_root = handle.state_root.join("attribution-import-fixture");
         let seed_store = FileWalStore::new(&seed_root);
@@ -3283,7 +3377,9 @@ impl LlmRunnerSubject for BrocaSubject {
         )
         .map_err(|e| HarnessError::new(e.to_string()))?
         .prompt
-        .len() as u64;
+        .len() as u64
+            // The imported message lands at that stored position; public ordinals start at 1.
+            + 1;
         let mut wal = wal_store
             .open(&identity)
             .map_err(|e| HarnessError::new(e.to_string()))?;
@@ -3328,80 +3424,17 @@ impl LlmRunnerSubject for BrocaSubject {
             // A tag the expired session's first part held: resolve reads through the same
             // transcript path as session.read, so an expired session serves none of it.
             "session.resolve" => Ok(Some(vec![json!({"tag": "§1§"})])),
+            // llm-runner 0.8's name for `send.status`, served by the same handler. The kit
+            // treats `send.status` as a role op that serves no stored content, and this name
+            // answers the same receipt, so it is classified the same way.
+            "session.send_status" => Ok(None),
             _ => Err(HarnessError::new(format!(
                 "unclassified retention probe op: {method}"
             ))),
         }
     }
-    async fn release_compaction_model(&self, session: &str) -> Result<(), HarnessError> {
-        self.release_model_compaction(session).await
-    }
-    async fn install_compaction_setup(
-        &self,
-        session: &str,
-        setup: cortexkit_role_llm_runner_conformance::CompactionSetup,
-    ) -> Result<(), HarnessError> {
-        self.install_setup(session, setup);
-        Ok(())
-    }
-    async fn compaction_observation(
-        &self,
-        session: &str,
-    ) -> Result<cortexkit_role_llm_runner_conformance::CompactionObservation, HarnessError> {
-        self.observe_compaction(session).await
-    }
-    async fn compaction_provider_calls(
-        &self,
-        session: &str,
-    ) -> Result<Vec<cortexkit_role_llm_runner_conformance::ProviderCall>, HarnessError> {
-        self.shared
-            .compaction
-            .lock()
-            .unwrap()
-            .get(session)
-            .map(|state| state.provider_calls.clone())
-            .ok_or_else(|| HarnessError::new("compaction session absent"))
-    }
     fn serializer_profile(&self, _session: &str) -> Option<String> {
         Some(cortexkit_role_llm_runner::serializer_profile::OWNED_BROCA.into())
-    }
-    async fn install_setup_view_due_fixture(
-        &self,
-        session: &str,
-        initial: cortexkit_role_llm_runner_conformance::CompactionMessage,
-        replacement: Vec<String>,
-        refuse_fetch: bool,
-    ) -> Result<cortexkit_role_llm_runner_conformance::SetupViewDueFixture, HarnessError> {
-        self.prepare_due_view(session, initial, replacement, refuse_fetch)
-    }
-    async fn set_setup_view_due_fetch_refused(
-        &self,
-        session: &str,
-        refused: bool,
-    ) -> Result<(), HarnessError> {
-        self.shared
-            .compaction
-            .lock()
-            .unwrap()
-            .get_mut(session)
-            .ok_or_else(|| HarnessError::new("compaction session absent"))?
-            .refuse_due_fetch = refused;
-        Ok(())
-    }
-    async fn publish_compaction_part_edits(
-        &self,
-        session: &str,
-        edits: Vec<broca_core::compaction_provider::view::PartEdit>,
-    ) -> Result<u64, HarnessError> {
-        self.publish_part_edits(session, edits).await
-    }
-    async fn durable_compaction_setup(
-        &self,
-        handle: &Live,
-        session: &str,
-    ) -> Result<Option<cortexkit_role_llm_runner_conformance::CompactionMessage>, HarnessError>
-    {
-        self.durable_setup(handle, session)
     }
 }
 
@@ -3544,6 +3577,24 @@ async fn describe_diagnostics_follow_each_call_across_two_routes_on_one_worker()
     broca_test_support::remove_rig_dir(&scratch);
 }
 
+const UNNUMBERED_PLAN_INAPPLICABLE_CASES: &[&str] = &[
+    "output_refs_scanning",
+    "output_refs_shared_samples",
+    "output_refs_writing_request",
+    "output_refs_target_reasons",
+    "output_refs_held_placeholder",
+    "output_refs_snapshot_size",
+    "output_refs_snapshot_budget",
+    "output_refs_descriptor_digest",
+    "output_refs_rewind",
+    "output_refs_compaction",
+    "output_refs_session_isolation",
+    "output_refs_slots",
+    "output_refs_reference_limit",
+    "output_refs_read_limits",
+    "delivery_order_template_part_gone_refused",
+];
+
 const REQUIRED_INPUT_CAP_CASES: &[&str] = &[
     "input_token_cap_at_limit",
     "input_token_cap_crossing_tools",
@@ -3566,6 +3617,13 @@ const REQUIRED_STRUCTURED_OUTPUT_CASES: &[&str] = &[
     "structured_output_sibling_never_dispatched",
 ];
 
+const REQUIRED_INTERRUPT_CANCEL_CASES: &[&str] = &[
+    "run_cancel_by_interrupt_now_cancelled",
+    "run_cancel_by_interrupt_without_grant_refused",
+    "run_cancel_by_interrupt_non_now_refused",
+    "run_cancel_by_interrupt_other_session_refused",
+];
+
 const REQUIRED_RETRACT_OWN_SEND_CASES: &[&str] = &[
     "retract_own_send_sender_retracted",
     "retract_own_send_other_sender_refused",
@@ -3584,6 +3642,7 @@ fn check_named_contract_cases(
         .iter()
         .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
         .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
+        .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
     {
         let case = cases
             .iter()
@@ -3623,6 +3682,7 @@ mod named_contract_case_tests {
                 case.name.starts_with("input_token_cap_")
                     || case.name.starts_with("structured_output_")
                     || case.name.starts_with("retract_own_send_")
+                    || case.name.starts_with("run_cancel_by_interrupt_")
             })
             .map(|case| CaseReport {
                 case: case.name,
@@ -3649,6 +3709,7 @@ mod named_contract_case_tests {
             .iter()
             .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
             .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
+            .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
             .copied()
             .chain(std::iter::once("structured_output_streamed_siblings"))
         {
@@ -3699,7 +3760,11 @@ mod named_contract_case_tests {
 /// include a real process kill rather than only simulated recovery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ck_broca_passes_the_llm_runner_conformance_suite() {
-    require_compaction_test_clock();
+    let test_clock_enabled = cfg!(feature = "test-clock");
+    assert!(
+        test_clock_enabled,
+        "native conformance requires the debug-only test-clock feature"
+    );
     for (name, env_key) in [
         ("ck-subc", "SUBC_CORE_BIN"),
         ("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
@@ -3737,13 +3802,11 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         .await
         .expect("the suite set up");
     println!("{}", report.render());
-    subject
-        .export_compaction_samples()
-        .expect("write observed compaction samples");
     let failed: Vec<_> = report
         .cases
         .iter()
         .filter(|case| matches!(case.outcome, CaseOutcome::Failed { .. }))
+        .filter(|case| known_kit_defect(case.case, &case.outcome).is_none())
         .collect();
     if !failed.is_empty() {
         // Print before asserting: the panic message keeps only the report, and CI keeps only
@@ -3751,15 +3814,70 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
-    if subject.media_enabled {
-        for case in report
+    // Runner-room request #1723 tracks the kit's caller-cap prerequisite. Broca cannot
+    // promise that cap on every provider, so preserve the kit's exact missing-capability
+    // outcome rather than disguising it as an inapplicable provider-limit check.
+    assert_eq!(
+        report
             .cases
             .iter()
-            .filter(|case| case.case.starts_with("attachments_"))
-        {
-            assert_eq!(case.outcome, CaseOutcome::Passed, "{}", report.render());
-        }
+            .find(|case| case.case == "finish_reason_output_cap")
+            .expect("finish_reason_output_cap")
+            .outcome,
+        CaseOutcome::Skipped {
+            missing: vec![Capability::MaxOutputTokens]
+        },
+        "{}",
+        report.render()
+    );
+    for name in [
+        "sender_succession_same_payload_receipt",
+        "sender_succession_changed_payload_refused",
+        "sender_succession_third_sender_fresh",
+        "sender_succession_predecessor_status",
+        "sender_succession_undeclared_refused",
+        "delivery_deadline_retry_keeps_original_expiry",
+        "read_display_facts_default_absent",
+        "read_display_facts_opt_in_envelope",
+        "read_display_facts_undeclared_refused",
+    ] {
+        let case = report
+            .cases
+            .iter()
+            .find(|case| case.case == name)
+            .expect(name);
+        assert!(
+            matches!(
+                case.outcome,
+                CaseOutcome::Passed | CaseOutcome::Inapplicable { .. }
+            ),
+            "{}",
+            report.render()
+        );
     }
+    // The kit times the sender check against the live `message_started` event, and this
+    // adapter has no live observation hook, so the case passes with exactly that one rule
+    // reported not applicable. Pin that outcome rather than accepting any partial pass.
+    let message_senders = report
+        .cases
+        .iter()
+        .find(|case| case.case == "message_senders_rows_name_their_sender")
+        .expect("message_senders_rows_name_their_sender");
+    assert!(
+        matches!(
+            &message_senders.outcome,
+            CaseOutcome::PassedWithInapplicableRule { reason }
+                if reason.contains("message_senders_timing_at_message_started")
+        ),
+        "{}",
+        report.render()
+    );
+    let attachment_gaps = attachment_contract_gaps(&report);
+    assert!(
+        attachment_gaps.is_empty(),
+        "unchecked attachment cases: {attachment_gaps:?}\n{}",
+        report.render()
+    );
     // Broca declares these operations, so a case that drifts to skipped or inapplicable
     // must not silently pass. Input-cap and structured-output outcomes are checked by name
     // below, including the undeclared streamed-sibling behavior.
@@ -3778,28 +3896,10 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "display_own_run_records_model",
         "client_message_id_on_display_rows_never_in_read",
         "display_row_names_the_sender_never_in_read",
-        "output_refs_scanning",
-        "output_refs_target_reasons",
-        "output_refs_descriptor_digest",
-        "output_refs_session_isolation",
-        "output_refs_slots",
-        "output_refs_shared_samples",
-        "output_refs_reference_limit",
-        "output_refs_read_limits",
-        "output_refs_snapshot_budget",
-        if subject.media_enabled {
-            "tags_tool_result_blocks_share_one_number"
-        } else {
-            "tags_count_only_parts_rendered_with_a_number"
-        },
-        "compaction_setup_durable_once",
-        "model_view_half_open_ranges_and_travel",
-        "compaction_unavailable_distinct_from_refuse",
-        "view_due_first_model_uses_view",
-        "view_due_refused_fetch_blocks_model",
-        "view_due_later_step_retries",
-        "part_edits_truncate_renders_with_own_tag",
-        "part_edits_bytes_render_with_own_tag",
+        "finish_reason_provider_limit",
+        "finish_reason_no_model_step",
+        "finish_reason_last_model_step",
+        "output_refs_without_compaction_unknown_tag",
         "run_cancel_step_boundary_finishes_tool_batch",
         "run_cancel_unlisted_at_refused",
         "run_cancel_step_boundary_escalates_to_now",
@@ -3832,7 +3932,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "retention_honoured",
         "retention_run_status_expired",
         "retention_no_content_served",
-        "retention_shorten_continues_lineage",
+        "retention_shorten_continues_history_version",
         "retention_equal_noop",
         "retention_lengthen_refused",
         "retention_late_opt_in_refused",
@@ -3848,6 +3948,9 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             .iter()
             .find(|case| case.case == name)
             .unwrap_or_else(|| panic!("the suite has no case {name}"));
+        if known_kit_defect(name, &case.outcome).is_some() {
+            continue;
+        }
         if skip_crash_kills()
             && case
                 .requires
@@ -3867,6 +3970,18 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             "{name}\n{}",
             report.render()
         );
+    }
+    // These fixture plans deliberately omit compaction_item. The kit grades numbered
+    // scenarios by the opening plan, not by whether a runner happened to render numbers.
+    for name in UNNUMBERED_PLAN_INAPPLICABLE_CASES {
+        let case = report
+            .cases
+            .iter()
+            .find(|case| case.case == *name)
+            .unwrap_or_else(|| panic!("the suite has no case {name}"));
+        assert_eq!(case.outcome, CaseOutcome::Inapplicable {
+            reason: "the kit's opening plan has no plan.compaction_item, so no part numbers are shown".into(),
+        }, "{name}\n{}", report.render());
     }
     let host_set = report
         .cases
@@ -3888,15 +4003,20 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     assert!(
         matches!(&follows.outcome, CaseOutcome::Inapplicable { reason } if reason.contains("replan_rich_ui"))
     );
-    for name in [
-        "archive_pruning_generation",
-        "archive_pruning_restored_view_refused",
-        "archive_pruning_restored_edit_refused",
-        "archive_pruning_setup_after_prune",
-        "archive_pruning_setup_initial_replaced",
-        "archive_pruning_applied_edit_pruned",
-    ] {
-        let case = report.cases.iter().find(|case| case.case == name).unwrap();
+    // broca does not declare archive_prunes_reasoning, so every archive-pruning case the kit
+    // carries must report exactly that, whichever cases a kit version adds or retires.
+    let archive_pruning: Vec<_> = report
+        .cases
+        .iter()
+        .filter(|case| case.case.starts_with("archive_pruning_"))
+        .collect();
+    assert!(
+        archive_pruning.len() >= 5,
+        "the kit's archive-pruning cases went missing: {}",
+        archive_pruning.len()
+    );
+    for case in archive_pruning {
+        let name = &case.case;
         assert_eq!(
             case.outcome,
             CaseOutcome::Inapplicable {
@@ -3927,6 +4047,21 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         );
     }
     check_named_contract_cases(&report.cases, skip_crash_kills()).unwrap();
+    for name in [
+        "service_tier_unsupported_before_model",
+        "service_tier_run_fixed",
+        "service_tier_unknown_never_echoed",
+    ] {
+        let case = report.cases.iter().find(|case| case.case == name).unwrap();
+        let expected = if subject.service_tier_enabled {
+            CaseOutcome::Passed
+        } else {
+            CaseOutcome::Inapplicable {
+                reason: "role.describe does not declare service_tier".into(),
+            }
+        };
+        assert_eq!(case.outcome, expected, "{name}: {:?}", case.outcome);
+    }
     if skip_crash_kills() {
         assert!(report.kills.is_empty());
         println!("Crash kills disabled: the kit's overall verdict remains non-conforming without a real kill; run natively without BROCA_CONFORMANCE_SKIP_CRASH_KILLS to verify durability.");
@@ -3960,115 +4095,6 @@ async fn attach_notice_bus(subject: &mut BrocaSubject, root: &Path) {
 /// Sandboxed runs can exercise every non-kill case without claiming crash conformance.
 fn skip_crash_kills() -> bool {
     std::env::var("BROCA_CONFORMANCE_SKIP_CRASH_KILLS").as_deref() == Ok("1")
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn compaction_bus_disabled_refuses_plan_without_writes() {
-    require_compaction_test_clock();
-    if !sibling_bin("ck-subc", "SUBC_CORE_BIN").exists()
-        || !sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN").exists()
-    {
-        assert!(
-            !require_subc(),
-            "compaction bus-off test requires the daemon fixtures"
-        );
-        return;
-    }
-    let root = broca_test_support::scratch_root().join("compaction-bus-off");
-    std::fs::create_dir_all(&root).unwrap();
-    let mut subject = BrocaSubject::new(&root).await;
-    subject.bus_events_enabled = false;
-    let live = subject.start(&root).await.unwrap();
-    let session = "bus-off";
-    subject.install_setup(
-        session,
-        cortexkit_role_llm_runner_conformance::CompactionSetup::Ready(
-            cortexkit_role_llm_runner_conformance::CompactionMessage {
-                compaction_id: "head".into(),
-                version: 1,
-                from: 0,
-                to: 0,
-                replacement: vec![],
-            },
-        ),
-    );
-    let route = subject
-        .session_route(&live, session, &subject.owner_stamp())
-        .await
-        .unwrap();
-    let Reply::Response(describe) = route.request("role.describe", json!({})).await.unwrap() else {
-        panic!("describe refused");
-    };
-    assert!(!describe["capabilities"]
-        .as_array()
-        .unwrap()
-        .contains(&json!("compaction")));
-    let mut fields = subject.send_fields(session, true);
-    fields.insert("prompt".into(), json!("do not write"));
-    fields.insert("send_id".into(), json!("bus-off"));
-    let reply = route
-        .request("session.send", Value::Object(fields))
-        .await
-        .unwrap();
-    let encoded = format!("{reply:?}");
-    assert!(
-        encoded.contains("invalid_params") && encoded.contains("compaction"),
-        "{encoded}"
-    );
-    assert!(
-        subject.records(&live, session).is_empty(),
-        "disabled compaction wrote WAL records"
-    );
-    assert!(subject.shared.compaction.lock().unwrap()[session]
-        .describe()
-        .contains("captured model inputs=0"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kit_compaction_cases_without_process_kills() {
-    require_compaction_test_clock();
-    let root = broca_test_support::scratch_root().join("kit-compaction-without-kills");
-    std::fs::create_dir_all(&root).unwrap();
-    let mut subject = BrocaSubject::new(&root).await;
-    #[cfg(feature = "test-clock")]
-    attach_notice_bus(&mut subject, &root).await;
-    let advertised = subject.capabilities();
-    subject.process_kills_disabled = true;
-    assert_eq!(
-        subject.capabilities(),
-        advertised,
-        "disabling kills changed daemon capability declarations"
-    );
-    let report = run_suite(&subject, &root.join("suite")).await.unwrap();
-    println!("{}", report.render());
-    assert!(report.kills.is_empty());
-    assert!(
-        report
-            .cases
-            .iter()
-            .all(|case| !matches!(case.outcome, CaseOutcome::Failed { .. })),
-        "{}",
-        report.render()
-    );
-    for name in [
-        "model_view_half_open_ranges_and_travel",
-        "compaction_unavailable_distinct_from_refuse",
-    ] {
-        let case = report.cases.iter().find(|c| c.case == name).unwrap();
-        assert_eq!(case.outcome, CaseOutcome::Passed, "{}", report.render());
-    }
-    assert!(
-        matches!(
-            report
-                .cases
-                .iter()
-                .find(|c| c.case == "compaction_setup_durable_once")
-                .unwrap()
-                .outcome,
-            CaseOutcome::Skipped { .. }
-        ),
-        "the Setup crash case remains reserved to a real-kill runner"
-    );
 }
 
 /// After a cut between a step's record and its calls' dispatch intents, broca does not resume
@@ -4553,6 +4579,7 @@ async fn ck_broca_boot_enrolls_and_deletes_expired_retention_before_serving_cont
     let root = scratch.join("daemon");
     let state = root.join("broca-state");
     let key = subject.bind_identity("rolled-back-retention");
+    broca_test_support::register_legacy_session(&state, &key).unwrap();
     let wal_store = broca_core::FileWalStore::new(state.join("wal"));
     let live_path = wal_store.ephemeral_wal_path(&key);
     let lineage;
@@ -4667,6 +4694,7 @@ async fn ck_broca_boot_completes_incomplete_tombstones_before_serving() {
     let mut cuts = Vec::new();
     for cut in ["live", "moved", "deleted"] {
         let key = subject.bind_identity(cut);
+        broca_test_support::register_legacy_session(&state, &key).unwrap();
         let mut wal = store.open_with_retention(&key, Some(1)).unwrap();
         let mut start: broca_wal::WalRecord = serde_json::from_str(include_str!(
             "../../broca-wal/tests/golden/pre_step_transforms/run_started.json"
@@ -4837,13 +4865,15 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
         .contains(&json!(
             cortexkit_role_llm_runner::capabilities::ORDERED_HOOK_PHASES
         )));
+    // llm-runner 0.8 retired these groups: compaction moved to the compaction-runner role,
+    // which the module manifest declares, so role.describe must no longer name them.
     for group in ["compaction", "model_view"] {
         assert!(
-            describe["capabilities"]
+            !describe["capabilities"]
                 .as_array()
                 .unwrap()
                 .contains(&json!(group)),
-            "the bus-enabled runner must declare the {group} group"
+            "the 0.8 runner must not declare the retired {group} group"
         );
     }
     assert!(!describe["majors"][0]["ops"]
@@ -4916,9 +4946,12 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
             .into_iter()
             .collect()
     );
+    // Step-transform v2 hooks name no session in the body; the per-session route does.
     for call in state.hooks() {
-        assert_eq!(call["harness"], HARNESS);
-        assert_eq!(call["session"], session);
+        assert!(
+            call.get("harness").is_none() && call.get("session").is_none(),
+            "{call}"
+        );
     }
     state.clear();
     response(route.request("session.send", params).await.unwrap());
@@ -5156,11 +5189,15 @@ async fn reader_release_reads_writer_records_and_refuses_hooked_advancement() {
     let reader_root = scratch.join("reader");
     let state_root = reader_root.join("broca-state");
     let store = broca_core::FileWalStore::new(state_root.join("wal"));
-    let complete_path = store.wal_path(&subject.bind_identity(session));
+    let complete_identity = subject.bind_identity(session);
+    broca_test_support::register_legacy_session(&state_root, &complete_identity).unwrap();
+    let complete_path = store.wal_path(&complete_identity);
     std::fs::create_dir_all(complete_path.parent().unwrap()).unwrap();
     std::fs::write(&complete_path, &bytes).unwrap();
     let inflight = "rollback-inflight";
-    let inflight_path = store.wal_path(&subject.bind_identity(inflight));
+    let inflight_identity = subject.bind_identity(inflight);
+    broca_test_support::register_legacy_session(&state_root, &inflight_identity).unwrap();
+    let inflight_path = store.wal_path(&inflight_identity);
     std::fs::write(&inflight_path, &bytes[..cut_end]).unwrap();
     subject.binary = Some(reader);
     let mut reader_live = subject.start(&reader_root).await.unwrap();
@@ -5446,6 +5483,37 @@ async fn pending_delivery_order_send_is_retracted_before_tool_result() {
 #[cfg(test)]
 mod held_call_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn service_tier_fixture_uses_cache_scope_identity_for_plan_sends() {
+        let shared = Arc::new(Shared::default());
+        let mut subject = subject(shared.clone());
+        subject.service_tier_enabled = true;
+        let session = "tier-compaction-fixture-with-a-long-session-name-that-needs-clamping";
+        assert!(subject
+            .configure_service_tier(session, "service_tier_ride_before_changed_request")
+            .await
+            .unwrap());
+        let fields = subject.send_fields(session, true);
+        // Tier sessions carry no plan: the v1 compaction ride they once fed is retired.
+        assert!(fields.get("plan").is_none());
+        assert!(
+            fields.get("system").is_none(),
+            "fixture identity must not alter system text"
+        );
+        let key =
+            broca_provider::hash::clamp_prompt_cache_key(fields["cache"]["key"].as_str().unwrap());
+        assert_eq!(key.len(), 32, "exercise the renderer's long-key spelling");
+        assert_eq!(
+            shared
+                .service_tier_keys
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(String::as_str),
+            Some(session)
+        );
+    }
     use std::sync::atomic::Ordering;
 
     fn subject(shared: Arc<Shared>) -> BrocaSubject {
@@ -5458,12 +5526,10 @@ mod held_call_tests {
             backup_classes: None,
             bus_events_enabled: false,
             process_kills_disabled: true,
-            media_enabled: false,
+            service_tier_enabled: false,
             reserved_reader: false,
             #[cfg(feature = "test-clock")]
             bus: None,
-            #[cfg(feature = "test-clock")]
-            mc: None,
         }
     }
 
@@ -5772,11 +5838,9 @@ mod held_call_tests {
             .all(|tool| tool["result_format"] == "tool-result/v1"));
         for route in [(12, 1), (13, 1), (11, 2), (14, 1)] {
             let catalog = provider.catalog_for_route(route, &request);
-            assert!(catalog["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|tool| tool.get("result_format").is_none()));
+            // Every catalog declares tool-result/v1 results; only the held session's adds
+            // late-result capabilities.
+            assert!(catalog.get("capabilities").is_none(), "{catalog}");
             assert_eq!(
                 serde_json::to_vec(&catalog).unwrap(),
                 before,
@@ -6021,4 +6085,175 @@ async fn scripted_model_failure_ends_one_turn_and_preserves_fractional_retry_hin
     assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
     assert!(recovered.contains("recovered"));
     assert_eq!(shared.failure_turns.lock().unwrap()[session], 2);
+}
+
+#[tokio::test]
+async fn conformance_subject_always_declares_attachments() {
+    let root = broca_test_support::scratch_root().join("subject-attachments");
+    let subject = BrocaSubject::new(&root).await;
+    assert!(subject.capabilities().contains(&Capability::Attachments));
+    assert!(subject.image_tool_result("old-image-rule").is_some());
+}
+
+fn attachment_contract_gaps(
+    report: &cortexkit_role_llm_runner_conformance::SuiteReport,
+) -> Vec<&'static str> {
+    let specs = cortexkit_role_llm_runner_conformance::CASES
+        .iter()
+        .filter(|spec| spec.name.starts_with("attachments_"))
+        .collect::<Vec<_>>();
+    assert!(
+        !specs.is_empty(),
+        "the shared suite must contain attachment cases"
+    );
+    specs
+        .into_iter()
+        .filter(|spec| !matches!(report.outcome(spec.name), Some(CaseOutcome::Passed)))
+        .map(|spec| spec.name)
+        .collect()
+}
+
+#[test]
+fn attachment_report_guard_rejects_missing_or_skipped_cases() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, SuiteReport, SuiteVerdict, CASES};
+    let mut report = SuiteReport {
+        cases: CASES
+            .iter()
+            .filter(|spec| spec.name.starts_with("attachments_"))
+            .map(|spec| CaseReport {
+                case: spec.name,
+                requires: spec.requires.to_vec(),
+                outcome: CaseOutcome::Passed,
+            })
+            .collect(),
+        kills: vec![],
+        verdict: SuiteVerdict::Passed,
+    };
+    assert!(attachment_contract_gaps(&report).is_empty());
+    for index in 0..report.cases.len() {
+        let name = report.cases[index].case;
+        report.cases[index].outcome = CaseOutcome::Skipped {
+            missing: vec![Capability::Attachments],
+        };
+        assert_eq!(attachment_contract_gaps(&report), vec![name]);
+        report.cases[index].outcome = CaseOutcome::Passed;
+    }
+    let missing = report.cases.pop().unwrap();
+    assert_eq!(attachment_contract_gaps(&report), vec![missing.case]);
+    report.cases.push(missing);
+    let name = report.cases[0].case;
+    report.cases[0].outcome = CaseOutcome::PassedWithInapplicableRule {
+        reason: "not checked".into(),
+    };
+    assert_eq!(attachment_contract_gaps(&report), vec![name]);
+}
+
+#[tokio::test]
+async fn assertion_wal_reader_uses_the_inventory_address_for_a_folderless_session() {
+    use broca_core::{SessionInventory, WalStore};
+
+    let scratch = broca_test_support::scratch_root().join("assertion-inventory-address");
+    let subject = BrocaSubject::new(&scratch).await;
+    let state = scratch.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let inventory = broca_store::SqliteStore::open(state.join("run-index.db")).unwrap();
+    inventory.rebuild_inventory(&state).unwrap();
+    let session = "folderless";
+    let claim = subject.raw_bind_identity(session);
+    let resolved = inventory.resolve_session_address(&claim, None).unwrap();
+    assert_ne!(resolved.project_root, claim.project_root);
+    subject
+        .shared
+        .session_roots
+        .lock()
+        .unwrap()
+        .insert(session.into(), state.clone());
+    let store = broca_core::FileWalStore::new(state.join("wal"));
+    let mut wal = store.open(&resolved).unwrap();
+    wal.append(
+        1,
+        &broca_wal::WalRecord::RunFinished {
+            interrupt_reason: None,
+            reason: broca_protocol::RunFinishReason::Completed,
+            ts_ms: Some(1),
+            usage: Default::default(),
+            error: None,
+            retries_used: 0,
+        },
+        true,
+    )
+    .unwrap();
+    drop(wal);
+    assert_eq!(subject.bind_identity(session), resolved);
+    let live_records = store.read_records(&subject.bind_identity(session)).unwrap();
+    assert_eq!(live_records.len(), 1);
+    assert!(matches!(
+        live_records[0].record,
+        broca_wal::WalRecord::RunFinished {
+            reason: broca_protocol::RunFinishReason::Completed,
+            ..
+        }
+    ));
+    assert!(!store.wal_path(&claim).exists());
+}
+
+#[tokio::test]
+async fn conformance_subject_declares_the_served_finish_reason_group() {
+    let scratch = broca_test_support::scratch_root().join("finish-reason-declaration");
+    let subject = BrocaSubject::new(&scratch).await;
+    assert!(subject.capabilities().contains(&Capability::FinishReason));
+    assert_eq!(
+        subject.model_finish_reason_source(),
+        Some("openai.chat_completions")
+    );
+}
+
+#[test]
+fn assertion_address_lookup_does_not_contend_with_a_held_writer() {
+    for overhaul in [false, true] {
+        let root = broca_test_support::scratch_root()
+            .join(format!("assertion-address-held-writer-{overhaul}"));
+        std::fs::create_dir_all(&root).unwrap();
+        if overhaul {
+            std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+        }
+        let seed = broca_protocol::BindIdentity::new(root.join("legacy"), "harness", "session");
+        broca_test_support::register_legacy_session(&root, &seed).unwrap();
+        let database = root.join(if overhaul { "broca.db" } else { "run-index.db" });
+        let blocker = rusqlite::Connection::open(database).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let claim = broca_protocol::BindIdentity::new(root.join("route"), "harness", "session");
+        assert_eq!(
+            broca_test_support::resolve_session_address(&root, &claim).unwrap(),
+            seed,
+            "the committed identity must remain readable while another connection owns the writer"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+    }
+}
+
+/// Kit 0.17.2 cases SUBC confirmed as kit defects against llm-runner 0.8.1 (Mode 3 room
+/// #2150-#2152). Each is excused only with its exact failure, so any other outcome of these
+/// cases still fails the suite. Remove an entry when the kit that fixes it is pinned.
+fn known_kit_defect(case: &str, outcome: &CaseOutcome) -> Option<&'static str> {
+    let CaseOutcome::Failed { reason } = outcome else {
+        return None;
+    };
+    match case {
+        // Its result is 131,072 bytes, over the 0.8 runner's 65,536-byte limit, so broca
+        // correctly refuses it at intake. Kit 0.17.3 uses a 32 KiB result.
+        "display_without_limits_is_whole"
+            if reason.starts_with("a display read without limits served arguments of") =>
+        {
+            Some("kit 0.17.2 sends a result over the 64 KiB limit; fixed in kit 0.17.3")
+        }
+        // retention.rs:463-464 demands the faithful fake's own identity for a never-written
+        // read, contradicting §4.3. Fixed in kit 0.17.4.
+        "retention_honoured"
+            if reason == "never-written session did not keep its empty success" =>
+        {
+            Some("kit 0.17.2 pins a fixed identity for a never-written read; fixed in kit 0.17.4")
+        }
+        _ => None,
+    }
 }

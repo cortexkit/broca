@@ -1,6 +1,175 @@
 //! Operator policy for model tools. Missing configuration is deliberately conservative:
 //! private content stays within the explicitly trusted provider set.
 
+/// Operator-selected wire names, keyed by credential routing key rather than account identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolNameAliasesConfig(pub std::collections::BTreeMap<String, ToolAliasRoute>);
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ToolAliasRoute {
+    Names {
+        names: std::collections::BTreeMap<String, String>,
+    },
+    Prefix {
+        prefix_all: String,
+    },
+}
+
+impl ToolNameAliasesConfig {
+    pub fn load_default() -> Result<Self, String> {
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
+            crate::config_home::ConfigHome::Resolved { path, .. } => {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => Self::parse(&text),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(Self::default())
+                    }
+                    Err(error) => Err(format!(
+                        "read tool_name_aliases from {}: {error}",
+                        path.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let mut file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|error| format!("parse tool_name_aliases: {error}"))?;
+        match file.remove("tool_name_aliases") {
+            None => Ok(Self::default()),
+            Some(value) => serde_json::from_value(value)
+                .map(Self)
+                .map_err(|error| format!("tool_name_aliases: {error}")),
+        }
+    }
+
+    pub fn for_tools(
+        &self,
+        route: &str,
+        tools: &[broca_protocol::request::Tool],
+    ) -> std::collections::BTreeMap<String, String> {
+        tools
+            .iter()
+            .filter_map(|tool| match self.0.get(route)? {
+                ToolAliasRoute::Names { names } => names
+                    .get(&tool.name)
+                    .map(|alias| (tool.name.clone(), alias.clone())),
+                ToolAliasRoute::Prefix { prefix_all } => {
+                    Some((tool.name.clone(), format!("{prefix_all}{}", tool.name)))
+                }
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tool_name_aliases_config_tests {
+    use super::*;
+
+    #[test]
+    fn tool_name_aliases_config_shape_is_strict() {
+        assert!(ToolNameAliasesConfig::parse("{}").unwrap().0.is_empty());
+        for text in [
+            r#"{"tool_name_aliases":null}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"bash":"client_bash"}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"names":{},"prefix_all":"client_"}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"prefix_all":"client_","unknown":true}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"names":{"bash":1}}}}"#,
+        ] {
+            assert!(
+                ToolNameAliasesConfig::parse(text)
+                    .unwrap_err()
+                    .contains("tool_name_aliases"),
+                "{text}"
+            );
+        }
+        for text in [
+            r#"{"tool_name_aliases":{"oauth:p":{"names":{"bash":"client_bash"}}}}"#,
+            r#"{"tool_name_aliases":{"oauth:p":{"prefix_all":"client_"}}}"#,
+        ] {
+            assert_eq!(ToolNameAliasesConfig::parse(text).unwrap().0.len(), 1);
+        }
+    }
+}
+
+/// Opt-in writer policy for the `service-tier-queue/v1` representation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServiceTierConfig {
+    pub enabled: bool,
+}
+
+impl ServiceTierConfig {
+    pub fn load_default() -> Result<Self, String> {
+        match crate::CacheTtlTable::default_path() {
+            crate::config_home::ConfigHome::Unresolvable => Ok(Self::default()),
+            crate::config_home::ConfigHome::Resolved { path, .. } => {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => Self::parse(&text),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(Self::default())
+                    }
+                    Err(error) => Err(format!(
+                        "read service_tier from {}: {error}",
+                        path.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let mut file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|error| format!("parse service_tier.enabled: {error}"))?;
+        match file.remove("service_tier") {
+            None => Ok(Self::default()),
+            Some(value) => serde_json::from_value(value)
+                .map_err(|error| format!("service_tier.enabled: {error}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod service_tier_config_tests {
+    use super::ServiceTierConfig;
+
+    #[test]
+    fn service_tier_defaults_off_and_refuses_malformed_switches_by_name() {
+        for text in [
+            "{}",
+            r#"{"service_tier":{}}"#,
+            r#"{"service_tier":{"enabled":false}}"#,
+        ] {
+            assert!(!ServiceTierConfig::parse(text).unwrap().enabled);
+        }
+        assert!(
+            ServiceTierConfig::parse(r#"{"service_tier":{"enabled":true}}"#)
+                .unwrap()
+                .enabled
+        );
+        for text in [
+            r#"{"service_tier":true}"#,
+            r#"{"service_tier":{"enabled":"yes"}}"#,
+            r#"{"service_tier":null}"#,
+            r#"{"service_tier":{"enable":true}}"#,
+        ] {
+            assert!(ServiceTierConfig::parse(text)
+                .unwrap_err()
+                .contains("service_tier.enabled"));
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmToolsConfig {
@@ -218,7 +387,112 @@ pub struct StateFormatConfig {
     pub overhaul_opt_in: bool,
 }
 
+/// Physical recovery policy for overhaul logs. Legacy log policy is unaffected.
+pub struct WalRecoveryConfig;
+
+impl WalRecoveryConfig {
+    pub fn parse(text: &str) -> Result<broca_wal::recovery::RecoveryPolicy, String> {
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let file: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("parse wal_recovery: {e}"))?;
+        match file.get("wal_recovery") {
+            None => Ok(broca_wal::recovery::RecoveryPolicy::Repair),
+            Some(value) if value == "repair" => Ok(broca_wal::recovery::RecoveryPolicy::Repair),
+            Some(value) if value == "refuse" => Ok(broca_wal::recovery::RecoveryPolicy::Refuse),
+            Some(value) => Err(format!(
+                "wal_recovery accepts only \"repair\" or \"refuse\"; got {value}"
+            )),
+        }
+    }
+    pub fn load_default() -> Result<broca_wal::recovery::RecoveryPolicy, String> {
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            crate::config_home::ConfigHome::Unresolvable => {
+                Ok(broca_wal::recovery::RecoveryPolicy::Repair)
+            }
+            crate::config_home::ConfigHome::Resolved { path, .. } => {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(broca_wal::recovery::RecoveryPolicy::Repair)
+                    }
+                    Err(e) => Err(format!("read wal_recovery from {}: {e}", path.display())),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wal_recovery_config_tests {
+    use super::*;
+    #[test]
+    fn wal_recovery_config_defaults_and_refuses_unknown_values_by_name() {
+        use broca_wal::recovery::RecoveryPolicy;
+        assert_eq!(
+            WalRecoveryConfig::parse("{}").unwrap(),
+            RecoveryPolicy::Repair
+        );
+        assert_eq!(
+            WalRecoveryConfig::parse("{\"wal_recovery\":\"repair\"}").unwrap(),
+            RecoveryPolicy::Repair
+        );
+        assert_eq!(
+            WalRecoveryConfig::parse("{\"wal_recovery\":\"refuse\"}").unwrap(),
+            RecoveryPolicy::Refuse
+        );
+        for value in ["null", "true", "0", "\"repairs\"", "{}"] {
+            assert!(
+                WalRecoveryConfig::parse(&format!("{{\"wal_recovery\":{value}}}"))
+                    .unwrap_err()
+                    .contains("wal_recovery")
+            );
+        }
+    }
+}
+
 impl StateFormatConfig {
+    /// Reuse the state-format file read for recovery policy, including on legacy
+    /// roots. Selecting the new policy must not add another boot config read.
+    pub fn load_default_with_recovery(
+    ) -> Result<(Self, broca_wal::recovery::RecoveryPolicy), String> {
+        use crate::config_home::ConfigHome;
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            ConfigHome::Resolved { path, .. } => Self::load_with_recovery(&path),
+            ConfigHome::Unresolvable => {
+                Ok((Self::default(), broca_wal::recovery::RecoveryPolicy::Repair))
+            }
+        }
+    }
+
+    pub fn load_with_recovery(
+        path: &std::path::Path,
+    ) -> Result<(Self, broca_wal::recovery::RecoveryPolicy), String> {
+        Self::load_policies(path, |path| std::fs::read_to_string(path))
+    }
+
+    fn load_policies(
+        path: &std::path::Path,
+        read: impl FnOnce(&std::path::Path) -> std::io::Result<String>,
+    ) -> Result<(Self, broca_wal::recovery::RecoveryPolicy), String> {
+        match read(path) {
+            Ok(text) => Ok((
+                Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+                WalRecoveryConfig::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok((Self::default(), broca_wal::recovery::RecoveryPolicy::Repair))
+            }
+            Err(error) => Err(format!(
+                "read state_format from {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
     /// The only value the key accepts.
     pub const OVERHAUL: u64 = 2;
 
@@ -502,6 +776,27 @@ mod state_format_config_tests {
     use super::StateFormatConfig;
 
     #[test]
+    fn state_format_and_recovery_share_one_boot_file_read() {
+        let reads = std::cell::Cell::new(0);
+        let (format, recovery) =
+            StateFormatConfig::load_policies(std::path::Path::new("broca.jsonc"), |_| {
+                reads.set(reads.get() + 1);
+                Ok("{\"wal_recovery\":\"refuse\"}".into())
+            })
+            .unwrap();
+        assert_eq!(reads.get(), 1);
+        assert_eq!(format, StateFormatConfig::default());
+        assert_eq!(recovery, broca_wal::recovery::RecoveryPolicy::Refuse);
+        let error = StateFormatConfig::load_policies(std::path::Path::new("broca.jsonc"), |_| {
+            reads.set(reads.get() + 1);
+            Ok("{\"wal_recovery\":\"misspelt\"}".into())
+        })
+        .unwrap_err();
+        assert!(error.contains("wal_recovery"));
+        assert_eq!(reads.get(), 2);
+    }
+
+    #[test]
     fn absent_key_keeps_todays_format() {
         for text in ["{}", "{ \"llm_tools\": {} }", "// only a comment\n{}"] {
             assert_eq!(
@@ -538,5 +833,122 @@ mod state_format_config_tests {
             StateFormatConfig::load(&path).unwrap(),
             StateFormatConfig::default()
         );
+    }
+}
+/// Root-level same-account wait cap loaded at boot. Consent is frozen at admission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountLimitPauseConfig {
+    pub max_same_account_wait: broca_core::SameAccountWait,
+    pub obsolete_account_limit_pause: bool,
+}
+
+impl AccountLimitPauseConfig {
+    pub fn load_default() -> Result<Self, String> {
+        use crate::config_home::ConfigHome;
+        match crate::config_home::config_file(crate::cache_routing::CONFIG_PATH_ENV, "broca.jsonc")
+        {
+            ConfigHome::Resolved { path, .. } => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    Self::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                Err(error) => Err(format!(
+                    "read max_same_account_wait from {}: {error}",
+                    path.display()
+                )),
+            },
+            ConfigHome::Unresolvable => Ok(Self::default()),
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = crate::cache_routing::strip_trailing_commas(
+            &crate::cache_routing::strip_jsonc_comments(text),
+        );
+        let file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|error| format!("parse max_same_account_wait: {error}"))?;
+        let setting = match file.get("max_same_account_wait") {
+            None => broca_core::SameAccountWait::default(),
+            Some(serde_json::Value::String(value)) if value == "max" => {
+                broca_core::SameAccountWait::Max
+            }
+            Some(value) if value.as_u64().is_some() => {
+                broca_core::SameAccountWait::Minutes(value.as_u64().unwrap())
+            }
+            Some(_) => return Err(
+                "max_same_account_wait must be a non-negative integer number of minutes or \"max\""
+                    .into(),
+            ),
+        };
+        Ok(Self {
+            max_same_account_wait: setting,
+            obsolete_account_limit_pause: file.contains_key("account_limit_pause"),
+        })
+    }
+}
+
+#[cfg(test)]
+mod account_limit_pause_config_tests {
+    use super::AccountLimitPauseConfig;
+
+    #[test]
+    fn max_same_account_wait_defaults_and_typed_values() {
+        for text in [
+            "{}",
+            r#"{"account_limit_pause":false}"#,
+            r#"{"other":true}"#,
+        ] {
+            assert_eq!(
+                AccountLimitPauseConfig::parse(text)
+                    .unwrap()
+                    .max_same_account_wait,
+                broca_core::SameAccountWait::Minutes(15)
+            );
+        }
+        for (value, expected) in [
+            ("0", broca_core::SameAccountWait::Minutes(0)),
+            ("42", broca_core::SameAccountWait::Minutes(42)),
+            ("\"max\"", broca_core::SameAccountWait::Max),
+        ] {
+            assert_eq!(
+                AccountLimitPauseConfig::parse(&format!(r#"{{"max_same_account_wait":{value}}}"#))
+                    .unwrap()
+                    .max_same_account_wait,
+                expected
+            );
+        }
+        for value in [
+            "null", "true", "false", "-1", "1.5", "1.0", "\"15\"", "\"MAX\"", "{}", "[]",
+        ] {
+            assert!(AccountLimitPauseConfig::parse(&format!(
+                r#"{{"max_same_account_wait":{value}}}"#
+            ))
+            .unwrap_err()
+            .contains("max_same_account_wait"));
+        }
+    }
+
+    #[test]
+    fn obsolete_account_limit_pause_is_ignored_without_parsing_its_value() {
+        assert!(
+            !AccountLimitPauseConfig::parse("{}")
+                .unwrap()
+                .obsolete_account_limit_pause
+        );
+        for value in ["true", "false", "null", "1", "{}", "[]", "\"bad\""] {
+            let config =
+                AccountLimitPauseConfig::parse(&format!(r#"{{"account_limit_pause":{value}}}"#))
+                    .unwrap();
+            assert!(config.obsolete_account_limit_pause);
+            assert_eq!(
+                config.max_same_account_wait,
+                broca_core::SameAccountWait::Minutes(15)
+            );
+        }
+        let config = AccountLimitPauseConfig::parse(
+            r#"{"account_limit_pause":true,"max_same_account_wait":0}"#,
+        )
+        .unwrap();
+        assert!(!config.max_same_account_wait.enabled());
     }
 }

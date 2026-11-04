@@ -58,7 +58,7 @@ pub(super) async fn measure(sizes: &[usize], assert_bounded: bool) {
     for &messages in sizes {
         let rig = prepare(messages, false).await;
         let warm = rig.registry().head(&rig.session).await.unwrap();
-        assert_eq!(warm.last_ordinal, Some(messages as u64 - 1));
+        assert_eq!(warm.last_ordinal, Some(messages as u64));
         assert_eq!(warm.last_run_state.as_ref().unwrap().state, "active");
         let counter = WalAccessCounter::default();
         for sample in 0..3 {
@@ -111,7 +111,7 @@ pub(super) async fn measure(sizes: &[usize], assert_bounded: bool) {
                 .unwrap();
             let elapsed = before.elapsed().as_micros();
             assert_eq!(head.last_run_state.as_ref().unwrap().state, "paused");
-            assert_eq!(head.last_ordinal, Some(messages as u64 - 1));
+            assert_eq!(head.last_ordinal, Some(messages as u64));
             let access = counter.snapshot().pop().unwrap();
             let origin_bytes: u64 = access
                 .reads

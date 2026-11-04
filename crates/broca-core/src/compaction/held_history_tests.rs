@@ -135,6 +135,7 @@ impl CompactionPlane for Windows {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         let mut answer = ready();
@@ -153,6 +154,7 @@ impl CompactionPlane for Windows {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, CompactionUnavailable> {
         Ok(ViewGetAnswer::view(
@@ -164,6 +166,7 @@ impl CompactionPlane for Windows {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::ride::RideRequest,
     ) -> Result<crate::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
         if self.wait != WaitViews::Off
@@ -924,6 +927,7 @@ async fn every_full_replay_fallback_releases_before_the_first_request() {
     let checkpoint =
         crate::AdmissionCheckpointV1::from_frames(&full.frames()[..watermark]).unwrap();
     let prefix = crate::StorePrefix {
+        refusal: Some(Default::default()),
         lineage_id: Some(fixture_lineage_id().to_string()),
         prefix: projected.prompt,
         completed_steps: projected.completed_steps,
@@ -1027,6 +1031,7 @@ async fn admission_only_prefix_and_tail_views_keep_episode_metadata() {
     let projected = crate::replay(&records[..watermark]).unwrap();
     let store = Arc::new(BrokenStore {
         prefix: crate::StorePrefix {
+            refusal: Some(Default::default()),
             lineage_id: Some(fixture_lineage_id().to_string()),
             prefix: projected.prompt,
             completed_steps: projected.completed_steps,

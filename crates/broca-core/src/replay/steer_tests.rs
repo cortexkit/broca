@@ -19,6 +19,8 @@ fn user(text: &str) -> Message {
 
 fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -38,6 +40,9 @@ fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
         run_id: RunId("r1".into()),
         session: BindIdentity::new("/tmp/project", "runner", "session"),
         config: Box::new(RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -69,6 +74,7 @@ fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
 
 fn steered(text: &str) -> WalRecord {
     WalRecord::Steered {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         retention: None,
@@ -107,7 +113,7 @@ fn seeded_episode_coordinates_are_absolute_and_a_steer_is_not_the_first_user() {
             None,
             100,
             false,
-            crate::tags::TagSeed::default(),
+            crate::tags::TagSeed::default().into(),
         )
         .unwrap();
         assert_eq!(state.extent, if admitted_user { 103 } else { 102 });
@@ -127,6 +133,7 @@ fn seeded_episode_coordinates_are_absolute_and_a_steer_is_not_the_first_user() {
 
 fn text_step(step: u64, text: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -146,6 +153,7 @@ fn text_step(step: u64, text: &str) -> WalRecord {
 
 fn call_step(step: u64, call: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -504,3 +512,37 @@ fn replay_reads_a_steer_as_written() {
 
 #[path = "batch_overlap_tests.rs"]
 mod batch_overlap_tests;
+
+#[test]
+fn recovery_preserves_recorded_terminal_states_during_reconciliation() {
+    let cut: WalRecord = serde_json::from_value(serde_json::json!({
+        "type":"recovery_cut", "cut_id":"cut-completed", "sidecar_basename":"log.cut-1",
+        "cut_offset":69, "removed_len":1, "removed_sha256":"a".repeat(64),
+        "reason":"unproven_corruption", "active_run":"r1",
+        "runs":[{"run_id":"r1","calls":[{"tool_call_id":"late-call"}]}],
+        "unattributed_tool_risk":false
+    }))
+    .unwrap();
+    let receipt: WalRecord = serde_json::from_str(
+        r#"{"type":"recovery_call_closed","cut_id":"cut-completed","run_id":"r1","tool_call_id":"late-call","outcome":"unknown","result":{"tool_call_id":"late-call","output":{"kind":"error","message":"outcome_unknown"},"is_error":true}}"#,
+    ).unwrap();
+    for reason in [
+        RunFinishReason::Completed,
+        RunFinishReason::MaxSteps,
+        RunFinishReason::Cancelled,
+        RunFinishReason::Interrupted,
+        RunFinishReason::Error,
+        RunFinishReason::TransformUnavailable,
+    ] {
+        for marker in [&cut, &receipt] {
+            let mut records = vec![run_started(vec![]), run_finished(reason)];
+            let expected = super::reconcile_run_state(&records, "r1").unwrap();
+            for _ in 0..2 {
+                records.push(marker.clone());
+                let actual = super::reconcile_run_state(&records, "r1").unwrap();
+                assert_eq!(actual.state, expected.state, "{reason:?}: {marker:?}");
+                assert_eq!(actual.retries_used, expected.retries_used);
+            }
+        }
+    }
+}

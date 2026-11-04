@@ -60,8 +60,10 @@ a complete inventory or a pagination cursor.
 | `session_inventory_repairs` | Timestamped repair attempts grouped by `started`, `completed` and `failed`. Progress/completion is informational; failure is an error. Counts attempts, not sessions or census rows. |
 | `run_errors` | Indexed error terminals with provider, error class and observation time, grouped by provider, shared error class and safe provider code. Floors below. A missing optional provider code or credential does not prevent classification. |
 | `tool_outages` | Newly durable attributed unavailable tool results/no-dispatch records, grouped by module. Warn. Counts calls/results, not outage episodes. |
+| `tool_result_json_dump` | Tool-result intake observations, grouped by provider module and tool name. Warn when model-visible text dumps raw JSON; the tool provider should shape its output. The exact rule and bounded coverage are described below. |
 | `interrupted_runs` | Indexed interrupted terminals with an interruption reason and observation time, other than explicit `runner_shutdown`/`runner_crash` seals, plus observed `transform_unavailable` terminals. Warn; a run is not classified as restart-related based only on its timestamp. |
 | `data_quality` | One info finding for indexed rows excluded from `paused_runs`, `run_errors` and `interrupted_runs` because classification fields or observation times are NULL. Counts do not contribute to operational severity. |
+| `wal_recovery_cut` | Immutable overhaul recovery manifests, scanned with bounded traversal and file size. Warn; samples name the session, reason, cut offset, removed length and `unattributed_tool_risk`, never removed content. The flag signals that undecodable removed bytes may conceal dispatch identities; it does not block later episodes. Evidence persists across restarts until whole-session retention deletion removes the captured recovery artifacts with the session. |
 
 `result.coverage` is additive. For each ring-backed check it gives `since_ms`
 (process start, or the oldest retained event after eviction) and `truncated`.
@@ -69,6 +71,29 @@ Each ring-backed finding's first sample also carries `coverage_since_ms`.
 Empty rings after boot do not create coverage findings or wake an operator.
 Rings retain at most 20,000 events each and at most seven days of history.
 They are process-local, not a durable incident ledger.
+
+`tool_result_json_dump` checks each newly received final tool result at intake,
+after normalization, without changing its model-visible output or stored bytes.
+Late (provider-held) results aren't counted yet.
+A tool result is a raw JSON dump when all three hold:
+
+1. Its tool isn't one of `bash`, `read`, `read_json`, `codemode`, `todowrite`, which
+   return the caller's own data or JSON on purpose.
+2. Its model-visible text (the text parts joined, images excluded), trimmed of
+   surrounding whitespace, is at least 200 bytes.
+3. Either the whole trimmed text parses as a JSON object or array, or it contains
+   the 3-byte sequence `{\"` and at least 10 occurrences of the 2-byte sequence
+   `\"`, which is JSON escaped inside text.
+
+The tool allowlist and byte floor are checked before attempting a JSON parse.
+Each finding's key is a compact JSON pair `[module_id,tool_name]`; samples name
+the provider module, tool, session, dispatch call key (the durable call identity,
+null when unavailable), and trimmed text byte length (`text_bytes`), never the
+text. Evidence retains at most 20,000
+observations and seven days, groups counts and first/last times within the requested
+window, and keeps up to five samples per tool. Sample trimming does not reduce
+counts. Coverage reports eviction just like the other process-local rings. All
+retained identifiers longer than 256 bytes are replaced by stable SHA-256 identifiers.
 
 `health.check.metrics.session_address_refusals` exposes lifetime counters for
 `incomplete_inventory`, `gap_marker`, `store_error`, `ambiguous` and `invalid_identity`,

@@ -48,6 +48,15 @@ pub struct StepRuntime {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Whether template text can be delivered at system authority at this boundary.
+    /// `followed_by_user` accounts for other staged sends in the same request.
+    fn turn_system_possible(
+        &self,
+        _preceding: Option<&broca_protocol::Message>,
+        _followed_by_user: bool,
+    ) -> bool {
+        false
+    }
     /// Pricing of edits on the route the next model call would use; unknown routes omit it.
     fn history_edit_cost(&self) -> Option<crate::compaction_provider::notice::HistoryEditCost> {
         None
@@ -88,6 +97,13 @@ pub trait Provider: Send + Sync {
     fn set_cache_evidence_view(&self, _view: Option<u64>) {}
     fn annotate_cache_evidence(&self, _attempt: &mut broca_protocol::ModelAttempt) {}
     fn cache_attempt_recorded(&self, _locator: Option<String>) {}
+
+    /// Latest 2xx model-attempt send for this account in the bound session. Refusals do
+    /// not refresh this clock, even though cache diagnostics compare against the latest
+    /// attempt regardless of whether the provider accepted it.
+    fn last_accepted_at_ms(&self, _account: &str) -> Option<u64> {
+        None
+    }
 
     /// Pin the freshly resolved credential record version before acquiring run transport.
     fn set_credential_revision(&self, _revision: u64) {}
@@ -323,6 +339,13 @@ pub trait Provider: Send + Sync {
 /// `run_loop` directly, without the loop needing to know the concrete type.
 #[async_trait]
 impl Provider for Box<dyn Provider> {
+    fn turn_system_possible(
+        &self,
+        preceding: Option<&broca_protocol::Message>,
+        followed_by_user: bool,
+    ) -> bool {
+        (**self).turn_system_possible(preceding, followed_by_user)
+    }
     fn history_edit_cost(&self) -> Option<crate::compaction_provider::notice::HistoryEditCost> {
         (**self).history_edit_cost()
     }
@@ -365,6 +388,10 @@ impl Provider for Box<dyn Provider> {
     }
     fn cache_attempt_recorded(&self, locator: Option<String>) {
         (**self).cache_attempt_recorded(locator)
+    }
+
+    fn last_accepted_at_ms(&self, account: &str) -> Option<u64> {
+        (**self).last_accepted_at_ms(account)
     }
 
     fn set_credential_revision(&self, revision: u64) {

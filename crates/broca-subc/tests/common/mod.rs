@@ -80,6 +80,8 @@ pub struct Rig {
     pub connection_file: PathBuf,
 }
 
+pub mod role_scope;
+
 impl Drop for Rig {
     fn drop(&mut self) {
         broca_test_support::kill_and_reap_tree(&mut self._child);
@@ -127,6 +129,14 @@ impl Rig {
     /// Spawn the daemon supervising multiple module binaries in one subc-core process.
     /// Returns None if subc-core or any module program is absent (caller skips).
     pub async fn start_with_modules(tag: &str, modules: Vec<ModuleSpec>) -> Option<Rig> {
+        Self::start_with_scope_owners(tag, modules, &[]).await
+    }
+
+    pub async fn start_with_scope_owners(
+        tag: &str,
+        modules: Vec<ModuleSpec>,
+        owners: &[&str],
+    ) -> Option<Rig> {
         // When the test process itself runs under subc supervision (an operator shell
         // spawned by a daemon-supervised tool), it inherits that daemon's attestation
         // env (SUBC_MODULE_ID / SUBC_LAUNCH_NONCE). The in-process consumer connection
@@ -181,12 +191,14 @@ impl Rig {
                         "args": args_json,
                         "env": env_json,
                         "enabled": true,
+                        "reserved": !owners.is_empty(),
                     }),
                 )
             })
             .collect();
         let config = json!({
             "version": 1,
+            "scope_authority_owners": owners,
             "modules": modules_json
         });
         std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();

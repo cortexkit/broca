@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 fn rich_request() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -31,6 +32,7 @@ fn rich_request() -> CallOptions {
             }],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -39,6 +41,7 @@ fn rich_request() -> CallOptions {
             content: vec![ContentBlock::Text { text: "Hi".into() }],
         },
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -104,6 +107,7 @@ fn bedrock_spec() -> (ProviderSpec, ModelSpec) {
         cost: CostSchedule::default(),
         reasoning_options: Default::default(),
         server_side_fallback: None,
+        mid_conversation_system: None,
         input_modalities: Default::default(),
         release_date: None,
         status: None,
@@ -279,11 +283,14 @@ fn recorded_bedrock_event_stream_through_message_stop() -> Vec<u8> {
 }
 
 pub(super) fn event_stream_message(event_type: &str, payload: &Value) -> Vec<u8> {
+    raw_event_stream_message(event_type, &serde_json::to_vec(payload).unwrap())
+}
+
+pub(super) fn raw_event_stream_message(event_type: &str, payload: &[u8]) -> Vec<u8> {
     let mut headers = Vec::new();
     string_header(&mut headers, ":message-type", "event");
     string_header(&mut headers, ":event-type", event_type);
     string_header(&mut headers, ":content-type", "application/json");
-    let payload = serde_json::to_vec(payload).unwrap();
 
     let total_len = 12 + headers.len() + payload.len() + 4;
     let mut message = Vec::new();

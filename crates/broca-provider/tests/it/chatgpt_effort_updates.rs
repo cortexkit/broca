@@ -28,6 +28,8 @@ fn config(model: &str, effort: &str, admitted: bool) -> FrozenRenderConfig {
 fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRecord {
     let frozen = config(model, effort, admitted);
     WalRecord::RunStarted {
+        compaction_plan_version: None,
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -47,6 +49,9 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
         run_id: RunId(format!("run-{effort}")),
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -72,6 +77,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
         }),
         input: role
             .map(|role| Message {
+                turn_system: false,
                 role,
                 content: vec![ContentBlock::Text {
                     text: format!("episode-{effort}"),

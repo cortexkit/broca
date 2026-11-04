@@ -144,6 +144,9 @@ impl Drop for Rig {
 /// A run frozen under the computed tag rules that shows the model its numbers.
 fn tagged_config() -> RunConfig {
     RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: true,
         computed_tags: Some(broca_wal::ComputedTagRules { checkpoint: 0 }),
@@ -195,6 +198,7 @@ fn compacting_manifest() -> broca_wal::PlanManifest {
 
 fn step(step: u64, content: Vec<ContentBlock>, finish: FinishReason) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -247,6 +251,8 @@ fn seed(rig: &Rig, episodes: u64, compacts: bool) {
         let first = 4 * episode;
         let mut records = vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -360,18 +366,25 @@ fn seed(rig: &Rig, episodes: u64, compacts: bool) {
 async fn final_reply(rig: &Rig, episodes: u64, label: &str) -> Vec<serde_json::Value> {
     let key = rig.key();
     let last = 4 * episodes - 1;
-    let lineage = rig
+    let page = rig
         .registry
         .read(broca_module::serve::SessionReadRequest::new(
             key.clone(),
-            Some(last),
+            Some(last + 1),
             Some(1),
         ))
         .await
-        .unwrap()
-        .lineage_id
         .unwrap();
-    let set = format!("{lineage}/m{last}");
+    // A reply's set id is scoped to the history snapshot it was served from and names the
+    // message by its stored position.
+    let set = {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        format!(
+            "h1.{}.{}/m{last}",
+            URL_SAFE_NO_PAD.encode(page.incarnation.as_bytes()),
+            page.history_version
+        )
+    };
     // The frozen plan comes from the session's ownership fold, which a route bind computes and
     // caches before any request on it. Measured apart, so the operations below show their own
     // cost on a bound route.
@@ -384,7 +397,7 @@ async fn final_reply(rig: &Rig, episodes: u64, label: &str) -> Vec<serde_json::V
         rig.registry
             .read(broca_module::serve::SessionReadRequest::new(
                 key.clone(),
-                Some(last),
+                Some(last + 1),
                 Some(1),
             ))
             .await
@@ -554,7 +567,7 @@ async fn a_display_page_reads_each_shared_target_and_manifest_once() {
     let entries: Vec<_> = page
         .messages
         .into_iter()
-        .filter(|entry| entry.ordinal % 4 == 3)
+        .filter(|entry| (entry.ordinal - 1) % 4 == 3)
         .collect();
     let counted = CountedReads {
         registry: &rig.registry,
@@ -565,7 +578,8 @@ async fn a_display_page_reads_each_shared_target_and_manifest_once() {
     let sets = broca_module::output_refs::page_output_refs(
         &counted,
         &rig.key(),
-        page.lineage_id.as_deref().unwrap(),
+        &page.incarnation,
+        page.history_version,
         &entries,
         None,
     )
@@ -600,7 +614,7 @@ async fn history_never_invents_creation_times_for_legacy_records() {
         matches!(
             reply,
             Err(broca_module::history::HistoryError::Unrepresentable {
-                ordinal: 0,
+                ordinal: 1,
                 field: "written_at"
             })
         ),
@@ -714,7 +728,7 @@ async fn pre_message_times_history_uses_legacy_clocks_and_reports_remaining_gaps
         matches!(
             reply,
             Err(broca_module::history::HistoryError::Unrepresentable {
-                ordinal: 6,
+                ordinal: 7,
                 field: "written_at"
             })
         ),

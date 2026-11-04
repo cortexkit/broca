@@ -38,6 +38,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Start of every fake `ck` that stands in for a restart. place-release.sh saves
+# `ck --json health broca` just before `ck module restart broca`, so the fake answers that
+# read with an empty JSON object and stops. Only the restart command reaches the lines after
+# this, which mark the module restarted.
+FAKE_CK_HEALTH = '#!/bin/sh\n[ "$1 $2 $3" = "--json health broca" ] && { echo "{}"; exit 0; }\n'
 PLACE = ROOT / "scripts" / "place-release.sh"
 VERIFY = ROOT / "scripts" / "verify-deploy.sh"
 
@@ -725,7 +731,7 @@ class PlacementGateTests(GateBase):
         stub_binary(self.staged, features=[], signed="adhoc,runtime")
         restarted = self.tmp / "restarted"
         ck = self.fake_bin / "ck"
-        ck.write_text('#!/bin/sh\n' + (f'touch "{restarted}"\n' if new_pid else 'exit 0\n'))
+        ck.write_text(FAKE_CK_HEALTH + (f'touch "{restarted}"\n' if new_pid else 'exit 0\n'))
         ck.chmod(0o755)
         (self.fake_bin / "ps").write_text(f'''#!/usr/bin/env python3
 from pathlib import Path
@@ -772,7 +778,7 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         )
         restarted = self.tmp / "restarted"
         ck = Path(env["PLACE_RELEASE_CK"])
-        ck.write_text(f'#!/bin/sh\ncat "{restart_records}" >> "{session}"\ntouch "{restarted}"\n')
+        ck.write_text(FAKE_CK_HEALTH + f'cat "{restart_records}" >> "{session}"\ntouch "{restarted}"\n')
         ck.chmod(0o755)
         result = self.place("--restart", "--live-approved", "--report", str(report),
                             PLACE_RELEASE_GATE_CMD='echo "live runs          3"; echo "  live  session.wal  last write 0s ago"; echo "  live  unsealed.wal  last write 0s ago"; echo "  live  finished.wal  last write 0s ago"; exit 1', **env)
@@ -812,7 +818,7 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         restart_records.write_bytes(wal_frame(3, {"type": "run_finished", "reason": "cancelled"}))
         restarted = self.tmp / "restarted"
         ck = Path(env["PLACE_RELEASE_CK"])
-        ck.write_text(f'#!/bin/sh\ncat "{restart_records}" >> "{session}"\ntouch "{restarted}"\n')
+        ck.write_text(FAKE_CK_HEALTH + f'cat "{restart_records}" >> "{session}"\ntouch "{restarted}"\n')
         ck.chmod(0o755)
 
         result = self.place(

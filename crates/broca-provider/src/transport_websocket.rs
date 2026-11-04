@@ -439,19 +439,34 @@ impl Session {
     /// it does not count as this switch: Codex has no such threshold, so in its terms the
     /// WebSocket is still enabled and the retry count may still fall back once.
     pub(super) fn try_switch_to_https(&self) -> bool {
-        let policy = Arc::clone(&self.policy.read().unwrap());
-        if policy() {
+        let Some(mut state) = self.https_switch_eligible() else {
             return false;
-        }
-        let mut state = self.state.lock().unwrap();
-        if state.force_https {
-            return false;
-        }
+        };
         state.force_https = true;
         if let Some(socket) = state.socket.take() {
             socket.shutdown.cancel();
         }
         true
+    }
+
+    #[cfg(test)]
+    pub(super) fn can_switch_to_https(&self) -> bool {
+        self.https_switch_eligible().is_some()
+    }
+
+    // Keep the lock through the switch so a read-only query and a mutating switch use the
+    // same eligibility rules without introducing a check-then-lock race in the switch.
+    #[inline(always)]
+    fn https_switch_eligible(&self) -> Option<std::sync::MutexGuard<'_, State>> {
+        let policy = Arc::clone(&self.policy.read().unwrap());
+        if policy() {
+            return None;
+        }
+        let state = self.state.lock().unwrap();
+        if state.force_https {
+            return None;
+        }
+        Some(state)
     }
 
     fn now(&self) -> Instant {
@@ -638,6 +653,7 @@ impl Drop for Session {
 }
 
 struct SendCommand {
+    quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     text: String,
     response_create: bool,
     result: oneshot::Sender<Result<(), std::io::Error>>,
@@ -808,9 +824,20 @@ async fn connect(
     use tracing::instrument::WithSubscriber;
     // Dependency trace logs may dump frame or handshake contents. Keep library IO silent;
     // the transport emits only its own payload-free diagnostics outside this scope.
-    let (stream, response) = connect_async_with_config(upgrade, Some(config), false)
+    let connected = connect_async_with_config(upgrade, Some(config), false)
         .with_subscriber(tracing::subscriber::NoSubscriber::default())
-        .await?;
+        .await;
+    if let Some(observer) = &request.quota_observer {
+        let headers = match &connected {
+            Ok((_, response)) => Some(response.headers()),
+            Err(tungstenite::Error::Http(response)) => Some(response.headers()),
+            _ => None,
+        };
+        if let Some(headers) = headers {
+            observer.headers(headers, super::now_millis());
+        }
+    }
+    let (stream, response) = connected?;
     let turn_state = response
         .headers()
         .get("x-codex-turn-state")
@@ -848,6 +875,7 @@ async fn connect(
         shutdown,
         (closed, close_code, frames),
         activity,
+        request.quota_observer.clone(),
     );
     Ok((socket, turn_state))
 }
@@ -859,6 +887,7 @@ fn spawn_pump<S>(
     shutdown: CancellationToken,
     diagnostics: (Arc<AtomicBool>, Arc<AtomicU16>, Arc<FrameCounts>),
     mut activity: tokio::sync::watch::Receiver<bool>,
+    mut quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
 ) -> JoinHandle<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -881,8 +910,13 @@ where
                         let result = stream.send(Message::Text(command.text.into())).await
                             .map_err(|_| std::io::Error::other("Responses socket send failed"));
                         let failed = result.is_err();
-                        if !failed {
-                            let count = if command.response_create { &frames.response_create_sent } else { &frames.other_text_sent };
+                         if !failed {
+                             // A kept socket can serve another run, including one without a
+                             // frozen credential id. Attribute frames to the current send only.
+                             if command.response_create {
+                                 quota_observer = command.quota_observer;
+                             }
+                             let count = if command.response_create { &frames.response_create_sent } else { &frames.other_text_sent };
                             count.fetch_add(1, Ordering::Relaxed);
                         }
                         let _ = command.result.send(result);
@@ -893,6 +927,9 @@ where
                 };
                 let record = match message {
                     Some(Ok(Message::Text(text))) => {
+                        if let Some(observer) = &quota_observer {
+                            crate::quota::observe_frame(observer.as_ref(), &text);
+                        }
                         frames.text_received.fetch_add(1, Ordering::Relaxed);
                         Ok(text.as_bytes().to_vec())
                     }
@@ -1071,6 +1108,8 @@ async fn drive_socket(
         Err(UpgradeFailure::AccountLimit(status, error)) => {
             trace.http_status = Some(status);
             trace.account_observation.limit = Some(broca_protocol::AttemptAccountLimit {
+                disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+                observed_at_ms: clock.now_ms(),
                 resets_at_ms: error.resets_at_ms,
                 resets_at_source: error.resets_at_source.clone(),
                 limit_window: error.limit_window.clone(),
@@ -1236,6 +1275,7 @@ async fn drive_socket(
         socket
             .send
             .send(SendCommand {
+                quota_observer: request.quota_observer.clone(),
                 text,
                 response_create: true,
                 result,
@@ -1423,11 +1463,20 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
     trace.wrapped_error_frame = Some(Box::new(WrappedErrorFrame::read(status, &value)));
     let error = classify_http_error(status, &text, retry, None);
     let error = classify_chatgpt_upstream_key_rejection(family, status, &text, error);
-    let error =
-        classify_account_limit_exhausted(family, status, &headers, &text, SystemTime::now(), error);
+    let observed_at_ms = now_millis();
+    let error = classify_account_limit_exhausted(
+        family,
+        status,
+        &headers,
+        &text,
+        UNIX_EPOCH + Duration::from_millis(observed_at_ms),
+        error,
+    );
     trace.http_status = Some(status);
     if error.is_account_limit_exhausted() {
         trace.account_observation.limit = Some(broca_protocol::AttemptAccountLimit {
+            disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+            observed_at_ms,
             resets_at_ms: error.resets_at_ms,
             resets_at_source: error.resets_at_source.clone(),
             limit_window: error.limit_window.clone(),
@@ -1851,9 +1900,11 @@ mod pump_tests {
                 Arc::clone(&frames),
             ),
             tokio::sync::watch::channel(false).1,
+            None,
         );
         let (result, mut receive) = oneshot::channel();
         send.send(SendCommand {
+            quota_observer: None,
             text: "test-payload".repeat(4),
             response_create: false,
             result,
@@ -1914,6 +1965,7 @@ mod pump_tests {
                     Arc::clone(&frames),
                 ),
                 activity,
+                None,
             );
             server
                 .send(Message::Ping(vec![1; 125].into()))
@@ -1971,9 +2023,11 @@ mod pump_tests {
                     Arc::clone(&frames),
                 ),
                 activity,
+                None,
             );
             let (result, received) = oneshot::channel();
             send.send(SendCommand {
+                quota_observer: None,
                 text: "other".into(),
                 response_create: false,
                 result,
@@ -2057,6 +2111,7 @@ mod pump_tests {
             shutdown.clone(),
             (closed, close_code, Arc::clone(&socket.frames)),
             activity,
+            None,
         );
         let session = Session::default();
         session.state.lock().unwrap().socket = Some(Arc::clone(&socket));
@@ -2168,6 +2223,7 @@ mod pump_tests {
                 Arc::new(FrameCounts::default()),
             ),
             activity,
+            None,
         );
         server.send(Message::Ping(vec![1].into())).await.unwrap();
         assert_eq!(
@@ -2187,6 +2243,7 @@ mod pump_tests {
         active.send_replace(false);
         let (result, received) = oneshot::channel();
         send.send(SendCommand {
+            quota_observer: None,
             text: "next".into(),
             response_create: false,
             result,
@@ -2503,4 +2560,136 @@ fn credential_identity_ignores_header_name_case_and_order() {
         credential_identity_changed(&socket, &request),
         "a changed authentication value is attributable"
     );
+}
+
+#[tokio::test]
+async fn quota_websocket_handshake_and_raw_frame_are_tapped_at_receipt() {
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let frame = r#"{ "type": "codex.rate_limits", "rate_limits": {"used_percent":1.000e+00} }"#;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut config = tungstenite::protocol::WebSocketConfig::default();
+        config.extensions.permessage_deflate = Some(DeflateConfig::default());
+        let mut socket = tokio_tungstenite::accept_hdr_async_with_config(
+            socket,
+            |_: &tungstenite::handshake::server::Request,
+             mut response: tungstenite::handshake::server::Response| {
+                response
+                    .headers_mut()
+                    .insert("x-codex-primary-used-percent", "100".parse().unwrap());
+                response
+                    .headers_mut()
+                    .insert("x-codex-turn-state", "private-turn-token".parse().unwrap());
+                Ok(response)
+            },
+            Some(config),
+        )
+        .await
+        .unwrap();
+        socket.send(Message::Text(frame.into())).await.unwrap();
+        let _ = socket.next().await;
+    });
+    let capture = Arc::new(crate::quota::tests::Capture::default());
+    let mut request = PreparedHttpRequest::from(crate::wire::HttpRequest {
+        method: crate::wire::HttpMethod::Post,
+        url,
+        headers: vec![],
+        body: b"{}".to_vec(),
+    });
+    request.quota_observer = Some(capture.clone());
+    let before = super::now_millis();
+    let (socket, _) = connect(&request, 1, Instant::now()).await.unwrap();
+    // The receive pump taps before handing a frame to the attempt's bounded channel.
+    let record = tokio::time::timeout(Duration::from_secs(5), socket.recv.lock().await.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(record, frame.as_bytes());
+    {
+        let headers = capture.headers.lock().unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0["x-codex-primary-used-percent"], "100");
+        assert!(headers[0].1 >= before && headers[0].1 <= super::now_millis());
+        let frames = capture.frames.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, frame);
+        assert!(frames[0].1 >= before && frames[0].1 <= super::now_millis());
+    }
+    socket.shutdown.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn quota_websocket_reuse_updates_or_removes_run_attribution() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut config = tungstenite::protocol::WebSocketConfig::default();
+        config.extensions.permessage_deflate = Some(DeflateConfig::default());
+        let mut socket = tokio_tungstenite::accept_async_with_config(socket, Some(config))
+            .await
+            .unwrap();
+        for ordinal in 0..3 {
+            socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Text(
+                    format!(r#"{{"type":"codex.rate_limits","ordinal":{ordinal}}}"#).into(),
+                ))
+                .await
+                .unwrap();
+        }
+    });
+    let first = Arc::new(crate::quota::tests::Capture::default());
+    let second = Arc::new(crate::quota::tests::Capture::default());
+    let mut request = PreparedHttpRequest::from(crate::wire::HttpRequest {
+        method: crate::wire::HttpMethod::Post,
+        url,
+        headers: vec![],
+        body: b"{}".to_vec(),
+    });
+    request.quota_observer = Some(first.clone());
+    let (socket, _) = connect(&request, 1, Instant::now()).await.unwrap();
+    let observers: [Option<Arc<dyn crate::quota::QuotaObserver>>; 3] =
+        [Some(first.clone()), Some(second.clone()), None];
+    for observer in observers {
+        let (result, receive) = oneshot::channel();
+        socket
+            .send
+            .send(SendCommand {
+                quota_observer: observer,
+                text: "{}".into(),
+                response_create: true,
+                result,
+            })
+            .await
+            .unwrap();
+        receive.await.unwrap().unwrap();
+        socket.recv.lock().await.recv().await.unwrap().unwrap();
+    }
+    assert_eq!(
+        first
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.0.clone())
+            .collect::<Vec<_>>(),
+        vec![r#"{"type":"codex.rate_limits","ordinal":0}"#]
+    );
+    assert_eq!(
+        second
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.0.clone())
+            .collect::<Vec<_>>(),
+        vec![r#"{"type":"codex.rate_limits","ordinal":1}"#]
+    );
+    socket.shutdown.cancel();
+    server.await.unwrap();
 }

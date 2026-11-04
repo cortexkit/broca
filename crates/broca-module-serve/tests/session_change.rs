@@ -1,5 +1,7 @@
 //! Session-change operations through the real serve loop, WAL writer and episode executor.
 mod delivery_rig;
+#[path = "session_change/interrupt_cancel.rs"]
+mod interrupt_cancel;
 
 use delivery_rig::*;
 use serde_json::{json, Value};
@@ -167,6 +169,65 @@ async fn refresh(rig: &mut Rig, plan: &Value, policy: &str, generation: u64) -> 
         json!({"plan":plan,"policy":policy,"generation":generation}),
     )
     .await
+}
+
+#[tokio::test]
+async fn compaction_item_refresh_is_refused_before_fetch_and_actor_write() {
+    let (mut rig, admitter, initial) = ready("fixed-compaction-item").await;
+    let mut changed = initial.clone();
+    changed["compaction_item"] = json!({"provider":"ck-mc","preset":"head","params":{}});
+    changed["composition"]["compaction"] = json!({"provider":"ck-mc"});
+    changed["composition"]["providers"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"provider":"ck-mc","tools":[]}));
+    changed["composition_digest"] = json!(
+        cortexkit_role_tool_provider::catalog::composition_digest(&changed["composition"]).unwrap()
+    );
+    let before = rig.wal_bytes();
+    let fetched = admitter.0.load(Ordering::SeqCst);
+    let refused = error(&refresh(&mut rig, &changed, "immediately", 1).await);
+    assert_eq!(refused["code"], "invalid_params");
+    assert_eq!(refused["detail"]["field"], "plan.compaction_item");
+    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(admitter.0.load(Ordering::SeqCst), fetched);
+
+    let mut manifest = rig
+        .records()
+        .into_iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::RunStarted {
+                manifest: Some(manifest),
+                ..
+            } => Some(manifest),
+            _ => None,
+        })
+        .unwrap();
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(changed.to_string()).unwrap();
+    manifest.plan_identity = broca_fetch_plan::plan_identity(&changed).unwrap();
+    let outcome = rig
+        .registry()
+        .route_session_refresh(&rig.session, 1, "immediately".into(), manifest)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, broca_module::actor::SessionRefreshOutcome::Refused(broca_module::serve::SessionChangeError::InvalidParams { field, .. }) if field == "plan.compaction_item")
+    );
+    assert_eq!(rig.wal_bytes(), before);
+
+    let mut composition_only = initial;
+    composition_only["composition"]["opaque"] = json!({"updated":true});
+    composition_only["composition_digest"] = json!(
+        cortexkit_role_tool_provider::catalog::composition_digest(&composition_only["composition"])
+            .unwrap()
+    );
+    assert_eq!(
+        refresh(&mut rig, &composition_only, "immediately", 1)
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
 }
 
 async fn baseline(rig: &mut Rig) -> Value {

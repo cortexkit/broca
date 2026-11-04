@@ -264,6 +264,19 @@ fn item(value: &Value, at: &str, may_be_optional: bool) -> Result<Item, Refusal>
     })
 }
 
+/// New compaction sessions need an explicit provider preset. Keep this separate
+/// from decoding frozen legacy plans, whose optional selector remains replayable.
+pub fn require_compaction_preset(plan: &Plan) -> Result<(), Refusal> {
+    if plan
+        .compaction_item
+        .as_ref()
+        .is_some_and(|item| item.preset.is_none())
+    {
+        return Err(Refusal::invalid("plan.compaction_item.preset"));
+    }
+    Ok(())
+}
+
 pub(crate) fn items(
     plan: &Map<String, Value>,
     list: &str,
@@ -387,6 +400,13 @@ pub fn parse_plan_with(
     compaction: CompactionSupport,
     output_refs: OutputRefsSupport,
 ) -> Result<Plan, Refusal> {
+    if let Some(object) = plan.as_object() {
+        cortexkit_role_llm_runner::sender_succession::check_plan(
+            object,
+            &[cortexkit_role_llm_runner::capabilities::SENDER_SUCCESSION],
+        )
+        .map_err(Refusal::invalid)?;
+    }
     check_output_refs(plan, output_refs)?;
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
     let tool_items = items(object, "tool_items", true)?;
@@ -516,6 +536,9 @@ pub fn parse_plan_with(
         return Err(Refusal::invalid("plan.composition"));
     }
 
+    // A missing compaction preset is refused at admission of a new plan
+    // (`require_compaction_preset`), not here: frozen legacy plans without one must keep
+    // decoding when their sessions are read or resumed.
     // Reader releases can replay compaction records but cannot serve the writer surface.
     // Refuse before admission starts any provider fetch or declaration.
     if compaction == CompactionSupport::Unsupported && compaction_item.is_some() {
@@ -531,13 +554,12 @@ pub fn parse_plan_with(
                 && subscription.on_unavailable == OnUnavailable::Pass
             {
                 return Err(Refusal::InvalidParams {
-                    detail: serde_json::to_value(InvalidSubscriptionDetail {
-                        field: "plan.step_transform_items".into(),
-                        item: index,
-                        subscription: position,
-                        problem: "approve_on_unavailable_pass".into(),
-                    })
-                    .expect("a subscription detail is JSON"),
+                    detail: serde_json::json!({
+                        "field": "plan.step_transform_items",
+                        "item": index,
+                        "subscription": position,
+                        "problem": "approve_on_unavailable_pass",
+                    }),
                 });
             }
             if subscription.budget_ms > broca_protocol::STEP_TRANSFORM_HOOK_CAP {
@@ -573,6 +595,34 @@ mod sender_tests {
 
     fn senders(value: Value) -> Result<Vec<PlanSender>, Refusal> {
         plan_senders(json!({ "senders": value }).as_object().unwrap())
+    }
+
+    #[test]
+    fn succession_is_checked_before_ordinary_plan_fields() {
+        for (senders, field) in [
+            (
+                json!([{"module":"a","succeeds":"a"}]),
+                "plan.senders[0].succeeds",
+            ),
+            (
+                json!([{"module":"b","succeeds":""}]),
+                "plan.senders[0].succeeds",
+            ),
+            (
+                json!([{"module":"b","succeeds":null}]),
+                "plan.senders[0].succeeds",
+            ),
+            (
+                json!([{"module":"b","succeeds":"a"},{"module":"c","succeeds":"a"}]),
+                "plan.senders[1].succeeds",
+            ),
+        ] {
+            assert_eq!(
+                parse_plan(&json!({"senders":senders}), CompactionSupport::Unsupported)
+                    .unwrap_err(),
+                Refusal::invalid(field)
+            );
+        }
     }
 
     #[test]

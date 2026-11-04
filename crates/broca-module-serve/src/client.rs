@@ -461,6 +461,7 @@ fn send_params(spec: SendSpec<'_>) -> SendRequest {
     SendRequest {
         plan: spec.plan,
         params: SendParams {
+            route_decision_id: None,
             content: Vec::new(),
             directives: None,
             session_class: spec.session_class.map(str::to_owned),
@@ -634,18 +635,21 @@ mod tests {
     #[test]
     fn typed_read_matches_legacy_double_parse() {
         let read = ReadResult {
+            history_version: 1,
+            incarnation: "00112233445566778899aabbccddeeff".into(),
             next_late_after: None,
             deferred_calls: None,
             late_approvals: None,
             open_batch: None,
-            // Absent: this fixture pins the DECODE shape of a legacy page, and a legacy
-            // lineage genuinely has no id until its next write mints one.
+            // An unframed legacy log has a minted snapshot incarnation, but no lineage frame.
             lineage_id: None,
             messages: vec![broca_wire::SessionReadMessage {
+                client_message_id: None,
+                tool_times: Vec::new(),
                 rich_ui: None,
                 written_at: None,
                 delivered_as: None,
-                tags: Vec::new(),
+                part_keys: None,
                 run: None,
                 ordinal: 7,
                 mid: "m7".into(),
@@ -843,6 +847,7 @@ mod tests {
         assert_request_preserves_legacy_shape("session.import", &import);
 
         let send = SendParams {
+            route_decision_id: None,
             content: Vec::new(),
             directives: None,
             session_class: None,

@@ -7,8 +7,7 @@
 //! - `tool_result`: when a tool batch of the running turn has just finished with a text or error
 //!   result to carry the send's text, and the send's input is text only. Decided as the batch
 //!   commits, so the delivery record sits before the turn's `TurnFinished`.
-//! - `turn_system`: never possible in this build ([`TURN_SYSTEM_TEMPLATE_UNIMPLEMENTED`]); the
-//!   list falls through to its next mode.
+//! - `turn_system`: rendered template text at a confirmed provider route and legal position.
 //! - `steer`: at every step boundary of a running turn.
 //! - `idle_start`: when the session is idle; the actor drains the send into a new run.
 //!
@@ -27,6 +26,8 @@ use std::sync::Arc;
 pub struct Boundary {
     /// A tool batch has just finished with a result that can carry text.
     pub tool_result: bool,
+    /// The route accepts a turn-scoped system entry at this position.
+    pub turn_system: bool,
     /// A turn is running and will render another step.
     pub running: bool,
     /// The session is idle and may start a run.
@@ -38,6 +39,7 @@ impl Boundary {
     pub fn tool_batch(carrier: bool) -> Self {
         Self {
             tool_result: carrier,
+            turn_system: false,
             running: true,
             idle: false,
         }
@@ -46,6 +48,7 @@ impl Boundary {
     /// A step boundary of a running turn.
     pub const STEP: Self = Self {
         tool_result: false,
+        turn_system: false,
         running: true,
         idle: false,
     };
@@ -53,6 +56,7 @@ impl Boundary {
     /// An idle session.
     pub const IDLE: Self = Self {
         tool_result: false,
+        turn_system: false,
         running: false,
         idle: true,
     };
@@ -67,7 +71,7 @@ pub fn choose_mode(
 ) -> Option<DeliveryMode> {
     order.modes.iter().copied().find(|mode| match mode {
         DeliveryMode::ToolResult => boundary.tool_result && has_text,
-        DeliveryMode::TurnSystem => false,
+        DeliveryMode::TurnSystem => boundary.turn_system && has_text && order.template.is_some(),
         DeliveryMode::Steer => boundary.running,
         DeliveryMode::IdleStart => boundary.idle,
         _ => false,
@@ -104,6 +108,17 @@ pub fn carrier<'a>(results: impl IntoIterator<Item = &'a ToolResult>) -> Option<
                 ToolOutput::Text { .. } | ToolOutput::Error { .. }
             )
         })
+        .last()
+        .map(|result| &result.tool_call_id)
+}
+
+/// Mode-3 renders delivered text after the result, independently of its native
+/// output kind. Called only for the newly completed batch's first placement.
+pub fn carrier_mode3<'a>(
+    results: impl IntoIterator<Item = &'a ToolResult>,
+) -> Option<&'a ToolCallId> {
+    results
+        .into_iter()
         .last()
         .map(|result| &result.tool_call_id)
 }
@@ -209,6 +224,26 @@ pub fn steered(send: &OrderedSend, run_id: &RunId) -> WalRecord {
         run_id: run_id.clone(),
         mode: DeliveryMode::Steer,
         input: Some(Arc::new(send.input.clone())),
+        tool_call_id: None,
+        appended_text: None,
+    }
+}
+
+/// Freeze a rendered template at its conversation position. Admission chooses whether
+/// system authority is possible; replay uses the stored message without re-rendering slots.
+pub fn system_delivered(send: &OrderedSend, run_id: &RunId) -> WalRecord {
+    let mut input = send.input.clone();
+    for message in &mut input {
+        message.role = Role::System;
+        message.turn_system = true;
+    }
+    WalRecord::SendDelivered {
+        written_at_ms: send.admitted_at_ms,
+        tags: None,
+        submission_id: send.submission_id.clone(),
+        run_id: run_id.clone(),
+        mode: DeliveryMode::TurnSystem,
+        input: Some(Arc::new(input)),
         tool_call_id: None,
         appended_text: None,
     }

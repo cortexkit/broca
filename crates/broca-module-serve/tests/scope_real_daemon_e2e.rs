@@ -38,6 +38,12 @@ const SCOPE_EPOCH: u64 = 7;
 /// out with corr `SCOPE_SYNC_CORR_BASE + n`, and its reply is recorded under that corr.
 const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 
+#[path = "scope_real_daemon_e2e/compaction_routes.rs"]
+mod compaction_routes;
+
+#[path = "scope_real_daemon_e2e/compose_plan.rs"]
+mod compose_plan;
+
 #[derive(Default)]
 struct AcceptanceCatalog {
     fetched: std::sync::atomic::AtomicBool,
@@ -90,6 +96,32 @@ impl subc_client_rs::ModuleHandler for AcceptanceCatalog {
     }
 }
 
+fn worker_acceptance_scope(checkout: &Path) -> serde_json::Value {
+    serde_json::json!([{
+        "ref": SCOPE_REF, "scope_epoch": SCOPE_EPOCH, "kind": "head",
+        "workdir": checkout, "attributes": {},
+        "carriers": [{
+            "principal": {"kind": "reserved", "module_id": "broca"},
+            "targets": ["aft"],
+        }],
+    }])
+}
+
+#[test]
+fn worker_acceptance_scope_authorizes_broca_for_aft() {
+    let scopes = worker_acceptance_scope(Path::new("/fixture/checkout"));
+    let _: Vec<subc_protocol::scope::ScopeRecord> = serde_json::from_value(scopes.clone())
+        .expect("the fixture follows the daemon's scope schema");
+    assert_eq!(
+        scopes[0]["carriers"],
+        serde_json::json!([{
+            "principal": {"kind": "reserved", "module_id": "broca"},
+            "targets": ["aft"],
+        }]),
+        "broca must carry the owner's scope to the plan's AFT provider"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_admission_acceptance_reads_real_run_started_gates() {
     use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, ProviderRole, Tool};
@@ -124,6 +156,145 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
         .join("../..")
         .canonicalize()
         .unwrap();
+
+    let now_ms = || {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+    };
+    let restart_observed_at_ms = now_ms();
+    let placement_report = rig.dir.join("placement.json");
+    std::fs::write(
+        &placement_report,
+        serde_json::to_vec(&serde_json::json!({
+            "restart_observed_at_ms": restart_observed_at_ms,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    broca_test_support::wait_until(
+        "an admission timestamp after the restart boundary",
+        || async {
+            if now_ms() > restart_observed_at_ms {
+                Ok(())
+            } else {
+                Err("the clock is still at the restart boundary".into())
+            }
+        },
+    )
+    .await;
+
+    // The rig's authenticated owner registers a scope with a real checkout.
+    // The acceptance script only observes the worker the owner admits below.
+    let checkout = rig.dir.join("acceptance-checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let checkout = checkout.canonicalize().unwrap();
+    rig.sync_scopes(worker_acceptance_scope(&checkout), 1).await;
+    let owner = std::sync::Arc::new(rig.connect_as(OWNER, &rig.owner_nonce).await);
+    let session = rig.session("worker-admission-acceptance");
+    let route = open_scoped(&owner, &session).await.unwrap();
+    let scope = broca_protocol::SessionScope {
+        owner: broca_protocol::BindPrincipal::Reserved {
+            module_id: OWNER.into(),
+        },
+        scope_ref: SCOPE_REF.into(),
+        scope_epoch: SCOPE_EPOCH,
+        flow_id: None,
+        sender: None,
+        agent_id: None,
+        run_id: None,
+    };
+    // The daemon validates the same registered scope on catalog and management routes.
+    let fetcher =
+        broca_subc::SubcPlanFetcher::new(owner.clone(), session.clone(), Some(scope.clone()));
+    let items = serde_json::from_slice(
+        &std::fs::read(root.join("scripts/fixtures/acceptance-reader-plan.json")).unwrap(),
+    )
+    .unwrap();
+    let plan = broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE)
+        .await
+        .expect("compose through the owner's real scoped AFT route");
+    fetcher.close().await;
+    let mut params = serde_json::json!({
+        "prompt": "Reply only OK. Do not call tools.",
+        "model": {"provider": "mock", "model": "mock-model"},
+        "session_class": "mason", "plan": plan,
+    });
+    let stale = scope_request(&owner, &route, "session.send", params.clone())
+        .await
+        .expect_err("the changed AFT catalog refuses the stale composition before admission");
+    assert!(stale.to_string().contains("plan_stale"), "{stale}");
+    params["plan"] =
+        broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE)
+            .await
+            .expect("recompose once after the catalog change");
+    fetcher.close().await;
+    let admitted = scope_request(&owner, &route, "session.send", params)
+        .await
+        .expect("admit the scoped worker with the refreshed AFT composition");
+    assert_eq!(admitted["result"]["state"], "active");
+    let run = admitted["result"]["run_id"].as_str().unwrap();
+    completed_run(&owner, &route, run).await;
+
+    let mut storage = session.clone();
+    storage.project_root = checkout;
+    let wal = std::fs::read(rig.wal_path(&storage)).unwrap();
+    let starts = run_started_frame_requires(&wal);
+    assert_eq!(starts.len(), 1, "only the refreshed plan was admitted");
+    let requires = starts[0].as_ref().expect("RunStarted is feature-gated");
+    for feature in ["session-class/v1", "provider-declarations/v1", "scope/v1"] {
+        assert!(
+            requires.iter().any(|name| name == feature),
+            "missing {feature}"
+        );
+    }
+    let records = broca_wal::replay_file(rig.wal_path(&storage), broca_wal::DEFAULT_MAX_READ_BYTES)
+        .expect("read the daemon-written worker WAL");
+    let (frozen_scope, class, manifest) = records
+        .iter()
+        .find_map(|framed| match &framed.record {
+            broca_wal::WalRecord::RunStarted {
+                scope,
+                session_class,
+                manifest,
+                ..
+            } => Some((scope, session_class, manifest)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(frozen_scope.as_ref(), Some(&scope));
+    assert_eq!(class.as_deref(), Some("mason"));
+    let aft = manifest
+        .as_ref()
+        .unwrap()
+        .fetches
+        .iter()
+        .find(|fetch| fetch.provider == "aft")
+        .expect("admission froze the AFT fetch");
+    let broca_wal::FetchOutcome::Answered {
+        declarations_frozen: Some(declarations),
+        ..
+    } = &aft.outcome
+    else {
+        panic!("the admitted AFT fetch has no frozen declarations");
+    };
+    assert_eq!(declarations.late_results, Some(true));
+    assert!(declarations
+        .result_formats
+        .as_ref()
+        .is_some_and(|formats| !formats.is_empty()));
+    assert!(records.iter().any(|framed| matches!(
+        framed.record,
+        broca_wal::WalRecord::RunFinished {
+            reason: broca_protocol::RunFinishReason::Completed,
+            ..
+        }
+    )));
+
     let output = Command::new("python3")
         .arg(root.join("scripts/acceptance-worker-turn.py"))
         .arg("--session-bin")
@@ -134,7 +305,10 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
         .arg(&rig.state_root)
         .arg("--project-root")
         .arg(&rig.dir)
-        .args(["--model", "mock/mock-model", "--timeout", "30"])
+        .arg("--placement-report")
+        .arg(&placement_report)
+        .args(["--timeout", "30"])
+        .env("BROCA_BIN", env!("CARGO_BIN_EXE_ck-broca"))
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
         .await
@@ -162,7 +336,12 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
         output.status.success(),
         "worker admission acceptance failed"
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("recomposing once"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PASS -- admitted, completed"));
+    assert!(stdout.contains("class=mason"));
+    assert!(stdout.contains("candidates=1"));
+    assert!(stdout.contains("terminal_counts=completed:1"));
+    assert!(!stdout.contains("scope answer"));
 }
 
 fn sibling_bin(name: &str, env_key: &str) -> PathBuf {
@@ -173,6 +352,90 @@ fn sibling_bin(name: &str, env_key: &str) -> PathBuf {
 /// daemon is a failure that names itself; a bare local run may still skip, out loud.
 fn require_subc() -> bool {
     std::env::var_os("BROCA_REQUIRE_SUBC").is_some()
+}
+
+async fn broca_management_ready<T, Open, Opened>(mut open: Open) -> T
+where
+    Open: FnMut() -> Opened,
+    Opened: std::future::Future<Output = Result<T, broca_subc::ConnError>>,
+{
+    broca_test_support::wait_until("broca's sessionless management bind", || {
+        let opened = open();
+        async move {
+            match opened.await {
+                Ok(route) => Ok(route),
+                Err(error) if error.code() == Some("module_warming") => Err(error.to_string()),
+                Err(error) => panic!("broca startup readiness failed: {error}"),
+            }
+        }
+    })
+    .await
+}
+
+fn warming_refusal(code: &str) -> broca_subc::ConnError {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "code": code, "message": "broca is supervised but not available",
+    }))
+    .unwrap();
+    broca_subc::ConnError::Rejected(
+        broca_subc::connection::RejectedMessage::from_error_frame_body_for_test(&body),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn rig_readiness_waits_for_a_live_management_bind() {
+    let attempts = std::cell::Cell::new(0);
+    let opened = broca_management_ready(|| {
+        attempts.set(attempts.get() + 1);
+        std::future::ready(if attempts.get() == 3 {
+            Ok("management route")
+        } else {
+            Err(warming_refusal("module_warming"))
+        })
+    })
+    .await;
+    assert_eq!(opened, "management route");
+    assert_eq!(attempts.get(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn rig_readiness_refuses_nonwarming_errors_without_retrying() {
+    use futures::FutureExt;
+    for error in [
+        warming_refusal("permission_denied"),
+        warming_refusal("module_reloading"),
+        broca_subc::ConnError::Rejected("module_warming in plain text".into()),
+        broca_subc::ConnError::Transport("connection lost".into()),
+    ] {
+        let expected = error.to_string();
+        let error = std::cell::RefCell::new(Some(error));
+        let attempts = std::cell::Cell::new(0);
+        let start = tokio::time::Instant::now();
+        let panic = std::panic::AssertUnwindSafe(broca_management_ready(|| {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Err::<(), _>(
+                error
+                    .borrow_mut()
+                    .take()
+                    .expect("must not retry a terminal error"),
+            ))
+        }))
+        .catch_unwind()
+        .await
+        .expect_err("a non-warming refusal must fail readiness");
+        let report = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                panic
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+            })
+            .expect("readiness panic is text");
+        assert!(report.contains(&expected), "{report}");
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
 }
 
 async fn project_identity_open(
@@ -199,10 +462,16 @@ async fn project_identity_open(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn project_identity_existing_unscoped_and_scoped_resume_on_legacy_addresses() {
-    for scoped in [false, true] {
+    for (scoped, old_folder) in [
+        (false, "legacy-one"),
+        (false, "legacy-two"),
+        (true, "legacy-one"),
+        (true, "legacy-two"),
+    ] {
         let Some(rig) = Rig::start().await else {
             return;
         };
+        rig.wait_for_broca_ready().await;
         if scoped {
             rig.sync_scopes(
                 serde_json::json!([{
@@ -214,11 +483,24 @@ async fn project_identity_existing_unscoped_and_scoped_resume_on_legacy_addresse
             .await;
         }
         let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
-        let legacy = rig.session(if scoped {
+        let mut legacy = rig.session(if scoped {
             "scoped-resume"
         } else {
             "athena-seat"
         });
+        let old_root = rig.dir.join(old_folder);
+        std::fs::create_dir_all(&old_root).unwrap();
+        legacy.project_root = old_root.canonicalize().unwrap();
+        // Reserve a pre-existing directory-root identity independently of today's wire bind.
+        let inventory =
+            broca_store::SqliteStore::open(rig.state_root.join("run-index.db")).unwrap();
+        broca_core::SessionRefIndex::record_session(
+            &inventory,
+            &broca_core::session_addr(&legacy),
+            &legacy,
+        )
+        .unwrap();
+        drop(inventory);
         let route = project_identity_open(&owner, &legacy, scoped).await;
         let first = send(&owner, &route, "first-consult-round").await.unwrap();
         let run_id = first["result"]["run_id"].as_str().unwrap().to_owned();
@@ -301,6 +583,34 @@ async fn project_identity_new_scoped_session_uses_stamped_workdir() {
     assert!(!rig.wal_path(&route_identity).exists());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn project_identity_new_unscoped_session_uses_namespace_under_state_root() {
+    let Some(rig) = Rig::start().await else {
+        return;
+    };
+    let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
+    let mut claimed = rig.session("new-unscoped");
+    claimed.project_root = rig.dir.canonicalize().unwrap();
+    let route = project_identity_open(&owner, &claimed, false).await;
+    send(&owner, &route, "first").await.unwrap();
+    let expected =
+        broca_protocol::BindIdentity::new("broca-unscoped-v1", &claimed.harness, &claimed.session);
+    let path = rig.wal_path(&expected);
+    assert_eq!(path.parent(), Some(rig.state_root.join("wal").as_path()));
+    assert!(path.exists());
+    assert!(!rig.wal_path(&claimed).exists());
+    let inventory =
+        broca_store::SqliteStore::open_read_only(rig.state_root.join("run-index.db")).unwrap();
+    let reference = broca_core::agent_session_ref(&expected);
+    let snapshot = inventory
+        .session_refs(std::iter::once(reference.as_str()))
+        .unwrap();
+    assert_eq!(
+        snapshot.sessions[&reference],
+        (broca_core::session_addr(&expected), expected)
+    );
+}
+
 struct Rig {
     child: Child,
     dir: PathBuf,
@@ -338,10 +648,37 @@ impl Rig {
         Self::start_configured(None, None, None).await
     }
 
+    async fn start_with_compaction_writer() -> Option<Self> {
+        Self::start_configured_with_compaction_writer(None, None, None, true).await
+    }
+
+    fn write_compaction_config(config_home: &Path) -> PathBuf {
+        let path = config_home.join("cortexkit/broca.jsonc");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "bus_run_events_enabled": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
     async fn start_configured(
         binary: Option<&Path>,
         state: Option<&Path>,
         model_url: Option<&str>,
+    ) -> Option<Self> {
+        Self::start_configured_with_compaction_writer(binary, state, model_url, false).await
+    }
+
+    async fn start_configured_with_compaction_writer(
+        binary: Option<&Path>,
+        state: Option<&Path>,
+        model_url: Option<&str>,
+        compaction_writer: bool,
     ) -> Option<Self> {
         let subc_core = sibling_bin("ck-subc", "SUBC_CORE_BIN");
         let stub = sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
@@ -449,7 +786,7 @@ impl Rig {
                 "reserved": true,
             })
         };
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "version": 1,
             "scope_authority_owners": [OWNER],
             "modules": {
@@ -479,6 +816,12 @@ impl Rig {
                 })),
             }
         });
+        if compaction_writer {
+            // Broca calls compaction providers only when bus events are enabled. Without that
+            // startup switch, admission refuses every compaction item before asking its provider.
+            config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] =
+                serde_json::json!(Self::write_compaction_config(&config_home));
+        }
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 
         let connection_file = runtime_dir.join("subc-connection.json");
@@ -578,6 +921,29 @@ impl Rig {
         Some(rig)
     }
 
+    async fn wait_for_broca_ready(&self) {
+        // The process image and connection file can precede store initialization and
+        // HELLO. A permissions-role bind observes readiness without creating a session.
+        let connection =
+            SubcConnection::connect_with_consumer_identity(&self.connection_file, None)
+                .await
+                .expect("connect for broca readiness");
+        let identity = broca_protocol::BindIdentity::new("broca-unscoped-v1", "", "");
+        let route = broca_management_ready(|| {
+            connection.route_open_management_roles_within(
+                "broca",
+                &identity,
+                std::collections::BTreeMap::from([("permissions".into(), "v1".into())]),
+                RouteOpenRetry::within(Duration::ZERO, Duration::ZERO),
+            )
+        })
+        .await;
+        connection
+            .route_close(&route)
+            .await
+            .expect("close readiness route");
+    }
+
     async fn wait_for_file(&self, path: &Path) -> String {
         broca_test_support::wait_until("scope rig marker file", || async {
             if let Ok(text) = std::fs::read_to_string(path) {
@@ -661,9 +1027,7 @@ impl Rig {
     }
 
     fn session(&self, name: &str) -> broca_protocol::BindIdentity {
-        // Canonical, as broca keys it: on macOS the scratch root sits under /var, a symlink to
-        // /private/var, and the WAL address is derived from the resolved project root.
-        broca_protocol::BindIdentity::new(self.dir.canonicalize().unwrap(), "scope-e2e", name)
+        broca_protocol::BindIdentity::new("broca-unscoped-v1", "scope-e2e", name)
     }
 
     fn wal_path(&self, session: &broca_protocol::BindIdentity) -> PathBuf {
@@ -1196,6 +1560,7 @@ async fn real_basal_sender_guard_protects_other_runs_and_allows_own_flow() {
     let Some(rig) = Rig::start().await else {
         return;
     };
+    rig.wait_for_broca_ready().await;
     rig.sync_scope_with(Some("flow-a"), 1).await;
     let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
     let basal = rig.connect_as(CARRIER, &rig.carrier_nonce).await;
@@ -2187,10 +2552,12 @@ async fn real_unscoped_session_uses_only_attested_first_sender() {
         .await;
     let direct = SubcConnection::connect(&rig.connection_file).await.unwrap();
     let session = rig.session("unscoped-owner-cleanup");
-    let sending = owner
-        .route_open_management("broca", &session)
-        .await
-        .unwrap();
+    let sending = broca_test_support::wait_for(
+        "live broca management route for unscoped owner",
+        project_identity_open(&owner, &session, false),
+        || broca_test_support::rig_process_logs(&rig.dir, "daemon"),
+    )
+    .await;
     let started = send(&owner, &sending, "first").await.unwrap();
     let run_id = started["result"]["run_id"].as_str().unwrap();
     model.wait_request().await;

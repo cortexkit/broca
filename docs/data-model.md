@@ -53,6 +53,9 @@ take it (`crates/broca-module-serve/src/state_root_lock.rs`).
 The WAL is the source of truth. Everything in `run-index.db` is derived from it, although
 not all of it can be regenerated (section 4 says which parts cannot).
 
+Format-2 roots created before the final wiring release must be recreated; these development
+roots are identified by a `run-index.db` file beside `state-format`.
+
 
 broca creates the WAL directory, WAL files and archive containers owner-only (`0700`
 directories, `0600` files), and restricts `run-index.db` and its `-wal`/`-shm` sidecars to
@@ -154,6 +157,15 @@ The encoder adds a record's own requirements itself, so a `run_started` with a `
 `steered` record, can only be written as `ver = 3`.
 Builds before the gate refuse `ver = 3` as "unsupported WAL framing version 3".
 
+`compaction-v2/v1` covers `compaction_view_v2`, `compaction_marker`,
+`compaction_view_applied_v2` and the optional
+`run_started.compaction_plan_version`. Each requires a gated frame; a reader missing the
+feature refuses the WAL by that name. Reader support shipped before the writer: the reader
+release (0.3.306) decodes these records, ignores them in every projection, and serves any log
+that requires this feature read-only, so a rollback to it can't run such a session. The mode-3
+writer rebuilds accepted views, validates checksums and marker identity, and records the view
+selected for each step. `RunConfig.global_system`, when present, requires the same feature.
+
 **The feature floor.** Before the first frame that requires a feature, the writer adds the
 feature to `wal-feature-floor` in the state root (next to `wal/`): one name per line, sorted,
 written to a temporary file and renamed over the old one, and only ever grown. If the floor
@@ -229,6 +241,7 @@ pause) does **not** write a new `run_started`; it continues under the same `run_
 | `input` | array of `Message` | required | The user input for this run. |
 | `origin` | object tagged by `kind` | defaulted `{"kind":"fresh"}` | `fresh`, or `seeded_from` (import/fork) with `origin_kind` (`import`/`fork`), `source_ref`, optional `origin_device_pseudonym` (16 bytes), optional `base_seq`. |
 | `submission_id` | string | absent | Set when the run consumed a queued submission. |
+| `compaction_plan_version` | u32 | absent | **Must-understand, feature `compaction-v2/v1`.** The compaction render-plan version frozen for a mode-3 run. Omitted when unset, so existing `run_started` bytes are unchanged. A record carrying it requires a `ver = 3` frame. An unfinished run refuses to resume under a different version; a new run after completed older-version history freezes the current version. |
 | `title` | string | absent | The human-readable title the `session.send` that opened this run carried (for a drained queued send, the title its `queued` record carried): 1-200 Unicode scalar values, not blank, no control characters. Informational only and ungated: never rendered into a provider request and not part of routing, cache keys or the request identity digest. Absent when the send carried none and on records written before it existed. |
 | `scope` | `{owner, ref, scope_epoch}` | absent | **Must-understand, feature `scope/v1`.** The scope the session was admitted under, as the subc daemon stamped it on the bind: `owner` is a principal object (`{"kind":"reserved","module_id":…}`), `ref` a string, `scope_epoch` a u64. Frozen at the session's first scoped episode and repeated on every later one. A record carrying it is written only in a `ver = 3` frame requiring `scope/v1`; an unscoped record stays `ver = 1`. Written by admission after its owner check (the scope a send freezes or adopts, or the one the session already froze); the broca release before the one that first writes it already reads it, so rolling back one release still reads the session. |
 | `manifest` | object | absent | **Must-understand, feature `plan-manifest/v1`.** What a session's first send fetched from its tool providers, frozen so every later episode and resume renders from it without fetching again: `plan` (the first `session.send`'s `plan` member exactly as received, opaque), `plan_identity` (SHA-256 of the plan's RFC 8785 (JCS) bytes, 64 lowercase hex), `composition_digest` (64 lowercase hex, the digest the plan stated and the writer verified), `fetches` (array, one per provider fetched, sorted by provider id bytewise; each is flat: an answered fetch is `{provider, catalog_digest, tools, text}` with `tools` exactly as the provider answered (empty for a provider asked only for system text) and `text` the system text it answered, omitted when no system-text item was asked of it and `""` when present and empty; an absent fetch is `{provider, absent}`, an optional text-only item that did not answer, with `absent` an open reason string such as `timeout`, `unknown_module` or `refused:<code>`; a fetch with both `catalog_digest` and `absent` does not decode, and one with neither decodes as a state from a later build and is never written), `tools` (array of `Tool`, as in `RunConfig.tools`, in the order offered to the model), `system_text` (the joined system text), `system_digest`, `join_version` (u32) and `role_versions` (object, role name to version string). The plan's own layout is never WAL schema, so the plan can grow without a WAL change. `plan` is opaque JSON stored as a JSON **string** holding the JSON text, so its key order, number spellings and escapes survive a decode exactly (an embedded value would not: `run_started` is decoded through serde's internally tagged buffer, which re-sorts keys and re-spells numbers). A record carrying it is written only in a `ver = 3` frame requiring `plan-manifest/v1`. Written on the `run_started` of every episode of a session whose first send carried a fetch plan (the first episode freezes it; later ones repeat it, so episodes left after a fold still carry it); the WAL raises its feature floor to `plan-manifest/v1` before the first such frame. The system texts are joined in plan order with `"\n\n"` under `join_version` 1, an empty text adding neither bytes nor a separator. |
@@ -243,6 +256,12 @@ absent); `stop_when` (array, absent when empty). `frozen_render_config`,
 `provider_options` and `cache_tiers` are opaque provider blobs (see section 7). Note that
 `frozen_render_config` can contain a `project_id` key of its own (Google Code Assist's
 GCP project), which is not `run_started.project_id`.
+
+`global_system` is an optional array of native system messages, omitted unless a mode-3 run
+without a fetch plan has global instructions. It requires `compaction-v2/v1`. Global
+instructions are provider configuration, not transcript entries: they consume no ordinal or
+mid. Planned mode-3 runs take their instructions from their own frozen `manifest.system_text`
+and omit this member. Legacy runs omit it and retain their original input layout.
 
 **`run_finished`**: closes the episode (not the session: a later `run_started` can open
 the next one). Synced before the caller sees the terminal.
@@ -429,7 +448,7 @@ member yet: the reader must ship in a release before the writer is enabled.
 | `steered` | `send_id` (absent), `request_identity_digest` (absent), `delivery` (absent; `"steer"`), `title` (absent; the steering send's title, informational like `run_started.title`), `input` (the user message(s), after any pre-user transformations), `hooks` (absent; optional pre-user hook metadata, written alongside the prepared `input`). **Must-understand, feature `steer-queue/v1`**: always a `ver = 3` frame. A message a caller added to the running turn. |
 | `delivery_ordered` | `submission_id`, `order` (`{modes, dedupe_key?, expires_at_ms?}`). **Must-understand, feature `delivery-order/v1`**. The ordered `delivery` list of the `queued` record for the same submission that follows it in the same barrier (a running turn's own records may lie between them). Written only for a send using the `delivery_order` group. |
 | `send_ended` | `submission_id`, `reason` (`{kind: "superseded", by}` or `{kind: "expired"}`). **Must-understand, feature `delivery-order/v1`**. A queued ordered send that will never be delivered; removes it from the pending queue like `retracted`. |
-| `send_delivered` | `submission_id`, `run_id`, `mode` (`"steer"` or `"tool_result"`), `input` (with `steer`: placed like a `steered` record's input), `tool_call_id` and `appended_text` (with `tool_result`: rendered after that result's stored output, which is never changed; written between the batch's `tool_batch_finished` and `turn_finished`). **Must-understand, feature `delivery-order/v1`**. Consumes the queued send; an `idle_start` delivery is the `run_started` naming its `submission_id`. |
+| `send_delivered` | `submission_id`, `run_id`, `mode` (`"steer"`, `"tool_result"`, or `"turn_system"`), `input` (with `steer` or `turn_system`: placed like a `steered` record's input), `tool_call_id` and `appended_text` (with `tool_result`: rendered after that result's stored output, which is never changed; written between the batch's `tool_batch_finished` and `turn_finished`). **Must-understand, feature `delivery-order/v1`**. A `turn_system` delivery additionally requires `turn-system/v1`; its system-role input carries `turn_system: true`, preserving its conversation position rather than becoming global instructions. The marker defaults to false and is omitted when false. Every record carrying a marked message requires the feature. Consumes the queued send; an `idle_start` delivery is the `run_started` naming its `submission_id`. |
 
 The pending queue is `queued` minus `retracted` (and `send_ended`) minus those consumed by a
 `run_started` carrying their `submission_id` (or a `send_delivered`). A queued send whose order
@@ -517,6 +536,59 @@ Several records documented above also become must-understand when they carry cer
 (for example `run_started` with a scope, a plan manifest or retention, `run_started` and
 `run_auth_refrozen` whose `auth_selection` carries `auth_method`, and `run_paused` with
 reason `restart`). `WalRecord::required_features` in the same file lists every case.
+
+#### Mode-3 compaction
+
+**`compaction_view_v2`**: a delta for a complete mode-3 view. **Must-understand, feature
+`compaction-v2/v1`**. Acceptance validates the view with the shared library, durably stores
+it and checks its checksum on reconstruction. Acceptance alone never changes the transcript
+or selects what renders; `compaction_view_applied_v2` records that selection separately.
+
+| Field | Type | Rule | Meaning |
+|---|---|---|---|
+| `version` | u64 | required | The view version. |
+| `checksum` | string | required | The view's provider-defined checksum, exactly as the provider gave it. |
+| `edits` | array of `StoredViewEdit` | required | The complete edit order. `{"kind":"full","edit": JSON}` keeps the edit object exactly as received, including unknown members, key order and number spellings. `{"kind":"previous","index": u32}` references that position in the previous view's rebuilt edit list. |
+
+The previous view is the latest earlier accepted `compaction_view_v2` in the log, whether or
+not it was applied. The writer uses a previous
+reference only for a byte-identical edit; every changed edit is full. `broca-wal` exports
+`CompactionViewV2 {version, checksum, edits}` and `StoredViewEdit`; a full edit is a JSON
+`RawValue`, not a string or a dependency on the view library. A first view has no previous
+references. Reconstruction checks every referenced index and recomputes the checksum.
+
+**`compaction_marker`**: a mode-3 cut marker. **Must-understand, feature `compaction-v2/v1`**.
+It is written when a view with a cut first applies, before reporting `marker_written`.
+It anchors numbering without deleting transcript entries. Every marker's harness and session
+must match the loaded session before Setup or rendering.
+
+| Field | Type | Rule | Meaning |
+|---|---|---|---|
+| `harness` | string | required | The session's harness. |
+| `session` | string | required | The session name. |
+| `view_version` | u64 | required | The view that supplied the cut. |
+| `first_kept_mid` | string | required | The first kept message's id. |
+| `first_kept_ordinal` | u64 | required | The first kept message's ordinal. |
+| `checkpoint` | u64 | required | The marker's checkpoint. |
+
+**`compaction_view_applied_v2`**: the mode-3 view selected at a step boundary, before that
+step's request, whenever the view in force changes. This includes a view the compaction provider returns for
+that very request. **Must-understand, feature `compaction-v2/v1`**. The latest applied
+record at or before a step selects the accepted view that step renders; an accepted view
+received after the step opened cannot silently replace it. `compaction_view_v2` only stores
+content. The v1 `compaction_view_applied` remains a separate record with its original bytes
+and replay meaning.
+
+| Field | Type | Rule | Meaning |
+|---|---|---|---|
+| `step_id` | u64 | required | The step whose request first uses this view. |
+| `version` | u64 | required | The selected accepted view's version. |
+| `checksum` | string | required | The selected view's provider-defined checksum, as provided. |
+
+All three records are ignored by full replay, admission and continuation checkpoints, store
+projection, `session.read`, `session.history`, `run.status` and `run.result`. Interleaving
+them changes WAL sequence numbers and offsets, but not message numbering, transcript or
+run state. Their rendering semantics will be implemented by a later writer release.
 
 #### Unknown record types
 
@@ -800,7 +872,7 @@ Usage facts for metering: one row per billing-homogeneous slice of a finished ru
 Older files had a `session` column and a second `fact_id` index; both are dropped when the
 database is opened.
 
-**`segment_json` fields:** `run_id`, `session` (triple object), `segment_ordinal`,
+**`segment_json` fields:** `run_id`, `session` (identity object), `segment_ordinal`,
 `fact_id`, `provider`, `model`, `auth_selection` (credential id or null), `account_ref`,
 `resolved_credential_id`, `vault_request`, `work_class` (these four absent when unset),
 `charge_basis` (`metered_api`, `subscription_included`, `unknown`),
@@ -810,6 +882,13 @@ separate-reasoning normalizer), `usage` (`Usage`, section 2.5), `usage_by_servic
 (absent when no step reported a tier; buckets need not sum to `usage`), `retries_used`,
 `pricing_at_ms`, `pricing_at_precision`, `occurred_at_ms`, `occurred_at_precision`,
 `terminal_reason` (final slice only). New fields are only ever added.
+
+For a session whose frozen storage root is exactly `broca-unscoped-v1`, the fact's
+`session` object contains `harness` and `session` but omits `project_root`: the
+namespace is not a project. Every other root retains the original triple bytes.
+Fact ids still hash the full storage triple, including the namespace for an
+unscoped session; no new no-project marker or id algorithm is introduced. The WAL
+retains that storage root, and existing stored facts and ids are never rewritten.
 
 A slice ends at a refreeze, and also where a model call is answered by another model than the
 slice's: a step routed to the refusal-fallback model (`route`) or served by an Anthropic
@@ -1075,3 +1154,27 @@ are refused before fetch/WAL admission. The frozen sender must remain Basal;
 Basal still cannot read or affect sessions whose first sender is not Basal.
 Usage-export labels are optional `agent_id` and `agent_run_id`, with ordinary
 bytes and `fact_id` unchanged.
+
+## Mode-3 message creation times
+
+A log is mode-3 exactly when its first `RunStarted` has `compaction_plan_version`.
+Later runs do not change the log's classification. `broca_core::is_mode3_log` owns
+that rule; the small head projection caches it as `mode3`, with `None` meaning
+unknown rather than legacy.
+
+For mode-3 logs the transcript projector stores creation times in the existing
+`message.written_at_ms` column. Approval closures use `ApprovalRecorded.closed_at_ms`;
+a `BudgetFired` message uses its run's last earlier timed record. An entry without
+its own time takes the nearest earlier entry's time, or 0 when there is none. No
+future entry is consulted. The projector's incremental head state keeps both the
+last timed record and the previous entry's time, so tail-only appends compute new
+rows without replaying the prefix. The column and that state commit with the same
+projection watermark. Reads consume the stored column; appending cannot change a
+creation time already stored.
+
+Legacy logs retain their existing fold and stored values, including absent times.
+Learning an older cache's missing log-mode proof updates only its head/checkpoint
+metadata, never its message rows. Mode-3 reads use the same fixed fold for a WAL
+suffix not yet represented by the column. An assistant entry's completion stamp
+is its step-end creation stamp, but is exposed only after every tool part is final,
+including pending approvals and provider-held calls.

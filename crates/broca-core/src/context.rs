@@ -50,6 +50,9 @@ pub use model_page::{
 /// counters it reflects + the WAL seq watermark + the context epoch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePrefix {
+    /// Refusal state at this watermark. None means an older writer did not record it;
+    /// the prior must then be reconstructed from the complete WAL, not an empty seed.
+    pub refusal: Option<crate::refusal_fallback::RefusalReplayState>,
     /// WAL identity captured in the same transaction as the messages and watermark.
     /// Readers must compare it with the authoritative WAL before merging this prefix.
     pub lineage_id: Option<String>,
@@ -80,6 +83,7 @@ impl StorePrefix {
     /// (the merge then degenerates to a full-WAL replay).
     pub fn empty() -> Self {
         Self {
+            refusal: Some(Default::default()),
             lineage_id: None,
             prefix: Vec::new(),
             completed_steps: 0,
@@ -373,6 +377,7 @@ pub(crate) fn finish_offset_prompt_window(
 /// with the WAL tail would take from it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeldPrefix {
+    pub refusal: Option<crate::refusal_fallback::RefusalReplayState>,
     /// WAL identity captured in the same transaction; compared with the WAL before merging.
     pub lineage_id: Option<String>,
     pub watermark_seq: u64,
@@ -408,6 +413,19 @@ pub struct StorePageRow {
     pub ordinal: u64,
     pub message: Message,
     pub run: Option<crate::RunAttribution>,
+}
+
+/// A bounded neutral-entry page and the exact store boundary it came from.
+/// Native messages are not loaded for this read, so compact tool entries stay compact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionStorePage {
+    pub entries: Vec<crate::compaction_v2::protocol::read::Entry>,
+    pub head: Option<crate::head::HeadProjection>,
+    pub watermark_seq: u64,
+    pub lineage_id: Option<String>,
+    pub anchor: Option<WalByteAnchor>,
+    pub prefix_len: u64,
+    pub has_more: bool,
 }
 
 /// One episode's durable render inputs, with the state of every value separated from the value
@@ -681,6 +699,16 @@ pub trait AdmissionReader: Send + Sync {
         safe_head: u64,
     ) -> Result<crate::run::PriorWalSnapshot, String>;
 
+    /// Sender and template admission additionally require a complete refresh-policy fold.
+    /// Execution-only reads must not repair this optional admission cache for an owner send.
+    fn sender_snapshot(
+        &self,
+        session: &BindIdentity,
+        safe_head: u64,
+    ) -> Result<crate::run::PriorWalSnapshot, String> {
+        self.prior_snapshot(session, safe_head)
+    }
+
     fn paused_episode(
         &self,
         session: &BindIdentity,
@@ -736,6 +764,76 @@ pub struct TagLocation {
 
 /// The materialized store read seam. The loop depends only on this trait.
 pub trait MaterializedStore: Send + Sync {
+    /// Durable snapshot identity is separate from rebuildable transcript rows.
+    fn served_history(&self) -> Option<&dyn crate::ServedHistory> {
+        None
+    }
+
+    /// Cache only the first-run mode proof, never rebuilding legacy message timestamps.
+    fn cache_history_mode(&self, _session: &BindIdentity, _mode3: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// A neutral page from the same transcript projection as native reads. A
+    /// backend without this projection returns None rather than scanning history.
+    fn read_compaction_page(
+        &self,
+        _session: &BindIdentity,
+        _request: &crate::compaction_v2::protocol::read::ReadRequest,
+    ) -> Result<Option<CompactionStorePage>, String> {
+        Ok(None)
+    }
+
+    /// Display facts are an opt-in, per-lineage cache. A missing seed requires one lazy
+    /// backfill for this session only; default transcript reads never call this seam.
+    fn read_display_facts_cache(
+        &self,
+        _session: &BindIdentity,
+        _lineage: &str,
+        _at_seq: u64,
+        _ordinals: &[u64],
+    ) -> Result<Option<crate::display_facts::DisplayFactsCache>, String> {
+        Ok(None)
+    }
+
+    /// Publish fact versions and their complete continuation in one transaction. An expected
+    /// sequence mismatch means another reader won, not permission to overwrite its seed.
+    /// Stores with recovery epochs also reject publication from a pre-cut read ticket.
+    fn publish_display_facts(
+        &self,
+        _session: &BindIdentity,
+        _lineage: &str,
+        _expected_seq: Option<u64>,
+        _expected_epoch: Option<i64>,
+        _seed: &crate::display_facts::DisplayFactsSeed,
+        _versions: &[crate::display_facts::DisplayFactVersion],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Invalidate rebuildable views durably before physical WAL recovery cuts.
+    /// Usage export facts are independent authority and must not be changed.
+    fn invalidate_wal_recovery(
+        &self,
+        _session: &BindIdentity,
+        _cut: &broca_wal::recovery::RecoveryCut,
+    ) -> Result<(), String> {
+        Err("materialized store cannot durably invalidate a WAL recovery".into())
+    }
+    fn needs_wal_recovery_projection(
+        &self,
+        _session: &BindIdentity,
+        _cut_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn reproject_wal_recovery(
+        &self,
+        _session: &BindIdentity,
+        _range: &WalRangeRead,
+    ) -> Result<(), String> {
+        Err("materialized store cannot reproject a WAL recovery".into())
+    }
     fn read_retained_head(
         &self,
         _session: &BindIdentity,
@@ -926,6 +1024,16 @@ pub trait Persister: Send + Sync {
         Ok(watermark)
     }
 
+    /// Explicitly repair unknown sender policy from a complete durable prefix. Ordinary
+    /// projection must not force this migration merely because an owner started a run.
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &WalRangeRead,
+    ) -> Result<u64, String> {
+        self.project_range(session, range)
+    }
+
     /// Persist a derived byte anchor after projection advances its watermark.
     /// Implementations may ignore `None`, which is expected when the backend has no file identity.
     fn persist_wal_anchor(
@@ -940,6 +1048,69 @@ pub trait Persister: Send + Sync {
 /// The combined session-store seam `run_loop` accepts (read + project). A single
 /// `SqliteStore` implements both halves.
 pub trait SessionStore: MaterializedStore + Persister {}
+
+/// Identity candidates are useful even when discovery is incomplete. Only a complete
+/// snapshot can establish absence or uniqueness; candidates still require WAL checks.
+#[derive(Default, Debug)]
+pub struct SessionRefs {
+    pub sessions: std::collections::BTreeMap<String, (String, BindIdentity)>,
+    pub complete: bool,
+}
+
+pub trait SessionRefResolver: Send + Sync {
+    fn resolve_refs(&self, refs: &[&str]) -> Result<SessionRefs, String>;
+    fn named_refs(&self, name: &str, limit: u32) -> Result<SessionRefs, String>;
+}
+
+/// Identity discovery and projection maintenance do not authorize moving a WAL
+/// or record whether an ownership transfer completed.
+pub trait SessionInventory: SessionRefResolver + crate::SessionRefIndex {
+    /// Synchronous preparation for offline maintenance. Serving starts repair
+    /// through shared readiness instead of blocking on this operation. An empty
+    /// or unfinished census must remain incomplete until repair has finished.
+    fn prepare_inventory(&self, root: &std::path::Path) -> Result<(), String>;
+    fn rebuild_inventory(&self, root: &std::path::Path) -> Result<(), String>;
+    fn retained_sessions(&self) -> Result<Vec<BindIdentity>, String>;
+    fn forget_projection(&self, session: &BindIdentity) -> Result<(), String>;
+}
+
+/// Advisory recovery candidates only. The recovery service must confirm each
+/// candidate against the durable WAL before resuming or interrupting a run.
+pub trait RecoveryDiscovery: Send + Sync {
+    fn active_runs(&self) -> Result<Vec<(String, BindIdentity)>, String>;
+    fn restart_resume_candidates(&self) -> Result<Vec<(String, BindIdentity)>, String>;
+    fn withdrawal_candidates(&self) -> Result<Vec<WithdrawalRun>, String>;
+}
+
+/// Identity-only billing exclusions durable before a moved session can be served
+/// or billed. The move coordinator keeps its irreversible activation intent
+/// fenced until installation and cut completion recover; the SQL commit does not
+/// include the filesystem rename or cut completion. Abort before activation writes
+/// no exclusions. Projection replacement and retention preserve these facts.
+pub trait ImportedRunExclusions: Send + Sync {
+    fn record_imported_runs(
+        &self,
+        session: &BindIdentity,
+        cut_id: &str,
+        run_ids: &[RunId],
+    ) -> Result<(), ExportError>;
+    fn is_imported_run(&self, session: &BindIdentity, run_id: &RunId) -> Result<bool, ExportError>;
+}
+
+impl<T: ExportIndex + ?Sized> ImportedRunExclusions for T {
+    fn record_imported_runs(
+        &self,
+        session: &BindIdentity,
+        cut_id: &str,
+        run_ids: &[RunId],
+    ) -> Result<(), ExportError> {
+        ExportIndex::record_imported_runs(self, session, cut_id, run_ids)
+    }
+
+    fn is_imported_run(&self, session: &BindIdentity, run_id: &RunId) -> Result<bool, ExportError> {
+        ExportIndex::is_imported_run(self, session, run_id)
+    }
+}
 impl<T: MaterializedStore + Persister> SessionStore for T {}
 
 /// A run's coarse lifecycle state in the durable run index. This is the index's view —
@@ -1315,6 +1486,16 @@ impl std::error::Error for ExportError {}
 /// record and the run-index terminal update are durable. The serve adapter uses `read_page` for
 /// a lease-free, daemon-scoped pull.
 pub trait ExportIndex: Send + Sync {
+    fn is_imported_run(
+        &self,
+        _session: &BindIdentity,
+        _run_id: &RunId,
+    ) -> Result<bool, ExportError> {
+        Err(ExportError::Storage(
+            "export index cannot read imported-run exclusions".into(),
+        ))
+    }
+
     /// Durably mark run ids executed on another machine so they are not billed
     /// again here. This additive set (the billing floor) is scoped by the session
     /// and the move's `cut_id`; repeats preserve all previously recorded ids.
@@ -1508,6 +1689,7 @@ impl SessionReadReason {
             }
             SessionReadReason::Pause(PauseReason::AuthRequired) => "auth_required",
             SessionReadReason::Pause(PauseReason::Restart) => "restart",
+            SessionReadReason::Pause(PauseReason::AccountLimit) => "account_limit",
             SessionReadReason::Pause(PauseReason::ToolHeld) => "tool_held",
         }
     }
@@ -1641,15 +1823,51 @@ fn read_session_page_from_rows(
     let capped_limit = limit
         .unwrap_or(SESSION_READ_DEFAULT_LIMIT)
         .clamp(1, SESSION_READ_MAX_LIMIT);
-    let times = crate::message_times::written_times_with_queued(
-        framed_tail.iter().map(|frame| &frame.record),
-        crate::placement::Placement::new(snapshot.prefix_len),
-        snapshot
-            .head
-            .as_ref()
-            .map(|head| head.queued_times().clone())
-            .unwrap_or_default(),
-    )
+    let discard_materialized_seed = snapshot.completed_steps == 0
+        && crate::replay::first_session_record_is_interrupted(
+            framed_tail.iter().map(|frame| &frame.record),
+        );
+    let mode3 = snapshot
+        .head
+        .as_ref()
+        .and_then(|head| head.mode3)
+        .or_else(|| {
+            (snapshot.prefix_len == 0)
+                .then(|| crate::is_mode3_log(framed_tail.iter().map(|frame| &frame.record)))
+        })
+        .ok_or_else(|| crate::ReplayError::CorruptLineage {
+            episode_run_id: snapshot
+                .last_run_id
+                .clone()
+                .unwrap_or_else(|| RunId(String::new())),
+            reason: "first-run history mode is not known".into(),
+        })?;
+    let queued = snapshot
+        .head
+        .as_ref()
+        .map(|head| head.queued_times().clone())
+        .unwrap_or_default();
+    let records = framed_tail.iter().map(|frame| &frame.record);
+    let placement = crate::placement::Placement::new(if mode3 && discard_materialized_seed {
+        0
+    } else {
+        snapshot.prefix_len
+    });
+    let times = if mode3 {
+        let seed = if discard_materialized_seed {
+            Default::default()
+        } else {
+            snapshot
+                .head
+                .as_ref()
+                .and_then(|head| head.mode3_times.clone())
+                .unwrap_or_default()
+        };
+        crate::message_times::mode3_written_times(records, placement, queued, seed)
+            .map(|fold| fold.times)
+    } else {
+        crate::message_times::written_times_with_queued(records, placement, queued)
+    }
     .map_err(|reason| crate::ReplayError::CorruptLineage {
         episode_run_id: snapshot
             .last_run_id
@@ -1657,10 +1875,6 @@ fn read_session_page_from_rows(
             .unwrap_or_else(|| RunId(String::new())),
         reason,
     })?;
-    let discard_materialized_seed = snapshot.completed_steps == 0
-        && crate::replay::first_session_record_is_interrupted(
-            framed_tail.iter().map(|framed| &framed.record),
-        );
     let mut tail_state = crate::replay::replay_seeded(
         framed_tail.iter().map(|framed| &framed.record),
         snapshot.trailing_origin.clone(),
@@ -1669,7 +1883,7 @@ fn read_session_page_from_rows(
         None,
         snapshot.prefix_len,
         false,
-        snapshot.tag_seed,
+        crate::replay::TranscriptSeed::for_page(snapshot, framed_tail),
     )?;
     if tail_state.run_id.is_none() {
         tail_state.run_id.clone_from(&snapshot.last_run_id);
@@ -1812,8 +2026,10 @@ pub struct ToolCallDispatch {
 /// An ordinary call's fallback key, from its own `ToolDispatchIntent`.
 ///
 /// Ordinary calls use their own intent: sibling calls share a step record but have
-/// distinct intents. A synced sequence is never reissued, and the log identity
-/// distinguishes replacements at one address. Consent preparation can make a call
+/// distinct intents. This fallback spelling is for unrepaired history. After a
+/// repair the writer records a cut-generation key so reused sequences cannot alias
+/// removed calls. The log identity distinguishes replacements at one address.
+/// Consent preparation can make a call
 /// durable earlier; its key is then recorded on the later intent and preserved by
 /// [`tool_call_key`]. Model ids may repeat without reusing either kind of key.
 /// The spelling is printable ASCII, below the tool-provider role's 256-byte bound.
@@ -1917,7 +2133,12 @@ pub fn tool_call_dispatches(
         None,
         0,
         false,
-        crate::tags::TagSeed::default(),
+        crate::replay::TranscriptSeed {
+            tags: crate::tags::TagSeed::default(),
+            mode3: Some(crate::is_mode3_log(
+                framed.iter().map(|frame| &frame.record),
+            )),
+        },
     )?;
     Ok(dispatches_of_turns(
         framed,
@@ -1950,7 +2171,12 @@ pub fn replay_transcript(framed: &[FramedRecord]) -> Result<Vec<Message>, crate:
         None,
         0,
         false,
-        crate::tags::TagSeed::default(),
+        crate::replay::TranscriptSeed {
+            tags: crate::tags::TagSeed::default(),
+            mode3: Some(crate::is_mode3_log(
+                framed.iter().map(|frame| &frame.record),
+            )),
+        },
     )?
     .prompt)
 }
@@ -2064,7 +2290,7 @@ pub fn effective_context(
                 prefix.prefix.len() as u64
             },
             false,
-            crate::tags::TagSeed::from_prefix(&prefix.prefix),
+            crate::tags::TagSeed::from_prefix(&prefix.prefix).into(),
         )?
         .prompt,
     );
@@ -2107,7 +2333,20 @@ pub fn resume_state_from_store(
     run_id: Option<crate::RunId>,
     budget_state: Option<crate::BudgetReplayStateV1>,
 ) -> Result<crate::ReplayState, crate::ReplayError> {
+    resume_state_from_store_with_mode(prefix, tail, run_config, run_id, budget_state, None)
+}
+
+pub(crate) fn resume_state_from_store_with_mode(
+    prefix: &StorePrefix,
+    tail: &[WalRecord],
+    run_config: Option<crate::RunConfig>,
+    run_id: Option<crate::RunId>,
+    budget_state: Option<crate::BudgetReplayStateV1>,
+    mode3: Option<bool>,
+) -> Result<crate::ReplayState, crate::ReplayError> {
     let seed = PrefixSeed {
+        mode3,
+        refusal: prefix.refusal.clone(),
         prefix_len: prefix.prefix.len() as u64,
         completed_steps: prefix.completed_steps,
         usage: prefix.usage,
@@ -2133,6 +2372,8 @@ pub fn resume_state_from_store(
 /// [`MaterializedStore::read_held_prefix`]) seeds the tail exactly as a merge of all of them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PrefixSeed {
+    pub mode3: Option<bool>,
+    pub refusal: Option<crate::refusal_fallback::RefusalReplayState>,
     /// How many transcript messages the prefix holds: the tail's first ordinal.
     pub prefix_len: u64,
     pub completed_steps: u64,
@@ -2174,10 +2415,14 @@ pub(crate) fn merge_prefix_and_tail(
     run_id: Option<crate::RunId>,
     budget_state: Option<crate::BudgetReplayStateV1>,
 ) -> Result<(crate::ReplayState, TailEpisodes), crate::ReplayError> {
+    let refusal = seed.refusal.clone().ok_or_else(|| {
+        crate::refusal_fallback::note_unrecorded_replay();
+        crate::ReplayError::UnrecordedRefusalSchedule
+    })?;
     let abandoned = materialized_zero_step_seed_was_interrupted(seed.completed_steps, tail);
     // Seed the mid-episode tail's origin from the prefix's trailing assistant turn (see
     // `effective_context`) so a resumed turn stamps the same model a full replay would.
-    let tail_state = crate::replay::replay_seeded(
+    let tail_state = crate::replay::replay_seeded_with_refusal(
         tail,
         seed.trailing_origin.clone(),
         run_id.clone(),
@@ -2185,7 +2430,11 @@ pub(crate) fn merge_prefix_and_tail(
         budget_state,
         if abandoned { 0 } else { seed.prefix_len },
         seed.prefix_len > 0,
-        seed.tag_seed,
+        crate::replay::TranscriptSeed {
+            tags: seed.tag_seed,
+            mode3: seed.mode3,
+        },
+        refusal,
     )?;
     // A view the prefix's leading records applied or replaced: a replacement at the transcript's
     // start, so the prompt no longer leads with the lineage's first message and the tail's
@@ -2295,6 +2544,9 @@ pub(crate) fn merge_prefix_and_tail(
     };
     tail_episodes.render = tail_state.render_episodes.clone().unwrap_or_default();
     let state = crate::ReplayState {
+        mode3: tail_state.mode3,
+        account_limit_pause: None,
+        recovered_calls: Vec::new(),
         extent: tail_state.extent,
         tags_await_setup: tail_state.tags_await_setup,
         input_budget: tail_state.input_budget,
@@ -2343,7 +2595,9 @@ pub(crate) fn merge_prefix_and_tail(
         // `latest_projection_boundary`), so every unplaced steer is in the tail.
         pending_steers: tail_state.pending_steers,
         resolution: tail_state.resolution,
-        // Only what the tail recorded: the materialized prefix keeps no schedule.
+        // Tail replay starts with the prefix's refusal state, then applies each later
+        // admission and step once. Projection catching up must preserve the refusal
+        // schedule already carried through tail replay.
         refusal_fallback: tail_state.refusal_fallback,
         refused_steps: tail_state.refused_steps,
         committed_tool_turns: Vec::new(),
@@ -2741,6 +2995,7 @@ mod catch_up_tests {
             seq: 13,
             fence: 1,
             record: WalRecord::RunPaused {
+                account_limit: None,
                 ts_ms: Some(4000),
                 reason: broca_protocol::PauseReason::Restart,
                 run_id: RunId("paused".into()),
@@ -2854,6 +3109,8 @@ mod tests {
     fn sample_wal() -> Vec<WalRecord> {
         vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -2873,6 +3130,9 @@ mod tests {
                 session: BindIdentity::new("/tmp/p", "h", "s"),
                 ts_ms: None,
                 config: Box::new(RunConfig {
+                    global_system: None,
+                    route_decision_id: None,
+                    account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,
                     computed_tags: None,
@@ -2897,6 +3157,7 @@ mod tests {
                     context_management: None,
                 }),
                 input: vec![Message {
+                    turn_system: false,
                     cache_prefix_blocks: None,
                     role: Role::User,
                     content: vec![ContentBlock::Text { text: "hi".into() }],
@@ -2909,6 +3170,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -2970,6 +3232,7 @@ mod tests {
             },
             WalRecord::TurnFinished { step_id: StepId(1) },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3223,6 +3486,8 @@ mod tests {
         };
         records.extend([
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -3253,6 +3518,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3304,6 +3570,7 @@ mod tests {
             // This naturally terminal no-tool step is durable but has no RunFinished, so the
             // corpus ends with a non-empty, not-yet-materialized tail.
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3334,6 +3601,7 @@ mod tests {
         (
             framed,
             StorePrefix {
+                refusal: Some(Default::default()),
                 lineage_id: None,
                 prefix,
                 completed_steps: committed_state.completed_steps,
@@ -3387,7 +3655,11 @@ mod tests {
             })
             .collect();
         StorePageSnapshot {
-            head: None,
+            head: Some({
+                let mut head = crate::head::HeadProjection::default();
+                head.mode3 = Some(false);
+                head
+            }),
             model_history: None,
             last_title: None,
             deferred_calls: None,
@@ -3566,6 +3838,11 @@ mod tests {
             })
             .collect();
         let clamped_snapshot = StorePageSnapshot {
+            head: Some({
+                let mut head = crate::head::HeadProjection::default();
+                head.mode3 = Some(false);
+                head
+            }),
             prefix_len: SESSION_READ_MAX_LIMIT + 1,
             completed_steps: 1,
             rows,
@@ -3620,6 +3897,7 @@ mod tests {
         let watermark = framed.len() as u64 - 1;
         let committed = replay(&wal[..watermark as usize]).expect("committed prefix replays");
         let prefix = StorePrefix {
+            refusal: Some(Default::default()),
             lineage_id: None,
             prefix: committed.prompt,
             completed_steps: committed.completed_steps,
@@ -3912,6 +4190,9 @@ mod episode_merge_regression {
 
     fn config(model: &str) -> RunConfig {
         RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -3939,6 +4220,8 @@ mod episode_merge_regression {
 
     fn start(run: &str, model: &str, text: &str) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -3959,6 +4242,7 @@ mod episode_merge_regression {
             session: BindIdentity::new("/tmp/p", "h", "s"),
             config: Box::new(config(model)),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: text.into() }],
@@ -3986,6 +4270,7 @@ mod episode_merge_regression {
         let wal = vec![
             start("a", "a-model", "episode a"),
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -4018,6 +4303,7 @@ mod episode_merge_regression {
         let projected = crate::replay(&wal[..2]).expect("episode A prefix replays");
         let stored_messages = projected.prompt;
         let prefix = StorePrefix {
+            refusal: Some(Default::default()),
             lineage_id: None,
             prefix: stored_messages,
             completed_steps: projected.completed_steps,

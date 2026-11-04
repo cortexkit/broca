@@ -62,8 +62,10 @@ fn scan(state_root: &Path) -> Result<Report, WalError> {
                     .or_default()
                     .push(address);
             }
-            // Tag numbering that would overflow is also a refusal, grouped under its own reason.
-            Err(error @ ReplayError::TagNumbering(_)) => {
+            // Replay failures without episode attribution are grouped under their own reason.
+            Err(
+                error @ (ReplayError::TagNumbering(_) | ReplayError::UnrecordedRefusalSchedule),
+            ) => {
                 report
                     .other_refusals
                     .entry(error.to_string())
@@ -156,6 +158,8 @@ mod tests {
 
     fn started(run: &str, session: &BindIdentity) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -175,6 +179,9 @@ mod tests {
             run_id: RunId(run.into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                global_system: None,
+                route_decision_id: None,
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -212,6 +219,7 @@ mod tests {
 
     fn step(content: ContentBlock) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

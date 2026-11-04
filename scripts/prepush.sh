@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Dispatch builds to motor; never fall back to building on the caller's machine.
 set -euo pipefail
-root="$(cd "$(dirname "$0")/.." && pwd)"
+root="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$root"
 export PYTHONDONTWRITEBYTECODE=1
 source scripts/lib/prepush-report.sh

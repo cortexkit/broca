@@ -33,6 +33,12 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+mod cutoff_diagnostic_tests;
+
+#[cfg(all(test, feature = "test-clock"))]
+mod route_local_retry_tests;
+
 /// The error code broca answers a reverse request with: a `Request` a module sends toward the
 /// consumer on a route channel. Copied from the subc Rust consumer SDK
 /// (`subc-client-rs/src/consumer.rs`, `REVERSE_REQUEST_UNHANDLED`), which keeps it private
@@ -144,7 +150,14 @@ pub struct RejectedMessage {
 }
 
 impl RejectedMessage {
-    fn structured(code: String, message: String) -> Self {
+    /// Decode a daemon refusal for daemon-free tests. Plain-text constructors intentionally
+    /// cannot supply the structured code on which the retry policy depends.
+    #[cfg(feature = "test-refusals")]
+    pub fn from_error_frame_body_for_test(body: &[u8]) -> Self {
+        decode_error_body(body)
+    }
+
+    pub(crate) fn structured(code: String, message: String) -> Self {
         let text = format!("{code} — {message}");
         Self {
             code: Some(code),
@@ -157,6 +170,10 @@ impl RejectedMessage {
     fn with_detail(mut self, detail: Option<serde_json::Value>) -> Self {
         self.detail = detail.filter(|detail| !detail.is_null());
         self
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 
     pub(crate) fn code(&self) -> &str {
@@ -295,6 +312,32 @@ pub struct RouteHandle {
     conn: ConnToken,
     pub(crate) reads_tool_result: bool,
     pub(crate) reads_held_reply: bool,
+    pub(crate) call_keepalive: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ToolReplyDeadline {
+    pub duration: Duration,
+    pub declared: bool,
+}
+
+struct ToolReplyWait {
+    duration: Duration,
+    enqueued_at: time::Instant,
+    absolute: bool,
+    silence: Option<Duration>,
+}
+
+impl ToolReplyWait {
+    fn enqueued(duration: Duration, declared_reply: bool, keepalive: bool) -> Self {
+        Self {
+            duration,
+            enqueued_at: time::Instant::now(),
+            absolute: declared_reply || keepalive,
+            silence: keepalive
+                .then(|| Duration::from_millis(cortexkit_role_tool_provider::KEEPALIVE_SILENCE_MS)),
+        }
+    }
 }
 
 impl RouteHandle {
@@ -308,6 +351,7 @@ impl RouteHandle {
             conn,
             reads_tool_result: false,
             reads_held_reply: false,
+            call_keepalive: false,
         }
     }
 
@@ -1367,8 +1411,9 @@ impl SubcConnection {
         scope: Option<&subc_protocol::scope::ScopeSelector>,
         tool_result_v1: bool,
         provider_held_installed: bool,
+        call_keepalive: bool,
     ) -> ConnResult<RouteHandle> {
-        let capabilities = if provider_held_installed {
+        let mut capabilities = if provider_held_installed {
             Some(vec![
                 cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
                 cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
@@ -1377,6 +1422,11 @@ impl SubcConnection {
             tool_result_v1
                 .then(|| vec![cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into()])
         };
+        if call_keepalive {
+            capabilities
+                .get_or_insert_with(Vec::new)
+                .push(cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY.into());
+        }
         self.route_open_target_with_capabilities(
             RouteTarget::ToolProvider {
                 module_id: module_id.into(),
@@ -1460,37 +1510,7 @@ impl SubcConnection {
         .await
     }
 
-    /// Probe an untrusted bind project claim independently of the daemon's scope stamp.
-    /// This opener is absent from release builds and confers no project authority.
-    #[cfg(debug_assertions)]
-    pub async fn route_open_tool_provider_with_bind_project_for_tests(
-        &self,
-        module_id: &str,
-        identity: &BindIdentity,
-        scope: Option<subc_protocol::scope::ScopeSelector>,
-        client_project_id: Option<&str>,
-        held: bool,
-    ) -> ConnResult<RouteHandle> {
-        let target = RouteTarget::ToolProvider {
-            module_id: module_id.into(),
-        };
-        let role_versions = Some(std::collections::BTreeMap::from([(
-            "tool-provider".into(),
-            "v1".into(),
-        )]));
-        let mut identity = to_subc_bind(identity, &target, role_versions.as_ref());
-        identity.project_id = client_project_id.map(str::to_owned);
-        let capabilities = held.then(|| {
-            vec![
-                cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
-                cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
-            ]
-        });
-        self.route_open_wire_target(target, identity, scope, role_versions, capabilities)
-            .await
-    }
-
-    /// Open an unscoped module-level role using the same bind translation and retry machinery
+    /// Open a module-level role using the same bind translation and retry machinery
     /// as step-transform hooks. The caller bounds the entire route-open future.
     pub(crate) async fn route_open_role_within(
         &self,
@@ -1498,6 +1518,7 @@ impl SubcConnection {
         identity: &BindIdentity,
         role: &str,
         version: &str,
+        scope: Option<subc_protocol::scope::ScopeSelector>,
         retry: RouteOpenRetry,
     ) -> ConnResult<RouteHandle> {
         self.retry_open_through_gate(GateTarget::tool_provider(module_id), retry, || {
@@ -1506,7 +1527,7 @@ impl SubcConnection {
                     module_id: module_id.to_string(),
                 },
                 identity,
-                None,
+                scope.clone(),
                 Some(std::collections::BTreeMap::from([(
                     role.to_owned(),
                     version.to_owned(),
@@ -1759,6 +1780,10 @@ impl SubcConnection {
         let reads_tool_result = cortexkit_role_tool_provider::consumer_reads_tool_result_v1(
             consumer_capabilities.as_deref(),
         );
+        let call_keepalive = consumer_capabilities.as_ref().is_some_and(|caps| {
+            caps.iter()
+                .any(|cap| cap == cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY)
+        });
         let req = ClientControlRequest::RouteOpen {
             identity,
             target,
@@ -1788,6 +1813,7 @@ impl SubcConnection {
                         let mut handle = RouteHandle::new(route_channel, route_epoch, conn);
                         handle.reads_tool_result = reads_tool_result;
                         handle.reads_held_reply = reads_held_reply;
+                        handle.call_keepalive = call_keepalive;
                         Ok(handle)
                     }
                     Ok(other) => Err(ConnError::Protocol(format!(
@@ -2081,8 +2107,9 @@ impl SubcConnection {
     }
 
     /// [`Self::tool_call`] with the terminal-reply deadline chosen by the caller. The tool plane
-    /// passes the per-call value from [`crate::tool_deadline::tool_reply_deadline`]; like every
-    /// deadline here it bounds silence between frames, resetting on interim Push frames.
+    /// supplies no frozen reply metadata. Non-negotiated routes therefore use the legacy
+    /// silence bound; negotiated routes also have an absolute budget. Agent dispatch uses
+    /// the guarded path so a declared `reply` deadline is absolute regardless of negotiation.
     pub async fn tool_call_with_deadline(
         &self,
         route: &RouteHandle,
@@ -2155,6 +2182,7 @@ impl SubcConnection {
         args_jcs: &str,
         tool_call_id: Option<&str>,
         deadline: Duration,
+        declared_reply: bool,
         preset: Option<&str>,
         call_key: Option<&str>,
         schema_pin: Option<&str>,
@@ -2184,12 +2212,14 @@ impl SubcConnection {
             )
             .map_err(|error| ConnError::Transport(error.to_string()))?;
             self.enqueue_approved(&runtime, frame, signals).await?;
+            // Route-open, bind and writer-capacity waits consume no provider reply budget.
+            let wait = ToolReplyWait::enqueued(deadline, declared_reply, route.call_keepalive);
             log_tool_dispatch(route.channel, corr, name);
-            Ok::<_, ApprovedSetupError>((runtime, registration, rx, corr))
+            Ok::<_, ApprovedSetupError>((runtime, registration, rx, corr, wait))
         };
-        let (runtime, _registration, mut rx, corr) =
+        let (runtime, _registration, mut rx, corr, wait) =
             before_push.await.map_err(ApprovedCallError::BeforePush)?;
-        self.receive_tool_call(runtime, route, corr, &mut rx, deadline)
+        self.receive_tool_call(runtime, route, corr, &mut rx, wait, Some(signals))
             .await
             .map_err(ApprovedCallError::AfterPush)
     }
@@ -2245,8 +2275,9 @@ impl SubcConnection {
         )
         .map_err(|error| ConnError::Transport(error.to_string()))?;
         self.send(&runtime, frame).await?;
+        let wait = ToolReplyWait::enqueued(deadline, false, route.call_keepalive);
         log_tool_dispatch(route.channel, corr, operation);
-        self.receive_tool_call(runtime, route, corr, &mut rx, deadline)
+        self.receive_tool_call(runtime, route, corr, &mut rx, wait, None)
             .await
     }
 
@@ -2256,12 +2287,30 @@ impl SubcConnection {
         route: &RouteHandle,
         corr: u64,
         rx: &mut mpsc::UnboundedReceiver<Frame>,
-        deadline: Duration,
+        wait: ToolReplyWait,
+        signals: Option<&broca_core::tool_plane::DispatchSignals>,
     ) -> ConnResult<serde_json::Value> {
         // Arm abandonment only after enqueue. A request canceled while reserving
         // writer capacity has no provider work to cancel.
         let mut abandon = CancelOnAbandon::arm(&runtime, route, corr);
-        let terminal = self.await_terminal_deadline(&runtime, rx, deadline).await;
+        let terminal = tokio::select! {
+            // Arm abandonment before polling the signals: cancellation may already have
+            // arrived just after enqueue, before the reply wait was first polled.
+            biased;
+            _ = async {
+                match signals {
+                    Some(signals) => signals.caller_cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => Err(ConnError::Transport("tool call abandoned: run cancelled or stopped".into())),
+            terminal = async {
+                if wait.absolute {
+                    self.await_tool_terminal_absolute(&runtime, rx, wait).await
+                } else {
+                    self.await_terminal_deadline(&runtime, rx, wait.duration).await
+                }
+            } => terminal,
+        };
         if terminal.is_ok() {
             abandon.disarm();
         }
@@ -2273,6 +2322,55 @@ impl SubcConnection {
             ty => Err(ConnError::Protocol(format!(
                 "unexpected tool-call frame {ty:?}"
             ))),
+        }
+    }
+
+    async fn await_tool_terminal_absolute(
+        &self,
+        runtime: &Arc<ConnectionRuntime>,
+        rx: &mut mpsc::UnboundedReceiver<Frame>,
+        wait: ToolReplyWait,
+    ) -> ConnResult<Frame> {
+        let deadline = wait.duration;
+        let reply_at = wait.enqueued_at + deadline;
+        let mut silent_at = wait.silence.map(|silence| wait.enqueued_at + silence);
+        loop {
+            let received = tokio::select! {
+                // An already queued PUSH must not win over an expired reply deadline.
+                biased;
+                _ = time::sleep_until(silent_at.map_or(reply_at, |silent| reply_at.min(silent))) => {
+                    self.spawn_liveness_probe(runtime);
+                    let reason = if silent_at.is_some_and(|silent| silent < reply_at) {
+                        format!("tool call silent for {:?}", wait.silence.expect("silence timer configured"))
+                    } else {
+                        format!("timed out after {deadline:?}")
+                    };
+                    return Err(ConnError::Transport(reason));
+                }
+                received = rx.recv() => received,
+            };
+            match received {
+                Some(frame) => match frame.header.ty {
+                    FrameType::Push => {
+                        silent_at = wait.silence.map(|silence| time::Instant::now() + silence);
+                        // Keepalives are transport liveness, never display, history or model
+                        // content. Ordinary progress is drained here as on legacy routes.
+                        if cortexkit_role_tool_provider::is_keepalive(&frame.body) {
+                            continue;
+                        }
+                    }
+                    FrameType::Goodbye => {
+                        return Err(ConnError::Transport(ROUTE_GONE_MESSAGE.into()))
+                    }
+                    FrameType::Response | FrameType::Error => return Ok(frame),
+                    ty => {
+                        return Err(ConnError::Protocol(format!(
+                            "frame {ty:?} arrived where a Response or Error terminal was expected"
+                        )))
+                    }
+                },
+                None => return Err(ConnError::Transport("connection closed mid-call".into())),
+            }
         }
     }
 
@@ -3624,6 +3722,17 @@ async fn sleep_until_or_never(at: Option<time::Instant>) {
     }
 }
 
+/// The protocol owns whether an individual route open may retry its refusal.
+fn route_open_is_retryable(code: &str) -> bool {
+    // Model a future root-local retryable code without changing the pinned protocol.
+    // The stand-in is unreachable in shipping builds and has no effect on real codes.
+    #[cfg(all(test, feature = "test-clock"))]
+    if code == "test_root_busy" {
+        return true;
+    }
+    subc_protocol::error_codes::is_retryable_route_open(code)
+}
+
 /// The retry loop itself, drawing each backoff wait with `jitter` ([`full_jitter`] outside
 /// tests, so that a test can make the schedule exact). With `outage`, `retry.budget` is the
 /// outage patience and is measured as [`OutageWait`] describes.
@@ -3735,9 +3844,7 @@ where
         }
         match outcome {
             Ok(handle) => return Ok(handle),
-            Err(ConnError::Rejected(message))
-                if subc_protocol::error_codes::is_retryable_route_open(message.code()) =>
-            {
+            Err(ConnError::Rejected(message)) if route_open_is_retryable(message.code()) => {
                 let code = message.code();
                 let held = scope_hold.filter(|_| matches!(code, SCOPE_NOT_SYNCED | SCOPE_CHANGED));
                 if held.is_none() && !patience_started {
@@ -3802,10 +3909,10 @@ async fn cancelled_or_never(cancel: Option<&CancellationToken>) {
     }
 }
 
-/// Whether a route.open refusal says the target MODULE is unavailable (stopped, starting,
-/// restarting, or not answering), as opposed to anything about the route asked for. These are
-/// the refusals that are the same for every caller of that module, so one caller's refusal is
-/// news for all of them; see [`ModuleGate`].
+/// Whether a route.open refusal describes the whole module, so one caller's refusal is
+/// news for every caller sharing its gate. This list is deliberately narrower than the
+/// protocol's retryable codes: a busy root or unavailable session address only makes its
+/// own route wait, and must not pace other roots or sessions behind a module-wide outage.
 pub(crate) fn is_module_availability_refusal(code: &str) -> bool {
     use subc_protocol::error_codes::{
         MODULE_RELOADING, MODULE_TIMEOUT, MODULE_WARMING, TARGET_UNAVAILABLE,
@@ -3820,8 +3927,8 @@ pub(crate) fn is_module_availability_refusal(code: &str) -> bool {
 enum ModuleEvidence<'a> {
     /// The daemon refused the open because the module is unavailable.
     Unavailable(&'a RejectedMessage),
-    /// A scope refusal: about the caller's scope, not the module.
-    ScopeOnly,
+    /// A retryable route or scope refusal: about one caller, not the whole module.
+    RouteOnly,
     /// A route, or a definite answer from the daemon that is not about availability.
     Answered,
     /// A transport or protocol failure, including broca's own attempt timeout (which surfaces
@@ -3835,8 +3942,10 @@ fn module_evidence(outcome: &ConnResult<RouteHandle>) -> ModuleEvidence<'_> {
         Err(ConnError::Rejected(message)) if is_module_availability_refusal(message.code()) => {
             ModuleEvidence::Unavailable(message)
         }
-        Err(ConnError::Rejected(message)) if message.code().starts_with("scope_") => {
-            ModuleEvidence::ScopeOnly
+        Err(ConnError::Rejected(message))
+            if message.code().starts_with("scope_") || route_open_is_retryable(message.code()) =>
+        {
+            ModuleEvidence::RouteOnly
         }
         Err(ConnError::Rejected(_)) => ModuleEvidence::Answered,
         Err(_) => ModuleEvidence::Inconclusive,
@@ -3857,8 +3966,9 @@ fn module_evidence(outcome: &ConnResult<RouteHandle>) -> ModuleEvidence<'_> {
 /// again only on evidence that the module is up: a route, or a definite answer from the daemon
 /// that is not an availability refusal. Each waiting caller then makes its own open, one
 /// bounded burst. A transport or protocol failure (including broca's own attempt timeout) says
-/// nothing either way, and a scope refusal (`scope_*`) is about one caller's scope, so neither
-/// opens or closes the gate. A waiting caller still leaves at its own deadline or cancellation.
+/// nothing either way. A scope refusal (`scope_*`) or another route-local retryable refusal
+/// also neither opens nor closes the gate. A waiting caller still leaves at its own deadline
+/// or cancellation.
 ///
 /// Every close and every reopen starts a new period (`epoch`), and every probe turn has its
 /// own number. So an availability refusal from an open admitted in an earlier period cannot
@@ -4191,11 +4301,11 @@ impl ModuleGate {
                 }
                 ModuleEvidence::Inconclusive if own_turn => closed.probe_failed(now, jitter),
                 // Not about the module: the probe gives up its turn until the next tick.
-                ModuleEvidence::ScopeOnly if own_turn => {
+                ModuleEvidence::RouteOnly if own_turn => {
                     closed.probe = None;
                     closed.next_probe_at = now + jitter(closed.envelope);
                 }
-                ModuleEvidence::Inconclusive | ModuleEvidence::ScopeOnly => return false,
+                ModuleEvidence::Inconclusive | ModuleEvidence::RouteOnly => return false,
             }
             true
         });
@@ -4360,7 +4470,7 @@ pub fn supervised_consumer_identity() -> Option<subc_control::ConsumerIdentity> 
 ///
 /// Tool modules accept only a fixed set of harness values at bind (opencode, pi, runner, mcp:*,
 /// fed:*) and reject anything else, so every `RouteTarget::ToolProvider` bind that does not
-/// declare the compaction-provider role presents `runner`.
+/// declare a session-keyed compaction or step-transform role presents `runner`.
 ///
 /// Broca's own `BindIdentity.harness` cannot simply be that value: it is an opaque key component,
 /// joined into WAL, lease, store and idempotency keys, so it partitions durable state and broca
@@ -4405,15 +4515,6 @@ fn declares_compaction_provider(
     role_versions.is_some_and(|roles| roles.contains_key(broca_core::compaction_provider::ROLE))
 }
 
-/// Storage resolution preserves an existing session's original transport folder.
-/// Keep this choice separate from storage addressing when adopting folderless binds.
-fn outgoing_project_root(
-    storage_identity: &BindIdentity,
-    _current_bind: &BindIdentity,
-) -> std::path::PathBuf {
-    storage_identity.project_root.clone()
-}
-
 fn to_subc_bind(
     identity: &BindIdentity,
     target: &RouteTarget,
@@ -4424,9 +4525,18 @@ fn to_subc_bind(
     // workaround onto a surface that never asked for it (which is the defect this fixes), and
     // defaulting to pass-through silently hands a closed enum a value it rejects at bind.
     let harness = match target {
-        // A compaction provider keys the conversation on the session's real identity, and its
-        // Setup body reports that identity, so the route presents it unchanged.
-        RouteTarget::ToolProvider { .. } if declares_compaction_provider(role_versions) => {
+        // Session-keyed compaction and step-transform roles use the caller's real harness;
+        // only tool-provider routes need the closed-enum `runner` translation.
+        RouteTarget::ToolProvider { .. }
+            if declares_compaction_provider(role_versions)
+                || role_versions.is_some_and(|roles| {
+                    roles
+                        .get(cortexkit_role_step_transform_provider::ROLE)
+                        .is_some_and(|version| {
+                            version == cortexkit_role_step_transform_provider::VERSION
+                        })
+                }) =>
+        {
             identity.harness.as_str()
         }
         // Tool modules run a closed enum and reject anything else at bind.
@@ -4467,18 +4577,9 @@ fn to_subc_bind(
     // WAL name with nothing recording the move. Measured when this was chosen: 395 live
     // sessions would have been stranded by the caller-side revert.
     //
-    // `project_id` is None here BY CONSTRUCTION, not by default. subc's contract on the field
-    // is that a producer sends it on every bind of a session or on none, because alternating
-    // silently forks the consumer's lineage. Broca's own `BindIdentity` does not yet carry the
-    // inbound id, so nothing is persisted with the session to forward consistently -- and a
-    // value that is only sometimes available must be sent never. When the inbound id is
-    // carried and persisted (the session-identity re-key), this becomes "forward what was
-    // persisted with the session, else None"; it must not become "forward whatever arrived".
-    SubcBindIdentity::new(
-        outgoing_project_root(identity, identity),
-        harness,
-        identity.session.clone(),
-    )
+    // Project attribution travels only through the route's scope selector. A storage key
+    // may be a legacy folder or the unscoped namespace; neither belongs in a wire bind.
+    SubcBindIdentity::new(harness, identity.session.clone())
 }
 
 /// The far end of an in-process connection with no socket, for tests OUTSIDE this module that
@@ -4567,6 +4668,9 @@ impl SubcConnection {
 
 #[cfg(test)]
 impl InProcessModuleEnd {
+    pub(crate) fn push(&self, request: &Frame, body: Vec<u8>) -> bool {
+        self.terminal(request, FrameType::Push, body)
+    }
     pub(crate) fn fill_pending_for_test(&self) {
         for corr in 0..MAX_PENDING_REQUESTS as u64 {
             let (sender, _rx) = mpsc::unbounded_channel();
@@ -4632,9 +4736,31 @@ impl InProcessModuleEnd {
             request.header.epoch,
             request.header.corr,
         );
-        let sender = match self.pending.lock().unwrap().get(&key) {
-            Some(PendingEntry::Live { sender, .. }) => sender.clone(),
-            _ => return false,
+        let sender = {
+            let mut pending = self.pending.lock().unwrap();
+            // The real reader removes terminal route.open entries before waking their waiter.
+            // Otherwise dropping the registration keeps an entry for a possible late route
+            // bind, even though this test provider has already answered.
+            if request.header.channel == 0
+                && matches!(ty, FrameType::Response | FrameType::Error)
+                && matches!(
+                    pending.get(&key),
+                    Some(PendingEntry::Live {
+                        route_open: true,
+                        ..
+                    })
+                )
+            {
+                match pending.remove(&key) {
+                    Some(PendingEntry::Live { sender, .. }) => sender,
+                    _ => unreachable!("the route.open entry was inspected under the same lock"),
+                }
+            } else {
+                match pending.get(&key) {
+                    Some(PendingEntry::Live { sender, .. }) => sender.clone(),
+                    _ => return false,
+                }
+            }
         };
         let response = Frame::build(
             ty,
@@ -4651,20 +4777,9 @@ impl InProcessModuleEnd {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn outgoing_folder_uses_the_resolved_storage_identity_not_a_new_route_claim() {
-        let stored = broca_protocol::BindIdentity::new("/original/checkout", "runner", "s");
-        let rebound = broca_protocol::BindIdentity::new("/later/checkout", "runner", "s");
-        assert_eq!(
-            super::outgoing_project_root(&stored, &rebound),
-            std::path::PathBuf::from("/original/checkout")
-        );
-        assert_eq!(
-            super::outgoing_project_root(&rebound, &rebound),
-            std::path::PathBuf::from("/later/checkout")
-        );
-    }
+    include!("connection/project_identity_tests.rs");
     include!("connection/route_close_followup_tests.rs");
+    include!("connection/call_keepalive_tests.rs");
     #[tokio::test]
     async fn a_registered_call_waiting_for_egress_cannot_use_a_closing_route() {
         for guarded in [false, true] {
@@ -4681,6 +4796,7 @@ mod tests {
                                 "{}",
                                 None,
                                 Duration::from_secs(10),
+                                false,
                                 None,
                                 None,
                                 None,
@@ -4774,7 +4890,7 @@ mod tests {
                 session: "session".into(),
             };
             let open = conn.route_open_dispatch_single_attempt(
-                "provider", &identity, None, result_v1, installed,
+                "provider", &identity, None, result_v1, installed, false,
             );
             tokio::pin!(open);
             let request = tokio::select! {
@@ -4876,6 +4992,7 @@ mod tests {
             arguments,
             Some("call"),
             Duration::from_secs(1),
+            false,
             None,
             Some("lineage:7"),
             Some(&pin),
@@ -5266,7 +5383,7 @@ mod tests {
     }
 
     #[test]
-    fn route_open_retryable_codes_match_only_the_four_temporary_refusals() {
+    fn route_open_retryable_codes_include_inventory_unavailability_not_permanent_errors() {
         use subc_protocol::error_codes::{is_retryable_route_open, *};
 
         for code in [
@@ -5274,6 +5391,7 @@ mod tests {
             MODULE_WARMING,
             TARGET_UNAVAILABLE,
             MODULE_TIMEOUT,
+            "session_address_unavailable",
         ] {
             assert!(is_retryable_route_open(code), "{code} should retry");
         }
@@ -5293,7 +5411,31 @@ mod tests {
             "unknown_module is terminal"
         );
         assert!(!is_retryable_route_open(MODULE_REMOVED));
+        assert!(!is_retryable_route_open("session_address_ambiguous"));
         assert!(!is_retryable_route_open("some_future_code"));
+
+        for code in [
+            MODULE_RELOADING,
+            MODULE_WARMING,
+            TARGET_UNAVAILABLE,
+            MODULE_TIMEOUT,
+            SCOPE_NOT_SYNCED,
+            SCOPE_CHANGED,
+            "bind_blocked_by_reader",
+            "some_future_code",
+        ] {
+            assert_eq!(
+                is_module_availability_refusal(code),
+                [
+                    TARGET_UNAVAILABLE,
+                    MODULE_WARMING,
+                    MODULE_RELOADING,
+                    MODULE_TIMEOUT
+                ]
+                .contains(&code),
+                "only whole-module refusals belong in the shared gate: {code}"
+            );
+        }
 
         // AN UNDECODABLE BODY MUST BE TERMINAL, and this is the arm a future "robustness"
         // edit would break. `decode_error_body` falls back to the raw bytes when the body is
@@ -5392,10 +5534,8 @@ mod tests {
                 outbound.harness, TOOL_MODULE_HARNESS,
                 "a {caller_harness:?} bind must still attach as {TOOL_MODULE_HARNESS:?}"
             );
-            // The other two fields are NOT translated: they carry the caller's real identity and
-            // the tool module scopes its work by them.
+            // The session still carries the caller's identity; scope supplies project attribution.
             assert_eq!(outbound.session, identity.session);
-            assert_eq!(outbound.project_root, identity.project_root);
         }
     }
 
@@ -5480,11 +5620,15 @@ mod tests {
                 harness: caller_harness.to_string(),
                 session: "s1".to_string(),
             };
-            let compaction = role(broca_core::compaction_provider::ROLE);
-            let outbound = to_subc_bind(&identity, &target, Some(&compaction));
-            assert_eq!(outbound.harness, caller_harness);
-            assert_eq!(outbound.session, identity.session);
-            assert_eq!(outbound.project_root, identity.project_root);
+            for version in ["v1", "v2"] {
+                let compaction = BTreeMap::from([(
+                    broca_core::compaction_provider::ROLE.to_owned(),
+                    version.to_owned(),
+                )]);
+                let outbound = to_subc_bind(&identity, &target, Some(&compaction));
+                assert_eq!(outbound.harness, caller_harness);
+                assert_eq!(outbound.session, identity.session);
+            }
 
             for other in [
                 Some(role("step-transform-provider")),
@@ -5987,6 +6131,7 @@ mod tests {
             r#"{"secret":"argument content"}"#,
             Some("provider-call"),
             Duration::from_secs(1),
+            false,
             None,
             None,
             None,

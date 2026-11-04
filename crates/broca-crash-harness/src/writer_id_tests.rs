@@ -5,6 +5,12 @@ pub(super) mod actual_open_writers;
 
 #[cfg(feature = "writer-id-faults")]
 mod faults;
+#[cfg(feature = "writer-id-faults")]
+pub(crate) use faults::recovery_manifest_dir_sync_fault;
+#[cfg(feature = "writer-id-faults")]
+pub(crate) use faults::recovery_marker_sync_fault;
+#[cfg(feature = "writer-id-faults")]
+pub(crate) use faults::recovery_sync_fault;
 
 use crate::power_loss::{Family, RecordingFs, State};
 use actual_open_writers::WriterContext;
@@ -38,11 +44,15 @@ impl Drop for Scratch {
 }
 
 fn open(root: &Path) -> FileWal {
-    FileWal::open(root.join("wal/log"))
-        .unwrap()
-        .with_feature_floor(root.join(broca_wal::FEATURE_FLOOR_FILENAME))
-        .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-        .unwrap()
+    FileWal::open_with_recovery(
+        root.join("wal/log"),
+        broca_wal::WalConfig::OVERHAUL,
+        root.join(broca_wal::FEATURE_FLOOR_FILENAME),
+    )
+    .unwrap()
+    .with_feature_floor(root.join(broca_wal::FEATURE_FLOOR_FILENAME))
+    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
+    .unwrap()
 }
 
 fn record_lifecycle(close: bool) -> (Scratch, Arc<RecordingFs>, [u8; 16]) {
@@ -144,19 +154,38 @@ fn writer_id_power_loss_open_close_and_recovery_preserve_marker_or_closed() {
     let (_root, fs, id) = record_lifecycle(true);
     let first_recovery = Scratch::new();
     let second_recovery = Scratch::new();
-    let states = fs
-        .enumerate_recovery(&first_recovery.0, 100_000, |root| {
-            let wal = open(root);
-            check_records(&wal.replay().unwrap(), root.join(marker(id)).exists(), id);
-            wal.sync()
-                .map_err(|error| std::io::Error::other(error.to_string()))
-        })
-        .unwrap();
+    let states = fs.enumerate(100_000).unwrap();
     assert!(!states.is_empty());
     assert!(states
         .iter()
-        .any(|state| state.first.family == Family::PartialPersistence));
-    for state in states {
-        check_state(&state.second.state, &second_recovery, id);
+        .any(|state| state.family == Family::PartialPersistence));
+    for (index, first) in states.into_iter().enumerate() {
+        let root = first_recovery.0.join(format!("recovery-{index}"));
+        first.state.install(&root).unwrap();
+        let recovery = Arc::new(RecordingFs::new(&root).unwrap());
+        with_fs_ops(recovery.clone(), || {
+            let wal = open(&root);
+            check_records(&wal.replay().unwrap(), root.join(marker(id)).exists(), id);
+            wal.sync().unwrap();
+        });
+        // Recovery now publishes durable suffix backups as well as shortening
+        // the log. Schedule every operation cut under the model's unchanged
+        // per-cut budget instead of accumulating one budget across all recoveries.
+        let mut covered = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for cut in 0..=recovery.operation_kinds().len() {
+            let images = recovery.enumerate_cut(cut).unwrap();
+            assert!(!images.is_empty());
+            covered.push(images[0].clone());
+            for image in images {
+                // The marker invariant depends on the complete filesystem image,
+                // not on which operation cut produced an identical image.
+                if seen.insert(image.state.clone()) {
+                    check_state(&image.state, &second_recovery, id);
+                }
+            }
+        }
+        recovery.assert_all_cuts_covered(&covered);
     }
 }
+crate::require_process_kill!();

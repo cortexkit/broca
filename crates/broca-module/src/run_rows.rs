@@ -19,7 +19,17 @@ use sha2::{Digest, Sha256};
 pub struct OverhaulRunSource {
     db: Arc<OverhaulDb>,
     wal: Arc<FileWalStore>,
+    consistency: Option<RunReadConsistency>,
 }
+
+struct RunReadConsistency {
+    refresh: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    publication: Arc<RunPublication>,
+    gates: Arc<broca_store::db::SessionGateFactory>,
+}
+
+type RunPublication =
+    dyn Fn(&BindIdentity) -> Result<broca_wal::file_wal::DurablePublication, String> + Send + Sync;
 
 pub(crate) struct RunRead {
     pub records: Vec<FramedRecord>,
@@ -43,21 +53,73 @@ struct Row {
 }
 
 impl OverhaulRunSource {
+    pub(super) fn history_db(&self) -> Arc<OverhaulDb> {
+        self.db.clone()
+    }
+
     pub fn new(db: Arc<OverhaulDb>, wal: Arc<FileWalStore>) -> Self {
-        Self { db, wal }
+        Self {
+            db,
+            wal,
+            consistency: None,
+        }
+    }
+
+    pub fn with_consistency(
+        mut self,
+        refresh: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+        publication: Arc<RunPublication>,
+        gates: Arc<broca_store::db::SessionGateFactory>,
+    ) -> Self {
+        self.consistency = Some(RunReadConsistency {
+            refresh,
+            publication,
+            gates,
+        });
+        self
     }
 
     pub(super) fn lookup_run(
         &self,
         run_id: &str,
     ) -> Result<Option<broca_core::RunIndexRow>, String> {
-        self.db.lookup_run(run_id).map_err(|e| e.to_string())
+        let mut row = self.db.lookup_run(run_id).map_err(|e| e.to_string())?;
+        if row.is_none() {
+            if let Some(context) = &self.consistency {
+                (context.refresh)()?;
+            }
+            row = self.db.lookup_run(run_id).map_err(|e| e.to_string())?;
+        }
+        if let (Some(row), Some(context)) = (&row, &self.consistency) {
+            let gate = (context.gates)(&row.session);
+            let _guard = gate.lock().map_err(|e| e.to_string())?;
+            (context.publication)(&row.session)?;
+            return self.db.lookup_run(run_id).map_err(|e| e.to_string());
+        }
+        Ok(row)
     }
 
     pub(super) fn restart_resume_candidates(&self) -> Result<Vec<(String, BindIdentity)>, String> {
-        self.db
+        if let Some(context) = &self.consistency {
+            (context.refresh)()?;
+        }
+        let mut rows = self
+            .db
             .restart_resume_candidates()
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        rows.retain(|(_, key)| self.session_current(key));
+        Ok(rows)
+    }
+
+    fn session_current(&self, key: &BindIdentity) -> bool {
+        self.consistency.as_ref().is_none_or(|context| {
+            let gate = (context.gates)(key);
+            let current = match gate.lock() {
+                Ok(_guard) => (context.publication)(key).is_ok(),
+                Err(_) => false,
+            };
+            current
+        })
     }
 
     fn row(&self, key: &BindIdentity, run_id: &RunId) -> Result<Option<Row>, DbError> {
@@ -116,6 +178,19 @@ impl OverhaulRunSource {
         key: &BindIdentity,
         run_id: &RunId,
     ) -> Result<Option<RunRead>, String> {
+        let gate = self
+            .consistency
+            .as_ref()
+            .map(|context| (context.gates)(key));
+        let _guard = gate
+            .as_ref()
+            .map(|gate| gate.lock().map_err(|e| e.to_string()))
+            .transpose()?;
+        let publication = self
+            .consistency
+            .as_ref()
+            .map(|context| (context.publication)(key))
+            .transpose()?;
         let fallback = |reason| {
             access_counter::seed_fallback(reason);
             Ok(None)
@@ -133,16 +208,30 @@ impl OverhaulRunSource {
             .resolve_live_path(key)
             .map_err(|e| e.to_string())?
             .ok_or("run log is not live")?;
+        if publication
+            .as_ref()
+            .is_some_and(|proof| proof.path() != path.as_path())
+        {
+            return Err("run publication and live WAL paths differ".into());
+        }
         // Windows requires write access for sync_all's FlushFileBuffers call.
         let file = File::options()
             .read(true)
             .write(cfg!(windows))
             .open(path)
             .map_err(|e| e.to_string())?;
-        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        let physical_len = file.metadata().map_err(|e| e.to_string())?.len();
+        let len = publication
+            .as_ref()
+            .map_or(physical_len, |proof| proof.byte_end());
+        if len > physical_len {
+            return Err("run publication exceeds the live WAL".into());
+        }
         // Sync the same descriptor we read, not a pathname that a move could replace.
         // Bytes appended after this captured length belong to the next read.
-        file.sync_all().map_err(|e| e.to_string())?;
+        if publication.is_none() {
+            file.sync_all().map_err(|e| e.to_string())?;
+        }
         let file = RefCell::new(file);
         let read_at = |off: u64, count: u64| -> std::io::Result<Vec<u8>> {
             let mut file = file.borrow_mut();
@@ -385,6 +474,9 @@ impl OverhaulRunSource {
         &self,
         fallback: &[(RunId, BindIdentity)],
     ) -> Result<Vec<(RunId, BindIdentity)>, String> {
+        if let Some(context) = &self.consistency {
+            (context.refresh)()?;
+        }
         let mut candidates: Vec<_> = self
             .db
             .active_runs()
@@ -399,6 +491,7 @@ impl OverhaulRunSource {
                 candidates.push((run_id.clone(), key.clone()));
             }
         }
+        candidates.retain(|(_, key)| self.session_current(key));
         Ok(candidates)
     }
 }
@@ -436,6 +529,8 @@ mod tests {
         source: Arc<OverhaulRunSource>,
         publish_on_append: bool,
         media: bool,
+        // Fields are dropped in order; remove the directory only after closing its files.
+        _scratch: Scratch,
     }
     impl Fixture {
         fn new(name: &str) -> Self {
@@ -454,6 +549,7 @@ mod tests {
                 store,
             ));
             Self {
+                _scratch: Scratch(root.clone()),
                 root,
                 key,
                 wal,
@@ -479,11 +575,13 @@ mod tests {
             // so publication can use the durable byte end recorded by its successful sync.
             drop(store.open(key).unwrap());
             Box::new(
-                broca_wal::FileWal::open(store.wal_path(key))
-                    .unwrap()
-                    .with_feature_floor(root.join("wal-floor"))
-                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                    .unwrap(),
+                broca_wal::FileWal::open_with_recovery(
+                    store.wal_path(key),
+                    broca_wal::WalConfig::OVERHAUL,
+                    root.join("wal-floor"),
+                )
+                .unwrap()
+                .with_feature_floor(root.join("wal-floor")),
             )
         }
         fn append(&mut self, record: WalRecord) {
@@ -521,6 +619,7 @@ mod tests {
             let step_id = StepId(step);
             self.append(WalRecord::StepStarted { step_id });
             self.append(WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 step_id,
@@ -649,10 +748,19 @@ mod tests {
             self.append(WalRecord::TurnFinished { step_id: StepId(1) });
         }
     }
-    impl Drop for Fixture {
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn fixture_cleanup_closes_database_and_wal() {
+        let fixture = Fixture::new("cleanup");
+        let root = fixture.root.clone();
+        drop(fixture);
+        assert!(!root.exists(), "fixture left its scratch directory behind");
     }
 
     struct ReadPlan {
@@ -1052,6 +1160,7 @@ mod tests {
         f.history();
         f.start("paused");
         f.append(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("paused".into()),
             ts_ms: None,
             reason: broca_protocol::PauseReason::Restart,
@@ -1561,6 +1670,7 @@ mod tests {
         };
         assert!(!qualified(), "a start alone is not a committed cut");
         f.append(WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("zero-step".into()),
             ts_ms: None,
             reason: broca_protocol::PauseReason::AuthRequired,

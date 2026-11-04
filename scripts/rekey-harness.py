@@ -122,6 +122,20 @@ def main() -> int:
         return 3
 
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    if db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name IN ('agent_data_session_ref', 'agent_data_session_ref_v2') LIMIT 1"
+    ).fetchone():
+        db.close()
+        print(
+            "rekey-harness.py: refusing a store with session-ref inventory; this legacy "
+            "harness migrator cannot move inventory addresses safely. Nothing changed. "
+            "For a split-root session use store-maintenance repair-session-root "
+            "<state-root> --harness <harness> --session <session> (preview by default). "
+            "General inventory-aware harness migration is not supported.",
+            file=sys.stderr,
+        )
+        return 2
     # Destination occupancy is the union of meta and run_index. One-shot sends can
     # skip projection, so a destination may have an index row without a meta row.
     all_keys = {s for (s,) in db.execute("SELECT session FROM meta")}

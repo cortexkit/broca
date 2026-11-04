@@ -36,6 +36,10 @@ use serde::{Deserialize, Serialize};
 /// with the SAME config it was submitted with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingSubmission {
+    /// Display provenance is restored from the Queued record because checkpoint
+    /// serialization omits it; sender labels must not change admission identities.
+    #[serde(skip)]
+    pub display_sent_by: Option<broca_protocol::BindPrincipal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admitted_at_ms: Option<u64>,
     /// Durable pre_user output. The caller request stays unchanged for keyed retries;
@@ -168,6 +172,7 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
             orders.insert(submission_id, (order, sent_by));
         }
         if let WalRecord::Queued {
+            sent_by: display_sent_by,
             written_at_ms,
             ts_ms,
             keep_warm,
@@ -189,6 +194,7 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
             insert_in_drain_order(
                 &mut pending,
                 PendingSubmission {
+                    display_sent_by: display_sent_by.clone(),
                     admitted_at_ms: written_at_ms.or(*ts_ms),
                     hooks: hooks.clone(),
                     conversation_key: conversation_key.clone(),
@@ -267,6 +273,7 @@ mod tests {
 
     fn msg(text: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
@@ -357,6 +364,7 @@ mod tests {
 
     fn queued_as(id: &str, text: &str, delivery: Option<broca_protocol::Delivery>) -> WalRecord {
         WalRecord::Queued {
+            sent_by: None,
             written_at_ms: None,
             retention: None,
             ts_ms: None,
@@ -368,6 +376,7 @@ mod tests {
             send_id: None,
             submission_id: SubmissionId(id.into()),
             request: Box::new(SubmissionRequest {
+                route_decision_id: None,
                 service_tier_level: None,
                 staged_uploads: None,
                 content: Vec::new(),
@@ -450,6 +459,8 @@ mod tests {
 
     fn consumed(run: &str, sub: &str) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -469,6 +480,9 @@ mod tests {
             run_id: RunId(run.into()),
             session: BindIdentity::new("/tmp/p", "h", "s"),
             config: Box::new(RunConfig {
+                global_system: None,
+                route_decision_id: None,
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,

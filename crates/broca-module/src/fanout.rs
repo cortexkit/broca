@@ -1249,8 +1249,9 @@ async fn subscriber_task<W: WalStore + 'static>(
                 spawn_blocking(
                     JobKind::WalRead,
                     broca_wal::access_counter::inherit(move || {
-                        let reader = source.reader(&session, Some(h))?;
-                        replay_for_database_attach(&reader, from)
+                        source.with_reader(&session, Some(h), |reader| {
+                            replay_for_database_attach(&reader, from)
+                        })
                     }),
                 )
                 .await,
@@ -1675,6 +1676,8 @@ mod tests {
 
     fn run_started(session: &BindIdentity) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -1694,6 +1697,9 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                global_system: None,
+                route_decision_id: None,
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -1725,6 +1731,7 @@ mod tests {
 
     fn tool_step() -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -1865,6 +1872,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     fn text_step(step_id: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -1950,6 +1958,7 @@ mod tests {
         final_step_finish_reason: Option<FinishReason>,
     ) -> broca_core::ProjectionSeed {
         broca_core::ProjectionSeed {
+            refusal: Default::default(),
             open_episode_span: None,
             open_episode: None,
             earlier_episodes: Vec::new(),
@@ -3357,6 +3366,8 @@ mod tests {
                 seq: 1,
                 fence: 1,
                 record: WalRecord::RunStarted {
+                    compaction_plan_version: None,
+                    sent_by: None,
                     written_at_ms: None,
                     tags: None,
                     session_class: None,
@@ -3376,6 +3387,9 @@ mod tests {
                     run_id: RunId("r1".into()),
                     session: BindIdentity::new("/tmp/project-a", "runner", "restart"),
                     config: Box::new(RunConfig {
+                        global_system: None,
+                        route_decision_id: None,
+                        account_limit_pause: false,
                         turn_directives_v1: None,
                         render_tags: false,
                         computed_tags: None,
@@ -3408,6 +3422,7 @@ mod tests {
                 seq: 2,
                 fence: 1,
                 record: WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -3689,6 +3704,8 @@ mod episode_attach_tests {
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -3708,6 +3725,9 @@ mod episode_attach_tests {
             run_id: RunId(run_id.into()),
             session: broca_protocol::BindIdentity::new("/tmp/project", "runner", "attach"),
             config: Box::new(RunConfig {
+                global_system: None,
+                route_decision_id: None,
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -3743,6 +3763,7 @@ mod episode_attach_tests {
                 step_id: StepId(step),
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3847,6 +3868,7 @@ mod episode_attach_tests {
         records.extend(tool_step(1, "r1-b1", &["a", "b"]));
         records.extend(step(2, text("done")));
         records.push(WalRecord::Steered {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             retention: None,
@@ -4292,6 +4314,145 @@ mod episode_attach_tests {
 
 #[cfg(test)]
 mod database_attach_tests {
+    #[test]
+    fn header_only_database_pages_and_attach_stay_empty() {
+        let root = root();
+        let bind = BindIdentity::new("/db", "runner", "empty");
+        let (_store, wal) = wal(&root, &bind);
+        wal.sync().unwrap();
+        let proof = wal.durable_publication().unwrap();
+        assert_eq!(proof.sequence(), 0);
+        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        db.publish(
+            &bind,
+            &broca_core::agent_session_ref(&bind),
+            broca_store::db::LogLocation::Live,
+            &proof,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let reader = db.episode_reader(bind.clone(), proof.clone()).unwrap();
+            let model = reader.read_model_page(&Default::default()).unwrap();
+            assert!(model.page.messages.is_empty());
+            assert!(model.fallback.is_none());
+            let raw = db
+                .read_raw_page(
+                    &bind,
+                    &broca_core::agent_session_ref(&bind),
+                    broca_store::db::LogLocation::Live,
+                    &proof,
+                    Default::default(),
+                )
+                .unwrap();
+            assert!(raw.page.messages.is_empty());
+            assert_eq!(raw.at_seq, 0);
+            assert!(raw.index_validated);
+            let source = proof.clone();
+            let admission = db.admission_reader(move |_| Ok(source.clone()));
+            assert!(admission
+                .prior_snapshot(&bind, 0)
+                .unwrap()
+                .checkpoint_at_head
+                .last_episode
+                .is_none());
+            let source = proof.clone();
+            let receipts = db.compaction_receipt_store(move |_| Ok(source.clone()));
+            receipts
+                .current_compaction_facts(_store.as_ref(), &bind)
+                .unwrap();
+            let replay =
+                replay_for_database_attach(&reader, AttachFrom::Cursor(FromCursor::Start)).unwrap();
+            assert!(replay.units.is_empty());
+            assert_eq!(reader.sequence(), 0);
+        }
+        drop(wal);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscribe_at_zero_then_first_append_delivers_each_live_cursor_once() {
+        let root = root();
+        let bind = BindIdentity::new("/db", "runner", "zero-handoff");
+        let (store, mut wal) = wal(&root, &bind);
+        wal.sync().unwrap();
+        let initial = wal.durable_publication().unwrap();
+        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        db.publish(
+            &bind,
+            &broca_core::agent_session_ref(&bind),
+            broca_store::db::LogLocation::Live,
+            &initial,
+        )
+        .unwrap();
+        let latest = Arc::new(std::sync::Mutex::new(initial));
+        let source = latest.clone();
+        let (fanout, _observer) = Fanout::new(store, bind.clone());
+        let mut fanout =
+            fanout.with_episode_source(Arc::new(crate::registry::EpisodeReadSource::new(
+                db.clone(),
+                Arc::new(move |_, head| {
+                    let proof = source.lock().unwrap().clone();
+                    proof
+                        .prefix_at(head.unwrap_or(proof.sequence()), 0)
+                        .map_err(|e| e.to_string())
+                }),
+            )));
+        let (slot, rx, detached) = fanout.prepare_attach();
+        let h = 0;
+        for record in records(0) {
+            wal.append(1, &record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        *latest.lock().unwrap() = wal.durable_publication().unwrap();
+        let expected = project_control(&wal.replay().unwrap());
+        assert!(!expected.is_empty());
+        for event in &expected {
+            fanout.ring.send(Arc::new(event.clone())).unwrap();
+        }
+        let (sink, mut deliveries) = mpsc::channel(128);
+        fanout.spawn_subscriber(
+            slot,
+            AttachFrom::Cursor(FromCursor::Start),
+            h,
+            rx,
+            detached,
+            sink,
+            None,
+        );
+        let reset = broca_test_support::wait_for(
+            "display reset for empty attach",
+            deliveries.recv(),
+            || "empty attach did not reset display".into(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(reset,Delivery::Display(event) if matches!(event.as_ref(),broca_protocol::DisplayEvent::DisplayReset))
+        );
+        for event in expected {
+            let delivery = broca_test_support::wait_for(
+                "first live cursor after empty attach",
+                deliveries.recv(),
+                || "empty attach did not hand off".into(),
+            )
+            .await
+            .unwrap();
+            match delivery {
+                Delivery::Control(actual) => assert_eq!(actual.0, event.0),
+                other => panic!("unexpected delivery: {other:?}"),
+            }
+        }
+        assert!(deliveries.try_recv().is_err());
+        fanout.teardown().await;
+        // Teardown joins tasks, but the episode source still owns a database handle.
+        // Release that handle before removing the database files on Windows.
+        drop(fanout);
+        drop(wal);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use broca_core::{FileWalStore, WalHandle};
     use broca_wal::WalRecord;
@@ -4379,11 +4540,13 @@ mod database_attach_tests {
             root.join("wal"),
             broca_wal::classify_state_root(root).unwrap(),
         ));
-        let wal = broca_wal::FileWal::open(store.wal_path(bind))
-            .unwrap()
-            .with_feature_floor(root.join("wal-floor"))
-            .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-            .unwrap();
+        let wal = broca_wal::FileWal::open_with_recovery(
+            store.wal_path(bind),
+            broca_wal::WalConfig::OVERHAUL,
+            root.join("wal-floor"),
+        )
+        .unwrap()
+        .with_feature_floor(root.join("wal-floor"));
         (store, Box::new(wal))
     }
 
@@ -4593,9 +4756,10 @@ mod database_attach_tests {
                 op.frames_decoded,
                 op.reads.iter().map(|r| r.length).sum::<u64>(),
             ));
+            drop(reader);
             drop(wal);
             drop(db);
-            let _ = std::fs::remove_dir_all(root);
+            std::fs::remove_dir_all(root).unwrap();
         }
         assert_eq!(measurements[0], measurements[1]);
         eprintln!("bounded attach reads/decodes/bytes: {measurements:?}");
@@ -4724,8 +4888,9 @@ mod database_attach_tests {
         );
         fanout.teardown().await;
         writer.shutdown().await.unwrap();
+        drop(fanout);
         drop(lease);
         drop(db);
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -32,6 +32,8 @@ use broca_subc::{SubcConnection, SubcToolPlane};
 use clap::Parser;
 use tokio::sync::mpsc;
 
+use broca_subc::carrier_scope;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "broca-run",
@@ -65,7 +67,7 @@ struct Args {
 
     /// Optional JSON array of tools to use INSTEAD of catalog discovery — each
     /// `{name, description, input_schema, execution_mode}`. Omit to derive the tool
-    /// set from what the target module registers in subc's catalog.
+    /// set from the provider's --preset catalog, or its subc registration without --preset.
     #[arg(long)]
     tools: Option<String>,
 
@@ -88,9 +90,25 @@ struct Args {
     #[arg(long, default_value = "broca-run")]
     session: String,
 
-    /// The project root the run binds to (AFT sandboxes file tools to this root).
+    /// Local lease and write-ahead log (WAL) root. File tools use --scope's
+    /// daemon-stamped workdir, not this path.
     #[arg(long, default_value = ".")]
     project_root: PathBuf,
+
+    /// OWNER/REF/EPOCH for model tool routes. For a module-owned scope, OWNER is the
+    /// scope owner's module id (for example, --scope cke2e-scope-owner/rig/1).
+    /// REF names the owner's scope and EPOCH selects its incarnation, preventing ref reuse
+    /// from silently selecting a different scope. Reads the private 32-byte proof that
+    /// authorizes this Direct consumer's tool-route bind as
+    /// 64 hex characters from stdin (optional newline, then EOF), never argv or environment.
+    /// Global catalog and vault routes remain unscoped.
+    #[arg(long, value_name = "OWNER/REF/EPOCH", requires = "preset")]
+    scope: Option<carrier_scope::CarrierScope>,
+
+    /// Tool catalog preset, required with --scope. AFT defines head, worker and reader
+    /// today; the tool provider decides which values are valid.
+    #[arg(long, value_name = "NAME")]
+    preset: Option<String>,
 
     /// Explicit Bearer override. Otherwise catalog models read a vault dev-tools handle;
     /// an explicit --base-url needs no credential (for mock providers).
@@ -204,7 +222,7 @@ fn mint_run_id(session: &str) -> RunId {
 async fn main() {
     let args = Args::parse();
     let json = args.json_events;
-    std::process::exit(match run(args).await {
+    std::process::exit(match run_task_result(tokio::spawn(run(args)).await) {
         Ok(code) => code,
         Err(e) => {
             // A startup failure (couldn't connect / no tools / bind timed out) is a
@@ -217,6 +235,16 @@ async fn main() {
             1
         }
     });
+}
+
+fn run_task_result(
+    joined: Result<Result<i32, String>, tokio::task::JoinError>,
+) -> Result<i32, String> {
+    match joined {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(format!("run task cancelled: {error}")),
+    }
 }
 
 /// Where this CLI keeps its fusiform last-known-good catalog.
@@ -232,17 +260,39 @@ fn catalog_lkg_path(args: &Args) -> Result<std::path::PathBuf, String> {
     Ok(state_root.path.join("catalog/fusiform-lkg.json"))
 }
 
-async fn run(args: Args) -> Result<i32, String> {
+// Keep the run task's entry future small, as the daemon's actor does for deeply awaited work.
+fn run(args: Args) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<i32, String>>>> {
+    Box::pin(run_inner(args))
+}
+
+async fn run_inner(args: Args) -> Result<i32, String> {
     let json = args.json_events;
     let bind = BindIdentity::new(&args.project_root, &args.harness, &args.session);
     bind.validate_keyable()
         .map_err(|error| format!("invalid bind identity: {error}"))?;
+    let carrier_scope = match &args.scope {
+        Some(scope) => Some(
+            scope
+                .read_proof(&mut std::io::stdin().lock())
+                .map_err(str::to_owned)?,
+        ),
+        None => None,
+    };
 
     // 1. Connect to the running subc daemon as a consumer.
     let conn = SubcConnection::connect(&args.subc)
         .await
         .map_err(|e| format!("connect subc ({}): {e}", args.subc.display()))?;
-    let plane = SubcToolPlane::new(conn, &args.module_id);
+    let plane = match carrier_scope {
+        Some(selector) => {
+            SubcToolPlane::new_with_direct_carrier_scope(conn, &args.module_id, selector)
+        }
+        None => SubcToolPlane::new(conn, &args.module_id),
+    };
+    let plane = match &args.preset {
+        Some(preset) => plane.with_direct_tool_preset(preset),
+        None => plane,
+    };
 
     // 1b. Fill the catalog before resolving a model.
     //
@@ -280,7 +330,7 @@ async fn run(args: Args) -> Result<i32, String> {
     let tools: Vec<Tool> = match &args.tools {
         Some(json) => serde_json::from_str(json).map_err(|e| format!("parse --tools json: {e}"))?,
         None => plane
-            .tools_from_catalog()
+            .tools_from_catalog_for_bind(&bind, Duration::from_millis(args.bind_timeout_ms))
             .await
             .map_err(|e| format!("read catalog tools: {e}"))?,
     };
@@ -347,6 +397,7 @@ async fn run(args: Args) -> Result<i32, String> {
     let wal = FileWalStore::new(args.project_root.join(".broca").join("wal"));
     let policy_allowed = tools.iter().map(|t| t.name.clone()).collect();
     let req = RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -363,6 +414,7 @@ async fn run(args: Args) -> Result<i32, String> {
         session: bind,
         model: ModelHandle::new(&provider_tag, &resolved.wire_model),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -587,6 +639,54 @@ async fn run(args: Args) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_entry_future_is_boxed() {
+        // The run is spawned because Windows' 1 MiB main thread overflowed at the first tool call; this only guards future growth.
+        let future = run(args(&[]));
+        let bytes = std::mem::size_of_val(&future);
+        assert!(
+            bytes <= 4096,
+            "CLI entry future is {bytes} bytes; keep the run future off the Windows main-thread frame"
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "run task panic payload")]
+    async fn run_task_panic_is_resumed() {
+        let joined = tokio::spawn(async { panic!("run task panic payload") }).await;
+        let _ = run_task_result(joined);
+    }
+
+    #[tokio::test]
+    async fn run_task_cancellation_is_an_error() {
+        let task = tokio::spawn(std::future::pending::<Result<i32, String>>());
+        task.abort();
+        let error = run_task_result(task.await).unwrap_err();
+        assert!(error.starts_with("run task cancelled:"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn run_task_preserves_errors_and_exit_codes() {
+        assert_eq!(run_task_result(tokio::spawn(async { Ok(7) }).await), Ok(7));
+        assert_eq!(
+            run_task_result(tokio::spawn(async { Err("startup failed".into()) }).await),
+            Err("startup failed".into())
+        );
+    }
+
+    #[test]
+    fn scope_help_names_private_stdin_and_unscoped_services() {
+        use clap::CommandFactory;
+        let help = super::Args::command().render_long_help().to_string();
+        assert!(help.contains("--scope <OWNER/REF/EPOCH>"));
+        assert!(help.contains("scope owner's module id"));
+        assert!(help.contains("--scope cke2e-scope-owner/rig/1"));
+        assert!(help.contains("stdin"));
+        assert!(help.contains("vault routes remain unscoped"));
+        assert!(help.contains("--preset <NAME>"));
+        assert!(help.contains("head, worker and reader"));
+        assert!(help.contains("tool provider decides which values are valid"));
+    }
     use super::*;
     use broca_protocol::request::CallOptions;
     use broca_provider::families::{openai_chat_frozen_config, OpenAiChat};
@@ -615,7 +715,7 @@ mod tests {
 
     /// Parse a minimal arg vector into `Args` (exercises the real clap parsing, so a
     /// flag rename or a wrong `required` shows up here). Extra flags are appended.
-    fn args(extra: &[&str]) -> Args {
+    fn try_args(extra: &[&str]) -> Result<Args, clap::Error> {
         let mut v = vec![
             "broca-run",
             "--subc",
@@ -626,7 +726,51 @@ mod tests {
             "hi",
         ];
         v.extend_from_slice(extra);
-        Args::parse_from(v)
+        Args::try_parse_from(v)
+    }
+
+    fn args(extra: &[&str]) -> Args {
+        try_args(extra).expect("valid arguments")
+    }
+
+    #[test]
+    fn scope_requires_explicit_preset() {
+        let error = try_args(&["--scope", "cke2e-scope-owner/rig/1"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let message = error.to_string();
+        assert!(message.contains("--scope"), "{message}");
+        assert!(message.contains("--preset"), "{message}");
+    }
+
+    #[test]
+    fn scope_accepts_explicit_preset() {
+        let parsed = args(&["--scope", "cke2e-scope-owner/rig/1", "--preset", "worker"]);
+        assert!(parsed.scope.is_some());
+        assert_eq!(parsed.preset.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn preset_is_optional_without_scope() {
+        let parsed = args(&[]);
+        assert!(parsed.scope.is_none());
+        assert!(parsed.preset.is_none());
+    }
+
+    #[test]
+    fn preset_accepts_provider_defined_names_without_scope() {
+        for name in ["head", "worker", "reader", "provider-specific"] {
+            let parsed = args(&["--preset", name]);
+            assert!(parsed.scope.is_none());
+            assert_eq!(parsed.preset.as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn preset_requires_a_name() {
+        assert!(try_args(&["--preset"]).is_err());
     }
 
     /// `resolve_provider` Ok-or-panic — `ProviderResolution` holds a `Box<dyn Provider>`
@@ -640,6 +784,7 @@ mod tests {
 
     fn fixed_opts() -> CallOptions {
         let mut o = CallOptions::new(vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

@@ -26,8 +26,22 @@ use crate::{
 
 use crate::access_counter::decode_next;
 use broca_protocol::BindIdentity;
+use sha2::{Digest, Sha256};
 
 pub const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024 * 1024;
+
+static RECOVERY_TAIL_TRUNCATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// File-synced version 4 (overhaul) truncations in this process. Ordinary final tails have
+/// no marker; a real cut can still need marker completion from its manifest.
+pub fn recovery_tail_truncations() -> u64 {
+    RECOVERY_TAIL_TRUNCATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn recovery_truncated() {
+    RECOVERY_TAIL_TRUNCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 #[path = "human_prompt_count.rs"]
 mod human_prompt_count;
@@ -142,10 +156,24 @@ pub struct WalRangeRead {
     /// and `None` means the result was constructed without determining presence.
     file_present: Option<bool>,
     archive_lookup_missed: bool,
+    run_incompatible: Option<(usize, u8)>,
     anchors: Vec<WalByteAnchor>,
 }
 
 impl WalRangeRead {
+    /// Refuse running a session when any verified frame in this source requires a reader-only
+    /// feature. This summary includes frames filtered out of the returned record range. An
+    /// anchored suffix cannot prove that an unobserved prefix is writable.
+    pub fn check_run_compatible(&self) -> Result<(), WalError> {
+        if let Some((offset, ver)) = self.run_incompatible {
+            return Err(WalError::NewerWriter {
+                offset,
+                ver,
+                missing: vec![crate::COMPACTION_V2_FEATURE.to_string()],
+            });
+        }
+        Ok(())
+    }
     /// An authoritative miss after consulting archives, unlike legacy live-only absence.
     /// Keep the Absent variant while allowing readers to reject a store-prefix-only answer.
     pub fn absent_after_archive_lookup() -> Self {
@@ -217,6 +245,7 @@ impl WalRangeRead {
             complete_byte_end: None,
             file_present: None,
             archive_lookup_missed: false,
+            run_incompatible: None,
             anchors,
         }
     }
@@ -230,6 +259,7 @@ impl WalRangeRead {
             complete_byte_end: None,
             file_present: None,
             archive_lookup_missed: false,
+            run_incompatible: None,
             anchors: Vec::new(),
         }
     }
@@ -258,6 +288,8 @@ pub enum WalError {
         holder: String,
     },
     Io(std::io::Error),
+    /// The WAL is synced, but its observer could not accept the publication.
+    PublicationObserver(&'static str),
     Frame(FrameError),
     TooLarge {
         max_bytes: u64,
@@ -325,6 +357,13 @@ pub enum WalError {
         log: WalFormat,
         offered: WalFormat,
     },
+    /// Recovery already ran under the opening boot configuration. Selecting a
+    /// different overhaul configuration now would bypass that recovery decision.
+    BootConfigurationChange {
+        path: PathBuf,
+        opened: WalConfig,
+        requested: WalConfig,
+    },
 }
 
 impl WalError {
@@ -334,6 +373,7 @@ impl WalError {
             Self::SessionMoved { holder } => Ok(crate::migration::MoveRefusal::Moved { holder }),
             other @ (Self::RelocationIncomplete { .. }
             | Self::Io(_)
+            | Self::PublicationObserver(_)
             | Self::Frame(_)
             | Self::TooLarge { .. }
             | Self::NonMonotonic { .. }
@@ -345,6 +385,7 @@ impl WalError {
             | Self::Entropy(_)
             | Self::FeatureFloor { .. }
             | Self::StateRoot(_)
+            | Self::BootConfigurationChange { .. }
             | Self::FrameFormat { .. }) => Err(other),
         }
     }
@@ -371,6 +412,7 @@ impl std::fmt::Display for WalError {
             Self::SessionMoving { cut_id } => write!(f, "session_moving {{cutId: {cut_id}}}"),
             Self::SessionMoved { holder } => write!(f, "session_moved {{holder: {holder}}}"),
             WalError::Io(e) => write!(f, "wal io: {e}"),
+            WalError::PublicationObserver(reason) => write!(f,"WAL publication observer refused: {reason}"),
             WalError::Frame(e) => write!(f, "wal frame: {e}"),
             WalError::TooLarge {
                 max_bytes,
@@ -388,6 +430,14 @@ impl std::fmt::Display for WalError {
             WalError::Corrupt { offset, source } => {
                 write!(f, "wal corruption at offset {offset}: {source}")
             }
+            WalError::NewerWriter {
+                missing,
+                ..
+            } if missing.iter().any(|name| name == crate::framing::COMPACTION_V2_FEATURE) => write!(
+                f,
+                "session requires {} and needs a newer build to run; it is read-only on this build",
+                missing.join(", ")
+            ),
             WalError::NewerWriter {
                 offset,
                 ver,
@@ -429,6 +479,9 @@ impl std::fmt::Display for WalError {
                 format_name(*log),
                 format_name(*offered)
             ),
+            WalError::BootConfigurationChange { path, opened, requested } => write!(f,
+                "WAL {} was opened with boot configuration {opened:?}; {requested:?} must be selected before opening, not after recovery",
+                path.display()),
         }
     }
 }
@@ -480,6 +533,10 @@ fn closed_error() -> WalError {
 
 /// The append-only WAL log. The loop depends on the trait, not the impl.
 pub trait Wal {
+    /// Borrow the last synced prefix without allocating on the writer barrier.
+    fn borrowed_publication(&self) -> Option<DurablePublicationRef<'_>> {
+        None
+    }
     /// The last prefix synced on this writer's descriptor, never speculative EOF.
     /// Memory logs and wrappers without a durable file witness return `None`.
     fn durable_publication(&self) -> Option<DurablePublication> {
@@ -595,6 +652,14 @@ struct SyncProbe {
 /// An immutable publication witness minted only by a successful writer sync.
 /// Readers must still authenticate lineage, frame hashes and contiguous ranges;
 /// the witness bounds their reads, not the lifetime of the file at its path.
+/// Callers cannot mint one by syncing an unrelated descriptor:
+/// ```compile_fail
+/// use broca_wal::{file_wal::{DurablePublication, FileWal}, Wal};
+/// let file = broca_wal::fs_ops::File::open("unrelated").unwrap();
+/// let lineage = FileWal::open("identity.wal").unwrap().lineage_id().unwrap();
+/// let _ = DurablePublication::sync_recovered(&file, std::path::Path::new("unsynced.wal"),
+///     lineage, 7, 69);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurablePublication {
     path: PathBuf,
@@ -603,7 +668,145 @@ pub struct DurablePublication {
     end: u64,
 }
 
+/// A borrowed descriptor proof whose coordinates cannot be supplied by observers.
+#[derive(Clone, Copy)]
+pub struct DurablePublicationRef<'a> {
+    path: &'a Path,
+    lineage: WalLineageId,
+    seq: u64,
+    end: u64,
+}
+impl DurablePublicationRef<'_> {
+    pub fn path(&self) -> &Path {
+        self.path
+    }
+    pub fn lineage(&self) -> WalLineageId {
+        self.lineage
+    }
+    pub fn sequence(&self) -> u64 {
+        self.seq
+    }
+    pub fn byte_end(&self) -> u64 {
+        self.end
+    }
+    pub fn to_owned(self) -> DurablePublication {
+        DurablePublication::new(self.path.to_path_buf(), self.lineage, self.seq, self.end)
+    }
+}
+
 impl DurablePublication {
+    pub fn borrowed(&self) -> DurablePublicationRef<'_> {
+        DurablePublicationRef {
+            path: &self.path,
+            lineage: self.lineage,
+            seq: self.seq,
+            end: self.end,
+        }
+    }
+    fn new(path: PathBuf, lineage: WalLineageId, seq: u64, end: u64) -> Self {
+        Self {
+            path,
+            lineage,
+            seq,
+            end,
+        }
+    }
+
+    /// Bound an existing proof to an earlier frame, starting at an indexed frame
+    /// offset. No writer is opened and no new durability claim is made.
+    pub fn prefix_at(&self, sequence: u64, offset: u64) -> std::io::Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
+        if sequence > self.seq || offset >= self.end {
+            return Err(std::io::Error::other(
+                "publication prefix is outside its durable proof",
+            ));
+        }
+        if sequence == self.seq {
+            return Ok(self.clone());
+        }
+        let mut file = fs_ops::OpenOptions::new().read(true).open(&self.path)?;
+        if sequence == 0 {
+            let mut header = [0u8; crate::framing::LINEAGE_FRAME_LEN];
+            crate::access_counter::AccessReader::new(&mut file, 0).read_exact(&mut header)?;
+            if !matches!(crate::access_counter::decode_next(&header), crate::framing::DecodeStep::Lineage { lineage_id, consumed } if lineage_id == self.lineage && consumed == header.len())
+            {
+                return Err(std::io::Error::other(
+                    "empty publication lineage does not match its proof",
+                ));
+            }
+            return Ok(Self::new(
+                self.path.clone(),
+                self.lineage,
+                0,
+                header.len() as u64,
+            ));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut file =
+            crate::access_counter::AccessReader::new(file.take(self.end - offset), offset);
+        let mut consumed = 0usize;
+        while (consumed as u64) < self.end - offset {
+            let mut header = [0u8; crate::framing::HEADER_LEN];
+            file.read_exact(&mut header)?;
+            let payload = u32::from_le_bytes(header[..4].try_into().unwrap());
+            let header_len = if header[4] == crate::framing::V4_FRAMING_VERSION {
+                crate::framing::v4_header_len(&header).ok_or_else(|| {
+                    std::io::Error::other("invalid publication prefix frame header")
+                })?
+            } else {
+                header.len()
+            };
+            let size = header_len
+                .checked_add(payload as usize)
+                .ok_or_else(|| std::io::Error::other("publication prefix frame overflows"))?;
+            if payload > crate::framing::MAX_PAYLOAD_LEN
+                || size as u64 > self.end - offset - consumed as u64
+            {
+                return Err(std::io::Error::other(
+                    "publication prefix frame exceeds its durable proof",
+                ));
+            }
+            let mut frame = vec![0u8; size];
+            frame[..header.len()].copy_from_slice(&header);
+            file.read_exact(&mut frame[header.len()..])?;
+            match crate::access_counter::decode_next(&frame) {
+                crate::framing::DecodeStep::Record {
+                    framed: record,
+                    consumed: len,
+                } => {
+                    consumed += len;
+                    if record.seq == sequence {
+                        let gap_len = crate::framing::LINEAGE_FRAME_LEN;
+                        if (consumed + gap_len) as u64 <= self.end - offset {
+                            let mut gap = vec![0u8; gap_len];
+                            file.read_exact(&mut gap)?;
+                            if matches!(crate::access_counter::decode_next(&gap), crate::framing::DecodeStep::Lineage { lineage_id, .. } if lineage_id == self.lineage)
+                            {
+                                consumed += gap_len;
+                            }
+                        }
+                        return Ok(Self::new(
+                            self.path.clone(),
+                            self.lineage,
+                            sequence,
+                            offset + consumed as u64,
+                        ));
+                    }
+                    if record.seq > sequence {
+                        break;
+                    }
+                }
+                crate::framing::DecodeStep::Lineage { consumed: len, .. } => {
+                    consumed += len;
+                }
+                _ => break,
+            }
+        }
+        Err(std::io::Error::other(
+            "attach barrier frame is absent from the proven prefix",
+        ))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -615,6 +818,276 @@ impl DurablePublication {
     }
     pub fn byte_end(&self) -> u64 {
         self.end
+    }
+}
+
+/// Untrusted index coordinates; recovery authenticates them on its own descriptor.
+#[derive(Clone, PartialEq, Eq)]
+pub enum RecoveryCursor {
+    Empty,
+    Frame {
+        off: u64,
+        end: u64,
+        identity: [u8; 32],
+    },
+}
+
+/// Boot recovery owns the descriptor used for reads and sync. Neither the path,
+/// lineage nor the recovered sequence/end can be supplied to proof minting.
+pub struct WalRecovery {
+    path: PathBuf,
+    file: RefCell<File>,
+    size: u64,
+    lineage: WalLineageId,
+    verified: RefCell<Option<RecoveryAnchor>>,
+}
+
+type RecoveryAnchor = (RecoveryCursor, u64, Option<u64>);
+
+impl WalRecovery {
+    pub fn open(path: &Path, max_bytes: u64) -> Result<Self, WalError> {
+        let file = fs_ops::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(WalError::Io)?;
+        let size = file.metadata().map_err(WalError::Io)?.len();
+        if size > max_bytes {
+            return Err(WalError::TooLarge {
+                max_bytes,
+                file_size: size,
+            });
+        }
+        let file = RefCell::new(file);
+        let read = |off, len| recovery_read(&file, size, off, len);
+        let header = access_counter::read_at(&read, 0, crate::framing::LINEAGE_FRAME_LEN as u64)
+            .map_err(WalError::Io)?;
+        let lineage = match access_counter::decode_next(&header) {
+            DecodeStep::Lineage {
+                lineage_id,
+                consumed,
+            } if consumed == header.len() && consumed == crate::framing::LINEAGE_FRAME_LEN => {
+                lineage_id
+            }
+            _ => {
+                return Err(WalError::Io(std::io::Error::other(
+                    "boot WAL has no complete lineage header",
+                )))
+            }
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            size,
+            lineage,
+            verified: RefCell::new(None),
+        })
+    }
+
+    pub fn byte_len(&self) -> u64 {
+        self.size
+    }
+    pub fn lineage(&self) -> WalLineageId {
+        self.lineage
+    }
+    pub fn read_at(&self, off: u64, len: u64) -> std::io::Result<Vec<u8>> {
+        recovery_read(&self.file, self.size, off, len)
+    }
+
+    fn checked_cursor(&self, cursor: &RecoveryCursor) -> Result<Option<RecoveryAnchor>, WalError> {
+        let (start, previous) = match cursor {
+            RecoveryCursor::Empty => (crate::framing::LINEAGE_FRAME_LEN as u64, None),
+            RecoveryCursor::Frame { off, end, identity } => {
+                if off >= end || *end > self.size {
+                    return Ok(None);
+                }
+                let bytes = access_counter::read_validation_at(
+                    access_counter::ValidationRead::BoundaryFrame,
+                    &|off, len| self.read_at(off, len),
+                    *off,
+                    end - off,
+                )
+                .map_err(WalError::Io)?;
+                let (seq, mut at) = match access_counter::decode_next(&bytes) {
+                    DecodeStep::Record { framed, consumed }
+                        if Sha256::digest(&bytes[..consumed]).as_slice() == identity.as_slice() =>
+                    {
+                        (framed.seq, consumed)
+                    }
+                    _ => return Ok(None),
+                };
+                while at < bytes.len() {
+                    match access_counter::decode_next(&bytes[at..]) {
+                        DecodeStep::Lineage {
+                            lineage_id,
+                            consumed,
+                        } if lineage_id == self.lineage => at += consumed,
+                        _ => return Ok(None),
+                    }
+                }
+                (*end, Some(seq))
+            }
+        };
+        Ok((start <= self.size).then(|| (cursor.clone(), start, previous)))
+    }
+
+    /// Authenticate an index hint once on this descriptor. The cached anchor is
+    /// private and can only be reused for these exact coordinates on this open.
+    pub fn authenticate_cursor(
+        &self,
+        cursor: &RecoveryCursor,
+        expected: Option<u64>,
+    ) -> Result<bool, WalError> {
+        let checked = self
+            .checked_cursor(cursor)?
+            .filter(|(_, _, actual)| *actual == expected);
+        let valid = checked.is_some();
+        *self.verified.borrow_mut() = checked;
+        Ok(valid)
+    }
+
+    pub fn recover_and_sync(
+        &self,
+        cursor: Option<RecoveryCursor>,
+    ) -> Result<DurablePublication, WalError> {
+        let (start, previous) = match cursor {
+            None => (0, None),
+            Some(cursor) => {
+                let cached = self
+                    .verified
+                    .borrow()
+                    .as_ref()
+                    .filter(|(raw, _, _)| raw == &cursor)
+                    .cloned();
+                let (_, start, previous) = match cached {
+                    Some(anchor) => Some(anchor),
+                    None => self.checked_cursor(&cursor)?,
+                }
+                .ok_or_else(|| {
+                    WalError::Io(std::io::Error::other(
+                        "boot recovery cursor does not authenticate on the WAL descriptor",
+                    ))
+                })?;
+                (start, previous)
+            }
+        };
+        let bytes =
+            access_counter::read_at(&|off, len| self.read_at(off, len), start, self.size - start)
+                .map_err(WalError::Io)?;
+        let recovered = recover_prefix(&bytes, start, previous, Some(self.lineage))?;
+        self.file.borrow().sync_all().map_err(WalError::Io)?;
+        Ok(DurablePublication::new(
+            self.path.clone(),
+            self.lineage,
+            recovered.last_seq.unwrap_or(0),
+            recovered.valid_end,
+        ))
+    }
+}
+
+fn recovery_read(file: &RefCell<File>, size: u64, off: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    let mut file = file.borrow_mut();
+    file.seek(SeekFrom::Start(off))?;
+    let mut bytes = Vec::new();
+    (&mut *file)
+        .take(len.min(size.saturating_sub(off)))
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// A single writer's latest proof. Recording uses only atomic stores, so a slow
+/// indexer never blocks a WAL barrier. Snapshots may retry while the writer stores.
+pub struct PublicationSlot {
+    paths: Vec<PathBuf>,
+    lineage: WalLineageId,
+    version: std::sync::atomic::AtomicU64,
+    seq: std::sync::atomic::AtomicU64,
+    end: std::sync::atomic::AtomicU64,
+    path_index: std::sync::atomic::AtomicUsize,
+    invalid: std::sync::atomic::AtomicBool,
+}
+
+impl PublicationSlot {
+    pub fn new(paths: Vec<PathBuf>, lineage: WalLineageId) -> Self {
+        Self {
+            paths,
+            lineage,
+            version: std::sync::atomic::AtomicU64::new(0),
+            seq: std::sync::atomic::AtomicU64::new(0),
+            end: std::sync::atomic::AtomicU64::new(0),
+            path_index: std::sync::atomic::AtomicUsize::new(0),
+            invalid: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Called by the one writer that owns this slot, never concurrently.
+    pub fn record(&self, publication: &DurablePublication) {
+        self.record_borrowed(publication.borrowed());
+    }
+
+    /// Reuse an older acknowledged prefix only when it belongs to this open's
+    /// lineage and placement domain. A nonmatching predecessor is not a fault
+    /// in the new descriptor and must not invalidate its fresh slot.
+    pub fn seed_previous(&self, publication: &DurablePublication) -> bool {
+        if publication.lineage() != self.lineage
+            || !self.paths.iter().any(|path| path == publication.path())
+        {
+            return false;
+        }
+        self.record_borrowed(publication.borrowed())
+    }
+    pub fn record_borrowed(&self, publication: DurablePublicationRef<'_>) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let path_index = self
+            .paths
+            .iter()
+            .position(|path| path == publication.path());
+        let Some(path_index) = path_index.filter(|_| {
+            publication.lineage() == self.lineage
+                && publication.sequence() >= self.seq.load(SeqCst)
+                && !self.invalid.load(SeqCst)
+        }) else {
+            self.invalid.store(true, SeqCst);
+            return false;
+        };
+        self.version.fetch_add(1, SeqCst);
+        self.seq.store(publication.sequence(), SeqCst);
+        self.end.store(publication.byte_end(), SeqCst);
+        self.path_index.store(path_index, SeqCst);
+        self.version.fetch_add(1, SeqCst);
+        true
+    }
+
+    pub fn is_invalid(&self) -> bool {
+        self.invalid.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn snapshot(&self) -> Option<DurablePublication> {
+        use std::sync::atomic::Ordering::SeqCst;
+        loop {
+            if self.is_invalid() {
+                return None;
+            }
+            let before = self.version.load(SeqCst);
+            if before == 0 {
+                return None;
+            }
+            if !before.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+            let seq = self.seq.load(SeqCst);
+            let end = self.end.load(SeqCst);
+            let path_index = self.path_index.load(SeqCst);
+            if before == self.version.load(SeqCst) && !self.is_invalid() {
+                return Some(DurablePublication::new(
+                    self.paths[path_index].clone(),
+                    self.lineage,
+                    seq,
+                    end,
+                ));
+            }
+        }
     }
 }
 
@@ -644,7 +1117,7 @@ pub struct FileWal {
     /// whose direct child was newly created.
     newly_created_dirs: RefCell<Vec<PathBuf>>,
     /// The frame format this log writes, set by the store that opened it from the boot
-    /// decision. Legacy unless [`FileWal::with_wal_config`] says otherwise.
+    /// decision. Unconfigured opens are legacy-only; a later builder cannot promote them.
     config: WalConfig,
     /// Minted when the log is configured as an overhaul log: the random 128-bit id stamped in
     /// every version 4 frame this open appends, so a frame names the writer that wrote it.
@@ -683,7 +1156,7 @@ fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
     fs_ops::create_dir_all(dir)
 }
 
-fn mint_lineage_id() -> Result<WalLineageId, WalError> {
+pub(crate) fn mint_lineage_id() -> Result<WalLineageId, WalError> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(WalError::Entropy)?;
     // UUID-shaped presentation is only a convenient encoding; consumers treat the value as opaque.
@@ -886,7 +1359,10 @@ impl FileWal {
     }
     /// Open (creating if absent) the WAL at `path`, recovering `next_seq` from the
     /// last committed record. Creation writes a fresh lineage identity; an existing legacy file
-    /// remains unidentified until its next append. A torn trailing frame (an append that crashed
+    /// remains unidentified until its next append. This unconfigured path is legacy-only and
+    /// never probes recovery sidecars. Overhaul callers supply the boot format and policy through
+    /// `open_with_recovery` or `open_with_manifest_and_recovery` before any recovery.
+    /// A legacy torn trailing frame (an append that crashed
     /// mid-write, never fsynced as complete) is TRUNCATED away on open, so the file ends exactly at
     /// the last valid frame before any new append.
     ///
@@ -902,6 +1378,8 @@ impl FileWal {
             String::new(),
             AccessMode::GuardEveryMutation,
             None,
+            None,
+            None,
         )
     }
 
@@ -916,6 +1394,8 @@ impl FileWal {
             String::new(),
             AccessMode::GuardEveryMutation,
             Some(sync_probe),
+            None,
+            None,
         )
     }
 
@@ -958,6 +1438,72 @@ impl FileWal {
             session_ref,
             AccessMode::GuardEveryMutation,
             None,
+            None,
+            None,
+        )
+    }
+
+    /// Supply the boot decision before recovery can mutate an overhaul log.
+    pub fn open_with_manifest_and_recovery(
+        path: impl Into<PathBuf>,
+        manifest_path: impl Into<PathBuf>,
+        session_addr: impl Into<String>,
+        identity: impl Into<String>,
+        session_ref: String,
+        recovery: (WalConfig, PathBuf),
+    ) -> Result<Self, WalError> {
+        Self::open_inner(
+            path.into(),
+            Some(ManifestAppend {
+                path: manifest_path.into(),
+                session_addr: session_addr.into(),
+                identity: identity.into(),
+            }),
+            session_ref,
+            AccessMode::GuardEveryMutation,
+            None,
+            Some(recovery),
+            None,
+        )
+    }
+
+    pub fn open_with_manifest_and_recovery_hooks(
+        path: impl Into<PathBuf>,
+        manifest_path: impl Into<PathBuf>,
+        session_addr: impl Into<String>,
+        identity: impl Into<String>,
+        session_ref: String,
+        recovery: (WalConfig, PathBuf),
+        hooks: std::sync::Arc<dyn crate::recovery::RecoveryHooks>,
+    ) -> Result<Self, WalError> {
+        Self::open_inner(
+            path.into(),
+            Some(ManifestAppend {
+                path: manifest_path.into(),
+                session_addr: session_addr.into(),
+                identity: identity.into(),
+            }),
+            session_ref,
+            AccessMode::GuardEveryMutation,
+            None,
+            Some(recovery),
+            Some(hooks),
+        )
+    }
+
+    pub fn open_with_recovery(
+        path: impl Into<PathBuf>,
+        config: WalConfig,
+        feature_floor: PathBuf,
+    ) -> Result<Self, WalError> {
+        Self::open_inner(
+            path.into(),
+            None,
+            String::new(),
+            AccessMode::GuardEveryMutation,
+            None,
+            Some((config, feature_floor)),
+            None,
         )
     }
 
@@ -968,6 +1514,8 @@ impl FileWal {
         access: AccessMode,
         #[cfg(test)] sync_probe: Option<SyncProbe>,
         #[cfg(not(test))] _sync_probe: Option<()>,
+        recovery: Option<(WalConfig, PathBuf)>,
+        hooks: Option<std::sync::Arc<dyn crate::recovery::RecoveryHooks>>,
     ) -> Result<Self, WalError> {
         crate::migration::guard(&path, &session_ref, true)?;
         #[cfg(windows)]
@@ -993,32 +1541,53 @@ impl FileWal {
         let max_read_bytes = OPEN_READ_CAP.with(Cell::get);
         #[cfg(not(test))]
         let max_read_bytes = DEFAULT_MAX_READ_BYTES;
-        let recovered = access_counter::writer_open(&path, true, || match File::open(&path) {
-            Ok(file) => {
-                let size = file.metadata().map_err(WalError::Io)?.len();
-                if size > max_read_bytes {
-                    return Err(WalError::TooLarge {
-                        max_bytes: max_read_bytes,
-                        file_size: size,
-                    });
-                }
-                scan_prefix(
-                    std::io::BufReader::new(file),
-                    max_read_bytes,
-                    |_| None::<()>,
-                )
+        let boot_config = recovery
+            .as_ref()
+            .map_or(WalConfig::LEGACY, |(config, _)| *config);
+        let recovered = access_counter::writer_open(&path, true, || {
+            let initial = scan_writer_open(&path, max_read_bytes, boot_config.is_overhaul());
+            if matches!(&initial, Err(error) if !matches!(error,
+                WalError::Corrupt { .. } | WalError::SequenceGap { .. } | WalError::NonMonotonic { .. }))
+            {
+                return initial;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                scan_prefix(std::io::empty(), max_read_bytes, |_| None::<()>)
+            let inspection = match &initial {
+                Ok(open) => crate::recovery::OpenInspection {
+                    file_len: open.file_len,
+                    valid_end: Some(open.scan.valid_end),
+                    lineage: open.scan.lineage_id,
+                    legacy_records: open.scan.legacy_records,
+                    missing: open.missing,
+                },
+                Err(_) => crate::recovery::OpenInspection {
+                    file_len: 0,
+                    valid_end: None,
+                    lineage: None,
+                    legacy_records: false,
+                    missing: false,
+                },
+            };
+            let changed = crate::recovery::before_open_with_hooks(
+                &path,
+                recovery.as_ref().map(|r| r.0),
+                recovery.as_ref().map(|r| r.1.as_path()),
+                &session_ref,
+                max_read_bytes,
+                hooks.as_deref(),
+                Some(&inspection),
+            )?;
+            if changed {
+                scan_writer_open(&path, max_read_bytes, boot_config.is_overhaul())
+            } else {
+                initial
             }
-            Err(error) => Err(WalError::Io(error)),
         })?;
-        let valid_end = recovered.valid_end;
-        let recovered_lineage_id = recovered.lineage_id;
+        let valid_end = recovered.scan.valid_end;
+        let recovered_lineage_id = recovered.scan.lineage_id;
         // Seq is 1-BASED: the first record is seq 1, so a watermark of 0
         // unambiguously means "nothing projected yet" and `tail_after_seq(0)`
         // includes the first record (the cold-start merge case).
-        let next_seq = recovered.last_seq.map(|seq| seq + 1).unwrap_or(1);
+        let next_seq = recovered.scan.last_seq.map(|seq| seq + 1).unwrap_or(1);
         // If the file is longer than the last valid record, a torn tail exists — truncate it
         // so the file ends exactly at the last valid record, BEFORE opening the append
         // handle. The truncation uses a dedicated WRITE handle: an append-mode handle
@@ -1035,6 +1604,16 @@ impl FileWal {
                     .map_err(WalError::Io)?;
                 trunc.set_len(valid_end).map_err(WalError::Io)?;
                 trunc.sync_all().map_err(WalError::Io)?; // durable before appending after it
+                if boot_config.is_overhaul() {
+                    recovery_truncated();
+                }
+            }
+        }
+        // Projection repair must read the final durable file, after either a real
+        // cut or silent ordinary-tail trimming, before any writable handle escapes.
+        if !recovered.cut_ids.is_empty() {
+            if let Some(hooks) = &hooks {
+                hooks.after_repair(&path, &recovered.cut_ids)?;
             }
         }
         let mut create_opts = OpenOptions::new();
@@ -1075,7 +1654,7 @@ impl FileWal {
         } else {
             valid_end
         };
-        Ok(Self {
+        Self {
             path,
             file,
             next_seq,
@@ -1083,7 +1662,7 @@ impl FileWal {
             synced_prefix: Cell::new(None),
             dir_needs_sync: Cell::new(true),
             newly_created_dirs: RefCell::new(newly_created_dirs),
-            config: WalConfig::LEGACY,
+            config: boot_config,
             writer_id: None,
             writer_close_reserve: 0,
             lineage_id,
@@ -1095,7 +1674,8 @@ impl FileWal {
             access,
             #[cfg(test)]
             sync_probe,
-        })
+        }
+        .with_wal_config(boot_config)
     }
 
     /// Name the feature floor this WAL raises before it appends a record that requires a WAL
@@ -1105,19 +1685,28 @@ impl FileWal {
         self
     }
 
-    /// Write this log in `config`'s format, as decided once at boot for its state root. An
-    /// overhaul log mints its random `writer_id` here, so each open stamps its own; it then writes
-    /// only version 4 frames it stamps itself and refuses caller-encoded bytes.
+    /// Validate the writing configuration decided before this handle was opened.
+    /// This never reruns recovery or promotes an unconfigured legacy handle.
     pub fn with_wal_config(mut self, config: WalConfig) -> Result<Self, WalError> {
+        if self.config.format != config.format
+            || (self.config.is_overhaul() && self.config.recovery != config.recovery)
+        {
+            return Err(WalError::BootConfigurationChange {
+                path: self.path.clone(),
+                opened: self.config,
+                requested: config,
+            });
+        }
         self.writer_id = match config.format {
             WalFormat::Legacy => None,
-            WalFormat::Overhaul => {
+            WalFormat::Overhaul if self.writer_id.is_none() => {
                 let mut id = [0u8; 16];
                 getrandom::fill(&mut id).map_err(WalError::Entropy)?;
                 #[cfg(feature = "fs-override")]
                 let id = WRITER_ID_FOR_TEST.with(|slot| slot.get().unwrap_or(id));
                 Some(id)
             }
+            WalFormat::Overhaul => self.writer_id,
         };
         self.config = config;
         Ok(self)
@@ -1232,6 +1821,16 @@ impl FileWal {
         sync: bool,
         source: FrameSource,
     ) -> Result<u64, WalError> {
+        if matches!(
+            record,
+            WalRecord::RecoveryCut { .. } | WalRecord::RecoveryCallClosed { .. }
+        ) && !self.config.is_overhaul()
+        {
+            return Err(WalError::FrameFormat {
+                log: WalFormat::Legacy,
+                offered: WalFormat::Overhaul,
+            });
+        }
         // One validation phase per tenure: the open-time guard cleared the
         // fenced path and reference under the held tenure, so owned appends
         // skip the repeated migration probes while that verdict still covers
@@ -1444,14 +2043,18 @@ impl FileWal {
 }
 
 impl Wal for FileWal {
-    fn durable_publication(&self) -> Option<DurablePublication> {
+    fn borrowed_publication(&self) -> Option<DurablePublicationRef<'_>> {
         let (seq, end) = self.synced_prefix.get()?;
-        Some(DurablePublication {
-            path: self.path.clone(),
+        Some(DurablePublicationRef {
+            path: &self.path,
             lineage: self.lineage_id?,
             seq,
             end,
         })
+    }
+    fn durable_publication(&self) -> Option<DurablePublication> {
+        self.borrowed_publication()
+            .map(DurablePublicationRef::to_owned)
     }
     fn log_path(&self) -> Option<&Path> {
         Some(&self.path)
@@ -1719,11 +2322,9 @@ impl OwnedWriterWal {
             fenced_path,
             fenced_ref,
         };
-        let wal =
-            FileWal::open_inner(path, manifest, session_ref, access, None).map_err(|error| {
-                OwnedOpenError {
-                    cause: OwnedOpenCause::Wal(error),
-                }
+        let wal = FileWal::open_inner(path, manifest, session_ref, access, None, None, None)
+            .map_err(|error| OwnedOpenError {
+                cause: OwnedOpenCause::Wal(error),
             })?;
         #[cfg(test)]
         OWNED_OPEN_PANIC_AFTER_RECOVERY.with(|flag| {
@@ -1937,6 +2538,64 @@ struct PrefixScan<T> {
     valid_end: u64,
     last_seq: Option<u64>,
     lineage_id: Option<WalLineageId>,
+    legacy_records: bool,
+}
+
+struct WriterOpenScan {
+    scan: PrefixScan<()>,
+    file_len: u64,
+    missing: bool,
+    cut_ids: std::collections::BTreeSet<String>,
+}
+
+fn scan_writer_open(path: &Path, cap: u64, overhaul: bool) -> Result<WriterOpenScan, WalError> {
+    let mut cut_ids = std::collections::BTreeSet::new();
+    let mut observe = |frame: &FramedRecord| {
+        if overhaul {
+            if let WalRecord::RecoveryCut { recovery } = &frame.record {
+                cut_ids.insert(recovery.cut_id.clone());
+            }
+        }
+        None::<()>
+    };
+    let (scan, file_len, missing) = match File::open(path) {
+        Ok(file) => {
+            let file_len = file.metadata().map_err(WalError::Io)?.len();
+            if file_len > cap {
+                return Err(WalError::TooLarge {
+                    max_bytes: cap,
+                    file_size: file_len,
+                });
+            }
+            (
+                scan_prefix_with_decoder(
+                    std::io::BufReader::new(file),
+                    cap,
+                    &mut observe,
+                    crate::framing::decode_next_for_writer,
+                )?,
+                file_len,
+                false,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+            scan_prefix_with_decoder(
+                std::io::empty(),
+                cap,
+                &mut observe,
+                crate::framing::decode_next_for_writer,
+            )?,
+            0,
+            true,
+        ),
+        Err(error) => return Err(WalError::Io(error)),
+    };
+    Ok(WriterOpenScan {
+        scan,
+        file_len,
+        missing,
+        cut_ids,
+    })
 }
 
 fn read_up_to(file: &mut impl Read, bytes: &mut [u8]) -> Result<usize, WalError> {
@@ -1957,7 +2616,16 @@ fn read_up_to(file: &mut impl Read, bytes: &mut [u8]) -> Result<usize, WalError>
 fn scan_prefix<T>(
     file: impl Read,
     max_bytes: u64,
+    found: impl FnMut(&FramedRecord) -> Option<T>,
+) -> Result<PrefixScan<T>, WalError> {
+    scan_prefix_with_decoder(file, max_bytes, found, crate::framing::decode_next)
+}
+
+fn scan_prefix_with_decoder<T>(
+    file: impl Read,
+    max_bytes: u64,
     mut found: impl FnMut(&FramedRecord) -> Option<T>,
+    decode: fn(&[u8]) -> DecodeStep,
 ) -> Result<PrefixScan<T>, WalError> {
     let mut file = access_counter::AccessReader::new(file, 0);
     let mut scan = PrefixScan {
@@ -1966,6 +2634,7 @@ fn scan_prefix<T>(
         valid_end: 0,
         last_seq: None,
         lineage_id: None,
+        legacy_records: false,
     };
     loop {
         let offset = scan.valid_end;
@@ -2015,8 +2684,9 @@ fn scan_prefix<T>(
                 scan.bytes_read += n as u64;
             }
         }
-        match decode_next_counted(&frame) {
+        match decode_next_counted_with(&frame, decode) {
             DecodeStep::Record { framed, consumed } => {
+                scan.legacy_records |= frame[4] != crate::framing::V4_FRAMING_VERSION;
                 validate_contiguous_sequence(scan.last_seq, 1, framed.seq)?;
                 scan.last_seq = Some(framed.seq);
                 scan.valid_end += consumed as u64;
@@ -2193,6 +2863,7 @@ pub fn read_records_range(
                 file_present: Some(false),
                 complete_byte_end: None,
                 archive_lookup_missed: false,
+                run_incompatible: None,
                 anchors: Vec::new(),
             });
         }
@@ -2424,10 +3095,50 @@ pub fn read_verified_member_range(
     )
 }
 
+/// Check a member's frame requirements before restoring its already-loaded archive bytes.
+/// Project only sequence metadata: no second file read or decoded transcript is needed.
+pub fn check_member_run_compatible(bytes: &[u8]) -> Result<(), WalError> {
+    let mut offset = 0;
+    let mut last_seq = None;
+    let mut lineage = None;
+    while offset < bytes.len() {
+        match access_counter::decode_using(&bytes[offset..], |buf| {
+            crate::framing::decode_projected_for_writer(buf, |seq, _, _| Ok(seq))
+        }) {
+            DecodeStep::Record {
+                framed: seq,
+                consumed,
+            } => {
+                validate_contiguous_sequence(last_seq, 1, *seq)?;
+                last_seq = Some(*seq);
+                offset += consumed;
+            }
+            DecodeStep::Lineage {
+                lineage_id,
+                consumed,
+            } => {
+                fold_lineage_id(&mut lineage, lineage_id)?;
+                offset += consumed;
+            }
+            DecodeStep::NewerWriter { ver, missing } => {
+                return Err(WalError::NewerWriter {
+                    offset,
+                    ver,
+                    missing,
+                })
+            }
+            DecodeStep::Corrupt(source) => return Err(WalError::Corrupt { offset, source }),
+            DecodeStep::TornTail => break,
+        }
+    }
+    Ok(())
+}
+
 struct DecodedBytes {
     records: Vec<(FramedRecord, u64)>,
     valid_end: u64,
     lineage_id: Option<WalLineageId>,
+    run_incompatible: Option<(usize, u8)>,
 }
 
 /// A verified prefix, not a durability witness. Only the caller's descriptor
@@ -2450,7 +3161,15 @@ pub fn recover_prefix(
     previous_seq: Option<u64>,
     lineage: Option<WalLineageId>,
 ) -> Result<WalRecoveryPrefix, WalError> {
-    let decoded = decode_bytes_seeded(bytes, absolute_start, previous_seq, 1, Vec::new(), lineage)?;
+    let decoded = decode_bytes_seeded(
+        bytes,
+        absolute_start,
+        previous_seq,
+        1,
+        Vec::new(),
+        lineage,
+        None,
+    )?;
     Ok(WalRecoveryPrefix {
         valid_end: decoded.valid_end,
         last_seq: decoded
@@ -2467,7 +3186,11 @@ std::thread_local! {
 }
 
 fn decode_next_counted(bytes: &[u8]) -> DecodeStep {
-    let step = decode_next(bytes);
+    decode_next_counted_with(bytes, crate::framing::decode_next)
+}
+
+fn decode_next_counted_with<T>(bytes: &[u8], decode: fn(&[u8]) -> DecodeStep<T>) -> DecodeStep<T> {
+    let step = access_counter::decode_using(bytes, decode);
     #[cfg(test)]
     if let DecodeStep::Record { consumed, .. } | DecodeStep::Lineage { consumed, .. } = &step {
         DECODED_BYTE_COUNT.with(|count| count.set(count.get() + *consumed as u64));
@@ -2510,7 +3233,10 @@ fn decode_anchored_suffix(
     let mut lineage_id = None;
     while offset < bytes.len() {
         open_observed("frame decode");
-        match decode_next_counted(&bytes[offset..]) {
+        match decode_next_counted_with(
+            &bytes[offset..],
+            crate::framing::decode_with_run_requirement,
+        ) {
             DecodeStep::Lineage {
                 lineage_id: found,
                 consumed,
@@ -2519,6 +3245,7 @@ fn decode_anchored_suffix(
                 offset += consumed;
             }
             DecodeStep::Record { framed, consumed } => {
+                let (framed, read_only) = *framed;
                 if let Err(error) = validate_contiguous_sequence(None, expected_next, framed.seq) {
                     return match error {
                         WalError::SequenceGap { .. } => Ok(None),
@@ -2527,7 +3254,7 @@ fn decode_anchored_suffix(
                 }
                 let first_seq = framed.seq;
                 let first_end = absolute_start + offset as u64 + consumed as u64;
-                let records = vec![(*framed, first_end)];
+                let records = vec![(framed, first_end)];
                 return match decode_bytes_seeded(
                     &bytes[offset + consumed..],
                     first_end,
@@ -2535,6 +3262,8 @@ fn decode_anchored_suffix(
                     expected_next,
                     records,
                     lineage_id,
+                    read_only
+                        .then_some(((absolute_start + offset as u64) as usize, bytes[offset + 4])),
                 ) {
                     Ok(decoded) => Ok(Some(decoded)),
                     // Return `None` for a gap in an anchored suffix so the caller retries from byte
@@ -2550,6 +3279,7 @@ fn decode_anchored_suffix(
                     records: Vec::new(),
                     valid_end: absolute_start + offset as u64,
                     lineage_id,
+                    run_incompatible: None,
                 }));
             }
             // A complete frame that only a newer build can read is an answer, not a reason to
@@ -2571,6 +3301,7 @@ fn decode_anchored_suffix(
         records: Vec::new(),
         valid_end: absolute_start + offset as u64,
         lineage_id,
+        run_incompatible: None,
     }))
 }
 
@@ -2585,6 +3316,7 @@ fn decode_bytes(
         None,
         expected_first_seq,
         Vec::new(),
+        None,
         None,
     )
 }
@@ -2610,6 +3342,9 @@ fn validate_contiguous_sequence(
     }
     Ok(())
 }
+
+// Damage may hide the next boundary, so search every possible lineage envelope
+// rather than trusting the damaged frame's declared length.
 
 // A damaged length cannot identify the next boundary. Search for intact frames
 // instead; matching lineage-only metadata after a damaged last record is part
@@ -2642,16 +3377,25 @@ fn decode_bytes_seeded(
     expected_first_seq: u64,
     mut records: Vec<(FramedRecord, u64)>,
     mut lineage_id: Option<WalLineageId>,
+    mut run_incompatible: Option<(usize, u8)>,
 ) -> Result<DecodedBytes, WalError> {
     let mut offset = 0usize;
     while offset < bytes.len() {
         open_observed("frame decode");
-        match decode_next_counted(&bytes[offset..]) {
+        match decode_next_counted_with(
+            &bytes[offset..],
+            crate::framing::decode_with_run_requirement,
+        ) {
             DecodeStep::Record { framed, consumed } => {
+                let (framed, read_only) = *framed;
+                if read_only && run_incompatible.is_none() {
+                    run_incompatible =
+                        Some(((absolute_start + offset as u64) as usize, bytes[offset + 4]));
+                }
                 validate_contiguous_sequence(prev_seq, expected_first_seq, framed.seq)?;
                 prev_seq = Some(framed.seq);
                 offset += consumed;
-                records.push((*framed, absolute_start + offset as u64));
+                records.push((framed, absolute_start + offset as u64));
             }
             DecodeStep::Lineage {
                 lineage_id: found,
@@ -2691,6 +3435,7 @@ fn decode_bytes_seeded(
         records,
         valid_end: absolute_start + offset as u64,
         lineage_id,
+        run_incompatible,
     })
 }
 
@@ -2711,6 +3456,7 @@ fn select_decoded_range(
         through_seq,
         decoded.lineage_id,
     );
+    range.run_incompatible = decoded.run_incompatible;
     if source_head.is_some() && range.next_anchor.map(|a| a.seq) == source_head {
         range.complete_byte_end = Some(complete_end);
     }
@@ -2883,6 +3629,32 @@ fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, WalError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mismatched_slot_identity_is_unavailable_not_a_writer_panic() {
+        let first = DurablePublication::new(
+            PathBuf::from("a.wal"),
+            WalLineageId::from_bytes([1; 16]),
+            1,
+            100,
+        );
+        let other = DurablePublication::new(
+            PathBuf::from("b.wal"),
+            WalLineageId::from_bytes([2; 16]),
+            2,
+            200,
+        );
+        let slot = PublicationSlot::new(vec![first.path().to_path_buf()], first.lineage());
+        slot.record(&first);
+        assert!(slot.snapshot().is_some());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slot.record(&other))).is_ok()
+        );
+        assert!(
+            slot.snapshot().is_none(),
+            "a mismatched proof must make only this slot unavailable"
+        );
+    }
+
     #[test]
     fn durable_publication_is_frozen_at_the_descriptor_sync() {
         let path = tmp("durable-publication");
@@ -3617,6 +4389,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -3744,6 +4517,7 @@ mod tests {
 
     fn run_started(n: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4106,6 +4880,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     fn large_step(n: u64, text_bytes: usize) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4756,6 +5531,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    raw_finish_reason: None,
                     fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
@@ -5258,6 +6034,33 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(path).unwrap();
         file.write_all(&bytes).unwrap();
         offset
+    }
+
+    #[test]
+    fn compaction_v2_logs_open_for_writing_on_this_build_and_repair_their_torn_tail() {
+        // This build runs mode-3 sessions, so a `compaction-v2/v1` log is an ordinary writable
+        // log: the writer repairs its torn tail and appends. (A reader-only build, with
+        // `RUNS_COMPACTION_V2` false, refuses this open instead.)
+        let path = tmp("mode3-writable");
+        let _ = std::fs::remove_file(&path);
+        let record = run_started(1);
+        let mut bytes =
+            crate::framing::encode_with_requires(1, 1, &[crate::COMPACTION_V2_FEATURE], &record)
+                .unwrap();
+        bytes.extend_from_slice(&[0, 1, 2]);
+        std::fs::write(&path, &bytes).unwrap();
+        let range = read_records_range(&path, DEFAULT_MAX_READ_BYTES, 1, None, None).unwrap();
+        range.check_run_compatible().unwrap();
+        let wal = FileWal::open(&path).expect("a mode-3 log opens for writing on this build");
+        drop(wal);
+        let frames = replay_file(&path, DEFAULT_MAX_READ_BYTES).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].record, record);
+        assert!(
+            std::fs::read(&path).unwrap().len() < bytes.len(),
+            "the writer repaired the torn tail"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     fn expect_newer_writer<T: std::fmt::Debug>(result: Result<T, WalError>, offset: u64) {
@@ -6132,5 +6935,95 @@ mod windows_acl_tests {
     #[test]
     fn windows_manifest_wal_refused_before_replay() {
         refuses_before_replay(true);
+    }
+}
+
+#[cfg(all(test, unix, feature = "fs-override"))]
+mod legacy_owned_io_tests {
+    use super::*;
+    use std::sync::Arc;
+    mod trace {
+        use crate as wal_api;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../broca-crash-harness/src/io_trace_backend.rs"
+        ));
+    }
+
+    #[test]
+    fn prototype_owned_legacy_open_keeps_master_io() {
+        let root = broca_test_support::scratch_root().join(format!(
+            "prototype-owned-legacy-io-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("wal/log");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            crate::framing::encode(
+                1,
+                1,
+                &WalRecord::StepStarted {
+                    step_id: broca_protocol::StepId(1),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let session = broca_protocol::BindIdentity::new("/legacy-project", "harness", "owned-io");
+        let tenure = crate::writer_tenure::WalLeaseDomain::new(root.join("leases"))
+            .mint_for_test(&session, 1)
+            .unwrap();
+        let fs = Arc::new(trace::IoTraceFs::new(
+            &root,
+            Arc::new(crate::fs_ops::RealFs),
+        ));
+        crate::fs_ops::with_fs_ops(fs.clone(), || {
+            drop(OwnedWriterWal::open(&path, &session, "legacy-owned-ref", tenure).unwrap());
+        });
+        let attempts = fs.attempts();
+        println!("master prototype-owned trace: {attempts:?}");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/legacy-owned-master-io.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(attempts).unwrap(),
+            expected["attempts"],
+            "prototype legacy owned open must keep its independently measured master I/O"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unconfigured_legacy_handle_cannot_be_promoted_after_open() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("legacy-promotion-{}", std::process::id()));
+        let path = root.join("wal/log");
+        let wal = FileWal::open(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let trace = Arc::new(trace::IoTraceFs::new(
+            &root,
+            Arc::new(crate::fs_ops::RealFs),
+        ));
+        let result =
+            crate::fs_ops::with_fs_ops(trace.clone(), || wal.with_wal_config(WalConfig::OVERHAUL));
+        match result {
+            Ok(_) => panic!("an unconfigured legacy handle must not become an overhaul writer"),
+            Err(error) => assert!(
+                error.to_string().contains("boot"),
+                "typed refusal must explain boot configuration: {error}"
+            ),
+        }
+        assert!(
+            trace.attempts().is_empty(),
+            "promotion refusal must not run recovery again"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

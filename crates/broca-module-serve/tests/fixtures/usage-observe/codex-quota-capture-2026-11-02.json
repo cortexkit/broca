@@ -1,0 +1,68 @@
+[
+  {
+    "transport": "http",
+    "status": 429,
+    "headers": {
+      "x-codex-active-limit": "premium",
+      "x-codex-credits-balance": "0",
+      "x-codex-credits-has-credits": "False",
+      "x-codex-credits-unlimited": "False",
+      "x-codex-plan-type": "pro",
+      "x-codex-primary-over-secondary-limit-percent": "0",
+      "x-codex-primary-reset-after-seconds": "154246",
+      "x-codex-primary-reset-at": "1793774135",
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-window-minutes": "10080",
+      "x-codex-secondary-reset-after-seconds": "0",
+      "x-codex-secondary-reset-at": "",
+      "x-codex-secondary-used-percent": "0",
+      "x-codex-secondary-window-minutes": "0"
+    }
+  },
+  {
+    "transport": "http",
+    "status": 200,
+    "headers": {
+      "x-codex-active-limit": "premium",
+      "x-codex-credits-balance": "1234.5000000000",
+      "x-codex-credits-has-credits": "True",
+      "x-codex-credits-unlimited": "False",
+      "x-codex-plan-type": "pro",
+      "x-codex-primary-over-secondary-limit-percent": "0",
+      "x-codex-primary-reset-after-seconds": "154200",
+      "x-codex-primary-reset-at": "1793774164",
+      "x-codex-primary-used-percent": "100",
+      "x-codex-primary-window-minutes": "10080",
+      "x-codex-secondary-reset-after-seconds": "0",
+      "x-codex-secondary-reset-at": "",
+      "x-codex-secondary-used-percent": "0",
+      "x-codex-secondary-window-minutes": "0"
+    }
+  },
+  {
+    "transport": "websocket",
+    "frame": {
+      "type": "codex.rate_limits",
+      "plan_type": "pro",
+      "rate_limits": {
+        "allowed": false,
+        "limit_reached": true,
+        "primary": {
+          "used_percent": 100,
+          "window_minutes": 10080,
+          "reset_after_seconds": 154198,
+          "reset_at": 1793774164
+        },
+        "secondary": null
+      },
+      "code_review_rate_limits": null,
+      "additional_rate_limits": null,
+      "credits": {
+        "has_credits": true,
+        "unlimited": false,
+        "balance": "1234.5000000000"
+      },
+      "promo": null
+    }
+  }
+]

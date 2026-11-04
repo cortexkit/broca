@@ -390,7 +390,6 @@ impl LateResultsIntake {
         let mut view = match self.readable(&registration.bind) {
             Some(records) => LineageView {
                 facts: broca_core::held_call_facts(&records, None),
-                closing: closing_episode(&records),
                 records,
                 tombstoned: false,
                 delivered: HashSet::new(),
@@ -401,7 +400,6 @@ impl LateResultsIntake {
                     unreadable: true,
                     ..HeldCallFacts::default()
                 },
-                closing: false,
                 records: Vec::new(),
                 tombstoned: false,
                 delivered: HashSet::new(),
@@ -866,13 +864,17 @@ impl LateResultsIntake {
         if !dispatch.run_open {
             // A sealed run cannot write a held record or accept a result. An indeterminate
             // call stays indeterminate; a provider answer must never cross into another run.
-            return Ok(Classified::NoOp);
+            return Ok(settled_without_delivery(module, entry, "run_ended"));
         }
         if dispatch
             .module
             .is_some_and(|dispatched| dispatched != module)
         {
-            return Ok(Classified::NoOp);
+            return Ok(settled_without_delivery(
+                module,
+                entry,
+                "dispatched_elsewhere",
+            ));
         }
         let Some(held) = view.facts.held_call(&entry.call_key) else {
             return Ok(if row.state == RegistrationState::Registered {
@@ -880,7 +882,7 @@ impl LateResultsIntake {
                 // here until the record syncs.
                 Classified::Pending
             } else {
-                Classified::NoOp
+                settled_without_delivery(module, entry, "not_held")
             });
         };
         if !held.module.is_empty() && held.module != module {
@@ -896,10 +898,10 @@ impl LateResultsIntake {
             // The call already has its terminal: this entry was delivered before (its ack was
             // lost, or the provider restarted and re-served it), or the call was closed out. Either
             // way it is acked as a no-op and never written a second time.
-            return Ok(Classified::NoOp);
+            return Ok(settled_without_delivery(module, entry, "already_terminal"));
         }
-        if view.closing {
-            return Ok(Classified::NoOp);
+        if dispatch.closing {
+            return Ok(settled_without_delivery(module, entry, "run_cancelling"));
         }
         let raw: Vec<WalRecord> = view
             .records
@@ -1078,22 +1080,38 @@ impl LateResultsIntake {
 pub struct LineageView {
     pub facts: HeldCallFacts,
     pub records: Vec<FramedRecord>,
-    /// An episode is closing when its run was canceled, or when a held call already has a
-    /// close-out terminal. Recognition never reads the result's reason.
-    pub closing: bool,
     pub tombstoned: bool,
     delivered: HashSet<String>,
 }
 
-fn closing_episode(records: &[FramedRecord]) -> bool {
-    let held: Vec<ToolCallId> = records
+/// Settles an entry for an open held call without writing it into the run, and says why.
+/// These outcomes are rare and each one discards a provider's answer, so each is logged: a
+/// silent one hid an answer dropped from a later run of a session for 2.6 days. The line names
+/// the reason only, never the entry's result.
+fn settled_without_delivery(module: &str, entry: &LateEntry, reason: &str) -> Classified {
+    tracing::info!(
+        target: "late_results",
+        module,
+        call_key = entry.call_key,
+        event_id = entry.event_id,
+        "late-results entry settled without delivery: {reason}"
+    );
+    Classified::NoOp
+}
+
+/// Whether `episode`, the records of one run from its `RunStarted` up to the next one, is
+/// closing: its run was cancelled, or a call held in it already has a close-out terminal.
+/// Recognition never reads the result's reason. It covers one episode only: a cancelled run
+/// must not close a later run of the same session.
+fn closing_episode(episode: &[FramedRecord]) -> bool {
+    let held: Vec<ToolCallId> = episode
         .iter()
         .filter_map(|frame| match &frame.record {
             WalRecord::ToolCallProviderHeld { tool_call_id, .. } => Some(tool_call_id.clone()),
             _ => None,
         })
         .collect();
-    records.iter().any(|frame| match &frame.record {
+    episode.iter().any(|frame| match &frame.record {
         WalRecord::RunCancelRequested { .. } => true,
         WalRecord::ToolResult {
             result, outcome, ..
@@ -1132,6 +1150,8 @@ struct DispatchFact<'a> {
     module: Option<&'a str>,
     terminal: bool,
     run_open: bool,
+    /// The dispatching run's episode is closing (see [`closing_episode`]).
+    closing: bool,
 }
 
 /// Intents with an explicit call key store it; intents without one are identified by their
@@ -1159,13 +1179,18 @@ fn dispatch_fact<'a>(call_key: &str, records: &'a [FramedRecord]) -> Option<Disp
                 }
                 _ => None,
             })?;
-    let run_id = records[..index]
+    let start = records[..index]
         .iter()
-        .rev()
-        .find_map(|frame| match &frame.record {
-            WalRecord::RunStarted { run_id, .. } => Some(run_id),
-            _ => None,
-        });
+        .rposition(|frame| matches!(frame.record, WalRecord::RunStarted { .. }));
+    let run_id = start.and_then(|start| match &records[start].record {
+        WalRecord::RunStarted { run_id, .. } => Some(run_id),
+        _ => None,
+    });
+    let end = records[index + 1..]
+        .iter()
+        .position(|frame| matches!(frame.record, WalRecord::RunStarted { .. }))
+        .map_or(records.len(), |offset| index + 1 + offset);
+    let closing = closing_episode(&records[start.unwrap_or(0)..end]);
     let run_open = run_id.is_some_and(|run_id| {
         broca_core::replay::run_is_open(records.iter().map(|frame| &frame.record), run_id)
     });
@@ -1192,6 +1217,7 @@ fn dispatch_fact<'a>(call_key: &str, records: &'a [FramedRecord]) -> Option<Disp
         module,
         terminal,
         run_open,
+        closing,
     })
 }
 
@@ -1658,6 +1684,7 @@ fn registration_candidates(
 
 #[cfg(test)]
 mod tests {
+    include!("late_results_puller/abandoned_call_tests.rs");
     use super::*;
     use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall};
     use broca_protocol::{BatchId, MessageId, RunId, StepId};
@@ -1802,6 +1829,8 @@ mod tests {
     fn held_records(call_key: &str, module: &str, bind: &BindIdentity) -> Vec<WalRecord> {
         let mut records = vec![
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -1826,6 +1855,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -1874,6 +1904,7 @@ mod tests {
                 sequential: false,
             },
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("run".into()),
                 reason: broca_wal::PauseReason::ToolHeld,
                 error: None,
@@ -1889,6 +1920,9 @@ mod tests {
 
     fn min_config() -> broca_wal::RunConfig {
         broca_wal::RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -2335,6 +2369,7 @@ mod tests {
                 completed_at_ms: None,
                 next_tag: None,
                 next_notice_seq: None,
+                recovery_artifacts: Vec::new(),
             })
             .unwrap(),
         )
@@ -2542,6 +2577,123 @@ mod tests {
                 .seq,
             1
         );
+    }
+
+    /// A session's earlier run was cancelled while a provider held one of its calls. A later
+    /// run of the same session dispatches a new held call, and its answer must still be
+    /// delivered: a cancel only closes the episode it belongs to.
+    #[tokio::test]
+    async fn an_earlier_cancelled_episode_does_not_drop_a_later_runs_held_answer() {
+        let bind = session("earlier-cancel");
+        let mut records = held_records("lineage:4", "tools", &bind);
+        for record in &mut records {
+            match record {
+                WalRecord::RunStarted { run_id, .. } | WalRecord::RunPaused { run_id, .. } => {
+                    *run_id = RunId("old".into())
+                }
+                _ => {}
+            }
+        }
+        for value in [
+            json!({"type":"run_cancel_requested","run_id":"old","at":"step_boundary"}),
+            json!({"type":"tool_result","batch_id":"b","result":{"tool_call_id":"a",
+                "output":{"kind":"error","message":"provider_held_cancelled"},"is_error":true},
+                "outcome":"interrupted","reason":"provider_held_cancelled"}),
+            json!({"type":"tool_batch_finished","batch_id":"b"}),
+            json!({"type":"turn_finished","step_id":1}),
+            json!({"type":"run_finished","reason":"cancelled","usage":{},"retries_used":0}),
+        ] {
+            records.push(serde_json::from_value(value).unwrap());
+        }
+        // The later run's call has its own tool call id, batch and key.
+        let call_key = "lineage:20";
+        for mut record in held_records(call_key, "tools", &bind) {
+            match &mut record {
+                WalRecord::ModelStepFinished {
+                    assistant_message, ..
+                } => {
+                    let mut message = (**assistant_message).clone();
+                    if let Some(ContentBlock::ToolCall(call)) = message.content.first_mut() {
+                        call.tool_call_id = ToolCallId("later".into());
+                    }
+                    *assistant_message = Arc::new(message);
+                }
+                WalRecord::ToolBatchStarted {
+                    batch_id,
+                    planned_calls,
+                    ..
+                } => {
+                    *batch_id = BatchId("later-b".into());
+                    *planned_calls = vec![ToolCallId("later".into())];
+                }
+                WalRecord::ToolDispatchIntent {
+                    batch_id,
+                    tool_call_id,
+                    ..
+                }
+                | WalRecord::ToolCallProviderHeld {
+                    batch_id,
+                    tool_call_id,
+                    ..
+                } => {
+                    *batch_id = BatchId("later-b".into());
+                    *tool_call_id = ToolCallId("later".into());
+                }
+                _ => {}
+            }
+            records.push(record);
+        }
+        let rig = Rig::new(
+            "earlier-cancel",
+            None,
+            vec![registration(call_key, "tools", &bind)],
+        )
+        .await;
+        write_wal(&rig.intake.wal, &bind, &records);
+        let _puller = rig.puller("tools");
+        rig.feed.replies(vec![reply(
+            vec![entry(kinds::RESULT, call_key, "ev-later")],
+            1,
+            false,
+        )]);
+        rig.intake.tick("tools").await.unwrap();
+        assert_eq!(
+            rig.delivery.delivered.lock().unwrap().clone(),
+            vec![(call_key.to_owned(), "ev-later".to_owned())],
+            "the later run's held answer was settled without delivery"
+        );
+    }
+
+    /// The other side of the episode scope: a cancel requested in the dispatching run itself
+    /// still settles that run's held answer as a no-op, and nothing is delivered into a run
+    /// that is being cancelled.
+    #[tokio::test]
+    async fn a_cancel_in_the_dispatching_run_settles_its_held_answer_without_delivery() {
+        let call_key = "lineage:4";
+        let bind = session("same-cancel");
+        let mut records = held_records(call_key, "tools", &bind);
+        records.push(
+            serde_json::from_value(
+                json!({"type":"run_cancel_requested","run_id":"run","at":"step_boundary"}),
+            )
+            .unwrap(),
+        );
+        let rig = Rig::new(
+            "same-cancel",
+            None,
+            vec![registration(call_key, "tools", &bind)],
+        )
+        .await;
+        write_wal(&rig.intake.wal, &bind, &records);
+        let _puller = rig.puller("tools");
+        rig.feed.replies(vec![reply(
+            vec![entry(kinds::RESULT, call_key, "ev-1")],
+            1,
+            false,
+        )]);
+        rig.intake.tick("tools").await.unwrap();
+        assert!(rig.delivery.delivered.lock().unwrap().is_empty());
+        assert_eq!(rig.feed.acks(), vec![cursor(1)]);
     }
 
     #[tokio::test]
@@ -3512,9 +3664,17 @@ mod tests {
                 "withdraw must follow the durable cancel seal"
             );
             self.seen.lock().unwrap().push(call.call_key.clone());
-            if self.mode == "offline" {
+            if matches!(
+                self.mode,
+                "offline" | "scope_not_live" | "scope_ended" | "scope_not_carrier"
+            ) {
+                let code = if self.mode == "offline" {
+                    "target_unavailable"
+                } else {
+                    self.mode
+                };
                 let error = serde_json::from_value(
-                    json!({"code": "target_unavailable", "message": "offline"}),
+                    json!({"code": code, "message": "withdraw route refused"}),
                 )
                 .unwrap();
                 (
@@ -3598,6 +3758,81 @@ mod tests {
         service.recover().await.unwrap();
         assert_eq!(*route.seen.lock().unwrap(), ["lineage:4"]);
         assert_eq!(service.health()["failed"], 0);
+    }
+
+    #[tokio::test]
+    async fn held_withdrawal_scope_gone_refusals_are_reported_without_failure_or_resend() {
+        use crate::held_slots::HeldWithdrawal;
+        for (code, failed, scope_gone) in [
+            ("scope_not_live", 0, 1),
+            ("scope_ended", 0, 1),
+            ("scope_not_carrier", 1, 0),
+        ] {
+            let root = rig_root(&format!("withdraw-{code}"));
+            let bind = session(code);
+            let wal = Arc::new(FileWalStore::new(root.join("wal")));
+            let mut records = held_records("lineage:4", "tools", &bind);
+            records.push(WalRecord::RunFinished {
+                reason: broca_protocol::RunFinishReason::Cancelled,
+                interrupt_reason: None,
+                ts_ms: Some(50),
+                usage: Default::default(),
+                error: None,
+                retries_used: 0,
+            });
+            write_wal_gated(&wal, &bind, &records);
+            let before = std::fs::read(wal.wal_path(&bind)).unwrap();
+            let path = root.join("late-results.db");
+            let store = Arc::new(LateResultsStore::open(&path).unwrap());
+            store
+                .register_calls(&held_registrations(&framed(records), &bind))
+                .unwrap();
+            let route = Arc::new(WithdrawalRoute {
+                wal: wal.clone(),
+                seen: Mutex::default(),
+                mode: code,
+            });
+            let service =
+                crate::held_withdrawals::HeldWithdrawals::new(store, wal.clone(), route.clone());
+            service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+            let reply = broca_core::tool_plane::ProviderHeldReply {
+                tool_call_id: ToolCallId("a".into()),
+                call_key: "lineage:4".into(),
+                module: "tools".into(),
+                reason: "approval".into(),
+                detail_digest: None,
+            };
+            service.withdraw(&reply).await.unwrap();
+            service.withdraw(&reply).await.unwrap();
+            let health = service.health();
+            assert_eq!(health["failed"], failed, "{code}: {health}");
+            assert_eq!(health["scope_gone"], scope_gone, "{code}: {health}");
+            assert_eq!(health["pending"], 0);
+            let details_key = if scope_gone > 0 {
+                "scope_gone_details"
+            } else {
+                "failure_details"
+            };
+            assert_eq!(
+                health[details_key],
+                json!([{"code":code, "answer":null, "reason":null}])
+            );
+            drop(service);
+            let store = Arc::new(LateResultsStore::open(&path).unwrap());
+            store.recovery_snapshot().unwrap();
+            let service =
+                crate::held_withdrawals::HeldWithdrawals::new(store, wal.clone(), route.clone());
+            service.bind_stopping_signal(tokio_util::sync::CancellationToken::new());
+            service.recover().await.unwrap();
+            assert_eq!(service.health()["failed"], failed);
+            assert_eq!(service.health()["scope_gone"], scope_gone);
+            assert_eq!(
+                route.seen.lock().unwrap().len(),
+                1,
+                "terminal refusals never resend"
+            );
+            assert_eq!(std::fs::read(wal.wal_path(&bind)).unwrap(), before);
+        }
     }
 
     #[tokio::test]

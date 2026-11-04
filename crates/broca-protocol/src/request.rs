@@ -296,6 +296,9 @@ pub struct EpisodeRenderInput {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RenderHistory {
     pub episodes: Vec<EpisodeRenderInput>,
+    /// Mode-3 episode boundaries use native transcript ordinals, excluding global
+    /// instructions and view insertions. Render-only prefixes must not shift them.
+    pub raw_ordinals: bool,
     /// Number of canonical messages present when the compaction view was applied.
     /// Raw messages with smaller ordinals were produced before that view. Absent
     /// means no compaction view; replacement messages have no ordinal.
@@ -306,6 +309,7 @@ impl From<Vec<EpisodeRenderInput>> for RenderHistory {
     fn from(episodes: Vec<EpisodeRenderInput>) -> Self {
         Self {
             episodes,
+            raw_ordinals: false,
             compaction_prefix_len: None,
         }
     }
@@ -497,6 +501,9 @@ pub enum KeepWarm {
 /// as the identical request sent when idle).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubmissionRequest {
+    /// Caller-owned routing decision, distinct from routing's allocated account decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_decision_id: Option<String>,
     /// Held by the server after read-only preflight; never supplied by a client or persisted.
     #[serde(skip)]
     pub staged_uploads: Option<Arc<StagedUploads>>,
@@ -572,7 +579,7 @@ pub struct SubmissionRequest {
     /// Abstract tier retained by a queued send from a newer writer. Separate from the legacy
     /// provider-tier enum so old recorded requests keep their vocabulary. Records preserve
     /// unfamiliar strings; admission must refuse a level it cannot apply rather than downgrade it.
-    /// This reader accepts the member, but public send admission does not populate it yet.
+    /// The boot-gated serve writer populates this independently of the legacy tier member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier_level: Option<String>,
     #[serde(default)]
@@ -843,6 +850,7 @@ mod tests {
     #[test]
     fn submission_request_tool_module_round_trips_when_present() {
         let request = SubmissionRequest {
+            route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),
@@ -936,6 +944,7 @@ mod budget_compat_tests {
     #[test]
     fn absent_submission_budget_is_omitted_and_defaults_to_none() {
         let request = SubmissionRequest {
+            route_decision_id: None,
             service_tier_level: None,
             staged_uploads: None,
             content: Vec::new(),

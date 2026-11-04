@@ -75,12 +75,18 @@ fn snapshot(
         .query_row(
             "SELECT tail_seed,lineage_id,indexed_seq FROM session WHERE sid=?1",
             [&key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<u64>>(2)?.unwrap_or(0),
+                ))
+            },
         )
         .optional()
         .map_err(sql)?;
     let (encoded, lineage, indexed) = row.ok_or_else(|| bad("resume session index missing"))?;
-    let stored = ProjectionContinuation::decode(&encoded)?;
+    let stored = ProjectionContinuation::decode_for_execution(&encoded)?;
     let boundary = stored.boundary();
     let indexed_boundary = tx.query_row(
         "SELECT lineage_id,seq,frame_off,frame_end,frame_identity,qualified FROM projection_boundary WHERE sid=?1 AND seq=?2",
@@ -485,11 +491,13 @@ mod tests {
             };
             let bind = session.clone();
             let wal = Box::new(
-                broca_wal::FileWal::open(store.wal_path(&bind))
-                    .unwrap()
-                    .with_feature_floor(root.join("wal-floor"))
-                    .with_wal_config(broca_wal::WalConfig::OVERHAUL)
-                    .unwrap(),
+                broca_wal::FileWal::open_with_recovery(
+                    store.wal_path(&bind),
+                    broca_wal::WalConfig::OVERHAUL,
+                    root.join("wal-floor"),
+                )
+                .unwrap()
+                .with_feature_floor(root.join("wal-floor")),
             );
             Self {
                 db: Arc::new(OverhaulDb::open(&root).unwrap()),
@@ -632,8 +640,12 @@ mod tests {
     }
 
     fn full(fixture: &Fixture) -> broca_core::ReplayState {
-        let wal =
-            broca_wal::FileWal::open(fixture.wal.durable_publication().unwrap().path()).unwrap();
+        let wal = broca_wal::FileWal::open_with_recovery(
+            fixture.wal.durable_publication().unwrap().path(),
+            broca_wal::WalConfig::OVERHAUL,
+            fixture._scratch.0.join("wal-floor"),
+        )
+        .unwrap();
         let records: Vec<_> = wal
             .replay()
             .unwrap()

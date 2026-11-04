@@ -142,18 +142,10 @@ pub(super) async fn resolve_hooked<T: ToolPlane>(
         _ => (String::new(), None),
     };
     let mut resolution = resolve(plan, ctx, tool_plane, cancel, stop).await;
-    // Eligibility is decided BEFORE capping, so even an oversized Json remains hookless.
+    // JSON results remain hookless; intake already enforced the provider-result size limit.
     let subscribed = resolution.plane_subject
         && !matches!(resolution.result.output, ToolOutput::Json { .. })
         && hooks.is_some_and(|runtime| runtime.plan.post_tool(&tool));
-    if resolution.outcome.is_some() {
-        cap_tool_result(
-            Arc::make_mut(&mut resolution.result),
-            &ctx.run_id,
-            &tool,
-            subscribed,
-        );
-    }
     if !subscribed {
         return resolution;
     }

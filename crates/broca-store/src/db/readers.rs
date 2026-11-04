@@ -32,11 +32,21 @@ pub struct RawPageSnapshot {
     pub page: SessionReadPage,
     pub at_seq: u64,
     pub head: broca_core::head::HeadProjection,
+    pub head_media: Option<RawHeadMedia>,
     pub last_title: Option<String>,
     pub last_write_ms: Option<u64>,
     pub retention_activity_ms: Option<u64>,
     pub tools: Option<(RunId, std::sync::Arc<Vec<broca_protocol::request::Tool>>)>,
     pub dispatches: BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
+}
+
+/// Ephemeral media metadata from the raw page's authenticated log snapshot.
+/// Media profiles are read from log records, never persisted in the database.
+#[derive(Debug, Clone)]
+pub struct RawHeadMedia {
+    pub run_id: broca_protocol::RunId,
+    pub media: Option<serde_json::Value>,
+    pub interrupt_reason: Option<String>,
 }
 
 struct Session {
@@ -88,7 +98,7 @@ impl OverhaulDb {
                     final_step_finish_reason: None,
                     retries_used: 0,
                     title: None,
-                    withdrawals_owed: false,
+                    withdrawals_owed: super::recovery::owed(tx, run_id)?,
                 })
             })
             .transpose()
@@ -220,7 +230,7 @@ impl OverhaulDb {
                     [&key],
                     |r| {
                         Ok((
-                            r.get::<_, u64>(0)?,
+                            r.get::<_, Option<u64>>(0)?.unwrap_or(0),
                             r.get::<_, u64>(1)?,
                             r.get::<_, String>(2)?,
                         ))
@@ -228,12 +238,13 @@ impl OverhaulDb {
                 )
                 .optional()?)
         })?;
-        let stale_fold = cursor.as_ref().is_some_and(|(_, _, locator)| {
-            serde_json::from_str::<serde_json::Value>(locator)
-                .ok()
-                .and_then(|value| value.get(1)?.get("head_fold")?.get("version")?.as_u64())
-                != Some(1)
-        });
+        let stale_fold = publication.sequence() != 0
+            && cursor.as_ref().is_some_and(|(_, _, locator)| {
+                serde_json::from_str::<serde_json::Value>(locator)
+                    .ok()
+                    .and_then(|value| value.get(1)?.get("head_fold")?.get("version")?.as_u64())
+                    != Some(1)
+            });
         if stale_fold {
             self.raw_fallback_notice(
                 &key,
@@ -258,6 +269,13 @@ impl OverhaulDb {
                 .read_to_end(&mut bytes)?;
             Ok(bytes)
         };
+        if publication.sequence() == 0 {
+            let page = full_page(&read, publication, from, limit, include_tools, true)?;
+            if page.page.lineage_id != Some(publication.lineage()) {
+                return Err(invalid("empty raw page lineage mismatch"));
+            }
+            return Ok(page);
+        }
         let result = self.read_snapshot(|tx| {
             page(
                 tx,
@@ -318,6 +336,44 @@ struct Sources<'a> {
 }
 
 impl<'a> Sources<'a> {
+    fn compaction_frame(
+        &mut self,
+        tx: &Transaction<'_>,
+        key: &str,
+        off: u64,
+    ) -> Result<(), DbError> {
+        let bad = || {
+            DbError::SeedFallback(SeedFallback::new(
+                "raw page requires compaction source hydration",
+            ))
+        };
+        let auth: Option<(u64, u64, Vec<u8>)> = tx.query_row(
+            "SELECT frame_end,seq,frame_identity FROM source_auth WHERE sid=?1 AND frame_off=?2",
+            params![key, off], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional()?;
+        let (end, seq, identity) = auth.ok_or_else(bad)?;
+        let len = end
+            .checked_sub(off)
+            .filter(|len| *len > 0 && end <= self.end)
+            .ok_or_else(bad)?;
+        let bytes = access_counter::read_at(self.read, off, len)?;
+        match access_counter::decode_next(&bytes) {
+            DecodeStep::Record { framed, consumed }
+                if consumed == bytes.len()
+                    && framed.seq == seq
+                    && Sha256::digest(&bytes).as_slice() == identity
+                    && matches!(
+                        framed.record,
+                        WalRecord::CompactionMessage { .. } | WalRecord::CompactionAnswer { .. }
+                    ) =>
+            {
+                self.frames.insert(off, (end, *framed));
+                Ok(())
+            }
+            _ => Err(bad()),
+        }
+    }
+
     fn range(&mut self, lo: u64, hi: u64) -> Result<Vec<FramedRecord>, DbError> {
         if let Some(frames) = self.ranges.get(&(lo, hi)) {
             return Ok(frames.clone());
@@ -533,8 +589,21 @@ fn page(
         Vec::new(),
     )
     .map_err(DbError::SeedFallback)?;
+    let compaction_sources: u64 = tx.query_row(
+        "SELECT count(*) FROM source_auth WHERE sid=?1",
+        [key],
+        |r| r.get(0),
+    )?;
+    if compaction_sources != seed.admission.compaction.len() as u64 {
+        return Err(DbError::SeedFallback(SeedFallback::new(
+            "raw page requires compaction source hydration",
+        )));
+    }
+    for off in &seed.admission.compaction {
+        sources.compaction_frame(tx, key, *off)?;
+    }
     let mut ownership = continuation
-        .raw_read_ownership()
+        .raw_read_ownership(read)
         .map_err(DbError::SeedFallback)?;
     let tail_frames: Vec<_> = tail.iter().map(|p| p.framed.clone()).collect();
     if broca_core::replay::project_deferred_calls(
@@ -559,6 +628,19 @@ fn page(
         ownership,
     )
     .ok_or_else(|| invalid("raw head fold unsupported"))?;
+    continuation
+        .restore_head_sender_admission(read, &mut head)
+        .map_err(DbError::SeedFallback)?;
+    for frame in &tail {
+        if matches!(
+            frame.framed.record,
+            WalRecord::SessionRefreshAccepted { .. }
+                | WalRecord::SessionRefreshPolicyChanged { .. }
+                | WalRecord::SessionPrefixFlushed { .. }
+        ) {
+            head.observe(&frame.framed.record);
+        }
+    }
     for off in seed.admission.queued.values() {
         head.observe(&sources.frame(*off)?.record);
     }
@@ -577,6 +659,9 @@ fn page(
     if rows.len() as u64 != end.min(session.count).saturating_sub(start) {
         return Err(invalid("raw page ordinal gap"));
     }
+    let mode3 = head
+        .mode3
+        .unwrap_or_else(|| broca_core::is_mode3_log(first.iter().map(|frame| &frame.record)));
     let mut messages = Vec::new();
     let mut dispatches = BTreeMap::new();
     for (ordinal, source) in rows {
@@ -604,7 +689,8 @@ fn page(
             .2
             .map(|off| sources.indexed_frame(tx, key, off))
             .transpose()?;
-        let (mut message, written_at, turn) = hydrate_message(&frames, &source, started.as_ref())?;
+        let (mut message, written_at, turn) =
+            hydrate_message(&frames, &source, started.as_ref(), mode3)?;
         if source.flags & 2 != 0 {
             let mut high = source
                 .tag_base
@@ -650,10 +736,20 @@ fn page(
     if session.count >= start && session.count < end {
         if let Some((mut message, step)) = replayed.open_tool_turn {
             message.ordinal = Some(session.count);
-            let times = broca_core::message_times::written_times(
-                tail_frames.iter().map(|f| &f.record),
-                broca_core::placement::Placement::new(ordinal_base),
-            )
+            let times = if mode3 {
+                broca_core::message_times::mode3_written_times(
+                    tail_frames.iter().map(|f| &f.record),
+                    broca_core::placement::Placement::new(ordinal_base),
+                    Default::default(),
+                    Default::default(),
+                )
+                .map(|fold| fold.times)
+            } else {
+                broca_core::message_times::written_times(
+                    tail_frames.iter().map(|f| &f.record),
+                    broca_core::placement::Placement::new(ordinal_base),
+                )
+            }
             .map_err(invalid)?;
             dispatches.extend(broca_core::dispatches_of_turns(
                 &tail_frames,
@@ -674,6 +770,49 @@ fn page(
         .and_then(|e| e.terminal_off)
         .map(|off| sources.frame(off))
         .transpose()?;
+    let mut head_media = current.as_ref().and_then(|frame| match &frame.record {
+        WalRecord::RunStarted { run_id, config, .. } => Some(RawHeadMedia {
+            run_id: run_id.clone(),
+            media: config.frozen_render_config.get("media").cloned(),
+            interrupt_reason: None,
+        }),
+        _ => None,
+    });
+    if let Some(off) = seed.admission.refreeze {
+        let frame = sources.frame(off)?;
+        if current
+            .as_ref()
+            .is_none_or(|current| frame.seq <= current.seq)
+        {
+            return Err(invalid("raw head media refreeze precedes episode"));
+        }
+        match (&mut head_media, frame.record) {
+            (
+                Some(media),
+                WalRecord::RunConfigRefrozen {
+                    frozen_render_config,
+                    ..
+                },
+            ) => {
+                media.media = frozen_render_config.get("media").cloned();
+            }
+            _ => return Err(invalid("raw head media refreeze mismatch")),
+        }
+    }
+    if let (Some(media), Some(frame)) = (&mut head_media, &terminal) {
+        match &frame.record {
+            WalRecord::RunFinished {
+                reason,
+                interrupt_reason,
+                ..
+            } => {
+                media.interrupt_reason = (*reason == broca_protocol::RunFinishReason::Interrupted)
+                    .then(|| interrupt_reason.clone())
+                    .flatten();
+            }
+            _ => return Err(invalid("raw head media terminal mismatch")),
+        }
+    }
     let mut state_snapshot = StorePageSnapshot::empty();
     state_snapshot.last_run_id = current.as_ref().and_then(|f| match &f.record {
         WalRecord::RunStarted { run_id, .. } => Some(run_id.clone()),
@@ -734,6 +873,7 @@ fn page(
         },
         at_seq: session.seq,
         head,
+        head_media,
         last_title,
         last_write_ms: seed.last_write_ms,
         retention_activity_ms: seed.frozen_policy.and(seed.last_activity_ms),
@@ -746,10 +886,16 @@ fn hydrate_message(
     frames: &[FramedRecord],
     source: &OffsetSource,
     started: Option<&FramedRecord>,
+    mode3: bool,
 ) -> Result<(Message, Option<u64>, Option<usize>), DbError> {
     let first = frames
         .first()
         .ok_or_else(|| invalid("empty raw message source"))?;
+    if mode3 && matches!(first.record, WalRecord::BudgetFired { .. }) {
+        return Err(DbError::SeedFallback(SeedFallback::new(
+            "mode3 budget timestamp source",
+        )));
+    }
     let input = match &first.record {
         WalRecord::RunStarted { input, .. }
         | WalRecord::Steered { input, .. }
@@ -797,6 +943,11 @@ fn hydrate_message(
             _ => None,
         }
         .filter(|time| *time != 0);
+        if mode3 && time.is_none() {
+            return Err(DbError::SeedFallback(SeedFallback::new(
+                "mode3 historical timestamp source",
+            )));
+        }
         return Ok((message, time, None));
     }
     if frames.iter().any(|f| {
@@ -827,10 +978,20 @@ fn hydrate_message(
     }
     // The turn range includes all result/no-dispatch frames, so timestamps and
     // dispatch ordering use the same folds as a full transcript read.
-    let times = broca_core::message_times::written_times(
-        frames.iter().map(|f| &f.record),
-        broca_core::placement::Placement::default(),
-    )
+    let times = if mode3 {
+        broca_core::message_times::mode3_written_times(
+            frames.iter().map(|f| &f.record),
+            broca_core::placement::Placement::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .map(|fold| fold.times)
+    } else {
+        broca_core::message_times::written_times(
+            frames.iter().map(|f| &f.record),
+            broca_core::placement::Placement::default(),
+        )
+    }
     .map_err(invalid)?;
     let turn = (source.input_start == 0)
         .then(|| replay.committed_tool_turns.first().map(|(_, index)| *index))
@@ -864,6 +1025,36 @@ fn full_page(
     for frame in &frames {
         head.observe(&frame.record);
     }
+    let mut head_media = None;
+    for frame in &frames {
+        match &frame.record {
+            WalRecord::RunStarted { run_id, config, .. } => {
+                head_media = Some(RawHeadMedia {
+                    run_id: run_id.clone(),
+                    media: config.frozen_render_config.get("media").cloned(),
+                    interrupt_reason: None,
+                });
+            }
+            WalRecord::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => {
+                if let Some(media) = &mut head_media {
+                    media.media = frozen_render_config.get("media").cloned();
+                }
+            }
+            WalRecord::RunFinished {
+                reason: broca_protocol::RunFinishReason::Interrupted,
+                interrupt_reason,
+                ..
+            } => {
+                if let Some(media) = &mut head_media {
+                    media.interrupt_reason = interrupt_reason.clone();
+                }
+            }
+            _ => {}
+        }
+    }
     let last_title = frames
         .iter()
         .rev()
@@ -889,6 +1080,7 @@ fn full_page(
         dispatches,
         at_seq: publication.sequence(),
         head,
+        head_media,
         last_title,
         last_write_ms,
         retention_activity_ms: None,

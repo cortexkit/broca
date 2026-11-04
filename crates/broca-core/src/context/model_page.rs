@@ -171,7 +171,7 @@ pub fn read_session_model_page(
         None,
         snapshot.prefix_len,
         false,
-        snapshot.tag_seed,
+        crate::replay::TranscriptSeed::for_page(snapshot, tail),
     )?;
     let history = snapshot.model_history.as_ref();
     if snapshot.watermark_seq == 0 && compaction.is_none() {
@@ -988,6 +988,8 @@ mod episode_page_tests {
     /// tag checkpoint can renumber.
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -1007,6 +1009,9 @@ mod episode_page_tests {
             run_id: RunId(run_id.into()),
             session: BindIdentity::new("/tmp/project", "runner", "session"),
             config: Box::new(RunConfig {
+                global_system: None,
+                route_decision_id: None,
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: true,
                 computed_tags: Some(ComputedTagRules { checkpoint: 0 }),
@@ -1044,6 +1049,7 @@ mod episode_page_tests {
 
     fn step(step: u64, content: Vec<ContentBlock>) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -1181,6 +1187,7 @@ mod episode_page_tests {
         records.push(step_started(3));
         records.push(step(3, vec![text("done")]));
         records.push(WalRecord::Steered {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             retention: None,

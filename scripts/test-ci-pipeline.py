@@ -170,12 +170,6 @@ with record.open('a') as events:
     import json
     events.write(json.dumps({'type':'started','started_at_ms':time.time_ns()//1000000})+'\\n')
     events.write(json.dumps({'type':'terminal','wall_ms':17,'queue_wait_ms':1})+'\\n')
-if lane == 'linux-unit':
-    deadline = time.monotonic() + 5
-    while not (root / 'windows.started').exists():
-        if time.monotonic() >= deadline:
-            sys.exit('Windows was not launched in parallel')
-        time.sleep(.01)
 if lane == os.environ.get('FAIL_LANE'):
     if lane == 'linux-msrv':
         print('error[E0599]: fixture MSRV compiler error')
@@ -187,11 +181,11 @@ print('Summary: 1 test run: 1 passed')
 ''')
         ck.chmod(0o755)
 
-    def run_prepush(self, **extra):
+    def run_prepush(self, *, checkout=None, **extra):
         env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
                    FIXTURE=str(self.root), BROCA_PREPUSH_LANE_POOL=str(self.root / 'lane-pool'))
         env.update(extra)
-        return subprocess.run(['bash', 'scripts/prepush.sh'], cwd=self.root,
+        return subprocess.run(['bash', 'scripts/prepush.sh'], cwd=checkout or self.root,
                                env=env, capture_output=True, text=True)
 
     def test_generated_inputs_are_never_tracked(self):
@@ -217,7 +211,21 @@ print('Summary: 1 test run: 1 passed')
         home = self.root / 'target/home'
         result = self.run_prepush(BROCA_PREPUSH_LANE_POOL='', HOME=str(home), FAIL_LANE='fast')
         self.assertNotEqual(result.returncode, 0)
-        checkout_id = self.root.name + '-' + hashlib.sha256(str(self.root).encode()).hexdigest()[:12]
+        physical_root = self.root.resolve()
+        checkout_id = physical_root.name + '-' + hashlib.sha256(str(physical_root).encode()).hexdigest()[:12]
+        expected = home / 'Work/Projects/CortexKit-scratch/broca-prepush-lanes' / checkout_id / 'fast'
+        event = shlex.split((self.root / 'events').read_text())
+        self.assertEqual(Path(event[event.index('--cwd') + 1]), expected)
+        self.assertTrue(expected.is_dir())
+
+    def test_default_lane_pool_id_is_stable_through_a_checkout_symlink(self):
+        alias = self.bin / 'checkout-alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        home = self.root / 'target/home'
+        result = self.run_prepush(checkout=alias, BROCA_PREPUSH_LANE_POOL='', HOME=str(home), FAIL_LANE='fast')
+        self.assertNotEqual(result.returncode, 0)
+        physical_root = self.root.resolve()
+        checkout_id = physical_root.name + '-' + hashlib.sha256(str(physical_root).encode()).hexdigest()[:12]
         expected = home / 'Work/Projects/CortexKit-scratch/broca-prepush-lanes' / checkout_id / 'fast'
         event = shlex.split((self.root / 'events').read_text())
         self.assertEqual(Path(event[event.index('--cwd') + 1]), expected)
@@ -235,7 +243,11 @@ print('Summary: 1 test run: 1 passed')
         self.assertGreaterEqual(result.stdout.count('permissions::warming_route'), 2)
 
     def test_heavy_lanes_parallel_and_windows_failure_not_hidden(self):
-        result = self.run_prepush(FAIL_LANE='windows')
+        (self.root / 'target').mkdir()
+        os.mkfifo(self.root / 'target/barrier')
+        # Hold the first wave until all five jobs have started so checkout duration
+        # does not affect the parallel-dispatch check.
+        result = self.run_prepush(FAIL_LANE='windows', CPU_BARRIER='1')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         events = (self.root / 'events').read_text().splitlines()
         self.assertEqual(len(events), 13)
@@ -264,6 +276,10 @@ print('Summary: 1 test run: 1 passed')
         self.assertNotIn('FAILED linux', result.stdout)
         self.assertGreaterEqual(result.stdout.count('permissions::warming_route'), 2)
         self.assertFalse((self.root / 'lane-pool/windows/prepush-inputs').exists())
+        state = json.loads((self.root / 'target/cpus.json').read_text())
+        self.assertEqual(state['peak'], 32)
+        self.assertEqual(set(state['first_wave']), {'linux-unit', 'linux-production', 'windows',
+                                                   'linux-integration-4', 'linux-integration-2'})
 
     def test_success_reports_every_lane_and_wall_time(self):
         result = self.run_prepush()
@@ -308,6 +324,63 @@ print('Summary: 1 test run: 1 passed')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn('==> windows summary', result.stdout)
                 self.assertIn('prepush: Windows runner instance=' + (host or 'unreported'), result.stdout)
+
+    def test_linux_fixture_builds_omit_empty_offline_config_arrays(self):
+        import re
+        source = (ROOT / 'scripts/lib/prepush-lane.sh').read_text()
+        function = re.search(r'^fixtures\(\) \{.*?^\}', source, re.M | re.S)
+        self.assertIsNotNone(function)
+        assert function is not None
+        shutil.copy(ROOT / 'scripts/ci-fixture-revisions.conf', self.root / 'scripts/ci-fixture-revisions.conf')
+        scratch = self.root / 'target/fixture scratch'
+        target = self.root / 'target/build cache'
+        (target / 'debug').mkdir(parents=True)
+        for name in ('ck-subc', 'fake-aft-stub', 'ck', 'ck-claustrum', 'ck-auth'):
+            (target / 'debug' / name).write_text('fixture binary')
+        surface = target / 'fake-surface-target/debug'
+        surface.mkdir(parents=True)
+        (surface / 'fake-surface').write_text('fixture binary')
+        script = '''set -euo pipefail
+platform=linux; lane=linux-unit
+checkout_pin() {
+  mkdir -p "$3/crates/credentials-module/tests/fixtures"
+  printf '{}' > "$3/crates/credentials-module/tests/fixtures/enrollment_wire_contract.json"
+}
+cargo() {
+  python3 -c 'import json,sys; open("cargo-args", "a").write(json.dumps(sys.argv[1:])+"\\n")' "$@"
+}
+bash() { :; }
+''' + function.group(0) + '\nfixtures\n'
+        env = dict(os.environ, scratch=str(scratch), CARGO_TARGET_DIR=str(target))
+        result = subprocess.run(['bash', '-c', script], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = [json.loads(line) for line in (self.root / 'cargo-args').read_text().splitlines()]
+        self.assertEqual(len(commands), 3)
+        for command, package in zip(commands, ('subc-core', 'credentials-module')):
+            self.assertEqual(command[:3], ['build', '--locked', '--manifest-path'])
+            self.assertEqual(command[-3:], ['-p', package, '--bins'])
+            self.assertNotIn('', command)
+            self.assertNotIn('--offline', command)
+        self.assertTrue((scratch / 'fixtures.tar.gz').is_file())
+
+    def test_linux_broker_setup_passes_no_empty_option_word(self):
+        import re
+        source = (ROOT / 'scripts/lib/prepush-lane.sh').read_text()
+        function = re.search(r'^broker\(\) \{.*?^\}', source, re.M | re.S)
+        self.assertIsNotNone(function)
+        assert function is not None
+        script = '''set -euo pipefail
+platform=linux
+python3() {
+  [[ "$RUNNER_TEMP" == "$scratch" && "$GITHUB_ENV" == "$scratch/nats.env" ]]
+  printf '%s\\n' "$#" "$@" > "$scratch/broker-args"
+}
+''' + function.group(0) + '\nbroker\n'
+        result = subprocess.run(['bash', '-c', script], env=dict(os.environ, scratch=str(self.root)),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / 'broker-args').read_text().splitlines(),
+                         ['1', 'scripts/install-ci-nats.py'])
 
     def test_concurrent_cpu_requests_never_exceed_32(self):
         (self.root / 'target').mkdir()

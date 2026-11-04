@@ -91,8 +91,10 @@ impl subc_client_rs::ModuleHandler for Provider {
 
 struct Serving {
     plane: Arc<SubcCompactionPlane>,
+    conn: Arc<broca_subc::SubcConnection>,
     script: Arc<Script>,
     bind: BindIdentity,
+    scope: Option<broca_protocol::SessionScope>,
     serve: Vec<tokio::task::JoinHandle<()>>,
     _rig: Rig,
 }
@@ -104,11 +106,26 @@ impl Drop for Serving {
     }
 }
 async fn start(tag: &str, replies: Vec<Reply>, description: Value, bind_silent: bool) -> Serving {
+    start_with_scope(tag, replies, description, bind_silent, false).await
+}
+async fn start_with_scope(
+    tag: &str,
+    replies: Vec<Reply>,
+    description: Value,
+    bind_silent: bool,
+    scoped: bool,
+) -> Serving {
     use subc_protocol::manifest::{Concurrency, ModuleManifest, ProviderRole};
-    let rig = Rig::start_with_modules(tag, vec![])
-        .await
-        .expect("real ck-subc required");
-    let conn = Arc::new(rig.connect().await);
+    let (rig, conn, scope) = if scoped {
+        let (rig, conn, scope) = super::common::role_scope::start(tag).await;
+        (rig, conn, Some(scope))
+    } else {
+        let rig = Rig::start_with_modules(tag, vec![])
+            .await
+            .expect("real ck-subc required");
+        let conn = Arc::new(rig.connect().await);
+        (rig, conn, None)
+    };
     let script = Arc::new(Script {
         describe: description,
         replies: Mutex::new(replies.into()),
@@ -143,9 +160,11 @@ async fn start(tag: &str, replies: Vec<Reply>, description: Value, bind_silent: 
     }
     let bind = BindIdentity::new(&rig.dir, "broca", "ses_01J9Z");
     Serving {
-        plane: Arc::new(SubcCompactionPlane::new(conn)),
+        plane: Arc::new(SubcCompactionPlane::new(conn.clone())),
+        conn,
         script,
         bind,
+        scope,
         serve: serves,
         _rig: rig,
     }
@@ -177,13 +196,22 @@ fn op_count(serving: &Serving, method: &str) -> usize {
 async fn setup_ok(serving: &Serving) -> bool {
     serving
         .plane
-        .setup("compaction-test", &serving.bind, setup(&serving.bind))
+        .setup("compaction-test", &serving.bind, None, setup(&serving.bind))
         .await
         .is_ok()
 }
 
 #[tokio::test]
 async fn setup_uses_the_unscoped_role_route_and_frozen_vectors() {
+    setup_role_route_and_frozen_vectors(false).await;
+}
+
+#[tokio::test]
+async fn setup_uses_the_frozen_scope_and_real_harness() {
+    setup_role_route_and_frozen_vectors(true).await;
+}
+
+async fn setup_role_route_and_frozen_vectors(scoped: bool) {
     let setup_vectors = fixture("setup.json");
     let replies = setup_vectors["requests"]
         .as_array()
@@ -191,13 +219,29 @@ async fn setup_uses_the_unscoped_role_route_and_frozen_vectors() {
         .iter()
         .map(|_| Reply::Json(ready()))
         .collect();
-    let serving = start("compaction-wire", replies, describe(), false).await;
+    let serving = start_with_scope(
+        if scoped {
+            "compaction-wire-scoped"
+        } else {
+            "compaction-wire"
+        },
+        replies,
+        describe(),
+        false,
+        scoped,
+    )
+    .await;
     let mut expected = vec![];
     for vector in setup_vectors["requests"].as_array().unwrap() {
         let request: SetupRequest = serde_json::from_value(vector["request"].clone()).unwrap();
         let answer = serving
             .plane
-            .setup("compaction-test", &serving.bind, request)
+            .setup(
+                "compaction-test",
+                &serving.bind,
+                serving.scope.as_ref(),
+                request,
+            )
             .await
             .unwrap();
         assert_eq!(serde_json::to_value(answer).unwrap(), ready());
@@ -227,26 +271,166 @@ async fn setup_uses_the_unscoped_role_route_and_frozen_vectors() {
             "a compaction route must not present the tool-module harness"
         );
         assert_eq!(binds[0]["identity"]["session"], serving.bind.session);
-        // The daemon canonicalises the bound project root, so compare canonical paths: on macOS
-        // the scratch root sits under the /var -> /private/var symlink.
-        let bound_root = std::path::PathBuf::from(
-            binds[0]["identity"]["project_root"]
-                .as_str()
-                .expect("bound project_root is a string"),
-        );
+        // Wire identity carries only harness/session; project attribution belongs to scope.
         assert_eq!(
-            std::fs::canonicalize(&bound_root).expect("canonicalise the bound root"),
-            std::fs::canonicalize(&serving.bind.project_root)
-                .expect("canonicalise the session root"),
-            "a compaction route must bind the session's own project root"
+            binds[0]["identity"],
+            json!({"harness": serving.bind.harness, "session": serving.bind.session}),
+            "a compaction route must not carry a project folder"
         );
         assert_eq!(
             binds[0]["role_versions"],
             json!({"compaction-provider": "v1"})
         );
-        assert!(binds[0].get("scope").is_none_or(Value::is_null));
+        assert_scope(&binds[0], serving.scope.as_ref());
     }
     serving.plane.close_session_routes(&serving.bind).await;
+}
+
+fn assert_scope(bind: &Value, scope: Option<&broca_protocol::SessionScope>) {
+    if let Some(scope) = scope {
+        assert_eq!(bind["scope"]["owner"], json!(scope.owner));
+        assert_eq!(bind["scope"]["ref"], scope.scope_ref);
+        assert_eq!(bind["scope"]["scope_epoch"], scope.scope_epoch);
+    } else {
+        assert!(bind.get("scope").is_none_or(Value::is_null));
+    }
+}
+
+#[tokio::test]
+async fn admission_compaction_discovery_uses_the_frozen_scope() {
+    use broca_fetch_plan::Fetcher;
+    let serving = start_with_scope(
+        "compaction-admission-scope",
+        vec![],
+        describe(),
+        false,
+        true,
+    )
+    .await;
+    let fetcher = broca_subc::SubcPlanFetcher::new(
+        serving.conn.clone(),
+        serving.bind.clone(),
+        serving.scope.clone(),
+    );
+    assert!(matches!(
+        fetcher
+            .describe_compaction("compaction-test")
+            .await
+            .unwrap(),
+        broca_fetch_plan::DescribeAnswer::Answered(_)
+    ));
+    assert_eq!(op_count(&serving, "compaction.setup"), 0);
+    assert_scope(
+        &serving.script.binds.lock().unwrap()[0],
+        serving.scope.as_ref(),
+    );
+    fetcher.close().await;
+}
+
+#[tokio::test]
+async fn scoped_compaction_open_names_scope_not_carrier_without_unscoped_fallback() {
+    use broca_fetch_plan::Fetcher;
+    let serving = start_with_scope(
+        "compaction-carrier-refusal",
+        vec![],
+        describe(),
+        false,
+        true,
+    )
+    .await;
+    let mut scope = serving.scope.clone().unwrap();
+    scope.scope_ref = "denied-scope".into();
+    let fetcher = broca_subc::SubcPlanFetcher::new(
+        serving.conn.clone(),
+        serving.bind.clone(),
+        Some(scope.clone()),
+    );
+    assert!(
+        matches!(fetcher.describe_compaction("compaction-test").await,
+        Err(broca_fetch_plan::FetchError::Refused { code, retryable: false, .. }) if code == "scope_not_carrier")
+    );
+    assert!(serving
+        .plane
+        .setup(
+            "compaction-test",
+            &serving.bind,
+            Some(&scope),
+            setup(&serving.bind)
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        bind_count(&serving),
+        0,
+        "no unscoped fallback reaches the provider"
+    );
+    assert!(serving.script.bodies.lock().unwrap().is_empty());
+    assert!(broca_subc::scoped_role_route_refusals()["scope_not_carrier"] >= 2);
+    fetcher.close().await;
+}
+
+#[tokio::test]
+async fn role_cache_separates_scopes_from_each_other_and_unscoped_routes() {
+    let serving = start_with_scope(
+        "compaction-scope-cache",
+        (0..5).map(|_| Reply::Json(ready())).collect(),
+        describe(),
+        false,
+        true,
+    )
+    .await;
+    let mut other = serving.scope.clone().unwrap();
+    other.scope_ref = "other-scope".into();
+    for scope in [
+        serving.scope.as_ref(),
+        Some(&other),
+        None,
+        Some(&other),
+        serving.scope.as_ref(),
+    ] {
+        serving
+            .plane
+            .setup(
+                "compaction-test",
+                &serving.bind,
+                scope,
+                setup(&serving.bind),
+            )
+            .await
+            .unwrap();
+    }
+    {
+        let binds = serving.script.binds.lock().unwrap();
+        assert_eq!(binds.len(), 3);
+        for (bind, scope) in binds
+            .iter()
+            .zip([serving.scope.as_ref(), Some(&other), None])
+        {
+            assert_scope(bind, scope);
+        }
+    }
+    serving.plane.close_session_routes(&serving.bind).await;
+    serving
+        .script
+        .replies
+        .lock()
+        .unwrap()
+        .push_back(Reply::Json(ready()));
+    serving
+        .plane
+        .setup(
+            "compaction-test",
+            &serving.bind,
+            Some(&other),
+            setup(&serving.bind),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bind_count(&serving),
+        4,
+        "retirement closes every scope slot"
+    );
 }
 
 #[tokio::test]
@@ -270,7 +454,7 @@ async fn route_slots_are_isolated_by_session_harness_root_and_provider() {
         };
         serving
             .plane
-            .setup(provider, bind, setup(bind))
+            .setup(provider, bind, None, setup(bind))
             .await
             .unwrap();
     }
@@ -290,6 +474,7 @@ async fn setup_refuses_mismatched_caller_identity_before_opening_a_route() {
             .setup(
                 "compaction-test",
                 &serving.bind,
+                None,
                 serde_json::from_value(request).unwrap()
             )
             .await
@@ -315,7 +500,7 @@ async fn an_open_session_route_never_carries_a_setup_for_another_session() {
     let accepted = serde_json::to_value(setup(&serving.bind)).unwrap();
     assert!(serving
         .plane
-        .setup("compaction-test", &serving.bind, setup(&serving.bind))
+        .setup("compaction-test", &serving.bind, None, setup(&serving.bind))
         .await
         .is_ok());
     {
@@ -333,6 +518,7 @@ async fn an_open_session_route_never_carries_a_setup_for_another_session() {
             .setup(
                 "compaction-test",
                 &serving.bind,
+                None,
                 serde_json::from_value(request).unwrap()
             )
             .await
@@ -352,13 +538,33 @@ async fn an_open_session_route_never_carries_a_setup_for_another_session() {
 /// naming a session other than the caller's is never sent.
 #[tokio::test]
 async fn view_get_and_ride_use_the_role_route_and_only_the_callers_session() {
+    view_get_and_ride_role_route(false).await;
+}
+
+#[tokio::test]
+async fn view_get_and_ride_use_the_frozen_scope() {
+    view_get_and_ride_role_route(true).await;
+}
+
+async fn view_get_and_ride_role_route(scoped: bool) {
     use broca_core::compaction_provider::{
         lineage::MessageRef,
         notice::ViewReady,
         ride::{RideAnswer, RideCause, RideRequest},
         view::{CompactionView, ViewGetAnswer, ViewGetRequest, ViewRange},
     };
-    let serving = start("compaction-view-ride", vec![], describe(), false).await;
+    let serving = start_with_scope(
+        if scoped {
+            "compaction-view-ride-scoped"
+        } else {
+            "compaction-view-ride"
+        },
+        vec![],
+        describe(),
+        false,
+        scoped,
+    )
+    .await;
     let session_ref = broca_core::wal_writer::agent_session_ref(&serving.bind);
     let view = CompactionView::new(
         &session_ref,
@@ -381,14 +587,24 @@ async fn view_get_and_ride_use_the_role_route_and_only_the_callers_session() {
     let get = ViewGetRequest::for_ready(&ViewReady::for_view(&view));
     let answer = serving
         .plane
-        .view_get("compaction-test", &serving.bind, get.clone())
+        .view_get(
+            "compaction-test",
+            &serving.bind,
+            serving.scope.as_ref(),
+            get.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(answer, ViewGetAnswer::view(view));
     let ride = RideRequest::new(&session_ref, RideCause::ModelChange, 2_000);
     let answer = serving
         .plane
-        .ride("compaction-test", &serving.bind, ride.clone())
+        .ride(
+            "compaction-test",
+            &serving.bind,
+            serving.scope.as_ref(),
+            ride.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(answer, RideAnswer::nothing());
@@ -409,6 +625,10 @@ async fn view_get_and_ride_use_the_role_route_and_only_the_callers_session() {
         ]
     );
     assert_eq!(bind_count(&serving), 1, "one route serves every op");
+    assert_scope(
+        &serving.script.binds.lock().unwrap()[0],
+        serving.scope.as_ref(),
+    );
 
     let other = "0123456789abcdef0123456789abcdef";
     assert_ne!(other, session_ref);
@@ -416,7 +636,7 @@ async fn view_get_and_ride_use_the_role_route_and_only_the_callers_session() {
     foreign.session_ref = other.into();
     assert!(serving
         .plane
-        .view_get("compaction-test", &serving.bind, foreign)
+        .view_get("compaction-test", &serving.bind, None, foreign)
         .await
         .is_err());
     assert!(serving
@@ -424,6 +644,7 @@ async fn view_get_and_ride_use_the_role_route_and_only_the_callers_session() {
         .ride(
             "compaction-test",
             &serving.bind,
+            None,
             RideRequest::new(other, RideCause::ModelChange, 2_000)
         )
         .await
@@ -448,7 +669,7 @@ async fn incomplete_role_discovery_never_calls_setup() {
         .await;
         assert!(serving
             .plane
-            .setup("compaction-test", &serving.bind, setup(&serving.bind))
+            .setup("compaction-test", &serving.bind, None, setup(&serving.bind))
             .await
             .is_err());
         assert!(!setup_ok(&serving).await);
@@ -476,7 +697,7 @@ async fn unknown_answer_tags_are_failed_calls_and_invalidate_the_route() {
     .await;
     assert!(serving
         .plane
-        .setup("compaction-test", &serving.bind, setup(&serving.bind))
+        .setup("compaction-test", &serving.bind, None, setup(&serving.bind))
         .await
         .is_err());
     assert!(!setup_ok(&serving).await);
@@ -502,7 +723,7 @@ async fn role_refuse_answers_are_returned_but_transport_refusals_are_not_retried
     .await;
     let answer = serving
         .plane
-        .setup("compaction-test", &serving.bind, setup(&serving.bind))
+        .setup("compaction-test", &serving.bind, None, setup(&serving.bind))
         .await
         .unwrap();
     assert_eq!(serde_json::to_value(answer).unwrap(), setup_refuse);
@@ -525,7 +746,7 @@ async fn deadline_bounds_route_open_queueing_and_silent_provider_calls() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let request = tokio::spawn(async move {
         plane
-            .setup_with_deadline("compaction-test", &bind, setup(&bind), deadline)
+            .setup_with_deadline("compaction-test", &bind, None, setup(&bind), deadline)
             .await
     });
     broca_test_support::wait_until("silent compaction bind reached", || async {
@@ -561,7 +782,7 @@ async fn deadline_bounds_route_open_queueing_and_silent_provider_calls() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let request = tokio::spawn(async move {
         plane
-            .setup_with_deadline("compaction-test", &bind, setup(&bind), deadline)
+            .setup_with_deadline("compaction-test", &bind, None, setup(&bind), deadline)
             .await
     });
     broca_test_support::wait_until("silent compaction setup reached", || async {
@@ -590,6 +811,7 @@ async fn deadline_bounds_route_open_queueing_and_silent_provider_calls() {
             .setup_with_deadline(
                 "compaction-test",
                 &bind,
+                None,
                 setup(&bind),
                 Instant::now() + Duration::from_secs(30),
             )
@@ -607,6 +829,7 @@ async fn deadline_bounds_route_open_queueing_and_silent_provider_calls() {
     let mut queued = Box::pin(serving.plane.setup_with_deadline(
         "compaction-test",
         &serving.bind,
+        None,
         setup(&serving.bind),
         deadline,
     ));

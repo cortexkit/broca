@@ -80,10 +80,11 @@ async fn reserved_reader_same_triple_gets_written_lineage() {
             3,
             "{written}"
         );
+        // llm-runner 0.8 pages name the written log by incarnation, not lineage.
         assert!(
-            written["lineage_id"]
+            written["incarnation"]
                 .as_str()
-                .is_some_and(|id| !id.is_empty()),
+                .is_some_and(|id| !id.is_empty() && id != "unwritten"),
             "{written}"
         );
         assert_eq!(

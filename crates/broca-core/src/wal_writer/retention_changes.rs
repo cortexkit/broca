@@ -51,6 +51,7 @@ pub(super) struct ObservedWal {
     pub retained: Arc<AtomicBool>,
     pub session: BindIdentity,
     pub durable_observer: Option<Arc<DurableWalObserver>>,
+    pub publication_observer: Option<Arc<super::PublicationObserver>>,
 }
 
 impl Drop for ObservedWal {
@@ -108,7 +109,25 @@ impl Drop for ReleaseHintLease {
 }
 
 impl ObservedWal {
-    fn durable(&self) {
+    fn durable(&self) -> Result<(), WalError> {
+        let publication_result = (|| {
+            if let Some(observer) = &self.publication_observer {
+                if let Some(publication) = self.inner.borrowed_publication() {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        observer(publication)
+                    })) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(reason)) => return Err(WalError::PublicationObserver(reason)),
+                        Err(_) => {
+                            return Err(WalError::PublicationObserver(
+                                "publication observer panicked after WAL sync",
+                            ))
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
         if let Some(observer) = &self.durable_observer {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 observer(
@@ -122,6 +141,7 @@ impl ObservedWal {
                 tracing::warn!(target: "wal", "durable WAL observer panicked; WAL remains committed");
             }
         }
+        publication_result
     }
 
     /// A default-placement WAL becomes retained when its first run carries a retention
@@ -150,7 +170,7 @@ impl Wal for ObservedWal {
         let result = self.inner.append(fence, record, sync);
         self.note_retention(record);
         if sync && result.is_ok() {
-            self.durable();
+            self.durable()?;
         }
         result
     }
@@ -165,7 +185,7 @@ impl Wal for ObservedWal {
         let result = self.inner.append_preencoded(fence, record, sync, frame);
         self.note_retention(record);
         if sync && result.is_ok() {
-            self.durable();
+            self.durable()?;
         }
         result
     }
@@ -182,7 +202,7 @@ impl Wal for ObservedWal {
             .append_v4(fence, record, sync, prepared, appended_ms);
         self.note_retention(record);
         if sync && result.is_ok() {
-            self.durable();
+            self.durable()?;
         }
         result
     }
@@ -192,7 +212,7 @@ impl Wal for ObservedWal {
 
     fn sync(&self) -> Result<(), WalError> {
         self.inner.sync()?;
-        self.durable();
+        self.durable()?;
         Ok(())
     }
     fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
@@ -210,6 +230,13 @@ impl Wal for ObservedWal {
     fn durable_publication(&self) -> Option<broca_wal::file_wal::DurablePublication> {
         if self.inner.wal_config().is_overhaul() {
             self.inner.durable_publication()
+        } else {
+            None
+        }
+    }
+    fn borrowed_publication(&self) -> Option<broca_wal::file_wal::DurablePublicationRef<'_>> {
+        if self.inner.wal_config().is_overhaul() {
+            self.inner.borrowed_publication()
         } else {
             None
         }
@@ -318,6 +345,7 @@ mod tests {
                 changes: Arc::default(),
                 retained: Arc::default(),
                 session: BindIdentity::new("/", "test", "s"),
+                publication_observer: None,
                 durable_observer: Some(Arc::new(move |_, seq, _| {
                     output
                         .lock()
@@ -328,6 +356,46 @@ mod tests {
             assert_eq!(wal.sync().is_err(), fail);
         }
         assert_eq!(*observed.lock().unwrap(), vec![(7, true)]);
+    }
+
+    #[test]
+    fn absent_publication_hook_does_not_request_a_proof() {
+        struct NoProofWal;
+        impl Wal for NoProofWal {
+            fn append(&mut self, _: u64, _: &WalRecord, _: bool) -> Result<u64, WalError> {
+                unreachable!()
+            }
+            fn sync(&self) -> Result<(), WalError> {
+                Ok(())
+            }
+            fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+                unreachable!()
+            }
+            fn tail_after_seq(&self, _: u64) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+                unreachable!()
+            }
+            fn last_seq(&self) -> u64 {
+                0
+            }
+            fn durable_publication(&self) -> Option<broca_wal::file_wal::DurablePublication> {
+                panic!("an unconfigured barrier must not construct or clone a proof")
+            }
+            fn borrowed_publication(
+                &self,
+            ) -> Option<broca_wal::file_wal::DurablePublicationRef<'_>> {
+                panic!("an unconfigured barrier must not request a borrowed proof")
+            }
+        }
+        let wal = ObservedWal {
+            inner: Box::new(NoProofWal),
+            address: Arc::from("legacy"),
+            changes: Arc::default(),
+            retained: Arc::default(),
+            session: BindIdentity::new("/", "test", "legacy"),
+            durable_observer: None,
+            publication_observer: None,
+        };
+        wal.sync().unwrap();
     }
 
     #[test]

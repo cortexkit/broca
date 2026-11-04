@@ -34,6 +34,8 @@ fn import_records(session: &BindIdentity) -> Vec<FramedRecord> {
             seq: 1,
             fence: 1,
             record: WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -53,6 +55,9 @@ fn import_records(session: &BindIdentity) -> Vec<FramedRecord> {
                 run_id: RunId("maintenance-run".into()),
                 session: session.clone(),
                 config: Box::new(RunConfig {
+                    global_system: None,
+                    route_decision_id: None,
+                    account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,
                     computed_tags: None,

@@ -191,7 +191,12 @@ fn build_request_body_with_media_and_provenance(
         body["service_tier"] = serde_json::Value::String(service_tier.clone());
     }
     if let Some(wire) = &frozen.chatgpt_wire {
-        wire.apply_with_provenance(&mut body, prepared.as_ref(), provenance);
+        wire.apply_with_provenance(
+            &mut body,
+            prepared.as_ref(),
+            &frozen.tool_name_aliases,
+            provenance,
+        );
     }
     body
 }
@@ -308,6 +313,9 @@ struct ChatgptNormalizer {
 }
 
 impl StreamNormalizer for ChatgptNormalizer {
+    fn set_raw_sse_observer(&mut self, observer: crate::wire::RawSseObserver) {
+        self.inner.set_raw_sse_observer(observer);
+    }
     fn observe_error_response(&mut self, response: &serde_json::Value) {
         self.inner.observe_error_response(response);
     }
@@ -366,6 +374,7 @@ mod tests {
 
     fn opts() -> CallOptions {
         CallOptions::new(vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

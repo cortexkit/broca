@@ -590,14 +590,23 @@ async fn crash_cut_inside_a_version_4_header_is_a_torn_tail() {
     assert_eq!(
         recovered.last_seq(),
         2,
-        "recovery discards the header that was cut short"
+        "an ordinary cut-short final header is discarded without a recovery record"
     );
     assert_eq!(
         frames(&root).len(),
         2,
         "only the open and first application frames survive"
     );
-    // Appending after recovery continues from the surviving frame.
+    let records = recovered.replay().unwrap();
+    assert_eq!(
+        serde_json::to_value(&records[1].record).unwrap(),
+        serde_json::to_value(record(1)).unwrap()
+    );
+    assert!(records
+        .iter()
+        .all(|frame| !matches!(frame.record, WalRecord::RecoveryCut { .. })));
+    assert_eq!(stored(&root).len(), second_start);
+    // Appending continues immediately after the valid prefix.
     let handle = root.spawn(recovered, 5, StampClock::wall());
     handle.record(record(3)).into_result().unwrap();
     handle.record(record(4)).into_result().unwrap();

@@ -126,50 +126,8 @@ struct SetKey {
     call: Option<usize>,
 }
 
-fn set_id(lineage: &str, key: SetKey) -> String {
-    match key.call {
-        None => format!("{lineage}/m{}", key.ordinal),
-        Some(index) => format!("{lineage}/m{}/c{index}", key.ordinal),
-    }
-}
-
-fn ref_id(set: &str, index: usize) -> String {
-    format!("{set}/r{index}")
-}
-
-/// A decimal number spelled exactly as `to_string` spells it, so each set and record has one
-/// id and no other string aliases it.
-fn canonical(text: &str) -> Option<u64> {
-    let number: u64 = text.parse().ok()?;
-    (number.to_string() == text).then_some(number)
-}
-
-/// The lineage an id names and the set it names there. `None` for anything this module never
-/// minted.
-fn parse_set(id: &str) -> Option<(&str, SetKey)> {
-    let (lineage, rest) = id.split_once("/m")?;
-    let (ordinal, call) = match rest.split_once("/c") {
-        Some((ordinal, call)) => (ordinal, Some(call)),
-        None => (rest, None),
-    };
-    let call = match call {
-        Some(call) => Some(usize::try_from(canonical(call)?).ok()?),
-        None => None,
-    };
-    (!lineage.is_empty()).then_some((
-        lineage,
-        SetKey {
-            ordinal: canonical(ordinal)?,
-            call,
-        },
-    ))
-}
-
-fn parse_ref(id: &str) -> Option<(&str, SetKey, usize)> {
-    let (set, index) = id.rsplit_once("/r")?;
-    let (lineage, key) = parse_set(set)?;
-    Some((lineage, key, usize::try_from(canonical(index)?).ok()?))
-}
+mod identity;
+use identity::{parse_ref, parse_set, ref_id, set_id, snapshot_scope};
 
 fn unknown_set(id: &str) -> OutputRefRefusal {
     OutputRefRefusal::UnknownRef(format!("no output reference set {id} in this session"))
@@ -181,23 +139,35 @@ fn unknown_ref(id: &str) -> OutputRefRefusal {
     ))
 }
 
-/// Reads single messages of one session's current lineage, each at most once.
+/// Reads single messages of one history snapshot, each at most once.
 struct Messages<'a, H: ?Sized> {
     handler: &'a H,
     session: &'a LineageKey,
     lineage: String,
+    history_version: u64,
     cache: BTreeMap<u64, Option<SessionReadMessage>>,
     locations: BTreeMap<u64, Option<broca_core::TagLocation>>,
     records: Option<Vec<broca_wal::WalRecord>>,
 }
 
 impl<H: ServeHandler + ?Sized> Messages<'_, H> {
-    /// Read from `from` on, at most `limit` messages, within the lineage the derivation started
-    /// on: a read after a lineage change is refused rather than mixed with the old one.
+    /// Internal coordinates are stored positions; translate only at the public read boundary.
+    /// Pin the version so a repair cannot mix replacement content into an older reference.
     async fn page(&self, from: u64, limit: u64) -> Result<Vec<SessionReadMessage>, ServeError> {
-        let mut request = SessionReadRequest::new(self.session.clone(), Some(from), Some(limit));
-        request.lineage_id = Some(self.lineage.clone());
-        Ok(self.handler.read(request).await?.messages)
+        let mut request = SessionReadRequest::new(
+            self.session.clone(),
+            Some(from.saturating_add(1)),
+            Some(limit),
+        );
+        request.history_version = Some(self.history_version);
+        Ok(self
+            .handler
+            .read(request)
+            .await?
+            .messages
+            .into_iter()
+            .map(native_entry)
+            .collect())
     }
 
     async fn entry(&mut self, ordinal: u64) -> Result<Option<&SessionReadMessage>, ServeError> {
@@ -213,16 +183,18 @@ impl<H: ServeHandler + ?Sized> Messages<'_, H> {
     }
 }
 
+fn native_entry(mut entry: SessionReadMessage) -> SessionReadMessage {
+    entry.ordinal = entry.ordinal.saturating_sub(1);
+    entry
+}
+
 /// Whether `message` was written by a model step of a run that showed the model numbers under
 /// the computed rules: only such a message has sets.
+/// Every assistant message a run wrote has reference sets. Under llm-runner 0.8 (§9.13) output
+/// references no longer depend on part numbering: in a session that shows no numbers, a
+/// reference the model writes is still recorded, as `unknown_tag`.
 fn has_sets(entry: &SessionReadMessage) -> bool {
-    entry.message.role == Role::Assistant
-        && entry.run.is_some()
-        && entry
-            .message
-            .part_tags()
-            .and_then(|tags| tags.computed)
-            .is_some_and(|computed| computed.render)
+    entry.message.role == Role::Assistant && entry.run.is_some()
 }
 
 /// The model's own text parts of `message`, in block order, as every exposure shows them.
@@ -624,10 +596,8 @@ async fn writing_request<H: ServeHandler + ?Sized>(
     Ok(request)
 }
 
-/// The sets message `ordinal` of the caller's session has, and the session's lineage id;
-/// `None` when the message does not exist or has none. With `lineage`, also `None` when the
-/// session's lineage is another: an id minted for another session (or a lineage retention
-/// deleted) names nothing here, and that is settled before any part's content is read.
+/// The sets at a stored message position, scoped to its incarnation and history version.
+/// An expected scope from another snapshot names nothing, before any target content is read.
 pub async fn message_output_refs<H: ServeHandler + ?Sized>(
     handler: &H,
     session: &LineageKey,
@@ -637,20 +607,23 @@ pub async fn message_output_refs<H: ServeHandler + ?Sized>(
     let page = handler
         .read(SessionReadRequest::new(
             session.clone(),
-            Some(ordinal),
+            Some(ordinal.saturating_add(1)),
             Some(1),
         ))
         .await?;
-    let Some(current) = page.lineage_id.clone() else {
+    if page.incarnation == "unwritten" {
         return Ok(None);
-    };
+    }
+    let current = snapshot_scope(&page.incarnation, page.history_version);
     if lineage.is_some_and(|lineage| lineage != current) {
         return Ok(None);
     }
     let lineage = current;
+    let history_version = page.history_version;
     let Some(entry) = page
         .messages
         .into_iter()
+        .map(native_entry)
         .find(|entry| entry.ordinal == ordinal)
     else {
         return Ok(None);
@@ -662,6 +635,7 @@ pub async fn message_output_refs<H: ServeHandler + ?Sized>(
         handler,
         session,
         lineage: lineage.clone(),
+        history_version,
         cache: BTreeMap::new(),
         locations: BTreeMap::new(),
         records: None,
@@ -677,16 +651,20 @@ pub async fn page_output_refs<H: ServeHandler + ?Sized>(
     handler: &H,
     session: &LineageKey,
     lineage: &str,
+    history_version: u64,
     entries: &[SessionReadMessage],
     records: Option<Vec<broca_wal::WalRecord>>,
 ) -> Result<BTreeMap<u64, MessageOutputDescriptors>, ServeError> {
     let mut messages = Messages {
         handler,
         session,
-        lineage: lineage.to_owned(),
+        lineage: snapshot_scope(lineage, history_version),
+        history_version,
         cache: entries
             .iter()
-            .map(|entry| (entry.ordinal, Some(entry.clone())))
+            .cloned()
+            .map(native_entry)
+            .map(|entry| (entry.ordinal, Some(entry)))
             .collect(),
         locations: BTreeMap::new(),
         records,
@@ -694,9 +672,10 @@ pub async fn page_output_refs<H: ServeHandler + ?Sized>(
     let manifest = handler.frozen_manifest(session).await?;
     let mut sets = BTreeMap::new();
     for entry in entries.iter().filter(|entry| has_sets(entry)) {
+        let entry = native_entry(entry.clone());
         sets.insert(
             entry.ordinal,
-            derive_message(&mut messages, entry, manifest.as_deref())
+            derive_message(&mut messages, &entry, manifest.as_deref())
                 .await?
                 .descriptors(),
         );
@@ -733,7 +712,7 @@ async fn derive_message<H: ServeHandler + ?Sized>(
     } else {
         writing_request(messages, ordinal, &run_id, &wanted, plan_compacts(manifest)).await?
     };
-    let mid = format!("m{ordinal}");
+    let mid = &entry.mid;
     let reply = resolve_set(
         set_id(
             &lineage,
@@ -742,7 +721,7 @@ async fn derive_message<H: ServeHandler + ?Sized>(
                 call: None,
             },
         ),
-        &mid,
+        mid,
         None,
         &request,
         |resolution, request, mut mint| {
@@ -762,7 +741,7 @@ async fn derive_message<H: ServeHandler + ?Sized>(
                         call: Some(call.index),
                     },
                 ),
-                &mid,
+                mid,
                 call.call_key.as_deref(),
                 &request,
                 |resolution, request, mut mint| {
@@ -782,9 +761,11 @@ async fn find_set<H: ServeHandler + ?Sized>(
     lineage: &str,
     key: SetKey,
 ) -> Result<Option<OutputRefSet>, ServeError> {
-    let Some((_, mut sets)) =
-        message_output_refs(handler, session, key.ordinal, Some(lineage)).await?
-    else {
+    let sets = match message_output_refs(handler, session, key.ordinal, Some(lineage)).await {
+        Err(ServeError::HistoryChanged | ServeError::HistoryRewriting) => return Ok(None),
+        result => result?,
+    };
+    let Some((_, mut sets)) = sets else {
         return Ok(None);
     };
     Ok(match key.call {
@@ -998,7 +979,7 @@ mod tests {
 
     #[test]
     fn ids_parse_only_as_minted() {
-        let lineage = "0190a6b2-0000-7000-8000-000000000001";
+        let lineage = snapshot_scope("0190a6b2-0000-7000-8000-000000000001", 123);
         for key in [
             SetKey {
                 ordinal: 0,
@@ -1009,9 +990,12 @@ mod tests {
                 call: Some(3),
             },
         ] {
-            let set = set_id(lineage, key);
-            assert_eq!(parse_set(&set), Some((lineage, key)));
-            assert_eq!(parse_ref(&ref_id(&set, 7)), Some((lineage, key, 7)));
+            let set = set_id(&lineage, key);
+            assert_eq!(parse_set(&set), Some((lineage.as_str(), key)));
+            assert_eq!(
+                parse_ref(&ref_id(&set, 7)),
+                Some((lineage.as_str(), key, 7))
+            );
             assert_eq!(
                 parse_set(&ref_id(&set, 7)),
                 None,
@@ -1049,8 +1033,8 @@ mod tests {
     #[test]
     fn attach_puts_each_descriptor_on_its_row_or_call() {
         let refs = MessageOutputRefs {
-            reply: set("l/m3", None),
-            calls: vec![("call-b".into(), set("l/m3/c2", Some("l:9")))],
+            reply: set("h1.bA.1/m3", None),
+            calls: vec![("call-b".into(), set("h1.bA.1/m3/c2", Some("l:9")))],
         };
         let row = DisplayRow::new(
             "assistant",
@@ -1073,7 +1057,7 @@ mod tests {
             ],
         );
         let row = refs.attach(row);
-        assert_eq!(row.output_refs.as_ref().unwrap().set_id, "l/m3");
+        assert_eq!(row.output_refs.as_ref().unwrap().set_id, "h1.bA.1/m3");
         let calls: Vec<_> = row
             .parts
             .iter()
@@ -1084,7 +1068,7 @@ mod tests {
             .collect();
         assert_eq!(calls[0], None);
         let attached = calls[1].as_ref().unwrap();
-        assert_eq!(attached.set_id, "l/m3/c2");
+        assert_eq!(attached.set_id, "h1.bA.1/m3/c2");
         assert_eq!(attached.call_key.as_deref(), Some("l:9"));
     }
 
@@ -1103,7 +1087,7 @@ mod tests {
         ]}})).unwrap();
         let target = target_of(&results, 1, Some(&calls)).unwrap();
         let set = resolve_set(
-            "l/m3".into(),
+            "h1.bA.1/m3".into(),
             "m3",
             None,
             &BTreeMap::from([(1, target)]),

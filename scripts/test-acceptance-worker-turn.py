@@ -108,7 +108,7 @@ class WorkerAcceptance(unittest.TestCase):
         with self.assertRaisesRegex(acceptance.ArchiveRefusal, "digest mismatch"):
             acceptance.check_wal(self.path, "run-under-test")
 
-    def run_main(self, answers, *, env=None, wal_results=None, compose_answers=None, extra_args=()):
+    def run_main(self, answers, *, env=None, wal_results=None, compose_answers=None, extra_args=(), no_project=False):
         output = io.StringIO()
         argv = ["acceptance-worker-turn.py", "--project-root", self.tmp.name, "--state-root", self.tmp.name, *extra_args]
         answers = iter(answers)
@@ -126,6 +126,7 @@ class WorkerAcceptance(unittest.TestCase):
             return result
 
         with patch.dict(acceptance.os.environ, env or {}, clear=True), \
+                patch.object(acceptance, "bind_no_project", return_value=no_project), \
                 patch.object(acceptance, "MODELS_FILE", self.models), \
                 patch.object(acceptance.sys, "argv", argv), patch.object(acceptance, "invoke", side_effect=answer) as invoke, \
                 patch.object(acceptance, "checked_run", return_value=(acceptance.REQUIRED, self.error_terminal()),

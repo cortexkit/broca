@@ -18,7 +18,7 @@ use broca_core::{
     CompactionPlane, CompactionUnavailable,
 };
 use broca_fetch_plan::{DescribeAnswer, FetchError};
-use broca_protocol::BindIdentity;
+use broca_protocol::{BindIdentity, SessionScope};
 use tokio::time::Instant;
 
 use crate::{connection::SubcConnection, role_route::RoleRoute};
@@ -39,15 +39,17 @@ fn current_reference(bind: &BindIdentity, supplied: &str) -> Result<String, Comp
     }
 }
 
-/// Routes are isolated by caller session and provider. Discovery, queueing and the RPC all
+/// Routes are isolated by caller session, provider and frozen scope. Discovery, queueing and the RPC all
 /// consume the call's budget; failed calls invalidate the route before another request uses it.
 pub struct SubcCompactionPlane {
     route: RoleRoute,
+    v2_route: RoleRoute,
 }
 
 impl SubcCompactionPlane {
     pub fn new(conn: Arc<SubcConnection>) -> Self {
         Self {
+            v2_route: RoleRoute::without_discovery(conn.clone(), "compaction-provider", "v2"),
             route: RoleRoute::new(conn, ROLE, VERSION, |describe| {
                 check_describe(describe)
                     .map(|_| ())
@@ -66,6 +68,7 @@ impl SubcCompactionPlane {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&SessionScope>,
         request: SetupRequest,
         deadline: Instant,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
@@ -76,6 +79,7 @@ impl SubcCompactionPlane {
             .call(
                 provider,
                 bind,
+                scope,
                 &OpRequest::new(ops::COMPACTION_SETUP, &request),
                 bounded(deadline),
                 false,
@@ -86,6 +90,7 @@ impl SubcCompactionPlane {
 
     pub async fn close_session_routes(&self, bind: &BindIdentity) {
         self.route.close_session_routes(bind).await;
+        self.v2_route.close_session_routes(bind).await;
     }
 
     /// `provider`'s answer to `role.describe`, asked on a fresh `compaction-provider: v1`
@@ -102,9 +107,10 @@ impl SubcCompactionPlane {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&SessionScope>,
         deadline: Instant,
     ) -> Result<DescribeAnswer, FetchError> {
-        match self.route.describe(provider, bind, deadline).await? {
+        match self.route.describe(provider, bind, scope, deadline).await? {
             Ok(answer) => Ok(DescribeAnswer::Answered(answer)),
             Err(refusal) => {
                 let may_clear = describe_refusal_may_clear(&refusal.code);
@@ -152,15 +158,49 @@ fn bounded(deadline: Instant) -> Instant {
 
 #[async_trait]
 impl CompactionPlane for SubcCompactionPlane {
+    async fn call_v2(
+        &self,
+        provider: &str,
+        bind: &BindIdentity,
+        scope: Option<&SessionScope>,
+        method: &str,
+        params: serde_json::Value,
+        deadline_ms: u64,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
+    {
+        use broca_core::compaction_v2::{protocol::wire::Refusal, runtime::CallError};
+        self.v2_route
+            .call(
+                provider,
+                bind,
+                scope,
+                &serde_json::json!({"method": method, "params": params}),
+                Instant::now() + Duration::from_millis(deadline_ms),
+                false,
+            )
+            .await
+            .map_err(|error| match error {
+                FetchError::ProviderRefused {
+                    code,
+                    detail,
+                    message,
+                    ..
+                } => CallError::Refused(Refusal::new(&code, message, detail)),
+                _ => CallError::Unavailable,
+            })
+    }
+
     async fn setup(
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         self.setup_with_deadline(
             provider,
             bind,
+            scope,
             request,
             bounded(Instant::now() + Duration::from_millis(COMPACTION_CALL_BUDGET_MS)),
         )
@@ -173,6 +213,7 @@ impl CompactionPlane for SubcCompactionPlane {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&SessionScope>,
         mut request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, CompactionUnavailable> {
         request.session_ref = current_reference(bind, &request.session_ref)?;
@@ -180,6 +221,7 @@ impl CompactionPlane for SubcCompactionPlane {
             .call(
                 provider,
                 bind,
+                scope,
                 &OpRequest::new(ops::VIEW_GET, &request),
                 bounded(Instant::now() + Duration::from_millis(COMPACTION_CALL_BUDGET_MS)),
                 false,
@@ -195,6 +237,7 @@ impl CompactionPlane for SubcCompactionPlane {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        scope: Option<&SessionScope>,
         mut request: RideRequest,
     ) -> Result<RideAnswer, CompactionUnavailable> {
         request.session_ref = current_reference(bind, &request.session_ref)?;
@@ -203,6 +246,7 @@ impl CompactionPlane for SubcCompactionPlane {
             .call(
                 provider,
                 bind,
+                scope,
                 &OpRequest::new(ops::COMPACTION_RIDE, &request),
                 bounded(ride_deadline),
                 false,

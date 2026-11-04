@@ -461,6 +461,12 @@ struct CodeAssistNormalizer {
     sse: SseDecoder,
 }
 
+/// Code Assist accepts both enveloped and bare Gemini responses. Decoding and content
+/// timing must inspect the same body so a valid bare response is not left unmeasured.
+pub(crate) fn response_body(value: &Value) -> &Value {
+    value.get("response").unwrap_or(value)
+}
+
 impl StreamNormalizer for CodeAssistNormalizer {
     fn observe_error_response(&mut self, response: &Value) {
         self.inner.observe_error_response(response);
@@ -479,13 +485,8 @@ impl StreamNormalizer for CodeAssistNormalizer {
             }
             let parsed: Value = serde_json::from_str(&payload)
                 .map_err(|e| NormalizeError::Invalid(e.to_string()))?;
-            // cloudcode-pa wraps each chunk as { response: <GenerateContentResponse> }; a
-            // bare response (no wrapper) is fed through directly (the reference handles both).
-            let response = match parsed.get("response") {
-                Some(r) => r,
-                None => &parsed,
-            };
-            self.inner.handle_response_value(response, &mut out)?;
+            self.inner
+                .handle_response_value(response_body(&parsed), &mut out)?;
         }
         Ok(out)
     }
@@ -518,11 +519,8 @@ impl StreamNormalizer for CodeAssistNormalizer {
             }
             let parsed: Value = serde_json::from_str(&payload)
                 .map_err(|e| NormalizeError::Invalid(e.to_string()))?;
-            let response = match parsed.get("response") {
-                Some(r) => r,
-                None => &parsed,
-            };
-            self.inner.handle_response_value(response, &mut out)?;
+            self.inner
+                .handle_response_value(response_body(&parsed), &mut out)?;
         }
         out.extend(self.inner.finish()?);
         Ok(out)
@@ -548,6 +546,7 @@ mod tests {
 
     fn user(text: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
@@ -915,6 +914,58 @@ mod tests {
         // The Option footgun guard: a missing step_context must FAIL, never render a default.
         let opts = CallOptions::new(vec![user("hi")]);
         let _ = GoogleCodeAssist.render(&frozen(), &opts);
+    }
+
+    #[test]
+    fn bare_and_wrapped_streams_measure_text_and_tool_calls() {
+        for wrapped in [false, true] {
+            let mut normalizer = GoogleCodeAssist.normalizer(&frozen(), StepId(1));
+            let mut first_content_at_ms = None;
+            let mut content_bytes = 0;
+            for body in [
+                serde_json::json!({"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}),
+                serde_json::json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"lookup","args":{"key":"value"}}}]},"finishReason":"STOP"}]}),
+            ] {
+                let value = if wrapped {
+                    serde_json::json!({"response":body})
+                } else {
+                    body
+                };
+                content_bytes += value.to_string().len() as u64;
+                normalizer
+                    .push(format!("data: {value}\n\n").as_bytes())
+                    .unwrap();
+                let progress = normalizer.content_progress();
+                let first = progress
+                    .first_content_at_ms
+                    .expect("decoded text and tool calls have a first content timestamp");
+                let last = progress
+                    .last_content_at_ms
+                    .expect("decoded text and tool calls have a last content timestamp");
+                assert_eq!(*first_content_at_ms.get_or_insert(first), first);
+                assert!(last >= first);
+                assert_eq!(progress.content_bytes, Some(content_bytes));
+                assert_eq!(progress.events_after_last_content, Some(0));
+            }
+            let events = normalizer.finish().unwrap();
+            let message = events
+                .iter()
+                .find_map(|event| match event {
+                    NormalizedEvent::Control(
+                        broca_protocol::ProviderControl::AssistantMessage { message },
+                    ) => Some(message),
+                    _ => None,
+                })
+                .expect("the stream still assembles its assistant message");
+            assert!(message.content.iter().any(|block| matches!(
+                block,
+                broca_protocol::ContentBlock::Text { text } if text == "hello"
+            )));
+            assert!(message.content.iter().any(|block| matches!(
+                block,
+                broca_protocol::ContentBlock::ToolCall(call) if call.tool_name == "lookup"
+            )));
+        }
     }
 
     #[test]

@@ -93,6 +93,14 @@ impl CodeAssistRoute<'_> {
 /// policies within the same `AnthropicMessages` family.
 #[derive(Debug, Clone, Default)]
 pub struct ResolveOptions<'a> {
+    /// An optional runtime-only raw quota tap, never part of the render bundle.
+    pub quota_observer: Option<Arc<dyn broca_provider::quota::QuotaObserver>>,
+    /// Fresh admission's concrete operator aliases and complete canonical tool declarations.
+    /// Recorded episodes use only their frozen bundle.
+    pub tool_name_aliases: Option<(
+        &'a [broca_protocol::request::Tool],
+        &'a std::collections::BTreeMap<String, String>,
+    )>,
     /// Consider media facts for a fresh, media-enabled episode. A tool can return media even
     /// when the caller's input is text; models with no known media modality keep no profile.
     pub media: bool,
@@ -128,8 +136,7 @@ pub struct ResolveOptions<'a> {
     /// refused, naming the offered tiers. A resume passes the frozen tier through
     /// `EpisodeRenderConfig` instead.
     pub service_tier: Option<ServiceTier>,
-    /// Abstract level recovered from a durable queue written by a later release. Fresh public
-    /// sends never set this reader-only input. Resumed runs use their recorded render bundle.
+    /// Abstract level from a public send or durable queue. Resumed runs use their recorded bundle.
     pub queued_service_tier: Option<&'a str>,
     /// Where a fresh token for the run's own credential comes from when the provider rejects
     /// the served one with a 401 mid-run or its token is about to expire. Used only with
@@ -161,6 +168,22 @@ pub struct ResolveOptions<'a> {
     /// resume keeps whatever its recorded config froze. `None` freezes nothing, so the episode's
     /// config and request bytes are exactly what they would be without the fallback.
     pub refusal_fallback_model: Option<&'a str>,
+}
+
+fn freeze_tool_aliases(
+    mut frozen: FrozenRenderConfig,
+    opts: &ResolveOptions<'_>,
+) -> Result<FrozenRenderConfig, ResolutionError> {
+    if let Some((tools, aliases)) = opts.tool_name_aliases {
+        broca_provider::tool_name_alias::validate_operator_aliases(
+            frozen.family_id,
+            tools,
+            aliases,
+        )
+        .map_err(ResolutionError::ToolAliasInvalid)?;
+        frozen.tool_name_aliases = aliases.clone();
+    }
+    Ok(frozen)
 }
 
 /// The Claude Code persona an episode renders with, as the code starting it knows it.
@@ -219,6 +242,7 @@ pub struct ProviderResolution {
 #[derive(Debug, Clone)]
 pub enum ResolutionError {
     Config(String),
+    ToolAliasInvalid(broca_core::run::ToolAliasInvalid),
     VariantUnsupported(broca_provider::variant::VariantRefusal),
 }
 impl From<String> for ResolutionError {
@@ -235,6 +259,7 @@ impl std::fmt::Display for ResolutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config(s) => f.write_str(s),
+            Self::ToolAliasInvalid(e) => e.fmt(f),
             Self::VariantUnsupported(e) => e.fmt(f),
         }
     }
@@ -267,6 +292,7 @@ impl From<ResolutionError> for broca_core::RunError {
     fn from(value: ResolutionError) -> Self {
         match value {
             ResolutionError::Config(s) => Self::Config(s),
+            ResolutionError::ToolAliasInvalid(e) => Self::ToolAliasInvalid(e),
             ResolutionError::VariantUnsupported(e) => Self::VariantUnsupported(e),
         }
     }
@@ -485,6 +511,34 @@ pub fn provider_for_recorded_config(
     http_client: ProviderHttpClient,
     clock: &broca_core::clock::Clock,
 ) -> Result<Box<dyn broca_core::provider::Provider>, String> {
+    provider_for_recorded_config_with_quota_observer(
+        provider_id,
+        model_id,
+        frozen,
+        auth,
+        auth_method,
+        frozen_account_ref,
+        served_account_ref,
+        http_client,
+        clock,
+        None,
+    )
+}
+
+/// Build a recorded provider with the run's optional, runtime-only quota tap.
+#[allow(clippy::too_many_arguments)]
+pub fn provider_for_recorded_config_with_quota_observer(
+    provider_id: &str,
+    model_id: &str,
+    frozen: FrozenRenderConfig,
+    auth: &AuthMode,
+    auth_method: Option<AuthMethod>,
+    frozen_account_ref: Option<&str>,
+    served_account_ref: Option<&str>,
+    http_client: ProviderHttpClient,
+    clock: &broca_core::clock::Clock,
+    quota_observer: Option<Arc<dyn broca_provider::quota::QuotaObserver>>,
+) -> Result<Box<dyn broca_core::provider::Provider>, String> {
     let model = format!("{provider_id}/{model_id}");
     let provider_id = recorded_auth_provider(&frozen, &model, provider_id);
     let auth_kind = provider_route_auth_kind(
@@ -505,6 +559,7 @@ pub fn provider_for_recorded_config(
         frozen,
         resolved_auth.handle,
         ProviderOptions {
+            quota_observer,
             refresher: resolved_auth.refresher,
             auth_method: resolved_auth
                 .auth_method
@@ -686,6 +741,9 @@ pub fn default_max_output_tokens(output_limit: Option<u64>, context_limit: Optio
 
 impl EpisodeRenderConfig<'_> {
     fn apply(self, mut config: FrozenRenderConfig) -> FrozenRenderConfig {
+        config.image_notice_labels = self
+            .recorded_config
+            .is_none_or(|recorded| recorded.image_notice_labels);
         if let Some(session_id) = self.opencode_go_session_id {
             config.opencode_go_session_id = Some(session_id.to_string());
             if config.family_id == WireFamilyId::OpenAiChat {
@@ -944,6 +1002,9 @@ fn resolve_provider_inner(
             "openai-compatible",
             opts.auth_method,
         );
+        // Opaque endpoints share fresh-episode render rules with catalog routes.
+        // Recorded episodes take the earlier recorded-config branch instead.
+        let frozen = freeze_tool_aliases(episode_render.apply(frozen), opts)?;
         let provider =
             resolved_live_provider(http_client, frozen, handle, refresher, auth_method, opts)?;
         return Ok(ProviderResolution {
@@ -1161,7 +1222,7 @@ fn resolve_provider_inner(
                 .media
                 .filter(|profile| profile.modalities.supports_media());
         }
-        let frozen = episode_render.apply(frozen);
+        let frozen = freeze_tool_aliases(episode_render.apply(frozen), opts)?;
         let resolved_base_url = frozen
             .base_url
             .clone()
@@ -1358,7 +1419,7 @@ fn resolve_provider_inner(
             .media
             .filter(|profile| profile.modalities.supports_media());
     }
-    let mut frozen = episode_render.apply(frozen);
+    let mut frozen = freeze_tool_aliases(episode_render.apply(frozen), opts)?;
     if let Some(fallback_model) = opts.refusal_fallback_model {
         match freeze_refusal_fallback(
             &frozen,
@@ -1601,6 +1662,8 @@ fn freeze_refusal_fallback(
         return Err("the fallback model echoes thinking only to the model that produced it".into());
     }
     fallback.max_output_tokens = max_tokens;
+    fallback.image_notice_labels = source.image_notice_labels;
+    fallback.tool_name_aliases = source.tool_name_aliases.clone();
     fallback.base_url = source.base_url.clone();
     fallback.cache = source.cache.clone();
     fallback.prompt_cache_key = source.prompt_cache_key.clone();
@@ -1800,8 +1863,7 @@ fn apply_service_tier(
     broca_provider::service_tier::freeze_service_tier(frozen, provider_id, requested)
 }
 
-/// Interpret the abstract level retained by a queued request without extending the legacy
-/// stored enum. Public send admission cannot set this input until the writer release ships.
+/// Interpret an abstract level without extending the legacy stored enum.
 fn apply_queued_service_tier(
     frozen: &mut FrozenRenderConfig,
     level: &str,
@@ -1851,6 +1913,20 @@ fn apply_queued_service_tier(
         provider_id,
         catalog_model,
         priced_modes,
+    )
+}
+
+/// Check an enqueue against its model row and selected family without making a model call.
+pub fn check_service_tier_level(
+    family: WireFamilyId,
+    level: &str,
+    provider_id: &str,
+    catalog_model: &str,
+    priced_modes: &[String],
+) -> Result<(), String> {
+    let mut frozen = broca_provider::families::frozen_config_for_family(family, catalog_model);
+    apply_queued_service_tier(&mut frozen, level, provider_id, catalog_model, priced_modes).map_err(
+        |error| format!("service_tier {level:?} is unsupported for {catalog_model}: {error}"),
     )
 }
 
@@ -1995,6 +2071,7 @@ fn resolved_live_provider(
         frozen,
         auth,
         ProviderOptions {
+            quota_observer: opts.quota_observer.clone(),
             refresher,
             auth_method: auth_method.map(|method| method.as_token().to_owned()),
             frozen_account_ref: opts.frozen_account_ref.map(str::to_owned),
@@ -2648,6 +2725,36 @@ mod tests {
         let body = serde_json::from_slice(&resolved.provider.render_request(&anthropic_options()))
             .expect("step-one body is JSON");
         (frozen, body)
+    }
+
+    #[test]
+    fn image_notice_labels_are_admitted_once_and_keep_recorded_absence_on_resume() {
+        let catalog = catalog_stating_server_side_fallback(&[("claude-fable-5-1", Some(true))]);
+        with_test_catalog(&catalog, || {
+            for method in [AuthMethod::ApiKey, AuthMethod::Oauth] {
+                let (fresh, _) = resolve_anthropic_episode(
+                    "anthropic/claude-fable-5-1",
+                    method,
+                    false,
+                    EpisodeRenderConfig::default(),
+                );
+                assert!(fresh.image_notice_labels);
+                let mut old = fresh.clone();
+                old.image_notice_labels = false;
+                let recorded = serde_json::to_value(&old).unwrap();
+                assert!(recorded.get("image_notice_labels").is_none());
+                let (resumed, _) = resolve_anthropic_episode(
+                    "anthropic/claude-fable-5-1",
+                    method,
+                    false,
+                    EpisodeRenderConfig {
+                        recorded_config: Some(&old),
+                        ..EpisodeRenderConfig::default()
+                    },
+                );
+                assert_eq!(serde_json::to_value(resumed).unwrap(), recorded);
+            }
+        });
     }
 
     /// The opt-in is set for exactly one shape: an OAuth (identity-lead) run of an `anthropic`
@@ -4077,6 +4184,7 @@ mod responses_tool_admission_tests {
             let recorded: FrozenRenderConfig = serde_json::from_value(blob.clone()).unwrap();
             assert!(!recorded.responses_tools_non_strict);
             let resumed = EpisodeRenderConfig {
+                recorded_config: Some(&recorded),
                 responses_tools_non_strict: Some(recorded.responses_tools_non_strict),
                 chatgpt_effort_updates: Some(recorded.chatgpt_effort_updates),
                 ..Default::default()
@@ -4108,6 +4216,7 @@ mod responses_tool_admission_tests {
         let blob = serde_json::to_value(&admitted).unwrap();
         let recorded: FrozenRenderConfig = serde_json::from_value(blob.clone()).unwrap();
         let resumed = EpisodeRenderConfig {
+            recorded_config: Some(&recorded),
             chatgpt_wire: recorded.chatgpt_wire.as_ref(),
             ..Default::default()
         }

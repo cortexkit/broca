@@ -59,6 +59,7 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "limit.output",
     "capability.attachment",
     "capability.input_modalities",
+    "capability.mid_conversation_system",
     "capability.reasoning",
     "capability.reasoning_options",
     "capability.server_side_fallback",
@@ -87,6 +88,7 @@ pub(crate) const MODEL_KIND_CHAT: &str = "chat";
 /// another model itself. A named constant because the rest of the work keys on it: the prefix
 /// list above, the row reader, the `carries_…` scan and the tests.
 pub(crate) const SERVER_SIDE_FALLBACK_FACT: &str = "capability.server_side_fallback";
+pub(crate) const MID_CONVERSATION_SYSTEM_FACT: &str = "capability.mid_conversation_system";
 
 /// The successful `catalog.get` response persisted as the last-known-good document.
 ///
@@ -162,6 +164,8 @@ struct LoadedCatalog {
     /// next poll and none of the fact. Reusing its index would leave every row reading "no
     /// server-side fallback" until fusiform happened to mint a new version.
     carries_server_side_fallback: bool,
+    /// Refresh equal-version last-known-good data fetched before `mid_conversation_system` was requested.
+    carries_mid_conversation_system: bool,
     /// Present rows this catalog left out or kept from the catalog it replaced, because their
     /// facts could not be used. Shared with an equal-version republish, which reuses the index
     /// these describe.
@@ -195,6 +199,13 @@ fn response_carries_server_side_fallback(response: &FusiformCatalogResponse) -> 
         .models
         .values()
         .any(|facts| facts.contains_key(SERVER_SIDE_FALLBACK_FACT))
+}
+
+fn response_carries_mid_conversation_system(response: &FusiformCatalogResponse) -> bool {
+    response
+        .models
+        .values()
+        .any(|facts| facts.contains_key(MID_CONVERSATION_SYSTEM_FACT))
 }
 
 fn response_carries_routing_facts(response: &FusiformCatalogResponse) -> bool {
@@ -281,6 +292,7 @@ struct ServingModel {
     /// malformed; it is reported and reads as `None`, because an optional routing feature must
     /// not take a model offline.
     server_side_fallback: Option<bool>,
+    mid_conversation_system: Option<bool>,
     /// Upstream mode names (`fast`, `priority`, ...) for which fusiform serves BOTH a priced
     /// input and a priced output rate, sorted. A mode missing either side is unpriced and is
     /// not listed; see `priced_modes_fact`.
@@ -306,6 +318,7 @@ impl Default for ServingModel {
             structured_output: CapabilityFlag::Absent,
             reasoning_options: ReasoningOptions::Unstated,
             server_side_fallback: None,
+            mid_conversation_system: None,
             priced_modes: Vec::new(),
             wire_family: None,
             kind: None,
@@ -334,6 +347,7 @@ impl ServingModel {
             structured_output: model.capabilities.structured_output,
             reasoning_options: model.reasoning_options.clone(),
             server_side_fallback: model.server_side_fallback,
+            mid_conversation_system: model.mid_conversation_system,
             // The legacy snapshot path carries no fusiform mode rates, so it offers no tier
             // that needs one.
             priced_modes: Vec::new(),
@@ -365,6 +379,7 @@ impl ServingModel {
             cost: self.cost.clone(),
             reasoning_options: self.reasoning_options.clone(),
             server_side_fallback: self.server_side_fallback,
+            mid_conversation_system: self.mid_conversation_system,
             release_date: None,
             status: None,
             overlay: Overlay::default(),
@@ -1455,6 +1470,9 @@ fn serving_model_from_facts(
         )?,
         reasoning_options: reasoning_options_fact(identity, facts)?,
         server_side_fallback: server_side_fallback_fact(identity, facts),
+        mid_conversation_system: facts
+            .get(MID_CONVERSATION_SYSTEM_FACT)
+            .and_then(Value::as_bool),
         priced_modes: priced_modes_fact(identity, facts)?,
         wire_family: None,
         kind: model_kind_fact(identity, facts)?,
@@ -2143,6 +2161,8 @@ impl CatalogCache {
                     || response_carries_display_names(&response) != current.carries_display_names
                     || response_carries_server_side_fallback(&response)
                         != current.carries_server_side_fallback
+                    || response_carries_mid_conversation_system(&response)
+                        != current.carries_mid_conversation_system
                 {
                     let rebuilt = Arc::new(loaded(
                         &response,
@@ -2175,6 +2195,7 @@ impl CatalogCache {
                     carries_input_modalities: current.carries_input_modalities,
                     carries_display_names: current.carries_display_names,
                     carries_server_side_fallback: current.carries_server_side_fallback,
+                    carries_mid_conversation_system: current.carries_mid_conversation_system,
                     excluded_rows: Arc::clone(&current.excluded_rows),
                 });
                 self.install(refreshed);
@@ -2269,6 +2290,7 @@ impl CatalogCache {
             carries_display_names: false,
             // The vendored snapshot serves no `capability.server_side_fallback`.
             carries_server_side_fallback: false,
+            carries_mid_conversation_system: false,
             excluded_rows: Arc::from([]),
         });
         *self.current.write().expect("catalog cache lock poisoned") = Some(next);
@@ -2341,6 +2363,7 @@ fn loaded(
         carries_input_modalities: response_carries_input_modalities(response),
         carries_display_names: response_carries_display_names(response),
         carries_server_side_fallback: response_carries_server_side_fallback(response),
+        carries_mid_conversation_system: response_carries_mid_conversation_system(response),
         excluded_rows: assembled.excluded_rows.into(),
     })
 }
@@ -3576,6 +3599,70 @@ mod tests {
 
     /// The fact reaches the resolved row as a plain yes, no or nothing, and a malformed value
     /// leaves the row serving with its route unchanged, reported by one WARN.
+    #[test]
+    fn mid_conversation_system_fact_is_optional_and_frozen_without_name_inference() {
+        use broca_provider::{
+            families::resolve_frozen, spec::WireFamilyId, turn_system::catalog_support,
+        };
+        assert!(FUSIFORM_FACT_PREFIXES.contains(&MID_CONVERSATION_SYSTEM_FACT));
+        for (value, expected) in [
+            (None, None),
+            (Some(Value::Bool(false)), Some(false)),
+            (Some(Value::Bool(true)), Some(true)),
+            (Some(Value::Null), None),
+            (Some(Value::String("true".into())), None),
+        ] {
+            let mut page = response(100);
+            let facts = page.models.get_mut("anthropic/claude-sonnet-4-5").unwrap();
+            facts.insert(
+                "wire.npm".into(),
+                serde_json::json!({"value":"@ai-sdk/anthropic", "from":"provider"}),
+            );
+            facts.insert(
+                "wire.api".into(),
+                serde_json::json!({"value":"https://api.anthropic.com/v1", "from":"curated"}),
+            );
+            if let Some(value) = value {
+                facts.insert(MID_CONVERSATION_SYSTEM_FACT.into(), value);
+            }
+            let cache = CatalogCache::empty();
+            cache
+                .refresh(page)
+                .expect("an optional fact must never exclude a route");
+            let snapshot = cache.snapshot().unwrap();
+            let (provider, model) = snapshot
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .unwrap();
+            assert_eq!(model.mid_conversation_system, expected);
+            let frozen = resolve_frozen(&provider, &model, 2048, 2).unwrap();
+            assert_eq!(frozen.anthropic_turn_system, expected == Some(true));
+            assert!(!catalog_support(
+                WireFamilyId::AnthropicMessages,
+                "compatible-host",
+                &model
+            ));
+        }
+        let mut page = response(100);
+        let cache = CatalogCache::empty();
+        cache.refresh(page.clone()).unwrap();
+        page.models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap()
+            .insert(MID_CONVERSATION_SYSTEM_FACT.into(), Value::Bool(true));
+        cache.refresh(page).unwrap();
+        assert_eq!(
+            cache
+                .snapshot()
+                .unwrap()
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .unwrap()
+                .1
+                .mid_conversation_system,
+            Some(true),
+            "an equal-version poll must not reuse an index fetched without the fact"
+        );
+    }
+
     #[test]
     fn server_side_fallback_reaches_the_resolved_row() {
         let mut page = response(100);

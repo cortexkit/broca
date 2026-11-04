@@ -71,6 +71,7 @@ fn model_with_marked_raw() -> ModelSpec {
         cost: Default::default(),
         reasoning_options: Default::default(),
         server_side_fallback: None,
+        mid_conversation_system: None,
         input_modalities: Default::default(),
         release_date: None,
         status: None,

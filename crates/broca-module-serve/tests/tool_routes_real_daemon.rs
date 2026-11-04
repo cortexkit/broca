@@ -70,6 +70,8 @@ impl RunExecutor for Executor {
             .await
             .map_err(|e| RunError::Config(e.to_string()))?;
         job.writer.record(WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -125,6 +127,9 @@ impl RunExecutor for Executor {
 
 fn config() -> RunConfig {
     RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         generation: Default::default(),
         tool_choice: Default::default(),
@@ -308,6 +313,8 @@ async fn sweeper_deleted_session_releases_tool_routes() {
     wal.append(
         1,
         &WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,

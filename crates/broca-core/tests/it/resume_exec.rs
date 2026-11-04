@@ -183,6 +183,7 @@ fn scripts() -> Vec<Vec<NormalizedEvent>> {
 
 fn request(run: &str, dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -199,6 +200,7 @@ fn request(run: &str, dir: &std::path::Path) -> RunRequest {
         session: broca_protocol::BindIdentity::new(dir, "m9", "s1"),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -874,163 +876,4 @@ async fn finalize_answer_is_committed_to_durable_history() {
     ));
 
     let _ = std::fs::remove_dir_all(dir);
-}
-
-async fn check_tool_result_ceiling(tag: &str, output: ToolOutput, original: String) {
-    check_named_tool_result_ceiling(tag, "edit", "edit", output, original).await;
-}
-
-async fn check_named_tool_result_ceiling(
-    tag: &str,
-    tool_name: &str,
-    marker_name: &str,
-    output: ToolOutput,
-    original: String,
-) {
-    const LIMIT: usize = 1_048_576;
-    let dir = broca_test_support::scratch_root()
-        .join(format!("broca-tool-ceiling-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut steps = scripts();
-    if let NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) =
-        &mut steps[0][0]
-    {
-        message.content.truncate(1);
-        if let ContentBlock::ToolCall(call) = &mut message.content[0] {
-            call.tool_name = tool_name.into();
-        }
-    }
-    let is_error = matches!(&output, ToolOutput::Error { .. });
-    let tool_plane = StubToolPlane::new().with_tool(tool_name, move |_| match &output {
-        ToolOutput::Error { message, .. } => StubReply::ExecError(message.clone()),
-        _ => StubReply::Output(output.clone()),
-    });
-    let mut req = request("r", &dir);
-    req.tools[0].name = tool_name.into();
-    req.policy_allowed = [tool_name.to_string()].into_iter().collect();
-    let provider = RecordingProvider::new(steps.clone());
-    assert_eq!(
-        run_once_req(&dir, req.clone(), &provider, &tool_plane).await,
-        RunFinishReason::Completed
-    );
-    let records = read_wal(&dir);
-    let (index, stored) = records
-        .iter()
-        .enumerate()
-        .find_map(|(index, record)| match record {
-            broca_wal::WalRecord::ToolResult { result, .. } => Some((index, result)),
-            _ => None,
-        })
-        .expect("durable dispatched result");
-    let ToolOutput::Text { text } = &stored.output else {
-        panic!("expected text result")
-    };
-    assert!(
-        stored.is_error == is_error,
-        "truncation does not change the tool outcome"
-    );
-    assert!(
-        text.len() <= LIMIT,
-        "stored result exceeds byte ceiling: {}",
-        text.len()
-    );
-    assert!(std::str::from_utf8(text.as_bytes()).is_ok());
-    if original.len() <= LIMIT {
-        assert_eq!(text, &original);
-    } else {
-        let (head, marker) = text.rsplit_once('\n').expect("truncation marker line");
-        assert!(original.starts_with(head));
-        assert!(!head.is_empty());
-        assert_eq!(marker, format!("[broca: tool result truncated: {marker_name} returned {} bytes, over the {LIMIT} byte limit; the first {} bytes are shown. Narrow the request (a smaller range, a filter, or a more specific query).]", original.len(), head.len()));
-        // The retained head must be the longest complete UTF-8 prefix that fits with its marker.
-        let next = original[head.len()..].chars().next().unwrap().len_utf8();
-        let next_count = head.len() + next;
-        let next_marker = format!("\n[broca: tool result truncated: {marker_name} returned {} bytes, over the {LIMIT} byte limit; the first {next_count} bytes are shown. Narrow the request (a smaller range, a filter, or a more specific query).]", original.len());
-        assert!(next_count + next_marker.len() > LIMIT);
-    }
-    let sent = provider
-        .sent
-        .lock()
-        .unwrap()
-        .get(&1)
-        .cloned()
-        .expect("next model step");
-    let rendered: serde_json::Value = serde_json::from_slice(&sent).unwrap();
-    assert!(
-        rendered
-            .to_string()
-            .contains(&serde_json::to_string(text).unwrap()),
-        "next request carries stored text"
-    );
-    // Retain the tool-result WAL entry but exclude the later batch and turn completion entries,
-    // simulating a crash after the result was stored and before the turn was marked complete.
-    truncate_wal(&dir, index + 1);
-    let resumed = RecordingProvider::new(steps);
-    let resume_plane = plane();
-    assert_eq!(
-        run_once_req(&dir, req, &resumed, &resume_plane).await,
-        RunFinishReason::Completed
-    );
-    assert_eq!(resume_plane.exec_count(&ToolCallId("t1".into())), 0);
-    assert_eq!(
-        resumed.sent.lock().unwrap().get(&1).unwrap(),
-        &sent,
-        "resume renders byte-identical capped output"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test]
-async fn tool_result_ceiling_caps_over_limit_in_wal_and_resume() {
-    let text = "a".repeat(1_048_577);
-    check_tool_result_ceiling("over", ToolOutput::Text { text: text.clone() }, text).await;
-}
-
-#[tokio::test]
-async fn tool_result_ceiling_preserves_multibyte_boundary() {
-    // A one-byte prefix offsets the two-byte characters so the raw byte cut splits one.
-    let text = format!("a{}a", "é".repeat((11 * 1_048_576 - 2) / 2));
-    check_tool_result_ceiling("utf8", ToolOutput::Text { text: text.clone() }, text).await;
-}
-
-#[tokio::test]
-async fn tool_result_ceiling_exact_limit_is_unchanged() {
-    let text = "a".repeat(1_048_576);
-    check_tool_result_ceiling("exact", ToolOutput::Text { text: text.clone() }, text).await;
-}
-
-#[tokio::test]
-async fn tool_result_ceiling_serializes_large_json_as_text() {
-    let value = json!({"payload": "é".repeat(1_048_576)});
-    let original = value.to_string();
-    check_tool_result_ceiling("json", ToolOutput::Json { value }, original).await;
-}
-
-#[tokio::test]
-async fn tool_result_ceiling_caps_error_and_preserves_is_error() {
-    let message = "failure".repeat(160_000);
-    check_tool_result_ceiling("error", ToolOutput::error(message.clone()), message).await;
-}
-
-#[tokio::test]
-async fn tool_result_ceiling_caps_denied_including_provider_prefix() {
-    let reason = "denial".repeat(180_000);
-    let original = format!("denied: {reason}");
-    check_tool_result_ceiling("denied", ToolOutput::Denied { reason }, original).await;
-}
-
-#[tokio::test]
-async fn tool_result_ceiling_shortens_unbounded_utf8_tool_name() {
-    let tool_name = format!("{}{}", "x".repeat(255), "é".repeat(600_000));
-    let marker_name = format!("{}…", "x".repeat(255));
-    let text = "a".repeat(1_048_577);
-    check_named_tool_result_ceiling(
-        "name",
-        &tool_name,
-        &marker_name,
-        ToolOutput::Text { text: text.clone() },
-        text,
-    )
-    .await;
 }

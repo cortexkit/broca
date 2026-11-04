@@ -889,12 +889,14 @@ impl Fixture {
         ServeHandler::read(
             &self.registry,
             SessionReadRequest {
+                history_version: None,
                 late_after: None,
                 session: self.key.clone(),
                 from_ordinal: Some(0),
                 limit: Some(100),
                 include_tools: false,
                 include_rich_ui: false,
+                include_display_facts: false,
                 after_mid: None,
                 lineage_id: None,
                 max_bytes: None,
@@ -934,6 +936,8 @@ impl Fixture {
         });
         let records = [
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -959,6 +963,7 @@ impl Fixture {
             },
             WalRecord::StepStarted { step_id: StepId(1) },
             WalRecord::ModelAttemptFinished {
+                account_limit_disposition: None,
                 attempt_id: None,
                 reservation: None,
                 envelope: None,
@@ -985,6 +990,7 @@ impl Fixture {
                 served_account_ref: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,

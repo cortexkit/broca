@@ -19,6 +19,7 @@
 #[cfg(all(feature = "test-clock", not(debug_assertions)))]
 compile_error!("broca-subc's test-clock feature must not be enabled in a release build");
 
+pub mod carrier_scope;
 pub mod compaction_plane;
 pub mod connection;
 pub mod consent;
@@ -30,12 +31,14 @@ pub mod late_results;
 pub mod plan_fetch;
 pub mod private_content;
 mod role_route;
+mod role_route_diagnostics;
 mod route_close;
 pub mod scope_describe;
 pub mod session_door;
 pub mod subc_plane;
 pub mod tcp_connect;
 pub mod tool_deadline;
+pub mod tool_result_diagnostics;
 pub mod vault;
 
 pub use compaction_plane::SubcCompactionPlane;
@@ -57,6 +60,7 @@ pub use late_results::{late_entry_tool_result, LateResultsError, LateResultsFeed
 pub use plan_fetch::{SubcPlanAdmitter, SubcPlanFetcher};
 pub use private_content::{ImageResolveError, ResolvedImage};
 pub use private_content::{PrivateContent, PrivateContentClient, PrivateContentError, SourceKind};
+pub use role_route_diagnostics::scoped_role_route_refusals;
 pub use scope_describe::{DescribedScope, ModuleScopeDescriber, ScopeDescriber};
 pub use session_door::{DoorCoverage, DoorRead, SessionDoorClient, SessionDoorError};
 pub use subc_plane::SubcToolPlane;

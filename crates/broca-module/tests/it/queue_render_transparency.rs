@@ -43,6 +43,7 @@ use tokio::sync::{mpsc, Notify};
 
 fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -59,6 +60,7 @@ fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("anthropic", "claude-opus-4-8"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -88,8 +90,8 @@ fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
             role: Some(CacheRole::Ephemeral),
             ttl: Some("5m".into()),
             key: Some("alfonso-classify-v1".into()),
-            // Populated so the round-trip below actually carries the tail declaration; this
-            // fixture is never admitted, so the tools beside it are not a conflict here.
+            // Populate the optional tail member so the round-trip covers it. This is a
+            // serialization fixture, not a run submitted for admission.
             tail: Some(CacheTail::Volatile),
             mode: None,
         }),
@@ -352,6 +354,7 @@ impl LineageOpener for RecOpener {
 
 fn text(run: &str, msg: &str, session: &BindIdentity) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -368,6 +371,7 @@ fn text(run: &str, msg: &str, session: &BindIdentity) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("anthropic", "claude-opus-4-8"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -652,6 +656,9 @@ async fn drained_run_renders_identical_bytes_to_idle_send() {
 
 fn recovered_stop_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -696,6 +703,8 @@ async fn crash_recovery_preserves_stop_before_tool_dispatch() {
     wal.append(
         1,
         &broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,

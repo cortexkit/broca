@@ -12,6 +12,8 @@ use broca_wal::{wal_bytes_read, RunConfig, RunOrigin, WalRecord};
 
 fn run_started(session: &BindIdentity) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -31,6 +33,9 @@ fn run_started(session: &BindIdentity) -> WalRecord {
         run_id: RunId("anchor-run".into()),
         session: session.clone(),
         config: Box::new(RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -55,6 +60,7 @@ fn run_started(session: &BindIdentity) -> WalRecord {
             context_management: None,
         }),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -80,6 +86,7 @@ fn nonadvancing_projection_preserves_anchor_and_tail_read_cost() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

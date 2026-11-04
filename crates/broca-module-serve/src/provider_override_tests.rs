@@ -206,7 +206,8 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         broca_core::ChargeBasis::MeteredApi
     );
     install_test_catalog();
-    let mut req = broca_core::RunRequest { input_written_at_ms: None, directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
+    let mut req = broca_core::RunRequest { route_decision_id: None,
+    input_written_at_ms: None, directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
         scope: None,
         project_id: None,
         principal: None,
@@ -230,7 +231,8 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
         stop_when: vec![],
         submission_id: None,
         context_management: None,
-        inherit_frozen_cache: false, structured_output: None, };
+        inherit_frozen_cache: false, structured_output: None,
+    };
     assert!(executor
         .cache_policy_for_episode(true, None, &req, None)
         .unwrap()
@@ -414,7 +416,8 @@ fn resolve_drift_revision(
 }
 
 fn drift_request(root: &std::path::Path) -> broca_core::RunRequest {
-    broca_core::RunRequest { input_written_at_ms: None, directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
+    broca_core::RunRequest { route_decision_id: None,
+    input_written_at_ms: None, directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None,
         scope: None,
         project_id: None,
         principal: None,
@@ -438,7 +441,8 @@ fn drift_request(root: &std::path::Path) -> broca_core::RunRequest {
         stop_when: vec![],
         submission_id: None,
         context_management: None,
-        inherit_frozen_cache: false, structured_output: None, }
+        inherit_frozen_cache: false, structured_output: None,
+    }
 }
 
 /// The RunConfig a run started with `started` would have written into RunStarted.
@@ -446,7 +450,7 @@ fn drift_run_config(
     req: &broca_core::RunRequest,
     started: &broca_catalog::live::ProviderResolution,
 ) -> broca_wal::RunConfig {
-    broca_wal::RunConfig { turn_directives_v1: None, render_tags: false, computed_tags: None,
+    broca_wal::RunConfig { global_system: None, route_decision_id: None, account_limit_pause: false, turn_directives_v1: None, render_tags: false, computed_tags: None,
         model: req.model.clone(),
         tools: req.tools.clone().into(),
         tool_choice: req.tool_choice.clone(),
@@ -465,7 +469,8 @@ fn drift_run_config(
         variant: None,
         service_tier: None,
         stop_when: vec![],
-        context_management: None, }
+        context_management: None,
+    }
 }
 
 // Keep production rendering/config identity; replace only network IO. A masked drift
@@ -543,7 +548,7 @@ async fn resume_through_core(
     let mut wal = wal_store.open(&req.session).unwrap();
     wal.append(
         1,
-        &broca_wal::WalRecord::RunStarted { written_at_ms: None, tags: None, session_class: None, retention: None,
+        &broca_wal::WalRecord::RunStarted { compaction_plan_version: None, sent_by: None, written_at_ms: None, tags: None, session_class: None, retention: None,
         hooks: None,
          title: None,
          on_restart: None,
@@ -1111,6 +1116,17 @@ fn deepseek_episode_admitted_before_the_reasoning_echo_resumes_with_its_bytes() 
 /// An executor whose tool plane is a stand-in subc connection that authenticates and then idles:
 /// enough for admission-side methods, with no daemon, vault or provider.
 async fn stand_in_executor(root: &std::path::Path) -> (LiveLoopExecutor, tokio::task::JoinHandle<()>) {
+    let (plane, server) = stand_in_plane(root).await;
+    let executor = LiveLoopExecutor::new(
+        Arc::new(FileWalStore::new(root.join("wal"))),
+        Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap()),
+        plane,
+        None,
+    );
+    (executor, server)
+}
+
+async fn stand_in_plane(root: &std::path::Path) -> (Arc<SubcToolPlane>, tokio::task::JoinHandle<()>) {
     use subc_transport::connection_file::{ConnectionInfo, Endpoint, SCHEMA_VERSION};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1148,13 +1164,7 @@ async fn stand_in_executor(root: &std::path::Path) -> (LiveLoopExecutor, tokio::
     let connection = broca_subc::SubcConnection::connect(&connection_file)
         .await
         .unwrap();
-    let executor = LiveLoopExecutor::new(
-        Arc::new(FileWalStore::new(root.join("wal"))),
-        Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap()),
-        Arc::new(SubcToolPlane::new(connection, "unused")),
-        None,
-    );
-    (executor, server)
+    (Arc::new(SubcToolPlane::new(connection, "unused")), server)
 }
 
 /// A `RunStarted` record for `session` whose input is one user message of `text`.

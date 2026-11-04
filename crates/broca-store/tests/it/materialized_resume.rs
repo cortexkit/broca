@@ -113,6 +113,7 @@ fn queued_title(request: &RunRequest, index: usize, bytes: usize) -> [WalRecord;
     let submission_id = broca_protocol::SubmissionId(format!("noise-{index}"));
     [
         WalRecord::Queued {
+            sent_by: None,
             written_at_ms: None,
             retention: None,
             ts_ms: None,
@@ -136,6 +137,7 @@ fn queued_title(request: &RunRequest, index: usize, bytes: usize) -> [WalRecord;
 
 #[tokio::test]
 async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
+    let unrecorded_before = broca_core::refusal_fallback::refusal_schedule_unrecorded_replays();
     use broca_core::{
         load_prior_wal_snapshot, run_loop_on_writer_admitted_with_prior_snapshot, RunControl,
         StartMode, WalHandle,
@@ -188,6 +190,14 @@ async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
             .read_records_range(&req.session, 0, None, None)
             .unwrap();
         Persister::project_range(materialized.as_ref(), &req.session, &prefix).unwrap();
+        assert_eq!(
+            materialized
+                .read_prefix_with_watermark(&req.session)
+                .unwrap()
+                .refusal,
+            Some(Default::default()),
+            "a session with no schedule records an empty seed, not unknown metadata"
+        );
         for record in queued_title(&req, history_len, 10) {
             wal.append(1, &record, false).unwrap();
         }
@@ -219,6 +229,8 @@ async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
         assert_eq!(suffix_decodes, 2);
 
         let complete = broca_core::PriorWalSnapshot {
+            lineage_id: None,
+            anchor: None,
             base_watermark: 0,
             head_seq: head,
             tail: Arc::new(frames.clone()),
@@ -322,6 +334,106 @@ async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
         measurements[0], measurements[1],
         "resume work must not grow with session history"
     );
+    assert_eq!(
+        broca_core::refusal_fallback::refusal_schedule_unrecorded_replays(),
+        unrecorded_before,
+        "recorded empty schedules must never request a full-replay fallback"
+    );
+}
+
+#[tokio::test]
+async fn refusal_materialized_unrecorded_prior_replays_once_and_repairs() {
+    use broca_core::provider::StubProvider;
+    use broca_core::refusal_fallback::{refusal_schedule_unrecorded_replays, StepRoute};
+    let dir = broca_test_support::scratch_root()
+        .join(format!("refusal-unrecorded-{}", std::process::id()));
+    let mut req = request(&dir);
+    let fallback = ModelHandle::new("stub", "fallback");
+    let mut refusal = text_turn("refused", "discarded");
+    if let NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) =
+        refusal.last_mut().unwrap()
+    {
+        *finish_reason = FinishReason::ContentFilter;
+    }
+    let seed_provider = StubProvider::new(vec![refusal, text_turn("fallback", "answer")])
+        .with_refusal_fallback(fallback.clone(), Some(1_000_000));
+    let wal = FileWalStore::new(dir.join("wal"));
+    let (tx, mut rx) = mpsc::channel(512);
+    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    run_loop(
+        req.clone(),
+        &seed_provider,
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(dir.join("leases")),
+        &AllowAll,
+        &wal,
+        &tx,
+    )
+    .await
+    .unwrap();
+    let store = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
+    let range = wal.read_records_range(&req.session, 0, None, None).unwrap();
+    store.project_range(&req.session, &range).unwrap();
+    let frames = wal.read_records(&req.session).unwrap();
+    let mut second = frames
+        .iter()
+        .find_map(|frame| match &frame.record {
+            WalRecord::RunStarted { .. } => Some(frame.record.clone()),
+            _ => None,
+        })
+        .unwrap();
+    req.run_id = RunId("second".into());
+    if let WalRecord::RunStarted { run_id, input, .. } = &mut second {
+        *run_id = req.run_id.clone();
+        *input = req.input.clone().into();
+    }
+    let mut writer = wal.open(&req.session).unwrap();
+    writer.append(1, &second, true).unwrap();
+    drop(writer);
+    let conn = rusqlite::Connection::open(dir.join("store.db")).unwrap();
+    conn.execute("UPDATE meta SET refusal_replay_json=NULL", [])
+        .unwrap();
+    drop(conn);
+    assert!(store
+        .read_prefix_with_watermark(&req.session)
+        .unwrap()
+        .refusal
+        .is_none());
+    let before = refusal_schedule_unrecorded_replays();
+    let provider = StubProvider::new(vec![text_turn("resumed", "answer")])
+        .with_refusal_fallback(fallback, Some(1_000_000));
+    req.input.clear();
+    run_loop_with_store(
+        req.clone(),
+        &provider,
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(dir.join("leases")),
+        &AllowAll,
+        &wal,
+        Some(store.clone()),
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(provider.routes(), vec![StepRoute::Fallback]);
+    assert_eq!(refusal_schedule_unrecorded_replays(), before + 1);
+    // The next projection replaces unknown metadata with a complete, recorded seed.
+    let range = wal.read_records_range(&req.session, 0, None, None).unwrap();
+    store.project_range(&req.session, &range).unwrap();
+    let prefix = store.read_prefix_with_watermark(&req.session).unwrap();
+    let all = wal.read_records(&req.session).unwrap();
+    let at_watermark = broca_core::replay(
+        &all.iter()
+            .filter(|f| f.seq <= prefix.watermark_seq)
+            .map(|f| f.record.clone())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let recorded = prefix.refusal.unwrap();
+    assert_eq!(recorded.schedule, at_watermark.refusal_fallback);
+    assert_eq!(recorded.refused_steps, at_watermark.refused_steps);
+    drop(tx);
+    collector.await.unwrap();
 }
 
 #[derive(Clone)]
@@ -440,6 +552,7 @@ fn scripts() -> Vec<Vec<NormalizedEvent>> {
 
 fn request(dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -456,6 +569,7 @@ fn request(dir: &std::path::Path) -> RunRequest {
         session: BindIdentity::new(dir, "m10", "s1"),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -728,6 +842,13 @@ impl MaterializedStore for LaggingStore {
 }
 
 impl Persister for LaggingStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        self.inner.repair_sender_policy(session, range)
+    }
     fn projection_seed(
         &self,
         session: &BindIdentity,
@@ -858,6 +979,13 @@ impl MaterializedStore for CountingStore {
 }
 
 impl Persister for CountingStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        self.inner.repair_sender_policy(session, range)
+    }
     fn projection_seed(
         &self,
         session: &BindIdentity,
@@ -2283,6 +2411,7 @@ impl broca_core::compaction::CompactionPlane for HeldViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, broca_core::compaction::CompactionUnavailable> {
         if let Some(lineage) = &request.lineage_id {
@@ -2301,6 +2430,7 @@ impl broca_core::compaction::CompactionPlane for HeldViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, broca_core::compaction::CompactionUnavailable> {
         Ok(ViewGetAnswer::view(
@@ -2483,617 +2613,6 @@ async fn run_held_episodes(
         drop(tx);
         collector.await.unwrap();
     }
-}
-
-/// Counts what a resume reads from the store, forwarding everything to SQLite.
-#[derive(Default)]
-struct StoreReads {
-    held_reads: AtomicUsize,
-    held_rows: AtomicUsize,
-    page_rows: AtomicUsize,
-    whole_prefix_reads: AtomicUsize,
-}
-
-struct CountedStore {
-    inner: Arc<SqliteStore>,
-    reads: Arc<StoreReads>,
-}
-
-impl MaterializedStore for CountedStore {
-    fn read_retained_head(
-        &self,
-        session: &BindIdentity,
-        lineage_id: &str,
-    ) -> Result<Option<broca_core::head::RetainedHeadCheckpoint>, String> {
-        MaterializedStore::read_retained_head(self.inner.as_ref(), session, lineage_id)
-    }
-    fn checkpoint_retained_head(
-        &self,
-        session: &BindIdentity,
-        checkpoint: &broca_core::head::RetainedHeadCheckpoint,
-    ) -> Result<(), String> {
-        MaterializedStore::checkpoint_retained_head(self.inner.as_ref(), session, checkpoint)
-    }
-    fn tag_location(
-        &self,
-        session: &BindIdentity,
-        tag: u64,
-    ) -> Result<Option<broca_core::TagLocation>, String> {
-        MaterializedStore::tag_location(self.inner.as_ref(), session, tag)
-    }
-    fn materialized_message_count(&self, session: &BindIdentity) -> Result<Option<u64>, String> {
-        MaterializedStore::materialized_message_count(self.inner.as_ref(), session)
-    }
-    fn read_page_with_attribution(
-        &self,
-        session: &BindIdentity,
-        from: Option<u64>,
-        limit: u64,
-        view: broca_core::ReadView,
-    ) -> Result<StorePageSnapshot, broca_core::StorePageReadError> {
-        let page = MaterializedStore::read_page_with_attribution(
-            self.inner.as_ref(),
-            session,
-            from,
-            limit,
-            view,
-        )?;
-        self.reads
-            .page_rows
-            .fetch_add(page.rows.len(), Ordering::SeqCst);
-        Ok(page)
-    }
-    fn read_page_with_watermark(
-        &self,
-        session: &BindIdentity,
-        from: Option<u64>,
-        limit: u64,
-        view: broca_core::ReadView,
-    ) -> Result<StorePageSnapshot, String> {
-        let page = MaterializedStore::read_page_with_watermark(
-            self.inner.as_ref(),
-            session,
-            from,
-            limit,
-            view,
-        )?;
-        self.reads
-            .page_rows
-            .fetch_add(page.rows.len(), Ordering::SeqCst);
-        Ok(page)
-    }
-    fn read_prefix_with_watermark(
-        &self,
-        session: &BindIdentity,
-    ) -> Result<broca_core::StorePrefix, String> {
-        self.reads.whole_prefix_reads.fetch_add(1, Ordering::SeqCst);
-        MaterializedStore::read_prefix_with_watermark(self.inner.as_ref(), session)
-    }
-    fn read_held_prefix(
-        &self,
-        session: &BindIdentity,
-        held: &broca_core::HeldRowsRequest,
-    ) -> Result<Option<broca_core::HeldPrefix>, String> {
-        let prefix = MaterializedStore::read_held_prefix(self.inner.as_ref(), session, held)?;
-        if let Some(prefix) = &prefix {
-            self.reads.held_reads.fetch_add(1, Ordering::SeqCst);
-            self.reads
-                .held_rows
-                .fetch_add(prefix.rows.len(), Ordering::SeqCst);
-        }
-        Ok(prefix)
-    }
-    fn read_episode_projection(
-        &self,
-        session: &BindIdentity,
-    ) -> Result<Option<Vec<broca_core::context::EpisodeRenderProjection>>, String> {
-        MaterializedStore::read_episode_projection(self.inner.as_ref(), session)
-    }
-    fn read_admission_snapshot(
-        &self,
-        session: &BindIdentity,
-    ) -> Result<Option<broca_core::AdmissionStoreSnapshot>, String> {
-        MaterializedStore::read_admission_snapshot(self.inner.as_ref(), session)
-    }
-    fn reproject_if_lineage_mismatch(
-        &self,
-        session: &BindIdentity,
-        stale_lineage_id: Option<&str>,
-        complete_wal: &broca_wal::WalRangeRead,
-    ) -> Result<(), String> {
-        MaterializedStore::reproject_if_lineage_mismatch(
-            self.inner.as_ref(),
-            session,
-            stale_lineage_id,
-            complete_wal,
-        )
-    }
-}
-
-impl Persister for CountedStore {
-    fn projection_seed(
-        &self,
-        session: &BindIdentity,
-    ) -> Result<Option<broca_core::ProjectionSeed>, String> {
-        Persister::projection_seed(self.inner.as_ref(), session)
-    }
-    fn project(
-        &self,
-        session: &BindIdentity,
-        records: &[broca_wal::FramedRecord],
-    ) -> Result<u64, String> {
-        Persister::project(self.inner.as_ref(), session, records)
-    }
-    fn project_retention_metadata(
-        &self,
-        session: &BindIdentity,
-        metadata: &broca_core::projection_plan::RetainedWithdrawalProjection,
-    ) -> Result<(), String> {
-        Persister::project_retention_metadata(self.inner.as_ref(), session, metadata)
-    }
-    fn project_range(
-        &self,
-        session: &BindIdentity,
-        range: &broca_wal::WalRangeRead,
-    ) -> Result<u64, String> {
-        Persister::project_range(self.inner.as_ref(), session, range)
-    }
-    fn persist_wal_anchor(
-        &self,
-        session: &BindIdentity,
-        anchor: Option<&broca_wal::WalByteAnchor>,
-    ) -> Result<(), String> {
-        Persister::persist_wal_anchor(self.inner.as_ref(), session, anchor)
-    }
-}
-
-/// Where two requests first differ, with some context from each.
-fn first_difference(actual: &[u8], expected: &[u8]) -> String {
-    let at = actual
-        .iter()
-        .zip(expected)
-        .position(|(a, b)| a != b)
-        .unwrap_or(actual.len().min(expected.len()));
-    let window = |bytes: &[u8]| {
-        String::from_utf8_lossy(&bytes[at.saturating_sub(200)..(at + 300).min(bytes.len())])
-            .into_owned()
-    };
-    format!(
-        "at byte {at}:\n  resumed: {}\n  clean:   {}",
-        window(actual),
-        window(expected)
-    )
-}
-
-/// Project the durable records of the session in `dir` into `store`, with the WAL's identity.
-fn project_durable(dir: &std::path::Path, store: &SqliteStore) {
-    let session = request(dir).session;
-    let range = FileWalStore::new(dir.join("wal"))
-        .read_records_range(&session, 0, None, None)
-        .unwrap();
-    Persister::project_range(store, &session, &range).expect("project the durable records");
-}
-
-/// The episode a WAL cut is in and whether it already ended: the run that resumes it, or the
-/// first one still to run.
-fn resume_from(frames: &[broca_wal::FramedRecord], episodes: &[HeldEpisodeSpec]) -> usize {
-    let records: Vec<WalRecord> = frames.iter().map(|frame| frame.record.clone()).collect();
-    let state = replay(&records).unwrap();
-    state.run_id.map_or(0, |run| {
-        episodes
-            .iter()
-            .position(|episode| episode.run_id == run.0)
-            .unwrap()
-    })
-}
-
-/// A crash at every durable record of a session with applied views, resumed from the store
-/// projected at that cut: every request the resumed session sends is byte-identical to the
-/// uninterrupted run's, whether the store holds the cut or the WAL tail does. Covered: a keep
-/// range at ordinal 0 plus the suffix; repetition guidance of an episode that straddles the
-/// first view's cut, firing after it; ChatGPT effort updates (a changed effort per episode);
-/// a budget nudge firing after the cut; a newer view recorded past the store watermark; a cut
-/// whose coverage end is at or past the store prefix; and an active episode the newest view
-/// holds nothing of, which then repeats its read again.
-#[tokio::test]
-async fn held_view_resume_is_byte_identical_at_every_crash_cut() {
-    let base =
-        broca_test_support::scratch_root().join(format!("broca-held-cut-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    let episodes = held_episodes(0, true);
-
-    let ref_dir = base.join("ref");
-    std::fs::create_dir_all(&ref_dir).unwrap();
-    let ref_sent = HeldSent::default();
-    // The reference holds the whole transcript at every admission: no store, so every episode
-    // starts from a full WAL replay.
-    run_held_episodes(&ref_dir, &episodes, None, &ref_sent).await;
-    let ref_sent = ref_sent.lock().unwrap().clone();
-    let frames = wal_frames(&ref_dir);
-    let records: Vec<WalRecord> = frames.iter().map(|frame| frame.record.clone()).collect();
-    let applied: Vec<u64> = records
-        .iter()
-        .filter_map(|record| match record {
-            WalRecord::CompactionViewApplied {
-                view_version,
-                choice: broca_wal::CompactionViewChoice::Applied,
-                ..
-            } => Some(*view_version),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(applied, vec![2, 3], "both views applied in the clean run");
-    assert!(
-        records
-            .iter()
-            .any(|record| matches!(record, WalRecord::BudgetFired { .. })),
-        "the budget nudge fired"
-    );
-    let clean = replay(&records).unwrap();
-    assert!(
-        clean
-            .prompt
-            .iter()
-            .flat_map(|message| &message.content)
-            .filter(|block| matches!(block, ContentBlock::ToolResult(_)))
-            .count()
-            >= 7,
-        "every read returned"
-    );
-
-    let mut held_resumes = 0;
-    let mut views_past_watermark = 0;
-    let mut coverage_past_prefix_cuts = 0;
-    for keep in 1..frames.len() {
-        let dir = base.join(format!("cut-{keep}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        write_wal_frames(&dir, &frames[..keep]);
-        let sqlite = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
-        project_durable(&dir, &sqlite);
-        let watermark = sqlite
-            .read_admission_snapshot(&request(&dir).session)
-            .unwrap()
-            .map_or(0, |admission| admission.watermark_seq);
-        let prefix_len = sqlite
-            .materialized_message_count(&request(&dir).session)
-            .unwrap()
-            .unwrap_or(0);
-        let cut_state = replay(
-            &frames[..keep]
-                .iter()
-                .map(|frame| frame.record.clone())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let view_past_watermark = frames[..keep].iter().any(|frame| {
-            frame.seq > watermark && matches!(frame.record, WalRecord::CompactionViewApplied { .. })
-        });
-        let coverage_past_prefix = cut_state
-            .compaction
-            .state()
-            .and_then(|state| state.view.as_ref())
-            .is_some_and(|applied| applied.view.covers_through.ordinal + 1 >= prefix_len);
-        let reads = Arc::new(StoreReads::default());
-        let store = Arc::new(CountedStore {
-            inner: sqlite,
-            reads: reads.clone(),
-        });
-        let sent = HeldSent::default();
-        let from = resume_from(&frames[..keep], &episodes);
-        // A cut that leaves a tool call's outcome unknown seals its episode Interrupted, and
-        // the history every later episode renders then differs from the clean run's.
-        let cut_records: Vec<WalRecord> = frames[..keep]
-            .iter()
-            .map(|frame| frame.record.clone())
-            .collect();
-        let sealed = matches!(
-            replay(&cut_records).unwrap().resolution,
-            ReplayResolution::Interrupted { .. }
-        );
-        let to = if sealed { from + 1 } else { episodes.len() };
-        run_held_episodes(&dir, &episodes[from..to], Some(store), &sent).await;
-        let held = reads.held_reads.load(Ordering::SeqCst);
-        held_resumes += held;
-        if held > 0 && prefix_len > 0 {
-            views_past_watermark += usize::from(view_past_watermark);
-            coverage_past_prefix_cuts += usize::from(coverage_past_prefix);
-        }
-        for (step, bytes) in sent.lock().unwrap().iter() {
-            let expected = ref_sent.get(step).expect("the clean run sent this request");
-            assert!(
-                bytes == expected,
-                "cut@{keep}/{}: resumed request {step:?} differs from the clean run:\n{}",
-                frames.len(),
-                first_difference(bytes, expected)
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    assert!(
-        held_resumes > 10,
-        "only {held_resumes} resumes read the held set"
-    );
-    assert!(
-        views_past_watermark > 0 && coverage_past_prefix_cuts > 0,
-        "held resumes with a view past the watermark: {views_past_watermark}, \
-         with coverage at or past the prefix: {coverage_past_prefix_cuts}"
-    );
-    let _ = std::fs::remove_dir_all(&base);
-}
-
-/// What one held resume read before its first request.
-#[derive(Debug, PartialEq)]
-struct HeldResumeReads {
-    /// Store rows the held read returned.
-    held_rows: usize,
-    /// Store rows the repetition-guidance fold paged through.
-    page_rows: usize,
-    /// Store rows the resume would read under the held-set rule: the held rows below the
-    /// prefix (plus its last row), and the guidance episodes' model-step rows below it.
-    expected_rows: (usize, usize),
-    whole_prefix_reads: usize,
-    /// WAL sequences decoded, relative to the store watermark.
-    decoded: Vec<u64>,
-    /// How many records the WAL holds past the watermark.
-    tail: u64,
-}
-
-/// Resume the third episode of the held-view session (with `padding` discarded exchanges) at
-/// its last model step, from a store projected up to there, and report what it read.
-async fn held_resume_reads(padding: usize, effort_updates: bool, gap: bool) -> HeldResumeReads {
-    use broca_core::{
-        load_prior_wal_snapshot, run_loop_on_writer_admitted_with_prior_snapshot, StartMode,
-        WalHandle,
-    };
-    let base = broca_test_support::scratch_root().join(format!(
-        "broca-held-reads-{}-{padding}-{effort_updates}-{gap}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&base);
-    let episodes = held_episodes(padding, effort_updates);
-    let clean_dir = base.join("clean");
-    std::fs::create_dir_all(&clean_dir).unwrap();
-    let clean_sent = HeldSent::default();
-    run_held_episodes(
-        &clean_dir,
-        &episodes,
-        Some(Arc::new(
-            SqliteStore::open(clean_dir.join("store.db")).unwrap(),
-        )),
-        &clean_sent,
-    )
-    .await;
-    let frames = wal_frames(&clean_dir);
-    let cut = frames
-        .iter()
-        .rposition(|frame| matches!(frame.record, WalRecord::StepStarted { .. }))
-        .unwrap();
-    let clean_records: Vec<WalRecord> = frames.iter().map(|f| f.record.clone()).collect();
-    let clean = replay(&clean_records).unwrap();
-
-    let dir = base.join("resume");
-    std::fs::create_dir_all(&dir).unwrap();
-    let session = request(&dir).session;
-    write_wal_frames(&dir, &frames[..cut]);
-    let sqlite = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
-    project_durable(&dir, &sqlite);
-    let prefix_len = sqlite
-        .materialized_message_count(&session)
-        .unwrap()
-        .unwrap();
-    let watermark = sqlite
-        .read_admission_snapshot(&session)
-        .unwrap()
-        .unwrap()
-        .watermark_seq;
-    assert!(watermark > 0 && prefix_len > 0, "the store holds a prefix");
-    if gap {
-        // Lose a held row (the second episode's first message, which the newest view keeps).
-        let second = clean.render_episodes.as_ref().unwrap()[1].prompt_start as i64;
-        let session_key = format!(
-            "{}\u{1f}{}\u{1f}{}",
-            session.project_root.display(),
-            session.harness,
-            session.session
-        );
-        let deleted = rusqlite::Connection::open(dir.join("store.db"))
-            .unwrap()
-            .execute(
-                "DELETE FROM message WHERE session=?1 AND ord=?2",
-                rusqlite::params![session_key, second],
-            )
-            .unwrap();
-        assert_eq!(deleted, 1);
-    }
-
-    // The rows the held-set rule names, from the uninterrupted run's own replay.
-    let view = clean
-        .compaction
-        .state()
-        .and_then(|state| state.view.clone())
-        .expect("an applied view")
-        .view;
-    let holds = |ordinal: u64| {
-        ordinal > view.covers_through.ordinal
-            || view.ranges.iter().any(|range| {
-                matches!(range, ViewRange::Keep { from, to, .. } if *from <= ordinal && ordinal < *to)
-            })
-            || clean.prompt[ordinal as usize].role == Role::System
-    };
-    let held_rows = (0..prefix_len).filter(|ordinal| holds(*ordinal)).count()
-        + usize::from(!holds(prefix_len - 1));
-    let starts: Vec<u64> = clean
-        .render_episodes
-        .as_ref()
-        .unwrap()
-        .iter()
-        .map(|episode| episode.prompt_start as u64)
-        .collect();
-    let step_rows = clean
-        .episode_step_spans
-        .as_ref()
-        .unwrap()
-        .iter()
-        .filter(|span| {
-            // A guidance episode: the newest one, or one holding a message.
-            let episode = starts.partition_point(|start| *start <= span.start as u64) - 1;
-            let end = starts.get(episode + 1).copied().unwrap_or(u64::MAX);
-            episode + 1 == starts.len() || (starts[episode]..end).any(holds)
-        })
-        .map(|span| (span.start as u64..(span.end as u64).min(prefix_len)).count())
-        .sum::<usize>();
-
-    let encoded = frames[..cut]
-        .iter()
-        .map(|frame| serde_json::to_vec(&(frame.fence, &frame.record)).unwrap())
-        .collect();
-    let inner = FileWalStore::new(dir.join("wal"));
-    let lineage_id = inner
-        .read_records_range(&session, 0, None, None)
-        .unwrap()
-        .lineage_id;
-    let wal = Arc::new(DecodingWalStore {
-        inner,
-        lineage_id,
-        encoded,
-        decoded: AtomicUsize::new(0),
-        decoded_sequences: Mutex::new(Vec::new()),
-    });
-    let head = frames[cut - 1].seq;
-    let snapshot =
-        load_prior_wal_snapshot(wal.as_ref(), &session, head, Some(sqlite.as_ref())).unwrap();
-    assert_eq!(snapshot.base_watermark, watermark);
-    let reads = Arc::new(StoreReads::default());
-    let store = Arc::new(CountedStore {
-        inner: sqlite,
-        reads: reads.clone(),
-    });
-    let at_first_request = Arc::new(Mutex::new(None));
-    let probe = {
-        let at_first_request = at_first_request.clone();
-        let reads = reads.clone();
-        let wal = wal.clone();
-        Arc::new(move || {
-            at_first_request.lock().unwrap().get_or_insert_with(|| {
-                (
-                    reads.held_rows.load(Ordering::SeqCst),
-                    reads.page_rows.load(Ordering::SeqCst),
-                    reads.whole_prefix_reads.load(Ordering::SeqCst),
-                    wal.decoded_sequences.lock().unwrap().clone(),
-                )
-            });
-        })
-    };
-    let third = &episodes[2];
-    let sent = HeldSent::default();
-    let model = HeldModel {
-        effort: third.effort,
-        effort_updates,
-        scripts: [(third.run_id.to_string(), third.steps.clone())]
-            .into_iter()
-            .collect(),
-        sent: sent.clone(),
-        probe: Some(probe),
-    };
-    let writer = WalHandle::spawn(wal.open(&session).unwrap(), 1).unwrap();
-    let (out, _events) = mpsc::channel(1000);
-    run_loop_on_writer_admitted_with_prior_snapshot(
-        held_request(&dir, third),
-        &writer,
-        StartMode::FreshOrResume,
-        &model,
-        &held_plane(),
-        &AllowAll,
-        wal.as_ref(),
-        Some(store as Arc<dyn broca_core::SessionStore>),
-        held_control(&dir),
-        &out,
-        None,
-        Some(&snapshot),
-    )
-    .await
-    .unwrap();
-    writer.shutdown().await.unwrap();
-    let clean_sent = clean_sent.lock().unwrap();
-    let resumed = sent.lock().unwrap();
-    assert!(!resumed.is_empty(), "the resume sent its request");
-    for (step, bytes) in resumed.iter() {
-        assert_eq!(
-            Some(bytes),
-            clean_sent.get(step),
-            "resumed request {step:?}"
-        );
-    }
-    // The resume record reports the whole transcript it reconstructed, not the held part.
-    let resumed_frames = wal_frames(&dir);
-    let replayed = resumed_frames[cut..]
-        .iter()
-        .find_map(|frame| match &frame.record {
-            WalRecord::ResumeStarted { replayed, .. } => Some(replayed.messages),
-            _ => None,
-        })
-        .expect("the resume recorded itself");
-    let at_cut: Vec<WalRecord> = frames[..cut].iter().map(|f| f.record.clone()).collect();
-    assert_eq!(replayed, replay(&at_cut).unwrap().prompt.len() as u64);
-    let (held, pages, whole_prefix_reads, decoded) =
-        at_first_request.lock().unwrap().take().unwrap();
-    let _ = std::fs::remove_dir_all(&base);
-    HeldResumeReads {
-        held_rows: held,
-        page_rows: pages,
-        expected_rows: (held_rows, step_rows),
-        whole_prefix_reads,
-        decoded: decoded
-            .into_iter()
-            .map(|seq| seq.saturating_sub(watermark))
-            .collect(),
-        tail: head - watermark,
-    }
-}
-
-/// A resume at a nonzero watermark under an applied view never replays the whole WAL, decodes
-/// exactly the records past the watermark, and reads from the store only the held rows and the
-/// guidance episodes' model-step rows: the same counts however long the discarded history is.
-/// Run on a ChatGPT effort-update session and on one without effort updates, both with
-/// repetition guidance in an earlier episode.
-#[tokio::test]
-async fn held_view_resume_reads_only_the_held_set_and_the_wal_tail() {
-    for effort_updates in [true, false] {
-        let short = held_resume_reads(8, effort_updates, false).await;
-        let long = held_resume_reads(400, effort_updates, false).await;
-        for reads in [&short, &long] {
-            assert_eq!(reads.whole_prefix_reads, 0, "{reads:?}");
-            assert_eq!(
-                (reads.held_rows, reads.page_rows),
-                reads.expected_rows,
-                "{reads:?}"
-            );
-            assert_eq!(
-                reads.decoded,
-                (1..=reads.tail).collect::<Vec<_>>(),
-                "decoded exactly the WAL records past the watermark, once: {reads:?}"
-            );
-        }
-        assert_eq!(
-            short, long,
-            "resume reads must not grow with discarded history"
-        );
-    }
-}
-
-/// A held row missing from the store is read from the WAL instead: the resume decodes the
-/// whole WAL, never renders a gap, and sends the clean run's bytes (asserted while resuming).
-#[tokio::test]
-async fn a_held_row_missing_from_the_store_is_read_from_the_wal() {
-    let reads = held_resume_reads(8, true, true).await;
-    assert_eq!(
-        reads.held_rows, 0,
-        "the store's held read failed: {reads:?}"
-    );
-    assert!(
-        reads.decoded.contains(&0),
-        "the resume decoded records the store had materialized: {reads:?}"
-    );
 }
 
 /// A store whose episode projection was never computed (written before it existed) reads as

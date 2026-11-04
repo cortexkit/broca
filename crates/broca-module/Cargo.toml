@@ -40,8 +40,11 @@ async-trait.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+broca-crash-harness = { path = "../broca-crash-harness" }
 tokio-tungstenite.workspace = true
 cortexkit-role-llm-runner = { workspace = true, features = ["test-vectors"] }
+# llm-runner 0.7.48's tags.json vectors pin recorded v1 tool-result numbering and rendering.
+cortexkit-role-llm-runner-v1 = { workspace = true, features = ["test-vectors"] }
 cortexkit-bus-trait.workspace = true
 broca-wal = { path = "../broca-wal", features = ["test-io-trace"] }
 broca-store = { path = "../broca-store", features = ["test-conformance"] }

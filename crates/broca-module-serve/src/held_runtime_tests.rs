@@ -73,6 +73,9 @@ impl WithdrawTransport for NoWithdraw {
 
 fn config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -101,6 +104,7 @@ fn config() -> broca_wal::RunConfig {
 fn records(bind: &BindIdentity) -> Vec<WalRecord> {
     vec![
         WalRecord::RunStarted {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -109,6 +113,7 @@ fn records(bind: &BindIdentity) -> Vec<WalRecord> {
             title: None,
             on_restart: None,
             keep_warm: None,
+            compaction_plan_version: None,
             marker_order_version: None,
             manifest: None,
             scope: None,
@@ -125,6 +130,7 @@ fn records(bind: &BindIdentity) -> Vec<WalRecord> {
             submission_id: None,
         },
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -279,6 +285,7 @@ async fn large_stale_outbox_does_not_delay_held_result_intake() {
         sequential: false,
     });
     log.push(WalRecord::RunPaused {
+        account_limit: None,
         run_id: RunId("run".into()),
         reason: broca_protocol::PauseReason::ToolHeld,
         error: None,

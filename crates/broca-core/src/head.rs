@@ -5,6 +5,64 @@ use broca_wal::WalRecord;
 use cortexkit_role_llm_runner::{read::HeadModel, usage::SessionUsage};
 use serde::{Deserialize, Serialize};
 
+/// A log uses mode-3 semantics exactly when its first RunStarted has a plan version.
+/// Later runs cannot change that choice. HeadProjection caches this predicate, with None
+/// meaning unknown rather than legacy.
+pub fn is_mode3_log<'a>(records: impl IntoIterator<Item = &'a WalRecord>) -> bool {
+    records
+        .into_iter()
+        .find_map(|record| match record {
+            WalRecord::RunStarted {
+                compaction_plan_version,
+                ..
+            } => Some(compaction_plan_version.is_some()),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// Learn an old cache's missing mode from bounded first-run records, without replaying its
+/// transcript or recomputing any materialized legacy message times.
+pub fn mode3_log_from_wal(
+    wal: &dyn crate::WalStore,
+    session: &broca_protocol::BindIdentity,
+) -> Result<bool, broca_wal::WalError> {
+    let mut after = 0_u64;
+    let mut anchor = None;
+    loop {
+        let through = after.saturating_add(64);
+        let range = wal.read_records_range(session, after, Some(through), anchor.as_ref())?;
+        let records = match range.records() {
+            broca_wal::WalRangeRecords::Complete(records)
+            | broca_wal::WalRangeRecords::Unknown(records) => records,
+            broca_wal::WalRangeRecords::Absent => return Ok(false),
+            broca_wal::WalRangeRecords::Partial(_) => {
+                return Err(broca_wal::WalError::Io(std::io::Error::other(
+                    "cannot establish the log's first run from incomplete history",
+                )))
+            }
+        };
+        if records
+            .iter()
+            .any(|record| matches!(record.record, WalRecord::RunStarted { .. }))
+        {
+            return Ok(is_mode3_log(records.iter().map(|record| &record.record)));
+        }
+        // No record past `after` means the log ends here without a run (a writer that opened
+        // and wrote only its lineage frame); keep reading and the loop would never end.
+        if range.complete_byte_end.is_some() || records.is_empty() || through == u64::MAX {
+            return Ok(false);
+        }
+        if records.last().is_some_and(|record| record.seq <= after) {
+            return Err(broca_wal::WalError::Io(std::io::Error::other(
+                "history reader did not advance while locating its first run",
+            )));
+        }
+        after = through;
+        anchor = range.next_anchor;
+    }
+}
+
 /// A content-free retained summary with a watermark separate from transcript projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetainedHeadCheckpoint {
@@ -15,6 +73,12 @@ pub struct RetainedHeadCheckpoint {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeadProjection {
+    /// Set once from the first RunStarted. None is unknown, never evidence of a legacy log;
+    /// callers must obtain the shared is_mode3_log predicate's answer before choosing semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode3: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode3_times: Option<crate::message_times::MessageTimeSeed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_rich_ui: Option<broca_protocol::RichUiStamp>,
     pub model: Option<HeadModel>,
@@ -24,11 +88,18 @@ pub struct HeadProjection {
     senders: Vec<cortexkit_role_llm_runner::delivery_order::PlanSender>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     queued_times: std::collections::BTreeMap<String, u64>,
+    /// Mode-3 placement and provenance continuation; native message bytes stay in rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_metadata: Option<crate::compaction_v2::metadata::Fold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_newest: Option<crate::compaction_v2::protocol::read::Cursor>,
 }
 
 impl Default for HeadProjection {
     fn default() -> Self {
         Self {
+            mode3: None,
+            mode3_times: None,
             last_run_rich_ui: None,
             model: None,
             usage: None,
@@ -36,11 +107,46 @@ impl Default for HeadProjection {
             ownership: crate::SessionOwnershipV1::default().for_owner_access(),
             senders: vec![],
             queued_times: Default::default(),
+            compaction_metadata: None,
+            compaction_newest: None,
         }
     }
 }
 
 impl HeadProjection {
+    /// Cached heads written before sender-policy folding ignored accepted refreshes.
+    pub fn sender_admission_current(&self, session_change_recorded: bool) -> bool {
+        !session_change_recorded
+            || self.ownership.sender_admission_complete() && self.ownership.session_change_recorded
+    }
+
+    fn set_senders(&mut self, manifest: &broca_wal::PlanManifest) {
+        self.senders = crate::admission::manifest_senders(manifest);
+        for sender in &mut self.senders {
+            sender.templates.clear();
+        }
+    }
+
+    pub(crate) fn restore_sender_admission(&mut self, ownership: &crate::SessionOwnershipV1) {
+        self.senders = ownership.effective_senders();
+        for sender in &mut self.senders {
+            sender.templates.clear();
+        }
+        self.restore_sender_marker(ownership);
+    }
+
+    pub(crate) fn restore_sender_marker(&mut self, ownership: &crate::SessionOwnershipV1) {
+        self.ownership.session_change_recorded = ownership.session_change_recorded;
+        self.ownership.sender_admission =
+            ownership
+                .sender_admission
+                .as_ref()
+                .map(|fold| crate::admission::SenderAdmissionV1 {
+                    version: fold.version,
+                    accepted_senders: fold.accepted_senders.as_ref().map(|_| Vec::new()),
+                });
+    }
+
     /// Restore display metadata from its bounded WAL sources, not from stored text.
     pub fn from_read_fold(
         fold: &HeadReadFold,
@@ -65,6 +171,7 @@ impl HeadProjection {
         head.model = fold.model.clone();
         head.run_id = fold.run_id.clone();
         head.usage = fold.usage.clone();
+        head.mode3 = head.mode3.or(fold.mode3);
         Some(head)
     }
 
@@ -83,24 +190,20 @@ impl HeadProjection {
                 submission_id,
                 ..
             } => {
+                if self.run_id.is_none() {
+                    self.mode3 = Some(crate::is_mode3_log(std::iter::once(record)));
+                }
                 if let Some(id) = submission_id {
                     self.queued_times.remove(&id.0);
                 }
-                if self.ownership.episodes == 0 {
-                    self.senders = manifest
-                        .as_ref()
-                        .and_then(|manifest| {
-                            serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
-                                .ok()
-                        })
-                        .and_then(|plan| {
-                            plan.as_object().and_then(|plan| {
-                                cortexkit_role_llm_runner::delivery_order::plan_senders(plan).ok()
-                            })
-                        })
-                        .unwrap_or_default();
-                    for sender in &mut self.senders {
-                        sender.templates.clear();
+                if !self
+                    .ownership
+                    .sender_admission
+                    .as_ref()
+                    .is_some_and(|fold| fold.accepted_senders.is_some())
+                {
+                    if let Some(manifest) = manifest {
+                        self.set_senders(manifest);
                     }
                 }
                 self.ownership
@@ -153,7 +256,34 @@ impl HeadProjection {
             | WalRecord::SendDelivered { submission_id, .. } => {
                 self.queued_times.remove(&submission_id.0);
             }
+            WalRecord::SessionRefreshAccepted { manifest, .. } => {
+                self.set_senders(manifest);
+                self.ownership.session_change_recorded = true;
+                // The head keeps template-free grants above; only presence is needed here.
+                self.ownership.sender_admission = Some(crate::admission::SenderAdmissionV1 {
+                    version: 1,
+                    accepted_senders: Some(Vec::new()),
+                });
+            }
+            WalRecord::SessionRefreshPolicyChanged { .. }
+            | WalRecord::SessionPrefixFlushed { .. } => {
+                self.ownership.session_change_recorded = true;
+                self.ownership.sender_admission.get_or_insert(
+                    crate::admission::SenderAdmissionV1 {
+                        version: 1,
+                        accepted_senders: None,
+                    },
+                );
+            }
             _ => {}
+        }
+        if self.mode3 == Some(true) {
+            let seed = self.mode3_times.get_or_insert_with(Default::default);
+            if matches!(record, WalRecord::RunStarted { .. }) {
+                seed.last_record_ms = None;
+            }
+            seed.last_record_ms =
+                crate::message_times::record_written_ms(record).or(seed.last_record_ms);
         }
     }
 
@@ -204,7 +334,7 @@ impl HeadProjection {
 }
 
 /// A display-only continuation: identifiers and numeric counters, never a billing source.
-/// The `last_run_rich_ui` display metadata and sender authorization come from WAL RunStarted records.
+/// Display metadata and sender authorization are restored from bounded WAL manifest sources.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeadReadFold {
@@ -212,6 +342,10 @@ pub struct HeadReadFold {
     model: Option<HeadModel>,
     run_id: Option<RunId>,
     usage: Option<SessionUsage>,
+    /// Whether the session's first run started under mode 3. Fixed for the session's life, so
+    /// a reader restored from the fold never has to read the log's first run to learn it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode3: Option<bool>,
 }
 
 impl<'de> Deserialize<'de> for HeadReadFold {
@@ -223,6 +357,8 @@ impl<'de> Deserialize<'de> for HeadReadFold {
             model: Option<serde_json::Value>,
             run_id: Option<RunId>,
             usage: Option<serde_json::Value>,
+            #[serde(default)]
+            mode3: Option<bool>,
         }
         fn counters(value: &serde_json::Value, model: bool) -> bool {
             let Some(object) = value.as_object() else {
@@ -272,6 +408,7 @@ impl<'de> Deserialize<'de> for HeadReadFold {
                 .map(serde_json::from_value)
                 .transpose()
                 .map_err(serde::de::Error::custom)?,
+            mode3: fields.mode3,
         })
     }
 }
@@ -283,6 +420,7 @@ impl Default for HeadReadFold {
             model: None,
             run_id: None,
             usage: None,
+            mode3: None,
         }
     }
 }
@@ -293,12 +431,14 @@ impl HeadReadFold {
             model: self.model.clone(),
             run_id: self.run_id.clone(),
             usage: self.usage.take(),
+            mode3: self.mode3,
             ..HeadProjection::default()
         };
         head.observe(record);
         self.model = head.model;
         self.run_id = head.run_id;
         self.usage = head.usage;
+        self.mode3 = head.mode3;
     }
 }
 
@@ -326,6 +466,30 @@ mod tests {
         serde_json::from_value(json!({"type":"model_step_finished", "step_id":1,
             "assistant_message":{"message_id":"m","content":[]},"usage":usage,"retries_used":0}))
         .unwrap()
+    }
+
+    #[test]
+    fn history_mode_is_fixed_by_the_first_run_not_a_later_writer() {
+        let legacy = start("legacy", None);
+        let mut mode3 = start("mode3", None);
+        if let WalRecord::RunStarted {
+            compaction_plan_version,
+            ..
+        } = &mut mode3
+        {
+            *compaction_plan_version = Some(2);
+        }
+        assert!(!is_mode3_log([&legacy, &mode3]));
+        assert!(is_mode3_log([&mode3, &legacy]));
+        let mut head = HeadProjection::default();
+        assert_eq!(head.mode3, None);
+        head.observe(&legacy);
+        head.observe(&mode3);
+        assert_eq!(head.mode3, Some(false));
+        let mut head = HeadProjection::default();
+        head.observe(&mode3);
+        head.observe(&legacy);
+        assert_eq!(head.mode3, Some(true));
     }
 
     #[test]

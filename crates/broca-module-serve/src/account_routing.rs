@@ -711,6 +711,7 @@ pub fn conversation_key(session: &BindIdentity) -> String {
 
 /// One admission's request to routing.
 pub struct AccountForRequest<'a> {
+    pub decision_id: Option<&'a str>,
     pub provider: &'a str,
     pub model: &'a str,
     pub conversation_key: &'a str,
@@ -719,11 +720,68 @@ pub struct AccountForRequest<'a> {
     /// history a later episode renders before it.
     pub initial_input_bytes: u64,
     pub candidates: &'a Candidates,
+    pub hold_cap: AccountHoldCap,
+}
+
+static HOLD_CAP_UNKNOWN: AtomicU64 = AtomicU64::new(0);
+
+/// Admissions offered no hold time because their previous account's evidence was not loaded.
+pub fn account_limit_hold_cap_unknown() -> u64 {
+    HOLD_CAP_UNKNOWN.load(Ordering::Relaxed)
+}
+
+/// Routing's wait allowance and whether its zero is due only to unloaded cache evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountHoldCap {
+    pub max_s: u64,
+    pub evidence_unknown: bool,
+}
+
+/// Bound routing's hold by the previous episode's frozen account and cache policy, not the
+/// account or cache policy the new episode might choose. The lookup must never load history.
+/// Its outer `None` means unloaded; `Some(None)` proves no accepted send on that account.
+pub fn account_hold_cap(
+    setting: broca_core::SameAccountWait,
+    previous: Option<&broca_wal::RunConfig>,
+    now_ms: u64,
+    accepted: impl FnOnce(&str) -> Option<Option<u64>>,
+) -> AccountHoldCap {
+    if !setting.enabled() {
+        return AccountHoldCap::default();
+    }
+    let Some((previous, account)) = previous.and_then(|config| {
+        config
+            .auth_selection
+            .as_ref()?
+            .account_ref
+            .as_deref()
+            .map(|account| (config, account))
+    }) else {
+        return AccountHoldCap::default();
+    };
+    let Some(sent) = accepted(account) else {
+        return AccountHoldCap {
+            max_s: 0,
+            evidence_unknown: true,
+        };
+    };
+    let cache_s = broca_core::session_account_cache_expiry_ms(sent, &previous.frozen_render_config)
+        .unwrap_or(now_ms)
+        .saturating_sub(now_ms)
+        / 1000;
+    let max_s = match setting {
+        broca_core::SameAccountWait::Minutes(minutes) => cache_s.min(minutes.saturating_mul(60)),
+        broca_core::SameAccountWait::Max => cache_s,
+    };
+    AccountHoldCap {
+        max_s,
+        evidence_unknown: false,
+    }
 }
 
 /// The `route.account_for` params, in routing's field names.
 pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
-    json!({
+    let mut params = json!({
         "provider": request.provider,
         "model": request.model,
         "affinity_model": request.model,
@@ -733,6 +791,7 @@ pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
         "mode": "admit",
         "initial_input_bytes": request.initial_input_bytes,
         "initial_input_estimated": true,
+        "hold_wait_max_s": request.hold_cap.max_s,
         "candidates": {
             "view_digest": request.candidates.view_digest,
             "accounts": request
@@ -745,7 +804,11 @@ pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
                 }))
                 .collect::<Vec<_>>(),
         },
-    })
+    });
+    if let Some(decision_id) = request.decision_id {
+        params["decision_id"] = decision_id.into();
+    }
+    params
 }
 
 // ------------------------------------------------------------------------------------------
@@ -915,6 +978,7 @@ impl AccountChoice {
 
 /// Everything [`choose_account`] needs about one fresh run.
 pub struct ChoiceInputs<'a> {
+    pub decision_id: Option<&'a str>,
     /// Caller affinity for this admission; an explicit key always wins.
     pub conversation_key: Option<&'a str>,
     /// Affinity frozen by the latest episode in the durable admission snapshot.
@@ -929,6 +993,7 @@ pub struct ChoiceInputs<'a> {
     pub send_id: Option<&'a str>,
     pub run_id: &'a str,
     pub initial_input_bytes: u64,
+    pub hold_cap: AccountHoldCap,
 }
 
 fn decision(
@@ -988,7 +1053,17 @@ where
         .or(inputs.inherited_conversation_key)
         .unwrap_or(&derived);
     let decision = |path: &str, admission_id, decision_id| {
-        let mut result = decision(path, admission_id, decision_id);
+        // The caller owns reports for an explicit decision; only runner allocations have
+        // an admission id that enables broca's normal and sealed-run reporters.
+        let mut result = decision(
+            path,
+            if inputs.decision_id.is_some() {
+                None
+            } else {
+                admission_id
+            },
+            decision_id,
+        );
         result.conversation_key = Some(conversation.to_owned());
         result.conversation_key_source = Some(if inputs.conversation_key.is_some() {
             broca_wal::ConversationKeySource::Caller
@@ -1005,7 +1080,7 @@ where
         return Ok(AccountChoice::NotApplicable);
     }
     let admission = admission_id(inputs.run_id);
-    if inputs.caller_named_account {
+    if inputs.caller_named_account && inputs.decision_id.is_none() {
         client.counters.bump("pinned");
         return Ok(AccountChoice::Static(decision(
             broca_wal::ACCOUNT_DECISION_PINNED,
@@ -1014,6 +1089,9 @@ where
         )));
     }
     let Ok(Some(listing)) = tokio::time::timeout_at(deadline, listing).await else {
+        if inputs.decision_id.is_some() {
+            return Err(ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable()));
+        }
         client.counters.bump("candidates_unknown");
         tracing::warn!(
             target: "accounts",
@@ -1028,7 +1106,7 @@ where
         )));
     };
     let candidates = Candidates::from_listing(&listing, method, provider);
-    if candidates.distinct_accounts() <= 1 {
+    if candidates.distinct_accounts() <= 1 && inputs.decision_id.is_none() {
         client.counters.bump("single_candidate");
         return Ok(AccountChoice::Static(decision(
             broca_wal::ACCOUNT_DECISION_SINGLE_CANDIDATE,
@@ -1037,13 +1115,18 @@ where
         )));
     }
     let params = account_for_params(&AccountForRequest {
+        decision_id: inputs.decision_id,
         provider,
         model: inputs.model,
         conversation_key: conversation,
         admission_id: &admission,
         initial_input_bytes: inputs.initial_input_bytes,
         candidates: &candidates,
+        hold_cap: inputs.hold_cap,
     });
+    if inputs.hold_cap.evidence_unknown {
+        HOLD_CAP_UNKNOWN.fetch_add(1, Ordering::Relaxed);
+    }
     match client.account_for(params, deadline).await {
         AccountForOutcome::Chosen {
             account_id,

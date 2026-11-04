@@ -10,11 +10,24 @@
 
 mod episode_reader;
 mod index;
+mod inventory;
+pub use inventory::open_session_resolver;
+mod operational;
+mod outbox;
+pub use operational::{
+    open_diagnostic_reader, open_diagnostic_reader_decided, operational_database_name,
+    DiagnosticEvidenceReader,
+};
+pub use outbox::OverhaulRunEventStore;
 mod publication;
+#[cfg(feature = "publication-faults")]
+mod publication_faults;
 mod readers;
 mod rebuild;
 mod reconcile;
+mod recovery;
 mod resume_reader;
+mod retention;
 mod schema;
 mod seeds;
 
@@ -25,7 +38,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 pub use episode_reader::{DatabaseEpisodeReader, EpisodeSnapshot};
 pub use index::{IndexOutcome, LogLocation, PublishedSession};
-pub use readers::{RawPageRequest, RawPageSnapshot};
+pub use readers::{RawHeadMedia, RawPageRequest, RawPageSnapshot};
 pub use rebuild::{AddressFloor, CondemnedLineage, LedgerRows};
 pub use reconcile::{ReconcileOutcome, ReconcileSession};
 
@@ -71,20 +84,39 @@ impl From<broca_core::projection_plan::ProjectionPlanError> for DbError {
 
 pub struct OverhaulDb {
     conn: Mutex<Connection>,
+    root: std::path::PathBuf,
     raw_fallback_notices: Mutex<std::collections::HashSet<String>>,
+    #[cfg(feature = "test-conformance")]
+    snapshot_reads: std::sync::atomic::AtomicU64,
 }
 
+pub type SessionGateFactory =
+    dyn Fn(&broca_protocol::BindIdentity) -> std::sync::Arc<std::sync::Mutex<()>> + Send + Sync;
+
 impl OverhaulDb {
+    /// Counts snapshot requests before opening SQLite so tests can verify that
+    /// filesystem-only admission does not enter the database reader at all.
+    #[cfg(feature = "test-conformance")]
+    pub fn snapshot_reads_for_conformance(&self) -> u64 {
+        self.snapshot_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Read a consistent index snapshot. SQLite's query-only guard prevents an
     /// accidental write from bypassing the transaction durability policy.
     pub fn read_snapshot<T>(
         &self,
         read: impl FnOnce(&Transaction<'_>) -> Result<T, DbError>,
     ) -> Result<T, DbError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| DbError::Invalid("database writer poisoned".into()))?;
+        #[cfg(feature = "test-conformance")]
+        self.snapshot_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // WAL-mode readers must not queue behind another session's index rebuild.
+        let mut conn = Connection::open_with_flags(
+            self.root.join("broca.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(crate::STORE_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "query_only", true)?;
         let result = (|| {
             let tx = conn.transaction()?;
@@ -112,13 +144,45 @@ impl OverhaulDb {
         conn.pragma_update(None, "synchronous", "FULL")?;
         let db = Self {
             conn: Mutex::new(conn),
+            root: root.to_path_buf(),
             raw_fallback_notices: Mutex::new(Default::default()),
+            #[cfg(feature = "test-conformance")]
+            snapshot_reads: Default::default(),
         };
         db.authoritative_transaction(|tx| {
             schema::initialize(tx)?;
+            crate::served_history::initialize(tx)?;
+            inventory::initialize(tx)?;
+            retention::initialize(tx)?;
+            operational::initialize(tx)?;
+            recovery::initialize(tx)?;
+            outbox::initialize(tx)?;
             Ok(())
         })?;
         Ok(db)
+    }
+
+    /// Operational readers never initialize a missing database or migrate a root.
+    pub fn open_read_only(root: impl AsRef<Path>) -> Result<Self, DbError> {
+        let root = root.as_ref();
+        let marker = std::fs::read(root.join("state-format"))?;
+        if marker != b"broca-state/2" && marker != b"broca-state/2\n" {
+            return Err(DbError::Invalid(
+                "broca.db requires a broca-state/2 root".into(),
+            ));
+        }
+        let conn = Connection::open_with_flags(
+            root.join("broca.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            root: root.to_path_buf(),
+            raw_fallback_notices: Mutex::new(Default::default()),
+            #[cfg(feature = "test-conformance")]
+            snapshot_reads: Default::default(),
+        })
     }
 
     /// All external writers use FULL, including mixed authoritative/index updates.
@@ -150,5 +214,44 @@ impl OverhaulDb {
         let result = write(&tx)?;
         tx.commit()?;
         Ok(result)
+    }
+}
+
+impl broca_core::ServedHistory for OverhaulDb {
+    fn history_read_version(&self, address: &str) -> Result<Option<u64>, String> {
+        crate::served_history::read_version(&self.conn.lock().unwrap(), address)
+    }
+
+    fn served_snapshot(
+        &self,
+        address: &str,
+        has_log: bool,
+        lineage: Option<&str>,
+        expected_version: Option<Option<u64>>,
+    ) -> Result<broca_core::served_history::ServedSnapshot, String> {
+        crate::served_history::version(
+            &mut self.conn.lock().unwrap(),
+            address,
+            has_log,
+            lineage,
+            expected_version,
+        )
+    }
+
+    fn history_rewritten(
+        &self,
+        session: &broca_protocol::BindIdentity,
+        lineage: Option<&str>,
+    ) -> Result<(), String> {
+        crate::served_history::rewritten(&mut self.conn.lock().unwrap(), session, lineage)
+    }
+    fn history_rewrite_finished(
+        &self,
+        session: &broca_protocol::BindIdentity,
+    ) -> Result<(), String> {
+        crate::served_history::rewrite_finished(&mut self.conn.lock().unwrap(), session)
+    }
+    fn rewriting_sessions(&self) -> Result<Vec<broca_protocol::BindIdentity>, String> {
+        crate::served_history::rewriting_sessions(&self.conn.lock().unwrap())
     }
 }

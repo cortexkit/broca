@@ -19,45 +19,24 @@ use subc_transport::{read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing_subscriber::prelude::*;
 
-const MANAGEMENT_OPERATIONS: &[&str] = &[
-    "diagnostics.findings",
-    "session.send",
-    "send.status",
-    "session.import",
-    "session.retract",
-    "run.cancel",
-    "run.status",
-    "run.event.get",
-    "session.read",
-    "role.describe",
-    "session.resolve",
-    "session.head",
-    "run.result",
-    "run.tool_calls",
-    "session.baseline",
-    "session.refresh",
-    "session.refresh_policy",
-    "session.flush_prefix",
-    "session.warm",
-    "vault.audit",
-    "session.subscribe",
-    // Served only on routes opened for the classifier role, and counted like the others.
-    "classify.run",
-    // Served only on tool-provider routes for the sessionless model tools.
-    "tool.catalog",
-    "late_results",
-    "late_results.ack",
-    // Staged media uploads, served before any send references them.
-    "session.upload_begin",
-    "session.upload_append",
-    "session.upload_commit",
-    "session.upload_status",
-    "session.history",
-    "session.output_refs",
-    "session.output_ref_read",
-    "permissions.list",
-    "permissions.revoke",
-];
+fn manifest_management_operations() -> Vec<String> {
+    broca_module_serve::manifest::manifest("broca")
+        .provides
+        .into_iter()
+        .flat_map(|role| match role {
+            subc_protocol::manifest::ProviderRole::ManagementSurface {
+                operations,
+                observability,
+                ..
+            } => operations
+                .into_iter()
+                .map(|operation| operation.name)
+                .chain(observability.into_iter().map(|surface| surface.name))
+                .collect::<Vec<_>>(),
+            _ => vec![],
+        })
+        .collect()
+}
 
 #[derive(Clone, Debug)]
 struct CapturedRequestLog {
@@ -197,7 +176,7 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
 async fn bind_route<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     writer: &mut W,
     reader: &mut R,
-    project_root: &Path,
+    _project_root: &Path,
 ) {
     let bind = ModuleControlRequest::RouteBind {
         route_channel: 7,
@@ -205,7 +184,7 @@ async fn bind_route<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         target: RouteTarget::ManagementSurface {
             module_id: "broca".into(),
         },
-        identity: SubcBindIdentity::new(project_root.to_path_buf(), "runner", "operation-counters"),
+        identity: SubcBindIdentity::new("runner", "operation-counters"),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -295,10 +274,11 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
         serde_json::json!(0),
         "actor_opens must start at zero"
     );
+    let management_operations = manifest_management_operations();
     let mut expected_operation_counts: std::collections::BTreeMap<String, u64> =
-        MANAGEMENT_OPERATIONS
+        management_operations
             .iter()
-            .map(|operation| ((*operation).to_string(), 0))
+            .map(|operation| (operation.clone(), 0))
             .collect();
     assert_eq!(
         before["management_ops"],
@@ -360,7 +340,7 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
     assert_eq!(
         request_log.session,
         broca_core::session_addr(&BindIdentity::new(
-            dir.join("proj"),
+            "broca-unscoped-v1",
             "runner",
             "operation-counters"
         ))
@@ -391,9 +371,9 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
         "one session.read and one run.cancel were served"
     );
 
-    for (index, operation) in MANAGEMENT_OPERATIONS
+    for (index, operation) in management_operations
         .iter()
-        .filter(|operation| !matches!(**operation, "session.read" | "run.cancel"))
+        .filter(|operation| !matches!(operation.as_str(), "session.read" | "run.cancel"))
         .enumerate()
     {
         write_request(
@@ -413,7 +393,7 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
             reply.header.ty
         );
         *expected_operation_counts
-            .get_mut(*operation)
+            .get_mut(operation)
             .expect("the operation has a zero counter") += 1;
         let counts =
             health_metrics(&mut client_reader, &mut client_writer, 100 + index as u64).await;

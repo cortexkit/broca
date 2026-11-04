@@ -40,6 +40,9 @@ fn framed(seq: u64, record: WalRecord) -> FramedRecord {
 
 fn run_config() -> RunConfig {
     RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -67,6 +70,8 @@ fn run_config() -> RunConfig {
 
 fn started(run: &str) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -87,6 +92,7 @@ fn started(run: &str) -> WalRecord {
         session: BindIdentity::new("/tmp/p", "h", "s"),
         config: Box::new(run_config()),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -126,6 +132,7 @@ fn assistant_two_calls() -> AssistantMessage {
 
 fn step_with_two_calls(step: u64) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -322,6 +329,7 @@ fn projection_shape_and_cursors() {
 #[test]
 fn run_terminal_carries_last_recorded_step_finish_reason() {
     let terminal_step = WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -648,6 +656,7 @@ fn paused_run_projects_pause_as_terminal() {
         framed(
             3,
             WalRecord::RunPaused {
+                account_limit: None,
                 run_id: RunId("r1".into()),
                 ts_ms: None,
                 reason: PauseReason::AuthRequired,
@@ -676,7 +685,9 @@ fn paused_run_projects_pause_as_terminal() {
             run_id,
             reason,
             error,
+            resume_not_before_ms,
         } => {
+            assert_eq!(*resume_not_before_ms, None);
             assert_eq!(run_id.0, "r1");
             assert_eq!(*reason, PauseReason::AuthRequired);
             assert_eq!(error.as_ref().map(|e| e.message.as_str()), Some("expired"));
@@ -1043,6 +1054,7 @@ fn budget_firing_projects_to_control_stream() {
 /// Multi-unit records deliberately include two calls and a typed terminal error.
 fn all_projection_record_variants() -> Vec<FramedRecord> {
     let queued_request = SubmissionRequest {
+        route_decision_id: None,
         service_tier_level: None,
         staged_uploads: None,
         content: Vec::new(),
@@ -1054,6 +1066,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
         principal: None,
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1148,6 +1161,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             retries_used: 0,
         },
         WalRecord::RunPaused {
+            account_limit: None,
             run_id: RunId("r-all".into()),
             ts_ms: None,
             reason: PauseReason::AuthRequired,
@@ -1171,6 +1185,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             },
         },
         WalRecord::Queued {
+            sent_by: None,
             written_at_ms: None,
             retention: None,
             ts_ms: None,
@@ -1232,6 +1247,7 @@ fn cursor_only_projection_matches_full_projection_for_every_record_prefix() {
 #[test]
 fn a_steered_record_has_no_unit_until_placement_boundary() {
     let steered = WalRecord::Steered {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         retention: None,

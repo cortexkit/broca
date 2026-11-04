@@ -635,6 +635,8 @@ fn build_request_body_with_media_and_provenance(
 ) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
+    let turn_system = crate::turn_system::prepare(frozen, opts);
+    let opts = turn_system.as_ref();
     let prepared = crate::structured_output::prepare(frozen, opts);
     let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
@@ -667,7 +669,7 @@ fn build_request_body_with_media_and_provenance(
     let non_system: Vec<&Message> = opts
         .prompt
         .iter()
-        .filter(|m| m.role != Role::System)
+        .filter(|m| m.role != Role::System || m.turn_system)
         .collect();
     // Canonical tool-call ids that violate Anthropic's id grammar (^[a-zA-Z0-9_-]+$, ≤64) —
     // e.g. an OpenAI 450-char `|` id carried in from a provider switch — are aliased to a
@@ -675,7 +677,11 @@ fn build_request_body_with_media_and_provenance(
     // the arc still pairs. This is render-edge ONLY: the map is built from a read-only scan
     // and the canonical id stays the sole persisted form.
     let id_map = crate::tool_id_alias::ToolIdMap::build(&opts.prompt, &id_grammar());
-    let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
+    let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
+        &opts.tools,
+        &opts.prompt,
+        &frozen.tool_name_aliases,
+    );
     // The index of the first message whose thinking may be echoed, computed in ONE place
     // (`first_echoed_message`) so the request body and the tests' reference renderer read the
     // same positional cutoff and cannot drift.
@@ -684,7 +690,7 @@ fn build_request_body_with_media_and_provenance(
         .prompt
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role != Role::System)
+        .filter(|(_, m)| m.role != Role::System || m.turn_system)
         .enumerate()
         .map(|(i, (prompt_index, m))| {
             // Echo signed thinking back only when BOTH: the message is in the current turn
@@ -866,7 +872,7 @@ fn build_system(
         system.push(json!({ "type": "text", "text": identity }));
     }
     for m in &opts.prompt {
-        if m.role == Role::System {
+        if m.role == Role::System && !m.turn_system {
             for b in &m.content {
                 // Drop an empty text part — Anthropic rejects a `{type:text, text:""}` block.
                 // Defensive against foreign input; this codebase's own normalizers never
@@ -1120,6 +1126,12 @@ fn convert_message(
     name_map: &crate::tool_name_alias::ToolNameMap,
     media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Value {
+    if m.turn_system {
+        return json!({
+            "role": if m.role == Role::System { "system" } else { "user" },
+            "content": crate::turn_system::text(m),
+        });
+    }
     match m.role {
         Role::Tool => {
             let content: Vec<Value> = m
@@ -1497,6 +1509,7 @@ mod tests {
 
     fn system_message(text: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1508,6 +1521,7 @@ mod tests {
 
     fn user_message(text: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1548,7 +1562,11 @@ mod tests {
             .filter(|message| message.role != Role::System)
             .collect::<Vec<_>>();
         let id_map = crate::tool_id_alias::ToolIdMap::build(&opts.prompt, &id_grammar());
-        let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
+        let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
+            &opts.tools,
+            &opts.prompt,
+            &frozen.tool_name_aliases,
+        );
         let first_echoed = echo_scope.and_then(|scope| first_echoed_message(scope, &non_system));
 
         non_system
@@ -1692,6 +1710,7 @@ mod tests {
                 ModelHandle::new("anthropic", "claude-opus-4-8"),
             ),
             Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,

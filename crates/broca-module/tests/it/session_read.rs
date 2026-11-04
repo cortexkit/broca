@@ -28,8 +28,14 @@ use broca_wal::{DispatchOutcome, FileWal, RunConfig, Wal, WalRecord};
 use tokio::sync::{mpsc, Mutex};
 #[path = "session_read/attribution.rs"]
 mod attribution;
+#[path = "session_read/compaction_v2.rs"]
+mod compaction_v2;
+#[path = "session_read/display_facts.rs"]
+mod display_facts;
 #[path = "session_read/media.rs"]
 mod media;
+#[path = "session_read/root_repair.rs"]
+mod root_repair;
 #[path = "session_read/run_usage.rs"]
 mod run_usage;
 #[path = "session_read/tags.rs"]
@@ -103,6 +109,12 @@ impl WalStore for ReadCountingWalStore {
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
         self.inner.wal_present(session)
     }
+    fn wal_present_checked(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<bool>, broca_wal::WalError> {
+        self.inner.wal_present_checked(session)
+    }
 
     fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, broca_wal::WalError> {
         self.inner.open(session)
@@ -170,6 +182,12 @@ impl WalStore for ZeroRangeCountingWalStore {
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
         self.inner.wal_present(session)
     }
+    fn wal_present_checked(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<bool>, broca_wal::WalError> {
+        self.inner.wal_present_checked(session)
+    }
 
     fn live_wal_last_write(
         &self,
@@ -221,6 +239,12 @@ impl WalStore for NoFileIdentityWalStore {
 
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
         self.inner.wal_present(session)
+    }
+    fn wal_present_checked(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<bool>, broca_wal::WalError> {
+        self.inner.wal_present_checked(session)
     }
 
     fn live_wal_last_write(
@@ -485,6 +509,7 @@ fn tool_step() -> Vec<NormalizedEvent> {
             },
         }),
         ctrl(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id: StepId(0),
             usage: usage(),
             finish_reason: FinishReason::ToolCalls,
@@ -510,6 +535,7 @@ fn text_step(text: &str) -> Vec<NormalizedEvent> {
             },
         }),
         ctrl(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id: StepId(1),
             usage: usage(),
             finish_reason: FinishReason::Stop,
@@ -567,6 +593,7 @@ fn req(key: &BindIdentity, run: &str, text: &str) -> RunRequest {
     let tools = vec![tool("lookup")];
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -1312,6 +1339,7 @@ async fn run_status_pause_cause_matches_session_read() {
         &[
             started(&key, "run-paused", "auth"),
             WalRecord::RunPaused {
+                account_limit: None,
                 ts_ms: None,
                 run_id: RunId("run-paused".into()),
                 reason: PauseReason::AuthRequired,
@@ -1388,6 +1416,7 @@ async fn run_status_without_a_cause_omits_the_cause_keys() {
         &[
             started(&paused, "run-paused-bare", "auth"),
             WalRecord::RunPaused {
+                account_limit: None,
                 ts_ms: None,
                 run_id: RunId("run-paused-bare".into()),
                 reason: PauseReason::AuthRequired,
@@ -1665,6 +1694,9 @@ async fn idle_read_flush_failure_hides_the_unproven_tail() {
 
 fn min_config() -> RunConfig {
     RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -1692,6 +1724,8 @@ fn min_config() -> RunConfig {
 
 fn started(key: &BindIdentity, run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -1727,6 +1761,7 @@ fn assistant_text(step: u64, text: &str) -> WalRecord {
 
 fn assistant_text_with_usage(step: u64, text: &str, step_usage: Usage) -> WalRecord {
     WalRecord::ModelStepFinished {
+        raw_finish_reason: None,
         fallback: Default::default(),
         written_at_ms: None,
         tags: None,
@@ -1745,23 +1780,256 @@ fn assistant_text_with_usage(step: u64, text: &str, step_usage: Usage) -> WalRec
     }
 }
 
+// These fixtures describe native stored positions; the public request starts at position + 1.
 fn read_request(
     key: &BindIdentity,
-    from_ordinal: Option<u64>,
+    from_position: Option<u64>,
     limit: Option<u64>,
 ) -> SessionReadRequest {
     SessionReadRequest {
+        history_version: None,
         session: key.clone(),
         late_after: None,
-        from_ordinal,
+        from_ordinal: from_position.map(|position| position.saturating_add(1)),
         limit,
         include_tools: false,
         include_rich_ui: false,
+        include_display_facts: false,
         after_mid: None,
         lineage_id: None,
         max_bytes: None,
         media: Default::default(),
     }
+}
+
+async fn stale_inventory_fixture() -> (Rig, BindIdentity, BindIdentity, Vec<u8>) {
+    use broca_core::SessionRefIndex;
+    let rig = Rig::new("stale-inventory-diagnosis", Arc::new(NoopExec));
+    let old = BindIdentity::new(rig.dir.join("old-project"), "broca", "cktui-stale");
+    let real = BindIdentity::new(rig.dir.join("new-project"), "broca", "cktui-stale");
+    let mut wal = rig.wal_store.open(&old).unwrap();
+    wal.append(1, &started(&old, "real-run", "real content"), false)
+        .unwrap();
+    wal.append(1, &assistant_text(0, "real answer"), false)
+        .unwrap();
+    wal.append(1, &finished_ok(), true).unwrap();
+    drop(wal);
+    std::fs::rename(rig.wal_store.wal_path(&old), rig.wal_store.wal_path(&real)).unwrap();
+    let real_bytes = std::fs::read(rig.wal_store.wal_path(&real)).unwrap();
+    rig.store
+        .index_run_active(&RunIndexRow {
+            withdrawals_owed: false,
+            title: None,
+            run_id: "real-run".into(),
+            session: old.clone(),
+            submission_id: None,
+            request_identity_digest: None,
+            state: RunIndexState::Active,
+            usage: None,
+            final_step_finish_reason: None,
+            retries_used: 0,
+        })
+        .unwrap();
+    rig.store
+        .index_run_terminal("real-run", RunIndexState::Completed, None, None, 0)
+        .unwrap();
+    rig.store
+        .record_session(&broca_core::session_addr(&old), &old)
+        .unwrap();
+    rig.registry
+        .set_session_address_inventory(rig.store.clone());
+    let resolved = rig
+        .registry
+        .resolve_session_address(&real, None)
+        .await
+        .unwrap();
+    assert_eq!(resolved, old);
+    (rig, resolved, real, real_bytes)
+}
+
+#[tokio::test]
+async fn historical_missing_log_guards_history_and_activation_without_creating() {
+    assert_historical_session_ops_do_not_fork(false).await;
+}
+
+#[tokio::test]
+async fn forked_stub_guards_history_and_activation_without_changing_the_log() {
+    assert_historical_session_ops_do_not_fork(true).await;
+}
+
+async fn assert_historical_session_ops_do_not_fork(forked_stub: bool) {
+    let mut failures = Vec::new();
+    for op in [
+        "read",
+        "head",
+        "baseline",
+        "status",
+        "subscribe",
+        "warm",
+        "send",
+        "scoped_bind",
+    ] {
+        let (rig, resolved, real, real_bytes) = stale_inventory_fixture().await;
+        if forked_stub {
+            let history = rig
+                .wal_store
+                .read_records_range(&real, 0, None, None)
+                .unwrap();
+            rig.store.project_range(&resolved, &history).unwrap();
+            let evidence = rig.store.session_log_evidence(&resolved).unwrap();
+            assert!(
+                evidence
+                    .lineages
+                    .contains(&history.lineage_id.unwrap().to_string()),
+                "{evidence:?}"
+            );
+            let stub = rig.wal_store.open(&resolved).unwrap();
+            assert_ne!(stub.lineage_id(), history.lineage_id);
+            drop(stub);
+            assert_eq!(
+                std::fs::metadata(rig.wal_store.wal_path(&resolved))
+                    .unwrap()
+                    .len(),
+                69
+            );
+            assert!(
+                rig.store
+                    .session_log_state(&resolved, rig.wal_store.as_ref())
+                    .unwrap()
+                    .missing_history(),
+                "{evidence:?}"
+            );
+        }
+        let stub = rig.wal_store.wal_path(&resolved);
+        let before = std::fs::read(&stub).ok();
+        let result = match op {
+            "scoped_bind" => {
+                let stamp = broca_protocol::BindScope {
+                    scope: broca_protocol::SessionScope {
+                        owner: broca_protocol::BindPrincipal::Reserved {
+                            module_id: "core".into(),
+                        },
+                        scope_ref: "work".into(),
+                        scope_epoch: 1,
+                        flow_id: None,
+                        sender: None,
+                        agent_id: None,
+                        run_id: None,
+                    },
+                    owner_authorized: true,
+                    kind: broca_protocol::ScopeKind::Head,
+                    parent: None,
+                    parent_state: None,
+                };
+                rig.registry
+                    .bind_adoption_refusal(&resolved, None, &stamp)
+                    .await
+                    .map(|_| ())
+            }
+            "read" => rig
+                .registry
+                .read(read_request(&resolved, None, Some(20)))
+                .await
+                .map(|_| ()),
+            "head" => rig.registry.head(&resolved).await.map(|_| ()),
+            "baseline" => rig
+                .registry
+                .baseline(&resolved, None, &Default::default())
+                .await
+                .map(|_| ()),
+            "status" => rig.registry.status(&resolved).await.map(|reply| {
+                assert_eq!(reply, broca_module::serve::StatusResponse::Idle);
+            }),
+            "subscribe" => {
+                let (sink, _received) = tokio::sync::mpsc::channel(16);
+                rig.registry
+                    .subscribe(&resolved, broca_module::serve::SubscribeFrom::Start, sink)
+                    .await
+            }
+            "warm" => rig.registry.warm(&resolved, None).await.map(|_| ()),
+            "send" => {
+                let request = req(&resolved, "new-run", "must not fork");
+                rig.registry
+                    .send(broca_module::serve::SendRequest {
+                        session_class: None,
+                        retention: None,
+                        stop_sequences_named: false,
+                        title: None,
+                        conversation_key: None,
+                        delivery: Default::default(),
+                        session: resolved.clone(),
+                        run_id: request.run_id.clone(),
+                        send_id: None,
+                        request: Box::new(request.to_submission()),
+                        skip_materialization: false,
+                        kind: RunKind::FreshOrResume,
+                        plan: None,
+                        order: None,
+                    })
+                    .await
+                    .map(|_| ())
+            }
+            _ => unreachable!(),
+        };
+        let expected = if op == "status" {
+            result.is_ok()
+        } else if op == "scoped_bind" && forked_stub {
+            matches!(
+                &result,
+                Err(broca_module::serve::ServeError::Open(reason, Some(broca_protocol::ErrorClass::Transient)))
+                    if reason.contains("empty session WAL contradicts materialized history")
+            )
+        } else {
+            result.as_ref().is_err_and(|error| {
+                matches!(
+                    error,
+                    broca_module::serve::ServeError::SessionLogMissing { .. }
+                ) && error.to_string().contains("repair-session-root")
+            })
+        };
+        if !expected {
+            failures.push(format!("{op}: {result:?}"));
+        }
+        if std::fs::read(&stub).ok() != before {
+            failures.push(format!("{op}: created or changed a WAL"));
+        }
+        assert_eq!(
+            std::fs::read(rig.wal_store.wal_path(&real)).unwrap(),
+            real_bytes
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn interrupted_first_bind_reservation_can_subscribe_and_send_after_retry() {
+    use broca_core::SessionRefIndex;
+    let rig = Rig::new("reservation-retry", crate::common::FakeExecutor::auto());
+    let key = rig.key("new-session");
+    rig.store
+        .record_session(&broca_core::session_addr(&key), &key)
+        .unwrap();
+    rig.registry
+        .set_session_address_inventory(rig.store.clone());
+    let retry = rig
+        .registry
+        .resolve_session_address(&key, None)
+        .await
+        .unwrap();
+    assert!(!rig.wal_store.wal_path(&key).exists());
+    assert!(!rig.store.session_log_evidence(&key).unwrap().content);
+    let (sink, _received) = tokio::sync::mpsc::channel(16);
+    rig.registry
+        .subscribe(&retry, broca_module::serve::SubscribeFrom::Start, sink)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(rig.wal_store.wal_path(&key))
+            .unwrap()
+            .len(),
+        69
+    );
+    send(&rig, &retry, "new-run", "first input").await;
 }
 
 fn read_request_with_tools(
@@ -1770,6 +2038,7 @@ fn read_request_with_tools(
     limit: Option<u64>,
 ) -> SessionReadRequest {
     SessionReadRequest {
+        history_version: None,
         include_tools: true,
         ..read_request(key, from_ordinal, limit)
     }
@@ -2200,7 +2469,7 @@ async fn read_pages_match_replay_and_subscribe_projection_for_multi_episode_erro
             );
             break;
         }
-        page_from = page.next_from_ordinal;
+        page_from = page.next_from_ordinal.map(|ordinal| ordinal - 1);
     }
 
     let framed = rig.wal_store.read_records(&key).expect("read wal");
@@ -2266,7 +2535,7 @@ async fn read_all_pages(rig: &Rig, key: &BindIdentity) -> (Vec<u8>, Vec<u8>) {
                 serde_json::to_vec(&page.lineage_state).unwrap(),
             );
         }
-        from = page.next_from_ordinal;
+        from = page.next_from_ordinal.map(|ordinal| ordinal - 1);
     }
 }
 
@@ -2385,6 +2654,7 @@ async fn session_read_and_control_projection_skip_provider_attempt_records() {
                 (1, broca_protocol::AttemptOutcome::Complete),
             ] {
                 with_attempts.push(WalRecord::ModelAttemptFinished {
+                    account_limit_disposition: None,
                     attempt_id: None,
                     reservation: None,
                     envelope: None,
@@ -2802,6 +3072,7 @@ fn dispatch_module_episode(key: &BindIdentity, run: &str, call: &str) -> Vec<Wal
     vec![
         started(key, run, &format!("{run} question")),
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -2941,6 +3212,8 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
     let batch_id = BatchId("batch-1".into());
     let records = vec![
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -2971,6 +3244,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
             submission_id: None,
         },
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -3046,7 +3320,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
         let Some(next) = page.next_from_ordinal else {
             break;
         };
-        from = Some(next);
+        from = Some(next - 1);
     }
 
     let replayed = replay(&records).expect("full replay").prompt;
@@ -3098,7 +3372,7 @@ async fn read_paging_defaults_and_no_actor_invariant() {
         .await
         .expect("read newest page");
     assert_eq!(page.messages.len(), 1);
-    assert_eq!(page.messages[0].ordinal, 1);
+    assert_eq!(page.messages[0].ordinal, 2);
     assert_eq!(page.messages[0].mid, "m1");
     assert_eq!(page.next_from_ordinal, None);
     assert_eq!(page.lineage_state.state, "completed");
@@ -3167,8 +3441,8 @@ async fn read_head_resumes_subscribe_without_gaps_or_duplicates() {
     assert!(
         page.messages
             .iter()
-            .all(|message| message.mid == format!("m{}", message.ordinal)),
-        "wire message ids use the MC ordinal coordinate"
+            .all(|message| message.mid == format!("m{}", message.ordinal - 1)),
+        "wire message ids retain native stored positions"
     );
 
     // The read implementation derives both the page and `head` from one store snapshot plus one
@@ -3256,6 +3530,7 @@ async fn read_lineage_state_paused_and_active_with_open_dispatch() {
         &[
             started(&paused, "run-paused", "auth"),
             WalRecord::RunPaused {
+                account_limit: None,
                 ts_ms: None,
                 run_id: RunId("run-paused".into()),
                 reason: PauseReason::AuthRequired,
@@ -3282,6 +3557,7 @@ async fn read_lineage_state_paused_and_active_with_open_dispatch() {
         &[
             started(&active, "run-active", "open"),
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3385,6 +3661,8 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
         &key,
         &[
             WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -3415,6 +3693,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
@@ -3523,6 +3802,8 @@ async fn torn_import_is_publicly_interrupted_for_read_and_run_status() {
         &rig.wal_store,
         &key,
         &[WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -3887,6 +4168,24 @@ fn two_episode_pinned_bytes() -> String {
         .to_owned()
 }
 
+fn pinned_read_bytes(page: &broca_wire::SessionReadResponse) -> String {
+    // Unframed legacy logs mint an incarnation on first serve; version allocation uses wall time.
+    // Normalize only those two snapshot members, not transcript, attribution or cursor bytes.
+    serde_json::to_string(page)
+        .unwrap()
+        .replace(
+            &format!(
+                "\"incarnation\":{}",
+                serde_json::to_string(&page.incarnation).unwrap()
+            ),
+            "\"incarnation\":\"@INCARNATION@\"",
+        )
+        .replace(
+            &format!("\"history_version\":{}", page.history_version),
+            "\"history_version\":1",
+        )
+}
+
 /// The provider's raw reasoning item, as an OpenAI Responses step stores it: two summary parts
 /// beside the encrypted reasoning.
 const SUMMARY_REASONING_ITEM: &str = r#"{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"**Planning** I will check the inputs."},{"type":"summary_text","text":"**Answering** The inputs are fine."}],"encrypted_content":"synthetic-cipher"}"#;
@@ -3941,11 +4240,10 @@ async fn responses_reasoning_summary_reads_back_as_the_stored_blocks() {
         )
         .await
         .expect("model view read");
-    let model = serde_json::to_value(
-        broca_wire::ModelPage::try_from(model).expect("model page reaches the wire"),
-    )
-    .unwrap();
-    assert_eq!(model["messages"][1]["message"]["content"], stored_wire);
+    assert_eq!(
+        serde_json::to_value(&model.messages[1].message.content).unwrap(),
+        stored_wire
+    );
 
     let records = rig.wal_store.read_records(&key).expect("read WAL");
     let durable = records
@@ -3971,7 +4269,7 @@ async fn two_episode_read_response_bytes_are_pinned() {
     let request = read_request(&key, Some(0), Some(10));
     assert!(!request.include_tools);
     let page = rig.registry.read(request).await.expect("session.read");
-    let bytes = serde_json::to_string(&page).expect("serialize session.read response");
+    let bytes = pinned_read_bytes(&page);
     if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
         std::fs::write(two_episode_golden_path(), format!("{bytes}\n")).unwrap();
     }
@@ -4003,7 +4301,7 @@ async fn no_media_inline_and_descriptors_response_bytes_are_pinned() {
         let mut request = read_request(&key, Some(0), Some(10));
         request.media = media;
         let page = rig.registry.read(request).await.expect("session.read");
-        let bytes = serde_json::to_string(&page).expect("serialize session.read response");
+        let bytes = pinned_read_bytes(&page);
         if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
             std::fs::write(&fixture, format!("{bytes}\n")).unwrap();
         }
@@ -4095,7 +4393,7 @@ async fn include_tools_returns_the_latest_episodes_tools_and_run_id() {
             .collect();
         assert_eq!(names, ["lookup", "web_search"], "{key:?}");
         assert_eq!(
-            serde_json::to_string(&page).unwrap(),
+            pinned_read_bytes(&page),
             pinned_bytes_with_latest_tools(),
             "{key:?}"
         );
@@ -4164,6 +4462,7 @@ async fn session_read_renders_a_steered_message_at_its_wal_position() {
     let rig = Rig::new("steered-read", Arc::new(NoopExec));
     let key = rig.key("steered");
     let steered = WalRecord::Steered {
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         retention: None,
@@ -4247,7 +4546,7 @@ async fn session_read_renders_a_steered_message_at_its_wal_position() {
             .iter()
             .map(|entry| entry.ordinal)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2, 3]
+        vec![1, 2, 3, 4]
     );
 }
 
@@ -4335,7 +4634,7 @@ async fn session_head_reads_no_whole_wal() {
     let head = rig.registry.head(&key).await.expect("head answers");
     assert_eq!(whole_wal_reads.load(Ordering::SeqCst), 0, "{head:?}");
     assert_eq!(head.lineage_id, page.lineage_id);
-    assert_eq!(head.last_ordinal, Some(page.messages.len() as u64 - 1));
+    assert_eq!(head.last_ordinal, Some(page.messages.len() as u64));
     assert_eq!(
         head.last_run_state
             .as_ref()
@@ -4511,12 +4810,12 @@ async fn an_imported_message_never_takes_a_real_steps_attribution() {
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert_eq!(
             (calls[0].0, calls[0].2.as_deref(), calls[0].3.as_deref()),
-            (1, None, None),
+            (2, None, None),
             "the imported call: {calls:?}"
         );
         assert_eq!(
             (calls[1].0, calls[1].3.as_deref()),
-            (4, Some("aft")),
+            (5, Some("aft")),
             "{calls:?}"
         );
         assert!(calls[1].2.is_some(), "the real call has a key: {calls:?}");
@@ -4602,83 +4901,17 @@ async fn transcript_reply_body_budget_applies_to_tail_range_and_large_requests()
             assert!(serde_json::to_vec(&response).unwrap().len() < cap);
             assert_eq!(response.messages.len(), 1);
             let ordinal = u64::from(tail);
-            assert_eq!(response.messages[0].ordinal, ordinal);
+            assert_eq!(response.messages[0].ordinal, ordinal + 1);
             assert_eq!(
                 serde_json::to_value(&response.messages[0].message).unwrap(),
                 serde_json::to_value(&messages[ordinal as usize]).unwrap()
             );
             assert_eq!(
                 response.next_from_ordinal,
-                if tail { None } else { Some(1) }
+                if tail { None } else { Some(2) }
             );
         }
     }
-}
-
-#[tokio::test]
-async fn model_view_pages_fit_the_serialized_wire_reply_and_continue_exactly() {
-    let rig = crate::common::Rig::new(
-        "model-read-reply-budget",
-        crate::common::FakeExecutor::auto(),
-        Duration::from_secs(3600),
-    );
-    let key = rig.key("session");
-    let messages: Vec<_> = (0..3)
-        .map(|_| {
-            Message::new(
-                Role::User,
-                vec![ContentBlock::Text {
-                    text: "x".repeat(1_250_000),
-                }],
-            )
-        })
-        .collect();
-    rig.registry
-        .import(SessionImportRequest {
-            project_id: None,
-            principal: None,
-            session: key.clone(),
-            run_id: RunId("import-model-budget".into()),
-            messages: messages.clone(),
-            source_ref: "fixture:model-read-budget".into(),
-        })
-        .await
-        .unwrap();
-
-    let first = rig
-        .registry
-        .read_model(SessionReadRequest::new(key.clone(), Some(0), Some(100)))
-        .await
-        .unwrap();
-    assert_eq!(first.messages.len(), 2);
-    assert_eq!(first.next_from_ordinal, Some(2));
-    assert!(serde_json::to_vec(&first).unwrap().len() < 3 * 1024 * 1024);
-    for (entry, ordinal) in first.messages.iter().zip(0..2) {
-        assert_eq!(entry.source.from_ordinal(), ordinal);
-        assert_eq!(
-            serde_json::to_value(&entry.message).unwrap(),
-            serde_json::to_value(&messages[ordinal as usize]).unwrap()
-        );
-    }
-
-    let second = rig
-        .registry
-        .read_model(SessionReadRequest::new(
-            key,
-            first.next_from_ordinal,
-            Some(100),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(second.messages.len(), 1);
-    assert_eq!(second.messages[0].source.from_ordinal(), 2);
-    assert_eq!(
-        serde_json::to_value(&second.messages[0].message).unwrap(),
-        serde_json::to_value(&messages[2]).unwrap()
-    );
-    assert_eq!(second.next_from_ordinal, None);
-    assert!(serde_json::to_vec(&second).unwrap().len() < 3 * 1024 * 1024);
-    drop(rig);
 }
 
 #[tokio::test]
@@ -4761,8 +4994,46 @@ async fn imported_message_over_frame_limit_is_refused_with_identity() {
         detail.subject,
         cortexkit_role_llm_runner::errors::ReplyTooLargeSubject::Message {
             session,
-            ordinal: 0
+            ordinal: 1
         } if session == key.session
     ));
     drop(rig);
+}
+
+#[tokio::test]
+async fn missing_history_is_not_bypassed_by_a_legacy_lineage_argument() {
+    for forked_stub in [false, true] {
+        let (rig, resolved, real, real_bytes) = stale_inventory_fixture().await;
+        let history = rig
+            .wal_store
+            .read_records_range(&real, 0, None, None)
+            .unwrap();
+        let requested = history.lineage_id.unwrap().to_string();
+        if forked_stub {
+            rig.store.project_range(&resolved, &history).unwrap();
+            drop(rig.wal_store.open(&resolved).unwrap());
+        }
+        let path = rig.wal_store.wal_path(&resolved);
+        let before = std::fs::read(&path).ok();
+        let projection = rig.store.read_prefix_with_watermark(&resolved).unwrap();
+        let mut request = read_request(&resolved, None, Some(20));
+        request.lineage_id = Some(requested.clone());
+        let error = rig.registry.read(request).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                broca_module::serve::ServeError::SessionLogMissing { .. }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(std::fs::read(path).ok(), before);
+        assert_eq!(
+            rig.store.read_prefix_with_watermark(&resolved).unwrap(),
+            projection
+        );
+        assert_eq!(
+            std::fs::read(rig.wal_store.wal_path(&real)).unwrap(),
+            real_bytes
+        );
+    }
 }

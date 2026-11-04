@@ -19,7 +19,7 @@ impl RunExecutor for PauseBeforeCancel {
                 job.on_admitted, Some(&job.prior_snapshot),
             ).await;
         }
-        job.writer.record(WalRecord::RunStarted { written_at_ms: None, tags: None, session_class: None, retention: None, hooks: None, title: None, on_restart: None, keep_warm: None,
+        job.writer.record(WalRecord::RunStarted { compaction_plan_version: None, sent_by: None, written_at_ms: None, tags: None, session_class: None, retention: None, hooks: None, title: None, on_restart: None, keep_warm: None,
         marker_order_version: None, manifest: None, scope: None, send_id: None,
         request_identity_digest: None, project_id: None, principal: None,
         ts_ms: Some(100), run_id: job.req.run_id.clone(), session: job.req.session.clone(),
@@ -28,10 +28,8 @@ impl RunExecutor for PauseBeforeCancel {
         job.writer.sync().await?;
         let _ = job.on_admitted.take().unwrap().send(Ok(job.req.run_id.clone()));
         self.release.notified().await;
-        job.writer.record(WalRecord::RunPaused {
-            run_id: job.req.run_id.clone(), ts_ms: Some(200),
-            reason: broca_protocol::PauseReason::Restart, error: None,
-        });
+        job.writer.record(WalRecord::RunPaused { account_limit: None, run_id: job.req.run_id.clone(), ts_ms: Some(200),
+        reason: broca_protocol::PauseReason::Restart, error: None, });
         job.writer.sync().await?;
         // The next read belongs to the paused cancel finalizer, not the executor.
         self.wal.fail_next_read();

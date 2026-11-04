@@ -411,6 +411,11 @@ impl FetchError {
 /// them.
 #[async_trait]
 pub trait Fetcher: Send + Sync {
+    /// The provider's manifest promise, read from the daemon catalog at admission.
+    /// Older fetchers cannot negotiate keepalives and freeze no promise.
+    async fn call_keepalive_supported(&self, _provider: &str) -> Result<bool, FetchError> {
+        Ok(false)
+    }
     /// A declaration from the provider's daemon catalog entry, never guessed from
     /// a version or learned by forwarding a request an older provider cannot read.
     async fn system_text_default_supported(&self, _provider: &str) -> Result<bool, FetchError> {
@@ -484,7 +489,8 @@ pub fn catalog_request(
     request
 }
 
-fn tool_catalog_request(tool_item: Option<&Item>) -> CatalogRequest {
+/// Build a tool-only catalog request, also used by standalone callers without a composition.
+pub fn tool_catalog_request(tool_item: Option<&Item>) -> CatalogRequest {
     let mut request = CatalogRequest::new(
         tool_item
             .map(|item| item.params.clone())
@@ -708,6 +714,36 @@ fn unanswered(error: FetchError) -> Unanswered {
     }
 }
 
+async fn catalog_with_optional_keepalive(
+    fetcher: &dyn Fetcher,
+    provider: &str,
+    request: &CatalogRequest,
+    deadline: Instant,
+) -> Result<(Value, bool), FetchMiss> {
+    use crate::keepalive_discovery::{observe, Outcome};
+    let started = std::time::Instant::now();
+    let promise = fetcher.call_keepalive_supported(provider);
+    let catalog = within_deadline(deadline, || fetcher.catalog(provider, request));
+    tokio::pin!(promise, catalog);
+    tokio::select! {
+        biased;
+        promise = &mut promise => {
+            let (supported, outcome) = match promise {
+                Ok(supported) => (supported, Outcome::Finished),
+                Err(_) => (false, Outcome::Failed),
+            };
+            observe(provider, outcome, started.elapsed());
+            catalog.await.map(|answer| (answer, supported)).map_err(FetchMiss::from_error)
+        }
+        answer = &mut catalog => {
+            // Discovery is optional. Never extend a successful required fetch's wait, or
+            // spend its remaining admission budget retrying a failed liveness lookup.
+            observe(provider, Outcome::Unfinished, started.elapsed());
+            answer.map(|answer| (answer, false)).map_err(FetchMiss::from_error)
+        }
+    }
+}
+
 /// A provider's decoded catalog answer.
 #[derive(Debug, Clone)]
 struct Fetched {
@@ -789,6 +825,37 @@ fn decode_answer(value: Value, text_asked: bool) -> Result<Fetched, FetchMiss> {
     Ok(Fetched { answer, text })
 }
 
+/// A standalone caller's catalog snapshot. Pins come from the provider's answer, not from
+/// recomputing schema identities locally, just as they do for an admitted session.
+pub struct ToolCatalog {
+    pub tools: Vec<Tool>,
+    pub schema_pins: BTreeMap<String, broca_wal::DispatchSchemaPin>,
+}
+
+/// Decode standalone tool discovery with the same validation and mappings as plan admission.
+pub fn decode_tool_catalog(provider: &str, value: Value) -> Result<ToolCatalog, FetchError> {
+    let fetched = decode_answer(value, false).map_err(|miss| {
+        FetchError::provider_refused(
+            INVALID_ANSWER.into(),
+            miss.provider_detail(CATALOG_OP),
+            "invalid tool.catalog answer",
+            false,
+        )
+    })?;
+    let schema_pins = frozen_provider_declarations(&fetched.answer, false)
+        .and_then(|declarations| declarations.schema_pins)
+        .unwrap_or_default();
+    Ok(ToolCatalog {
+        tools: fetched
+            .answer
+            .tools
+            .iter()
+            .map(|tool| session_tool(provider, tool))
+            .collect(),
+        schema_pins,
+    })
+}
+
 /// Refuse a catalog whose reference slots break the catalog's own rules
 /// (`check_reference_slots`), naming the tool and member, when the provider's tool item opts
 /// into output references. A provider that does not opt in is not checked: its slots are never
@@ -868,6 +935,7 @@ fn freeze_reply(reply: &cortexkit_role_tool_provider::catalog::Reply) -> broca_w
 /// display never depend on a provider's later catalog.
 fn frozen_provider_declarations(
     answer: &cortexkit_role_tool_provider::catalog::CatalogAnswer,
+    call_keepalive: bool,
 ) -> Option<FrozenProviderDeclarations> {
     let result_formats: BTreeMap<String, FrozenResultFormat> = answer
         .tools
@@ -882,6 +950,7 @@ fn frozen_provider_declarations(
         })
         .collect();
     let declarations = FrozenProviderDeclarations {
+        call_keepalive: call_keepalive.then_some(true),
         schema_pins: (!answer.tools.is_empty()).then(|| {
             answer
                 .tools
@@ -1051,67 +1120,17 @@ impl CatalogFetch<'_> {
     }
 }
 
-/// What a plan's compaction provider said about the role, once its `role.describe` arrived.
-#[derive(Debug)]
-enum CompactionDiscovery {
-    /// It serves `compaction-provider/v1` with every required op.
-    Served,
-    /// It said it does not serve `compaction-provider/v1`. Each problem is an object whose
-    /// `problem` member names it: the role crate's `DescribeProblem::name` for a readable
-    /// describe (`missing_major` with the majors `found`, or `missing_op` with the `op`), or
-    /// [`DESCRIBE_REFUSED`] with the refusal's `code`.
-    NotServed(Vec<Value>),
-}
-
 /// The problem naming a non-retryable refusal of `role.describe` itself.
 pub const DESCRIBE_REFUSED: &str = "describe_refused";
-
-/// Classify a compaction provider's answer to `role.describe`. Proof that the provider does
-/// not serve the role is either a describe that decodes and then lacks the
-/// `compaction-provider/v1` major or a required op, or the provider refusing the describe with
-/// a code that does not clear on retry. An answer that is not a describe at all (not an
-/// object, or missing a required member) is unreadable, so it is a miss like any other
-/// unusable fetch answer: it leaves admission unable to tell what the provider serves, which
-/// is not the same as the provider saying no.
-fn classify_compaction_describe(answer: &DescribeAnswer) -> Result<CompactionDiscovery, FetchMiss> {
-    use cortexkit_role_compaction_provider::describe::{check_describe, DescribeProblem};
-    let raw = match answer {
-        DescribeAnswer::Answered(raw) => raw,
-        DescribeAnswer::Refused { code } => {
-            return Ok(CompactionDiscovery::NotServed(vec![
-                json!({"problem": DESCRIBE_REFUSED, "code": code}),
-            ]));
-        }
-    };
-    let problems = match check_describe(raw) {
-        Ok(_) => return Ok(CompactionDiscovery::Served),
-        Err(problems) => problems,
-    };
-    let mut named = Vec::with_capacity(problems.len());
-    for problem in &problems {
-        named.push(match problem {
-            DescribeProblem::NotAnObject | DescribeProblem::Undecodable(_) => {
-                return Err(FetchMiss::invalid_answer(None));
-            }
-            DescribeProblem::MissingMajor { found } => {
-                json!({"problem": problem.name(), "found": found})
-            }
-            DescribeProblem::MissingOp(op) => json!({"problem": problem.name(), "op": op}),
-        });
-    }
-    Ok(CompactionDiscovery::NotServed(named))
-}
 
 /// Admit `plan`: fetch every provider it names through `fetcher`, all within `deadline` of now,
 /// and check the answers. `session` identifies warning records for unanswered fetches. Returns
 /// the manifest to freeze, or the refusal.
 ///
-/// Refusals, in the order they are decided: `invalid_params` naming `plan.compaction_item` when
-/// the plan's compaction provider answered a describe that does not serve the role (a
-/// permanent answer, so it outranks a miss elsewhere that a retry might clear);
-/// `fetch_unavailable` for the first provider (by id) whose required item, or whose compaction
-/// describe, did not answer; `plan_stale` listing every difference between what was answered
-/// and the plan; `tool_name_collision` for the first model-facing name offered twice.
+/// Refusals, in the order they are decided: `fetch_unavailable` for the first provider (by id)
+/// whose required catalog or declaration did not answer; `plan_stale` listing every difference
+/// between what was answered and the plan; `tool_name_collision` for the first model-facing
+/// name offered twice.
 pub async fn admit(
     plan: &Plan,
     fetcher: &dyn Fetcher,
@@ -1164,9 +1183,7 @@ pub async fn admit(
             deadline
         };
         async move {
-            within_deadline(fetch_deadline, || fetcher.catalog(fetch.provider, &request))
-                .await
-                .map_err(FetchMiss::from_error)
+            catalog_with_optional_keepalive(fetcher, fetch.provider, &request, fetch_deadline).await
         }
     }));
     let declarations = futures::future::join_all(plan.step_items.iter().map(|step| {
@@ -1198,29 +1215,24 @@ pub async fn admit(
             }
         }
     }));
-    // Only a plan that names a compaction provider asks one anything; a plan without one opens
-    // no compaction route. Discovery sends `role.describe` alone, never Setup.
-    let compaction = async {
-        let item = plan.compaction_item.as_ref()?;
-        Some(
-            within_deadline(deadline, || fetcher.describe_compaction(&item.provider))
-                .await
-                .map_err(FetchMiss::from_error)
-                .and_then(|answer| classify_compaction_describe(&answer)),
-        )
-    };
-    let (catalogs, declarations, compaction) = futures::join!(catalogs, declarations, compaction);
+    // Compaction availability is established by the session's content-free v2
+    // Setup, not admission-time discovery. Legacy sessions never contact v1.
+    let (catalogs, declarations) = futures::join!(catalogs, declarations);
     let mut raw_answers = BTreeMap::new();
+    let mut keepalive_promises = BTreeSet::new();
     let mut outcomes: BTreeMap<&str, Result<Fetched, FetchMiss>> = BTreeMap::new();
     let mut absent_tools = BTreeSet::new();
     for (fetch, outcome) in catalog_fetches.iter().zip(&catalogs) {
         let mut decoded = match outcome {
-            Ok(answer) => decode_answer(answer.clone(), fetch.text_item.is_some())
+            Ok((answer, _)) => decode_answer(answer.clone(), fetch.text_item.is_some())
                 .and_then(|fetched| check_opted_in_slots(fetched, fetch.tool_item)),
             Err(_) => continue,
         };
-        if let Ok(answer) = outcome {
+        if let Ok((answer, keepalive)) = outcome {
             raw_answers.insert(fetch.provider, answer.clone());
+            if *keepalive {
+                keepalive_promises.insert(fetch.provider);
+            }
         }
         if fetch.tool_item.is_some_and(|item| item.optional)
             && decoded
@@ -1364,30 +1376,6 @@ pub async fn admit(
             DeclarationOutcome::Answered { .. } => {}
         }
     }
-    let compaction_provider = plan
-        .compaction_item
-        .as_ref()
-        .map(|item| item.provider.as_str());
-    if let (Some(provider), Some(Err(missed))) = (compaction_provider, &compaction) {
-        missed.warn(session, &plan.identity, provider, DESCRIBE_OP);
-    }
-
-    // A compaction provider that said it does not serve the role will say so on every retry.
-    if let (Some(provider), Some(Ok(CompactionDiscovery::NotServed(problems)))) =
-        (compaction_provider, &compaction)
-    {
-        tracing::warn!(
-            target: "admission",
-            "compaction provider does not serve the role session={} provider={} op={}",
-            session.session,
-            provider,
-            DESCRIBE_OP,
-        );
-        return Err(Refusal::CompactionRoleNotServed {
-            provider: provider.to_owned(),
-            problems: problems.clone(),
-        });
-    }
 
     // A required item that did not answer refuses admission; an optional one is absent.
     let mut failures: BTreeMap<&str, (FetchMiss, &'static str)> = BTreeMap::new();
@@ -1406,11 +1394,6 @@ pub async fn admit(
                 .entry(&step.item.provider)
                 .or_insert_with(|| (missed.clone(), DECLARE_OP));
         }
-    }
-    if let (Some(provider), Some(Err(missed))) = (compaction_provider, &compaction) {
-        failures
-            .entry(provider)
-            .or_insert_with(|| (missed.clone(), DESCRIBE_OP));
     }
     if let Some((provider, (missed, op))) = failures.into_iter().next() {
         return Err(Refusal::FetchUnavailable {
@@ -1595,7 +1578,10 @@ pub async fn admit(
                             })
                             .collect(),
                     ),
-                    declarations_frozen: frozen_provider_declarations(&fetched.answer),
+                    declarations_frozen: frozen_provider_declarations(
+                        &fetched.answer,
+                        keepalive_promises.contains(provider),
+                    ),
                 },
                 Err(missed) => FetchOutcome::Absent {
                     reason: missed.unanswered.absence(),
@@ -1606,7 +1592,7 @@ pub async fn admit(
     let mut role_versions = BTreeMap::new();
     role_versions.insert("tool-provider".to_owned(), "v1".to_owned());
     if plan.compaction_item.is_some() {
-        role_versions.insert("compaction-provider".to_owned(), "v1".to_owned());
+        role_versions.insert("compaction-provider".to_owned(), "v2".to_owned());
     }
     if !plan.step_items.is_empty() {
         role_versions.insert("step-transform-provider".to_owned(), "v1".to_owned());
@@ -1693,6 +1679,7 @@ pub fn baseline_facts(manifest: &PlanManifest) -> BaselineFacts {
 
 #[cfg(test)]
 mod tests {
+    include!("call_keepalive_tests.rs");
     use std::sync::Mutex;
 
     use super::*;
@@ -2027,7 +2014,7 @@ mod tests {
                 "name":"work", "input_schema":{"type":"object"}, "schema_digest":digest, "semantics":7, "capabilities":[]
             }]
         })).unwrap();
-        let frozen = frozen_provider_declarations(&answer).unwrap();
+        let frozen = frozen_provider_declarations(&answer, false).unwrap();
         answer.tools[0].schema_digest = "0".repeat(64);
         answer.tools[0].semantics = 99;
         let round_trip: FrozenProviderDeclarations =

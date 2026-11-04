@@ -737,6 +737,37 @@ fn extraction_preserves_lineage_identity_and_sequence_and_runs_once() {
 }
 
 #[test]
+fn an_archived_mode3_session_restores_and_opens_for_writing() {
+    let f = Fixture::new();
+    f.live();
+    let path = f.store.wal_path(&f.session);
+    let mut payload = std::fs::read(&path).unwrap();
+    payload.extend(
+        broca_wal::framing::encode_with_requires(
+            4,
+            1,
+            &[broca_wal::COMPACTION_V2_FEATURE],
+            &WalRecord::StepStarted { step_id: StepId(4) },
+        )
+        .unwrap(),
+    );
+    let archive = f.archive(1, &payload);
+    let container = std::fs::read(&archive).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(f.store.read_records(&f.session).unwrap().len(), 4);
+    // This build runs mode-3 sessions, so an archived one restores to a live log and opens
+    // for writing like any other. (The 0.3.306 reader release refused here instead.)
+    let _ = &container;
+    drop(
+        f.store
+            .open(&f.session)
+            .expect("an archived mode-3 session opens for writing"),
+    );
+    assert!(path.exists(), "the open restored a live copy");
+    assert_eq!(f.store.read_records(&f.session).unwrap().len(), 4);
+}
+
+#[test]
 fn extraction_crash_cuts_follow_observed_operations_and_keep_session_readable() {
     // Discover cut points from a completed extraction's operation trace, including every
     // payload chunk, rather than duplicating a fixed list of crash windows in the test.

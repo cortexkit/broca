@@ -51,6 +51,8 @@ impl ServeHandler for InstantSessions {
     async fn read(&self, _req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         Ok(SessionReadResponse {
+            history_version: 0,
+            incarnation: "unwritten".into(),
             next_late_after: None,
             deferred_calls: None,
             late_approvals: None,
@@ -298,7 +300,7 @@ impl Rig {
             target: subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "broca".into(),
             },
-            identity: SubcBindIdentity::new(project_root, "runner", "classifier-test"),
+            identity: SubcBindIdentity::new("runner", "classifier-test"),
             principal,
             consumer_capabilities: None,
             admission_facts: None,
@@ -306,6 +308,8 @@ impl Rig {
             role_versions: (!role_versions.is_empty()).then_some(role_versions),
             call_mode: None,
         };
+        let mut bind = serde_json::to_value(bind).unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(project_root);
         write_frame(
             &mut self.daemon,
             &Frame::build(

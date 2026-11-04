@@ -11,12 +11,49 @@ use subc_protocol::ErrorBody;
 
 pub use broca_wire::diagnostics::OP;
 pub const REPLY_LIMIT: usize = 65_536;
-static ROOT: OnceLock<PathBuf> = OnceLock::new();
+enum RootSource {
+    Unselected(PathBuf),
+    Boot(broca_wal::state_format::OwnedStateRootDecision),
+}
+impl RootSource {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Unselected(root) => root,
+            Self::Boot(decision) => decision.root(),
+        }
+    }
+}
+static ROOT: OnceLock<(RootSource, broca_wal::WalConfig)> = OnceLock::new();
+static READER: OnceLock<std::sync::Arc<dyn broca_store::db::DiagnosticEvidenceReader>> =
+    OnceLock::new();
 
-pub fn install(root: PathBuf) {
+pub fn install(root: PathBuf, config: broca_wal::WalConfig) {
     crate::session_address_health::initialize();
     live::initialize();
-    let _ = ROOT.set(root);
+    let _ = ROOT.set((RootSource::Unselected(root), config));
+}
+
+/// Retain the boot capability for every request without another marker read.
+pub fn install_decided(
+    decision: broca_wal::state_format::OwnedStateRootDecision,
+    config: broca_wal::WalConfig,
+) {
+    crate::session_address_health::initialize();
+    live::initialize();
+    let _ = ROOT.set((RootSource::Boot(decision), config));
+}
+
+/// Boot can inject its selected reader without changing the diagnostic service.
+/// The legacy installer retains its existing read-only connection behavior.
+/// Configure a concrete SqliteStore with the boot WalConfig before erasing its
+/// type; the config here also gates recovery-manifest diagnostics.
+pub fn install_with_reader(
+    root: PathBuf,
+    reader: std::sync::Arc<dyn broca_store::db::DiagnosticEvidenceReader>,
+    config: broca_wal::WalConfig,
+) {
+    install(root, config);
+    let _ = READER.set(reader);
 }
 
 pub fn admit(principal: Option<&BindPrincipal>, scope: &SendScope) -> Result<(), ErrorBody> {
@@ -42,6 +79,8 @@ pub fn admit(principal: Option<&BindPrincipal>, scope: &SendScope) -> Result<(),
 }
 
 pub struct Evidence {
+    pub tool_result_json_dumps: Result<broca_subc::tool_result_diagnostics::Snapshot, String>,
+    pub recovery_cuts: Vec<Finding>,
     pub runs: Runs,
     pub late_fence_ms: Option<i64>,
     pub late_delivery_stuck: Vec<Value>,
@@ -56,14 +95,28 @@ pub fn gather(
     catalog_age_ms: Result<i64, String>,
     since: i64,
     now: i64,
+    config: broca_wal::WalConfig,
 ) -> Result<Evidence, ErrorBody> {
-    let store =
-        broca_store::SqliteStore::open_read_only(root.join("run-index.db")).map_err(|_| {
-            ErrorBody::new(
-                "store_error",
-                "diagnostics.findings cannot read run-index.db",
-            )
-        })?;
+    let store = broca_store::db::open_diagnostic_reader(root, config).map_err(|_| {
+        ErrorBody::new(
+            "store_error",
+            format!(
+                "diagnostics.findings cannot read {}",
+                broca_store::db::operational_database_name(root).unwrap_or("state-format")
+            ),
+        )
+    })?;
+    gather_with_reader(root, store.as_ref(), catalog_age_ms, since, now, config)
+}
+
+pub fn gather_with_reader(
+    root: &Path,
+    store: &dyn broca_store::db::DiagnosticEvidenceReader,
+    catalog_age_ms: Result<i64, String>,
+    since: i64,
+    now: i64,
+    config: broca_wal::WalConfig,
+) -> Result<Evidence, ErrorBody> {
     let runs = store.diagnostic_evidence(since, now).map_err(|_| {
         ErrorBody::new(
             "store_error",
@@ -87,6 +140,13 @@ pub fn gather(
         }
     };
     Ok(Evidence {
+        tool_result_json_dumps: broca_subc::tool_result_diagnostics::TOOL_RESULT_JSON_DUMPS
+            .snapshot(since, now),
+        recovery_cuts: if config.is_overhaul() {
+            recovery_cut_findings(root, now)
+        } else {
+            Vec::new()
+        },
         runs,
         late_fence_ms,
         late_delivery_stuck: crate::held_runtime::health_gauges()["late_results_delivery_stuck"]
@@ -97,6 +157,10 @@ pub fn gather(
         retention: live::retention_fences(),
         unmapped_credentials: crate::account_routing::published_unmapped_credentials(),
         rings: [
+            (
+                "session_log_missing".into(),
+                crate::session_address_health::missing_snapshot(since, now),
+            ),
             (
                 "session_inventory_repairs".into(),
                 crate::session_address_health::repair_snapshot(since, now),
@@ -146,13 +210,41 @@ pub fn serving_reply(
     now: i64,
 ) -> Result<Reply, ErrorBody> {
     answer(params, principal, scope, now, |since| {
-        let root = ROOT.get().ok_or_else(|| {
+        let (source, config) = ROOT.get().ok_or_else(|| {
             ErrorBody::new(
                 "store_error",
                 "diagnostics.findings run-index source is not configured",
             )
         })?;
-        gather(root, catalog_age, since, now)
+        let root = source.path();
+        if let Some(reader) = READER.get() {
+            gather_with_reader(root, reader.as_ref(), catalog_age, since, now, *config)
+        } else if let RootSource::Boot(decision) = source {
+            let decision = decision.borrowed();
+            let database = if decision.legacy().is_some() {
+                "run-index.db"
+            } else {
+                "broca.db"
+            };
+            let store = broca_store::db::open_diagnostic_reader_decided(decision, *config)
+                .map_err(|_| {
+                    ErrorBody::new(
+                        "store_error",
+                        format!("diagnostics.findings cannot read {database}"),
+                    )
+                })?;
+            gather_with_reader(root, store.as_ref(), catalog_age, since, now, *config)
+        } else {
+            let store = broca_store::SqliteStore::open_read_only(root.join("run-index.db"))
+                .map_err(|_| {
+                    ErrorBody::new(
+                        "store_error",
+                        "diagnostics.findings cannot read run-index.db",
+                    )
+                })?
+                .with_wal_config(*config);
+            gather_with_reader(root, &store, catalog_age, since, now, *config)
+        }
     })
 }
 
@@ -184,6 +276,103 @@ fn unavailable(check: &str, now: i64) -> Finding {
         "Inspect health.check and the broca daemon log for an unavailable diagnostic evidence source.");
     f.samples.push(json!({"code":"evidence_unavailable"}));
     f
+}
+
+/// Manifests are immutable recovery evidence. Read metadata only, with bounded
+/// traversal and file size; raw removed content never enters diagnostics.
+pub fn recovery_cut_findings(root: &Path, now: i64) -> Vec<Finding> {
+    use std::io::Read;
+    let mut directories = ["wal", "wal-ephemeral", "wal-durable"]
+        .map(|name| root.join(name))
+        .to_vec();
+    let mut findings = Vec::new();
+    let mut scanned = 0;
+    while let Some(directory) = directories.pop() {
+        let entries = match broca_wal::fs_ops::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                findings.push(unavailable("wal_recovery_cut", now));
+                break;
+            }
+        };
+        for entry in entries {
+            scanned += 1;
+            if scanned > SCAN_LIMIT {
+                findings.push(unavailable("wal_recovery_cut", now));
+                return findings;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    findings.push(unavailable("wal_recovery_cut", now));
+                    continue;
+                }
+            };
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(_) => {
+                    findings.push(unavailable("wal_recovery_cut", now));
+                    continue;
+                }
+            };
+            if kind.is_dir() {
+                directories.push(entry.path());
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.contains(".cut-") || !name.ends_with(".json") {
+                continue;
+            }
+            let manifest = (|| {
+                let mut bytes = Vec::new();
+                broca_wal::fs_ops::File::open(entry.path())
+                    .ok()?
+                    .take(1_048_577)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                if bytes.len() > 1_048_576 {
+                    return None;
+                }
+                serde_json::from_slice::<broca_wal::recovery::CutManifest>(&bytes).ok()
+            })();
+            let Some(manifest) = manifest else {
+                findings.push(unavailable("wal_recovery_cut", now));
+                continue;
+            };
+            if !manifest.integrity_valid() {
+                findings.push(unavailable("wal_recovery_cut", now));
+                continue;
+            }
+            let mut warning = finding("wal_recovery_cut", manifest.recovery.cut_id.clone(), Severity::Warn, now, now,
+                "WAL recovery preserved a damaged suffix; some tool-call attribution may have been lost.",
+                "Inspect the session and preserved .cut sidecar before manually repeating external effects. Set wal_recovery to refuse to disable automatic repair.");
+            warning.samples.push(json!({"session":manifest.session,"reason":manifest.recovery.reason.as_str(),
+                "cut_offset":manifest.recovery.cut_offset,"removed_bytes":manifest.recovery.removed_len,
+                "unattributed_tool_risk":manifest.recovery.unattributed_tool_risk}));
+            let raw = directory.join(&manifest.recovery.sidecar_basename);
+            let raw_available = !manifest.recovery.sidecar_basename.contains(['/', '\\'])
+                && broca_wal::fs_ops::File::open(&raw)
+                    .and_then(|file| file.metadata())
+                    .is_ok_and(|metadata| {
+                        metadata.is_file() && metadata.len() == manifest.recovery.removed_len
+                    });
+            if !raw_available {
+                warning
+                    .samples
+                    .push(json!({"removed_evidence":"unreadable"}));
+            }
+            if !manifest.recovery.unowned_calls.is_empty() {
+                warning.samples.push(json!({"outcome":"unknown",
+                    "unowned_calls":manifest.recovery.unowned_calls}));
+            }
+            findings.push(warning);
+        }
+    }
+    findings
 }
 
 fn group(
@@ -344,9 +533,67 @@ fn error_floor(class: &str, code: &str, window: i64) -> (u64, Severity) {
 }
 
 pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
-    let mut findings = Vec::new();
+    let mut findings = std::mem::take(&mut evidence.recovery_cuts);
+    for pending in &evidence.runs.pending_recovery {
+        let session = broca_core::wal_writer::agent_session_ref(&pending.session);
+        let (summary, hint) = if pending.evidence_unreadable {
+            ("A session's recovery metadata is unreadable; its indexed run summaries are withheld.",
+                "Inspect the session's recovery metadata and WAL before restoring or rebuilding its materialized views.")
+        } else {
+            ("WAL recovery is pending for a session; its indexed run summaries are withheld.",
+                "Inspect the session's WAL recovery error and reopen it with a writable, correctly configured owner to finish rebuilding its views.")
+        };
+        let mut warning = finding(
+            "wal_recovery_cut",
+            format!("pending:{session}"),
+            Severity::Warn,
+            now,
+            now,
+            summary,
+            hint,
+        );
+        warning.samples.push(
+            json!({"session":session,"pending":true,"cut_ids":&pending.cut_ids,
+            "evidence_unreadable":pending.evidence_unreadable}),
+        );
+        findings.push(warning);
+    }
     findings.extend(data_quality(&evidence.runs, now));
     let mut coverage = BTreeMap::new();
+    match evidence.tool_result_json_dumps {
+        Ok(snapshot) => {
+            coverage.insert(
+                "tool_result_json_dump".into(),
+                Coverage {
+                    since_ms: snapshot.since_ms,
+                    truncated: snapshot.truncated,
+                },
+            );
+            for tool in snapshot.tools {
+                let mut f = finding(
+                    "tool_result_json_dump",
+                    json!([tool.module_id, tool.tool_name]).to_string(),
+                    Severity::Warn,
+                    tool.first_seen_ms,
+                    tool.last_seen_ms,
+                    "A tool provider dumped raw JSON into model-visible text.",
+                    "The tool provider should shape its output into concise model-facing text instead of dumping raw JSON.",
+                );
+                f.count = tool.count;
+                f.samples = tool
+                    .samples
+                    .into_iter()
+                    .map(|sample| {
+                        json!({"module_id":tool.module_id,"tool_name":tool.tool_name,
+                        "session":sample.session,"call_key":sample.call_key,
+                        "text_bytes":sample.text_bytes,"coverage_since_ms":snapshot.since_ms})
+                    })
+                    .collect();
+                findings.push(f);
+            }
+        }
+        Err(_) => findings.push(unavailable("tool_result_json_dump", now)),
+    }
     let live_truncated = evidence.runs.live.len() > SCAN_LIMIT;
     let paused: Vec<_> = evidence
         .runs
@@ -535,7 +782,7 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
                     code,
                 } in snapshot.events
                 {
-                    let key = if check == "tool_outages" {
+                    let key = if check == "tool_outages" || check == "session_log_missing" {
                         module.clone()
                     } else if check == "catalog_stale" {
                         "refusals".into()
@@ -555,6 +802,11 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
                             f.severity = if code == "failed" { Severity::Error } else { Severity::Info };
                             f.summary = format!("Session inventory repairs {} in the observed window.", code);
                             f.hint = "Inspect health.check session_address_refusals.repairs and the session-ref migration log; known sessions remain available during repair.".into();
+                        }
+                        if check == "session_log_missing" {
+                            f.severity = Severity::Error;
+                            f.summary = format!("Session {} has history but its log is missing.", module);
+                            f.hint = "Stop broca and inspect store-maintenance repair-session-root; do not create a replacement log.".into();
                         }
                         f.count=0;f
                     });
@@ -613,3 +865,157 @@ pub fn trim(mut reply: Reply) -> Reply {
 #[cfg(test)]
 #[path = "diagnostics_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod operational_port_tests {
+    use super::*;
+    use broca_core::{RunIndex, RunIndexAttribution, RunIndexRow, RunIndexState};
+    use broca_store::db::{DiagnosticEvidenceReader, LogLocation, OverhaulDb, PublishedSession};
+    use broca_wal::WalRecord;
+
+    #[test]
+    fn diagnostics_findings_match_legacy_from_the_same_lifecycle_records() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("diagnostic-ports-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+        let db = OverhaulDb::open(&root).unwrap();
+        let legacy = broca_store::SqliteStore::open_in_memory().unwrap();
+        let source = broca_wal::replay_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/fixtures/resume-close-out-sealed.wal"),
+            broca_wal::DEFAULT_MAX_READ_BYTES,
+        )
+        .unwrap();
+        let start = source
+            .iter()
+            .find(|f| matches!(f.record, WalRecord::RunStarted { .. }))
+            .unwrap()
+            .record
+            .clone();
+        let terminal = source
+            .iter()
+            .find(|f| matches!(f.record, WalRecord::RunFinished { .. }))
+            .unwrap()
+            .record
+            .clone();
+        let bind = broca_protocol::BindIdentity::new("/project", "runner", "diagnostic");
+        let mut records = Vec::new();
+        for (id, paused, timed) in [
+            ("paused", true, true),
+            ("error", false, true),
+            ("untimed", false, false),
+        ] {
+            let mut start = start.clone();
+            if let WalRecord::RunStarted {
+                session,
+                run_id,
+                ts_ms,
+                ..
+            } = &mut start
+            {
+                *session = bind.clone();
+                run_id.0 = id.into();
+                *ts_ms = Some(100);
+            }
+            let last = if paused {
+                WalRecord::RunPaused {
+                    account_limit: None,
+                    run_id: broca_protocol::RunId(id.into()),
+                    reason: broca_protocol::PauseReason::AuthRequired,
+                    error: None,
+                    ts_ms: Some(200),
+                }
+            } else {
+                let mut value = serde_json::to_value(&terminal).unwrap();
+                value["reason"] = json!("error");
+                value["ts_ms"] = if timed { json!(200) } else { Value::Null };
+                value["error"] = json!({"class":"auth_required","message":"PRIVATE_DIAGNOSTIC_MESSAGE","provider_code":"invalid_api_key","credential_id":"credential"});
+                serde_json::from_value(value).unwrap()
+            };
+            let mut attribution = RunIndexAttribution::default();
+            attribution.observe(&start);
+            attribution.observe(&last);
+            let state = if paused {
+                RunIndexState::Paused
+            } else {
+                RunIndexState::Error
+            };
+            legacy
+                .index_run_active(&RunIndexRow {
+                    run_id: id.into(),
+                    session: bind.clone(),
+                    state: RunIndexState::Active,
+                    submission_id: None,
+                    request_identity_digest: None,
+                    usage: None,
+                    final_step_finish_reason: None,
+                    retries_used: 0,
+                    title: None,
+                    withdrawals_owed: false,
+                })
+                .unwrap();
+            legacy
+                .index_run_attributed(id, state, None, None, 0, &attribution)
+                .unwrap();
+            records.extend([start, last]);
+        }
+        let bytes: Vec<_> = records
+            .iter()
+            .enumerate()
+            .flat_map(|(n, record)| broca_wal::framing::encode(n as u64 + 1, 1, record).unwrap())
+            .collect();
+        db.index(&PublishedSession {
+            bind: &bind,
+            session_ref: "diagnostic",
+            location: LogLocation::Live,
+            bytes: &bytes,
+        })
+        .unwrap();
+        let evidence = |runs| Evidence {
+            tool_result_json_dumps: Ok(broca_subc::tool_result_diagnostics::Snapshot {
+                since_ms: 150,
+                truncated: false,
+                tools: vec![],
+            }),
+            recovery_cuts: Vec::new(),
+            runs,
+            late_fence_ms: None,
+            late_delivery_stuck: vec![],
+            retention: Ok(vec![]),
+            catalog_age_ms: Ok(100),
+            unmapped_credentials: BTreeMap::new(),
+            rings: BTreeMap::new(),
+        };
+        let legacy = report(
+            evidence(legacy.diagnostic_evidence(150, 1000).unwrap()),
+            1000,
+            850,
+        );
+        let overhaul = report(
+            evidence(db.diagnostic_evidence(150, 1000).unwrap()),
+            1000,
+            850,
+        );
+        assert!(!legacy.findings.is_empty());
+        assert_eq!(
+            serde_json::to_value(overhaul).unwrap(),
+            serde_json::to_value(legacy).unwrap()
+        );
+        for name in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
+            assert!(!root.join(name).exists());
+        }
+        assert!(gather(&root, Ok(100), 150, 1000, broca_wal::WalConfig::OVERHAUL).is_ok());
+        drop(db);
+        std::fs::remove_file(root.join("broca.db")).unwrap();
+        assert_eq!(
+            gather(&root, Ok(100), 150, 1000, broca_wal::WalConfig::OVERHAUL)
+                .err()
+                .unwrap()
+                .code
+                .as_str(),
+            "store_error"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

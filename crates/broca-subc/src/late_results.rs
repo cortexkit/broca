@@ -582,6 +582,24 @@ mod tests {
     /// the result body through the `content/v1` mapper, the reduced outcome, and the two
     /// terminal kinds. Progress and unknown kinds settle nothing.
     #[test]
+    fn oversized_late_payload_is_discarded_without_counting_its_envelope() {
+        let id = broca_protocol::ToolCallId("late".into());
+        for bytes in [65_536, 65_537] {
+            let mut entry = settled("result");
+            entry.result =
+                Some(serde_json::json!({"content":[{"type":"text","text":"x".repeat(bytes)}]}));
+            let stored = late_entry_tool_result(&id, &entry).unwrap();
+            assert_eq!(stored.is_error, bytes > 65_536);
+            if bytes > 65_536 {
+                assert!(
+                    matches!(stored.output, broca_protocol::ToolOutput::Error { code: Some(code), detail: Some(detail), .. }
+                    if code == "tool_result_too_large" && serde_json::from_str::<serde_json::Value>(&detail).unwrap()["bytes"] == 65_537)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_late_entry_becomes_its_held_calls_result_with_pinned_text() {
         let id = broca_protocol::ToolCallId("tc_1".into());
         let render = |entry: &LateEntry| {
@@ -612,6 +630,12 @@ mod tests {
             render(&settled(kinds::NOT_STARTED).with_reason("restart_before_dispatch")),
             Some(
                 json!({"tool_call_id": "tc_1", "output": {"kind": "error", "message": "This call never ran: its provider settled it as not started (restart_before_dispatch)."}, "is_error": true})
+            )
+        );
+        assert_eq!(
+            render(&settled(kinds::NOT_STARTED).with_reason("scope_ended")),
+            Some(
+                json!({"tool_call_id": "tc_1", "output": {"kind": "error", "message": "This call never ran: its provider settled it as not started (scope_ended)."}, "is_error": true})
             )
         );
         assert_eq!(

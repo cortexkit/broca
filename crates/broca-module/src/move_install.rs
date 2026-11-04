@@ -76,11 +76,18 @@ pub fn check_installations(installations: &[Installation<'_>]) -> Result<(), Err
 /// which prevents sends from advancing the installed bytes before recovery checks
 /// them. Without that intent, do not invoke the missing-staging recovery path.
 /// `drop_projection` removes derived session data, never billing facts or floors.
-pub fn install_verified(
+/// The caller holds the move coordinator's durable activation intent and session
+/// guards. Exclusions become durable before a moved session can be served or
+/// billed; an interrupted install remains fenced until recovery completes it.
+/// This is not one transaction spanning SQLite, filesystem rename and cut state.
+/// Activation cannot be aborted after its intent is recorded. A successful abort
+/// occurs before activation, when no exclusion writes have been attempted.
+pub fn install_verified<E: broca_core::ImportedRunExclusions + ?Sized>(
     state_root: &Path,
     cut_id: &str,
     installations: &[Installation<'_>],
-    export: &dyn broca_core::ExportIndex,
+    export: &E,
+    before_rewrite: impl Fn(&BindIdentity) -> Result<(), String>,
     drop_projection: impl Fn(&BindIdentity) -> Result<(), String>,
 ) -> Result<(), ErrorBody> {
     check_installations(installations)?;
@@ -105,6 +112,10 @@ pub fn install_verified(
                     None => Vec::new(),
                 }
             };
+            let history_replaced = !local.is_empty()
+                && !broca_core::replay_transcript(&incoming)
+                    .map_err(unavailable)?
+                    .starts_with(&broca_core::replay_transcript(&local).map_err(unavailable)?);
             let imported: std::collections::BTreeSet<_> =
                 broca_core::imported_run_ids(&incoming, &local)
                     .into_iter()
@@ -144,6 +155,9 @@ pub fn install_verified(
                 .parent()
                 .ok_or_else(|| unavailable("live WAL has no directory"))?;
             broca_wal::migration::durable_dir(state_root, parent).map_err(unavailable)?;
+            if history_replaced {
+                before_rewrite(item.session).map_err(unavailable)?;
+            }
             fs::rename(item.staged, item.live).map_err(unavailable)?;
             broca_wal::migration::sync_dir(parent).map_err(unavailable)?;
             broca_wal::migration::sync_dir(item.staged.parent().unwrap()).map_err(unavailable)?;

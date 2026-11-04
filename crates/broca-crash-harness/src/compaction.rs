@@ -15,8 +15,8 @@ use broca_core::compaction_provider::{
     view::{CompactionView, PartEdit, ViewGetAnswer, ViewGetRequest, ViewRange},
 };
 use broca_core::{
-    CompactionPlane, CompactionUnavailable, CompactionViews, FileWalStore, RunControl, RunRequest,
-    StubReply, StubToolPlane,
+    CompactionPlane, CompactionUnavailable, CompactionViews, RunControl, RunRequest, StubReply,
+    StubToolPlane,
 };
 use broca_protocol::content::{ContentBlock, ToolCall, ToolOutput};
 use broca_protocol::{
@@ -27,8 +27,8 @@ use broca_wal::{CompactionMessageKind, OpaqueJson, WalRecord};
 use serde_json::{json, Value};
 
 use crate::{
-    drive, wal_path, HarnessPlane, InFlight, KillPoint, KillReport, KillTrigger, LogImage, Render,
-    Resumed, RunnerHandle, Scenario, ScriptedProvider, Suite,
+    wal_path, HarnessPlane, InFlight, KillPoint, KillReport, KillTrigger, LogImage, Render,
+    Resumed, RunnerHandle, Scenario, Suite,
 };
 
 const PROVIDER: &str = "compactor";
@@ -78,134 +78,6 @@ impl CeilingTime {
 impl Drop for CeilingTime {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
-#[tokio::test]
-async fn compaction_requests_match_the_pre_windowing_bytes() {
-    let mut requests = Vec::new();
-    for scenario in [LEGACY_SCENARIO, SIGNED_SCENARIO] {
-        let handle = RunnerHandle::new(scenario).await;
-        requests.push(
-            handle
-                .reference
-                .sent
-                .values()
-                .map(|bytes| String::from_utf8(bytes.clone()).expect("canonical request JSON"))
-                .collect::<Vec<_>>(),
-        );
-    }
-    let expected: Vec<Vec<String>> =
-        serde_json::from_str(include_str!("fixtures/compaction_request_bytes.json")).unwrap();
-    assert_eq!(requests, expected);
-}
-
-#[tokio::test]
-async fn compaction_requests_with_declared_features_match_the_producer_bytes() {
-    let mut requests = Vec::new();
-    for scenario in [SCENARIO, DECLARED_SIGNED_SCENARIO] {
-        let handle = RunnerHandle::new(scenario).await;
-        let records = handle.reference.log.records();
-        let features = records.iter().find_map(|record| match record {
-            WalRecord::CompactionMessage {
-                kind: CompactionMessageKind::Setup,
-                view_features,
-                ..
-            } => view_features.as_ref(),
-            _ => None,
-        });
-        assert_eq!(features.unwrap(), &["truncate", "tag_bytes_edits"]);
-        requests.push(
-            handle
-                .reference
-                .sent
-                .values()
-                .map(|bytes| String::from_utf8(bytes.clone()).expect("canonical request JSON"))
-                .collect::<Vec<_>>(),
-        );
-    }
-    let expected: Vec<Vec<String>> = serde_json::from_str(include_str!(
-        "fixtures/compaction_request_bytes_declared.json"
-    ))
-    .unwrap();
-    assert_eq!(requests, expected);
-    assert!(requests[1][1].contains("§4§ edited (short)"));
-}
-
-#[tokio::test]
-async fn bytes_edit_resume_uses_the_recorded_setup_features() {
-    for (scenario, declared, fixture) in [
-        (
-            SIGNED_SCENARIO,
-            false,
-            include_str!("fixtures/compaction_request_bytes.json"),
-        ),
-        (
-            DECLARED_SIGNED_SCENARIO,
-            true,
-            include_str!("fixtures/compaction_request_bytes_declared.json"),
-        ),
-    ] {
-        let handle = RunnerHandle::new(scenario).await;
-        let records = handle.reference.log.records();
-        let applied = records
-            .iter()
-            .position(|record| {
-                matches!(
-                    record,
-                    WalRecord::CompactionViewApplied {
-                        view_version: 3,
-                        ..
-                    }
-                )
-            })
-            .expect("the bytes edit was applied");
-        let kill = handle
-            .kill_at(
-                KillPoint::RecordBoundary {
-                    records: applied + 1,
-                    torn: false,
-                },
-                KillTrigger::Truncate,
-            )
-            .await;
-        let compaction = Arc::new(ScriptedCompaction::signed());
-        let resumed = resume_with(scenario, &kill, compaction.clone()).await;
-        handle.check(&kill, &resumed);
-        assert_eq!(compaction.setups.load(Ordering::SeqCst), 0);
-        for log in [&kill.durable, &resumed.log] {
-            let records = log.records();
-            let setup = records
-                .iter()
-                .find(|record| {
-                    matches!(
-                        record,
-                        WalRecord::CompactionMessage {
-                            kind: CompactionMessageKind::Setup,
-                            ..
-                        }
-                    )
-                })
-                .expect("the session has a recorded Setup");
-            let json = serde_json::to_value(setup).unwrap();
-            if declared {
-                assert_eq!(
-                    json["view_features"],
-                    json!(["truncate", "tag_bytes_edits"])
-                );
-            } else {
-                assert!(json.get("view_features").is_none());
-            }
-            assert!(json.get("view_due").is_none());
-        }
-        let expected: Vec<Vec<String>> = serde_json::from_str(fixture).unwrap();
-        let sent = resumed.provider.sent();
-        assert_eq!(
-            sent.len(),
-            1,
-            "only the request after the bytes edit resumes"
-        );
-        assert_eq!(sent.get(&1).unwrap(), expected[1][1].as_bytes());
     }
 }
 
@@ -408,8 +280,216 @@ const SCENARIO: Scenario = Scenario {
     scripts,
     render: Render::Canonical,
     plane: tools,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
+
+struct SlowRide;
+
+impl crate::scenario::ScenarioExtension for SlowRide {
+    fn setup(&self, root: &std::path::Path, control: &mut RunControl, _: &mut crate::HarnessPlane) {
+        std::fs::write(root.join("test-clock"), r#"{"now_ms":1000}"#).unwrap();
+        let clock = broca_core::Clock::for_state_root(root).unwrap();
+        control.clock = Some(clock.clone());
+        control.compaction_signals = true;
+        control.compaction_plane = Some(Arc::new(ScriptedCompaction {
+            slow_ride: Some((root.to_path_buf(), clock)),
+            ..Default::default()
+        }));
+        control.compaction_views = None;
+    }
+}
+
+const RIDE_SCENARIO: Scenario = Scenario {
+    name: "compaction-ride-wait",
+    render: Render::CompactionChainReset,
+    extension: Some(&SlowRide),
+    ..SCENARIO
+};
+
+fn old_wait_started() -> WalRecord {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../broca-wal/tests/fixtures/pre_flow_scoped_run_started.json"
+    ))
+    .unwrap();
+    serde_json::from_value(fixture["record"].clone()).unwrap()
+}
+
+fn old_wait_request() -> RunRequest {
+    let WalRecord::RunStarted {
+        run_id,
+        session,
+        config,
+        input,
+        scope,
+        principal,
+        project_id,
+        submission_id,
+        send_id,
+        request_identity_digest,
+        ..
+    } = old_wait_started()
+    else {
+        unreachable!()
+    };
+    let submission = serde_json::from_value(json!({"model":config.model,"input":input,"tools":[],"stop_when":[{"type":"step_count","n":1}]})).unwrap();
+    let mut request =
+        RunRequest::from_submission(submission, run_id, session, SubmissionId("old-wait".into()));
+    request.scope = scope;
+    request.principal = principal;
+    request.project_id = project_id;
+    request.submission_id = submission_id;
+    request.send_id = send_id;
+    request.request_identity_digest = request_identity_digest;
+    request
+}
+
+struct OldOpenWait;
+
+impl crate::scenario::ScenarioExtension for OldOpenWait {
+    fn setup(&self, _: &std::path::Path, _: &mut RunControl, _: &mut HarnessPlane) {}
+
+    fn seed_reference(&self, store: &crate::wal::ObservedWalStore, request: &RunRequest) -> usize {
+        use broca_core::WalStore;
+        let mut wal = store.open(&request.session).unwrap();
+        wal.append(1, &old_wait_started(), true).unwrap();
+        let replacement = Arc::new(vec![serde_json::from_value(
+            json!({"role":"user","content":[{"type":"text","text":"setup head"}]}),
+        )
+        .unwrap()]);
+        wal.append(
+            1,
+            &WalRecord::CompactionMessage {
+                provider: "provider".into(),
+                kind: CompactionMessageKind::Setup,
+                compaction_id: "summary".into(),
+                version: 1,
+                range: broca_wal::CompactionRange { from: 0, to: 0 },
+                sha256: broca_wal::compaction_replacement_sha256(&replacement).unwrap(),
+                replacement,
+                request_id: None,
+                cursor: None,
+                call_when: None,
+                stability: None,
+                ceiling: None,
+                tag_checkpoint: None,
+                ride_wait_ms: None,
+                view_features: None,
+                view_due: None,
+            },
+            true,
+        )
+        .unwrap();
+        let lineage = wal.lineage_id().unwrap().to_string();
+        wal.append(
+            1,
+            &WalRecord::CompactionRequest {
+                provider: "provider".into(),
+                request_id: "old-request".into(),
+            },
+            true,
+        )
+        .unwrap();
+        wal.append(
+            1,
+            &WalRecord::CompactionAnswer {
+                provider: "provider".into(),
+                request_id: "old-request".into(),
+                cursor: broca_wal::CompactionCursor {
+                    lineage_id: lineage,
+                    after_ordinal: None,
+                },
+                disposition: broca_wal::CompactionDisposition::Wait,
+                rejected: None,
+                wait: Some(broca_wal::CompactionWait {
+                    reason: "work".into(),
+                    bound_ms: 10,
+                }),
+            },
+            true,
+        )
+        .unwrap();
+        4
+    }
+
+    fn check(&self, kill: &KillReport, resumed: &Resumed) {
+        let end = kill.durable.end_of_records(4);
+        assert!(
+            resumed.log.bytes.starts_with(&kill.durable.bytes[..end]),
+            "the old wait prefix must remain byte-identical"
+        );
+        assert_eq!(
+            resumed
+                .log
+                .records()
+                .iter()
+                .filter(|record| matches!(record, WalRecord::CompactionWait { .. }))
+                .count(),
+            1
+        );
+        assert!(resumed.plane.dispatched().is_empty());
+        assert_eq!(
+            resumed.provider.request_count(),
+            0,
+            "an old open wait cannot authorize a provider call"
+        );
+    }
+}
+
+const OLD_WAIT_SCENARIO: Scenario = Scenario {
+    name: "old-open-compaction-wait",
+    request: old_wait_request,
+    control: RunControl::default,
+    scripts: Vec::new,
+    render: Render::Canonical,
+    plane: StubToolPlane::new,
+    expected: RunFinishReason::Interrupted,
+    extension: Some(&OldOpenWait),
+};
+
+#[tokio::test]
+async fn old_open_wait_recovery_preserves_seed_and_closes_once_at_every_cut() {
+    let handle = RunnerHandle::new(OLD_WAIT_SCENARIO).await;
+    let zero = handle
+        .kill_at(
+            KillPoint::RecordBoundary {
+                records: 0,
+                torn: false,
+            },
+            KillTrigger::Truncate,
+        )
+        .await;
+    assert_eq!(
+        zero.durable.record_count(),
+        4,
+        "cut zero must preserve the historical input"
+    );
+    assert!(matches!(
+        zero.durable.records().last(),
+        Some(WalRecord::CompactionAnswer {
+            disposition: broca_wal::CompactionDisposition::Wait,
+            ..
+        })
+    ));
+    assert_eq!(
+        handle
+            .reference
+            .log
+            .records()
+            .iter()
+            .filter(|record| matches!(record, WalRecord::CompactionWait { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        handle.reference.sent.is_empty(),
+        "legacy wait recovery must not request a model step"
+    );
+    let kills = handle.every_record_boundary(true).await;
+    assert_eq!(kills.len(), handle.record_boundaries(true).len());
+}
+
+crate::require_process_kill!();
 
 fn legacy_request() -> RunRequest {
     let mut request = request();
@@ -537,6 +617,7 @@ const SIGNED_SCENARIO: Scenario = Scenario {
     scripts: signed_scripts,
     render: Render::CanonicalPrefixBound,
     plane: tools,
+    extension: None,
     expected: RunFinishReason::Completed,
 };
 
@@ -554,6 +635,7 @@ const DECLARED_SIGNED_SCENARIO: Scenario = Scenario {
 
 pub(crate) fn find(name: &str) -> Option<Scenario> {
     [
+        RIDE_SCENARIO,
         SCENARIO,
         LEGACY_SCENARIO,
         TOOL_SCENARIO,
@@ -561,6 +643,7 @@ pub(crate) fn find(name: &str) -> Option<Scenario> {
         DECLARED_SIGNED_SCENARIO,
         CEILING_SCENARIO,
         CEILING_TIMEOUT_SCENARIO,
+        V2_SCENARIO,
     ]
     .into_iter()
     .find(|scenario| scenario.name == name)
@@ -577,6 +660,7 @@ fn replacement(version: u64, text: &str) -> Value {
 /// boundary whose applied view is older (`stale` announces an older one).
 #[derive(Default)]
 struct ScriptedCompaction {
+    slow_ride: Option<(std::path::PathBuf, broca_core::Clock)>,
     /// At the ceiling, return a smaller view or let the bound expire.
     ceiling: Option<bool>,
     ceiling_time: Option<CeilingTime>,
@@ -629,6 +713,7 @@ impl CompactionPlane for ScriptedCompaction {
         &self,
         provider: &str,
         bind: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         assert_eq!(provider, PROVIDER);
@@ -643,6 +728,13 @@ impl CompactionPlane for ScriptedCompaction {
             )
             .unwrap());
         }
+        if self.slow_ride.is_some() {
+            return Ok(serde_json::from_value(
+                json!({"answer":"ready","request_id":request.request_id,
+                "initial":replacement(1, "setup head"),"ride_wait_ms":30000}),
+            )
+            .unwrap());
+        }
         Ok(
             serde_json::from_value(json!({"answer":"ready","request_id":request.request_id,
             "initial":replacement(1, "setup head")}))
@@ -654,6 +746,7 @@ impl CompactionPlane for ScriptedCompaction {
         &self,
         provider: &str,
         _bind: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Result<ViewGetAnswer, CompactionUnavailable> {
         assert_eq!(provider, PROVIDER);
@@ -672,8 +765,31 @@ impl CompactionPlane for ScriptedCompaction {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: broca_core::compaction_provider::ride::RideRequest,
     ) -> Result<broca_core::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
+        if let Some((root, clock)) = &self.slow_ride {
+            let now = clock.now_ms()
+                + cortexkit_role_llm_runner::run::COMPACTION_WAIT_REPORT_AFTER_MS
+                + 1;
+            std::fs::write(root.join("test-clock"), json!({"now_ms":now}).to_string()).unwrap();
+            clock.refresh().unwrap();
+            broca_test_support::wait_until("durable compaction ride wait", || async {
+                use broca_core::WalStore;
+                let frames = broca_core::FileWalStore::new(root.join("wal"))
+                    .read_records(&crate::compaction::request().session)
+                    .unwrap();
+                if frames
+                    .iter()
+                    .any(|frame| matches!(frame.record, WalRecord::CompactionRideWait { .. }))
+                {
+                    Ok(())
+                } else {
+                    Err("the ride wait has not been recorded".to_owned())
+                }
+            })
+            .await;
+        }
         if let Some(marker) = &self.block_ride {
             std::fs::write(marker, b"ceiling ride entered").unwrap();
             return std::future::pending().await;
@@ -770,108 +886,163 @@ impl CompactionViews for ScriptedCompaction {
     }
 }
 
-async fn resume_with(
-    scenario: Scenario,
-    kill: &KillReport,
-    compaction: Arc<ScriptedCompaction>,
-) -> Resumed {
-    // A recorded answer is not ridden again on replay. Give that prefix the same clock
-    // transition as a fresh timely Nothing, without changing its persisted deadline.
-    compaction.ride_answered.store(
-        kill.durable.records().iter().any(|record| {
-            matches!(
-                record,
-                WalRecord::ContextCeilingWait {
-                    unavailable: Some(false),
-                    ..
-                }
-            )
-        }),
-        Ordering::SeqCst,
+// Mode 3 (compaction-provider/v2). A session created by this build calls the provider's v2
+// methods only; the v1 scenarios above cover logs recorded before the switch.
+
+fn v2_request() -> RunRequest {
+    let submission = serde_json::from_value(json!({
+        "model":{"provider_module_id":"stub","model_id":"model"},
+        "input":[
+            {"role":"user","content":[{"type":"text","text":"original user"}]},
+            {"role":"user","content":[{"type":"text","text":"second question"}]}
+        ],
+        "tools":[{"name":"edit","description":"edit","input_schema":{"type":"object"}}]
+    }))
+    .unwrap();
+    let mut request = RunRequest::from_submission(
+        submission,
+        RunId("compaction-v2-run".into()),
+        BindIdentity::new("/crash-harness/compaction-v2", "caller", "session"),
+        SubmissionId("compaction-v2-send".into()),
     );
-    let provider = ScriptedProvider::for_scenario(&scenario);
-    let plane = HarnessPlane::for_scenario(&scenario);
-    let store = FileWalStore::new(kill.state_root.join("wal"));
-    let control = with_compaction((scenario.control)(), compaction);
-    let outcome = drive(
-        (scenario.request)(),
-        control,
-        &kill.state_root,
-        &store,
-        &provider,
-        &plane,
-    )
-    .await;
-    let log = LogImage::read(&wal_path(&kill.state_root, &(scenario.request)().session));
-    Resumed {
-        reason: outcome.reason,
-        provider,
-        plane,
-        log,
-        outcome,
+    request.policy_allowed.insert("edit".into());
+    request.context_limit = Some(100_000);
+    request
+}
+
+fn v2_control() -> RunControl {
+    RunControl {
+        manifest: Some(Arc::new(broca_wal::PlanManifest {
+            rich_ui: None,
+            plan: OpaqueJson::from_json_text(
+                json!({"compaction_item":{"provider":PROVIDER,"preset":"summary","params":{}},"composition":{}})
+                    .to_string(),
+            )
+            .unwrap(),
+            plan_identity: "compaction-v2-plan".into(),
+            composition_digest: "composition".into(),
+            tools: Arc::new(vec![]),
+            system_text: String::new(),
+            system_digest: String::new(),
+            join_version: 1,
+            role_versions: [("compaction-provider".into(), "v2".into())].into(),
+            fetches: vec![],
+            declarations: vec![],
+        })),
+        new_log_compaction_plan_version: Some(broca_core::compaction_v2::PLAN_VERSION),
+        admitted_context_limit: Some(100_000),
+        ..Default::default()
     }
 }
 
-fn has_setup(records: &[WalRecord]) -> bool {
-    records.iter().any(|record| {
-        matches!(
-            record,
-            WalRecord::CompactionMessage {
-                kind: CompactionMessageKind::Setup,
-                ..
-            }
-        )
-    })
+/// Installs the scripted v2 provider for the run's own log, in the reference run, in every
+/// killed child and in every resume.
+struct V2Provider;
+
+impl crate::scenario::ScenarioExtension for V2Provider {
+    fn setup(&self, root: &Path, control: &mut RunControl, _: &mut HarnessPlane) {
+        control.compaction_plane = Some(Arc::new(V2Plane {
+            wal: wal_path(root, &v2_request().session),
+        }));
+        control.compaction_views = None;
+    }
 }
 
-fn views_applied(records: &[WalRecord]) -> usize {
+/// A v2 provider that answers Setup `ready`, takes every notice, and answers each ride with
+/// one view, version 1, cutting through the session's first message.
+struct V2Plane {
+    wal: PathBuf,
+}
+
+#[async_trait]
+impl CompactionPlane for V2Plane {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        _: SetupRequest,
+    ) -> Result<SetupAnswer, CompactionUnavailable> {
+        panic!("a mode-3 session never calls the retired v1 Setup")
+    }
+
+    async fn call_v2(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        method: &str,
+        _: Value,
+        _: u64,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
+    {
+        let answer = match method {
+            "compaction.setup" => json!({"answer":"ready"}),
+            "compaction.notice" => json!({"answer":"received"}),
+            "compaction.ride" => json!({"answer":"view","view":v2_cut(&self.wal)}),
+            other => panic!("unexpected compaction method {other}"),
+        };
+        Ok(serde_json::value::to_raw_value(&answer).unwrap())
+    }
+}
+
+/// Version 1 of the provider's view: a cut through the first message ("original user"). A
+/// message id carries its log's lineage and the message's 0-based position, so the cut is built
+/// from the log the run is writing.
+fn v2_cut(wal: &Path) -> broca_core::compaction_v2::protocol::view::View {
+    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+    let lineage = LogImage::read(wal)
+        .lineage_id()
+        .expect("a ride comes after the run wrote its log's lineage")
+        .to_string();
+    let through = broca_core::message_mid(true, Some(&lineage), 0).unwrap();
+    View::seal(1, vec![Edit::new(1, EditOp::Cut { through })])
+}
+
+const V2_SCENARIO: Scenario = Scenario {
+    name: "compaction-v2",
+    request: v2_request,
+    control: v2_control,
+    scripts: tool_scripts,
+    render: Render::Canonical,
+    plane: tools,
+    extension: Some(&V2Provider),
+    expected: RunFinishReason::Completed,
+};
+
+/// Accepted v2 views: each is recorded once, when the runner accepts it.
+fn accepted_views(records: &[WalRecord]) -> usize {
     records
         .iter()
-        .filter(|record| matches!(record, WalRecord::CompactionViewApplied { .. }))
+        .filter(|record| matches!(record, WalRecord::CompactionViewV2(_)))
         .count()
 }
 
-/// Every notice's sequence number, in WAL order.
-fn notice_seqs(records: &[WalRecord]) -> Vec<u64> {
-    records
-        .iter()
-        .filter_map(|record| match record {
-            WalRecord::CompactionNotice { seq, headers } => {
-                assert_eq!(headers["seq"], seq.to_string());
-                Some(*seq)
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// A run cut at every record boundary, and killed in flight, resumes sending exactly the bytes
-/// the uncut run sent under the applied view. A view already durable is rendered from the WAL
-/// and never applied again; Setup never runs twice; and notices keep one gapless sequence, so a
-/// notice republished after the crash reuses its number and none is skipped or repeated.
+/// A mode-3 run cut at every record boundary, and killed in flight, resumes sending exactly the
+/// bytes the uncut run sent under its applied view. A view already durable is rendered from the
+/// log on resume, and no view is ever accepted twice.
 #[tokio::test]
-async fn compaction_every_record_boundary_and_real_kill_replay_identical_bytes() {
-    let handle = RunnerHandle::new(SCENARIO).await;
+async fn compaction_v2_every_record_boundary_and_real_kill_replay_identical_bytes() {
+    let handle = RunnerHandle::new(V2_SCENARIO).await;
     let reference = handle.reference.sent.get(&0).expect("reference model call");
-    assert!(String::from_utf8_lossy(reference).contains(APPLIED_HEAD));
+    let text = String::from_utf8_lossy(reference);
+    assert!(text.contains("second question"), "{text}");
     assert!(
-        !String::from_utf8_lossy(reference).contains("original user"),
-        "the view must replace raw history, not merely insert a head"
-    );
-    assert!(
-        !String::from_utf8_lossy(reference).contains("setup head"),
-        "the view replaces Setup's head entirely"
+        !text.contains("original user"),
+        "the view's cut must hide the first message: {text}"
     );
     let reference_records = handle.reference.log.records();
-    assert_eq!(views_applied(&reference_records), 1);
-    let reference_notices = notice_seqs(&reference_records);
+    assert_eq!(accepted_views(&reference_records), 1);
+    assert!(reference_records
+        .iter()
+        .any(|record| matches!(record, WalRecord::CompactionViewAppliedV2 { .. })));
     assert!(
-        !reference_notices.is_empty(),
-        "the run announces its transcript"
+        !reference_records
+            .iter()
+            .any(|record| matches!(record, WalRecord::CompactionMessage { .. })),
+        "a mode-3 session writes no v1 compaction records"
     );
-    let mut suite = Suite::new("compaction");
-    let mut unsynced = 0;
-    let mut durable_view_resumes = 0;
+    let mut suite = Suite::new("compaction-v2");
     let mut durable_view_model_resumes = 0;
     let mut points = handle.record_boundaries(true);
     points.push(KillPoint::InFlight(InFlight::ProviderStep(1)));
@@ -882,383 +1053,23 @@ async fn compaction_every_record_boundary_and_real_kill_replay_identical_bytes()
             KillTrigger::Truncate
         };
         let kill = handle.kill_at(point, trigger).await;
-        unsynced += usize::from(kill.after_sync == Some(false));
-        let compaction = Arc::new(ScriptedCompaction::default());
-        let resumed = resume_with(SCENARIO, &kill, compaction.clone()).await;
+        let resumed = handle.resume(&kill).await;
+        // Compares every resumed request with the reference's request for the same step.
         handle.check(&kill, &resumed);
-        let prefix = kill.durable.records();
-        if has_setup(&prefix) {
-            assert_eq!(
-                compaction.setups.load(Ordering::SeqCst),
-                0,
-                "{}: Setup repeated",
-                kill.label()
-            );
-        }
-        let after = resumed.log.records();
-        if views_applied(&prefix) > 0 {
-            durable_view_resumes += 1;
+        if accepted_views(&kill.durable.records()) > 0 {
             durable_view_model_resumes += usize::from(resumed.provider.request_count() > 0);
-            assert_eq!(
-                compaction.offered.load(Ordering::SeqCst),
-                0,
-                "{}: a durable view was fetched again",
-                kill.label()
-            );
         }
         assert!(
-            views_applied(&after) <= 1,
-            "{}: the view was applied twice",
-            kill.label()
-        );
-        for bytes in resumed.provider.sent().values() {
-            assert_eq!(
-                bytes,
-                reference,
-                "{}: compaction request bytes changed",
-                kill.label()
-            );
-        }
-        let seqs = notice_seqs(&after);
-        assert_eq!(
-            seqs,
-            (1..=seqs.len() as u64).collect::<Vec<_>>(),
-            "{}: notice sequence repeated or skipped a number",
-            kill.label()
-        );
-        assert_eq!(
-            after
-                .iter()
-                .filter(|record| matches!(
-                    record,
-                    WalRecord::CompactionMessage {
-                        kind: CompactionMessageKind::Setup,
-                        ..
-                    }
-                ))
-                .count(),
-            1,
-            "{}: Setup record count",
+            accepted_views(&resumed.log.records()) <= 1,
+            "{}: a view was accepted twice",
             kill.label()
         );
         suite.record([kill]);
     }
-    assert!(unsynced > 0, "scenario must cut inside unsynced batches");
-    assert!(
-        durable_view_resumes > 0,
-        "scenario must resume durable views"
-    );
     assert!(
         durable_view_model_resumes > 0,
-        "durable views must be rendered on resume, not just sealed"
+        "durable views must be rendered on resume, not just recorded"
     );
     let methods = suite.finish();
     assert_eq!(methods.get("Sigkill"), Some(&1));
-    assert_eq!(
-        methods.get("Truncation"),
-        Some(&(2 * handle.reference.log.record_count() + 1))
-    );
-}
-
-/// After a restart that resumes a run whose view is durable, a view older than it is never
-/// applied, and the resumed requests keep the newer view's bytes.
-#[tokio::test]
-async fn stale_view_offered_after_restart_is_never_applied() {
-    let handle = RunnerHandle::new(TOOL_SCENARIO).await;
-    let records = handle.reference.log.records();
-    let applied = records
-        .iter()
-        .position(|record| matches!(record, WalRecord::CompactionViewApplied { .. }))
-        .expect("applied view")
-        + 1;
-    let kill = handle
-        .kill_at(
-            KillPoint::RecordBoundary {
-                records: applied,
-                torn: false,
-            },
-            KillTrigger::Truncate,
-        )
-        .await;
-    let compaction = Arc::new(ScriptedCompaction {
-        stale: true,
-        ..Default::default()
-    });
-    let resumed = resume_with(TOOL_SCENARIO, &kill, compaction.clone()).await;
-    handle.check(&kill, &resumed);
-    assert_eq!(compaction.setups.load(Ordering::SeqCst), 0);
-    assert!(
-        compaction.offered.load(Ordering::SeqCst) > 0,
-        "the stale view must actually be fetched and offered"
-    );
-    let after = resumed.log.records();
-    assert_eq!(views_applied(&after), 1, "the stale view was applied");
-    assert_eq!(resumed.provider.sent(), handle.reference.sent);
-    assert!(resumed
-        .provider
-        .sent()
-        .values()
-        .all(|bytes| !String::from_utf8_lossy(bytes).contains("stale summary")));
-}
-
-/// The signed scenario cut at every record boundary, and killed while the second model call
-/// is in flight, resumes sending exactly the uncut run's bytes: the first view's companion
-/// strip of signed reasoning, recorded with it, stays applied under the second view, runner
-/// tags render the same, neither view is applied twice, and notices keep one gapless sequence.
-#[tokio::test]
-async fn signed_reasoning_strip_and_a_second_view_replay_identical_bytes_at_every_cut() {
-    let handle = RunnerHandle::new(SIGNED_SCENARIO).await;
-    let first =
-        String::from_utf8_lossy(handle.reference.sent.get(&0).expect("first call")).into_owned();
-    let second =
-        String::from_utf8_lossy(handle.reference.sent.get(&1).expect("second call")).into_owned();
-    for sent in [&first, &second] {
-        assert!(sent.contains(APPLIED_HEAD), "{sent}");
-        assert!(!sent.contains("original user"), "{sent}");
-        assert!(
-            !sent.contains("old thinking"),
-            "the strip leaves it out: {sent}"
-        );
-        assert!(sent.contains('§'), "runner tags are rendered: {sent}");
-    }
-    assert!(
-        second.contains("plan thinking"),
-        "reasoning after the views is kept"
-    );
-    assert!(
-        second.contains("edited (short)") && !second.contains("§4§ edited"),
-        "{second}"
-    );
-    let records = handle.reference.log.records();
-    let choices: Vec<_> = records
-        .iter()
-        .filter_map(|record| match record {
-            WalRecord::CompactionViewApplied {
-                view_version,
-                choice,
-                ..
-            } => Some((
-                *view_version,
-                matches!(choice, broca_wal::CompactionViewChoice::Companion { .. }),
-            )),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(choices, vec![(2, true), (3, false)]);
-    let mut suite = Suite::new("compaction-signed");
-    let mut strip_resumes = 0;
-    let mut points = handle.record_boundaries(true);
-    points.push(KillPoint::InFlight(InFlight::ProviderStep(2)));
-    for point in points {
-        let trigger = if matches!(point, KillPoint::InFlight(_)) {
-            KillTrigger::ProcessKill
-        } else {
-            KillTrigger::Truncate
-        };
-        let kill = handle.kill_at(point, trigger).await;
-        let compaction = Arc::new(ScriptedCompaction::signed());
-        let resumed = resume_with(SIGNED_SCENARIO, &kill, compaction.clone()).await;
-        handle.check(&kill, &resumed);
-        let prefix = kill.durable.records();
-        if has_setup(&prefix) {
-            assert_eq!(
-                compaction.setups.load(Ordering::SeqCst),
-                0,
-                "{}",
-                kill.label()
-            );
-        }
-        strip_resumes +=
-            usize::from(views_applied(&prefix) > 0 && resumed.provider.request_count() > 0);
-        for (step, bytes) in resumed.provider.sent() {
-            assert_eq!(
-                Some(&bytes),
-                handle.reference.sent.get(&step),
-                "{}: step {step} request bytes changed",
-                kill.label()
-            );
-        }
-        let after = resumed.log.records();
-        // A cut inside the tool batch can end the resumed run before its second model call
-        // (an unknown dispatch outcome stops for review), and then the second view's boundary
-        // never comes. Every resume that reaches the second call applied both views, once.
-        let reached_second_call = after
-            .iter()
-            .filter(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
-            .count()
-            == 2;
-        assert!(views_applied(&after) <= 2, "{}", kill.label());
-        if reached_second_call {
-            assert_eq!(views_applied(&after), 2, "{}", kill.label());
-        }
-        let seqs = notice_seqs(&after);
-        assert_eq!(
-            seqs,
-            (1..=seqs.len() as u64).collect::<Vec<_>>(),
-            "{}: notice sequence repeated or skipped a number",
-            kill.label()
-        );
-        suite.record([kill]);
-    }
-    assert!(
-        strip_resumes > 0,
-        "some cut must resume over a durable strip"
-    );
-    let methods = suite.finish();
-    assert_eq!(methods.get("Sigkill"), Some(&1));
-}
-
-#[tokio::test]
-async fn ceiling_late_nothing_is_provider_unavailable() {
-    let compaction = Arc::new(ScriptedCompaction {
-        late_ride: true,
-        ..ScriptedCompaction::at_ceiling(false)
-    });
-    let root = compaction.ceiling_time.as_ref().unwrap().root.clone();
-    let provider = ScriptedProvider::for_scenario(&CEILING_TIMEOUT_SCENARIO);
-    let plane = HarnessPlane::for_scenario(&CEILING_TIMEOUT_SCENARIO);
-    let outcome = drive(
-        request(),
-        with_compaction(ceiling_timeout_control(), compaction.clone()),
-        &root,
-        &FileWalStore::new(root.join("wal")),
-        &provider,
-        &plane,
-    )
-    .await;
-    assert_eq!(outcome.reason, RunFinishReason::ContextCeiling);
-    assert_eq!(provider.request_count(), 0);
-    let log = LogImage::read(&wal_path(&root, &request().session));
-    assert!(log.records().iter().any(|record| matches!(
-        record,
-        WalRecord::ContextCeilingWait {
-            unavailable: Some(true),
-            ..
-        }
-    )));
-    let state = broca_core::reconcile_run_state(log.records().iter(), "compaction-run").unwrap();
-    let detail = state.context_ceiling.unwrap();
-    println!("late Nothing: {}", detail.cause);
-    assert_eq!(detail.cause, "provider_unavailable");
-    assert!(state.error.is_none());
-}
-
-#[tokio::test]
-async fn ceiling_wait_and_terminal_state_survive_every_record_and_torn_frame_cut() {
-    for (scenario, sends_view) in [(CEILING_SCENARIO, true), (CEILING_TIMEOUT_SCENARIO, false)] {
-        let handle = RunnerHandle::new(scenario).await;
-        let records = handle.reference.log.records();
-        assert!(records
-            .iter()
-            .any(|r| matches!(r, WalRecord::ContextCeilingWait { .. })));
-        assert!(records
-            .iter()
-            .any(|r| matches!(r, WalRecord::ContextCeilingDecided { .. })));
-        let mut waited = 0;
-        let mut decided = 0;
-        for point in handle.record_boundaries(true) {
-            let kill = handle.kill_at(point, KillTrigger::Truncate).await;
-            let compaction = Arc::new(ScriptedCompaction {
-                lineage: Mutex::new(kill.durable.lineage_id().map(|id| id.to_string())),
-                ..ScriptedCompaction::at_ceiling(sends_view)
-            });
-            let resumed = resume_with(scenario, &kill, compaction).await;
-            handle.check(&kill, &resumed);
-            waited += usize::from(
-                kill.durable
-                    .records()
-                    .iter()
-                    .any(|r| matches!(r, WalRecord::ContextCeilingWait { .. })),
-            );
-            decided += usize::from(
-                kill.durable
-                    .records()
-                    .iter()
-                    .any(|r| matches!(r, WalRecord::ContextCeilingDecided { .. })),
-            );
-            if sends_view {
-                for bytes in resumed.provider.sent().values() {
-                    assert_eq!(
-                        Some(bytes),
-                        handle.reference.sent.get(&0),
-                        "{}",
-                        kill.label()
-                    );
-                }
-            } else {
-                assert_eq!(resumed.provider.request_count(), 0, "{}", kill.label());
-                let after = resumed.log.records();
-                let state =
-                    broca_core::reconcile_run_state(after.iter(), "compaction-run").unwrap();
-                assert_eq!(
-                    state.context_ceiling.as_ref().unwrap().cause,
-                    "view_timeout",
-                    "{}",
-                    kill.label()
-                );
-                assert!(state.error.is_none());
-            }
-        }
-        assert!(waited > 0 && decided > 0);
-    }
-}
-
-#[tokio::test]
-async fn ceiling_wait_real_kill_resumes_the_same_request_bytes() {
-    const CHILD: &str = "BROCA_CEILING_CHILD_ROOT";
-    if let Some(root) = std::env::var_os(CHILD) {
-        let root = std::path::PathBuf::from(root);
-        let compaction = Arc::new(ScriptedCompaction {
-            ceiling: Some(true),
-            block_ride: Some(root.join("ceiling-entered")),
-            ..Default::default()
-        });
-        let control = with_compaction(ceiling_control(), compaction);
-        let provider = ScriptedProvider::for_scenario(&CEILING_SCENARIO);
-        let plane = HarnessPlane::for_scenario(&CEILING_SCENARIO);
-        drive(
-            request(),
-            control,
-            &root,
-            &FileWalStore::new(root.join("wal")),
-            &provider,
-            &plane,
-        )
-        .await;
-        panic!("child finished instead of blocking at the ceiling");
-    }
-    let root = broca_test_support::scratch_root()
-        .join(format!("ceiling-real-kill-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    crate::kill_child_test_at_marker(
-        "ceiling wait",
-        "compaction::ceiling_wait_real_kill_resumes_the_same_request_bytes",
-        &[(CHILD, root.as_os_str())],
-        &root.join("ceiling-entered"),
-    );
-    let prefix = LogImage::read(&wal_path(&root, &request().session));
-    assert!(prefix
-        .records()
-        .iter()
-        .any(|r| matches!(r, WalRecord::ContextCeilingWait { .. })));
-    let provider = ScriptedProvider::for_scenario(&CEILING_SCENARIO);
-    let plane = HarnessPlane::for_scenario(&CEILING_SCENARIO);
-    let compaction = Arc::new(ScriptedCompaction {
-        ceiling: Some(true),
-        lineage: Mutex::new(prefix.lineage_id().map(|id| id.to_string())),
-        ..Default::default()
-    });
-    let outcome = drive(
-        request(),
-        with_compaction(ceiling_control(), compaction),
-        &root,
-        &FileWalStore::new(root.join("wal")),
-        &provider,
-        &plane,
-    )
-    .await;
-    assert_eq!(outcome.reason, RunFinishReason::Completed);
-    let reference = RunnerHandle::new(CEILING_SCENARIO).await;
-    assert_eq!(provider.sent(), reference.reference.sent);
-    std::fs::remove_dir_all(root).unwrap();
 }

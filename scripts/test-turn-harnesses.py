@@ -22,6 +22,8 @@ class TurnHarnesses(unittest.TestCase):
             shutil.copy2(ROOT / "scripts" / name, scripts)
         (scripts / "lib").mkdir()
         shutil.copy2(ROOT / "scripts/lib/acceptance-models.txt", scripts / "lib")
+        for name in ("acceptance_contract.py", "artifact-probe.sh"):
+            shutil.copy2(ROOT / "scripts/lib" / name, scripts / "lib" / name)
         self.bins = self.root / "bin"
         self.bins.mkdir()
         self.home = self.root / "home"
@@ -37,6 +39,9 @@ class TurnHarnesses(unittest.TestCase):
         self.executable(client, r'''#!/usr/bin/env python3
 import os, pathlib, sys
 args = sys.argv[1:]
+if "describe" in args:
+    print('{"result":{"capabilities":[]}}')
+    sys.exit(0)
 session = args[args.index("--session") + 1]
 root = args[args.index("--project-root") + 1]
 harness = args[args.index("--harness") + 1] if "--harness" in args else "runner"
@@ -44,7 +49,7 @@ h = 0xcbf29ce484222325
 for b in f"{root}\x1f{harness}\x1f{session}".encode():
     h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
 (pathlib.Path(os.environ["BROCA_STATE_ROOT"]) / "wal" / f"{h:016x}.wal").write_text(session)
-print("TOOL_CALL read\nTOOL_RESULT is_error=false")
+print("TOOL_CALL seq=1 id=fixture-call name=read\nTOOL_RESULT seq=2 id=fixture-call is_error=false text=ok")
 if os.environ.get("TURN_KIND") != "incomplete": print("RUN_FINISHED reason=Completed")
 sys.stdout.flush()
 if os.environ.get("TURN_KIND") == "large":
@@ -52,6 +57,9 @@ if os.environ.get("TURN_KIND") == "large":
         sys.stdout.write("x" * 8192 + "\n")
     sys.stdout.flush()
 ''')
+        placed = self.home / ".local/share/cortexkit/bin/ck-broca"
+        placed.parent.mkdir(parents=True)
+        placed.write_text("#!/bin/sh\n# legacy fixture build\n")
         self.executable(self.bins / "sqlite3", "#!/bin/sh\ncase \"$2\" in PRAGMA*) echo lineage_id;; *) echo stored-id;; esac\n")
         self.executable(self.bins / "timeout", '#!/bin/sh\nshift\nexec "$@"\n')
         self.executable(self.bins / "cp", r'''#!/usr/bin/env python3

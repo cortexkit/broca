@@ -245,6 +245,9 @@ impl ControlProjectionState {
     /// A materialization boundary has no pending steer or open tool batch. Restore the
     /// absolute next ordinal and frozen budget facts rather than inferring them from a tail.
     pub fn from_projection_seed(seed: &crate::ProjectionSeed) -> Option<Self> {
+        if !seed.admission_checkpoint.recovery_cuts.is_empty() {
+            return None;
+        }
         if !crate::budget_replay_seed_is_valid(seed) {
             return None;
         }
@@ -814,12 +817,16 @@ fn project_control_record<S: ControlProjectionSink>(
             run_id,
             reason,
             error,
+            account_limit,
             ..
         } if *reason != broca_protocol::PauseReason::ToolHeld => {
             push!(
                 ControlUnit::Paused {
                     run_id: run_id.clone(),
                     reason: *reason,
+                    resume_not_before_ms: account_limit
+                        .as_ref()
+                        .map(|pause| pause.resume_not_before_ms),
                     error: error.clone().map(SharedProviderError::from),
                 },
                 LiveEvent::RunPaused(live::RunEnded::new(run_id.0.clone(), reason.as_str()))
@@ -860,6 +867,28 @@ fn project_control_record<S: ControlProjectionSink>(
             state.indeterminate_tool_calls.reset_batch();
             if let Some(ordinal) = state.tool_result_ordinal {
                 record_sink.boundary(ordinal, || message_event(Some(ordinal), false));
+            }
+        }
+        WalRecord::RecoveryCut { recovery } => {
+            for run in &recovery.runs {
+                if state.run_id.as_ref() == Some(&run.run_id) {
+                    for call in &run.calls {
+                        state
+                            .indeterminate_tool_calls
+                            .record_dispatch_terminal(&call.tool_call_id, true);
+                    }
+                }
+            }
+        }
+        WalRecord::RecoveryCallClosed {
+            run_id,
+            tool_call_id,
+            ..
+        } => {
+            if state.run_id.as_ref() == Some(run_id) {
+                state
+                    .indeterminate_tool_calls
+                    .record_dispatch_terminal(tool_call_id, true);
             }
         }
         WalRecord::ToolDispatchIntent {
@@ -945,6 +974,9 @@ fn project_control_record<S: ControlProjectionSink>(
         WalRecord::WriterOpened { .. }
         | WalRecord::WriterClosed { .. }
         | WalRecord::VisibilityLate { .. }
+        | WalRecord::CompactionViewV2 { .. }
+        | WalRecord::CompactionMarker { .. }
+        | WalRecord::CompactionViewAppliedV2 { .. }
         | WalRecord::Unknown => {}
         WalRecord::ContextCeilingWait {
             deadline_ms,
@@ -1546,7 +1578,7 @@ pub fn replay_from_episode_start(
                 None,
                 0,
                 false,
-                crate::tags::TagSeed::default(),
+                crate::tags::TagSeed::default().into(),
             )
             .map_err(|_| SeedFallback::new("replay refused the frames"))?;
             (state, 0)

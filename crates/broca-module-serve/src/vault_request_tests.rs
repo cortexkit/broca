@@ -1660,12 +1660,13 @@ async fn routed_chatgpt_choice() -> AccountChoice {
         credentials: candidates, grants: 1, grant_tuples: Vec::new(), view: "chatgpt-view".into(),
     });
     let credential = broca_module_serve::CredentialId::parse("chatgpt:openai").unwrap();
-    let choice = choose_account(&client, ChoiceInputs {
-        conversation_key: None, inherited_conversation_key: None,
-        static_credential: &credential, caller_named_account: false,
-        model: "gpt-6.1", session: &broca_protocol::BindIdentity::new("/tmp", "broca", "chatgpt"),
-        send_id: None,
-        run_id: "chatgpt-run", initial_input_bytes: 42,
+    let choice = choose_account(&client, ChoiceInputs { decision_id: None,
+    hold_cap: Default::default(),
+    conversation_key: None, inherited_conversation_key: None,
+    static_credential: &credential, caller_named_account: false,
+    model: "gpt-6.1", session: &broca_protocol::BindIdentity::new("/tmp", "broca", "chatgpt"),
+    send_id: None,
+    run_id: "chatgpt-run", initial_input_bytes: 42,
     }, async { Some(listing) }, tokio::time::Instant::now() + ADMISSION_BUDGET).await.unwrap();
     let requests = routing.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
@@ -1941,7 +1942,8 @@ async fn chatgpt_refresh_run_rejecting(
     // not socket negotiation, while retaining its original send-count assertions.
     broca_core::Provider::set_chatgpt_https_policy(&resolved.provider, Arc::new(|| true));
     let session = BindIdentity::new(&root, "chatgpt-refresh", label);
-    let req = broca_core::RunRequest { input_written_at_ms: None, directives: None, session_class: None, retention: None,
+    let req = broca_core::RunRequest { route_decision_id: None,
+    input_written_at_ms: None, directives: None, session_class: None, retention: None,
     title: None,
     on_restart: None,
     keep_warm: None,
@@ -1957,6 +1959,7 @@ async fn chatgpt_refresh_run_rejecting(
         model_id: "gpt-5".into(),
     },
     input: vec![Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,
@@ -1977,7 +1980,8 @@ async fn chatgpt_refresh_run_rejecting(
     stop_when: vec![broca_protocol::request::StopCondition::StepCount { n: 1 }],
     submission_id: None,
     context_management: None,
-    inherit_frozen_cache: false, structured_output: None, };
+    inherit_frozen_cache: false, structured_output: None,
+    };
     let wal = FileWalStore::new(root.join("refresh-wal"));
     let lease = FileLeaseStore::new(root.join("refresh-lease"));
     let (tx, mut rx) = mpsc::channel(256);

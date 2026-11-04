@@ -339,7 +339,7 @@ async fn real_daemon_text_only_tool_media_openai_responses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_daemon_text_only_model_frozen_config_matches_media_off_bytes() {
+async fn real_daemon_text_only_model_keeps_legacy_frozen_fields_with_new_notice_rule() {
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let url = serve_model_responses(bodies, vec![ANTHROPIC_SSE]).await;
     let mut catalog = catalog_for("anthropic", CLAUDE, "anthropic/claude-opus-5");
@@ -359,6 +359,15 @@ async fn real_daemon_text_only_model_frozen_config_matches_media_off_bytes() {
             _ => None,
         })
         .unwrap();
+    // New admissions freeze notice labeling. Keep the existing golden values for every
+    // other render input so the rule cannot hide transport or media-profile drift.
+    assert_eq!(
+        frozen
+            .as_object_mut()
+            .unwrap()
+            .remove("image_notice_labels"),
+        Some(json!(true))
+    );
     frozen["base_url"] = json!("@BASE_URL@");
     // Endpoint ports and freshly generated persona identities vary between isolated rigs.
     if let Some(persona) = frozen

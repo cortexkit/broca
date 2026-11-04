@@ -71,6 +71,7 @@ fn text_step_with_usage(text: &str, step_usage: Usage) -> Vec<NormalizedEvent> {
             },
         }),
         ctrl(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id: StepId(0),
             usage: step_usage,
             finish_reason: FinishReason::Stop,
@@ -98,6 +99,7 @@ fn length_step(text: &str) -> Vec<NormalizedEvent> {
             },
         }),
         ctrl(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id: StepId(0),
             usage: usage(10, 4096),
             finish_reason: FinishReason::Length,
@@ -136,6 +138,7 @@ fn tool_step(calls: &[(&str, &str, serde_json::Value)]) -> Vec<NormalizedEvent> 
             },
         }),
         ctrl(ProviderControl::StepFinished {
+            raw_finish_reason: None,
             step_id: StepId(0),
             usage: usage(10, 8),
             finish_reason: FinishReason::ToolCalls,
@@ -253,6 +256,9 @@ impl WalStore for ReadCountingWalStore {
 fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     let mut wal = store.open(&request.session).expect("open WAL for seed");
     let config = RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -279,6 +285,8 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     wal.append(
         1,
         &WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -322,6 +330,9 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
 
 fn resumable_frozen_config(request: &RunRequest, stop_when: Vec<StopCondition>) -> RunConfig {
     RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -361,6 +372,7 @@ fn tool(name: &str, mode: ExecutionMode) -> Tool {
 fn req(name: &str, tools: Vec<Tool>, stop_when: Vec<StopCondition>) -> RunRequest {
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -932,6 +944,8 @@ async fn zero_step_count_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -1011,6 +1025,8 @@ async fn zero_context_limit_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -1178,6 +1194,8 @@ async fn volatile_cache_tail_with_tools_in_frozen_config_remains_resumable() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -2971,6 +2989,7 @@ async fn run_usage_accumulates_across_steps() {
                     finish_reason,
                     ..
                 }) => ctrl(ProviderControl::StepFinished {
+                    raw_finish_reason: None,
                     step_id,
                     usage: usage(100, 10),
                     finish_reason,
@@ -3000,6 +3019,7 @@ async fn run_usage_accumulates_across_steps() {
                     finish_reason,
                     ..
                 }) => ctrl(ProviderControl::StepFinished {
+                    raw_finish_reason: None,
                     step_id,
                     usage: usage(7, 3),
                     finish_reason,
@@ -3827,6 +3847,7 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
                 }],
             )];
             PendingSubmission {
+                display_sent_by: None,
                 admitted_at_ms: None,
                 order: None,
                 sent_by: None,
@@ -3847,11 +3868,14 @@ fn prior_snapshot_handoff_excludes_pending_payloads_and_shares_pending_storage()
         block => panic!("expected queued text payload, got {block:?}"),
     };
     let mut snapshot = PriorWalSnapshot {
+        lineage_id: None,
+        anchor: None,
         base_watermark: 0,
         head_seq: 0,
         tail: Arc::new(Vec::new()),
         checkpoint_at_base: None,
         checkpoint_at_head: AdmissionCheckpointV1 {
+            recovery_cuts: Vec::new(),
             has_model_attempt: None,
             media: None,
             head: None,
@@ -3919,6 +3943,8 @@ async fn prior_frames_snapshot_skips_reconstruct_read() {
     assert_eq!(store.read_count(), 1, "executor took one prior snapshot");
 
     let snapshot = PriorWalSnapshot {
+        lineage_id: None,
+        anchor: None,
         base_watermark: 0,
         head_seq: prior.last().map_or(0, |frame| frame.seq),
         checkpoint_at_head: AdmissionCheckpointV1::from_frames(&prior).expect("checkpoint"),
@@ -3975,6 +4001,8 @@ async fn stale_prior_frames_fall_back_to_reconstruct_read() {
         .expect("snapshot read succeeds");
     let stale_prefix = prior[..prior.len().saturating_sub(1)].to_vec();
     let stale_snapshot = PriorWalSnapshot {
+        lineage_id: None,
+        anchor: None,
         base_watermark: 0,
         head_seq: stale_prefix.last().map_or(0, |frame| frame.seq),
         checkpoint_at_head: AdmissionCheckpointV1::from_frames(&stale_prefix)
@@ -4972,23 +5000,28 @@ mod keep_warm_scheduler {
         let budget_limited = costs.bust == 3.0;
         let stop_reason = if missed { "warm_missed" } else { "budget" };
         let stops = Arc::new(AtomicUsize::new(0));
-        let run = broca_core::run_loop_on_writer_admitted(
-            request,
-            &writer,
-            StartMode::FreshOrResume,
-            &provider,
-            &plane,
-            &AllowAll,
-            &wal,
-            None,
-            control,
-            &tx,
-            None,
-        )
-        .with_subscriber(super::unsupported_warm_logging::Stops(
-            stops.clone(),
-            stop_reason,
-        ));
+        // The run loop's future is large in debug builds. Held inline in the test future, which
+        // the test runtime pins on the 2 MiB test thread's stack, it overflows that stack on the
+        // first poll. A spawned task in production lives on the heap, so box it here too.
+        let run = Box::pin(
+            broca_core::run_loop_on_writer_admitted(
+                request,
+                &writer,
+                StartMode::FreshOrResume,
+                &provider,
+                &plane,
+                &AllowAll,
+                &wal,
+                None,
+                control,
+                &tx,
+                None,
+            )
+            .with_subscriber(super::unsupported_warm_logging::Stops(
+                stops.clone(),
+                stop_reason,
+            )),
+        );
         let inspect = async {
             plane.started.notified().await;
             if hanging {

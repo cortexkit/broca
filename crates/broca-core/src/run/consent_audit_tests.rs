@@ -606,13 +606,14 @@ async fn stopped_expired_sibling(cancel: bool) -> Rig {
             &self,
             provider: &str,
             bind: &BindIdentity,
+            scope: Option<&broca_protocol::SessionScope>,
             hook: HookCall,
         ) -> Result<HookAnswer, crate::HookUnavailable> {
             if matches!(&hook.subject, Subject::PreTool { phase: Phase::Approve, tool_call_id, .. } if tool_call_id == "held")
             {
                 return Ok(serde_json::from_value(json!({"answer":"ask","ask":{"prompt":"Allow held?","expires_at_ms":self.0.expires + 60_000,"on_expiry":"deny","material_damage":false,"late_execution":"execute"}})).unwrap());
             }
-            crate::HookPlane::hook(self.0.as_ref(), provider, bind, hook).await
+            crate::HookPlane::hook(self.0.as_ref(), provider, bind, scope, hook).await
         }
     }
     let mut rig = Rig::new("pass", "none", false, false);

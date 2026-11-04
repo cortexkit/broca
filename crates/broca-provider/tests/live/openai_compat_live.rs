@@ -67,6 +67,7 @@ async fn openai_chat_family_runs_live_against_a_compatible_provider() {
     let provider = LiveProvider::new(OpenAiChat, frozen, AuthHandle::Bearer(key));
 
     let opts = CallOptions::new(vec![Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,

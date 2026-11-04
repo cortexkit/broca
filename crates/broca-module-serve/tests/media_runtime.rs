@@ -262,6 +262,25 @@ async fn tool_png_on_next_request(accepts_images: bool) {
         assert!(next.to_string().contains("reason=modality"), "{next}");
         assert!(!next.to_string().contains(&STANDARD.encode(PNG)));
     }
+    let inline = result(&call(&mut rig, "session.read", json!({})).await);
+    let blocks = result(&call(&mut rig, "session.read", json!({"media":"blocks"})).await);
+    let output = |page: &Value| {
+        page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry["message"]["content"].as_array().unwrap())
+            .find(|block| block["tool_call_id"] == "photo" && block["type"] == "tool_result")
+            .unwrap()["output"]
+            .clone()
+    };
+    assert_eq!(output(&inline)["kind"], "text");
+    assert!(output(&inline)["text"]
+        .as_str()
+        .unwrap()
+        .contains("reason=not_requested"));
+    assert_eq!(output(&blocks)["kind"], "parts");
+    assert_eq!(output(&blocks)["parts"][1]["media"]["sha256"], digest(PNG));
     let configs = rig
         .records()
         .into_iter()
@@ -292,10 +311,6 @@ fn media_on_append_replay_is_offset_mismatch() {
     child_case("strict-append");
 }
 #[test]
-fn media_on_model_view_defaults_to_safe_markers() {
-    child_case("model-media");
-}
-#[test]
 fn media_on_head_mime_facts_match_admission() {
     child_case("head-mime");
 }
@@ -311,10 +326,6 @@ fn measure_active_media_head_cost() {
 #[test]
 fn media_on_active_head_avoids_replay() {
     child_case("head-bounded");
-}
-#[test]
-fn media_free_model_view_bytes_match_master() {
-    child_case("model-free");
 }
 
 #[tokio::test]

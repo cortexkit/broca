@@ -44,7 +44,7 @@ use broca_protocol::{
     request::{ExecutionMode, Tool},
     BatchId, BindIdentity, BindPrincipal, RunId, SessionScope, ToolCall, ToolCallId,
 };
-use broca_subc::{ModuleScopeDescriber, SubcConnection, SubcToolPlane};
+use broca_subc::{ModuleScopeDescriber, ScopeDescriber, SubcConnection, SubcToolPlane};
 use subc_control::ConsumerIdentity;
 use tokio::process::Child;
 use tokio::time::{sleep, Instant};
@@ -172,6 +172,10 @@ impl Rig {
                 PROVIDER: stub_module(PROVIDER, serde_json::json!({
                     "FAKE_AFT_EVENTS_PATH": provider_events,
                     "FAKE_AFT_TOOLS": TOOL,
+                    "FAKE_AFT_CAPABILITIES": serde_json::json!({"provides":[
+                        subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY,
+                        subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY,
+                    ]}).to_string(),
                 })),
             }
         });
@@ -237,6 +241,15 @@ impl Rig {
 
     /// The tool plane broca runs, on a connection attested as the carrier.
     async fn carrier_plane(&self, hold: Duration) -> SubcToolPlane {
+        self.carrier_plane_with_describer(hold, self.describer().await)
+            .await
+    }
+
+    async fn carrier_plane_with_describer(
+        &self,
+        hold: Duration,
+        describer: Arc<ModuleScopeDescriber>,
+    ) -> SubcToolPlane {
         let nonce = wait_until("the carrier's launch nonce", || {
             std::fs::read_to_string(&self.carrier_nonce)
                 .ok()
@@ -252,7 +265,7 @@ impl Rig {
                 .await
                 .expect("connect as the carrier");
         let plane = SubcToolPlane::new(conn, PROVIDER).with_scope_sync_hold_for_test(hold);
-        plane.set_scope_describer(self.describer().await);
+        plane.set_scope_describer(describer);
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let registered = plane.catalog().await.ok().is_some_and(|catalog| {
@@ -447,6 +460,85 @@ fn call(marker: &str, delay_ms: u64) -> ToolCall {
         tool_call_id: ToolCallId(format!("call-{marker}")),
         tool_name: TOOL.into(),
         input: serde_json::json!({ "marker": marker, "delay_ms": delay_ms }),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn project_identity_tool_routes_take_project_only_from_scope() {
+    let Some(mut rig) = Rig::start().await else {
+        return;
+    };
+    let workdir = rig.dir.join("stamped-checkout");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let workdir = workdir.canonicalize().unwrap();
+    let mut record = head("project-head");
+    record["workdir"] = serde_json::json!(workdir);
+    record["project_id"] = serde_json::json!("scope-project");
+    rig.sync(&[record]).await;
+    let describer = rig.describer().await;
+    let stamped = describer
+        .describe(
+            &subc_protocol::Principal::Reserved {
+                module_id: OWNER.into(),
+            },
+            "project-head",
+        )
+        .await
+        .unwrap()
+        .stamp
+        .expect("the daemon stamped the live project scope");
+    let stamped_workdir = stamped.workdir.expect("the scope has a workdir");
+    assert_eq!(std::fs::canonicalize(&stamped_workdir).unwrap(), workdir);
+    eprintln!(
+        "scope workdir: owner={} daemon={stamped_workdir}",
+        workdir.display()
+    );
+    let plane = rig
+        .carrier_plane_with_describer(Duration::from_secs(2), describer)
+        .await;
+    let frozen = scope(OWNER, "project-head");
+    for scoped in [false, true] {
+        let name = if scoped {
+            "scoped-project"
+        } else {
+            "unscoped-project"
+        };
+        let bind = BindIdentity::new("broca-unscoped-v1", "broca", name);
+        let mut context = ctx(&bind, name, name, &frozen);
+        if !scoped {
+            context.scope = None;
+        }
+        let read = call(name, 0);
+        plane
+            .batch_started(&context, std::slice::from_ref(&read), &manifest())
+            .await
+            .unwrap();
+        match plane.dispatch(&context, &read).await {
+            DispatchResult::Completed(result) => assert!(!result.is_error, "{result:?}"),
+            other => panic!("tool call did not complete: {other:?}"),
+        }
+        let attaches: Vec<_> = events(&rig.provider_events)
+            .into_iter()
+            .filter(|event| event["kind"] == "attach" && event["identity"]["session"] == name)
+            .collect();
+        assert_eq!(attaches.len(), 1, "{attaches:?}");
+        let attach = &attaches[0];
+        assert!(attach["identity"].get("project_root").is_none(), "{attach}");
+        assert!(attach["identity"].get("project_id").is_none(), "{attach}");
+        assert!(
+            !attach.to_string().contains("broca-unscoped-v1"),
+            "{attach}"
+        );
+        if scoped {
+            // Compare bytes to the daemon's stamp, not the owner's pre-normalized record.
+            assert_eq!(
+                attach["scope"]["workdir"],
+                serde_json::json!(stamped_workdir)
+            );
+            assert_eq!(attach["scope"]["project_id"], "scope-project");
+        } else {
+            assert!(attach["scope"].is_null(), "{attach}");
+        }
     }
 }
 

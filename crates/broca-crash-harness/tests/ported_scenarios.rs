@@ -62,6 +62,74 @@ async fn ported_crash_cut_scenarios_hold_every_invariant_at_every_boundary() {
         // nudge fires, the third request carries repetition guidance, the render embeds the
         // run identity), checked first so the cuts below are known to cover them.
         match scenario.name {
+            "provider_held" => assert!(handle
+                .reference
+                .log
+                .records()
+                .iter()
+                .any(|record| matches!(record, WalRecord::ToolCallProviderHeld { .. }))),
+            "session_changes" => {
+                let records = handle.reference.log.records();
+                for kind in [
+                    "session_refresh_accepted",
+                    "session_refresh_policy_changed",
+                    "session_prefix_flushed",
+                ] {
+                    assert!(
+                        records
+                            .iter()
+                            .any(|record| serde_json::to_value(record).unwrap()["type"] == kind),
+                        "missing {kind}"
+                    );
+                }
+            }
+            "cache_warmed" => assert!(handle
+                .reference
+                .log
+                .records()
+                .iter()
+                .any(|record| matches!(record, WalRecord::CacheWarmed { .. }))),
+            "refusal_fallback" => assert!(handle
+                .reference
+                .log
+                .records()
+                .iter()
+                .any(|record| matches!(record, WalRecord::ModelStepRefused { .. }))),
+            "output_reservation" => assert!(handle
+                .reference
+                .log
+                .records()
+                .iter()
+                .any(|record| matches!(record, WalRecord::OutputReservationClamped { .. }))),
+            "structured_fallback" => {
+                let records = handle.reference.log.records();
+                assert!(records
+                    .iter()
+                    .any(|record| matches!(record, WalRecord::StructuredOutputDowngraded { .. })));
+                assert!(records
+                    .iter()
+                    .any(|record| matches!(record, WalRecord::StructuredOutputResult { .. })));
+            }
+            "retry_attempts" => {
+                let records = handle.reference.log.records();
+                let attempts: Vec<_> = records
+                    .iter()
+                    .filter_map(|record| match record {
+                        WalRecord::ModelAttemptFinished {
+                            attempt, outcome, ..
+                        } => Some((*attempt, outcome.as_str())),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(attempts, [(0, "http_error"), (1, "complete")]);
+                assert!(records.iter().any(|record| matches!(
+                    record,
+                    WalRecord::ModelStepFinished {
+                        retries_used: 1,
+                        ..
+                    }
+                )));
+            }
             "antigravity_identity" => assert!(
                 String::from_utf8_lossy(&handle.reference.sent[&0]).contains("identity:r:1"),
                 "the reference render must embed run_id=r and step_index=1"
@@ -99,9 +167,7 @@ async fn ported_crash_cut_scenarios_hold_every_invariant_at_every_boundary() {
             }
             _ => {}
         }
-        // `inherited_tool_surface` is also cut as a torn append after each boundary; the other
-        // scenarios are cut at clean record boundaries only, to keep the suite quick.
-        let torn = scenario.name == "inherited_tool_surface";
+        let torn = true;
         let kills = handle.every_record_boundary(torn).await;
         assert_eq!(kills.len(), handle.record_boundaries(torn).len());
         truncations += kills.len();
@@ -136,6 +202,17 @@ async fn ported_crash_cut_scenarios_hold_every_invariant_at_every_boundary() {
         .await;
     let nested = handle.every_boundary_inside_resume(&kill).await;
     assert!(!nested.is_empty());
+    assert!(
+        nested
+            .iter()
+            .any(|nested| matches!(nested.point, KillPoint::RecordBoundary { torn: true, .. })),
+        "nested recovery must include torn appends"
+    );
+    assert!(
+        nested.iter().any(|nested| matches!(nested.point,
+        KillPoint::RecordBoundary { records, torn: false } if records == after_first_result)),
+        "nested recovery must also cut before its first new record"
+    );
     truncations += 1 + nested.len();
     suite.record(std::iter::once(kill).chain(nested));
 
@@ -165,3 +242,33 @@ async fn ported_crash_cut_scenarios_hold_every_invariant_at_every_boundary() {
     assert_eq!(methods["Truncation"], truncations, "{methods:?}");
     assert_eq!(methods["Sigkill"], 2, "{methods:?}");
 }
+
+#[tokio::test]
+async fn auth_refreeze_holds_every_invariant_at_every_boundary() {
+    let handle = RunnerHandle::new(scenarios::AUTH_REFREEZE).await;
+    let records = handle.reference.log.records();
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::RunConfigRefrozen { .. })));
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::RunAuthRefrozen { .. })));
+    let kills = handle.every_record_boundary(true).await;
+    assert_eq!(kills.len(), handle.record_boundaries(true).len());
+}
+
+#[tokio::test]
+async fn restart_refreeze_holds_every_invariant_at_every_boundary() {
+    let handle = RunnerHandle::new(scenarios::RESTART_REFREEZE).await;
+    let records = handle.reference.log.records();
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::RunConfigRefrozen { .. })));
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::RunAuthRefrozen { .. })));
+    let kills = handle.every_record_boundary(true).await;
+    assert_eq!(kills.len(), handle.record_boundaries(true).len());
+}
+
+broca_crash_harness::require_process_kill!();

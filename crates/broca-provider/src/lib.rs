@@ -9,6 +9,9 @@
 //! subcommands, not in this library surface.
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "live")]
+pub(crate) mod attempt_policy;
+
 pub mod cache_evidence;
 mod cache_hints;
 pub mod cache_markers;
@@ -41,6 +44,7 @@ pub mod sse;
 pub mod structured_output;
 pub mod tool_id_alias;
 pub mod tool_name_alias;
+pub mod turn_system;
 pub mod variant;
 pub mod wire;
 
@@ -50,6 +54,9 @@ pub mod factory;
 pub mod live;
 #[cfg(feature = "live")]
 pub mod transport;
+
+#[cfg(feature = "live")]
+pub mod quota;
 
 pub use broca_protocol::provider::NormalizedEvent;
 pub use normalize::{AnthropicNormalizer, NormalizeError};

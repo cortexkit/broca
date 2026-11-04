@@ -23,7 +23,9 @@ pub fn safe_provider_code(code: &str) -> bool {
             | "misalignment_policy_violation"
             | "usage_limit_reached"
             | "content_filter"
+            | "flex_unavailable"
             | "server_error"
+            | "server_is_overloaded"
             | "stream_too_slow"
             | "response_deadline"
             | "output_ceiling"
@@ -56,6 +58,8 @@ mod tests {
             "context_window_exceeded",
             "billing_exhausted",
             "credit_insufficient",
+            "flex_unavailable",
+            "server_is_overloaded",
             "output_ceiling",
             "previous_process_ended_unsealed",
             "websocket_auth_rejected",

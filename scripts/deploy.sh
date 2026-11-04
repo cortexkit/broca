@@ -132,6 +132,15 @@ if ! bash scripts/place-release.sh --staged "$staged" --restart --report "$repor
   rollback_command >&2
   exit 1
 fi
+# Record a conservative restart boundary after placement returns. A run admitted
+# before the restart (even if its result arrives later) cannot certify the new daemon.
+python3 - "$report" <<'PY'
+import json, pathlib, sys, time
+path = pathlib.Path(sys.argv[1])
+report = json.loads(path.read_text())
+report["restart_observed_at_ms"] = time.time_ns() // 1_000_000
+path.write_text(json.dumps(report))
+PY
 expected_sha="$(shasum -a 256 "$staged" | awk '{print $1}')"
 if ! bash scripts/verify-deploy.sh --staged "$staged" --sha "$expected_sha" --marker "$MARKER" --control "$CONTROL" \
     2>&1 | tee "$logdir/verify.log"; then
@@ -168,13 +177,28 @@ if [ ! -x "${CARGO_TARGET_DIR:-./target}/release/broca-session" ] || ! acceptanc
   rollback_command >&2
   exit 1
 fi
-if ! python3 scripts/acceptance-worker-turn.py >"$logdir/acceptance-worker.log" 2>&1; then
+# Project-free builds check mason/sidekick admissions whose plan fetched the aft
+# tool provider, then wait for any candidate to complete. Runs without an aft
+# fetch are counted as ignored; other terminal reasons are counted, not failures.
+# Older builds compose and send an acceptance turn with their project folder.
+# Observation sends nothing and reports metadata only; it never creates a
+# daemon-authenticated project scope. It waits at most ten minutes for completion.
+if ! python3 scripts/acceptance-worker-turn.py --placement-report "$report" \
+    >"$logdir/acceptance-worker.log" 2>&1; then
   cat "$logdir/acceptance-worker.log" >&2
   echo "deploy: WORKER ADMISSION ACCEPTANCE FAILED; not publishing." >&2
   rollback_command >&2
   exit 1
 fi
 cat "$logdir/acceptance-worker.log"
+if ! python3 scripts/lib/acceptance_scoped.py --placement-report "$report" \
+    >"$logdir/acceptance-scoped.log" 2>&1; then
+  cat "$logdir/acceptance-scoped.log" >&2
+  echo "deploy: SCOPED DISPATCH ACCEPTANCE FAILED; not publishing." >&2
+  rollback_command >&2
+  exit 1
+fi
+cat "$logdir/acceptance-scoped.log"
 ci_log="$logdir/ci.log"
 if ! TAG_WHEN_GREEN_LOG="$ci_log" bash scripts/tag-when-green.sh "$sha" "$version"; then
   echo "deploy: live acceptance passed, but could not start background publication. Retry scripts/tag-when-green.sh $sha $version" >&2
@@ -198,6 +222,6 @@ if report["seal_error"]:
 if report.get("sessions_cancelled"):
     sys.exit(1)
 PY
-echo "   acceptance PASS (live tool dispatch; classed fetch-plan turn and WAL feature gates)"
+echo "   acceptance PASS (direct tool round trip; classed fetch-plan turn; scoped AFT dispatch)"
 rollback_command
 echo "   CI log     $ci_log (detached; CI does not gate deployment)"

@@ -472,6 +472,12 @@ impl WalStore for CountingWal {
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
         WalStore::wal_present(&self.inner, session)
     }
+    fn wal_present_checked(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<bool>, broca_wal::WalError> {
+        WalStore::wal_present_checked(&self.inner, session)
+    }
     fn live_wal_last_write(
         &self,
         session: &BindIdentity,
@@ -686,6 +692,13 @@ impl MaterializedStore for CountingStore {
 }
 
 impl Persister for CountingStore {
+    fn repair_sender_policy(
+        &self,
+        session: &BindIdentity,
+        range: &broca_wal::WalRangeRead,
+    ) -> Result<u64, String> {
+        self.inner.repair_sender_policy(session, range)
+    }
     fn project_retained_head(
         &self,
         session: &BindIdentity,
@@ -923,16 +936,18 @@ impl CompactionViews for Views {
 }
 
 impl CompactionPlane for Views {
-    fn setup<'life0, 'life1, 'life2, 'async_trait>(
+    fn setup<'life0, 'life1, 'life2, 'life3, 'async_trait>(
         &'life0 self,
         _provider: &'life1 str,
         _bind: &'life2 BindIdentity,
+        _scope: Option<&'life3 broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Boxed<'async_trait, Result<SetupAnswer, CompactionUnavailable>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
         'life2: 'async_trait,
+        'life3: 'async_trait,
         Self: 'async_trait,
     {
         // The head Setup inserts before the transcript; the first view replaces it.
@@ -942,16 +957,18 @@ impl CompactionPlane for Views {
         Box::pin(async move { serde_json::from_value(answer).map_err(|_| CompactionUnavailable) })
     }
 
-    fn view_get<'life0, 'life1, 'life2, 'async_trait>(
+    fn view_get<'life0, 'life1, 'life2, 'life3, 'async_trait>(
         &'life0 self,
         _provider: &'life1 str,
         _bind: &'life2 BindIdentity,
+        _scope: Option<&'life3 broca_protocol::SessionScope>,
         request: ViewGetRequest,
     ) -> Boxed<'async_trait, Result<ViewGetAnswer, CompactionUnavailable>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
         'life2: 'async_trait,
+        'life3: 'async_trait,
         Self: 'async_trait,
     {
         self.fetches.fetch_add(1, Ordering::SeqCst);
@@ -994,6 +1011,7 @@ fn compaction_control(views: &Arc<Views>) -> RunControl {
 
 fn text_message(role: Role, text: String) -> Message {
     Message {
+        turn_system: false,
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,
@@ -1016,6 +1034,7 @@ fn request(session: &BindIdentity, run: &str, inputs: usize) -> RunRequest {
         reply: None,
     };
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -1039,8 +1058,8 @@ fn request(session: &BindIdentity, run: &str, inputs: usize) -> RunRequest {
                 )
             })
             .collect(),
-        // `read` is a read-only tool, so its repeated identical results draw repetition
-        // guidance; `lookup` is not, so it never does.
+        // Repeated identical results from the read-only `read` tool add model-facing
+        // guidance to stop repeating the call. `lookup` does not opt into that guidance.
         tools: vec![tool("lookup"), tool("read")],
         policy_allowed: HashSet::from(["lookup".to_owned(), "read".to_owned()]),
         tool_choice: ToolChoice::Auto,

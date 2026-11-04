@@ -1622,6 +1622,7 @@ async fn reopened_actor_starts_older_durable_queue_before_a_new_send() {
     wal.append(
         1,
         &broca_wal::WalRecord::Queued {
+            sent_by: None,
             written_at_ms: None,
             retention: None,
             ts_ms: None,
@@ -1964,6 +1965,7 @@ async fn reopened_retry_of_pending_run_is_not_started_twice() {
     wal.append(
         1,
         &broca_wal::WalRecord::Queued {
+            sent_by: None,
             written_at_ms: None,
             retention: None,
             ts_ms: None,
@@ -2016,6 +2018,8 @@ async fn reopened_actor_redrives_unfinished_run_before_accepting_a_new_send() {
     wal.append(
         1,
         &broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -2102,6 +2106,8 @@ async fn reopened_actor_seals_indeterminate_run_before_draining_new_send() {
     let batch_id = broca_protocol::BatchId("r1-b1".into());
     let seed = [
         broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -2129,6 +2135,7 @@ async fn reopened_actor_seals_indeterminate_run_before_draining_new_send() {
             step_id: broca_protocol::StepId(1),
         },
         broca_wal::WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -3183,6 +3190,8 @@ async fn renderer_drift_reaches_subscriber_and_run_status() {
     wal.append(
         1,
         &broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -3464,6 +3473,8 @@ async fn same_send_id_after_renderer_drift_is_an_idempotent_terminal_noop() {
     wal.append(
         1,
         &WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -3760,6 +3771,8 @@ async fn stale_active_reconciles_to_terminal_from_wal() {
         let wal = wal_store.open(&key).expect("open wal");
         let writer = WalHandle::spawn(wal, lease.epoch()).expect("spawn writer");
         writer.record(broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -3784,6 +3797,7 @@ async fn stale_active_reconciles_to_terminal_from_wal() {
             submission_id: None,
         });
         writer.record(broca_wal::WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -3907,6 +3921,8 @@ async fn stale_active_reconciles_renderer_drift_terminal_from_wal() {
     let mut config = min_run_config();
     config.frozen_render_config = serde_json::json!({"render_config": "stateless"});
     writer.record(broca_wal::WalRecord::RunStarted {
+        compaction_plan_version: None,
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -4013,6 +4029,8 @@ fn seed_unsealed_run_with_queue(
     };
     let mut records = vec![
         broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4040,6 +4058,7 @@ fn seed_unsealed_run_with_queue(
             step_id: broca_protocol::StepId(1),
         },
         broca_wal::WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -4085,6 +4104,7 @@ fn seed_unsealed_run_with_queue(
         ]);
     }
     records.push(broca_wal::WalRecord::Queued {
+        sent_by: None,
         written_at_ms: None,
         retention: None,
         ts_ms: None,
@@ -4111,6 +4131,8 @@ fn assert_unsealed_append_would_corrupt(rig: &Rig, key: &broca_protocol::BindIde
         seq: frames.last().map_or(1, |frame| frame.seq + 1),
         fence: 1,
         record: broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4201,6 +4223,8 @@ fn seed_completed_run_with_queue(
     wal.append(
         seq,
         &broca_wal::WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -4246,6 +4270,7 @@ fn seed_completed_run_with_queue(
         wal.append(
             seq,
             &broca_wal::WalRecord::Queued {
+                sent_by: None,
                 written_at_ms: None,
                 retention: None,
                 ts_ms: None,
@@ -4268,6 +4293,9 @@ fn seed_completed_run_with_queue(
 
 fn min_run_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,

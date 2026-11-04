@@ -157,8 +157,12 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
             'import runpy, sys\nsys.argv[1:] = ["metadata", *sys.argv[1:]]\n'
             'runpy.run_path(__file__.replace("check-credential-metadata.py", "stub.py"), run_name="__main__")\n')
         (self.scripts / "acceptance-worker-turn.py").write_text(
-            'import runpy, sys\nsys.argv[1:] = ["worker-accept"]\n'
+            'import runpy, sys\nsys.argv[1:] = ["worker-accept", *sys.argv[1:]]\n'
             'runpy.run_path(__file__.replace("acceptance-worker-turn.py", "stub.py"), run_name="__main__")\n')
+        (self.scripts / "lib").mkdir()
+        (self.scripts / "lib/acceptance_scoped.py").write_text(
+            'import runpy, sys\nsys.argv[1:] = ["scoped-accept", *sys.argv[1:]]\n'
+            'runpy.run_path(__file__.replace("lib/acceptance_scoped.py", "stub.py"), run_name="__main__")\n')
         for file, step in (("stage-release.sh", "stage"), ("place-release.sh", "place"),
                            ("verify-deploy.sh", "verify"), ("acceptance-turn.sh", "accept"),
                            ("tag-when-green.sh", "publish")):
@@ -250,7 +254,7 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
     def test_metadata_check_runs_concurrently_with_staging(self):
         result = self.deploy(**self.overlap())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_gated_steps(["place", "verify", "accept", "worker-accept", "publish"])
+        self.assert_gated_steps(["place", "verify", "accept", "worker-accept", "scoped-accept", "publish"])
         self.assertTrue((self.home / "stage-finished").exists())
         self.assertTrue((self.home / "metadata-active").exists())
         self.assert_metadata_log(result, 0)
@@ -314,7 +318,7 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
     def test_acceptance_waits_out_a_module_still_starting(self):
         result = self.deploy(WARMING_ACCEPTS="2", BROCA_DEPLOY_WARMING_RETRY_SECS="0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_gated_steps(["place", "verify", "accept", "accept", "accept", "worker-accept", "publish"])
+        self.assert_gated_steps(["place", "verify", "accept", "accept", "accept", "worker-accept", "scoped-accept", "publish"])
         self.assertIn("still starting (module_warming)", result.stdout)
 
     def test_acceptance_failure_other_than_warming_is_not_retried(self):
@@ -342,7 +346,7 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         result = self.deploy("--live-approved")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         records = dict(self.records())
-        self.assert_gated_steps(["place", "verify", "accept", "worker-accept", "publish"])
+        self.assert_gated_steps(["place", "verify", "accept", "worker-accept", "scoped-accept", "publish"])
         self.assertEqual(records["stage"], ["--marker", "new marker", "--control", "known control"])
         self.assertEqual(records["listing"], ["auth", "list", "--json"])
         self.assertEqual(records["metadata"][0], "--vault-listing")
@@ -350,7 +354,10 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         self.assertIn("--live-approved", records["place"])
         self.assertIn(hashlib.sha256(b"signed release").hexdigest(), records["verify"])
         self.assertEqual(records["accept"], ["0.0.2"])
-        self.assertEqual(records["worker-accept"], [])
+        # Both acceptance legs read the same restart report; its contents are pinned in
+        # tests/test-acceptance-turns.py.
+        self.assertEqual(records["worker-accept"][0], "--placement-report")
+        self.assertEqual(records["worker-accept"], records["scoped-accept"])
         self.assertEqual(records["publish"], [self.sha, "0.0.2"])
         self.assert_metadata_log(result, 0)
         self.assertIn("pid        4321", result.stdout)

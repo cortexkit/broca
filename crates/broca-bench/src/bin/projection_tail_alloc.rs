@@ -109,6 +109,8 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                compaction_plan_version: None,
+                sent_by: None,
                 written_at_ms: None,
                 tags: None,
                 session_class: None,
@@ -128,6 +130,9 @@ impl Fixture {
                 run_id: RunId(format!("run-{}", shape.label)),
                 session,
                 config: Box::new(RunConfig {
+                    global_system: None,
+                    route_decision_id: None,
+                    account_limit_pause: false,
                     turn_directives_v1: None,
                     render_tags: false,
                     computed_tags: None,
@@ -169,6 +174,7 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                raw_finish_reason: None,
                 fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,

@@ -1,5 +1,11 @@
 //! Setup, the replay of what the removed synchronous client recorded, and the in-memory WAL the
 //! asynchronous view tests share.
+//!
+//! V1 round-trip tests explicitly enable the unit-only historical writer fixture
+//! to generate old WAL prefixes without changing their renderer or expected
+//! results for simulated crashes.
+//! They do not assert that the daemon still calls v1. The mode-3 run-loop tests
+//! also exercise shipping legacy freeze with that fixture disabled.
 
 use super::*;
 use crate::compaction_provider::setup::{SetupAnswer, SetupRequest};
@@ -437,6 +443,7 @@ impl CompactionPlane for Scripted {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         self.setups.fetch_add(1, Ordering::SeqCst);
@@ -484,6 +491,7 @@ async fn run_setup_for(
         setups: AtomicUsize::new(0),
     });
     let runtime = runtime::Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: Some(&plane),
@@ -627,6 +635,7 @@ impl CompactionPlane for SlowRide {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         Err(CompactionUnavailable)
@@ -635,6 +644,7 @@ impl CompactionPlane for SlowRide {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::ride::RideRequest,
     ) -> Result<crate::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
         self.deadlines.lock().unwrap().push(request.deadline_ms);
@@ -659,6 +669,7 @@ async fn ride_after(
     });
     let plane: Arc<dyn CompactionPlane> = slow.clone();
     let runtime = runtime::Runtime {
+        scope: None,
         provider: "provider",
         bind: &bind,
         plane: Some(&plane),
@@ -785,6 +796,153 @@ async fn recorded_waits_are_sealed_without_a_provider() {
         assert!(state.open_wait.is_none());
         let _ = writer.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn legacy_wait_resume_is_recorded_before_its_only_closure() {
+    use crate::{FileLeaseStore, FileWalStore, RunControl, RunRequest, WalStore};
+    struct NoProvider;
+    #[async_trait::async_trait]
+    impl crate::Provider for NoProvider {
+        async fn step(
+            &self,
+            _: broca_protocol::StepId,
+            _: &broca_protocol::CallOptions,
+        ) -> tokio::sync::mpsc::Receiver<broca_protocol::NormalizedEvent> {
+            panic!("legacy wait recovery must not request a provider step")
+        }
+    }
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../broca-wal/tests/fixtures/pre_flow_scoped_run_started.json"
+    ))
+    .unwrap();
+    let started: WalRecord = serde_json::from_value(fixture["record"].clone()).unwrap();
+    let WalRecord::RunStarted {
+        run_id,
+        session,
+        config,
+        input,
+        scope,
+        principal,
+        project_id,
+        submission_id,
+        send_id,
+        request_identity_digest,
+        ..
+    } = started.clone()
+    else {
+        unreachable!()
+    };
+    let submission = serde_json::from_value(serde_json::json!({"model":config.model,"input":input,"tools":[],"stop_when":[{"type":"step_count","n":1}]})).unwrap();
+    let mut request = RunRequest::from_submission(
+        submission,
+        run_id.clone(),
+        session,
+        broca_protocol::SubmissionId("old-wait".into()),
+    );
+    request.scope = scope;
+    request.principal = principal;
+    request.project_id = project_id;
+    request.submission_id = submission_id;
+    request.send_id = send_id;
+    request.request_identity_digest = request_identity_digest;
+    let root = broca_test_support::scratch_root().join("legacy-wait-resume-marker");
+    let store = FileWalStore::new(root.join("wal"));
+    let mut wal = store.open(&request.session).unwrap();
+    wal.append(1, &started, true).unwrap();
+    wal.append(1, &setup_record(None), true).unwrap();
+    wal.append(
+        1,
+        &WalRecord::CompactionRequest {
+            provider: "provider".into(),
+            request_id: "old-request".into(),
+        },
+        true,
+    )
+    .unwrap();
+    let lineage = wal.lineage_id().unwrap().to_string();
+    wal.append(
+        1,
+        &WalRecord::CompactionAnswer {
+            provider: "provider".into(),
+            request_id: "old-request".into(),
+            cursor: CompactionCursor {
+                lineage_id: lineage,
+                after_ordinal: None,
+            },
+            disposition: CompactionDisposition::Wait,
+            rejected: None,
+            wait: Some(CompactionWait {
+                reason: "work".into(),
+                bound_ms: 10,
+            }),
+        },
+        true,
+    )
+    .unwrap();
+    drop(wal);
+    let before = store.read_records(&request.session).unwrap();
+    let path = store.wal_path(&request.session);
+    let bytes = std::fs::read(&path).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+    let leases = FileLeaseStore::new(root.join("lease"));
+    let summary = crate::run_loop_with_control(
+        request.clone(),
+        &NoProvider,
+        &crate::StubToolPlane::new(),
+        &leases,
+        &crate::AllowAll,
+        &store,
+        None,
+        RunControl::default(),
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.reason, RunFinishReason::Interrupted);
+    let after = store.read_records(&request.session).unwrap();
+    let appended = &after[before.len()..];
+    assert_eq!(
+        appended
+            .iter()
+            .filter(|frame| matches!(frame.record, WalRecord::ResumeStarted { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        matches!(&appended[0].record, WalRecord::ResumeStarted { episode, resumed_from_seq, redone, indeterminate, .. }
+        if episode == &run_id && *resumed_from_seq == before.last().unwrap().seq && redone.is_empty() && indeterminate.is_empty())
+    );
+    assert!(matches!(
+        appended[1].record,
+        WalRecord::CompactionWait {
+            exited: CompactionWaitExit::Interrupted,
+            ..
+        }
+    ));
+    assert!(matches!(
+        appended[2].record,
+        WalRecord::RunFinished {
+            reason: RunFinishReason::Interrupted,
+            ..
+        }
+    ));
+    assert_eq!(appended.len(), 3);
+    assert!(std::fs::read(&path).unwrap().starts_with(&bytes));
+    crate::run_loop_with_control(
+        request.clone(),
+        &NoProvider,
+        &crate::StubToolPlane::new(),
+        &leases,
+        &crate::AllowAll,
+        &store,
+        None,
+        RunControl::default(),
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(store.read_records(&request.session).unwrap(), after);
 }
 
 /// The replacement ceiling is broca's own, independent of configuration: an initial message
@@ -940,6 +1098,7 @@ async fn admission_and_model_page_absent_compaction_summary_force_complete_reads
     let model = crate::StubProvider::new(vec![model_events()]);
     let (out, _events) = tokio::sync::mpsc::channel(128);
     let control = crate::RunControl {
+        legacy_compaction_fixture: true,
         manifest: Some(manifest()),
         compaction_plane: Some(scripted.clone()),
         ..Default::default()
@@ -1151,6 +1310,7 @@ impl CompactionPlane for OneView {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         let mut answer = ready();
@@ -1165,6 +1325,7 @@ impl CompactionPlane for OneView {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::view::ViewGetRequest,
     ) -> Result<crate::compaction_provider::view::ViewGetAnswer, CompactionUnavailable> {
         use crate::compaction_provider::view::ViewGetAnswer;
@@ -1195,6 +1356,7 @@ impl CompactionPlane for OneView {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::ride::RideRequest,
     ) -> Result<crate::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
         use crate::compaction_provider::ride::RideAnswer;
@@ -1236,6 +1398,7 @@ fn history_request() -> (crate::RunRequest, crate::RunControl, Arc<OneView>) {
     .unwrap();
     let views = Arc::new(OneView::default());
     let control = crate::RunControl {
+        legacy_compaction_fixture: true,
         manifest: Some(Arc::new(plan)),
         compaction_plane: Some(Arc::new(Scripted {
             answer: ready(),
@@ -1256,6 +1419,7 @@ async fn presetless_compaction_setup_omits_the_member_on_the_real_call() {
             &self,
             _: &str,
             _: &BindIdentity,
+            _scope: Option<&broca_protocol::SessionScope>,
             request: SetupRequest,
         ) -> Result<SetupAnswer, CompactionUnavailable> {
             assert!(serde_json::to_value(&request)
@@ -1496,6 +1660,7 @@ async fn a_new_lineage_numbers_its_notices_past_the_deleted_lineages() {
         &store,
         None,
         crate::RunControl {
+            legacy_compaction_fixture: true,
             manifest: Some(manifest()),
             compaction_plane: Some(plane.clone()),
             ..Default::default()
@@ -1689,6 +1854,7 @@ async fn a_model_change_rides_for_a_view_and_applies_it() {
         ..Default::default()
     });
     let control = || crate::RunControl {
+        legacy_compaction_fixture: true,
         manifest: Some(manifest()),
         compaction_plane: Some(views.clone()),
         // A call budget above the rewrite deadline: the ride still waits no longer than the
@@ -1840,6 +2006,7 @@ async fn run_with_account(
     let writer = shared.writer();
     *views.wal.lock().unwrap() = Some(shared.clone());
     let control = crate::RunControl {
+        legacy_compaction_fixture: true,
         manifest: Some(manifest()),
         compaction_plane: Some(views.clone()),
         compaction_views: None,
@@ -1989,6 +2156,7 @@ impl CompactionPlane for RacingViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         Err(CompactionUnavailable)
@@ -1997,6 +2165,7 @@ impl CompactionPlane for RacingViews {
         &self,
         _: &str,
         _: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         request: crate::compaction_provider::view::ViewGetRequest,
     ) -> Result<crate::compaction_provider::view::ViewGetAnswer, CompactionUnavailable> {
         self.fetches.lock().unwrap().push(request.view_version);
@@ -2047,6 +2216,7 @@ async fn idle_boundary_applies_only_the_newest_view_announced_during_its_fetch()
     let (applied, ()) = tokio::join!(
         runtime::apply_idle_view(
             &session,
+            None,
             &writer,
             &plane,
             Some(views),
@@ -2103,10 +2273,12 @@ async fn step_boundary_logs_applied_and_superseded_views_with_session_ref() {
     });
     let plane: Arc<dyn CompactionPlane> = racing.clone();
     let control = crate::RunControl {
+        legacy_compaction_fixture: true,
         compaction_views: Some(inbox.clone()),
         ..Default::default()
     };
     let runtime = runtime::Runtime {
+        scope: None,
         provider: "provider",
         bind: &session,
         plane: Some(&plane),
@@ -2202,6 +2374,7 @@ async fn idle_view_records_lower_estimate_and_repairs_every_cut_before_wake() {
         let plane: Arc<dyn CompactionPlane> = plane;
         assert!(runtime::apply_idle_view(
             &bind(),
+            None,
             &writer,
             &plane,
             None,
@@ -2286,6 +2459,7 @@ async fn a_request_over_the_window_is_refused_before_it_is_sent() {
         let model = crate::StubProvider::new(vec![model_events()]);
         let (out, _events) = tokio::sync::mpsc::channel(256);
         let mut control = crate::RunControl {
+            legacy_compaction_fixture: true,
             admitted_context_limit: Some(4),
             ..Default::default()
         };
@@ -2443,6 +2617,7 @@ async fn only_a_compaction_session_reads_the_notice_floor() {
     plain.plan = OpaqueJson::from_json_text(json!({"composition":{}}).to_string()).unwrap();
     assert_eq!(
         floor_reads(crate::RunControl {
+            legacy_compaction_fixture: true,
             manifest: Some(Arc::new(plain)),
             ..Default::default()
         })
@@ -2451,6 +2626,7 @@ async fn only_a_compaction_session_reads_the_notice_floor() {
     );
     assert_eq!(
         floor_reads(crate::RunControl {
+            legacy_compaction_fixture: true,
             manifest: Some(manifest()),
             compaction_plane: Some(Arc::new(Scripted {
                 answer: ready(),
@@ -2554,6 +2730,7 @@ async fn ending_run(
         &shared,
         None,
         crate::RunControl {
+            legacy_compaction_fixture: true,
             manifest: Some(manifest()),
             compaction_plane: Some(Arc::new(Scripted {
                 answer: ready(),
@@ -2687,3 +2864,4 @@ async fn setup_view_negotiation_records_the_claim_and_rejects_malformed_or_unreq
         assert!(records.is_empty());
     }
 }
+mod mode3_run_loop_tests;

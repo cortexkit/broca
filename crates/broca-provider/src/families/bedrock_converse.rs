@@ -187,6 +187,8 @@ fn build_request_body_with_media_and_provenance(
 ) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
+    let turn_system = crate::turn_system::prepare(frozen, opts);
+    let opts = turn_system.as_ref();
     let prepared = crate::structured_output::prepare(frozen, opts);
     let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
@@ -194,7 +196,11 @@ fn build_request_body_with_media_and_provenance(
     let marker_policy = bedrock_marker_policy(frozen);
     let mut body = Map::new();
 
-    let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
+    let name_map = crate::tool_name_alias::ToolNameMap::build_with_aliases(
+        &opts.tools,
+        &opts.prompt,
+        &frozen.tool_name_aliases,
+    );
     let id_map = crate::tool_id_alias::ToolIdMap::build(
         &opts.prompt,
         &crate::tool_id_alias::IdGrammar::bedrock(),
@@ -1481,6 +1487,7 @@ impl BedrockStreamNormalizer {
         events.extend([
             NormalizedEvent::Control(ProviderControl::AssistantMessage { message }),
             NormalizedEvent::Control(ProviderControl::StepFinished {
+                raw_finish_reason: self.stop_reason.take(),
                 step_id: self.step_id,
                 usage: self.usage,
                 finish_reason: self.finish_reason,

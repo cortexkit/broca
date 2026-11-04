@@ -162,7 +162,7 @@ impl ModuleHandler for Transform {
             .and_then(Value::as_str)
         {
             Some("role.describe") => {
-                json!({"majors":[{"version":"step-transform-provider/v1","ops":["role.describe","transform.declare","transform.hook"],"stability":"alpha"},{"version":"tool-provider/v1","ops":["role.describe","tool.catalog"],"stability":"alpha"}],"implementation_version":"test","capabilities":[]})
+                json!({"majors":[{"version":"step-transform-provider/v2","ops":["role.describe","transform.declare","transform.hook"],"stability":"alpha"},{"version":"tool-provider/v1","ops":["role.describe","tool.catalog"],"stability":"alpha"}],"implementation_version":"test","capabilities":[]})
             }
             Some("transform.declare") => {
                 if *self.0.refuse_declare.lock().unwrap() {

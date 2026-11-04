@@ -136,9 +136,28 @@ pub struct FileCutArtifacts {
     registry: LineageRegistry,
     wal: Arc<FileWalStore>,
     leases: FileLeaseStore,
-    export: Arc<dyn ExportIndex>,
+    export: Arc<dyn broca_core::ImportedRunExclusions>,
     driver: Arc<dyn MoveDriver>,
     plans: Arc<Mutex<HashMap<String, LockedPlans>>>,
+}
+
+struct LegacyExclusions(Arc<dyn ExportIndex>);
+impl broca_core::ImportedRunExclusions for LegacyExclusions {
+    fn record_imported_runs(
+        &self,
+        session: &BindIdentity,
+        cut_id: &str,
+        runs: &[broca_protocol::RunId],
+    ) -> Result<(), broca_core::ExportError> {
+        self.0.record_imported_runs(session, cut_id, runs)
+    }
+    fn is_imported_run(
+        &self,
+        session: &BindIdentity,
+        run: &broca_protocol::RunId,
+    ) -> Result<bool, broca_core::ExportError> {
+        self.0.is_imported_run(session, run)
+    }
 }
 fn unavailable(e: impl std::fmt::Display) -> ErrorBody {
     refusal("unavailable", e.to_string(), Value::Null)
@@ -353,6 +372,22 @@ impl FileCutArtifacts {
         registry: LineageRegistry,
         wal: Arc<FileWalStore>,
         export: Arc<dyn ExportIndex>,
+        driver: Arc<dyn MoveDriver>,
+    ) -> Self {
+        Self::with_exclusions(
+            state_root,
+            registry,
+            wal,
+            Arc::new(LegacyExclusions(export)),
+            driver,
+        )
+    }
+
+    pub fn with_exclusions(
+        state_root: PathBuf,
+        registry: LineageRegistry,
+        wal: Arc<FileWalStore>,
+        export: Arc<dyn broca_core::ImportedRunExclusions>,
         driver: Arc<dyn MoveDriver>,
     ) -> Self {
         let root = wal.root().parent().unwrap_or(std::path::Path::new("."));
@@ -974,11 +1009,32 @@ impl CutArtifacts for FileCutArtifacts {
                     &self.installations(&locked.plans, &paths),
                     self.export.as_ref(),
                     |session| {
+                        self.registry.handle().invalidate_history_caches(session);
+                        if let Some(history) =
+                            broca_core::WalStore::served_history(self.wal.as_ref())
+                        {
+                            let lineage = locked
+                                .plans
+                                .iter()
+                                .find(|plan| &plan.session == session)
+                                .map(|plan| plan.lineage_id.as_str());
+                            history.history_rewritten(session, lineage)?;
+                        }
+                        Ok(())
+                    },
+                    |session| {
                         // Ownership sidecars retain the canonical wal/ address so every
                         // transcript tree shares one move refusal and one writer lease.
                         migration::unlink(&self.wal.wal_path(session).with_extension("moved"))
                             .map_err(|error| error.to_string())?;
-                        self.driver.drop_projection(session)
+                        self.driver.drop_projection(session)?;
+                        self.registry.handle().invalidate_history_caches(session);
+                        if let Some(history) =
+                            broca_core::WalStore::served_history(self.wal.as_ref())
+                        {
+                            history.history_rewrite_finished(session)?;
+                        }
+                        Ok(())
                     },
                 )
                 .map_err(|e| self.install_error(&cut_id, _state, &locked, e))?;
@@ -1144,6 +1200,7 @@ mod provider_held_tests {
             .append(
                 1,
                 &WalRecord::RunPaused {
+                    account_limit: None,
                     run_id: RunId("run".into()),
                     reason: PauseReason::ToolHeld,
                     error: None,

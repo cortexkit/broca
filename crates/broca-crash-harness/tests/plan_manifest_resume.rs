@@ -193,3 +193,5 @@ async fn resumed_dispatch_uses_the_wal_frozen_provider_preset_not_new_control() 
         "{seen:?}"
     );
 }
+
+broca_crash_harness::require_process_kill!();

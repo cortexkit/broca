@@ -32,7 +32,7 @@ impl Scratch {
 
     /// An overhaul log at [`Self::log`] with the floor beside its state root.
     fn overhaul(&self) -> FileWal {
-        FileWal::open(self.log())
+        FileWal::open_with_recovery(self.log(), WalConfig::OVERHAUL, self.floor())
             .unwrap()
             .with_feature_floor(self.floor())
             .with_wal_config(WalConfig::OVERHAUL)
@@ -246,10 +246,100 @@ fn a_legacy_log_refuses_version_4_frames() {
 }
 
 #[test]
+fn a_legacy_log_refuses_recovery_cut_without_changing_bytes() {
+    let scratch = Scratch::new("legacy-recovery-record");
+    let mut wal = FileWal::open(scratch.log()).unwrap();
+    let before = std::fs::read(scratch.log()).unwrap();
+    let record: WalRecord = serde_json::from_value(serde_json::json!({
+        "type":"recovery_cut", "cut_id":"cut", "sidecar_basename":"log.cut-1",
+        "cut_offset":69, "removed_len":1, "removed_sha256":"digest",
+        "reason":"unproven_corruption", "active_run":null, "runs":[], "unattributed_tool_risk":true
+    }))
+    .unwrap();
+    assert!(matches!(
+        wal.append(1, &record, true),
+        Err(WalError::FrameFormat {
+            log: WalFormat::Legacy,
+            offered: WalFormat::Overhaul
+        })
+    ));
+    assert_eq!(std::fs::read(scratch.log()).unwrap(), before);
+}
+
+#[test]
+fn overhaul_repair_preserves_undecodable_payload_but_never_downgrades_unknown_features() {
+    for requires in [vec!["frame-stamps/v1"], vec!["future-recovery/v1"]] {
+        let scratch = Scratch::new("undecodable-or-newer");
+        let mut wal = scratch.overhaul();
+        wal.append(1, &plain(1), true).unwrap();
+        drop(wal);
+        let original = std::fs::read(scratch.log()).unwrap();
+        let frame = v4::encode(
+            v4::Metadata {
+                seq: 2,
+                fence: 1,
+                appended_ms: 1,
+                writer_id: [1; 16],
+            },
+            &requires,
+            br#"{"type":"step_started","step_id":"not-an-integer"}"#,
+        )
+        .unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(scratch.log())
+            .unwrap()
+            .write_all(&frame)
+            .unwrap();
+        if requires.contains(&"future-recovery/v1") {
+            assert!(matches!(
+                FileWal::open_with_recovery(scratch.log(), WalConfig::OVERHAUL, scratch.floor()),
+                Err(WalError::NewerWriter { .. })
+            ));
+            let mut unchanged = original;
+            unchanged.extend_from_slice(&frame);
+            assert_eq!(std::fs::read(scratch.log()).unwrap(), unchanged);
+            assert!(
+                crate::recovery::manifests(&scratch.log(), DEFAULT_MAX_READ_BYTES)
+                    .unwrap()
+                    .is_empty()
+            );
+        } else {
+            let mut refused = WalConfig::OVERHAUL;
+            refused.recovery = crate::recovery::RecoveryPolicy::Refuse;
+            assert!(FileWal::open_with_recovery(scratch.log(), refused, scratch.floor()).is_err());
+            let wal =
+                FileWal::open_with_recovery(scratch.log(), WalConfig::OVERHAUL, scratch.floor())
+                    .unwrap();
+            assert!(std::fs::read(scratch.log()).unwrap().starts_with(&original));
+            let manifests =
+                crate::recovery::manifests(&scratch.log(), DEFAULT_MAX_READ_BYTES).unwrap();
+            assert_eq!(
+                std::fs::read(
+                    scratch
+                        .log()
+                        .parent()
+                        .unwrap()
+                        .join(&manifests[0].recovery.sidecar_basename)
+                )
+                .unwrap(),
+                frame
+            );
+            assert!(wal
+                .replay()
+                .unwrap()
+                .iter()
+                .any(|f| matches!(f.record, WalRecord::RecoveryCut { .. })));
+        }
+    }
+}
+
+#[test]
 fn an_overhaul_append_writes_nothing_when_the_floor_cannot_list_frame_stamps() {
     // No floor configured: refused by name, nothing written.
     let scratch = Scratch::new("no-floor");
-    let mut wal = FileWal::open(scratch.log())
+    let mut wal = FileWal::open_with_recovery(scratch.log(), WalConfig::OVERHAUL, scratch.floor())
         .unwrap()
         .with_wal_config(WalConfig::OVERHAUL)
         .unwrap();
@@ -312,10 +402,14 @@ fn complete_log(scratch: &Scratch) -> (Vec<u8>, Vec<WalRecord>) {
 /// Recover a copy of `prefix` through the real writer open, as a restart after a crash at
 /// that cut does.
 fn recover(scratch: &Scratch, prefix: &[u8]) -> Result<(FileWal, u64), WalError> {
-    let path = scratch.0.join("cut").join("session.wal");
+    let path = scratch
+        .0
+        .join("cut")
+        .join(prefix.len().to_string())
+        .join("session.wal");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, prefix).unwrap();
-    let wal = FileWal::open(&path)?;
+    let wal = FileWal::open_with_recovery(&path, WalConfig::OVERHAUL, scratch.floor())?;
     let len = std::fs::metadata(&path).unwrap().len();
     Ok((wal, len))
 }
@@ -351,15 +445,26 @@ fn every_crash_cut_of_a_version_4_log_recovers_its_complete_prefix() {
         let survivors = complete.iter().filter(|(_, record)| *record).count();
         let (wal, len) = recover(&scratch, &bytes[..cut])
             .unwrap_or_else(|error| panic!("cut at {cut}: recovery refused: {error}"));
-        assert_eq!(wal.last_seq(), survivors as u64, "cut at {cut}");
+        let repairs = wal
+            .replay()
+            .unwrap()
+            .iter()
+            .filter(|f| matches!(f.record, WalRecord::RecoveryCut { .. }))
+            .count();
         assert_eq!(
-            len, valid_end as u64,
-            "cut at {cut}: recovery truncates to the last complete frame"
+            repairs, 0,
+            "an ordinary byte cut at {cut} is not a recovery cut"
         );
+        assert_eq!(wal.last_seq(), (survivors + repairs) as u64, "cut at {cut}");
+        assert!(len >= valid_end as u64);
+        assert!(std::fs::read(wal.log_path().unwrap())
+            .unwrap()
+            .starts_with(&bytes[..valid_end]));
         let replayed: Vec<_> = wal
             .replay()
             .unwrap()
             .into_iter()
+            .filter(|f| !matches!(f.record, WalRecord::RecoveryCut { .. }))
             .map(|f| f.record)
             .collect();
         assert_eq!(replayed, records[..survivors], "cut at {cut}");
@@ -374,63 +479,208 @@ fn every_crash_cut_of_a_version_4_log_recovers_its_complete_prefix() {
 }
 
 #[test]
-fn a_damaged_header_crc_is_a_torn_tail_only_while_nothing_intact_follows() {
+fn a_damaged_header_crc_is_preserved_even_when_intact_records_follow() {
     let scratch = Scratch::new("damaged-crc");
     let (mut bytes, records) = complete_log(&scratch);
     let ends = frame_ends(&bytes);
-    let record_starts: Vec<usize> = ends
+    let (index, _) = ends
         .iter()
         .enumerate()
         .filter(|(_, (_, record))| *record)
-        .map(|(index, _)| ends[index - 1].0)
-        .collect();
-    let record_ends: Vec<usize> = ends
-        .iter()
-        .filter(|(_, record)| *record)
-        .map(|(end, _)| *end)
-        .collect();
-    // Damage the second record frame's header CRC, the last four bytes of its header.
-    let damaged = record_starts[1];
+        .nth(1)
+        .unwrap();
+    let damaged = ends[index - 1].0;
     let header_len = v4::decode_header(&bytes[damaged..])
         .unwrap()
         .unwrap()
         .header_len;
     bytes[damaged + header_len - 1] ^= 0xff;
-
     for cut in 0..=bytes.len() {
-        let result = recover(&scratch, &bytes[..cut]);
-        if cut < damaged {
-            let (wal, _) = result.unwrap_or_else(|error| panic!("cut at {cut}: {error}"));
-            let survivors = record_ends.iter().filter(|end| **end <= cut).count();
-            assert_eq!(wal.last_seq(), survivors as u64, "cut at {cut}");
-        } else if cut < record_ends[2] {
-            // Only the damaged frame, its identity frame and a torn third frame follow the
-            // first record: none of that is a committed record, so it is discarded.
-            let (wal, len) = result.unwrap_or_else(|error| panic!("cut at {cut}: {error}"));
-            assert_eq!(wal.last_seq(), 1, "cut at {cut}");
-            assert_eq!(len, damaged as u64, "cut at {cut}");
-            let replayed: Vec<_> = wal
-                .replay()
-                .unwrap()
-                .into_iter()
-                .map(|f| f.record)
-                .collect();
-            assert_eq!(replayed, records[..1], "cut at {cut}");
+        let retained = if cut <= damaged {
+            ends.iter()
+                .rev()
+                .find(|(end, _)| *end <= cut)
+                .map_or(0, |(end, _)| *end)
         } else {
-            // An intact record after the damage: corruption mid-log, refused loudly, never
-            // truncated away.
-            let error = result
-                .err()
-                .unwrap_or_else(|| panic!("cut at {cut} recovered"));
+            damaged
+        };
+        let survivors = ends
+            .iter()
+            .filter(|(end, record)| *record && *end <= retained)
+            .count();
+        let (wal, _) =
+            recover(&scratch, &bytes[..cut]).unwrap_or_else(|e| panic!("cut {cut}: {e}"));
+        let replayed: Vec<_> = wal
+            .replay()
+            .unwrap()
+            .into_iter()
+            .filter(|f| !matches!(f.record, WalRecord::RecoveryCut { .. }))
+            .map(|f| f.record)
+            .collect();
+        assert_eq!(replayed, records[..survivors], "cut at {cut}");
+        assert!(std::fs::read(wal.log_path().unwrap())
+            .unwrap()
+            .starts_with(&bytes[..retained]));
+        let mut frame_start = 0;
+        let intact_later = ends.iter().any(|(end, record)| {
+            let follows = *record && frame_start > damaged && *end <= cut;
+            frame_start = *end;
+            follows
+        });
+        if intact_later {
+            let manifests =
+                crate::recovery::manifests(wal.log_path().unwrap(), DEFAULT_MAX_READ_BYTES)
+                    .unwrap();
+            assert_eq!(manifests.len(), 1);
+            let raw = wal
+                .log_path()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(&manifests[0].recovery.sidecar_basename);
+            assert_eq!(
+                std::fs::read(raw).unwrap(),
+                bytes[retained..cut],
+                "cut at {cut}"
+            );
+        } else {
             assert!(
-                matches!(error, WalError::Corrupt { offset, .. } if offset == damaged),
-                "cut at {cut}: {error:?}"
+                crate::recovery::manifests(wal.log_path().unwrap(), DEFAULT_MAX_READ_BYTES)
+                    .unwrap()
+                    .is_empty()
             );
             assert_eq!(
-                std::fs::read(scratch.0.join("cut").join("session.wal")).unwrap(),
-                &bytes[..cut],
-                "cut at {cut}: a refused log is left as it was"
+                std::fs::read(wal.log_path().unwrap()).unwrap(),
+                bytes[..retained]
             );
         }
+    }
+}
+
+#[test]
+fn a_legacy_log_refuses_recovery_call_closed_without_changing_bytes() {
+    let scratch = Scratch::new("legacy-recovery-receipt");
+    let mut wal = FileWal::open(scratch.log()).unwrap();
+    let before = std::fs::read(scratch.log()).unwrap();
+    let record: WalRecord = serde_json::from_str(
+        r#"{"type":"recovery_call_closed","cut_id":"cut","run_id":"completed-owner","tool_call_id":"late-call","outcome":"unknown","result":{"tool_call_id":"late-call","output":{"kind":"error","message":"outcome_unknown"},"is_error":true}}"#,
+    ).unwrap();
+    assert!(matches!(
+        wal.append(1, &record, true),
+        Err(WalError::FrameFormat {
+            log: WalFormat::Legacy,
+            offered: WalFormat::Overhaul
+        })
+    ));
+    assert_eq!(std::fs::read(scratch.log()).unwrap(), before);
+}
+
+#[test]
+fn refuse_ignores_malformed_recovery_manifests_and_matches_decoder() {
+    let original = {
+        let scratch = Scratch::new("refuse-original");
+        let mut wal = scratch.overhaul();
+        for step in 1..=3 {
+            wal.append(1, &plain(step), true).unwrap();
+        }
+        std::fs::read(scratch.log()).unwrap()
+    };
+    let mut corrupt = original.clone();
+    corrupt[LINEAGE_FRAME_LEN + 4] = 0;
+    for image in [
+        original.clone(),
+        original[..original.len() - 1].to_vec(),
+        corrupt,
+    ] {
+        let scratch = Scratch::new("refuse-malformed-manifest");
+        std::fs::create_dir_all(scratch.log().parent().unwrap()).unwrap();
+        std::fs::write(scratch.log(), &image).unwrap();
+        let manifest = scratch
+            .log()
+            .with_file_name("session.wal.cut-malformed.json");
+        std::fs::write(&manifest, b"{not-json").unwrap();
+        let expected = recover_prefix(&image, 0, None, None);
+        let mut config = WalConfig::OVERHAUL;
+        config.recovery = crate::recovery::RecoveryPolicy::Refuse;
+        let actual = FileWal::open_with_recovery(scratch.log(), config, scratch.floor());
+        match expected {
+            Ok(prefix) => {
+                drop(actual.expect("Refuse must ignore malformed recovery artifacts"));
+                assert_eq!(
+                    std::fs::read(scratch.log()).unwrap(),
+                    image[..prefix.valid_end as usize]
+                );
+            }
+            Err(expected) => {
+                let actual = actual
+                    .err()
+                    .expect("the ordinary decoder refused this image");
+                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                assert_eq!(std::fs::read(scratch.log()).unwrap(), image);
+            }
+        }
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"{not-json");
+        assert!(!crate::head_proof::sidecar_path(&scratch.log()).exists());
+    }
+}
+#[cfg(feature = "fs-override")]
+#[test]
+fn oracle_prefix_matches_real_recovery_for_damaged_and_zeroed_frames() {
+    for zero_version in [false, true] {
+        let scratch = Scratch::new("oracle-prefix");
+        let mut wal = scratch.overhaul();
+        wal.append(1, &plain(1), true).unwrap();
+        let first_append = std::fs::read(scratch.log()).unwrap();
+        let kept_records = wal.replay().unwrap();
+        let damaged_seq = wal.append(1, &plain(2), true).unwrap();
+        wal.append(1, &plain(3), true).unwrap();
+        drop(wal);
+        let mut damaged = std::fs::read(scratch.log()).unwrap();
+        let mut second_start = 0;
+        let second_end = loop {
+            match crate::framing::decode_next(&damaged[second_start..]) {
+                DecodeStep::Record { framed, consumed } if framed.seq == damaged_seq => {
+                    assert_eq!(framed.record, plain(2));
+                    break second_start + consumed;
+                }
+                DecodeStep::Record { consumed, .. } | DecodeStep::Lineage { consumed, .. } => {
+                    second_start += consumed
+                }
+                _ => panic!("the clean fixture must decode before injecting damage"),
+            }
+        };
+        // Keep the verified log-identity frame immediately before the damaged record.
+        let kept_bytes = damaged[..second_start].to_vec();
+        assert!(kept_bytes.starts_with(&first_append));
+        if zero_version {
+            damaged[second_start + 4] = 0;
+        } else {
+            damaged[second_end - 1] ^= 1;
+        }
+        std::fs::write(scratch.log(), &damaged).unwrap();
+
+        let selected = crate::recovery::test_recovery_prefix(&damaged).unwrap();
+        assert_eq!(selected.valid_end, kept_bytes.len() as u64);
+        assert_eq!(selected.last_seq, Some(1));
+        assert_eq!(
+            std::fs::read(scratch.log()).unwrap(),
+            damaged,
+            "observation must not modify the damaged image"
+        );
+
+        let reopened = scratch.overhaul();
+        let recovered = reopened.replay().unwrap();
+        assert_eq!(&recovered[..kept_records.len()], kept_records.as_slice());
+        assert!(std::fs::read(scratch.log())
+            .unwrap()
+            .starts_with(&kept_bytes));
+        let cut = recovered
+            .iter()
+            .find_map(|frame| match &frame.record {
+                WalRecord::RecoveryCut { recovery } => Some(recovery),
+                _ => None,
+            })
+            .expect("real recovery must record its cut before the intact later frame");
+        assert_eq!(cut.cut_offset, selected.valid_end);
     }
 }

@@ -13,6 +13,8 @@ pub(crate) const MARKER: &str = "retention-content-must-not-be-projected-5d8e7b"
 
 pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
     WalRecord::RunStarted {
+        compaction_plan_version: None,
+        sent_by: None,
         written_at_ms: None,
         tags: None,
         session_class: None,
@@ -32,6 +34,9 @@ pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
         run_id: RunId(run.into()),
         session: BindIdentity::new("/retention-test", "runner", "session"),
         config: Box::new(RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -72,6 +77,7 @@ pub(crate) fn frames(retention: Option<u64>) -> Vec<FramedRecord> {
         started("r1", retention),
         WalRecord::StepStarted { step_id: StepId(1) },
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -112,6 +118,8 @@ pub(crate) fn frames(retention: Option<u64>) -> Vec<FramedRecord> {
 
 fn snapshot(seed: Option<ProjectionSeed>, watermark: u64) -> ProjectionSnapshot {
     ProjectionSnapshot {
+        context_epoch: 0,
+        required_recovery_cuts: Vec::new(),
         attribution_complete: true,
         seed,
         watermark,
@@ -169,6 +177,7 @@ fn retention_last_title_tail_has_no_title() {
     .unwrap();
     let sends = [
         WalRecord::Steered {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             retention: None,
@@ -181,6 +190,7 @@ fn retention_last_title_tail_has_no_title() {
             request_identity_digest: None,
         },
         WalRecord::Queued {
+            sent_by: None,
             written_at_ms: None,
             retention: None,
             ts_ms: Some(1500),

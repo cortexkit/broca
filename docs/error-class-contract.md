@@ -53,6 +53,36 @@ action", which makes the quota split derivable per provider code.
 **Ordering rule:** code/body discrimination runs before generic status defaults.
 A quota-429 is indistinguishable only after provider-code discrimination.
 
+### Timed account-limit recovery
+
+The root `broca.jsonc` setting `max_same_account_wait` does not add a fifth error class.
+It defaults to `15`: non-negative integers cap same-account waits in minutes, `0` never
+pauses, and `"max"` waits only up to cache expiry. Other values refuse boot. The obsolete
+`account_limit_pause` key is ignored with one boot warning naming `max_same_account_wait`.
+The setting is loaded once at boot; changes take effect at the next restart, like other
+`broca.jsonc` settings. The existing frozen consent boolean is `setting != 0`; new pause
+decisions use the executor's in-memory cap.
+The transport's
+positive account-wall classification produces `kind: account_limit, scope: account` beside
+its existing transient error. Consenting runs persist that disposition with the failed attempt;
+replay never infers it from HTTP status, Retry-After alone, message text or producer detail.
+Let `wake` be the latest blocking reset/retry floor plus any scheduling jitter,
+`cache_expiry` the send time of the session's last 2xx attempt on that account plus the run's
+frozen cache TTL (explicit 5 minutes or 1 hour, otherwise 5 minutes), and `cap = now + setting`
+(unbounded for `"max"`). A valid, non-stale floor pauses only when
+`wake <= min(cache_expiry, cap)` and consent is enabled. A 2xx stream need not complete to
+refresh the cache; a refused attempt cannot refresh it. Without an accepted attempt on that
+account there is no pause. Declines end the run with the unchanged transient
+`account_limit_exhausted` error and reset time, so Core can revive it and routing can switch
+accounts. Committed pauses replay their recorded wake, never re-decide these bounds.
+Untimed walls, resets beyond the cache/cap bounds,
+generic 429s, payment exhaustion, authentication and context overflow keep their earlier paths.
+Newly stale floors end the run and increment `health.check.metrics.account_limit_stale_resets`;
+a committed floor that expires during downtime is instead revalidated for immediate wake.
+The always-present health object `account_limit_pause_declined` counts `disabled`,
+`no_accepted_response`, `cache_expires_first` and `beyond_cap`; declines log reset, wake,
+cache expiry, cap and reason at info level.
+
 
 ### Producer-side status/code refinements
 
@@ -148,8 +178,10 @@ broca specifics:
   | Code | Class | Detail |
   |---|---|---|
   | `variant_unsupported` | `permanent` | `{model, variant, defined}` |
+  | `tool_alias_invalid` | `permanent` | `{tool, class: "permanent"}` |
   | `wal_newer_writer` | `permanent` | `{kind: "newer_writer", missing: [<feature names>]}` |
   | `agent_run_scopes_unsupported` | `permanent` | `{<session scope>}` |
+  | `session_log_missing` | `detail.class: permanent` | `{class, session, harness}`; a writer would recreate historical content or a read would falsely report empty history; existing named refusals and valid index answers keep precedence; stop broca and inspect `store-maintenance repair-session-root` |
 
 - Principal-specific admission refusals `flow_scope_required` and `sender_not_owner` carry a
   top-level `class: "permanent"` beside `code`, `message`, and `detail: {kind, principal}`.

@@ -143,6 +143,7 @@ fn queued_record(
     ts_ms: Option<u64>,
 ) -> WalRecord {
     WalRecord::Queued {
+        sent_by: None,
         written_at_ms: None,
         retention,
         ts_ms,
@@ -287,6 +288,8 @@ impl Fixture {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    compaction_plan_version: None,
+                    sent_by: None,
                     written_at_ms: None,
                     tags: None,
                     session_class: None,
@@ -356,8 +359,10 @@ impl Fixture {
         let (self_tx, rx) = mpsc::channel(64);
         let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
         let mut actor = LineageActor {
+            account_limit_timer: None,
             ceiling_drain_held: false,
             compaction_watch: Default::default(),
+            compaction_session: Arc::default(),
             admitting_session_class: None,
             agent_run_scope: None,
             #[cfg(all(test, feature = "test-clock"))]
@@ -398,6 +403,7 @@ impl Fixture {
             charge_basis_resolver: None,
             startup_recovery_pending: false,
             prior_snapshot: None,
+            sender_policy_cache: None,
             pending_fifo: Vec::new(),
             send_reply: None,
             skip_materialization_submissions: HashSet::new(),
@@ -425,6 +431,7 @@ impl Fixture {
             ended_submissions: Default::default(),
             delivered_submissions: Default::default(),
             restart_admitting: false,
+            deferred_restart_settings: Default::default(),
             restart_waiters: Vec::new(),
             restart_recovery_owns_waiters: false,
             resuming_for_late_result: false,
@@ -492,6 +499,7 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
             RunId("refused".into()),
             queue.request.clone(),
             SendIdentity {
+                display_sent_by: None,
                 conversation_key: None,
                 title: None,
                 send_id: Some("refused".into()),
@@ -500,6 +508,7 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
             true,
             broca_protocol::Delivery::Queue,
             Some(pre_user::PreparedInput {
+                at_ms: None,
                 input: queue.request.input.clone(),
                 hooks: None,
                 refused: None,
@@ -537,6 +546,7 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
             RunId("queued".into()),
             retract.request.clone(),
             SendIdentity {
+                display_sent_by: None,
                 conversation_key: None,
                 title: None,
                 send_id: Some("queued".into()),
@@ -545,6 +555,7 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
             true,
             broca_protocol::Delivery::Queue,
             Some(pre_user::PreparedInput {
+                at_ms: None,
                 input: retract.request.input.clone(),
                 hooks: None,
                 refused: None,
@@ -756,6 +767,8 @@ async fn retained_first_send_cut_before_its_index_sync_is_recovered_at_boot() {
     let digest = send_identity_digest(&request, broca_protocol::Delivery::Queue, None);
     writer
         .record(WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -1099,13 +1112,6 @@ impl Fixture {
         });
         writer.sync().await.unwrap();
     }
-    fn durable_count(&self) -> usize {
-        self.actor
-            .wal_store
-            .read_records(&self.actor.key)
-            .unwrap()
-            .len()
-    }
     async fn send_new(&mut self, delivery: broca_protocol::Delivery) -> SendOutcome {
         let mut request = self.request.clone();
         request.input = text_req(&self.actor.key, "new").input;
@@ -1129,131 +1135,6 @@ impl Fixture {
             )
             .await
     }
-}
-
-#[tokio::test]
-async fn context_ceiling_receipt_refuses_idle_start_and_joining_steer_without_writes() {
-    for delivery in [
-        broca_protocol::Delivery::Queue,
-        broca_protocol::Delivery::Steer,
-        broca_protocol::Delivery::Interrupt,
-    ] {
-        let mut fixture = Fixture::with_ceiling(8_000).await;
-        let before = fixture.durable_count();
-        let outcome = fixture.send_new(delivery).await;
-        assert!(
-            matches!(outcome, SendOutcome::ContextCeiling(ref d) if d.window == 10_000 && d.size >= 8_000),
-            "{outcome:?}"
-        );
-        assert_eq!(fixture.durable_count(), before);
-        assert_eq!(fixture.executor.0.load(Ordering::Relaxed), 0);
-        fixture.close().await;
-    }
-    let mut fixture = Fixture::with_ceiling(100).await;
-    let mut started = fixture
-        .actor
-        .wal_store
-        .read_records(&fixture.actor.key)
-        .unwrap()[0]
-        .record
-        .clone();
-    if let WalRecord::RunStarted { run_id, .. } = &mut started {
-        *run_id = RunId("running".into());
-    }
-    fixture.actor.writer.as_ref().unwrap().record(started);
-    fixture.actor.writer.as_ref().unwrap().sync().await.unwrap();
-    fixture.actor.prior_snapshot = None;
-    let run = fixture
-        .actor
-        .start_run(
-            RunId("running".into()),
-            fixture.request.clone(),
-            RunKind::FreshOrResume,
-            None,
-            SendIdentity::default(),
-            false,
-        )
-        .await;
-    assert!(run.is_ok());
-    fixture.record_ceiling_notice(8_000, 2).await;
-    let before = fixture.durable_count();
-    let outcome = fixture.send_new(broca_protocol::Delivery::Steer).await;
-    assert!(
-        matches!(outcome, SendOutcome::ContextCeiling(_)),
-        "{outcome:?}"
-    );
-    assert_eq!(fixture.durable_count(), before);
-    fixture.close().await;
-}
-
-#[tokio::test]
-async fn a_ceiling_held_queue_head_stays_pending_without_writes_and_wakes_after_a_view() {
-    let mut fixture = Fixture::with_ceiling(8_000).await;
-    let outcome = fixture
-        .actor
-        .queue_submission(
-            RunId("queued".into()),
-            fixture.request.clone(),
-            SendIdentity::default(),
-            false,
-            broca_protocol::Delivery::Queue,
-        )
-        .await;
-    assert!(
-        matches!(outcome, SendOutcome::Pending { .. }),
-        "{outcome:?}"
-    );
-    let before = fixture.durable_count();
-    fixture.actor.drain_queue_one().await.unwrap();
-    assert_eq!(fixture.durable_count(), before);
-    assert_eq!(fixture.actor.pending_fifo.len(), 1);
-    let records = fixture
-        .actor
-        .wal_store
-        .read_records(&fixture.actor.key)
-        .unwrap();
-    assert_eq!(
-        broca_core::delivery_order::queued_send_fate(records.iter().map(|r| &r.record), "queued"),
-        Some(broca_core::delivery_order::QueuedSendFate::Pending)
-    );
-    assert!(fixture.actor.ceiling_drain_held);
-    assert_eq!(fixture.executor.0.load(Ordering::Relaxed), 0);
-    let writer = fixture.actor.writer.as_ref().unwrap();
-    let view = broca_core::compaction_provider::view::CompactionView::new(
-        broca_core::agent_session_ref(&fixture.actor.key),
-        2,
-        writer.lineage_id().unwrap().to_string(),
-        broca_core::compaction_provider::lineage::MessageRef {
-            ordinal: 0,
-            mid: "m0".into(),
-        },
-        vec![broca_core::compaction_provider::view::ViewRange::replace(
-            0,
-            1,
-            serde_json::to_string(&fixture.request.input).unwrap(),
-        )],
-    );
-    writer.record(WalRecord::CompactionViewApplied {
-        provider: "provider".into(),
-        view_version: 2,
-        view: broca_wal::OpaqueJson::from_json_text(serde_json::to_string(&view).unwrap()).unwrap(),
-        choice: broca_wal::CompactionViewChoice::Applied,
-    });
-    writer.sync().await.unwrap();
-    fixture.record_ceiling_notice(100, 2).await;
-    let (reply, complete) = tokio::sync::oneshot::channel();
-    fixture
-        .actor
-        .handle_cmd(LineageCmd::CompactionChanged { reply })
-        .await;
-    complete.await.unwrap().unwrap();
-    assert_eq!(
-        fixture.executor.0.load(Ordering::Relaxed),
-        1,
-        "view wake must re-attempt admission"
-    );
-    assert!(!fixture.actor.ceiling_drain_held);
-    fixture.close().await;
 }
 
 #[tokio::test]

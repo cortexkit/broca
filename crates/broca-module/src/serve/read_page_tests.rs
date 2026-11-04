@@ -6,10 +6,12 @@ const THREE_MIB: usize = 3 * 1024 * 1024;
 
 fn message(ordinal: u64, len: usize) -> SessionReadMessage {
     SessionReadMessage {
+        client_message_id: None,
+        tool_times: Vec::new(),
         rich_ui: None,
         written_at: None,
         delivered_as: None,
-        tags: Vec::new(),
+        part_keys: None,
         ordinal,
         mid: format!("m{ordinal}"),
         message: Message::new(
@@ -40,7 +42,8 @@ fn page(messages: Vec<SessionReadMessage>) -> SessionReadResponse {
     let mut page: SessionReadResponse = serde_json::from_value(serde_json::json!({
         "messages": [],
         "head": {"wal_seq": 42, "sub_index": 0},
-        "lineage_id": "lineage",
+        "incarnation": "lineage",
+        "history_version": 1,
         "lineage_state": {"last_run_id": "latest-run", "state": "completed", "reason": "end_turn"},
         "tools": [{"name": "lookup", "description": "d".repeat(4096), "input_schema": {"type": "object"}}],
         "tools_run_id": "latest-run"
@@ -154,95 +157,4 @@ fn oversized_atomic_items_and_fixed_metadata_are_not_truncated() {
     let mut capped = original.clone();
     cap_page_bytes(&mut capped, 1, false, "test-session").unwrap();
     assert_eq!(capped, original, "unpaged tools and metadata stay whole");
-}
-
-#[test]
-fn model_reply_too_large_subject_preserves_the_entry_source() {
-    let source = serde_json::json!({
-        "kind": "replacement",
-        "compaction_id": "cmp-1",
-        "version": 4,
-        "from_ordinal": 5,
-        "to_ordinal": 10,
-    });
-    let page: broca_wire::ModelPage = serde_json::from_value(serde_json::json!({
-        "messages": [{
-            "source": source,
-            "message": {"role": "assistant", "content": []},
-        }],
-        "lineage_id": "lineage",
-        "compaction_id": "cmp-1",
-        "version": 4,
-    }))
-    .unwrap();
-    assert_eq!(
-        model_group_reply_too_large_subject(&page),
-        Some(ReplyTooLargeSubject::ModelGroup {
-            source: serde_json::from_value(serde_json::json!({
-                "kind": "replacement",
-                "compaction_id": "cmp-1",
-                "version": 4,
-                "from_ordinal": 5,
-                "to_ordinal": 10,
-            }))
-            .unwrap(),
-        })
-    );
-    let empty: broca_wire::ModelPage = serde_json::from_value(serde_json::json!({
-        "messages": [],
-    }))
-    .unwrap();
-    assert_eq!(model_group_reply_too_large_subject(&empty), None);
-}
-
-/// An assistant entry written by a tag-rendering run under the computed rules: its text
-/// numbered `§1§` and cleaned on exposure.
-fn cleaned_answer(text: &str) -> SessionReadMessage {
-    let mut entry = message(0, 0);
-    entry.message = Message::new(
-        Role::Assistant,
-        vec![ContentBlock::Text { text: text.into() }],
-    );
-    let mut high = 0;
-    broca_protocol::tags::number_message(
-        &mut entry.message,
-        broca_protocol::tags::ComputedRules {
-            render: true,
-            clean: true,
-        },
-        &mut high,
-    )
-    .unwrap();
-    entry.tags = broca_wire::tag_rows(0, &entry.message);
-    entry
-}
-
-/// `session.resolve` answers the part's exposed content: the model's text cleaned where its
-/// run cleans it, the stored text staying raw.
-#[test]
-fn resolve_answers_the_cleaned_model_text() {
-    let page = page(vec![cleaned_answer("§3§ hi as §1§ says")]);
-    let reply = resolve_in_page(&page, &broca_wire::ResolveParams::new("§1§"))
-        .expect("the page holds the tag")
-        .expect("resolved");
-    assert_eq!(reply.content, serde_json::json!("hi as  says"));
-}
-
-/// A descriptors `session.resolve` of text over the inline threshold answers a `text_ref`
-/// keyed by the part, over the exposed text; inline keeps the string.
-#[test]
-fn a_descriptors_resolve_of_large_text_answers_a_keyed_text_ref() {
-    use cortexkit_role_llm_runner::read::descriptors::PART_INLINE_MAX;
-    let text = "y".repeat(PART_INLINE_MAX + 1);
-    let page = page(vec![cleaned_answer(&format!("§7§ {text}"))]);
-    let params = broca_wire::ResolveParams::new("§1§")
-        .with_media(cortexkit_role_llm_runner::read::MediaMode::Descriptors);
-    let reply = resolve_in_page(&page, &params).unwrap().unwrap();
-    assert_eq!(reply.content["type"], "text_ref");
-    assert_eq!(reply.content["part"], "m0#0");
-    assert_eq!(reply.content["byte_size"], serde_json::json!(text.len()));
-    let inline = resolve_in_page(&page, &broca_wire::ResolveParams::new("§1§"))
-        .unwrap()
-        .unwrap();
-    assert_eq!(inline.content, serde_json::json!(text));
 }

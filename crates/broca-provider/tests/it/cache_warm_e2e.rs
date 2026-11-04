@@ -287,6 +287,7 @@ data: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"a
 
     fn message(role: Role, text: &str) -> Message {
         Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -319,6 +320,7 @@ data: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"a
 
     fn request(dir: &Path, tools: Vec<Tool>) -> RunRequest {
         RunRequest {
+            route_decision_id: None,
             input_written_at_ms: None,
             directives: None,
             session_class: None,

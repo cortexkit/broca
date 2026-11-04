@@ -91,6 +91,10 @@ impl LineageOpener for NoLineages {
 struct PoisonWal(AtomicUsize);
 
 impl broca_core::WalStore for PoisonWal {
+    fn wal_present(&self, _: &BindIdentity) -> Option<bool> {
+        // The log exists; only decoding its contents is poisoned.
+        Some(true)
+    }
     fn open(
         &self,
         _: &BindIdentity,
@@ -226,9 +230,9 @@ impl Rig {
         // Sessionless binds send an invalid identity to prove they bypass key validation.
         // They also carry a scope stamp, which must not trigger session-history authorization.
         let identity = if sessionless {
-            SubcBindIdentity::new("/role-binding-project", "runner", "not\u{1f}keyable")
+            SubcBindIdentity::new("runner", "not\u{1f}keyable")
         } else {
-            SubcBindIdentity::new("/role-binding-project", "runner", "role-binding")
+            SubcBindIdentity::new("runner", "role-binding")
         };
         let bind = ModuleControlRequest::RouteBind {
             route_channel: channel,
@@ -519,6 +523,16 @@ fn manifest_does_not_advertise_unimplemented_roles_or_operations() {
             operations.iter().any(|operation| operation.name == name),
             "missing implemented operation: {name}"
         );
+    }
+    for name in ["send.status", "session.send_status"] {
+        let operation = operations
+            .iter()
+            .find(|operation| operation.name == name)
+            .unwrap_or_else(|| panic!("missing implemented operation: {name}"));
+        assert!(matches!(
+            operation.kind,
+            subc_protocol::manifest::ManagementOperationKind::Query
+        ));
     }
     assert!(
         !operations

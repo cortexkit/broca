@@ -32,6 +32,8 @@ use tokio::sync::{mpsc, Notify};
 fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
     vec![
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -52,6 +54,7 @@ fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
             session: session.clone(),
             config: Box::new(min_config()),
             input: vec![Message {
+                turn_system: false,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -65,6 +68,7 @@ fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
         },
         WalRecord::StepStarted { step_id: StepId(1) },
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -191,6 +195,9 @@ fn assistant_one_call() -> AssistantMessage {
 
 fn min_config() -> RunConfig {
     RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
         computed_tags: None,
@@ -307,6 +314,7 @@ impl LineageOpener for FreeOpener {
 
 fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -323,6 +331,7 @@ fn text_req(key: &BindIdentity, run: &str) -> RunRequest {
         session: key.clone(),
         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

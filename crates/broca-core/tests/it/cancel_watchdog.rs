@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
     RunRequest {
+        route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
         session_class: None,
@@ -49,6 +50,7 @@ fn req(session: &BindIdentity, prompt: &str) -> RunRequest {
         session: session.clone(),
         model: ModelHandle::new("stub", "m"),
         input: vec![Message {
+            turn_system: false,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

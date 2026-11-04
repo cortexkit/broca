@@ -11,6 +11,7 @@
 //! See `docs/lineage-actor-coordinator.md` §1.
 
 use broca_diagnostics::JobKind;
+mod display_facts;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -197,6 +198,8 @@ pub type LineageKey = BindIdentity;
 /// Why opening a lineage failed (surfaced to every coalescing waiter, never swallowed).
 #[derive(Debug, Clone)]
 pub enum OpenError {
+    HistoryRewriting,
+    HistoryChanged,
     SessionMoving {
         cut_id: String,
     },
@@ -222,6 +225,11 @@ pub enum OpenError {
         session_ref: String,
         reason: String,
     },
+    SessionLogMissing {
+        session: String,
+        harness: String,
+        read: Option<HistoryReadContext>,
+    },
     /// The session's WAL holds a complete frame that requires WAL features this build does not
     /// know (`missing`): a newer broca wrote it. Kept apart from [`OpenError::Open`] because the
     /// remedy differs: retrying cannot help, only placing a build that knows the features can.
@@ -233,7 +241,81 @@ pub enum OpenError {
     },
 }
 
+/// Metadata from a successful would-be empty read. It carries no message content
+/// and lets serving retain established cursor refusals before a history refusal.
+#[derive(Debug, Clone)]
+pub struct HistoryReadContext {
+    pub lineage_id: Option<String>,
+    pub prompt_len: Option<u64>,
+    pub tags_await_setup: bool,
+}
+
 impl OpenError {
+    fn from_history_error(error: String) -> Self {
+        match error.as_str() {
+            broca_core::served_history::HISTORY_REWRITING => Self::HistoryRewriting,
+            broca_core::served_history::HISTORY_CHANGED => Self::HistoryChanged,
+            _ => Self::Open(error),
+        }
+    }
+
+    fn for_empty_read(
+        self,
+        lineage_id: Option<String>,
+        prompt_len: Option<u64>,
+        tags_await_setup: bool,
+    ) -> Self {
+        match self {
+            Self::SessionLogMissing {
+                session, harness, ..
+            } => Self::SessionLogMissing {
+                session,
+                harness,
+                read: Some(HistoryReadContext {
+                    lineage_id,
+                    prompt_len,
+                    tags_await_setup,
+                }),
+            },
+            other => other,
+        }
+    }
+    fn temporary_io(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::TimedOut
+        )
+    }
+
+    fn from_log_state(error: broca_store::session_log_evidence::SessionLogError) -> Self {
+        match error {
+            broca_store::session_log_evidence::SessionLogError::Wal(error) => {
+                Self::from_wal_read(format!("wal range-read failed: {error}"), &error)
+            }
+            broca_store::session_log_evidence::SessionLogError::Inventory(error) => {
+                let temporary = error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(Self::temporary_io)
+                    || matches!(error.downcast_ref::<broca_store::db::DbError>(), Some(broca_store::db::DbError::Io(io)) if Self::temporary_io(io));
+                if let Some(broca_store::db::DbError::Wal(wal)) =
+                    error.downcast_ref::<broca_store::db::DbError>()
+                {
+                    return Self::from_wal_read(error.to_string(), wal);
+                }
+                if temporary {
+                    Self::Classified {
+                        reason: error.to_string(),
+                        class: broca_protocol::ErrorClass::Transient,
+                    }
+                } else {
+                    Self::Open(error.to_string())
+                }
+            }
+        }
+    }
+
     pub(crate) fn relocation_or_open(error: broca_wal::WalError) -> Self {
         match error {
             error @ broca_wal::WalError::RelocationIncomplete { .. } => {
@@ -272,6 +354,9 @@ impl OpenError {
     }
     pub(crate) fn from_retention(error: crate::retention::RetentionReadError) -> Self {
         match error {
+            crate::retention::RetentionReadError::NewerWriter { missing, reason } => {
+                Self::NewerWriter { missing, reason }
+            }
             crate::retention::RetentionReadError::RelocationIncomplete { reason } => {
                 Self::Classified {
                     reason,
@@ -300,19 +385,10 @@ impl OpenError {
                 reason,
             },
             // For generic I/O failures, only these temporary OS kinds establish retryability.
-            broca_wal::WalError::Io(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                OpenError::Classified {
-                    reason,
-                    class: broca_protocol::ErrorClass::Transient,
-                }
-            }
+            broca_wal::WalError::Io(error) if Self::temporary_io(error) => OpenError::Classified {
+                reason,
+                class: broca_protocol::ErrorClass::Transient,
+            },
             // Corruption, replay/shape errors and opaque failures are not presumed retryable.
             _ => OpenError::Open(reason),
         }
@@ -354,12 +430,16 @@ mod relocation_error_tests {
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::HistoryRewriting => f.write_str("history is being rewritten; retry after its writer finishes recovery"),
+            Self::HistoryChanged => f.write_str("history changed while the page was read; read the newest page"),
             Self::SessionMoving { cut_id } => write!(f, "session_moving {{cutId: {cut_id}}}"),
             Self::SessionMoved { holder } => write!(f, "session_moved {{holder: {holder}}}"),
             OpenError::Expired { expired_at_ms } => write!(f, "lineage expired at {expired_at_ms}"),
             OpenError::RetentionInvalid(_) => write!(f, "invalid retention"),
             OpenError::SessionClassInvalid(message) => f.write_str(message),
             OpenError::LeaseHeld(s) => write!(f, "session '{s}' held by a live writer"),
+            OpenError::SessionLogMissing { session, harness, .. } => write!(f,
+                "session_log_missing: session {session:?} in harness {harness:?} has history but no log; stop broca and inspect store-maintenance repair-session-root STATE_ROOT --harness {harness:?} --session {session:?}"),
             OpenError::Open(s)
             | OpenError::Classified { reason: s, .. }
             | OpenError::HistoryUnreachable { reason: s, .. }
@@ -758,12 +838,99 @@ pub enum CutLockMode {
 
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 
+pub(crate) enum ReadOnlyRunState {
+    Interrupted,
+    Paused {
+        reason: broca_protocol::PauseReason,
+        error: Option<Box<broca_protocol::error::ProviderError>>,
+    },
+}
+
+impl ReadOnlyRunState {
+    fn apply(self, state: &mut broca_core::ReconciledRunState) {
+        match self {
+            Self::Interrupted => state.state = broca_core::RunIndexState::Interrupted,
+            Self::Paused { reason, error } => {
+                state.state = broca_core::RunIndexState::Paused;
+                state.pause_reason = Some(reason);
+                state.error = error.map(|error| *error);
+            }
+        }
+    }
+}
+
+struct ReadOnlyLineage {
+    read_only: bool,
+    unfinished: HashSet<String>,
+    pauses: HashMap<
+        String,
+        (
+            broca_protocol::PauseReason,
+            Option<Box<broca_protocol::error::ProviderError>>,
+        ),
+    >,
+}
+
+impl ReadOnlyLineage {
+    fn from_frames(read_only: bool, records: &[broca_wal::FramedRecord]) -> Self {
+        let mut unfinished = HashSet::new();
+        let mut pauses = HashMap::new();
+        let mut current = None;
+        if read_only {
+            for frame in records {
+                match &frame.record {
+                    broca_wal::WalRecord::RunStarted { run_id, .. } => {
+                        unfinished.insert(run_id.0.clone());
+                        pauses.remove(&run_id.0);
+                        current = Some(run_id.0.clone());
+                    }
+                    broca_wal::WalRecord::RunPaused {
+                        run_id,
+                        reason,
+                        error,
+                        ..
+                    } => {
+                        unfinished.remove(&run_id.0);
+                        pauses.insert(run_id.0.clone(), (*reason, error.clone().map(Box::new)));
+                    }
+                    broca_wal::WalRecord::RunFinished { .. } => {
+                        if let Some(run) = &current {
+                            unfinished.remove(run);
+                            pauses.remove(run);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self {
+            read_only,
+            unfinished,
+            pauses,
+        }
+    }
+
+    fn state(&self, run_id: Option<&str>) -> Option<ReadOnlyRunState> {
+        let run = run_id.filter(|_| self.read_only)?;
+        if let Some((reason, error)) = self.pauses.get(run) {
+            Some(ReadOnlyRunState::Paused {
+                reason: *reason,
+                error: error.clone(),
+            })
+        } else {
+            self.unfinished
+                .contains(run)
+                .then_some(ReadOnlyRunState::Interrupted)
+        }
+    }
+}
+
 struct Inner {
-    session_address_inventory: std::sync::OnceLock<Arc<broca_store::SqliteStore>>,
+    run_event_reader: std::sync::OnceLock<Arc<RunEventLookup>>,
+    session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
     episode_source: std::sync::OnceLock<Arc<EpisodeReadSource>>,
     session_inventory_readiness: std::sync::OnceLock<Arc<dyn SessionInventoryReadiness>>,
-    #[cfg(test)]
-    raw_pages: std::sync::OnceLock<Arc<RawPageTestBundle>>,
+    raw_pages: std::sync::OnceLock<Arc<RawPageSource>>,
     tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
     actor_idle_holds: Mutex<HashMap<LineageKey, (u64, Vec<&'static str>)>>,
     /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
@@ -799,12 +966,14 @@ struct Inner {
     /// Immutable first senders learned from the admission index or durable WAL. Empty sessions
     /// are never cached, since their next write may freeze a sender.
     frozen_senders: Mutex<BoundedSessionCache<Option<broca_protocol::BindPrincipal>>>,
+    mode3_logs: Mutex<BoundedSessionCache<(Option<String>, bool)>>,
     /// Each actor opening has a new generation. Its ownership is current only while both
     /// that opening and its last fsynced WAL sequence still match the published record.
     live_ownership: Mutex<HashMap<LineageKey, LiveOwnership>>,
     /// Cache only identities and the position after their represented WAL records. Prompts,
     /// queued requests and plan manifests stay out of this bounded, read-only cache.
     owner_snapshots: Mutex<OwnerSnapshots>,
+    sender_snapshots: Mutex<OwnerSnapshots>,
     stopping: tokio_util::sync::CancellationToken,
     seal: tokio_util::sync::CancellationToken,
     seal_state: Mutex<SealState>,
@@ -812,6 +981,9 @@ struct Inner {
     #[cfg(test)]
     actor_panics: AtomicU64,
     restart_resume_ready: AtomicBool,
+    /// Frame-derived compatibility and lifecycle facts, bounded and checked against lineage id.
+    /// This build cannot append the reader-only feature, and such logs cannot acquire a writer.
+    read_only_lineages: Mutex<BoundedSessionCache<(Option<String>, ReadOnlyLineage)>>,
     /// Sessions the startup crash-orphan pass marked, each with the run ids the run index
     /// still calls active there. The session's actor takes its mark when it opens, whoever
     /// opened it (the pass or a caller's send), and decides from its own WAL whether to seal.
@@ -1034,6 +1206,15 @@ impl OwnerSnapshots {
 
     fn insert(&mut self, key: LineageKey, mut snapshot: OwnershipSnapshot) {
         snapshot.ownership = snapshot.ownership.for_owner_access();
+        self.insert_summary(key, snapshot);
+    }
+
+    fn insert_sender(&mut self, key: LineageKey, mut snapshot: OwnershipSnapshot) {
+        snapshot.ownership = crate::sender_admission::compact(&snapshot.ownership);
+        self.insert_summary(key, snapshot);
+    }
+
+    fn insert_summary(&mut self, key: LineageKey, snapshot: OwnershipSnapshot) {
         if !self.entries.contains_key(&key) {
             if self.entries.len() == MAX_OWNER_SNAPSHOTS {
                 if let Some(oldest) = self.oldest.pop_front() {
@@ -1073,6 +1254,8 @@ pub struct RouteReadPage {
     /// Durable WAL sequence covered by the same page snapshot.
     pub at_seq: u64,
     pub head_facts: broca_core::head::HeadProjection,
+    /// Log-only media metadata validated alongside this read page.
+    pub head_media: Option<broca_store::db::RawHeadMedia>,
     pub head_facts_complete: bool,
     pub page: broca_core::SessionReadPage,
     /// Projection commits only complete tool turns. Any open batch therefore remains in the
@@ -1108,6 +1291,8 @@ struct ReadSources {
 type EpisodePublication = dyn Fn(&LineageKey, Option<u64>) -> Result<broca_wal::file_wal::DurablePublication, String>
     + Send
     + Sync;
+pub type RunEventLookup =
+    dyn Fn(&str) -> Result<Option<(LineageKey, Vec<u8>)>, String> + Send + Sync;
 
 /// Opt-in database composition. The callback supplies the writer's durable publication
 /// at the sequence requested for an attach, or the latest publication for a page.
@@ -1115,11 +1300,156 @@ type EpisodePublication = dyn Fn(&LineageKey, Option<u64>) -> Result<broca_wal::
 pub struct EpisodeReadSource {
     db: Arc<broca_store::db::OverhaulDb>,
     publication: Arc<EpisodePublication>,
+    gate: Option<Arc<broca_store::db::SessionGateFactory>>,
+    access: Option<broca_wal::access_counter::WalAccessCounter>,
+}
+
+// Validate the zero-record source before refusing its empty rebuild, so an
+// existing source I/O or witness refusal keeps its cause without changing rows.
+fn check_empty_publication_source(
+    publication: &broca_wal::file_wal::DurablePublication,
+) -> Result<(), OpenError> {
+    use std::io::Read;
+    let source_error = |error| {
+        let temporary = OpenError::temporary_io(&error);
+        let reason = broca_store::db::DbError::Io(error).to_string();
+        if temporary {
+            OpenError::Classified {
+                reason,
+                class: broca_protocol::ErrorClass::Transient,
+            }
+        } else {
+            OpenError::Open(reason)
+        }
+    };
+    let mut file = broca_wal::fs_ops::File::open(publication.path()).map_err(source_error)?;
+    let mut header = Vec::new();
+    (&mut file)
+        .take(broca_wal::framing::LINEAGE_FRAME_LEN as u64)
+        .read_to_end(&mut header)
+        .map_err(source_error)?;
+    match broca_wal::framing::decode_next(&header) {
+        broca_wal::framing::DecodeStep::Lineage {
+            lineage_id,
+            consumed,
+        } if consumed == header.len() && lineage_id == publication.lineage() => Ok(()),
+        _ => Err(OpenError::Open(
+            broca_store::db::DbError::Invalid(
+                "durable publication lineage differs from its witness".into(),
+            )
+            .to_string(),
+        )),
+    }
 }
 
 impl EpisodeReadSource {
     pub fn new(db: Arc<broca_store::db::OverhaulDb>, publication: Arc<EpisodePublication>) -> Self {
-        Self { db, publication }
+        Self {
+            db,
+            publication,
+            gate: None,
+            access: None,
+        }
+    }
+
+    pub fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
+        self.gate = Some(Arc::new(move |_| gate.clone()));
+        self
+    }
+    pub fn with_session_gates(mut self, gate: Arc<broca_store::db::SessionGateFactory>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    pub fn with_access_counter(
+        mut self,
+        access: broca_wal::access_counter::WalAccessCounter,
+    ) -> Self {
+        self.access = Some(access);
+        self
+    }
+
+    pub(crate) fn with_reader<T>(
+        &self,
+        key: &LineageKey,
+        head: Option<u64>,
+        read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if let Some(access) = &self.access {
+            return access
+                .operation(if head.is_some() {
+                    "model attach"
+                } else {
+                    "model page"
+                })
+                .run(|| self.with_reader_inner(key, head, read));
+        }
+        self.with_reader_inner(key, head, read)
+    }
+
+    fn with_reader_checked<T>(
+        &self,
+        key: &LineageKey,
+        head: Option<u64>,
+        empty_history_check: Result<(), OpenError>,
+        read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
+    ) -> Result<T, OpenError> {
+        let work = || {
+            let gate = self.gate.as_ref().map(|factory| factory(key));
+            let _guard = gate
+                .as_ref()
+                .map(|gate| {
+                    gate.lock()
+                        .map_err(|error| OpenError::Open(error.to_string()))
+                })
+                .transpose()?;
+            let publication = (self.publication)(key, head).map_err(OpenError::Open)?;
+            if head.is_some_and(|head| publication.sequence() != head) {
+                return Err(OpenError::Open(
+                    "episode publication does not name attach barrier".into(),
+                ));
+            }
+            if publication.sequence() == 0 {
+                // Refuse before an empty publication can replace historical
+                // index rows. Nonempty publications keep their original source
+                // validation and refusal paths.
+                if empty_history_check.is_err() {
+                    check_empty_publication_source(&publication)?;
+                }
+                empty_history_check.map_err(|error| {
+                    error.for_empty_read(Some(publication.lineage().to_string()), None, false)
+                })?;
+            }
+            let reader = self
+                .db
+                .episode_reader(key.clone(), publication)
+                .map_err(|error| OpenError::Open(error.to_string()))?;
+            read(reader).map_err(OpenError::Open)
+        };
+        if let Some(access) = &self.access {
+            return access
+                .operation(if head.is_some() {
+                    "model attach"
+                } else {
+                    "model page"
+                })
+                .run(work);
+        }
+        work()
+    }
+
+    fn with_reader_inner<T>(
+        &self,
+        key: &LineageKey,
+        head: Option<u64>,
+        read: impl FnOnce(broca_store::db::DatabaseEpisodeReader) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let gate = self.gate.as_ref().map(|factory| factory(key));
+        let _guard = gate
+            .as_ref()
+            .map(|gate| gate.lock().map_err(|e| e.to_string()))
+            .transpose()?;
+        read(self.reader(key, head)?)
     }
 
     pub(crate) fn reader(
@@ -1144,26 +1474,60 @@ pub(crate) struct RawPageTestBundle {
     pub publications: Mutex<HashMap<LineageKey, broca_wal::file_wal::DurablePublication>>,
 }
 
-#[cfg(test)]
-impl RawPageTestBundle {
+/// WAL-backed raw reads installed only by the boot-selected overhaul bundle.
+pub struct RawPageSource {
+    db: Arc<broca_store::db::OverhaulDb>,
+    publication: Arc<EpisodePublication>,
+    gate: Option<Arc<broca_store::db::SessionGateFactory>>,
+}
+
+impl RawPageSource {
+    pub fn new(db: Arc<broca_store::db::OverhaulDb>, publication: Arc<EpisodePublication>) -> Self {
+        Self {
+            db,
+            publication,
+            gate: None,
+        }
+    }
+
+    pub fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
+        self.gate = Some(Arc::new(move |_| gate.clone()));
+        self
+    }
+    pub fn with_session_gates(mut self, gate: Arc<broca_store::db::SessionGateFactory>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
     fn page(
         &self,
         key: &LineageKey,
         from: Option<u64>,
         limit: Option<u64>,
         tools: bool,
+        empty_history_check: Result<(), OpenError>,
     ) -> Result<Box<RouteReadPage>, OpenError> {
-        let publications = self.publications.lock().unwrap();
-        let publication = publications
-            .get(key)
-            .ok_or_else(|| OpenError::Open("raw page publication not supplied".into()))?;
+        let gate = self.gate.as_ref().map(|factory| factory(key));
+        let _guard = gate
+            .as_ref()
+            .map(|gate| gate.lock().map_err(|e| OpenError::Open(e.to_string())))
+            .transpose()?;
+        let publication = (self.publication)(key, None).map_err(OpenError::Open)?;
+        if publication.sequence() == 0 {
+            if empty_history_check.is_err() {
+                check_empty_publication_source(&publication)?;
+            }
+            empty_history_check.map_err(|error| {
+                error.for_empty_read(Some(publication.lineage().to_string()), Some(0), false)
+            })?;
+        }
         let raw = self
             .db
             .read_raw_page(
                 key,
                 &broca_core::agent_session_ref(key),
                 broca_store::db::LogLocation::Live,
-                publication,
+                &publication,
                 broca_store::db::RawPageRequest {
                     from_ordinal: from,
                     limit,
@@ -1175,6 +1539,7 @@ impl RawPageTestBundle {
             page: raw.page,
             at_seq: raw.at_seq,
             head_facts: raw.head,
+            head_media: raw.head_media,
             head_facts_complete: true,
             tools: raw
                 .tools
@@ -1192,16 +1557,18 @@ impl RawPageTestBundle {
         key: &LineageKey,
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
-        let publications = self.publications.lock().unwrap();
-        let publication = publications
-            .get(key)
-            .ok_or_else(|| OpenError::Open("raw tag publication not supplied".into()))?;
+        let gate = self.gate.as_ref().map(|factory| factory(key));
+        let _guard = gate
+            .as_ref()
+            .map(|gate| gate.lock().map_err(|e| OpenError::Open(e.to_string())))
+            .transpose()?;
+        let publication = (self.publication)(key, None).map_err(OpenError::Open)?;
         self.db
             .read_raw_tag_location(
                 key,
                 &broca_core::agent_session_ref(key),
                 broca_store::db::LogLocation::Live,
-                publication,
+                &publication,
                 tag,
             )
             .map(Some)
@@ -1253,8 +1620,228 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    async fn history_query<T: Send + 'static>(
+        &self,
+        query: impl FnOnce(&dyn broca_core::ServedHistory) -> Result<T, String> + Send + 'static,
+    ) -> Result<Option<T>, OpenError> {
+        let direct: Option<Arc<dyn broca_core::ServedHistory>> = self
+            .inner
+            .raw_pages
+            .get()
+            .map(|source| source.db.clone() as Arc<dyn broca_core::ServedHistory>)
+            .or_else(|| {
+                self.inner
+                    .episode_source
+                    .get()
+                    .map(|source| source.db.clone() as Arc<dyn broca_core::ServedHistory>)
+            })
+            .or_else(|| {
+                self.inner
+                    .run_rows
+                    .as_ref()
+                    .map(|source| source.history_db() as Arc<dyn broca_core::ServedHistory>)
+            })
+            .or_else(|| {
+                self.inner
+                    .reader
+                    .as_ref()
+                    .and_then(|reader| reader.wal_store.served_history())
+            });
+        let store = self
+            .inner
+            .reader
+            .as_ref()
+            .and_then(|reader| reader.store.clone());
+        spawn_blocking(JobKind::StoreRead, move || {
+            match direct
+                .as_deref()
+                .or_else(|| store.as_ref().and_then(|store| store.served_history()))
+            {
+                Some(source) => query(source)
+                    .map(Some)
+                    .map_err(OpenError::from_history_error),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|error| OpenError::Open(error.to_string()))?
+    }
+
+    /// Read-only gate shared by every history operation, including session.entries.
+    pub async fn history_read_version(
+        &self,
+        session: &LineageKey,
+    ) -> Result<Option<u64>, OpenError> {
+        let address = broca_core::session_addr(session);
+        Ok(self
+            .history_query(move |source| source.history_read_version(&address))
+            .await?
+            .flatten())
+    }
+
+    /// Boot opens only the indexed fenced sessions. Status waits for each actor's recovery
+    /// barrier, whose writer clears the fence after its repaired log is durable.
+    pub async fn finish_history_rewrites_at_boot(&self) -> Result<usize, OpenError> {
+        let sessions = self
+            .history_query(|source| source.rewriting_sessions())
+            .await?
+            .unwrap_or_default();
+        let mut recovered = 0;
+        for session in sessions {
+            let actor = self.actor_for(&session).await?;
+            let (reply, response) = tokio::sync::oneshot::channel();
+            actor
+                .send(crate::actor::LineageCmd::Status { reply })
+                .await
+                .map_err(|_| {
+                    OpenError::Open("fenced writer closed before its recovery barrier".into())
+                })?;
+            response
+                .await
+                .map_err(|_| OpenError::Open("fenced writer recovery barrier was lost".into()))?;
+            self.history_read_version(&session).await?;
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    /// Whether `session`'s log is a mode-3 log, and its lineage, read from the log alone. A live
+    /// subscription needs only these to spell public message ids, so it never waits on the
+    /// index (`None` when this registry reads no log directly).
+    pub(crate) async fn message_identity_from_log(
+        &self,
+        session: &LineageKey,
+    ) -> Result<Option<(bool, Option<String>)>, OpenError> {
+        let Some(reader) = &self.inner.reader else {
+            return Ok(None);
+        };
+        let wal = reader.wal_store.clone();
+        let key = session.clone();
+        let lineage = spawn_blocking(JobKind::WalRead, move || {
+            wal.read_records_range(&key, 0, Some(1), None)
+                .map(|range| range.lineage_id.map(|id| id.to_string()))
+                .map_err(|error| OpenError::Open(error.to_string()))
+        })
+        .await
+        .map_err(|error| OpenError::Open(error.to_string()))??;
+        let mode3 = self
+            .mode3_for_page(
+                session,
+                lineage.clone(),
+                &broca_core::head::HeadProjection::default(),
+            )
+            .await?;
+        Ok(Some((mode3, lineage)))
+    }
+
+    pub(crate) async fn mode3_for_page(
+        &self,
+        session: &LineageKey,
+        lineage: Option<String>,
+        head: &broca_core::head::HeadProjection,
+    ) -> Result<bool, OpenError> {
+        if let Some(mode3) = head.mode3 {
+            return Ok(mode3);
+        }
+        if let Some((_, mode3)) = self
+            .inner
+            .mode3_logs
+            .lock()
+            .unwrap()
+            .get(session)
+            .filter(|(cached, _)| *cached == lineage)
+        {
+            return Ok(*mode3);
+        }
+        let mode3 = if let Some(reader) = &self.inner.reader {
+            let wal = reader.wal_store.clone();
+            let store = reader.store.clone();
+            let key = session.clone();
+            spawn_blocking(JobKind::StoreRead, move || {
+                let mode3 = broca_core::mode3_log_from_wal(wal.as_ref(), &key)
+                    .map_err(|error| OpenError::Open(error.to_string()))?;
+                // The cached mode only saves the next read this log scan. A read must not fail
+                // because the index is busy, so a failed cache write is logged and skipped.
+                if let Some(store) = store {
+                    if let Err(error) = store.cache_history_mode(&key, mode3) {
+                        tracing::debug!(target: "store", %error, "history mode not cached");
+                    }
+                }
+                Ok::<_, OpenError>(mode3)
+            })
+            .await
+            .map_err(|error| OpenError::Open(error.to_string()))??
+        } else {
+            let records = self.read_durable_wal(session).await?.0;
+            broca_core::is_mode3_log(records.iter().map(|record| &record.record))
+        };
+        if head.model.is_some() {
+            self.inner
+                .mode3_logs
+                .lock()
+                .unwrap()
+                .insert(session.clone(), (lineage, mode3));
+        }
+        Ok(mode3)
+    }
+
+    pub async fn served_snapshot(
+        &self,
+        session: &LineageKey,
+        lineage: Option<String>,
+        mut has_log: bool,
+        expected_version: Option<u64>,
+    ) -> Result<broca_core::served_history::ServedSnapshot, OpenError> {
+        if !has_log {
+            if let Some(reader) = &self.inner.reader {
+                let wal = reader.wal_store.clone();
+                let key = session.clone();
+                has_log = spawn_blocking(JobKind::StoreRead, move || wal.wal_present_checked(&key))
+                    .await
+                    .map_err(|error| OpenError::Open(error.to_string()))?
+                    .map_err(|error| OpenError::Open(error.to_string()))?
+                    .unwrap_or(false);
+            }
+        }
+        let address = broca_core::session_addr(session);
+        let fallback_lineage = lineage.clone();
+        Ok(self
+            .history_query(move |source| {
+                source.served_snapshot(
+                    &address,
+                    has_log,
+                    lineage.as_deref(),
+                    Some(expected_version),
+                )
+            })
+            .await?
+            .unwrap_or_else(|| broca_core::served_history::ServedSnapshot {
+                history_version: u64::from(has_log),
+                incarnation: fallback_lineage.unwrap_or_else(|| {
+                    if has_log {
+                        "legacy".into()
+                    } else {
+                        "unwritten".into()
+                    }
+                }),
+            }))
+    }
+
+    pub fn set_run_event_reader(&self, reader: Arc<RunEventLookup>) {
+        assert!(
+            self.inner.run_event_reader.set(reader).is_ok(),
+            "run-event reader already installed"
+        );
+    }
     /// Supply the durable identity inventory before accepting routed session binds.
     pub fn set_session_address_inventory(&self, inventory: Arc<broca_store::SqliteStore>) {
+        self.set_session_address_resolver(inventory);
+    }
+
+    pub fn set_session_address_resolver(
+        &self,
+        inventory: Arc<dyn broca_store::SessionAddressResolver>,
+    ) {
         assert!(
             self.inner.session_address_inventory.set(inventory).is_ok(),
             "session address inventory already configured"
@@ -1330,14 +1917,29 @@ impl LineageRegistry {
         }
     }
 
-    /// Install database episode reads explicitly; boot-time store selection is unchanged.
+    /// Install the episode reader selected by the boot-time state format.
     pub fn with_episode_source(self, source: Arc<EpisodeReadSource>) -> Self {
         assert!(self.inner.episode_source.set(source).is_ok());
         self
     }
     #[cfg(test)]
     pub(crate) fn with_raw_pages_for_test(self, bundle: Arc<RawPageTestBundle>) -> Self {
-        assert!(self.inner.raw_pages.set(bundle).is_ok());
+        self.with_raw_page_source(Arc::new(RawPageSource::new(
+            bundle.db.clone(),
+            Arc::new(move |key, _| {
+                bundle
+                    .publications
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| "raw page publication not supplied".into())
+            }),
+        )))
+    }
+
+    pub fn with_raw_page_source(self, source: Arc<RawPageSource>) -> Self {
+        assert!(self.inner.raw_pages.set(source).is_ok());
         self
     }
     pub(crate) fn upload_store(&self) -> Option<broca_core::media_uploads::Uploads> {
@@ -1418,14 +2020,26 @@ impl LineageRegistry {
         session: &LineageKey,
         event_key: &str,
     ) -> Result<broca_wire::RunEventGetResponse, crate::serve::ServeError> {
-        let Some(store) = self.inner.reader.as_ref().and_then(|r| r.store.clone()) else {
+        let native = self.inner.run_event_reader.get().cloned();
+        let store = self.inner.reader.as_ref().and_then(|r| r.store.clone());
+        if native.is_none() && store.is_none() {
             return Ok(broca_wire::RunEventGetResponse::Absent);
-        };
+        }
+        if native.is_some() {
+            self.check_move(session, false)
+                .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?;
+        }
         let event_key = event_key.to_owned();
         let key = event_key.clone();
-        let row = spawn_blocking(broca_diagnostics::JobKind::StoreRead, move || {
-            store.read_run_event(&key)
-        })
+        let row = spawn_blocking(
+            broca_diagnostics::JobKind::StoreRead,
+            move || match native {
+                Some(reader) => reader(&key),
+                None => store
+                    .ok_or_else(|| "run-event reader unavailable".to_string())?
+                    .read_run_event(&key),
+            },
+        )
         .await
         .map_err(|e| crate::serve::ServeError::Open(e.to_string(), None))?
         .map_err(|e| crate::serve::ServeError::Open(e, None))?;
@@ -1630,10 +2244,10 @@ impl LineageRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                run_event_reader: std::sync::OnceLock::new(),
                 session_address_inventory: std::sync::OnceLock::new(),
                 episode_source: std::sync::OnceLock::new(),
                 session_inventory_readiness: std::sync::OnceLock::new(),
-                #[cfg(test)]
                 raw_pages: std::sync::OnceLock::new(),
                 tool_route_health: std::sync::OnceLock::new(),
                 actor_idle_holds: Mutex::new(HashMap::new()),
@@ -1658,9 +2272,11 @@ impl LineageRegistry {
                 read_proofs: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 media_heads: Mutex::default(),
                 dispatch_cache: Mutex::new(BoundedSessionCache::new(DISPATCH_CACHE_SESSIONS)),
+                mode3_logs: Mutex::new(BoundedSessionCache::new(DISPATCH_CACHE_SESSIONS)),
                 frozen_senders: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 live_ownership: Mutex::new(HashMap::new()),
                 owner_snapshots: Mutex::new(OwnerSnapshots::default()),
+                sender_snapshots: Mutex::new(OwnerSnapshots::default()),
                 stopping: tokio_util::sync::CancellationToken::new(),
                 seal: tokio_util::sync::CancellationToken::new(),
                 seal_state: Mutex::new(SealState::default()),
@@ -1668,6 +2284,7 @@ impl LineageRegistry {
                 #[cfg(test)]
                 actor_panics: AtomicU64::new(0),
                 restart_resume_ready: AtomicBool::new(false),
+                read_only_lineages: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 crash_orphan_marks: Mutex::new(HashMap::new()),
                 crash_orphans_sealed: AtomicU64::new(0),
                 crash_orphans_index_repaired: AtomicU64::new(0),
@@ -1715,6 +2332,19 @@ impl LineageRegistry {
             return Ok(None);
         };
         if read.state.state == broca_core::RunIndexState::Active {
+            if let Some(state) = self
+                .read_only_run_state(
+                    key,
+                    read.lineage_id.map(|id| id.to_string()),
+                    Some(&run_id.0),
+                    true,
+                    None,
+                )
+                .await?
+            {
+                state.apply(&mut read.state);
+                return Ok(Some(read));
+            }
             // An active cold run still needs the existing orphan-recovery policy;
             // an indexed row must not turn a dead writer into a live run.
             let state = self.route_run_state(key, run_id.clone()).await?;
@@ -1845,6 +2475,74 @@ impl LineageRegistry {
         }
     }
 
+    /// The compaction-runner wire adapter uses `bind` before acknowledging its
+    /// route, then the same session-bound entry point for all three operations.
+    pub async fn route_compaction_v2(
+        &self,
+        key: &LineageKey,
+        caller: Option<String>,
+        method: String,
+        params: Box<serde_json::value::RawValue>,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::protocol::wire::Refusal>
+    {
+        use broca_core::compaction_v2::protocol::wire::Refusal;
+        let internal = |message: String| Refusal::new("internal_error", message, None);
+        self.check_move(key, true)
+            .map_err(|error| internal(error.to_string()))?;
+        self.check_expired(key, None)
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+        let ownership = self
+            .durable_session_ownership(key, true)
+            .await
+            .map_err(|error| internal(error.into_open().to_string()))?;
+        let manifest = ownership
+            .latest_manifest
+            .as_deref()
+            .or_else(|| ownership.first_episode.as_ref()?.manifest.as_deref());
+        let item = manifest
+            .map(broca_core::compaction::item)
+            .transpose()
+            .map_err(internal)?
+            .flatten();
+        let wal = self
+            .inner
+            .reader
+            .as_ref()
+            .ok_or_else(|| internal("compaction session reader is unavailable".into()))?
+            .wal_store
+            .clone();
+        let session = key.clone();
+        let mode3 = spawn_blocking(JobKind::WalRead, move || {
+            broca_core::mode3_log_from_wal(wal.as_ref(), &session)
+        })
+        .await
+        .map_err(|error| internal(error.to_string()))?
+        .map_err(|error| internal(error.to_string()))?;
+        broca_core::compaction_v2::authority::check_bind(
+            mode3,
+            item.as_ref().map(|item| item.0.as_str()),
+            caller.as_deref(),
+        )?;
+        let handle = self
+            .actor_for(key)
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle
+            .send(crate::actor::LineageCmd::CompactionV2 {
+                caller,
+                method,
+                params,
+                reply,
+            })
+            .await
+            .map_err(|_| internal("compaction session actor closed".into()))?;
+        receive
+            .await
+            .map_err(|_| internal("compaction session actor closed".into()))?
+    }
+
     pub async fn route_compaction_ready(
         &self,
         key: &LineageKey,
@@ -1938,6 +2636,46 @@ impl LineageRegistry {
         Ok(sender)
     }
 
+    /// Observe ownership already learned by ordinary requests, without telemetry-only IO.
+    /// Only a current live summary is authoritative while an actor is open. A closed session
+    /// can reuse frozen owner identities from a nonempty ownership summary; an empty ownership
+    /// summary does not establish an owner.
+    pub(crate) fn cached_session_owner(
+        &self,
+        key: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Option<bool> {
+        fn matches(
+            ownership: &broca_core::SessionOwnershipV1,
+            principal: Option<&broca_protocol::BindPrincipal>,
+        ) -> Option<bool> {
+            (ownership.episodes > 0).then(|| {
+                principal.is_some()
+                    && (ownership.first_principal.as_ref() == principal
+                        || ownership
+                            .scope
+                            .as_ref()
+                            .is_some_and(|scope| Some(&scope.owner) == principal))
+            })
+        }
+        let slots = self.inner.slots.lock().unwrap();
+        if let Some(Entry::Open { handle, .. }) = slots.get(key) {
+            let live = self.inner.live_ownership.lock().unwrap();
+            return live.get(key).and_then(|cached| {
+                (cached.generation == handle.gen
+                    && cached.head == handle.durable_head.load(Ordering::Acquire))
+                .then(|| matches(&cached.ownership, principal))
+                .flatten()
+            });
+        }
+        self.inner
+            .owner_snapshots
+            .lock()
+            .unwrap()
+            .get(key)
+            .and_then(|snapshot| matches(&snapshot.ownership, principal))
+    }
+
     /// Cancel/retract ownership from a live reader, a checkpoint plus its durable suffix, or
     /// the complete WAL when no checkpoint is usable. Never open an actor to obtain it.
     pub(crate) async fn owner_ownership(
@@ -1965,6 +2703,301 @@ impl LineageRegistry {
             &records,
             &broca_protocol::SubmissionId(submission_id.into()),
         ))
+    }
+
+    /// Cold grant lookup never opens an actor, whose recovery could write history.
+    pub(crate) async fn interrupt_cancel_granted(
+        &self,
+        key: &LineageKey,
+        module_id: &str,
+    ) -> Result<bool, OpenError> {
+        self.check_authorization_expired(key).await?;
+        let ownership = self.sender_ownership_for_authorization(key).await?;
+        Ok(crate::sender_admission::interrupt_granted(
+            &ownership, module_id,
+        ))
+    }
+
+    /// Reuse an existing actor's admission source without opening or recovering a lineage.
+    pub(crate) async fn warm_cancel_authority(
+        &self,
+        key: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        at: broca_wal::record::RunCancelAt,
+    ) -> Result<Option<crate::actor::CancelAuthority>, crate::serve::ServeError> {
+        self.check_authorization_expired(key).await?;
+        match self.check_move(key, true) {
+            // Moving/moved sessions need owner_ownership's full log validation. Cached
+            // authority could hide corrupt history; move errors must wait for authorization.
+            Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error.into()),
+            Ok(()) => {}
+        }
+        let handle = {
+            let slots = self.inner.slots.lock().unwrap();
+            match slots.get(key) {
+                Some(Entry::Open { handle, .. }) => {
+                    let head = handle.durable_head.load(Ordering::Acquire);
+                    if let Some(cached) = self.inner.live_ownership.lock().unwrap().get(key) {
+                        // The first principal never changes within an actor generation.
+                        // Keep owners on the cached ownership path without querying sender policy.
+                        let immutable_authority = cached.ownership.episodes > 0
+                            && (cached.ownership.first_principal.as_ref() == principal
+                                || !matches!(
+                                    cached.ownership.first_principal,
+                                    Some(broca_protocol::BindPrincipal::Reserved { .. })
+                                ));
+                        if cached.generation == handle.gen
+                            && (cached.head == head || immutable_authority)
+                            && broca_core::scope_admission::decide_owner_access(
+                                &cached.ownership,
+                                principal,
+                                scope,
+                            )
+                            .is_ok()
+                        {
+                            return Ok(Some(crate::actor::CancelAuthority::Owner));
+                        }
+                    }
+                    Some(handle.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(handle) = handle {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if handle
+                .send(crate::actor::LineageCmd::SenderPolicy {
+                    principal: principal.cloned(),
+                    scope: scope.clone(),
+                    at,
+                    reply,
+                })
+                .await
+                .is_ok()
+            {
+                if let Ok(result) = rx.await {
+                    return result;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn resolve_cancel_authority(
+        &self,
+        key: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        at: broca_wal::record::RunCancelAt,
+    ) -> Result<crate::actor::CancelAuthority, crate::serve::ServeError> {
+        use crate::{actor::CancelAuthority, serve::ServeError};
+        if let Some(authority) = self
+            .warm_cancel_authority(key, principal, scope, at)
+            .await?
+        {
+            return Ok(authority);
+        }
+        let ownership = self.owner_ownership(key).await?;
+        let refusal =
+            match broca_core::scope_admission::decide_owner_access(&ownership, principal, scope) {
+                Ok(()) => return Ok(CancelAuthority::Owner),
+                Err(refusal) => refusal,
+            };
+        if let (
+            broca_wal::record::RunCancelAt::Now,
+            Some(broca_protocol::BindPrincipal::Reserved { module_id }),
+        ) = (at, principal)
+        {
+            if self.interrupt_cancel_granted(key, module_id).await? {
+                return Ok(CancelAuthority::Sender);
+            }
+        }
+        Err(ServeError::ScopeRefused(refusal))
+    }
+
+    /// Read existing durable policy without opening an actor or advancing a live writer.
+    /// Older policy may be repaired in memory, never published for an unadmitted caller.
+    async fn sender_ownership_for_authorization(
+        &self,
+        key: &LineageKey,
+    ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
+        let reader = self.inner.reader.as_ref().ok_or_else(|| {
+            OpenError::Open("sender authorization reader is not configured".into())
+        })?;
+        let live_head = {
+            let slots = self.inner.slots.lock().unwrap();
+            match slots.get(key) {
+                Some(Entry::Open { handle, .. }) => {
+                    Some(handle.durable_head.load(Ordering::Acquire))
+                }
+                _ => None,
+            }
+        };
+        let cached = self
+            .inner
+            .sender_snapshots
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .filter(|snapshot| live_head.is_none_or(|head| snapshot.watermark_seq <= head));
+        if let Some(snapshot) = cached {
+            let range = self
+                .read_durable_range_for(
+                    reader,
+                    key,
+                    ReadRangeRequest {
+                        after_seq: snapshot.watermark_seq,
+                        anchor: snapshot.anchor,
+                        live_head,
+                        through_seq: None,
+                        purpose: ReadPurpose::Authorization,
+                    },
+                )
+                .await?;
+            let records = crate::durable_read::DurableRead::classify(
+                &range,
+                snapshot.watermark_seq,
+                live_head,
+            )
+            .records()
+            .map_err(|error| OpenError::Open(error.to_string()))?;
+            if records.is_empty()
+                && snapshot.lineage_id.is_some()
+                && snapshot.lineage_id == range.lineage_id.map(|id| id.to_string())
+            {
+                return Ok(snapshot.ownership);
+            }
+        }
+        let stored = if let Some(store) = reader.store.clone() {
+            let key = key.clone();
+            spawn_blocking(JobKind::StoreRead, move || {
+                store.read_admission_snapshot(&key)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+        } else {
+            None
+        };
+        if let Some(stored) = stored {
+            if let Some(mut checkpoint) = stored.checkpoint {
+                if checkpoint.at_seq == stored.watermark_seq
+                    && checkpoint.ownership_complete()
+                    && live_head.is_none_or(|head| stored.watermark_seq <= head)
+                {
+                    let range = self
+                        .read_durable_range_for(
+                            reader,
+                            key,
+                            ReadRangeRequest {
+                                after_seq: stored.watermark_seq,
+                                anchor: stored.anchor,
+                                live_head,
+                                through_seq: None,
+                                purpose: ReadPurpose::Authorization,
+                            },
+                        )
+                        .await?;
+                    let records = crate::durable_read::DurableRead::classify(
+                        &range,
+                        stored.watermark_seq,
+                        live_head,
+                    )
+                    .records()
+                    .map_err(|error| OpenError::Open(error.to_string()))?;
+                    if stored.lineage_id.is_some()
+                        && stored.lineage_id == range.lineage_id.map(|id| id.to_string())
+                        && checkpoint.fold_frames(records).is_ok()
+                    {
+                        if let Some(ownership) = checkpoint.ownership {
+                            let head = checkpoint.at_seq;
+                            let wal = reader.wal_store.clone();
+                            let read_key = key.clone();
+                            let ownership =
+                                crate::sender_admission::resolve(ownership, || async move {
+                                    spawn_blocking(
+                                        JobKind::WalRead,
+                                        broca_wal::access_counter::inherit(move || {
+                                            crate::sender_admission::read_prefix(
+                                                wal.as_ref(),
+                                                &read_key,
+                                                head,
+                                            )
+                                        }),
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string())?
+                                })
+                                .await
+                                .map_err(OpenError::Open)?;
+                            self.cache_sender_snapshot(
+                                key,
+                                &ownership,
+                                head,
+                                range.lineage_id,
+                                range.anchor_at(head).or(stored.anchor),
+                            );
+                            return Ok(ownership);
+                        }
+                    }
+                }
+            }
+        }
+        let range = self
+            .read_durable_range_for(
+                reader,
+                key,
+                ReadRangeRequest {
+                    after_seq: 0,
+                    anchor: None,
+                    live_head,
+                    through_seq: None,
+                    purpose: ReadPurpose::Authorization,
+                },
+            )
+            .await?;
+        let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
+            .records()
+            .map_err(|error| OpenError::Open(error.to_string()))?;
+        let checkpoint = broca_core::AdmissionCheckpointV1::from_frames(records)
+            .map_err(|error| OpenError::Open(error.to_string()))?;
+        let ownership = checkpoint.ownership.ok_or_else(|| {
+            OpenError::Open("the admission snapshot carries no ownership summary".into())
+        })?;
+        self.cache_sender_snapshot(
+            key,
+            &ownership,
+            checkpoint.at_seq,
+            range.lineage_id,
+            range.anchor_at(checkpoint.at_seq),
+        );
+        Ok(ownership)
+    }
+
+    fn cache_sender_snapshot(
+        &self,
+        key: &LineageKey,
+        ownership: &broca_core::SessionOwnershipV1,
+        head: u64,
+        lineage_id: Option<broca_wal::WalLineageId>,
+        anchor: Option<broca_wal::WalByteAnchor>,
+    ) {
+        self.inner.sender_snapshots.lock().unwrap().insert_sender(
+            key.clone(),
+            OwnershipSnapshot {
+                ownership: ownership.clone(),
+                watermark_seq: head,
+                lineage_id: lineage_id.map(|id| id.to_string()),
+                anchor,
+                first_episode_position: None,
+            },
+        );
     }
 
     /// Upload standing includes every current plan-named sender, not just session owners.
@@ -2486,31 +3519,35 @@ impl LineageRegistry {
                     // fix the slot, so no waiter hangs. If this task is cancelled or panics
                     // mid-await, `OpenGuard` clears the Opening slot.
                     let open_guard = OpenGuard::new(self.inner.clone(), key.clone(), ready.clone());
-                    ACTOR_OPENS.fetch_add(1, Ordering::Relaxed);
-                    #[cfg(all(test, feature = "test-clock"))]
-                    if status {
-                        let probe = self.inner.status_open_probe.lock().unwrap().take();
-                        if let Some(probe) = probe {
-                            probe();
+                    let result = async {
+                        self.check_session_log(key).await?;
+                        ACTOR_OPENS.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(all(test, feature = "test-clock"))]
+                        if status {
+                            let probe = self.inner.status_open_probe.lock().unwrap().take();
+                            if let Some(probe) = probe {
+                                probe();
+                            }
+                        }
+                        if status {
+                            self.inner
+                                .opener
+                                .open_for_status(key, gen, self.handle())
+                                .await
+                        } else {
+                            self.inner
+                                .opener
+                                .open_with_class(
+                                    key,
+                                    gen,
+                                    self.handle(),
+                                    retention,
+                                    session_class.clone(),
+                                )
+                                .await
                         }
                     }
-                    let result = if status {
-                        self.inner
-                            .opener
-                            .open_for_status(key, gen, self.handle())
-                            .await
-                    } else {
-                        self.inner
-                            .opener
-                            .open_with_class(
-                                key,
-                                gen,
-                                self.handle(),
-                                retention,
-                                session_class.clone(),
-                            )
-                            .await
-                    };
+                    .await;
                     {
                         let mut slots = self.inner.slots.lock().unwrap();
                         match &result {
@@ -2878,16 +3915,50 @@ impl LineageRegistry {
         run_id: broca_protocol::RunId,
         at: broca_wal::record::RunCancelAt,
     ) -> Result<crate::actor::CancelOutcome, OpenError> {
+        self.route_cancel_inner(key, run_id, at, None).await
+    }
+
+    pub async fn route_cancel_from(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        principal: Option<broca_protocol::BindPrincipal>,
+        scope: broca_protocol::SendScope,
+    ) -> Result<crate::actor::CancelOutcome, OpenError> {
+        self.route_cancel_inner(key, run_id, at, Some((principal, scope)))
+            .await
+    }
+
+    async fn route_cancel_inner(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+        at: broca_wal::record::RunCancelAt,
+        caller: Option<(
+            Option<broca_protocol::BindPrincipal>,
+            broca_protocol::SendScope,
+        )>,
+    ) -> Result<crate::actor::CancelOutcome, OpenError> {
         use crate::actor::{CancelOutcome, LineageCmd};
         loop {
             self.check_move(key, true)?;
             self.check_expired(key, Some(&run_id.0)).await?;
             let handle = self.actor_for(key).await?;
             let (reply, rx) = tokio::sync::oneshot::channel();
-            let cmd = LineageCmd::Cancel {
-                run_id: run_id.clone(),
-                at,
-                reply,
+            let cmd = match &caller {
+                Some((principal, scope)) => LineageCmd::CancelFrom {
+                    run_id: run_id.clone(),
+                    at,
+                    principal: principal.clone(),
+                    scope: scope.clone(),
+                    reply,
+                },
+                None => LineageCmd::Cancel {
+                    run_id: run_id.clone(),
+                    at,
+                    reply,
+                },
             };
             if handle.send(cmd).await.is_err() {
                 continue;
@@ -3117,17 +4188,53 @@ impl LineageRegistry {
         ),
         OpenError,
     > {
+        let (state, records, _) = self.route_run_state_with_reader_policy(key, run_id).await?;
+        Ok((state, records))
+    }
+
+    pub(crate) async fn route_run_state_with_reader_policy(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+    ) -> Result<
+        (
+            Option<broca_core::ReconciledRunState>,
+            Option<Vec<broca_wal::FramedRecord>>,
+            bool,
+        ),
+        OpenError,
+    > {
         self.check_expired(key, Some(&run_id.0)).await?;
         if matches!(
             self.check_move(key, true),
             Err(OpenError::SessionMoving { .. })
         ) {
-            let records = self.read_durable_wal(key).await?.0;
-            let state = broca_core::reconcile_run_state(
+            let (records, lineage, read_only) = self
+                .read_durable_wal_with_compatibility(key, ReadPurpose::Session)
+                .await?;
+            let mut state = broca_core::reconcile_run_state(
                 records.iter().map(|frame| &frame.record),
                 &run_id.0,
             );
-            return Ok((state, Some(records)));
+            let policy = self
+                .read_only_run_state(
+                    key,
+                    lineage.map(|id| id.to_string()),
+                    Some(&run_id.0),
+                    state.as_ref().is_some_and(|state| {
+                        matches!(
+                            state.state,
+                            broca_core::RunIndexState::Active | broca_core::RunIndexState::Paused
+                        )
+                    }),
+                    Some((read_only, &records)),
+                )
+                .await?;
+            let preserve_pause = matches!(policy, Some(ReadOnlyRunState::Paused { .. }));
+            if let Some(policy) = policy {
+                policy.apply(state.as_mut().expect("known run state"));
+            }
+            return Ok((state, Some(records), preserve_pause));
         }
         use crate::actor::LineageCmd;
         loop {
@@ -3154,13 +4261,35 @@ impl LineageRegistry {
                     }
                     None => None,
                 };
-                let records = self.read_durable_wal(key).await?.0;
+                let (records, lineage, read_only) = self
+                    .read_durable_wal_with_compatibility(key, ReadPurpose::Session)
+                    .await?;
                 let reconciled = broca_core::reconcile_run_state(
                     records.iter().map(|frame| &frame.record),
                     &run_id.0,
                 );
-                let state = crate::actor::indexed_run_state(indexed, reconciled)
+                let mut state = crate::actor::indexed_run_state(indexed, reconciled)
                     .map_err(OpenError::Open)?;
+                if let Some(read_only_state) = self
+                    .read_only_run_state(
+                        key,
+                        lineage.map(|id| id.to_string()),
+                        Some(&run_id.0),
+                        state.as_ref().is_some_and(|state| {
+                            matches!(
+                                state.state,
+                                broca_core::RunIndexState::Active
+                                    | broca_core::RunIndexState::Paused
+                            )
+                        }),
+                        Some((read_only, &records)),
+                    )
+                    .await?
+                {
+                    let preserve_pause = matches!(read_only_state, ReadOnlyRunState::Paused { .. });
+                    read_only_state.apply(state.as_mut().expect("active state exists"));
+                    return Ok((state, Some(records), preserve_pause));
+                }
                 if state
                     .as_ref()
                     .is_some_and(|state| state.state == broca_core::RunIndexState::Active)
@@ -3175,7 +4304,7 @@ impl LineageRegistry {
                     self.recover_status_orphan(key, &run_id).await?;
                     continue;
                 }
-                return Ok((state, Some(records)));
+                return Ok((state, Some(records), false));
             };
             let (reply, rx) = tokio::sync::oneshot::channel();
             let cmd = LineageCmd::RunState {
@@ -3188,7 +4317,7 @@ impl LineageRegistry {
             match rx.await {
                 // A STORAGE failure resolving the run is surfaced as an error (so the wire
                 // reports it), never collapsed into "unknown run".
-                Ok(Ok(state)) => return Ok((state, None)),
+                Ok(Ok(state)) => return Ok((state, None, false)),
                 Ok(Err(e)) => {
                     self.check_expired(key, Some(&run_id.0)).await?;
                     return Err(OpenError::Open(e));
@@ -3277,6 +4406,7 @@ impl LineageRegistry {
             (Some(head), None) => Some(head),
             (None, through) => through,
         };
+        let whole_source = after_seq == 0 && anchor.is_none() && requested_through.is_none();
         let range_read = |through_seq| {
             let wal_store = reader.wal_store.clone();
             let session = key.clone();
@@ -3361,6 +4491,7 @@ impl LineageRegistry {
             return Ok(candidate);
         };
         if cached_head.is_some_and(|head| candidate_head <= head) {
+            self.cache_run_compatibility_range(key, &candidate, whole_source, candidate_head);
             return Ok(candidate);
         }
 
@@ -3440,7 +4571,34 @@ impl LineageRegistry {
         if let Some(identity) = flush_identity {
             self.cache_read_proof(key, identity, candidate_head);
         }
+        self.cache_run_compatibility_range(key, &proven, whole_source, candidate_head);
         Ok(proven)
+    }
+
+    fn cache_run_compatibility_range(
+        &self,
+        key: &LineageKey,
+        range: &broca_wal::WalRangeRead,
+        whole_source: bool,
+        head: u64,
+    ) {
+        if !whole_source {
+            return;
+        }
+        let Ok(records) =
+            crate::durable_read::DurableRead::classify(range, 0, Some(head)).records()
+        else {
+            return;
+        };
+        // Reuse a full read only after its durability proof. A suffix cannot establish that an
+        // unseen prefix lacks the reader-only feature, and classification must not add a flush.
+        self.inner.read_only_lineages.lock().unwrap().insert(
+            key.clone(),
+            (
+                range.lineage_id.map(|id| id.to_string()),
+                ReadOnlyLineage::from_frames(range.check_run_compatible().is_err(), records),
+            ),
+        );
     }
 
     fn cached_read_proof(&self, key: &LineageKey, identity: u64) -> Option<u64> {
@@ -3630,6 +4788,24 @@ impl LineageRegistry {
         ),
         OpenError,
     > {
+        let (records, lineage, _) = self
+            .read_durable_wal_with_compatibility(key, purpose)
+            .await?;
+        Ok((records, lineage))
+    }
+
+    async fn read_durable_wal_with_compatibility(
+        &self,
+        key: &LineageKey,
+        purpose: ReadPurpose,
+    ) -> Result<
+        (
+            Vec<broca_wal::FramedRecord>,
+            Option<broca_wal::WalLineageId>,
+            bool,
+        ),
+        OpenError,
+    > {
         match purpose {
             ReadPurpose::Session | ReadPurpose::Media => self.check_expired(key, None).await?,
             ReadPurpose::Authorization => self.check_authorization_expired(key).await?,
@@ -3668,7 +4844,90 @@ impl LineageRegistry {
                 class: broca_protocol::ErrorClass::Transient,
             })?
             .to_vec();
-        Ok((records, range.lineage_id))
+        Ok((
+            records,
+            range.lineage_id,
+            range.check_run_compatible().is_err(),
+        ))
+    }
+
+    /// Return an established policy without reading the log. The outer `None` means the
+    /// lineage's compatibility is unknown; `Some(None)` means no state rewrite is needed.
+    fn cached_read_only_run_state(
+        &self,
+        key: &LineageKey,
+        lineage: Option<&str>,
+        run_id: Option<&str>,
+        active: bool,
+    ) -> Option<Option<ReadOnlyRunState>> {
+        if !active
+            || matches!(
+                self.inner.slots.lock().unwrap().get(key),
+                Some(Entry::Open { .. })
+            )
+        {
+            return Some(None);
+        }
+        self.inner
+            .read_only_lineages
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|(stored, _)| stored.as_deref() == lineage)
+            .map(|(_, facts)| facts.state(run_id))
+    }
+
+    /// Establish run-state policy for run.status and run.result. A reader-only run with no live
+    /// session actor, terminal or durable pause is interrupted without sealing; a durable pause wins.
+    pub(crate) async fn read_only_run_state(
+        &self,
+        key: &LineageKey,
+        lineage: Option<String>,
+        run_id: Option<&str>,
+        active: bool,
+        observed: Option<(bool, &[broca_wal::FramedRecord])>,
+    ) -> Result<Option<ReadOnlyRunState>, OpenError> {
+        if !active
+            || matches!(
+                self.inner.slots.lock().unwrap().get(key),
+                Some(Entry::Open { .. })
+            )
+        {
+            return Ok(None);
+        }
+        if let Some((read_only, records)) = observed {
+            self.inner.read_only_lineages.lock().unwrap().insert(
+                key.clone(),
+                (
+                    lineage.clone(),
+                    ReadOnlyLineage::from_frames(read_only, records),
+                ),
+            );
+        }
+        let cached = self.cached_read_only_run_state(key, lineage.as_deref(), run_id, active);
+        match cached {
+            Some(state) => Ok(state),
+            None => {
+                let (records, current, read_only) = self
+                    .read_durable_wal_with_compatibility(key, ReadPurpose::Session)
+                    .await?;
+                if current.map(|id| id.to_string()) != lineage {
+                    return Err(OpenError::Classified {
+                        reason: "session lineage changed while classifying an unfinished run"
+                            .into(),
+                        class: broca_protocol::ErrorClass::Transient,
+                    });
+                }
+                let facts = ReadOnlyLineage::from_frames(read_only, &records);
+                let state = facts.state(run_id);
+                self.inner
+                    .read_only_lineages
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), (lineage, facts));
+                Ok(state)
+            }
+        }
     }
 
     /// Returns the same page as `route_read` and, when `include_tools` is set, the tool list
@@ -3700,9 +4959,15 @@ impl LineageRegistry {
         tag: u64,
     ) -> Result<Option<broca_core::TagLocation>, OpenError> {
         self.check_expired(key, None).await?;
-        #[cfg(test)]
         if let Some(bundle) = self.inner.raw_pages.get() {
-            return bundle.tag_location(key, tag);
+            let bundle = bundle.clone();
+            let key = key.clone();
+            return spawn_blocking(
+                JobKind::StoreRead,
+                broca_wal::access_counter::inherit(move || bundle.tag_location(&key, tag)),
+            )
+            .await
+            .map_err(|error| OpenError::Open(error.to_string()))?;
         }
         let Some(store) = self
             .inner
@@ -3750,13 +5015,55 @@ impl LineageRegistry {
         limit: Option<u64>,
         include_tools: bool,
     ) -> Result<RouteReadPage, OpenError> {
-        match self
+        let before = self.history_read_version(key).await?;
+        let result = match self
             .route_read_page_view(key, from_ordinal, limit, include_tools, None)
             .await?
         {
-            RoutedPage::Raw(page) => Ok(*page),
+            RoutedPage::Raw(mut page) => {
+                let lineage = page.page.lineage_id.map(|id| id.to_string());
+                // Pure reads use only facts already held or cached; run-state endpoints establish
+                // the policy. A cold bounded page keeps its existing state instead of reading the
+                // WAL from byte zero.
+                if let Some(state) = self
+                    .cached_read_only_run_state(
+                        key,
+                        lineage.as_deref(),
+                        page.page
+                            .lineage_state
+                            .last_run_id
+                            .as_ref()
+                            .map(|run| run.0.as_str()),
+                        page.page.lineage_state.state == broca_core::SessionReadStateKind::Active,
+                    )
+                    .flatten()
+                {
+                    match state {
+                        ReadOnlyRunState::Interrupted => {
+                            page.page.lineage_state.state =
+                                broca_core::SessionReadStateKind::Interrupted;
+                            page.page.lineage_state.reason =
+                                Some(broca_core::SessionReadReason::Terminal(
+                                    broca_protocol::RunFinishReason::Interrupted,
+                                ));
+                        }
+                        ReadOnlyRunState::Paused { reason, error } => {
+                            page.page.lineage_state.state =
+                                broca_core::SessionReadStateKind::Paused;
+                            page.page.lineage_state.reason =
+                                Some(broca_core::SessionReadReason::Pause(reason));
+                            page.page.lineage_state.error = error.map(|error| *error);
+                        }
+                    }
+                }
+                *page
+            }
             RoutedPage::Model(_) => unreachable!("raw read requested"),
+        };
+        if self.history_read_version(key).await? != before {
+            return Err(OpenError::HistoryChanged);
         }
+        Ok(result)
     }
 
     /// Model reads serve only fsynced WAL records and discard a store prefix whose
@@ -3790,30 +5097,44 @@ impl LineageRegistry {
         include_tools: bool,
         model: Option<&broca_core::ModelPageRequest>,
     ) -> Result<RoutedPage, OpenError> {
-        self.check_expired(key, None).await?;
+        self.check_history_expired(key).await?;
+        // Keep the evidence before a format-selected reader can rebuild rows,
+        // but let that reader's established errors win over a new refusal.
+        let empty_history_check = self.check_session_log(key).await;
         if let (Some(request), Some(source)) = (model, self.inner.episode_source.get()) {
             let source = source.clone();
             let key = key.clone();
             let request = request.clone();
-            return spawn_blocking(JobKind::StoreRead, move || {
-                source
-                    .reader(&key, None)?
-                    .read_model_page(&request)
-                    .map(|page| RoutedPage::Model(page.page))
-                    .map_err(|error| error.to_string())
-            })
+            return spawn_blocking(
+                JobKind::StoreRead,
+                broca_wal::access_counter::inherit(move || {
+                    source.with_reader_checked(&key, None, empty_history_check, |reader| {
+                        reader
+                            .read_model_page(&request)
+                            .map(|page| RoutedPage::Model(page.page))
+                            .map_err(|error| error.to_string())
+                    })
+                }),
+            )
             .await
-            .map_err(|error| OpenError::Open(error.to_string()))?
-            .map_err(OpenError::Open);
+            .map_err(|error| OpenError::Open(error.to_string()))?;
         }
-        #[cfg(test)]
         if model.is_none() {
             if let Some(bundle) = self.inner.raw_pages.get() {
                 let bundle = bundle.clone();
                 let key = key.clone();
-                return spawn_blocking(JobKind::StoreRead, move || {
-                    bundle.page(&key, from_ordinal, limit, include_tools)
-                })
+                return spawn_blocking(
+                    JobKind::StoreRead,
+                    broca_wal::access_counter::inherit(move || {
+                        bundle.page(
+                            &key,
+                            from_ordinal,
+                            limit,
+                            include_tools,
+                            empty_history_check,
+                        )
+                    }),
+                )
                 .await
                 .map_err(|e| OpenError::Open(e.to_string()))?
                 .map(RoutedPage::Raw);
@@ -3986,8 +5307,14 @@ impl LineageRegistry {
                 ),
             });
         }
+        let mut has_durable_records = match tail.records() {
+            broca_wal::WalRangeRecords::Complete(records)
+            | broca_wal::WalRangeRecords::Partial(records)
+            | broca_wal::WalRangeRecords::Unknown(records) => !records.is_empty(),
+            broca_wal::WalRangeRecords::Absent => false,
+        };
         let lineage_id = tail.lineage_id;
-        if attribution_backfill {
+        if attribution_backfill && (has_durable_records || empty_history_check.is_ok()) {
             let opener = self.inner.opener.clone();
             let session = key.clone();
             let range = tail.clone();
@@ -4036,6 +5363,7 @@ impl LineageRegistry {
                             ))
                         }
                     };
+                    has_durable_records |= !full_records.is_empty();
                     broca_core::read_session_model_page(&snapshot, records, request, || {
                         Ok(full_records)
                     })
@@ -4044,6 +5372,10 @@ impl LineageRegistry {
             }
             .map_err(|error| OpenError::Open(format!("model replay failed: {error}")))?;
             page.lineage_id = lineage_id.map(|id| id.to_string()).or(page.lineage_id);
+            if !has_durable_records {
+                empty_history_check
+                    .map_err(|error| error.for_empty_read(page.lineage_id.clone(), None, false))?;
+            }
             if let Some((store, session, stale_lineage_id)) = lineage_repair {
                 repair_materialized_lineage(store, session, stale_lineage_id, tail).await;
             }
@@ -4177,6 +5509,13 @@ impl LineageRegistry {
                 .map_or(snapshot.watermark_seq, |frame| frame.seq),
             broca_wal::WalRangeRecords::Absent => snapshot.watermark_seq,
         };
+        if snapshot.prefix_len > 0 && snapshot.head.as_ref().and_then(|head| head.mode3).is_none() {
+            let mode3 = self
+                .mode3_for_page(key, lineage_id.map(|id| id.to_string()), &head_facts)
+                .await?;
+            snapshot.head.get_or_insert_with(Default::default).mode3 = Some(mode3);
+            head_facts.mode3 = Some(mode3);
+        }
         let (mut page, dispatches) = broca_core::read_session_page_owned_with_dispatches(
             snapshot,
             match tail.records() {
@@ -4213,6 +5552,12 @@ impl LineageRegistry {
                     let prefix = self
                         .read_durable_range(reader, key, 0, None, Some(prefix_watermark))
                         .await?;
+                    has_durable_records |= match prefix.records() {
+                        broca_wal::WalRangeRecords::Complete(records)
+                        | broca_wal::WalRangeRecords::Partial(records)
+                        | broca_wal::WalRangeRecords::Unknown(records) => !records.is_empty(),
+                        broca_wal::WalRangeRecords::Absent => false,
+                    };
                     let prefix_tools = latest_run_started_tools(match prefix.records() {
                         broca_wal::WalRangeRecords::Complete(records)
                         | broca_wal::WalRangeRecords::Partial(records)
@@ -4235,12 +5580,22 @@ impl LineageRegistry {
             None
         };
 
+        if !has_durable_records {
+            empty_history_check.map_err(|error| {
+                error.for_empty_read(
+                    page.lineage_id.map(|id| id.to_string()),
+                    Some(page.prompt_len),
+                    page.tags_await_setup,
+                )
+            })?;
+        }
         if let Some((store, session, stale_lineage_id)) = lineage_repair {
             repair_materialized_lineage(store, session, stale_lineage_id, tail).await;
         }
         Ok(RoutedPage::Raw(Box::new(RouteReadPage {
             at_seq,
             head_facts,
+            head_media: None,
             head_facts_complete,
             page,
             open_batch,
@@ -4778,8 +6133,8 @@ impl LineageRegistry {
         (opened, failed)
     }
 
-    /// Resume WAL-confirmed restart pauses after dependency routes are registered. Candidate
-    /// index rows may lag the WAL; only a latest durable restart pause authorizes a resume.
+    /// Rebuild WAL-confirmed restart and timed-account continuations after routes are registered.
+    /// Candidate index rows may lag; only the latest durable pause authorizes continuation.
     pub async fn resume_restart_pauses(
         &self,
         wal_store: Arc<dyn broca_core::WalStore>,
@@ -4821,7 +6176,8 @@ impl LineageRegistry {
             };
             let resume = match &prior.resolution {
                 broca_core::ReplayResolution::AuthRequired { reason, .. } => match reason {
-                    broca_protocol::PauseReason::Restart => true,
+                    broca_protocol::PauseReason::Restart
+                    | broca_protocol::PauseReason::AccountLimit => true,
                     broca_protocol::PauseReason::AuthRequired
                     | broca_protocol::PauseReason::ToolHeld => false,
                 },
@@ -4984,7 +6340,10 @@ impl LineageRegistry {
                         OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. } => {
                             sweep.not_live += 1;
                         }
-                        OpenError::Expired { .. }
+                        OpenError::HistoryRewriting
+                        | OpenError::HistoryChanged
+                        | OpenError::Expired { .. }
+                        | OpenError::SessionLogMissing { .. }
                         | OpenError::RetentionInvalid(_)
                         | OpenError::SessionClassInvalid(_) => sweep.open_failed += 1,
                         OpenError::LeaseHeld(_) => sweep.lease_held += 1,
@@ -5013,6 +6372,13 @@ impl LineageRegistry {
 }
 
 impl RegistryHandle {
+    pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
+        LineageRegistry {
+            inner: self.inner.clone(),
+        }
+        .check_session_log(key)
+        .await
+    }
     pub(crate) fn note_session_ownership(
         &self,
         key: &LineageKey,
@@ -6403,6 +7769,8 @@ mod tests {
 
     pub(super) fn started_record(session: &LineageKey) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -6422,6 +7790,9 @@ mod tests {
             run_id: RunId("r1".into()),
             session: session.clone(),
             config: Box::new(RunConfig {
+                global_system: None,
+                route_decision_id: None,
+                account_limit_pause: false,
                 turn_directives_v1: None,
                 render_tags: false,
                 computed_tags: None,
@@ -6459,6 +7830,7 @@ mod tests {
 
     pub(super) fn assistant_record() -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -6948,6 +8320,51 @@ impl LineageRegistry {
         Ok(())
     }
 
+    async fn check_history_expired(&self, key: &LineageKey) -> Result<(), OpenError> {
+        match self.check_expired(key, None).await {
+            Err(error @ OpenError::Expired { .. }) => {
+                // A retired older generation cannot hide a newer missing
+                // transcript. Run-index lookups use their own run-scoped expiry.
+                self.check_session_log(key).await?;
+                Err(error)
+            }
+            result => result,
+        }
+    }
+
+    /// Identity-only reservations may still create their first subscriber lineage.
+    /// Historical content evidence, unlike a reservation, forbids replacing an
+    /// unexplained missing log. Both read admission and writer activation use this
+    /// check, including a second writer check under the acquired session lease.
+    /// `session.status` may still recover an existing log's torn tail or append an
+    /// orphan's terminal; it must never mint a replacement for missing history.
+    pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
+        let (Some(inventory), Some(reader)) = (
+            self.inner.session_address_inventory.get().cloned(),
+            self.inner.reader.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let wal = reader.wal_store.clone();
+        let session = key.clone();
+        let missing = spawn_blocking(JobKind::StoreRead, move || {
+            let state = inventory
+                .session_log_state(&session, wal.as_ref())
+                .map_err(OpenError::from_log_state)?;
+            Ok::<_, OpenError>(state.missing_history())
+        })
+        .await
+        .map_err(|error| OpenError::Open(error.to_string()))??;
+        if missing {
+            return Err(OpenError::SessionLogMissing {
+                session: key.session.clone(),
+                harness: key.harness.clone(),
+                read: None,
+            });
+        }
+        Ok(())
+    }
+
     fn evict_retention_caches(&self, key: &LineageKey) -> bool {
         // A live WAL, archive member or untombstoned meta row belongs to a newer lineage.
         // Address-keyed caches must survive completion of the older lineage's deletion.
@@ -6970,8 +8387,10 @@ impl LineageRegistry {
         }
         self.inner.opener.retire_session_transport(key);
         self.inner.read_proofs.lock().unwrap().remove(key);
+        self.inner.read_only_lineages.lock().unwrap().remove(key);
         self.inner.dispatch_cache.lock().unwrap().remove(key);
         self.inner.frozen_senders.lock().unwrap().remove(key);
+        self.inner.mode3_logs.lock().unwrap().remove(key);
         self.inner.attribution_notices.lock().unwrap().remove(key);
         self.inner.live_ownership.lock().unwrap().remove(key);
         self.inner.owner_snapshots.lock().unwrap().remove(key);
@@ -6981,6 +8400,16 @@ impl LineageRegistry {
 }
 
 impl RegistryHandle {
+    pub(crate) fn invalidate_history_caches(&self, key: &LineageKey) {
+        self.inner.read_proofs.lock().unwrap().remove(key);
+        self.inner.dispatch_cache.lock().unwrap().remove(key);
+        self.inner.frozen_senders.lock().unwrap().remove(key);
+        self.inner.mode3_logs.lock().unwrap().remove(key);
+        self.inner.attribution_notices.lock().unwrap().remove(key);
+        self.inner.live_ownership.lock().unwrap().remove(key);
+        self.inner.owner_snapshots.lock().unwrap().remove(key);
+    }
+
     pub(crate) fn retention_service(&self) -> Option<Arc<crate::retention::RetentionService>> {
         self.inner.retention.get().cloned()
     }
@@ -7048,6 +8477,9 @@ mod offset_page_tests {
 
     fn run_config() -> Box<RunConfig> {
         Box::new(RunConfig {
+            global_system: None,
+            route_decision_id: None,
+            account_limit_pause: false,
             turn_directives_v1: None,
             render_tags: false,
             computed_tags: None,
@@ -7075,6 +8507,8 @@ mod offset_page_tests {
 
     fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
         WalRecord::RunStarted {
+            compaction_plan_version: None,
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             session_class: None,
@@ -7102,6 +8536,7 @@ mod offset_page_tests {
 
     fn steered(text: &str) -> WalRecord {
         WalRecord::Steered {
+            sent_by: None,
             written_at_ms: None,
             tags: None,
             retention: None,
@@ -7123,6 +8558,7 @@ mod offset_page_tests {
 
     fn text_step(step: u64, text: &str) -> WalRecord {
         WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,
@@ -7157,6 +8593,7 @@ mod offset_page_tests {
     fn corpus_wal() -> (Vec<u8>, Vec<WalRecord>) {
         let mut records = vec![run_started("r1", vec![user("task")]), step_started(1)];
         records.push(WalRecord::ModelStepFinished {
+            raw_finish_reason: None,
             fallback: Default::default(),
             written_at_ms: None,
             tags: None,

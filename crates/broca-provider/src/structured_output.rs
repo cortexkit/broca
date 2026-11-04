@@ -712,14 +712,7 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
             #[cfg(test)]
             PREPARED_COPIES.with(|copies| copies.set(copies.get() + 1));
             let mut tools = Vec::clone(&opts.tools);
-            tools.push(Tool {
-                name: SUBMIT_RESULT_TOOL.to_owned(),
-                description: SUBMIT_RESULT_DESCRIPTION.to_owned(),
-                input_schema: so.schema(),
-                module: None,
-                execution_mode: Default::default(),
-                reply: None,
-            });
+            tools.push(submit_tool(so.schema()));
             view.tools = Arc::new(tools);
             Cow::Owned(view)
         }
@@ -727,7 +720,12 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
             let mut view = opts.clone();
             #[cfg(test)]
             PREPARED_COPIES.with(|copies| copies.set(copies.get() + 1));
-            match view.prompt.iter_mut().find(|m| m.role == Role::System) {
+            let raw_ordinals = view.render_episodes.raw_ordinals;
+            match view
+                .prompt
+                .iter_mut()
+                .find(|m| m.role == Role::System && (!raw_ordinals || !m.turn_system))
+            {
                 Some(system) => {
                     let text = if so.instructions_paragraph_break {
                         format!("\n\n{}", instructions(so))
@@ -746,9 +744,11 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
                         marker.message_index += 1;
                     }
                     let mut history = (*view.render_episodes).clone();
-                    for episode in &mut history.episodes {
-                        episode.prompt_start += 1;
-                        episode.first_user = episode.first_user.map(|index| index + 1);
+                    if !history.raw_ordinals {
+                        for episode in &mut history.episodes {
+                            episode.prompt_start += 1;
+                            episode.first_user = episode.first_user.map(|index| index + 1);
+                        }
                     }
                     view.render_episodes = Arc::new(history);
                 }
@@ -756,6 +756,18 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
             Cow::Owned(view)
         }
         _ => Cow::Borrowed(opts),
+    }
+}
+
+/// The runner-owned declaration shared by admission, rendering and reply-name restoration.
+pub fn submit_tool(schema: Value) -> Tool {
+    Tool {
+        name: SUBMIT_RESULT_TOOL.to_owned(),
+        description: SUBMIT_RESULT_DESCRIPTION.to_owned(),
+        input_schema: schema,
+        module: None,
+        execution_mode: Default::default(),
+        reply: None,
     }
 }
 

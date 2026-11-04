@@ -21,6 +21,7 @@ use subc_protocol::PROTOCOL_VERSION;
 
 /// The request/response ops, classified Query vs Mutate.
 pub const OP_SEND_STATUS: &str = broca_wire::OP_SEND_STATUS;
+pub const OP_SESSION_SEND_STATUS: &str = broca_wire::OP_SESSION_SEND_STATUS;
 pub const OP_SEND: &str = "session.send";
 pub const OP_IMPORT: &str = "session.import";
 pub const OP_RETRACT: &str = "session.retract";
@@ -39,7 +40,6 @@ pub const OP_HEAD: &str = broca_wire::OP_SESSION_HEAD;
 pub const OP_RUN_RESULT: &str = broca_wire::OP_RUN_RESULT;
 pub const OP_RUN_TOOL_CALLS: &str = broca_wire::OP_RUN_TOOL_CALLS;
 pub const OP_BASELINE: &str = broca_wire::OP_SESSION_BASELINE;
-pub const OP_RESOLVE: &str = broca_wire::OP_SESSION_RESOLVE;
 pub const OP_REFRESH: &str = cortexkit_role_llm_runner::ops::SESSION_REFRESH;
 pub const OP_REFRESH_POLICY: &str = cortexkit_role_llm_runner::ops::SESSION_REFRESH_POLICY;
 pub const OP_FLUSH_PREFIX: &str = cortexkit_role_llm_runner::ops::SESSION_FLUSH_PREFIX;
@@ -181,6 +181,11 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             description: Some("Read the durable fate of a send_id without admitting or delivering work.".into()),
         },
         ManagementOperation {
+            name: OP_SESSION_SEND_STATUS.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read the durable fate of a send_id without admitting or delivering work.".into()),
+        },
+        ManagementOperation {
             name: OP_SEND.to_string(),
             kind: ManagementOperationKind::Mutate,
             description: Some(
@@ -275,14 +280,6 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             name: "permissions.revoke".into(),
             kind: ManagementOperationKind::Mutate,
             description: Some("Permissions routes only: revoke one private-content grant for the operator.".into()),
-        },
-        ManagementOperation {
-            name: OP_RESOLVE.to_string(),
-            kind: ManagementOperationKind::Query,
-            description: Some(
-                "Answer the stored text of one runner-tagged part, or a character range of it."
-                    .to_string(),
-            ),
         },
         ManagementOperation {
             name: OP_HEAD.to_string(),
@@ -519,8 +516,10 @@ pub fn manifest_configured(
         // `scope-workdir/v1` asks the daemon to stamp a scope's session folder and project id
         // on its binds. New scoped sessions take workdir; the inventory preserves existing
         // addresses. Project id never keys a session.
+        // `bind-no-project/v1` promises that only scope supplies project attribution.
         provides: vec![
             broca_wire::LLM_RUNNER_V1.to_string(),
+            "compaction-runner/v1".to_string(),
             broca_wire::agent_data::PROVIDES.to_string(),
             // System One's decision models, on management routes opened declaring the
             // `classifier` role. A caller finds broca by this entry, then picks it for a model
@@ -531,6 +530,7 @@ pub fn manifest_configured(
             subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.to_string(),
             subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
+            subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
         ],
         requires: Vec::new(),
         must_never_reach: Vec::new(),
@@ -644,7 +644,7 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1", "scope-workdir/v1"],
+                "provides": ["llm-runner/v1", "compaction-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1", "scope-workdir/v1", "bind-no-project/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),
