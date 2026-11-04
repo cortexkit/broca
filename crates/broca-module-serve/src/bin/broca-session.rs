@@ -346,6 +346,10 @@ enum Cmd {
         /// composition, composition_digest, and compaction_item.
         #[arg(long)]
         items: PathBuf,
+        /// Fetch catalogs as a Direct carrier under owner/ref/epoch. Requires the private
+        /// 64-hex-character bind proof on stdin; does not create or scope a session.
+        #[arg(long)]
+        scope: Option<broca_subc::carrier_scope::CarrierScope>,
     },
     /// The combined single-turn flow: subscribe, send a prompt, drain the control stream to
     /// the run's terminal. This is the single-client/single-turn proof.
@@ -781,8 +785,8 @@ async fn run(args: Args) -> Result<i32, String> {
     if let Cmd::CredentialAudit { .. } = &args.cmd {
         return Ok(credential_audit(&args, json).await);
     }
-    if let Cmd::ComposePlan { items } = &args.cmd {
-        return compose_plan(&args, items).await;
+    if let Cmd::ComposePlan { items, scope } = &args.cmd {
+        return compose_plan(&args, items, scope.as_ref(), &mut std::io::stdin().lock()).await;
     }
     let session = bind_identity(&args)?;
     session
@@ -1217,7 +1221,16 @@ async fn run(args: Args) -> Result<i32, String> {
     }
 }
 
-async fn compose_plan(args: &Args, path: &std::path::Path) -> Result<i32, String> {
+async fn compose_plan(
+    args: &Args,
+    path: &std::path::Path,
+    scope: Option<&broca_subc::carrier_scope::CarrierScope>,
+    proof_input: &mut impl std::io::Read,
+) -> Result<i32, String> {
+    let scope = scope
+        .map(|scope| scope.read_proof(proof_input))
+        .transpose()
+        .map_err(str::to_owned)?;
     let bytes =
         std::fs::read(path).map_err(|error| format!("read --items {}: {error}", path.display()))?;
     let items = serde_json::from_slice(&bytes)
@@ -1229,7 +1242,10 @@ async fn compose_plan(args: &Args, path: &std::path::Path) -> Result<i32, String
     let conn = SubcConnection::connect(subc_path(args)?)
         .await
         .map_err(|_| "cannot connect subc".to_string())?;
-    let fetcher = broca_subc::SubcPlanFetcher::new(std::sync::Arc::new(conn), identity, None);
+    let mut fetcher = broca_subc::SubcPlanFetcher::new(std::sync::Arc::new(conn), identity, None);
+    if let Some(scope) = scope {
+        fetcher = fetcher.with_direct_carrier_scope(scope);
+    }
     let result =
         broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE).await;
     fetcher.close().await;
@@ -2343,6 +2359,111 @@ fn emit_to(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn compose_plan_without_scope_does_not_read_stdin() {
+        use clap::Parser;
+
+        struct Unreadable;
+        impl std::io::Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("unscoped compose-plan must not read stdin");
+            }
+        }
+
+        let args = super::Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "missing-connection.json",
+            "compose-plan",
+            "--items",
+            "missing-items.json",
+        ])
+        .unwrap();
+        let super::Cmd::ComposePlan { items, scope } = &args.cmd else {
+            panic!("expected compose-plan");
+        };
+        assert!(scope.is_none());
+        let error = super::compose_plan(&args, items, scope.as_ref(), &mut Unreadable)
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("read --items missing-items.json:"));
+    }
+
+    #[tokio::test]
+    async fn compose_plan_refuses_missing_and_malformed_proofs_before_connecting() {
+        use clap::Parser;
+
+        let args = super::Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "missing-connection.json",
+            "compose-plan",
+            "--items",
+            "missing-items.json",
+            "--scope",
+            "rig/run/1",
+        ])
+        .unwrap();
+        let super::Cmd::ComposePlan { items, scope } = &args.cmd else {
+            panic!("expected compose-plan");
+        };
+        for (input, expected) in [
+            (
+                String::new(),
+                "scope_bind_proof_required: --scope requires a private 64-hex-character proof on stdin",
+            ),
+            (
+                "f".repeat(63),
+                "scope_bind_proof_invalid: expected exactly 64 hex characters on stdin",
+            ),
+            (
+                "g".repeat(64),
+                "scope_bind_proof_invalid: expected exactly 64 hex characters on stdin",
+            ),
+        ] {
+            let error = super::compose_plan(&args, items, scope.as_ref(), &mut input.as_bytes())
+                .await
+                .unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(
+                error,
+                scope
+                    .as_ref()
+                    .unwrap()
+                    .read_proof(&mut input.as_bytes())
+                    .unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn scope_flag_is_only_accepted_by_compose_plan() {
+        use clap::Parser;
+
+        for command in ["send", "read", "status", "run"] {
+            let error = super::Args::try_parse_from([
+                "broca-session",
+                "--subc",
+                "connection.json",
+                command,
+                "--scope",
+                "rig/run/1",
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+        let error = super::Args::try_parse_from([
+            "broca-session",
+            "--scope",
+            "rig/run/1",
+            "compose-plan",
+            "--items",
+            "items.json",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
     #[test]
     fn namespace_diagnostic_never_canonicalizes_a_cwd_directory() {
         const CHILD: &str = "BROCA_NAMESPACE_DIAGNOSTIC_CHILD";
@@ -2989,7 +3110,7 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            matches!(args.cmd, Cmd::ComposePlan { items } if items == std::path::Path::new("items.json"))
+            matches!(args.cmd, Cmd::ComposePlan { items, scope: None } if items == std::path::Path::new("items.json"))
         );
     }
 

@@ -38,6 +38,7 @@ pub struct SubcPlanFetcher {
     conn: Arc<SubcConnection>,
     identity: BindIdentity,
     scope: Option<SessionScope>,
+    direct_carrier_scope: Option<ScopeSelector>,
     opened: Mutex<Vec<RouteHandle>>,
     hooks: crate::SubcHookPlane,
     compaction: crate::SubcCompactionPlane,
@@ -59,9 +60,17 @@ impl SubcPlanFetcher {
             conn,
             identity,
             scope,
+            direct_carrier_scope: None,
             opened: Mutex::new(Vec::new()),
             catalog_snapshot: Mutex::new(None),
         }
+    }
+
+    /// Fetch tool catalogs under a caller-supplied scope as a Direct carrier, without
+    /// creating a session or changing the session's frozen scope.
+    pub fn with_direct_carrier_scope(mut self, scope: ScopeSelector) -> Self {
+        self.direct_carrier_scope = Some(scope);
+        self
     }
 
     /// Close every route this fetcher opened. Best effort: a route that cannot be closed is
@@ -97,10 +106,30 @@ impl SubcPlanFetcher {
         snapshot.await
     }
 
-    /// The scope selector the session's fetch routes open under, from its frozen scope (`None`
-    /// for an unscoped session). Refused when the daemon does not support scoped routes, since
-    /// it would ignore the selector and open an unscoped route.
+    /// Prefer the carrier's selector for catalog composition, otherwise use the session's
+    /// frozen scope. Refuse a daemon without scoped routes rather than silently fetching
+    /// an unscoped catalog.
     async fn selector(&self) -> Result<Option<ScopeSelector>, FetchError> {
+        if let Some(selector) = &self.direct_carrier_scope {
+            if self.scope.is_some() {
+                return Err(FetchError::Refused {
+                    code: "scope_unsupported".into(),
+                    detail: Some(Value::String(
+                        "a private Direct carrier selector cannot replace a frozen session scope"
+                            .into(),
+                    )),
+                    retryable: false,
+                });
+            }
+            crate::carrier_scope::verify_direct_carrier_scope(&self.conn, selector)
+                .await
+                .map_err(|error| FetchError::Refused {
+                    code: error.split(':').next().unwrap_or(error).into(),
+                    detail: Some(Value::String(error.into())),
+                    retryable: false,
+                })?;
+            return Ok(Some(selector.clone()));
+        }
         let Some(scope) = &self.scope else {
             return Ok(None);
         };
@@ -131,7 +160,13 @@ impl SubcPlanFetcher {
             .conn
             .route_open_tool_provider_v1(provider, &self.identity, selector)
             .await
-            .map_err(open_error)?;
+            .map_err(|error| {
+                open_error(if self.direct_carrier_scope.is_some() {
+                    crate::carrier_scope::private_route_error(error)
+                } else {
+                    error
+                })
+            })?;
         self.opened.lock().unwrap().push(route);
         let body = fetch_body(op, arguments)?;
         match self
@@ -322,6 +357,155 @@ impl Fetcher for SubcPlanFetcher {
         self.compaction
             .describe(provider, &self.identity, self.scope.as_ref(), self.deadline)
             .await
+    }
+}
+
+#[cfg(test)]
+mod carrier_catalog_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn capabilities(capabilities: &[&str]) -> Vec<u8> {
+        serde_json::to_vec(&subc_control::ClientControlResponse::ServerDescribe {
+            protocol_ver: 1,
+            subc_ops: vec![],
+            capabilities: capabilities.iter().map(|cap| (*cap).into()).collect(),
+            connected_clients: 1,
+            counters: None,
+            build_git_sha: None,
+            build_lock_digest: None,
+            capability_requirements: vec![],
+            machine_id: None,
+            config_path: None,
+        })
+        .unwrap()
+    }
+
+    fn private_selector() -> ScopeSelector {
+        "rig/run/1"
+            .parse::<crate::carrier_scope::CarrierScope>()
+            .unwrap()
+            .read_proof(&mut "ab".repeat(32).as_bytes())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn direct_carrier_catalog_scope_reaches_every_provider() {
+        let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+        let selector = private_selector();
+        let fetcher = SubcPlanFetcher::new(
+            Arc::new(conn),
+            BindIdentity::new("/project", "runner", "catalogs"),
+            None,
+        )
+        .with_direct_carrier_scope(selector.clone());
+        let fetch = async {
+            for provider in ["aft", "other"] {
+                assert_eq!(
+                    fetcher.call(provider, CATALOG_OP, json!({})).await.unwrap(),
+                    json!({"tools": []})
+                );
+            }
+        };
+        let serve = async {
+            let describe = daemon.next_request().await;
+            assert_eq!(
+                serde_json::from_slice::<Value>(&describe.body).unwrap()["op"],
+                "server.describe"
+            );
+            assert!(daemon.reply(
+                &describe,
+                capabilities(&[
+                    CAP_SCOPES_V1,
+                    subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1,
+                ])
+            ));
+            for provider in ["aft", "other"] {
+                let open = daemon.next_request().await;
+                let body: Value = serde_json::from_slice(&open.body).unwrap();
+                assert_eq!(body["op"], "route.open");
+                assert_eq!(body["target"]["module_id"], provider);
+                assert_eq!(body["scope"], serde_json::to_value(&selector).unwrap());
+                assert!(body.get("consumer_identity").is_none());
+                assert!(daemon.reply(
+                    &open,
+                    serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
+                        route_channel: 1,
+                        route_epoch: 1,
+                    },)
+                    .unwrap()
+                ));
+                let catalog = daemon.next_request().await;
+                assert_eq!(catalog.header.channel, 1);
+                assert_eq!(catalog.body, br#"{"name":"tool.catalog","arguments":{}}"#);
+                assert!(daemon.reply(&catalog, br#"{"tools":[]}"#.to_vec()));
+            }
+        };
+        tokio::join!(fetch, serve);
+    }
+
+    #[tokio::test]
+    async fn direct_carrier_catalog_requires_proof_capability_without_opening_a_route() {
+        let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+        let fetcher = SubcPlanFetcher::new(
+            Arc::new(conn),
+            BindIdentity::new("/project", "runner", "catalogs"),
+            None,
+        )
+        .with_direct_carrier_scope(private_selector());
+        let (result, ()) = tokio::join!(fetcher.selector(), async {
+            let describe = daemon.next_request().await;
+            assert!(daemon.reply(&describe, capabilities(&[CAP_SCOPES_V1])));
+        });
+        assert!(
+            matches!(result, Err(FetchError::Refused { code, retryable: false, .. }) if code == "scope_unsupported")
+        );
+        assert!(daemon.take_written_for_test().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unscoped_composition_pins_catalog_requests_and_output_bytes() {
+        let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+        let fetcher = SubcPlanFetcher::new(
+            Arc::new(conn),
+            BindIdentity::new("/project", "runner", "unscoped-plan"),
+            None,
+        );
+        let items = json!({"tool_items": [{"provider": "aft", "preset": "reader", "params": {"scope": "read"}}],
+            "system_text_items": [], "step_transform_items": []});
+        let (plan, ()) = tokio::join!(
+            broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE),
+            async {
+                let open = daemon.next_request().await;
+                assert_eq!(open.body, br#"{"op":"route.open","target":{"kind":"tool_provider","module_id":"aft"},"identity":{"harness":"runner","session":"unscoped-plan"},"role_versions":{"tool-provider":"v1"}}"#);
+                assert!(daemon.reply(
+                    &open,
+                    serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
+                        route_channel: 1,
+                        route_epoch: 1,
+                    },)
+                    .unwrap()
+                ));
+                let catalog = daemon.next_request().await;
+                assert_eq!(catalog.body, br#"{"name":"tool.catalog","arguments":{"params":{"scope":"read"},"preset":"reader"},"preset":"reader"}"#);
+                assert!(daemon.reply(&catalog, serde_json::to_vec(&json!({
+                    "generation": "live", "catalog_digest": "opaque", "tools": [
+                        {"name": "zoom", "description": "Zoom", "input_schema": {}, "schema_digest": "z",
+                         "semantics": 1, "capabilities": ["z/v1", "a/v1"]},
+                        {"name": "read", "description": "Read", "input_schema": {}, "schema_digest": "r",
+                         "semantics": 1, "capabilities": ["code.read/v1"]}
+                    ]
+                })).unwrap()));
+            }
+        );
+        assert_eq!(
+            format!("{}\n", plan.unwrap()),
+            concat!(
+                r#"{"composition":{"providers":[{"provider":"aft","tools":[{"capabilities":["code.read/v1"],"name":"read"},{"capabilities":["a/v1","z/v1"],"name":"zoom"}]}],"step_transform_items":[]},"composition_digest":"9881838597e87f35274e5d544969fb8f626aeee745ea81057a2f03909bf25fd8","step_transform_items":[],"system_text_items":[],"tool_items":[{"params":{"scope":"read"},"preset":"reader","provider":"aft"}]}"#,
+                "\n"
+            )
+        );
+        assert!(daemon.take_written_for_test().is_empty());
     }
 }
 
