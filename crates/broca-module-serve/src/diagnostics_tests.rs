@@ -1121,11 +1121,17 @@ fn tool_result_json_dump_finding_shape() {
     let store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
     let tally = broca_subc::tool_result_diagnostics::Tally::new(NOW - 1000);
     for offset in 1..=7 {
+        // The oldest result comes from a second session, so the summary counts sessions.
+        let session = if offset == 7 {
+            "second-session"
+        } else {
+            "sample-session"
+        };
         tally.record(
             NOW - offset,
             "tools",
             "search",
-            "sample-session",
+            session,
             Some("call-key"),
             200,
         );
@@ -1147,11 +1153,19 @@ fn tool_result_json_dump_finding_shape() {
         (f.count, f.first_seen_ms, f.last_seen_ms),
         (7, NOW - 7, NOW - 1)
     );
+    // Digests print the summary and hint, never the key, so both must name the tool and module.
     assert_eq!(
         f.summary,
-        "A tool provider dumped raw JSON into model-visible text."
+        "search from tools: 7 results in 2 sessions reached the model as a raw JSON dump instead of readable text."
     );
-    assert_eq!(f.hint, "The tool provider should shape its output into concise model-facing text instead of dumping raw JSON.");
+    assert_eq!(
+        f.hint,
+        "Report it to the owner of module tools with a sample call_key. The provider should shape its output into concise text for the model."
+    );
+    assert_eq!(
+        reply.findings[1].summary,
+        "search from other-tools: 1 result in 1 session reached the model as a raw JSON dump instead of readable text."
+    );
     assert_eq!(
         f.samples,
         vec![

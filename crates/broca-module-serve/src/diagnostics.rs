@@ -570,14 +570,29 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
                 },
             );
             for tool in snapshot.tools {
+                // Digests print a finding's summary and hint, never its key, so both name the
+                // tool, its module and who has to act.
+                let summary = format!(
+                    "{} from {}: {} {} in {} {} reached the model as a raw JSON dump instead of readable text.",
+                    tool.tool_name,
+                    tool.module_id,
+                    tool.count,
+                    if tool.count == 1 { "result" } else { "results" },
+                    tool.sessions,
+                    if tool.sessions == 1 { "session" } else { "sessions" },
+                );
+                let hint = format!(
+                    "Report it to the owner of module {} with a sample call_key. The provider should shape its output into concise text for the model.",
+                    tool.module_id,
+                );
                 let mut f = finding(
                     "tool_result_json_dump",
                     json!([tool.module_id, tool.tool_name]).to_string(),
                     Severity::Warn,
                     tool.first_seen_ms,
                     tool.last_seen_ms,
-                    "A tool provider dumped raw JSON into model-visible text.",
-                    "The tool provider should shape its output into concise model-facing text instead of dumping raw JSON.",
+                    &summary,
+                    &hint,
                 );
                 f.count = tool.count;
                 f.samples = tool

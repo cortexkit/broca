@@ -25,6 +25,8 @@ pub struct ToolTally {
     pub module_id: String,
     pub tool_name: String,
     pub count: u64,
+    /// Distinct sessions those results reached, so a summary can say how widely it happened.
+    pub sessions: u64,
     pub first_seen_ms: i64,
     pub last_seen_ms: i64,
     pub samples: Vec<Sample>,
@@ -102,21 +104,27 @@ impl Tally {
             .lock()
             .map_err(|_| "tool-result diagnostic tally is poisoned")?;
         let mut tools = BTreeMap::<(String, String), ToolTally>::new();
+        let mut sessions = BTreeMap::<(String, String), std::collections::BTreeSet<&str>>::new();
         for observation in state
             .0
             .iter()
             .filter(|o| o.at_ms >= since && o.at_ms <= now)
         {
             let key = (observation.module_id.clone(), observation.tool_name.clone());
+            let seen = sessions.entry(key.clone()).or_default();
+            seen.insert(&observation.sample.session);
+            let distinct = seen.len() as u64;
             let tally = tools.entry(key).or_insert_with(|| ToolTally {
                 module_id: observation.module_id.clone(),
                 tool_name: observation.tool_name.clone(),
                 count: 0,
+                sessions: 0,
                 first_seen_ms: observation.at_ms,
                 last_seen_ms: observation.at_ms,
                 samples: Vec::new(),
             });
             tally.count += 1;
+            tally.sessions = distinct;
             tally.first_seen_ms = tally.first_seen_ms.min(observation.at_ms);
             tally.last_seen_ms = tally.last_seen_ms.max(observation.at_ms);
             if tally.samples.len() < 5 {

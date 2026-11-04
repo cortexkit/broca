@@ -35,7 +35,7 @@
         "check": "tool_result_json_dump",
         "count": 7,
         "first_seen_ms": 199999993,
-        "hint": "The tool provider should shape its output into concise model-facing text instead of dumping raw JSON.",
+        "hint": "Report it to the owner of module tools with a sample call_key. The provider should shape its output into concise text for the model.",
         "key": "[\"tools\",\"search\"]",
         "last_seen_ms": 199999999,
         "samples": [
@@ -81,13 +81,13 @@
           }
         ],
         "severity": "warn",
-        "summary": "A tool provider dumped raw JSON into model-visible text."
+        "summary": "search from tools: 7 results in 2 sessions reached the model as a raw JSON dump instead of readable text."
       },
       {
         "check": "tool_result_json_dump",
         "count": 1,
         "first_seen_ms": 199999992,
-        "hint": "The tool provider should shape its output into concise model-facing text instead of dumping raw JSON.",
+        "hint": "Report it to the owner of module other-tools with a sample call_key. The provider should shape its output into concise text for the model.",
         "key": "[\"other-tools\",\"search\"]",
         "last_seen_ms": 199999992,
         "samples": [
@@ -101,7 +101,7 @@
           }
         ],
         "severity": "warn",
-        "summary": "A tool provider dumped raw JSON into model-visible text."
+        "summary": "search from other-tools: 1 result in 1 session reached the model as a raw JSON dump instead of readable text."
       }
     ],
     "generated_at_ms": 200000000,
