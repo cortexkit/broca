@@ -42,3 +42,30 @@ fn run_started_bytes_before_display_sender_are_pinned() {
         _ => panic!("pinned input frame did not decode as a record"),
     }
 }
+
+#[test]
+fn flow_run_started_bytes_before_agent_id_freeze_are_pinned() {
+    let payload = include_str!("fixtures/pre_agent_id_frozen_flow_run_started.json").trim_end();
+    let envelope: serde_json::Value = serde_json::from_str(payload).unwrap();
+    let record: WalRecord = serde_json::from_value(envelope["record"].clone()).unwrap();
+    let bytes = framing::encode(1, 1, &record).unwrap();
+    assert_eq!(bytes[4], 3);
+    assert_eq!(&bytes[53..], payload.as_bytes());
+    assert_eq!(
+        format!("{:x}", Sha256::digest(payload.as_bytes())),
+        "aff6e09262c555b3c9d46d2cd69511bf56d501641d16dbaa376eb92fe23746ca"
+    );
+}
+
+#[test]
+fn old_decoder_accepts_future_flow_discriminator_without_changing_replay_inputs() {
+    let mut envelope: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/pre_agent_id_frozen_flow_run_started.json"
+    ))
+    .unwrap();
+    let old: WalRecord = serde_json::from_value(envelope["record"].clone()).unwrap();
+    envelope["record"]["scope"]["agent_id_frozen"] = serde_json::json!(true);
+    let future: WalRecord = serde_json::from_value(envelope["record"].clone()).unwrap();
+    // Replay and rendering consume the decoded record, which the old decoder leaves identical.
+    assert_eq!(future, old);
+}
