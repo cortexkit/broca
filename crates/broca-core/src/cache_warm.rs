@@ -1133,34 +1133,13 @@ pub fn last_recorded_request_with_lineage(
             .expect("run found above");
         let state = crate::compaction_v2::session::load(session, &frames)
             .map_err(RecordedRequestError::Unavailable)?;
-        let transcript = crate::compaction_v2::transcript::project(&frames, lineage)
-            .map_err(RecordedRequestError::Unavailable)?;
-        let manifest = match &records[start] {
-            WalRecord::RunStarted { manifest, .. } => manifest.as_deref(),
-            _ => None,
-        };
-        let edits = state
-            .view_for_step(step_id.0)
-            .map_or(&[][..], |view| view.edits.as_slice());
-        let prompt = if manifest.is_some_and(crate::compaction::has_compaction) {
-            crate::compaction_v2::render::prompt(
-                &opts.prompt,
-                &transcript.entries,
-                edits,
-                crate::compaction_v2::host::image_reference,
-            )
-        } else {
-            crate::compaction_v2::render::deliveries_only(&opts.prompt, &transcript.entries)
-        }
+        opts = crate::compaction_v2::render::request_options(
+            &frames,
+            lineage,
+            opts,
+            state.view_for_step(step_id.0),
+        )
         .map_err(RecordedRequestError::Unavailable)?;
-        opts = crate::compaction_v2::render::options(&opts, prompt);
-        let global = crate::compaction_v2::systems::frozen(true, &config, manifest)
-            .map_err(RecordedRequestError::Unavailable)?;
-        if let Some(view) = crate::compaction_v2::systems::view(&opts, &global)
-            .map_err(RecordedRequestError::Unavailable)?
-        {
-            opts = view;
-        }
     } else {
         let compaction = crate::replay::replay(&records[..attempt_at])
             .map_err(|error| {

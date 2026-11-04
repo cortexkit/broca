@@ -6480,10 +6480,14 @@ where
                 },
                 |image| crate::compaction_v2::host::image(writer, image),
                 |prompt| {
-                    let view = crate::compaction_v2::render::options(&opts, prompt.to_vec());
-                    let globals = crate::compaction_v2::systems::view(&view, &v2_globals)?;
+                    let view = crate::compaction_v2::render::finish(
+                        &opts,
+                        prompt.to_vec(),
+                        &config,
+                        manifest,
+                    )?;
                     provider
-                        .try_render_request(globals.as_ref().unwrap_or(&view))
+                        .try_render_request(&view)
                         .map(|bytes| {
                             crate::compaction::request_estimate(bytes.len(), &compaction_history).0
                         })
@@ -6520,9 +6524,10 @@ where
                     prompt, applied, ..
                 } => {
                     provider.set_cache_evidence_view(applied.map(|view| view.version));
-                    model_opts = Some(Arc::new(crate::compaction_v2::render::options(
-                        &opts, prompt,
-                    )));
+                    model_opts = Some(Arc::new(
+                        crate::compaction_v2::render::finish(&opts, prompt, &config, manifest)
+                            .map_err(RunError::Wal)?,
+                    ));
                 }
             }
         }
@@ -6538,12 +6543,15 @@ where
                 .to_string();
             let transcript = crate::compaction_v2::transcript::project(&frames, &lineage)
                 .map_err(RunError::Wal)?;
+            let (config, manifest) =
+                crate::compaction_v2::host::frozen(&frames).map_err(RunError::Wal)?;
             let prompt =
                 crate::compaction_v2::render::deliveries_only(&opts.prompt, &transcript.entries)
                     .map_err(RunError::Wal)?;
-            model_opts = Some(Arc::new(crate::compaction_v2::render::options(
-                &opts, prompt,
-            )));
+            model_opts = Some(Arc::new(
+                crate::compaction_v2::render::finish(&opts, prompt, &config, manifest)
+                    .map_err(RunError::Wal)?,
+            ));
         }
         if let Some(runtime) = compaction_runtime
             .as_ref()
@@ -6881,14 +6889,6 @@ where
             .and_then(|text| crate::plan_system::view(sent_opts, &opts.prompt, text))
             .map(Arc::new);
         let sent_opts = system_view.as_ref().unwrap_or(sent_opts);
-        let v2_system_view = if mode3 {
-            crate::compaction_v2::systems::view(sent_opts, &v2_globals)
-                .map_err(RunError::Wal)?
-                .map(Arc::new)
-        } else {
-            None
-        };
-        let sent_opts = v2_system_view.as_ref().unwrap_or(sent_opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
             break RunFinishReason::Cancelled;
         }
