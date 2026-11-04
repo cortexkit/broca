@@ -724,6 +724,50 @@ async fn negotiated_final_content_uses_only_the_frozen_opt_in() {
 }
 
 #[tokio::test]
+async fn tool_result_json_dump_inline_intake_counts_both_formats_once() {
+    use crate::tool_result_diagnostics::TOOL_RESULT_JSON_DUMPS;
+    let text = format!(r#"{{"data":"{}"}}"#, "x".repeat(189));
+    for (index, format) in [None, Some("tool-result/v1")].into_iter().enumerate() {
+        let rig = Rig::new(true, true, true, false);
+        *rig.reply.lock().unwrap() = json!({"content":[
+            {"type":"text","text":&text[..100]}, {"type":"text","text":&text[100..]}
+        ], "structuredContent":{"not_model_visible":"private"}});
+        let plane = rig.plane(false);
+        let mut ctx = ctx();
+        ctx.bind.session = format!("json-dump-{index}");
+        let call = call("json-dump-call");
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&call),
+                &manifest_format(format, false),
+            )
+            .await
+            .unwrap();
+        let key = DispatchKey {
+            call_key: "lineage:7",
+            held_recorder: None,
+        };
+        for _ in 0..2 {
+            let result = completed(plane.dispatch_keyed(&ctx, &call, key).await);
+            assert_eq!(result.output, ToolOutput::Text { text: text.clone() });
+        }
+        assert_eq!(rig.sent.lock().unwrap().len(), 1);
+        let snapshot = TOOL_RESULT_JSON_DUMPS.snapshot(0, i64::MAX).unwrap();
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|t| t.module_id == "provider" && t.tool_name == "tool")
+            .unwrap();
+        assert_eq!(tool.count, index as u64 + 1);
+        assert_eq!(tool.samples[index].session, ctx.bind.session);
+        assert_eq!(tool.samples[index].call_key.as_deref(), Some("lineage:7"));
+        assert_eq!(tool.samples[index].text_bytes, 200);
+        plane.batch_finished(&ctx).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn staged_plain_key_reaches_the_real_guarded_wire_envelope() {
     let (conn, route, mut server) = SubcConnection::in_process_for_test(7, 1);
     let call = call("call");

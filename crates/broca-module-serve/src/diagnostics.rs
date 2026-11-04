@@ -79,6 +79,7 @@ pub fn admit(principal: Option<&BindPrincipal>, scope: &SendScope) -> Result<(),
 }
 
 pub struct Evidence {
+    pub tool_result_json_dumps: Result<broca_subc::tool_result_diagnostics::Snapshot, String>,
     pub recovery_cuts: Vec<Finding>,
     pub runs: Runs,
     pub late_fence_ms: Option<i64>,
@@ -139,6 +140,8 @@ pub fn gather_with_reader(
         }
     };
     Ok(Evidence {
+        tool_result_json_dumps: broca_subc::tool_result_diagnostics::TOOL_RESULT_JSON_DUMPS
+            .snapshot(since, now),
         recovery_cuts: if config.is_overhaul() {
             recovery_cut_findings(root, now)
         } else {
@@ -557,6 +560,40 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
     }
     findings.extend(data_quality(&evidence.runs, now));
     let mut coverage = BTreeMap::new();
+    match evidence.tool_result_json_dumps {
+        Ok(snapshot) => {
+            coverage.insert(
+                "tool_result_json_dump".into(),
+                Coverage {
+                    since_ms: snapshot.since_ms,
+                    truncated: snapshot.truncated,
+                },
+            );
+            for tool in snapshot.tools {
+                let mut f = finding(
+                    "tool_result_json_dump",
+                    json!([tool.module_id, tool.tool_name]).to_string(),
+                    Severity::Warn,
+                    tool.first_seen_ms,
+                    tool.last_seen_ms,
+                    "A tool provider dumped raw JSON into model-visible text.",
+                    "The tool provider should shape its output into concise model-facing text instead of dumping raw JSON.",
+                );
+                f.count = tool.count;
+                f.samples = tool
+                    .samples
+                    .into_iter()
+                    .map(|sample| {
+                        json!({"module_id":tool.module_id,"tool_name":tool.tool_name,
+                        "session":sample.session,"call_key":sample.call_key,
+                        "text_bytes":sample.text_bytes,"coverage_since_ms":snapshot.since_ms})
+                    })
+                    .collect();
+                findings.push(f);
+            }
+        }
+        Err(_) => findings.push(unavailable("tool_result_json_dump", now)),
+    }
     let live_truncated = evidence.runs.live.len() > SCAN_LIMIT;
     let paused: Vec<_> = evidence
         .runs
@@ -936,6 +973,11 @@ mod operational_port_tests {
         })
         .unwrap();
         let evidence = |runs| Evidence {
+            tool_result_json_dumps: Ok(broca_subc::tool_result_diagnostics::Snapshot {
+                since_ms: 150,
+                truncated: false,
+                tools: vec![],
+            }),
             recovery_cuts: Vec::new(),
             runs,
             late_fence_ms: None,

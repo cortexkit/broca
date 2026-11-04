@@ -24,6 +24,10 @@
       "tool_outages": {
         "since_ms": 199999000,
         "truncated": false
+      },
+      "tool_result_json_dump": {
+        "since_ms": 199999000,
+        "truncated": false
       }
     },
     "findings": [],

@@ -1,0 +1,110 @@
+{
+  "result": {
+    "coverage": {
+      "catalog_stale": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
+      "interrupted_runs": {
+        "since_ms": 200000000,
+        "truncated": false
+      },
+      "run_errors": {
+        "since_ms": 200000000,
+        "truncated": false
+      },
+      "send_refusals": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
+      "session_address_unavailable": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
+      "tool_outages": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
+      "tool_result_json_dump": {
+        "since_ms": 199999000,
+        "truncated": false
+      }
+    },
+    "findings": [
+      {
+        "check": "tool_result_json_dump",
+        "count": 7,
+        "first_seen_ms": 199999993,
+        "hint": "The tool provider should shape its output into concise model-facing text instead of dumping raw JSON.",
+        "key": "[\"tools\",\"search\"]",
+        "last_seen_ms": 199999999,
+        "samples": [
+          {
+            "call_key": "call-key",
+            "coverage_since_ms": 199999000,
+            "module_id": "tools",
+            "session": "sample-session",
+            "text_bytes": 200,
+            "tool_name": "search"
+          },
+          {
+            "call_key": "call-key",
+            "coverage_since_ms": 199999000,
+            "module_id": "tools",
+            "session": "sample-session",
+            "text_bytes": 200,
+            "tool_name": "search"
+          },
+          {
+            "call_key": "call-key",
+            "coverage_since_ms": 199999000,
+            "module_id": "tools",
+            "session": "sample-session",
+            "text_bytes": 200,
+            "tool_name": "search"
+          },
+          {
+            "call_key": "call-key",
+            "coverage_since_ms": 199999000,
+            "module_id": "tools",
+            "session": "sample-session",
+            "text_bytes": 200,
+            "tool_name": "search"
+          },
+          {
+            "call_key": "call-key",
+            "coverage_since_ms": 199999000,
+            "module_id": "tools",
+            "session": "sample-session",
+            "text_bytes": 200,
+            "tool_name": "search"
+          }
+        ],
+        "severity": "warn",
+        "summary": "A tool provider dumped raw JSON into model-visible text."
+      },
+      {
+        "check": "tool_result_json_dump",
+        "count": 1,
+        "first_seen_ms": 199999992,
+        "hint": "The tool provider should shape its output into concise model-facing text instead of dumping raw JSON.",
+        "key": "[\"other-tools\",\"search\"]",
+        "last_seen_ms": 199999992,
+        "samples": [
+          {
+            "call_key": null,
+            "coverage_since_ms": 199999000,
+            "module_id": "other-tools",
+            "session": "other-session",
+            "text_bytes": 300,
+            "tool_name": "search"
+          }
+        ],
+        "severity": "warn",
+        "summary": "A tool provider dumped raw JSON into model-visible text."
+      }
+    ],
+    "generated_at_ms": 200000000,
+    "window_ms": 21600000
+  }
+}
