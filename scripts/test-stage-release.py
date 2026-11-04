@@ -593,10 +593,58 @@ class ReleaseCardFloorArms(unittest.TestCase):
         self.assertIn("floor    none", self.card())
 
 
+def build_failure_block():
+    """The real build-failure explanation, lifted from the real script by its own markers."""
+    src = SCRIPT.read_text()
+    start = src.index("# EXPLAIN A FAILED RELEASE BUILD")
+    end = src.index("# END EXPLAIN A FAILED RELEASE BUILD")
+    block = src[start:end]
+    if "explain_release_build_failure()" not in block or "cargo update -w" not in block:
+        raise AssertionError("the extracted block lost its function or its lock remedy")
+    return block
+
+
+class BuildFailureRemedyArms(unittest.TestCase):
+    """A failed release build names the remedy for what actually failed.
+
+    On 11-04 the compiler cache's client could not reach its server ("sccache: error: Can't
+    assign requested address (os error 49)"), and the script told the operator to re-resolve
+    Cargo.lock and push. These arms feed the real function a captured Cargo log of each kind.
+    """
+
+    def explain(self, log_text):
+        with tempfile.TemporaryDirectory() as directory:
+            log = pathlib.Path(directory) / "build.log"
+            log.write_text(log_text)
+            proc = subprocess.run(
+                ["bash", "-c", build_failure_block() + '\nexplain_release_build_failure "$1"', "_", str(log)],
+                capture_output=True, text=True, timeout=30,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stderr
+
+    def test_a_compiler_wrapper_failure_is_not_reported_as_lock_drift(self):
+        out = self.explain(
+            "sccache: error: Can't assign requested address (os error 49)\n"
+            "error: could not compile `broca-module` (lib)\n"
+        )
+        self.assertNotIn("cargo update -w", out)
+        self.assertIn("the dependency lock is not the cause", out)
+        self.assertIn("first error: sccache: error: Can't assign requested address (os error 49)", out)
+
+    def test_a_lock_mismatch_gets_the_re_resolve_remedy(self):
+        out = self.explain(
+            "error: the lock file /x/Cargo.lock needs to be updated but --locked was passed "
+            "to prevent this\n"
+        )
+        self.assertIn("build refused under --locked", out)
+        self.assertIn("cargo update -w", out)
+
+
 if __name__ == "__main__":
     # A dropped or renamed arm leaves the run green with fewer tests in it, so the count is pinned.
     anchors = unittest.defaultTestLoader.loadTestsFromModule(__import__(__name__)).countTestCases()
     print(f"stage-release suite anchors: {anchors}", flush=True)
-    if anchors != 19:
+    if anchors != 21:
         raise SystemExit("stage-release suite anchor count changed")
     unittest.main(verbosity=2)

@@ -338,18 +338,51 @@ if [[ $(uname -s) == Darwin ]]; then
     export CARGO_PROFILE_RELEASE_STRIP=none
 fi
 
-if ! python3 scripts/lib/cargo-watchdog.py --step "build signed release artifact" -- cargo build --release --locked -p broca-module-serve -p broca-run --bin ck-broca --bin broca-session --bin broca-run --quiet; then
-    cat >&2 <<'DRIFT'
+# EXPLAIN A FAILED RELEASE BUILD by what Cargo printed, read from the build's own stderr
+# log. Only Cargo's own lock messages mean the committed lock disagrees with the manifests.
+# Any other failure (a compile error, or a compiler-wrapper or OS error such as sccache
+# failing with "os error 49") gets a different remedy: re-resolving the lock would change
+# nothing and would push an unneeded lock commit through CI.
+explain_release_build_failure() {
+    local log=$1 first
+    if grep -qE 'needs to be updated but --locked was passed|failed to select a version' "$log"; then
+        cat >&2 <<'DRIFT'
 stage-release: build refused under --locked.
 
 The build could not use the committed dependency set. Inspect the Cargo error above;
-if the manifests and lock disagree, re-resolve deliberately:
+the manifests and lock disagree, so re-resolve deliberately:
 
     cargo update -w && git diff Cargo.lock     # see what moved, and why
     # commit, push, and let CI verify the combination BEFORE staging again
 DRIFT
+        return
+    fi
+    first=$(grep -m1 -E '^(error(\[[A-Z0-9]+\])?:|sccache: error)' "$log" || true)
+    {
+        echo "stage-release: the release build failed, and the dependency lock is not the cause."
+        if [ -n "$first" ]; then echo "  first error: $first"; fi
+        echo "  A compiler-wrapper or OS error (for example sccache, or 'os error 49') is usually"
+        echo "  transient, so retry the stage. A Rust compile error needs a fix on master first."
+    } >&2
+}
+# END EXPLAIN A FAILED RELEASE BUILD
+
+# The build's stderr goes to the terminal as it happens and to BUILD_LOG, so the failure can be
+# classified from what Cargo actually printed.
+BUILD_LOG=$(mktemp "${TMPDIR:-/tmp}/broca-release-build.XXXXXX")
+build_status=0
+set +e
+{
+    python3 scripts/lib/cargo-watchdog.py --step "build signed release artifact" -- cargo build --release --locked -p broca-module-serve -p broca-run --bin ck-broca --bin broca-session --bin broca-run --quiet 2>&1 1>&3 3>&- | tee "$BUILD_LOG" >&2
+    build_status=${PIPESTATUS[0]}
+} 3>&1
+set -e
+if [ "$build_status" -ne 0 ]; then
+    explain_release_build_failure "$BUILD_LOG"
+    rm -f "$BUILD_LOG"
     exit 2
 fi
+rm -f "$BUILD_LOG"
 # Cargo builds into CARGO_TARGET_DIR when it is set (for example while the usual build drive
 # is unavailable), so read the artifacts from the folder cargo actually wrote.
 BUILT=${CARGO_TARGET_DIR:-target}/release/ck-broca
