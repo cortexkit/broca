@@ -220,6 +220,15 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
 
 #[async_trait]
 impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOpener<L, W> {
+    async fn check_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> Result<
+        Option<cortexkit_role_llm_runner::head_selection::PlanModel>,
+        cortexkit_role_llm_runner::head_selection::PlanModelProblem,
+    > {
+        self.executor.check_plan_selection(plan).await
+    }
     fn on_session_deleted(&self, session: &LineageKey) {
         self.executor.on_session_deleted(session);
     }

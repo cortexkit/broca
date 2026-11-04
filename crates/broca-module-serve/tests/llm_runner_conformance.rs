@@ -379,6 +379,7 @@ struct Armed {
 #[derive(Default)]
 struct Shared {
     service_tier_sessions: Mutex<BTreeSet<String>>,
+    head_selection_sessions: Mutex<BTreeSet<String>>,
     service_tier_keys: Mutex<HashMap<String, String>>,
     service_tier_rides: Mutex<HashMap<String, Vec<Value>>>,
     service_tier_request_rides: Mutex<HashMap<String, Vec<u64>>>,
@@ -2264,6 +2265,31 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    async fn head_selection_models(
+        &self,
+        session: &str,
+    ) -> Result<Option<[cortexkit_role_llm_runner::head_selection::PlanModel; 2]>, HarnessError>
+    {
+        use cortexkit_role_llm_runner::{head_selection::PlanModel, service_tier::ServiceTier};
+        self.shared
+            .head_selection_sessions
+            .lock()
+            .unwrap()
+            .insert(session.into());
+        self.shared.service_tier_keys.lock().unwrap().insert(
+            broca_provider::hash::clamp_prompt_cache_key(&format!("tier-fixture-{session}")),
+            session.into(),
+        );
+        let mut selected = PlanModel::new("xai", "conformance-service-tier");
+        if self.service_tier_enabled {
+            selected.service_tier = Some(ServiceTier::Fast);
+        }
+        Ok(Some([
+            selected,
+            PlanModel::new("xai", "head-selection-unavailable"),
+        ]))
+    }
+
     fn model_finish_reason_source(&self) -> Option<&'static str> {
         Some("openai.chat_completions")
     }
@@ -2509,6 +2535,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::FinishReason,
             Capability::RunUsage,
             Capability::SessionUsage,
+            Capability::HeadSelection,
             Capability::RunCancel,
             Capability::Retract,
             Capability::DispatchAttribution,
@@ -2658,6 +2685,23 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if self
+            .shared
+            .head_selection_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+        {
+            let mut fields = json!({"cache":{"key":format!("tier-fixture-{session}")}});
+            if first {
+                fields["model"] =
+                    json!({"provider":"mock","model":format!("{PLAN_MODEL_PREFIX}{session}")});
+                let composition = json!({"providers":[],"step_transform_items":[]});
+                fields["plan"] = json!({"tool_items":[],"system_text_items":[],"step_transform_items":[],
+                    "composition":composition,"composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap()});
+            }
+            return fields.as_object().unwrap().clone();
+        }
         if self
             .shared
             .service_tier_sessions
@@ -3867,6 +3911,79 @@ fn disabled_kill_case(
         && matches!(&case.outcome, CaseOutcome::Skipped { missing } if missing == &expected)
 }
 
+fn check_head_selection_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+    tiers: bool,
+) -> Result<(), String> {
+    for name in [
+        "head_selection_plan_tier",
+        "head_selection_send_overrides",
+        "head_selection_unsupported_tier",
+        "head_selection_unsupported_model",
+        "head_selection_immediate_head",
+        "head_selection_absent_preserves_choice",
+        "head_selection_unchanged_after_host_switch",
+    ] {
+        let case = cases
+            .iter()
+            .find(|case| case.case == name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        let expected_inapplicable = if name == "head_selection_unchanged_after_host_switch" {
+            Some("adapter cannot record a host-side model switch")
+        } else if !tiers
+            && matches!(
+                name,
+                "head_selection_plan_tier"
+                    | "head_selection_send_overrides"
+                    | "head_selection_unsupported_tier"
+                    | "head_selection_absent_preserves_choice"
+            )
+        {
+            Some("service_tier is not declared")
+        } else {
+            None
+        };
+        let valid = match expected_inapplicable {
+            Some(expected) => {
+                matches!(&case.outcome, CaseOutcome::Inapplicable { reason } if reason == expected)
+            }
+            None => case.outcome == CaseOutcome::Passed,
+        };
+        if !valid {
+            return Err(format!("{name}: {:?}", case.outcome));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn head_selection_cases_require_real_fixtures_and_explicit_inapplicability() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+    let cases: Vec<_> = CASES
+        .iter()
+        .filter(|case| case.name.starts_with("head_selection_"))
+        .map(|case| CaseReport {
+            case: case.name,
+            requires: case.requires.to_vec(),
+            outcome: if case.name == "head_selection_unchanged_after_host_switch" {
+                CaseOutcome::Inapplicable {
+                    reason: "adapter cannot record a host-side model switch".into(),
+                }
+            } else {
+                CaseOutcome::Passed
+            },
+        })
+        .collect();
+    assert!(check_head_selection_cases(&cases, true).is_ok());
+    for index in 0..cases.len() {
+        let mut broken = cases.clone();
+        broken[index].outcome = CaseOutcome::Skipped { missing: vec![] };
+        assert!(check_head_selection_cases(&broken, true).is_err());
+        broken.remove(index);
+        assert!(check_head_selection_cases(&broken, true).is_err());
+    }
+}
+
 /// Additive kit cases must not turn an undeclared capability into a required pass.
 /// Check the contracts this adapter implements by name, not by a shared name prefix's size.
 fn check_named_contract_cases(
@@ -4110,6 +4227,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
+    check_head_selection_cases(&report.cases, subject.service_tier_enabled).unwrap();
     // Broca does not promise caller-selected output caps on every provider. Only that
     // prerequisite is skipped; provider-limit finish normalization must still pass below.
     assert_eq!(

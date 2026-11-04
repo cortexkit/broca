@@ -1693,6 +1693,9 @@ pub struct AdmissionSeed {
     first_run: Option<AdmissionSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     latest_refresh: Option<AdmissionSource>,
+    /// The latest selection-bearing acceptance, independent of later model-free refreshes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_selection: Option<AdmissionSource>,
     episode: Option<AdmissionEpisodeSeed>,
     queued: Vec<AdmissionQueueSeed>,
     staged: Option<AdmissionSource>,
@@ -1702,6 +1705,33 @@ pub struct AdmissionSeed {
 }
 
 impl AdmissionSeed {
+    fn restore_head_selection(
+        &self,
+        read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+        head: &mut crate::head::HeadProjection,
+    ) -> Result<(), crate::replay::SeedFallback> {
+        let Some(source) = &self.latest_selection else {
+            return Ok(());
+        };
+        let record = source.read(read_at, &self.boundary)?.record;
+        let manifest = match &record {
+            WalRecord::RunStarted {
+                manifest: Some(manifest),
+                ..
+            }
+            | WalRecord::SessionRefreshAccepted { manifest, .. } => manifest,
+            _ => {
+                return Err(crate::replay::SeedFallback::new(
+                    "head selection source is not an acceptance",
+                ))
+            }
+        };
+        head.selection = Some(crate::head::manifest_selection(manifest).ok_or_else(|| {
+            crate::replay::SeedFallback::new("head selection source has no model")
+        })?);
+        Ok(())
+    }
+
     /// Capture a complete prefix ending at the index's committed projection boundary.
     /// Index writers supply actual positioned frames, never offsets inferred from re-encoding.
     pub fn capture(
@@ -1867,6 +1897,23 @@ impl AdmissionSeed {
                 .iter()
                 .rposition(|frame| matches!(frame.record, WalRecord::SessionRefreshAccepted { .. }))
                 .map(source)
+                .transpose()?,
+            latest_selection: frames
+                .iter()
+                .enumerate()
+                .rfind(|(index, frame)| match &frame.record {
+                    WalRecord::SessionRefreshAccepted { manifest, .. } => {
+                        crate::head::manifest_selection(manifest).is_some()
+                    }
+                    WalRecord::RunStarted {
+                        manifest: Some(manifest),
+                        ..
+                    } if Some(*index) == first => {
+                        crate::head::manifest_selection(manifest).is_some()
+                    }
+                    _ => false,
+                })
+                .map(|(index, _)| source(index))
                 .transpose()?,
             episode,
             queued,
@@ -2056,6 +2103,9 @@ impl AdmissionSeed {
             return Err(bad());
         }
         let mut checkpoint = self.scalars.clone();
+        if let Some(head) = &mut checkpoint.head {
+            self.restore_head_selection(read_at, head)?;
+        }
         if let Some(source) = &self.latest_refresh {
             let WalRecord::SessionRefreshAccepted { manifest, .. } =
                 source.read(read_at, &self.boundary)?.record
@@ -2287,6 +2337,7 @@ impl AdmissionContinuation {
             ));
         }
         head.restore_sender_marker(ownership);
+        self.seed.restore_head_selection(read_at, head)?;
         if let Some(source) = &self.seed.latest_refresh {
             let record = source.read(read_at, &self.seed.boundary)?.record;
             if !matches!(record, WalRecord::SessionRefreshAccepted { .. }) {
@@ -2977,6 +3028,19 @@ impl AdmissionContinuation {
                 next.media_sources
                     .get_or_insert_with(Vec::new)
                     .push(source.clone());
+            }
+            let selection = match &p.framed.record {
+                WalRecord::SessionRefreshAccepted { manifest, .. } => {
+                    crate::head::manifest_selection(manifest)
+                }
+                WalRecord::RunStarted {
+                    manifest: Some(manifest),
+                    ..
+                } if next.seed.first_run.is_none() => crate::head::manifest_selection(manifest),
+                _ => None,
+            };
+            if selection.is_some() {
+                next.seed.latest_selection = Some(source.clone());
             }
             match &p.framed.record {
                 WalRecord::SessionRefreshAccepted { .. } => next.seed.latest_refresh = Some(source),
@@ -4415,6 +4479,102 @@ mod tests {
             assert_eq!(actual.prior.usage, replayed.usage);
             assert_eq!(actual.prior.retries_used, replayed.retries_used);
         }
+    }
+
+    #[test]
+    fn head_selection_sources_are_bounded_at_1k_and_150k_messages() {
+        use crate::projection_plan::ProjectionContinuation;
+        let mut costs = Vec::new();
+        for prefix in [1_000, 150_000] {
+            let mut records = offset_corpus();
+            if let WalRecord::RunStarted { input, .. } = &mut records[0].record {
+                *input = Arc::new(vec![input[0].clone(); prefix]);
+            }
+            let manifest = |model| {
+                let mut plan = serde_json::json!({});
+                if model {
+                    plan["model"] = serde_json::json!({"provider":"selected","model":"next","service_tier":"fast"});
+                }
+                serde_json::from_value(serde_json::json!({
+                    "plan":plan.to_string(),"plan_identity":"accepted","composition_digest":"composition",
+                    "fetches":[],"tools":[],"system_text":"PRIVATE-SELECTION-TEXT","system_digest":"system",
+                    "join_version":1,"role_versions":{}
+                })).unwrap()
+            };
+            records.insert(
+                10,
+                frame(
+                    0,
+                    WalRecord::SessionRefreshAccepted {
+                        generation: 1,
+                        policy: "immediately".into(),
+                        manifest: Box::new(manifest(true)),
+                        run_in_progress: false,
+                        applies_from_next_run: true,
+                    },
+                ),
+            );
+            records.insert(
+                records.len() - 1,
+                frame(
+                    0,
+                    WalRecord::SessionRefreshAccepted {
+                        generation: 2,
+                        policy: "on_prefix_rebuild".into(),
+                        manifest: Box::new(manifest(false)),
+                        run_in_progress: true,
+                        applies_from_next_run: false,
+                    },
+                ),
+            );
+            for (index, frame) in records.iter_mut().enumerate() {
+                frame.seq = index as u64 + 1;
+            }
+            let (bytes, positioned) = offset_log(&records);
+            let read_at = offset_reader(&bytes);
+            let boundary = offset_boundary(&bytes, &positioned, records.len());
+            let captured =
+                ProjectionContinuation::capture(&read_at, &boundary, &positioned).unwrap();
+            let advanced = ProjectionContinuation::capture(
+                &read_at,
+                &offset_boundary(&bytes, &positioned, 4),
+                &positioned[..4],
+            )
+            .unwrap()
+            .advance(&read_at, &boundary, &positioned[4..])
+            .unwrap();
+            for stored in [captured, advanced] {
+                let encoded = stored.encode().unwrap();
+                assert_content_free_form(&encoded);
+                assert!(!encoded.contains("PRIVATE-SELECTION-TEXT"));
+                let restored = ProjectionContinuation::decode(&encoded).unwrap();
+                let mut head = crate::head::HeadProjection::default();
+                let counter = broca_wal::access_counter::WalAccessCounter::default();
+                counter
+                    .operation("head selection sources")
+                    .run(|| {
+                        restored
+                            .admission()
+                            .restore_head_sender_admission(&read_at, &mut head)
+                    })
+                    .unwrap();
+                assert_eq!(head.selected_model().unwrap().model, "next");
+                assert_eq!(
+                    head.selection.unwrap().service_tier.unwrap().as_str(),
+                    "fast"
+                );
+                let access = counter.snapshot().pop().unwrap();
+                assert!(access.seed_fallbacks.is_empty(), "{access:?}");
+                assert_eq!(
+                    access.reads.len(),
+                    2,
+                    "only the selection and the later model-free refresh are read: {access:?}"
+                );
+                assert_eq!(access.frames_decoded, 2, "{access:?}");
+                costs.push(access.reads.iter().map(|read| read.length).sum::<u64>());
+            }
+        }
+        assert!(costs.iter().all(|cost| *cost == costs[0]), "{costs:?}");
     }
 
     #[test]

@@ -289,6 +289,9 @@ pub type RoutingReply = Result<Result<Vec<u8>, Vec<u8>>, String>;
 /// Error frame's body, and `Err(cause)` means no reply arrived.
 #[async_trait::async_trait]
 pub trait RoutingTransport: Send + Sync {
+    async fn service_tier_supported(&self) -> Result<bool, String> {
+        Ok(false)
+    }
     async fn request(&self, body: Vec<u8>) -> RoutingReply;
 }
 
@@ -307,6 +310,7 @@ pub struct SubcRoutingTransport {
     module_id: String,
     identity: BindIdentity,
     route: Arc<Mutex<RouteSlot>>,
+    tier_support: tokio::sync::Mutex<Option<(broca_subc::RouteHandle, bool)>>,
 }
 
 impl SubcRoutingTransport {
@@ -320,6 +324,7 @@ impl SubcRoutingTransport {
             module_id,
             identity,
             route: Arc::new(Mutex::new(RouteSlot::Empty)),
+            tier_support: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -370,6 +375,36 @@ impl SubcRoutingTransport {
 
 #[async_trait::async_trait]
 impl RoutingTransport for SubcRoutingTransport {
+    async fn service_tier_supported(&self) -> Result<bool, String> {
+        let route = self.route().await?;
+        let mut cached = self.tier_support.lock().await;
+        if let Some((known, supported)) = *cached {
+            if known == route {
+                return Ok(supported);
+            }
+        }
+        let response = self
+            .conn
+            .route_request_terminal(
+                &route,
+                serde_json::to_vec(&json!({"method":"role.describe","params":{}}))
+                    .expect("describe JSON"),
+            )
+            .await
+            .map_err(|error| {
+                self.forget(route);
+                error.to_string()
+            })?;
+        let supported = match response {
+            Ok(body) => serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|value| value["result"]["capabilities"].as_array().cloned())
+                .is_some_and(|capabilities| capabilities.iter().any(|name| name == "service_tier")),
+            Err(_) => false,
+        };
+        *cached = Some((route, supported));
+        Ok(supported)
+    }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
         let route = self.route().await?;
         match self.conn.route_request_terminal(&route, body).await {
@@ -394,6 +429,7 @@ pub enum AccountForOutcome {
         account_id: String,
         credential_id: String,
         decision_id: Option<String>,
+        service_tier_chosen: Option<String>,
     },
     /// `auth_required`: every remaining candidate needs a fresh login.
     AuthRequired { decision_id: Option<String> },
@@ -485,6 +521,9 @@ fn classify_account_for_reply_at(
                         account_id: account_id.to_string(),
                         credential_id: credential_id.to_string(),
                         decision_id: result["reason"]["decision_id"].as_str().map(str::to_string),
+                        service_tier_chosen: result["service_tier_chosen"]
+                            .as_str()
+                            .map(str::to_owned),
                     }
                 }
                 _ => AccountForOutcome::Unreachable(
@@ -712,6 +751,7 @@ pub fn conversation_key(session: &BindIdentity) -> String {
 /// One admission's request to routing.
 pub struct AccountForRequest<'a> {
     pub decision_id: Option<&'a str>,
+    pub service_tier: Option<&'a str>,
     pub provider: &'a str,
     pub model: &'a str,
     pub conversation_key: &'a str,
@@ -779,6 +819,43 @@ pub fn account_hold_cap(
     }
 }
 
+fn check_account_tier(params: &Value, chosen: Option<&str>) -> Result<(), String> {
+    use cortexkit_role_llm_runner::service_tier::ServiceTier;
+    let requested = params.get("service_tier").and_then(Value::as_str);
+    let rank = |tier| match tier {
+        ServiceTier::Standard => 0,
+        ServiceTier::Fast => 1,
+        ServiceTier::Ultrafast => 2,
+        _ => 3,
+    };
+    let requested_tier = match requested {
+        Some(tier) => ServiceTier::parse(tier)
+            .ok_or_else(|| "route.account_for request names an unknown service_tier".to_owned())?,
+        None => ServiceTier::Standard,
+    };
+    let chosen_tier = match chosen {
+        Some(tier) => ServiceTier::parse(tier).ok_or_else(|| {
+            "route.account_for answered an unknown service_tier_chosen".to_owned()
+        })?,
+        None if requested.is_some() => {
+            return Err("route.account_for omitted service_tier_chosen on a tier request".into())
+        }
+        None => ServiceTier::Standard,
+    };
+    if rank(chosen_tier) > rank(requested_tier) {
+        return Err("route.account_for upgraded service_tier_chosen above the request".into());
+    }
+    // A decision already fixed the tier. The unbound account-admission step-down rule cannot
+    // choose it again, even when a lower level would otherwise be a valid answer.
+    if params.get("decision_id").is_some()
+        && !requested_tier.is_standard()
+        && chosen_tier != requested_tier
+    {
+        return Err("route.account_for changed the decision's fixed service tier".into());
+    }
+    Ok(())
+}
+
 /// The `route.account_for` params, in routing's field names.
 pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
     let mut params = json!({
@@ -807,6 +884,9 @@ pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
     });
     if let Some(decision_id) = request.decision_id {
         params["decision_id"] = decision_id.into();
+    }
+    if let Some(tier) = request.service_tier {
+        params["service_tier"] = tier.into();
     }
     params
 }
@@ -842,9 +922,25 @@ impl RoutingClient {
     /// Ask routing for an account, giving up at `deadline`.
     pub async fn account_for(
         &self,
-        params: Value,
+        mut params: Value,
         deadline: tokio::time::Instant,
     ) -> AccountForOutcome {
+        let tier_aware = match tokio::time::timeout_at(
+            deadline,
+            self.transport.service_tier_supported(),
+        )
+        .await
+        {
+            Ok(Ok(supported)) => supported,
+            Ok(Err(error)) => return AccountForOutcome::Unreachable(error),
+            Err(_) => return AccountForOutcome::NoDecisionWithinBudget,
+        };
+        if !tier_aware {
+            params
+                .as_object_mut()
+                .expect("account_for params are an object")
+                .remove("service_tier");
+        }
         let body = match serde_json::to_vec(&json!({ "method": ACCOUNT_FOR_OP, "params": params }))
         {
             Ok(body) => body,
@@ -853,11 +949,25 @@ impl RoutingClient {
             }
         };
         let started = std::time::Instant::now();
-        let outcome = match tokio::time::timeout_at(deadline, self.transport.request(body)).await {
-            Err(_) => AccountForOutcome::NoDecisionWithinBudget,
-            Ok(Err(cause)) => AccountForOutcome::Unreachable(cause),
-            Ok(Ok(reply)) => classify_account_for_reply(reply),
-        };
+        let mut outcome =
+            match tokio::time::timeout_at(deadline, self.transport.request(body)).await {
+                Err(_) => AccountForOutcome::NoDecisionWithinBudget,
+                Ok(Err(cause)) => AccountForOutcome::Unreachable(cause),
+                Ok(Ok(reply)) => classify_account_for_reply(reply),
+            };
+        if let AccountForOutcome::Chosen {
+            service_tier_chosen,
+            ..
+        } = &mut outcome
+        {
+            if tier_aware {
+                if let Err(message) = check_account_tier(&params, service_tier_chosen.as_deref()) {
+                    return AccountForOutcome::Unreachable(message);
+                }
+            } else {
+                *service_tier_chosen = None;
+            }
+        }
         // Routing records no time of its own for this call, and every send waits on it, so the
         // round trip as broca sees it is logged per call: it decides whether the call can stay
         // ahead of the rest of admission or has to run beside it.
@@ -960,6 +1070,7 @@ pub enum AccountChoice {
         decision: AccountDecision,
         /// The digest of the listing the candidates were sent from.
         view_digest: String,
+        service_tier_chosen: Option<String>,
     },
     /// Admit on the static pick and pause for a fresh login; record `decision`.
     AuthRequired(AccountDecision),
@@ -979,6 +1090,7 @@ impl AccountChoice {
 /// Everything [`choose_account`] needs about one fresh run.
 pub struct ChoiceInputs<'a> {
     pub decision_id: Option<&'a str>,
+    pub service_tier: Option<&'a str>,
     /// Caller affinity for this admission; an explicit key always wins.
     pub conversation_key: Option<&'a str>,
     /// Affinity frozen by the latest episode in the durable admission snapshot.
@@ -1116,6 +1228,7 @@ where
     }
     let params = account_for_params(&AccountForRequest {
         decision_id: inputs.decision_id,
+        service_tier: inputs.service_tier,
         provider,
         model: inputs.model,
         conversation_key: conversation,
@@ -1132,6 +1245,7 @@ where
             account_id,
             credential_id,
             decision_id,
+            service_tier_chosen,
         } => {
             // Routing returns the vault credential id verbatim, and it must be one broca offered:
             // those, and only those, are credentials whose vault metadata names this run's
@@ -1164,6 +1278,7 @@ where
                     decision_id,
                 ),
                 view_digest: candidates.view_digest,
+                service_tier_chosen,
             })
         }
         AccountForOutcome::Unreachable(cause) => {

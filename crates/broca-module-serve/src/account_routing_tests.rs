@@ -20,6 +20,7 @@ struct FakeRouting {
     /// Never answer, as a hung routing module would.
     hang: bool,
     answered: AtomicUsize,
+    tiers: bool,
 }
 
 impl FakeRouting {
@@ -84,6 +85,9 @@ impl FakeRouting {
 
 #[async_trait::async_trait]
 impl RoutingTransport for FakeRouting {
+    async fn service_tier_supported(&self) -> Result<bool, String> {
+        Ok(self.tiers)
+    }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
         self.requests
             .lock()
@@ -106,6 +110,70 @@ fn client(routing: &Arc<FakeRouting>) -> RoutingClient {
         Arc::clone(routing) as Arc<dyn RoutingTransport>,
         AccountSelectionConfig::default(),
     )
+}
+
+#[tokio::test]
+async fn head_selection_account_tier_is_capability_gated_and_chosen() {
+    for supported in [false, true] {
+        let routing = Arc::new(FakeRouting {
+            tiers: supported,
+            reply: Mutex::new(Some(Ok(Ok(serde_json::to_vec(&json!({"result":{
+                "account":{"account_id":"acct-a","credential_id":"opaque-a"},
+                "service_tier_chosen":"fast"}}))
+            .unwrap())))),
+            ..FakeRouting::default()
+        });
+        let result = client(&routing)
+            .account_for(
+                json!({"service_tier":"ultrafast"}),
+                tokio::time::Instant::now() + ADMISSION_BUDGET,
+            )
+            .await;
+        assert!(
+            matches!(result, AccountForOutcome::Chosen { service_tier_chosen, .. }
+            if service_tier_chosen.as_deref() == supported.then_some("fast"))
+        );
+        assert_eq!(
+            routing.requests.lock().unwrap()[0]["params"]
+                .get("service_tier")
+                .and_then(Value::as_str),
+            supported.then_some("ultrafast")
+        );
+    }
+}
+
+#[tokio::test]
+async fn head_selection_account_decision_tier_cannot_step_down() {
+    for chosen in [
+        Some("standard"),
+        Some("fast"),
+        Some("ultrafast"),
+        Some("future"),
+        None,
+    ] {
+        let mut result = json!({"account":{"account_id":"acct-a","credential_id":"opaque-a"}});
+        if let Some(chosen) = chosen {
+            result["service_tier_chosen"] = chosen.into();
+        }
+        let routing = Arc::new(FakeRouting {
+            tiers: true,
+            reply: Mutex::new(Some(Ok(Ok(
+                serde_json::to_vec(&json!({"result":result})).unwrap()
+            )))),
+            ..FakeRouting::default()
+        });
+        let answer = client(&routing)
+            .account_for(
+                json!({"decision_id":"fixed-fast","service_tier":"fast"}),
+                tokio::time::Instant::now() + ADMISSION_BUDGET,
+            )
+            .await;
+        assert_eq!(
+            matches!(answer, AccountForOutcome::Chosen { .. }),
+            chosen == Some("fast"),
+            "chosen={chosen:?}: {answer:?}"
+        );
+    }
 }
 
 /// A listed credential with the metadata the vault sends: the provider it serves and how it
@@ -165,6 +233,7 @@ async fn choose(
     choose_account(
         client,
         ChoiceInputs {
+            service_tier: None,
             decision_id: None,
             hold_cap: Default::default(),
             conversation_key: None,
@@ -282,6 +351,7 @@ fn account_for_hold_cap_params_preserve_legacy_members_and_bound_the_previous_ac
             "{name}"
         );
         let mut params = account_for_params(&AccountForRequest {
+            service_tier: None,
             decision_id: None,
             provider: "anthropic",
             model: "new-model",
@@ -315,6 +385,7 @@ async fn account_for_counts_only_sent_unknown_hold_caps_not_real_zero_or_static_
         choose_account(
             &client,
             ChoiceInputs {
+                service_tier: None,
                 decision_id: None,
                 hold_cap: AccountHoldCap {
                     max_s: 0,
@@ -434,6 +505,7 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
     let (choice, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
+            service_tier: None,
             decision_id: None,
             hold_cap: Default::default(),
             conversation_key: None,
@@ -488,6 +560,7 @@ async fn a_slow_listing_shares_the_admission_budget() {
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            service_tier: None,
             decision_id: None,
             hold_cap: Default::default(),
             conversation_key: None,
@@ -563,6 +636,7 @@ async fn a_routing_answer_names_the_credential_and_the_decision() {
     assert_eq!(
         choice,
         AccountChoice::Routed {
+            service_tier_chosen: None,
             account_id: "acct-b".into(),
             credential_id: "oauth:anthropic:acct-b".into(),
             method: AuthMethod::Oauth,
@@ -614,6 +688,7 @@ async fn caller_affinity_changes_only_the_conversation_key_in_the_routing_body()
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            service_tier: None,
             decision_id: None,
             hold_cap: Default::default(),
             conversation_key: Some("consult:42:subject:phase"),
@@ -943,6 +1018,7 @@ async fn refusal_log_names_send_and_routing_decision() {
     let (result, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
+            service_tier: None,
             decision_id: None,
             hold_cap: Default::default(),
             conversation_key: None,
@@ -1839,6 +1915,7 @@ async fn a_caller_decision_is_forwarded_even_with_a_pin_and_is_not_runner_report
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            service_tier: None,
             decision_id: Some("caller-decision"),
             hold_cap: Default::default(),
             conversation_key: None,
@@ -1877,6 +1954,7 @@ async fn an_unknown_caller_decision_never_falls_back_to_a_static_account() {
     let result = choose_account(
         &client,
         ChoiceInputs {
+            service_tier: None,
             decision_id: Some("expired"),
             hold_cap: Default::default(),
             conversation_key: None,

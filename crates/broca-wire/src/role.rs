@@ -167,6 +167,8 @@ pub struct HeadResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<cortexkit_role_llm_runner::read::HeadModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<cortexkit_role_llm_runner::usage::SessionUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<cortexkit_role_llm_runner::read::HeadSender>,
@@ -193,6 +195,7 @@ impl Default for HeadResponse {
             title: None,
             input: None,
             model: None,
+            service_tier: None,
             usage: None,
             sender: None,
             incarnation: "unwritten".into(),
@@ -405,6 +408,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::RUN_USAGE,
         cortexkit_role_llm_runner::capabilities::SESSION_USAGE,
         cortexkit_role_llm_runner::capabilities::HEAD_SENDER,
+        cortexkit_role_llm_runner::capabilities::HEAD_SELECTION,
         cortexkit_role_llm_runner::capabilities::RUN_CANCEL,
         cortexkit_role_llm_runner::capabilities::RUN_CANCEL_BY_INTERRUPT,
         cortexkit_role_llm_runner::capabilities::RETRACT,
@@ -768,6 +772,7 @@ mod pinned_reply_bytes {
     fn session_head_bytes_are_pinned() {
         assert_golden(
             HeadResponse {
+                service_tier: None,
                 mode3: false,
                 last_run_rich_ui: None,
                 model: None,
@@ -804,6 +809,7 @@ mod pinned_reply_bytes {
     fn session_head_with_a_title_bytes_are_pinned() {
         assert_golden(
             HeadResponse {
+                service_tier: None,
                 mode3: false,
                 last_run_rich_ui: None,
                 model: None,
@@ -838,6 +844,7 @@ mod pinned_reply_bytes {
     #[test]
     fn session_head_snapshot_members_are_pinned() {
         let head = HeadResponse {
+            service_tier: None,
             mode3: false,
             last_run_rich_ui: None,
             model: None,
@@ -1256,7 +1263,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "16179119420e070695c92788082e053407f4b0bef5e7995a633bc6074dcd2fd2",
+            "a58fd6980deec9cc2a9ed4bcd2f76ad6a5a58ab71406cab4bae9332ddd9faae8",
         );
     }
 
@@ -1369,6 +1376,7 @@ mod pinned_reply_bytes {
     fn cache_facts_on_head_and_baseline_are_pinned() {
         assert_golden(
             HeadResponse {
+                service_tier: None,
                 mode3: false,
                 last_run_rich_ui: None,
                 model: None,
@@ -1437,7 +1445,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "4baae6ad9f52ed917f625af6cff2e519e866b4d6d92cae86deb8ab5862b0532f";
+        "4f2bae8f94c58e811dc7d5ea7a56545019d48f423914f2de1f2328533ed61dab";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =
