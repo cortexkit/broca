@@ -131,6 +131,7 @@ fi
 [ -f "$DEST" ] || { echo "place-release: destination not found: $DEST" >&2; exit 2; }
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/scripts/lib/exit-guard.sh"
 source "$REPO_ROOT/scripts/signing-posture.sh"
 source "$REPO_ROOT/scripts/wal-floor.sh"
 source "$REPO_ROOT/scripts/running-image.sh"
@@ -159,7 +160,7 @@ cleanup_place() {
   fi
   rm -f "$GATE_LOG" "$ACTIVE_RUNS_FILE"
 }
-trap cleanup_place EXIT
+trap 'broca_exit_guard cleanup_place' EXIT
 
 # The live-run gate answers "is any run live RIGHT NOW". It only refuses when this invocation
 # will restart (--restart, --restart-only), because placement alone is an atomic rename that
@@ -411,7 +412,9 @@ if [ "$RESTART_ONLY" -eq 1 ]; then
   disk_inode="$(broca_file_inode "$DEST")"
   disk_sha="$(shasum -a 256 "$DEST" | awk '{print $1}')"
   restart_and_wait "$disk_inode" "$disk_sha"
-  exit $?
+  restart_status=$?
+  BROCA_EXIT_GUARD_FINISHED=1
+  exit "$restart_status"
 fi
 
 # FILE KIND, before anything is copied or signed. A staged path is just a path: a text file, a
@@ -847,6 +850,7 @@ if [ "$RESTART" -eq 0 ]; then
   echo "   NOT YET RUNNING. Load it with --restart next time, or by hand ONLY after re-checking"
   echo "   that no run is live:  ck module restart broca"
   echo "   Then verify:  scripts/verify-deploy.sh --staged '$STAGED' --sha $AFTER_SHA --marker <new> --control <known>"
+  BROCA_EXIT_GUARD_FINISHED=1
   exit 0
 fi
 
@@ -874,3 +878,4 @@ fi
 
 write_report
 restart_and_wait "$AFTER_INODE" "$AFTER_SHA"
+BROCA_EXIT_GUARD_FINISHED=1

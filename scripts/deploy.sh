@@ -5,6 +5,7 @@ set -euo pipefail
 umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source scripts/lib/exit-guard.sh
 MARKER="" CONTROL=""
 placement_args=()
 while [ "$#" -gt 0 ]; do
@@ -45,7 +46,6 @@ echo "deploy: logs $logdir"
 # until its status has been collected. Captured output stays private until then.
 metadata_pid="" metadata_listing="" metadata_listing_error="" metadata_output=""
 cleanup_metadata() {
-  local status=$?
   trap - EXIT
   if [ -n "$metadata_pid" ]; then
     # The gate owns a process group, including vault/checker descendants, so an
@@ -55,9 +55,8 @@ cleanup_metadata() {
     kill -KILL -- "-$metadata_pid" 2>/dev/null || true
   fi
   rm -f "$metadata_listing" "$metadata_listing_error" "$metadata_output"
-  exit "$status"
 }
-trap cleanup_metadata EXIT
+trap 'broca_exit_guard cleanup_metadata' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 metadata_listing="$(mktemp "$logdir/credential-listing.XXXXXX")" || {
@@ -225,3 +224,4 @@ PY
 echo "   acceptance PASS (direct tool round trip; classed fetch-plan turn; scoped AFT dispatch)"
 rollback_command
 echo "   CI log     $ci_log (detached; CI does not gate deployment)"
+BROCA_EXIT_GUARD_FINISHED=1

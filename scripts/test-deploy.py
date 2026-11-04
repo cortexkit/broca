@@ -160,6 +160,7 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
             'import runpy, sys\nsys.argv[1:] = ["worker-accept", *sys.argv[1:]]\n'
             'runpy.run_path(__file__.replace("acceptance-worker-turn.py", "stub.py"), run_name="__main__")\n')
         (self.scripts / "lib").mkdir()
+        shutil.copy2(ROOT / "scripts/lib/exit-guard.sh", self.scripts / "lib")
         (self.scripts / "lib/acceptance_scoped.py").write_text(
             'import runpy, sys\nsys.argv[1:] = ["scoped-accept", *sys.argv[1:]]\n'
             'runpy.run_path(__file__.replace("lib/acceptance_scoped.py", "stub.py"), run_name="__main__")\n')

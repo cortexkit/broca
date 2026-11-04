@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+source scripts/lib/exit-guard.sh
 
 # The local wrapper requests Gatekeeper warming after linting. Direct callers
 # (including CI) still run fmt and clippy but do not need that macOS-only step.
@@ -109,7 +110,7 @@ print_summary() {
   done
   printf '    %-60s %4ss\n' "total" "$total"
 }
-trap print_summary EXIT
+trap 'broca_exit_guard print_summary' EXIT
 
 # Keep the existing hard deadline for inventory commands alongside the
 # watchdog's no-progress limits; the watchdog owns the Cargo process group for
@@ -421,3 +422,4 @@ if [[ "$doc_count" -gt 0 ]]; then
 else
   skip_phase "cargo test --workspace --doc (live and test-clock features) --quiet" "0 doctests"
 fi
+BROCA_EXIT_GUARD_FINISHED=1

@@ -22,7 +22,7 @@ class TurnHarnesses(unittest.TestCase):
             shutil.copy2(ROOT / "scripts" / name, scripts)
         (scripts / "lib").mkdir()
         shutil.copy2(ROOT / "scripts/lib/acceptance-models.txt", scripts / "lib")
-        for name in ("acceptance_contract.py", "artifact-probe.sh"):
+        for name in ("acceptance_contract.py", "artifact-probe.sh", "exit-guard.sh"):
             shutil.copy2(ROOT / "scripts/lib" / name, scripts / "lib" / name)
         self.bins = self.root / "bin"
         self.bins.mkdir()

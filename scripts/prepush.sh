@@ -3,6 +3,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$root"
+source scripts/lib/exit-guard.sh
 export PYTHONDONTWRITEBYTECODE=1
 source scripts/lib/prepush-report.sh
 
@@ -147,8 +148,10 @@ launch() {
   } > "$logs/$name.prepare.log" 2>&1
   names+=("$name") requests+=("$cpus")
   (
+    BROCA_EXIT_GUARD_FINISHED=0
     if [[ ${scheduling:-0} == 1 ]]; then
-      trap 'printf "%s\n" "$index" >&3' EXIT
+      notify_completion() { printf "%s\n" "$index" >&3; }
+      trap 'broca_exit_guard notify_completion' EXIT
     fi
     rc=0
     requested_ms="$begin_ms"
@@ -171,6 +174,7 @@ launch() {
     python3 scripts/lib/prepush-motor-timing.py "$logs/$name.motor.jsonl" "$requested_ms" \
       "$((requested_ms - begin_ms))" "$((ended_ms - begin_ms))" --vcpus "$cpus" > "$logs/$name.timing.json"
     printf '%s\n' "$((SECONDS - begin))" > "$logs/$name.seconds"
+    BROCA_EXIT_GUARD_FINISHED=1
     exit "$rc"
   ) > "$logs/$name.log" 2>&1 &
   pids+=("$!")
@@ -266,7 +270,8 @@ fi
 # A completion FIFO works with macOS's Bash 3 as well as Linux, unlike wait -n.
 mkfifo "$logs/completed.fifo"
 exec 3<> "$logs/completed.fifo"
-trap 'exec 3>&-; rm -f "$logs/completed.fifo"' EXIT
+cleanup_fifo() { exec 3>&-; rm -f "$logs/completed.fifo"; }
+trap 'broca_exit_guard cleanup_fifo' EXIT
 scheduling=1 in_flight=0 active=0 pending="${#plan_names[@]}"
 admitted=()
 while [[ "$pending" -gt 0 || "$active" -gt 0 ]]; do
@@ -307,3 +312,4 @@ while [[ "$pending" -gt 0 || "$active" -gt 0 ]]; do
   fi
 done
 summarize
+BROCA_EXIT_GUARD_FINISHED=1

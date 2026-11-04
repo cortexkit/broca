@@ -3,9 +3,9 @@
 # green. Operator tooling runs through the real GitHub CLI (gh) via watch-ci.sh;
 # the shim is only for AI agent commands.
 #
-# Lifting this into another repository: carry four files together —
+# Lifting this into another repository: carry five files together —
 # scripts/train-push.sh, scripts/watch-ci.sh, scripts/lib/operator-gh.sh,
-# scripts/lib/workflow-gates.py — plus `python3`, `git`, and the real `gh` on
+# scripts/lib/workflow-gates.py, scripts/lib/exit-guard.sh — plus `python3`, `git`, and the real `gh` on
 # PATH. Nothing else here assumes this repository's layout: the default branch
 # is read from origin/HEAD, and repo-local preflights run only when their
 # scripts exist (see "Repo-local preflights" below), with the header line
@@ -113,14 +113,19 @@ if [ -z "${TRAIN_PUSH_EXEC_COPY:-}" ]; then
   TRAIN_PUSH_EXEC_COPY="$train_push_copy" TRAIN_PUSH_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")" \
     exec bash "$train_push_copy" "$@"
 fi
+script_dir="$(dirname "${TRAIN_PUSH_SOURCE:-${BASH_SOURCE[0]}}")"
+source "$script_dir/lib/exit-guard.sh"
 watch_log=""
 push_log=""
 train_lock_held=""
 # Install cleanup before acquisition: even a failed first remote lookup must release
 # our lock. An owner check keeps a refused contender from deleting another train's lock.
-trap 'rm -f "$watch_log" "$push_log" "$TRAIN_PUSH_EXEC_COPY"; if [ -n "$train_lock_held" ] && [ "$(awk "NR==1{print \$1}" "$train_lock_held/owner" 2>/dev/null || true)" = "$$" ]; then rm -rf "$train_lock_held"; fi' EXIT
+cleanup_train() {
+  rm -f "$watch_log" "$push_log" "$TRAIN_PUSH_EXEC_COPY"
+  if [ -n "$train_lock_held" ] && [ "$(awk "NR==1{print \$1}" "$train_lock_held/owner" 2>/dev/null || true)" = "$$" ]; then rm -rf "$train_lock_held"; fi
+}
+trap 'broca_exit_guard cleanup_train' EXIT
 
-script_dir="$(dirname "${TRAIN_PUSH_SOURCE:-${BASH_SOURCE[0]}}")"
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
@@ -278,6 +283,7 @@ if [ "$1" = "--status" ]; then
     printf 'train-push: leftover refs (spent ones are safe to delete):\n'
     printf '%s\n' "$refs" | sed 's/^/  /'
   fi
+  BROCA_EXIT_GUARD_FINISHED=1
   exit 0
 fi
 
@@ -1050,3 +1056,4 @@ if ! git push -q "$remote" --delete "$train_ref"; then
   printf 'train-push: warning — could not delete %s/%s (delete it by hand)\n' "$remote" "$train_ref" >&2
 fi
 say "done"
+BROCA_EXIT_GUARD_FINISHED=1
