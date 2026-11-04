@@ -597,11 +597,22 @@ async fn display_facts_opt_in_preserves_default_and_matches_stored_times() {
     .await;
     let facts = result(&decorated);
     assert_eq!(facts["messages"][0]["client_message_id"], "phone_facts_1");
+    // Recorded creation times (0.8.5) ride the same opt-in; the user entry's is its send's
+    // acceptance, which this session recorded.
+    assert!(facts["messages"][0]["created_at"].is_u64());
+    // Without its display facts, an opted-in read is the default read.
     let mut stripped = facts.clone();
     for entry in stripped["messages"].as_array_mut().unwrap() {
         let entry = entry.as_object_mut().unwrap();
-        entry.remove("client_message_id");
-        entry.remove("tool_times");
+        for fact in [
+            "client_message_id",
+            "tool_times",
+            "completed_at",
+            "created_at",
+            "reasoning_summaries",
+        ] {
+            entry.remove(fact);
+        }
     }
     assert_eq!(plain, stripped);
     let records = rig.records();

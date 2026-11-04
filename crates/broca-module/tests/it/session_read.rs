@@ -2936,6 +2936,11 @@ async fn check_scoped_session_reads(agent_run: bool) {
                 request: Box::new({
                     let mut submission = request.to_submission();
                     submission.scope = broca_protocol::SendScope::Unstamped;
+                    // The frozen sender itself, so the send passes the sender check, which the
+                    // contract runs first, and is refused for its missing run stamp.
+                    submission.principal = Some(broca_protocol::BindPrincipal::Reserved {
+                        module_id: "basal".into(),
+                    });
                     submission
                 }),
                 skip_materialization: false,
