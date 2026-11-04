@@ -12,7 +12,7 @@ use broca_protocol::BindIdentity;
 use broca_store::bus_events::{BusPublisher, Publication};
 use broca_subc::{connection::RouteOpenRetry, SubcConnection};
 use cortexkit_bus_naming::AccountNames;
-use cortexkit_bus_nats::{ConnectConfig, NatsConnection, NatsStream};
+use cortexkit_bus_nats::{CloseOutcome, ConnectConfig, NatsConnection, NatsStream};
 use cortexkit_bus_trait::{DurableOwner, PublishReceipt, Stream, StreamCursor};
 use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -586,6 +586,7 @@ trait Link: Send + Sync {
     fn credential_public(&self) -> &str;
     async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String>;
     async fn attach_compaction(&self) -> Result<Box<dyn StreamCursor>, String>;
+    async fn close(&self, deadline: Duration) -> Result<CloseOutcome, String>;
 }
 
 /// Opens [`Link`]s; a seam so tests can stand in for the broker.
@@ -612,6 +613,13 @@ impl Link for NatsLink {
     }
     async fn attach_compaction(&self) -> Result<Box<dyn StreamCursor>, String> {
         attach_compaction(&self.publisher.connection, &self.publisher.account).await
+    }
+    async fn close(&self, deadline: Duration) -> Result<CloseOutcome, String> {
+        self.publisher
+            .connection
+            .close(deadline)
+            .await
+            .map_err(|_| "ckbus close failed".into())
     }
 }
 
@@ -681,7 +689,7 @@ impl BusConnector for NatsConnector {
                 account: account.clone(),
                 state: Mutex::new(LazyState {
                     link: None,
-                    last_public: None,
+                    needs_redial: false,
                 }),
             }),
         };
@@ -700,7 +708,7 @@ impl BusConnector for NatsConnector {
         let link = state.link.as_ref().ok_or("ckbus connection absent")?;
         let result = link.attach_compaction().await;
         if result.is_err() {
-            state.link = None;
+            state.needs_redial = true;
         }
         result
     }
@@ -752,9 +760,10 @@ struct LazyPublisher {
 }
 struct LazyState {
     link: Option<Box<dyn Link>>,
-    /// The key of the last link that came up, to tell a re-issued key's first connection.
-    last_public: Option<String>,
+    /// Keep a failed link until its replacement is installed, so it can be closed too.
+    needs_redial: bool,
 }
+const CLOSE_DEADLINE: Duration = Duration::from_secs(2);
 /// Links opened by one `ensure_connected` before it gives up: the first, and one more after a
 /// handshake replaced a retired key, plus one spare for a key replaced again meanwhile.
 const MAX_DIALS: u32 = 3;
@@ -770,26 +779,42 @@ impl LazyPublisher {
             if credential.acct != self.account.account() {
                 return Err("ckbus account changed during this process".into());
             }
-            match &state.link {
-                Some(link) if link.credential_public() == credential.credential_public => {
-                    if state
-                        .last_public
-                        .as_ref()
-                        .is_some_and(|last| *last != credential.credential_public)
-                    {
-                        tracing::warn!(target: "bus", "ck-bus connection is up on the re-issued credential");
-                    }
-                    state.last_public = Some(credential.credential_public);
-                    return Ok(());
-                }
-                Some(_) => state.link = None,
-                None => {}
+            if state.link.as_ref().is_some_and(|link| {
+                link.credential_public() == credential.credential_public && !state.needs_redial
+            }) {
+                return Ok(());
             }
             if dials == MAX_DIALS {
                 return Err("ck-bus credential kept changing while connecting".into());
             }
             dials += 1;
-            state.link = Some(self.dialer.dial(&self.holder, &credential).await?);
+            let replacement = self.dialer.dial(&self.holder, &credential).await?;
+            let old = state.link.replace(replacement);
+            state.needs_redial = false;
+            if let Some(old) = old {
+                if old.credential_public() != credential.credential_public {
+                    let old_key_prefix: String = old.credential_public().chars().take(8).collect();
+                    let new_key_prefix: String =
+                        credential.credential_public.chars().take(8).collect();
+                    tracing::info!(target: "bus", old_key_prefix, new_key_prefix, "ck-bus connection swapped to re-issued credential");
+                }
+                // No permission-violation observer is attached to retired connections:
+                // their old inbox resubscriptions must not become publisher diagnostics.
+                // Pending still queues a drain. The authentication callback uses the
+                // current credential even for old connections, so they can reconnect
+                // and process their queued drains.
+                match old.close(CLOSE_DEADLINE).await {
+                    Ok(CloseOutcome::Closed) => {
+                        tracing::info!(target: "bus", "ck-bus old connection closed");
+                    }
+                    Ok(_) => {
+                        tracing::warn!(target: "bus", "ck-bus old connection close pending");
+                    }
+                    Err(_) => {
+                        tracing::warn!(target: "bus", "ck-bus old connection close failed");
+                    }
+                }
+            }
         }
     }
 }
@@ -801,9 +826,9 @@ impl BusPublisher for LazyPublisher {
         let link = state.link.as_ref().ok_or("ckbus connection absent")?;
         let result = link.publish(event).await;
         if result.is_err() {
-            // The next publish dials again on whatever key the holder then has. It never
-            // issues a credential by itself: only ck-bus reporting the key retired does.
-            state.link = None;
+            // The next publish dials again on whatever key the holder then has, then
+            // closes the failed link. Only ck-bus reporting retirement reissues a key.
+            state.needs_redial = true;
         }
         result
     }
@@ -814,7 +839,13 @@ mod tests {
     use super::*;
     use broca_store::{bus_events::DrainResult, SqliteStore};
     use serde_json::json;
-    use std::{collections::VecDeque, sync::Mutex as StdMutex};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex as StdMutex,
+        },
+    };
     type ExpectedCall = (
         &'static str,
         serde_json::Value,
@@ -953,15 +984,13 @@ mod tests {
     struct CkBus(StdMutex<CkBusState>);
     #[derive(Default)]
     struct CkBusState {
-        minted: u32,
         current: Option<String>,
         /// `ckbus.credential` calls broca made.
         issued: u32,
     }
     impl CkBus {
         fn mint(state: &mut CkBusState) -> String {
-            state.minted += 1;
-            let key = format!("U_KEY{}", state.minted);
+            let key = nkeys::KeyPair::new_user().public_key();
             state.current = Some(key.clone());
             key
         }
@@ -1021,6 +1050,10 @@ mod tests {
         published: StdMutex<Vec<String>>,
         /// The key each handshake authenticated with, in order.
         auths: StdMutex<Vec<String>>,
+        connections: StdMutex<Vec<Arc<FakeConnection>>>,
+        closed: StdMutex<Vec<String>>,
+        close_pending: AtomicBool,
+        closing_violations: StdMutex<Vec<String>>,
     }
     impl Broker {
         fn new(ckbus: Arc<CkBus>) -> Arc<Self> {
@@ -1028,24 +1061,36 @@ mod tests {
                 ckbus,
                 published: StdMutex::new(vec![]),
                 auths: StdMutex::new(vec![]),
+                connections: StdMutex::new(vec![]),
+                closed: StdMutex::new(vec![]),
+                close_pending: AtomicBool::new(false),
+                closing_violations: StdMutex::new(vec![]),
             })
         }
     }
     struct FakeLink {
         broker: Arc<Broker>,
-        inbox_key: String,
+        connection: Arc<FakeConnection>,
         auth_key: String,
+    }
+    struct FakeConnection {
+        inbox_key: String,
+        inbox_prefix: String,
+        closed: AtomicBool,
     }
     #[async_trait]
     impl Link for FakeLink {
         fn credential_public(&self) -> &str {
-            &self.inbox_key
+            &self.connection.inbox_key
         }
         async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String> {
+            if self.connection.closed.load(Ordering::SeqCst) {
+                return Err("connection closed".into());
+            }
             if self.broker.ckbus.current().as_deref() != Some(self.auth_key.as_str()) {
                 return Err("connection kicked: user authentication revoked".into());
             }
-            if self.inbox_key != self.auth_key {
+            if self.connection.inbox_key != self.auth_key {
                 return Err("permissions violation for the inbox prefix".into());
             }
             let mut published = self.broker.published.lock().unwrap();
@@ -1054,6 +1099,27 @@ mod tests {
         }
         async fn attach_compaction(&self) -> Result<Box<dyn StreamCursor>, String> {
             Err("the fake broker has no compaction stream".into())
+        }
+        async fn close(&self, deadline: Duration) -> Result<CloseOutcome, String> {
+            assert!(deadline <= Duration::from_secs(3));
+            self.broker
+                .closed
+                .lock()
+                .unwrap()
+                .push(self.connection.inbox_key.clone());
+            // Reconnecting with the current grant can reject the old inbox subscription.
+            // These asynchronous events are separate from a publication's result.
+            self.broker
+                .closing_violations
+                .lock()
+                .unwrap()
+                .push(self.connection.inbox_prefix.clone());
+            if self.broker.close_pending.load(Ordering::SeqCst) {
+                Ok(CloseOutcome::Pending)
+            } else {
+                self.connection.closed.store(true, Ordering::SeqCst);
+                Ok(CloseOutcome::Closed)
+            }
         }
     }
     #[async_trait]
@@ -1072,9 +1138,17 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(auth.credential_public.clone());
+            let connection = Arc::new(FakeConnection {
+                inbox_key: credential.credential_public.clone(),
+                inbox_prefix: ConnectConfig::new(&credential.credential_public)
+                    .unwrap()
+                    .inbox_prefix(),
+                closed: AtomicBool::new(false),
+            });
+            self.connections.lock().unwrap().push(connection.clone());
             Ok(Box::new(FakeLink {
                 broker: self.clone(),
-                inbox_key: credential.credential_public.clone(),
+                connection,
                 auth_key: auth.credential_public,
             }))
         }
@@ -1202,6 +1276,196 @@ mod tests {
             body: vec![],
             digest: None,
         }
+    }
+
+    async fn rotation_fixture() -> (NatsConnector, Arc<Broker>, Arc<dyn BusPublisher>) {
+        let ckbus = Arc::new(CkBus::default());
+        let broker = Broker::new(ckbus.clone());
+        let connector = NatsConnector {
+            holder: CredentialHolder::with_route(ckbus),
+            dialer: Arc::new(broker.clone()),
+            publisher: Mutex::new(None),
+        };
+        let publisher = connector.connect().await.unwrap().publisher;
+        let _receipt = publisher.publish(&publication()).await.unwrap();
+        (connector, broker, publisher)
+    }
+
+    async fn rotate(holder: &CredentialHolder, broker: &Broker) -> Credential {
+        broker.ckbus.issue_elsewhere();
+        // The old connection's authentication callback must still accept the replacement,
+        // so a reconnecting connection can process its queued drain.
+        let (credential, signature) = holder.authenticate(b"reconnect nonce").await.unwrap();
+        assert_eq!(signature, credential.credential_public.as_bytes());
+        credential
+    }
+
+    #[tokio::test]
+    async fn rotation_key_change_closes_old_link_and_moves_held_publisher() {
+        let (connector, broker, publisher) = rotation_fixture().await;
+        let old = broker.connections.lock().unwrap()[0].clone();
+        let replacement = rotate(&connector.holder, &broker).await;
+        let _receipt = publisher.publish(&publication()).await.unwrap();
+        assert_eq!(
+            broker.closed.lock().unwrap().as_slice(),
+            std::slice::from_ref(&old.inbox_key)
+        );
+        assert!(old.closed.load(Ordering::SeqCst));
+        let connections = broker.connections.lock().unwrap();
+        assert_eq!(connections.len(), 2);
+        assert_eq!(
+            connections[1].inbox_prefix,
+            format!("_INBOX.{}", replacement.credential_public)
+        );
+        assert_eq!(broker.published.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rotation_same_key_renewal_preserves_link_before_and_after_swap() {
+        let (connector, broker, publisher) = rotation_fixture().await;
+        for after_swap in [false, true] {
+            if after_swap {
+                rotate(&connector.holder, &broker).await;
+                let _receipt = publisher.publish(&publication()).await.unwrap();
+                assert_eq!(broker.closed.lock().unwrap().len(), 1);
+            }
+            let before = connector.holder.current().await.unwrap();
+            let dials = broker.connections.lock().unwrap().len();
+            let closes = broker.closed.lock().unwrap().len();
+            connector
+                .holder
+                .state
+                .lock()
+                .await
+                .current
+                .as_mut()
+                .unwrap()
+                .exp = now_ms() / 1000 + 60;
+            let _receipt = publisher.publish(&publication()).await.unwrap();
+            let renewed = connector.holder.current().await.unwrap();
+            assert_eq!(before.credential_public, renewed.credential_public);
+            assert_ne!(before.jwt, renewed.jwt);
+            assert_eq!(broker.connections.lock().unwrap().len(), dials);
+            assert_eq!(broker.closed.lock().unwrap().len(), closes);
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_pending_close_warns_and_keeps_replacement() {
+        let (connector, broker, publisher) = rotation_fixture().await;
+        broker.close_pending.store(true, Ordering::SeqCst);
+        rotate(&connector.holder, &broker).await;
+        let (_, logs) = broca_test_support::capture_logs(async {
+            let _receipt = publisher.publish(&publication()).await.unwrap();
+            let _receipt = publisher.publish(&publication()).await.unwrap();
+        })
+        .await;
+        assert_eq!(broker.closed.lock().unwrap().len(), 1);
+        assert_eq!(broker.connections.lock().unwrap().len(), 2);
+        assert_eq!(broker.published.lock().unwrap().len(), 3);
+        assert!(logs.iter().any(|event| event.target == "bus"
+            && event.level == tracing::Level::WARN
+            && event.message() == "ck-bus old connection close pending"));
+    }
+
+    #[tokio::test]
+    async fn rotation_initial_handshake_race_closes_stale_prefix() {
+        let ckbus = Arc::new(CkBus::default());
+        let broker = Broker::new(ckbus.clone());
+        let connector = NatsConnector {
+            holder: CredentialHolder::with_route(ckbus.clone()),
+            dialer: Arc::new(broker.clone()),
+            publisher: Mutex::new(None),
+        };
+        let publisher = connector.connect().await.unwrap().publisher;
+        let initial = connector.holder.current().await.unwrap();
+        ckbus.issue_elsewhere();
+        let _receipt = publisher.publish(&publication()).await.unwrap();
+        assert_eq!(
+            broker.closed.lock().unwrap().as_slice(),
+            std::slice::from_ref(&initial.credential_public)
+        );
+        let connections = broker.connections.lock().unwrap();
+        assert_eq!(connections.len(), 2);
+        assert_eq!(connections[0].inbox_prefix, initial.inbox_prefix);
+        assert_eq!(
+            connections[1].inbox_prefix,
+            format!("_INBOX.{}", ckbus.current().unwrap())
+        );
+        assert!(connections[0].closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn rotation_closing_permission_violations_do_not_reach_health() {
+        let (connector, broker, publisher) = rotation_fixture().await;
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.enable_bus_events("box_test").unwrap();
+        rotate(&connector.holder, &broker).await;
+        queue_run(
+            &store,
+            &BindIdentity::new("/test", "test", "closing"),
+            "closing",
+            1,
+        );
+        let (_, logs) = broca_test_support::capture_logs(async {
+            assert_eq!(drain(&store, publisher.as_ref()).await, Some(2));
+        })
+        .await;
+        assert_eq!(
+            broker.closing_violations.lock().unwrap().len(),
+            1,
+            "the old connection must have emitted its closing inbox violation"
+        );
+        assert_eq!(store.bus_metrics().snapshot()["bus_publish_failures"], 0);
+        assert!(!logs
+            .iter()
+            .any(|event| event.message().contains("permission")));
+    }
+
+    #[tokio::test]
+    async fn rotation_swap_info_logs_only_public_key_prefixes() {
+        let (connector, broker, publisher) = rotation_fixture().await;
+        let old = connector.holder.current().await.unwrap();
+        let new = rotate(&connector.holder, &broker).await;
+        let (_, logs) = broca_test_support::capture_logs(async {
+            let _receipt = publisher.publish(&publication()).await.unwrap();
+            let _receipt = publisher.publish(&publication()).await.unwrap();
+        })
+        .await;
+        let swaps: Vec<_> = logs
+            .iter()
+            .filter(|event| {
+                event.target == "bus"
+                    && event.message() == "ck-bus connection swapped to re-issued credential"
+            })
+            .collect();
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(swaps[0].level, tracing::Level::INFO);
+        assert_eq!(
+            swaps[0].fields["old_key_prefix"],
+            old.credential_public[..8]
+        );
+        assert_eq!(
+            swaps[0].fields["new_key_prefix"],
+            new.credential_public[..8]
+        );
+        assert_eq!(
+            swaps[0].fields.len(),
+            3,
+            "only the message and two prefixes belong in the swap log"
+        );
+        assert!(logs.iter().any(|event| event.level == tracing::Level::INFO
+            && event.message() == "ck-bus old connection closed"));
+        let logged = format!("{logs:?}");
+        for secret in [
+            &old.credential_public,
+            &new.credential_public,
+            &old.jwt,
+            &new.jwt,
+        ] {
+            assert!(!logged.contains(secret));
+        }
+        assert!(!logged.contains(&STANDARD.encode(new.credential_public.as_bytes())));
     }
 
     /// A renewal ck-bus refuses as revoked replaces the key instead of failing every

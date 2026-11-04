@@ -20,12 +20,21 @@ variable is accepted.
 
 ck-bus keeps one current key per module, and each `ckbus.credential` call retires
 the previous one. So the process holds exactly **one** credential, created at boot
-and shared by every NATS connection it opens (the run event publisher and the
-compaction consumer). When `ckbus.nonce_sign` or `ckbus.credential_renew` refuses
+and shared by every NATS connection it opens for run event publication.
+Compaction v2 exchanges requests over the session-scoped `compaction-provider/v2`
+route instead of consuming bus announcements (see [module surface](module-surface.md)).
+When `ckbus.nonce_sign` or `ckbus.credential_renew` refuses
 with `ckbus_credential_superseded` or `ckbus_credential_revoked`, the holder
 issues one replacement for every connection (concurrent callers share it), with
 exponential backoff from 1 to 60 seconds between failed issues; a connection the
-broker kicked reconnects naming the new key, and the publisher reconnects on it.
+broker kicked reconnects naming the new key. Before the next publication, a key
+change replaces the connection and its EVENT stream with ones using the new
+key's inbox prefix. Retained publisher facades follow the replacement. The old
+connection is then closed with a two-second deadline; a pending close logs WARN
+and continues draining in the background when the broker reconnects. Its old-inbox
+permission violations are not observed as publisher health or diagnostics.
+The swap logs INFO with only the first eight characters of the old and new public
+keys. Same-key JWT renewal keeps the connection and does not close or redial it.
 On `ckbus_generation_not_live` it issues nothing: the process is being replaced,
 so it logs once and makes no further ck-bus calls. Every ck-bus failure keeps its
 refusal code and is logged at WARN once per distinct cause and method.
