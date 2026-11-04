@@ -45,7 +45,19 @@ pub fn conditions(
     let window = config
         .context_limit
         .ok_or("compaction requires a frozen context_limit")?;
-    let reserve = config.generation.max_output_tokens.unwrap_or(0);
+    // What the model may still write. A run that froze no `max_output_tokens` of its own (the
+    // ChatGPT route never sends one, since that backend refuses the field) still writes up to
+    // the model's output cap, which the frozen render config holds.
+    let reserve = config
+        .generation
+        .max_output_tokens
+        .or_else(|| {
+            config
+                .frozen_render_config
+                .pointer("/max_output_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(0);
     if window > 9_007_199_254_740_991 || reserve > 9_007_199_254_740_991 {
         return Err(
             "compaction context_limit or output reserve exceeds the protocol integer range".into(),

@@ -1004,7 +1004,10 @@ const V2_SCENARIO: Scenario = Scenario {
     request: v2_request,
     control: v2_control,
     scripts: tool_scripts,
-    render: Render::Canonical,
+    // The scripted provider announces a chain reset before its first request, so the first
+    // step rides for that cause and gets the view. A fresh session has no other cause to ride
+    // for: broca claims `cache_expired` only when its cache clock proves it.
+    render: Render::CompactionChainReset,
     plane: tools,
     extension: Some(&V2Provider),
     expected: RunFinishReason::Completed,

@@ -25,7 +25,8 @@ pub struct At<'a> {
     pub conditions: &'a Conditions,
     pub previous: Option<&'a SendContext>,
     pub current: &'a SendContext,
-    pub cache_warm: bool,
+    /// The prompt cache has provably expired (see `conditions::cache_proven_expired`).
+    pub cache_expired: bool,
     pub chain_reset: bool,
     pub now: u64,
     pub next_mid: &'a str,
@@ -101,7 +102,7 @@ pub async fn prepare(
         conditions::ride_causes(
             at.previous,
             at.current,
-            at.cache_warm,
+            at.cache_expired,
             at.chain_reset,
             tokens,
             at.conditions,

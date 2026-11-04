@@ -680,6 +680,11 @@ pub struct RunControl {
     /// record prefixes at each simulated crash point. Production cannot enable it.
     #[cfg(test)]
     pub(crate) legacy_compaction_fixture: bool,
+    /// Tests of what a compaction ride delivers need a ride on a fresh step. In production, a
+    /// fresh session's first step has no proven cause to ride for, so these tests stand in for
+    /// the cache clock with this flag: it makes the step's cache count as proven expired.
+    #[cfg(test)]
+    pub(crate) compaction_cache_proven_expired: bool,
     /// Session-owned v2 state shared with compaction-runner pushed-view calls.
     pub compaction_session: Option<Arc<crate::compaction_v2::session::Session>>,
     /// Receives durable entry changes without putting v2 notices in the WAL.
@@ -912,6 +917,8 @@ impl Default for RunControl {
         Self {
             #[cfg(test)]
             legacy_compaction_fixture: false,
+            #[cfg(test)]
+            compaction_cache_proven_expired: false,
             compaction_session: None,
             compaction_changes: None,
             new_log_compaction_plan_version: None,
@@ -6418,12 +6425,17 @@ where
             let previous = crate::compaction_v2::host::previous(&frames);
             let now = control.now_ms().unwrap_or_else(crate::compaction::now);
             let raw: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
-            let cache_warm = control
-                .keep_warm
-                .as_ref()
-                .and_then(|driver| driver.timing(&config).ok())
-                .zip(crate::cache_warm::last_cache_send_at_ms(&raw))
-                .is_some_and(|(timing, sent)| now < sent.saturating_add(timing.ttl_ms));
+            let cache_expired = crate::compaction_v2::conditions::cache_proven_expired(
+                control
+                    .keep_warm
+                    .as_ref()
+                    .and_then(|driver| driver.timing(&config).ok())
+                    .map(|timing| timing.ttl_ms),
+                crate::cache_warm::last_cache_send_at_ms(&raw),
+                now,
+            );
+            #[cfg(test)]
+            let cache_expired = cache_expired || control.compaction_cache_proven_expired;
             let next_mid =
                 crate::message_mid(true, Some(&lineage), transcript.entries.len() as u64)
                     .map_err(RunError::Wal)?;
@@ -6449,7 +6461,7 @@ where
                     conditions: &conditions,
                     previous: previous.as_ref(),
                     current: &current,
-                    cache_warm,
+                    cache_expired,
                     chain_reset: chained && provider.prepare_chain_reset(),
                     now,
                     next_mid: &next_mid,

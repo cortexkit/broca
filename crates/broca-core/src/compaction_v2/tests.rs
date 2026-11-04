@@ -618,7 +618,7 @@ fn compaction_v2_rides_include_every_simultaneous_cause() {
     };
     let conditions = session_conditions::conditions(current.model.clone(), 1000, 100, true);
     assert_eq!(
-        session_conditions::ride_causes(Some(&previous), &current, false, true, 901, &conditions),
+        session_conditions::ride_causes(Some(&previous), &current, true, true, 901, &conditions),
         [
             RideCause::CacheExpired,
             RideCause::ChainReset,
@@ -632,7 +632,7 @@ fn compaction_v2_rides_include_every_simultaneous_cause() {
     assert!(session_conditions::ride_causes(
         Some(&current),
         &current,
-        true,
+        false,
         false,
         900,
         &conditions
@@ -1376,7 +1376,7 @@ fn request_at<'a>(
         conditions,
         previous: Some(current),
         current,
-        cache_warm: true,
+        cache_expired: false,
         chain_reset: false,
         now: 1,
         next_mid: "m12345678.1",
@@ -1549,4 +1549,72 @@ async fn compaction_v2_request_ride_view_applies_to_that_request_before_sending(
         ["accepted:1", "applied:1:1"]
     );
     assert!(matches!(&messages[0].content[0], ContentBlock::Text { text } if text.len() == 1000));
+}
+
+/// The ride (broca's call to the compaction provider before a step, naming why the request is
+/// about to change) claims `cache_expired` only when the cache clock proves it. A route with no cache clock,
+/// or a session with no send yet, claims nothing: the provider treats `cache_expired` as a free
+/// rebuild, so a guess there turns every step into a full resend.
+#[test]
+fn cache_expired_is_claimed_only_when_proven() {
+    use session_conditions::cache_proven_expired;
+    assert!(!cache_proven_expired(None, Some(1_000), 10_000_000));
+    assert!(!cache_proven_expired(Some(300_000), None, 10_000_000));
+    assert!(!cache_proven_expired(Some(300_000), Some(1_000), 300_999));
+    assert!(cache_proven_expired(Some(300_000), Some(1_000), 301_000));
+    let causes = session_conditions::ride_causes(
+        Some(&send_context()),
+        &send_context(),
+        false,
+        false,
+        10,
+        &conditions(),
+    );
+    assert!(causes.is_empty(), "{causes:?}");
+}
+
+/// The output reserve is the run's own `max_output_tokens` when it froze one, else the model's
+/// output cap from the frozen render config. The ChatGPT route never sends the field, and its
+/// sessions told the provider a reserve of 0.
+#[test]
+fn the_output_reserve_falls_back_to_the_models_output_cap() {
+    use broca_protocol::request::ModelHandle;
+    use broca_wal::RunConfig;
+    let config = |max_output_tokens: Option<u64>| RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: ModelHandle::new("openai", "gpt-6.1-sol"),
+        tools: Vec::new().into(),
+        tool_choice: Default::default(),
+        generation: broca_protocol::request::GenerationConfig {
+            max_output_tokens,
+            ..Default::default()
+        },
+        response_format: Default::default(),
+        provider_options: serde_json::Value::Null,
+        cache_tiers: serde_json::Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: serde_json::json!({"max_output_tokens": 128000}),
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: Some(1_050_000),
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None,
+    };
+    let reserve = |config: RunConfig| {
+        super::host::conditions(&config, &[], false)
+            .unwrap()
+            .output_reserve
+    };
+    assert_eq!(reserve(config(None)), 128_000);
+    assert_eq!(reserve(config(Some(4_096))), 4_096);
 }

@@ -21,13 +21,13 @@ pub struct SendContext {
 pub fn ride_causes(
     previous: Option<&SendContext>,
     current: &SendContext,
-    cache_warm: bool,
+    cache_expired: bool,
     chain_reset: bool,
     request_tokens: u64,
     conditions: &Conditions,
 ) -> Vec<RideCause> {
     let mut causes = Vec::new();
-    if !cache_warm {
+    if cache_expired {
         causes.push(RideCause::CacheExpired);
     }
     if chain_reset {
@@ -59,6 +59,21 @@ pub fn ride_causes(
         causes.push(RideCause::OverLimit);
     }
     causes
+}
+
+/// Whether the session's prompt cache has provably expired: its cache lifetime is known, the log
+/// records the last send that reached the cache, and that lifetime has run out since. When broca
+/// can't tell (no cache clock for the route, or no send yet), the answer is `false`.
+///
+/// Before a step, broca may *ride*: call the session's compaction provider with the causes that
+/// are about to change the request anyway. The `cache_expired` cause tells the provider that
+/// rewriting history now costs nothing extra, so it publishes any view it has queued. Claiming it when unsure made every step
+/// on routes without a cache clock look like a free rebuild, and each published view then cost a
+/// resend of the whole conversation behind its first edit.
+pub fn cache_proven_expired(ttl_ms: Option<u64>, last_send_ms: Option<u64>, now_ms: u64) -> bool {
+    ttl_ms
+        .zip(last_send_ms)
+        .is_some_and(|(ttl, sent)| now_ms >= sent.saturating_add(ttl))
 }
 
 pub fn usable_window(conditions: &Conditions) -> u64 {

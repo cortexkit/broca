@@ -87,6 +87,7 @@ async fn drive_events(
     control.new_log_compaction_plan_version = Some(cortexkit_compaction_view::PLAN_VERSION);
     control.compaction_plane = Some(plane);
     control.compaction_views = None;
+    control.compaction_cache_proven_expired = true;
     let model = PrefixBound(crate::StubProvider::new(vec![events]));
     let (out, _events) = tokio::sync::mpsc::channel(256);
     let result = crate::run_loop_on_writer(
@@ -1036,7 +1037,7 @@ async fn compaction_v2_context_folds_refreezes_and_tracks_accepted_attempts_befo
         v2::conditions::ride_causes(
             Some(&previous),
             &current,
-            true,
+            false,
             false,
             0,
             &v2::host::conditions(&config, &[], false).unwrap()
