@@ -135,14 +135,16 @@ async fn upload(rig: &mut Rig, mime: &str, bytes: &[u8]) -> String {
         .as_str()
         .unwrap()
         .to_owned();
-    result(
-        &call(
-            rig,
-            "session.upload_append",
-            json!({"upload_id":id,"offset":0,"data":STANDARD.encode(bytes)}),
-        )
-        .await,
-    );
+    for (index, bytes) in bytes.chunks(1_000_000).enumerate() {
+        result(
+            &call(
+                rig,
+                "session.upload_append",
+                json!({"upload_id":id,"offset":index * 1_000_000,"data":STANDARD.encode(bytes)}),
+            )
+            .await,
+        );
+    }
     result(&call(rig, "session.upload_commit", json!({"upload_id":id})).await);
     id
 }
@@ -695,4 +697,228 @@ fn obsolete_media_does_not_refuse_boot_before_connecting() {
         );
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+async fn runner_media_rig(tag: &str, family: WireFamilyId, held: bool) -> Rig {
+    let mut rig = Rig::start(tag).await;
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    *rig.script.media_frozen.lock().unwrap() = Some(frozen(family));
+    rig.script.hold_model(held);
+    rig.script.push(&[Step::Text("ready")]);
+    result(&rig.send("init", "ready", None).await);
+    if held {
+        rig.wait_entered().await;
+    } else {
+        rig.wait_idle().await;
+    }
+    rig
+}
+
+#[tokio::test]
+async fn runner_media_only_send_stores_media_without_empty_text() {
+    let mut rig = runner_media_rig(
+        "synthetic-photo-only",
+        WireFamilyId::AnthropicMessages,
+        false,
+    )
+    .await;
+    let describe = call(&mut rig, "role.describe", json!({})).await;
+    sample("runner", "role.describe", &[describe]);
+    for (index, explicit_empty) in [false, true].into_iter().enumerate() {
+        let id = upload(&mut rig, "image/png", PERSON_PNG).await;
+        rig.script.push(&[Step::Text("seen")]);
+        let mut params = json!({"send_id":format!("photo-{index}"), "delivery":["idle_start"],
+            "model":{"provider":"fake","model":"fake"},
+            "content":[{"type":"upload","upload_id":id}]});
+        if explicit_empty {
+            params["prompt"] = json!("");
+        }
+        let sent = call(&mut rig, "session.send", params).await;
+        if index == 0 {
+            sample("runner", "photo-only.send", std::slice::from_ref(&sent));
+        }
+        if sent.header.ty == subc_protocol::FrameType::Response {
+            rig.wait_idle().await;
+        }
+        let read = call(
+            &mut rig,
+            "session.read",
+            json!({"from_ordinal":3 + index * 2,"limit":1,"media":"blocks"}),
+        )
+        .await;
+        if index == 0 {
+            sample(
+                "runner",
+                "photo-only.stored-message",
+                std::slice::from_ref(&read),
+            );
+        }
+        assert_eq!(
+            sent.header.ty,
+            subc_protocol::FrameType::Response,
+            "{sent:?}"
+        );
+        let page = result(&read);
+        let message: broca_protocol::Message =
+            serde_json::from_value(page["messages"][0]["message"].clone()).unwrap();
+        assert_eq!(message.content.len(), 1);
+        assert!(
+            matches!(&message.content[0], broca_protocol::ContentBlock::Media(media) if media.sha256 == digest(PERSON_PNG))
+        );
+    }
+    let before = rig.wal_bytes();
+    let empty = call(
+        &mut rig,
+        "session.send",
+        json!({"send_id":"empty","model":{"provider":"fake","model":"fake"}}),
+    )
+    .await;
+    let error: Value = serde_json::from_slice(&empty.body).unwrap();
+    assert_eq!(empty.header.ty, subc_protocol::FrameType::Error);
+    assert_eq!(error["code"], "invalid_params");
+    assert_eq!(error["detail"]["field"], "template");
+    assert_eq!(rig.wal_bytes(), before);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn runner_head_reports_known_image_limits_and_omits_unknown_limits() {
+    for (name, family, known) in [
+        ("unknown-limits", WireFamilyId::OpenAiChat, false),
+        ("known-limits", WireFamilyId::AnthropicMessages, true),
+    ] {
+        let mut rig = runner_media_rig(name, family, true).await;
+        let before = rig.wal_bytes();
+        let head = call(&mut rig, "session.head", json!({})).await;
+        sample(
+            "runner",
+            &format!("session.head.{name}"),
+            std::slice::from_ref(&head),
+        );
+        let answer = result(&head);
+        assert_eq!(rig.wal_bytes(), before);
+        rig.script.hold_model(false);
+        rig.wait_idle().await;
+        rig.finish().await;
+        assert_eq!(answer["input"]["attachments"], "yes");
+        if known {
+            assert_eq!(answer["input"]["max_image_bytes"], 7_500_000);
+            assert_eq!(answer["input"]["max_image_dimension"], 8_000);
+        } else {
+            assert!(answer["input"].get("max_image_bytes").is_none());
+            assert!(answer["input"].get("max_image_dimension").is_none());
+        }
+    }
+}
+
+fn durable_media_snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let bytes = if path.is_dir() {
+                Vec::new()
+            } else {
+                std::fs::read(&path).unwrap()
+            };
+            out.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
+            if path.is_dir() {
+                visit(root, &path, out);
+            }
+        }
+    }
+    let mut out = Default::default();
+    visit(root, root, &mut out);
+    out
+}
+
+fn padded_png(bytes: &[u8], size: usize) -> Vec<u8> {
+    assert_eq!(&bytes[bytes.len() - 8..bytes.len() - 4], b"IEND");
+    let padding = size.checked_sub(bytes.len() + 12).unwrap();
+    let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(&bytes[..bytes.len() - 12]);
+    out.extend_from_slice(&u32::try_from(padding).unwrap().to_be_bytes());
+    let chunk_start = out.len();
+    out.extend_from_slice(b"npAD");
+    out.resize(out.len() + padding, 0);
+    let mut crc = flate2::Crc::new();
+    crc.update(&out[chunk_start..]);
+    out.extend_from_slice(&crc.sum().to_be_bytes());
+    out.extend_from_slice(&bytes[bytes.len() - 12..]);
+    assert_eq!(out.len(), size);
+    out
+}
+
+#[tokio::test]
+async fn runner_committed_image_limits_refuse_before_wal_or_media_publication() {
+    let wide = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAIygAAAABCAYAAACzIwVFAAAAOklEQVR4nO3BMQEAAADCoPVPbQ0PoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAGwOMoQABZriCzQAAAABJRU5ErkJggg==").unwrap();
+    let mut rig = runner_media_rig(
+        "synthetic-large-image",
+        WireFamilyId::AnthropicMessages,
+        false,
+    )
+    .await;
+    let mut errors = Vec::new();
+    for (name, mut bytes, byte_limit, dimension_limit) in [
+        ("dimension", wide.clone(), false, true),
+        ("bytes", PERSON_PNG.to_vec(), true, false),
+        ("both", wide, true, true),
+        ("store-ceiling", PERSON_PNG.to_vec(), true, false),
+    ] {
+        if byte_limit {
+            bytes = padded_png(
+                &bytes,
+                if name == "store-ceiling" {
+                    33_554_433
+                } else {
+                    7_500_001
+                },
+            );
+        }
+        let id = upload(&mut rig, "image/png", &bytes).await;
+        let before = rig.wal_bytes();
+        let media = durable_media_snapshot(&rig.dir.join("media-durable"));
+        let refused = call(
+            &mut rig,
+            "session.send",
+            json!({"send_id":name,"prompt":"look","model":{"provider":"fake","model":"fake"},
+            "content":[{"type":"upload","upload_id":id}]}),
+        )
+        .await;
+        if name != "store-ceiling" {
+            sample(
+                "runner",
+                &format!("media_too_large.{name}"),
+                std::slice::from_ref(&refused),
+            );
+        }
+        assert_eq!(
+            refused.header.ty,
+            subc_protocol::FrameType::Error,
+            "{refused:?}"
+        );
+        let error: Value = serde_json::from_slice(&refused.body).unwrap();
+        let mut expected = json!({});
+        if byte_limit {
+            expected["max_image_bytes"] = json!(7_500_000);
+        }
+        if dimension_limit {
+            expected["max_image_dimension"] = json!(8_000);
+        }
+        errors.push((error, expected));
+        assert_eq!(rig.wal_bytes(), before);
+        assert_eq!(
+            durable_media_snapshot(&rig.dir.join("media-durable")),
+            media
+        );
+    }
+    rig.finish().await;
+    for (error, expected) in errors {
+        assert_eq!(error["code"], "media_too_large");
+        assert_eq!(error["detail"], expected);
+    }
 }

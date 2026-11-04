@@ -20,11 +20,18 @@ pub const fn store_max_bytes(kind: MediaKind) -> u64 {
 /// The declared MIME is advisory only: a recognized, allowed magic signature wins
 /// even when the declaration names another type. The returned digest and size are
 /// over exactly `bytes`; callers must not publish anything on an error.
-pub fn validate_media(bytes: &[u8], _declared_mime: &str) -> Result<MediaRef, MediaMarkerReason> {
-    let (kind, mime) = detect(bytes).ok_or(MediaMarkerReason::Mime)?;
+pub fn validate_media(bytes: &[u8], declared_mime: &str) -> Result<MediaRef, MediaMarkerReason> {
+    let (kind, _) = detect(bytes).ok_or(MediaMarkerReason::Mime)?;
     if bytes.len() as u64 > store_max_bytes(kind) {
         return Err(MediaMarkerReason::TooLarge);
     }
+    inspect_media(bytes, declared_mime)
+}
+
+/// Inspect a staged upload before choosing its admission refusal. The caller must enforce
+/// model and store limits before publication; validate_media remains the bounded store gate.
+pub fn inspect_media(bytes: &[u8], _declared_mime: &str) -> Result<MediaRef, MediaMarkerReason> {
+    let (kind, mime) = detect(bytes).ok_or(MediaMarkerReason::Mime)?;
     let dimensions = if kind == MediaKind::Image {
         Some(
             match mime {

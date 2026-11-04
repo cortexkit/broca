@@ -506,6 +506,10 @@ pub fn broca_role_describe_with_writers(
         .role
         .capabilities
         .push(cortexkit_role_llm_runner::capabilities::ATTACHMENTS.into());
+    response
+        .role
+        .capabilities
+        .push(cortexkit_role_llm_runner::capabilities::MEDIA_ONLY_SEND.into());
     response.role.majors[0].ops.extend([
         "session.upload_begin".into(),
         "session.upload_append".into(),
@@ -1252,7 +1256,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "3882df4442ce703fd39aa886adc82df4282e0c977ade5f5f172e56dad689b176",
+            "16179119420e070695c92788082e053407f4b0bef5e7995a633bc6074dcd2fd2",
         );
     }
 
@@ -1433,7 +1437,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "5180347a01e1e3264e72546475b746aad42dc76c23e34f6a71c077c919536a29";
+        "4baae6ad9f52ed917f625af6cff2e519e866b4d6d92cae86deb8ab5862b0532f";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

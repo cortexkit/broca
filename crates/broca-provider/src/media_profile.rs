@@ -453,6 +453,25 @@ pub struct MediaProfile {
 }
 
 impl MediaProfile {
+    /// Known per-image admission limits for an accepted image. Request-wide and
+    /// multi-image limits are not single-image facts; an unstated limit stays unknown.
+    pub fn image_limits(&self) -> (Option<u64>, Option<u32>) {
+        if !self.accepts_modality(MediaKind::Image)
+            || self.image.user_message == MediaCarrier::Marker
+        {
+            return (None, None);
+        }
+        let bytes = self
+            .image
+            .max_item_bytes
+            .map(|limit| match limit {
+                ByteLimit::Decoded(bytes) => bytes,
+                ByteLimit::Encoded(bytes) => (bytes / 4) * 3,
+            })
+            .filter(|bytes| *bytes > 0);
+        (bytes, self.max_image_side(1, 0).filter(|side| *side > 0))
+    }
+
     /// Estimate tokens from the family facts table, never from compressed or base64 size.
     /// Missing dimensions use the fixed image budget rather than guessing a small image.
     pub fn media_tokens(&self, media: &MediaRef) -> u64 {
@@ -1412,5 +1431,47 @@ mod tests {
             media.kind = kind;
             assert_eq!(profile.media_tokens(&media), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod image_limit_facts_tests {
+    use super::*;
+
+    #[test]
+    fn image_limits_convert_encoded_bytes_and_keep_single_image_dimension() {
+        let mut profile = select_media_profile(
+            WireFamilyId::AnthropicMessages,
+            Some(MediaQuirk::Anthropic),
+            "synthetic-model",
+            InputModalities::from_value(&serde_json::json!(["text", "image"])),
+            Some(128_000),
+        );
+        assert_eq!(profile.image_limits(), (Some(7_500_000), Some(8_000)));
+        assert_eq!(profile.max_image_side(21, 0), Some(2_000));
+        profile.image.max_item_bytes = Some(ByteLimit::Encoded(11));
+        assert_eq!(profile.image_limits().0, Some(6));
+        assert!(profile.image.max_item_bytes.unwrap().admits(6));
+        assert!(!profile.image.max_item_bytes.unwrap().admits(7));
+        profile.image.max_item_bytes = Some(ByteLimit::Decoded(11));
+        assert_eq!(profile.image_limits().0, Some(11));
+    }
+
+    #[test]
+    fn image_limits_omit_unknown_or_unaccepted_limits_instead_of_zero() {
+        let mut profile = select_media_profile(
+            WireFamilyId::OpenAiChat,
+            Some(MediaQuirk::Openai),
+            "synthetic-model",
+            InputModalities::from_value(&serde_json::json!(["text", "image"])),
+            Some(128_000),
+        );
+        assert_eq!(profile.image_limits(), (None, None));
+        profile.image.max_item_bytes = Some(ByteLimit::Decoded(123));
+        profile.image.user_message = MediaCarrier::Marker;
+        assert_eq!(profile.image_limits(), (None, None));
+        profile.image.user_message = MediaCarrier::Native;
+        profile.modalities.image = None;
+        assert_eq!(profile.image_limits(), (None, None));
     }
 }

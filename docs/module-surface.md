@@ -315,6 +315,7 @@ their pre-existing unrestricted admission: any attested caller is admitted as ow
 reports the full owner grant to those callers too; reporting absence would incorrectly deny the
 permission the next send actually has. This does not tighten or otherwise change legacy admission.
 Flow sessions recorded without `agent_id_frozen` retain their historical admission that ignores `agent_id`; new flow freezes compare it, including absence.
+After a rollback, an older build cannot send to a flow session created with an `agent_id` and does not enforce the absence freeze on new flow sessions; existing flow sessions are unaffected.
 
 Tool and step-transform plan items may omit `preset`. Broca preserves the omission
 on catalog and declaration calls; it never substitutes an empty string. Mode-3 compaction
@@ -1803,8 +1804,8 @@ after the first model request. Requests without media retain their ordinary rend
 Resume never adds a profile to an older recorded configuration; those runs keep their media
 markers until a fresh episode is admitted. Existing per-family carrier gates remain in force.
 
-`role.describe` always declares the llm-runner `attachments` group and its upload
-and `session.media_read` operations. Upload staging is available independently of the model;
+`role.describe` always declares the llm-runner `attachments` and `media_only_send` groups and its upload
+and `session.media_read` operations. A non-template send with committed media may omit `prompt` or send it empty, storing media parts alone without an empty text part; a send with neither text nor media is refused as `invalid_params` naming `template`. Upload staging is available independently of the model;
 sending an upload requires the frozen profile to accept its kind and exact MIME type.
 The operations follow the pinned llm-runner contract §9.12. In particular,
 `session.media_read {sha256, offset, length}` serves at most 2,097,152 decoded bytes as
@@ -1824,6 +1825,7 @@ session open. A send carrying a kind the model cannot accept is refused before a
 `session.head.input` reports a finished episode's next model's accepted input kinds and exact
 MIME types from the in-memory catalog
 and adapter MIME filter without changing the recorded config or fetching catalog data.
+Known per-image `max_image_bytes` (uploaded file bytes, not base64 bytes) and `max_image_dimension` (longest side for one image) come from that same profile; unknown limits are omitted, never zero. A committed image exceeding a reported limit is refused before writing as non-retryable `media_too_large`, whose detail contains only the exceeded limits.
 Active resident heads use frozen facts published by the writer's durable metadata tap.
 Nonresident resumable heads cache the frozen facts by session, lineage and WAL sequence;
 only a cold position requires a historical read. No stored head-projection shape is added.

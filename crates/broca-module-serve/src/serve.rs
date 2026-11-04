@@ -3104,6 +3104,18 @@ where
                 )
                 .await;
             }
+            if let Err(field) = params.check_prompt_for(true) {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some(field.into()),
+                    "prompt must contain text or media; a template send must omit prompt",
+                )
+                .await;
+            }
             let describe = broca_wire::broca_role_describe_with_writers(
                 env!("CARGO_PKG_VERSION"),
                 handler.compaction_supported(),
@@ -4729,6 +4741,7 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::SendRetracted { .. } => "send_retracted".into(),
         ServeError::SendEnded { .. } => "send_ended".into(),
         ServeError::DeliveryRefused { code, .. } => (*code).into(),
+        ServeError::MediaTooLarge(_) => cortexkit_role_llm_runner::errors::MEDIA_TOO_LARGE.into(),
         ServeError::TemplatePartGone { .. } => {
             cortexkit_role_llm_runner::errors::TEMPLATE_PART_GONE.into()
         }
@@ -4917,6 +4930,16 @@ async fn send_serve_error(
         ServeError::DeliveryRefused { code, .. } => {
             let body = ErrorBody::new(*code, err.to_string())
                 .with_detail(serde_json::json!({"field": "delivery"}));
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
+        ServeError::MediaTooLarge(detail) => {
+            let body = ErrorBody::new(
+                cortexkit_role_llm_runner::errors::MEDIA_TOO_LARGE,
+                err.to_string(),
+            )
+            .with_detail(
+                serde_json::to_value(detail).map_err(|error| ServeIoError(error.to_string()))?,
+            );
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::TemplatePartGone { slot } => {

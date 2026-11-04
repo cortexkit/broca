@@ -1506,6 +1506,7 @@ pub enum ServeError {
         harness: String,
     },
     Upload(broca_core::media_uploads::UploadError),
+    MediaTooLarge(cortexkit_role_llm_runner::errors::MediaTooLargeDetail),
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     UnknownSend,
     SessionMoving {
@@ -1688,6 +1689,7 @@ impl std::fmt::Display for ServeError {
         match self {
             ServeError::SessionLogMissing { session, harness } => OpenError::SessionLogMissing { session: session.clone(), harness: harness.clone(), read: None }.fmt(f),
             Self::Upload(error) => error.fmt(f),
+            Self::MediaTooLarge(_) => f.write_str("committed image exceeds a reported image limit"),
             ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
             ServeError::SessionMoving { cut_id } => write!(f, "session is moving under cut {cut_id}"),
             ServeError::SessionMoved { holder } => write!(f, "session moved to {holder}"),
@@ -2764,6 +2766,7 @@ impl ServeHandler for crate::LineageRegistry {
                 Err(ServeError::ServiceTierInvalid { reason, message })
             }
             SendOutcome::Upload(error) => Err(ServeError::Upload(error)),
+            SendOutcome::MediaTooLarge(detail) => Err(ServeError::MediaTooLarge(detail)),
             // Actor errors can combine replay, storage and lifecycle failures after type erasure.
             SendOutcome::Error(e) => Err(ServeError::Open(e, None)),
             SendOutcome::ClassifiedError { reason, class } => {
@@ -4963,6 +4966,7 @@ mod context_ceiling_tests {
 fn media_preflight_error(error: broca_core::RunError) -> ServeError {
     match error {
         broca_core::RunError::Upload(error) => ServeError::Upload(error),
+        broca_core::RunError::MediaTooLarge(detail) => ServeError::MediaTooLarge(detail),
         broca_core::RunError::MediaUnsupported(message) => ServeError::DeliveryRefused {
             code: "media_unsupported",
             message,
