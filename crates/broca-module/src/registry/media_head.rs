@@ -186,9 +186,11 @@ fn input(profile: &broca_provider::media_profile::MediaProfile) -> HeadInput {
     if modalities.is_empty() {
         return broca_wire::head_input();
     }
-    HeadInput::new("yes")
+    let mut input = HeadInput::new("yes")
         .with_modalities(modalities)
-        .with_mime_types(broca_provider::person_media::input_mime_types(profile))
+        .with_mime_types(broca_provider::person_media::input_mime_types(profile));
+    (input.max_image_bytes, input.max_image_dimension) = profile.image_limits();
+    input
 }
 
 fn quote_request(model: &HeadModel) -> SubmissionRequest {

@@ -13,6 +13,7 @@ fn diagnostics_manifest_declares_complete_flow_operations() {
             owner: broca_protocol::BindPrincipal::Reserved {
                 module_id: "prefrontal-core".into(),
             },
+            agent_id_frozen: false,
             scope_ref: "flow".into(),
             scope_epoch: 1,
             flow_id: Some("flow".into()),

@@ -578,6 +578,7 @@ fn to_bind_scope(
     let run_id = stamp.attributes.run_id.clone();
     let agent_id = run_id
         .as_ref()
+        .or(flow_id.as_ref())
         .and(stamp.attributes.agent_id.as_ref())
         .cloned();
     let sender = flow_id
@@ -588,6 +589,7 @@ fn to_bind_scope(
     broca_protocol::BindScope {
         scope: broca_protocol::SessionScope {
             owner: to_bind_principal(&stamp.owner),
+            agent_id_frozen: false,
             scope_ref: stamp.scope_ref.clone(),
             scope_epoch: stamp.scope_epoch,
             flow_id,
@@ -3102,6 +3104,18 @@ where
                 )
                 .await;
             }
+            if let Err(field) = params.check_prompt_for(true) {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some(field.into()),
+                    "prompt must contain text or media; a template send must omit prompt",
+                )
+                .await;
+            }
             let describe = broca_wire::broca_role_describe_with_writers(
                 env!("CARGO_PKG_VERSION"),
                 handler.compaction_supported(),
@@ -4727,6 +4741,7 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::SendRetracted { .. } => "send_retracted".into(),
         ServeError::SendEnded { .. } => "send_ended".into(),
         ServeError::DeliveryRefused { code, .. } => (*code).into(),
+        ServeError::MediaTooLarge(_) => cortexkit_role_llm_runner::errors::MEDIA_TOO_LARGE.into(),
         ServeError::TemplatePartGone { .. } => {
             cortexkit_role_llm_runner::errors::TEMPLATE_PART_GONE.into()
         }
@@ -4915,6 +4930,16 @@ async fn send_serve_error(
         ServeError::DeliveryRefused { code, .. } => {
             let body = ErrorBody::new(*code, err.to_string())
                 .with_detail(serde_json::json!({"field": "delivery"}));
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
+        ServeError::MediaTooLarge(detail) => {
+            let body = ErrorBody::new(
+                cortexkit_role_llm_runner::errors::MEDIA_TOO_LARGE,
+                err.to_string(),
+            )
+            .with_detail(
+                serde_json::to_value(detail).map_err(|error| ServeIoError(error.to_string()))?,
+            );
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::TemplatePartGone { slot } => {
@@ -5124,6 +5149,15 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
         Err(refusal) => return Err(refusal.into()),
     };
     let plan_state = handler.plan_state(session).await;
+    let opener = handler
+        .frozen_scope_opener(session)
+        .await
+        .or_else(|| scope.and_then(broca_module::serve::scope_plan_opener));
+    cortexkit_role_llm_runner::scope_admission::check_plan_senders(
+        opener.as_deref(),
+        &parsed.senders,
+    )
+    .map_err(broca_fetch_plan::Refusal::invalid)?;
     // A new plan names its compaction preset before any other send member is weighed, so a
     // missing preset is refused as itself (llm-runner 0.8 kit `compaction_item_preset_required`).
     // A re-send of the session's frozen plan, including a legacy one without a preset, passes.
@@ -6718,6 +6752,9 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    created_at: None,
+                    completed_at: None,
+                    reasoning_summaries: Vec::new(),
                     client_message_id: None,
                     tool_times: Vec::new(),
                     rich_ui: None,
@@ -6739,6 +6776,9 @@ mod tests {
                     part_digests: None,
                 },
                 SessionReadMessage {
+                    created_at: None,
+                    completed_at: None,
+                    reasoning_summaries: Vec::new(),
                     client_message_id: None,
                     tool_times: Vec::new(),
                     rich_ui: None,
@@ -10259,6 +10299,30 @@ mod agent_run_writer_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn flow_bind_preserves_agent_identity_for_new_freezes() {
+        let stamp: subc_protocol::scope::ScopeStamp = serde_json::from_value(serde_json::json!({
+            "owner":{"kind":"reserved","module_id":"owner-module"},
+            "ref":"flow","scope_epoch":1,"kind":"head","owner_authorized":true,
+            "attributes":{"flow_id":"flow","agent_id":"agent-a"}
+        }))
+        .unwrap();
+        let principal = subc_protocol::Principal::Reserved {
+            module_id: "flow-carrier".into(),
+        };
+        let bind = to_bind_scope(&stamp, Some(&principal));
+        assert_eq!(bind.scope.agent_id.as_deref(), Some("agent-a"));
+        let decision = broca_core::decide_scope(
+            &broca_core::SessionOwnershipV1::default(),
+            Some(&to_bind_principal(&principal)),
+            &broca_protocol::SendScope::Stamped(bind),
+        )
+        .unwrap();
+        let scope = decision.scope().unwrap();
+        assert!(scope.agent_id_frozen);
+        assert_eq!(scope.agent_id.as_deref(), Some("agent-a"));
     }
 
     #[test]

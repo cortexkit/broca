@@ -465,6 +465,9 @@ fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                created_at: None,
+                completed_at: None,
+                reasoning_summaries: Vec::new(),
                 client_message_id: None,
                 tool_times: Vec::new(),
                 rich_ui: None,
@@ -618,6 +621,19 @@ fn baseline_owner_mismatch(
         }
         (None, None) => None,
     }
+}
+
+/// A frozen automation's plan may grant sends only to the sender recorded in its
+/// flow/run scope. Reserved principals use the module spelling carried by `plan.senders`,
+/// not the owner spelling.
+pub fn scope_plan_opener(scope: &broca_protocol::SessionScope) -> Option<String> {
+    if scope.flow_id.is_none() && scope.run_id.is_none() {
+        return None;
+    }
+    scope.sender.as_ref().map(|sender| match sender {
+        broca_protocol::BindPrincipal::Reserved { module_id } => module_id.clone(),
+        other => other.as_owner_string(),
+    })
 }
 
 /// The final assistant message of the completed run `run_id`: the last assistant message of the
@@ -1491,6 +1507,7 @@ pub enum ServeError {
         harness: String,
     },
     Upload(broca_core::media_uploads::UploadError),
+    MediaTooLarge(cortexkit_role_llm_runner::errors::MediaTooLargeDetail),
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     UnknownSend,
     SessionMoving {
@@ -1673,6 +1690,7 @@ impl std::fmt::Display for ServeError {
         match self {
             ServeError::SessionLogMissing { session, harness } => OpenError::SessionLogMissing { session: session.clone(), harness: harness.clone(), read: None }.fmt(f),
             Self::Upload(error) => error.fmt(f),
+            Self::MediaTooLarge(_) => f.write_str("committed image exceeds a reported image limit"),
             ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
             ServeError::SessionMoving { cut_id } => write!(f, "session is moving under cut {cut_id}"),
             ServeError::SessionMoved { holder } => write!(f, "session moved to {holder}"),
@@ -2171,6 +2189,12 @@ pub trait ServeHandler: Send + Sync {
     /// Where `session` stands with respect to fetch plans. The default cannot tell.
     async fn plan_state(&self, _session: &LineageKey) -> PlanState {
         PlanState::Unknown
+    }
+
+    /// The durable flow/run opener, if this session has frozen one. Reads and ordinary
+    /// unscoped or plain-scoped sessions keep their existing admission policy.
+    async fn frozen_scope_opener(&self, _session: &LineageKey) -> Option<String> {
+        None
     }
 
     /// What admits a send's fetch plan. The default has none, so such a send is refused.
@@ -2743,6 +2767,7 @@ impl ServeHandler for crate::LineageRegistry {
                 Err(ServeError::ServiceTierInvalid { reason, message })
             }
             SendOutcome::Upload(error) => Err(ServeError::Upload(error)),
+            SendOutcome::MediaTooLarge(detail) => Err(ServeError::MediaTooLarge(detail)),
             // Actor errors can combine replay, storage and lifecycle failures after type erasure.
             SendOutcome::Error(e) => Err(ServeError::Open(e, None)),
             SendOutcome::ClassifiedError { reason, class } => {
@@ -2894,6 +2919,14 @@ impl ServeHandler for crate::LineageRegistry {
                     .map(|manifest| manifest.plan_identity.clone()),
             },
         }
+    }
+
+    async fn frozen_scope_opener(&self, session: &LineageKey) -> Option<String> {
+        self.session_ownership_for_bind(session)
+            .await
+            .and_then(|ownership| ownership.scope)
+            .as_ref()
+            .and_then(scope_plan_opener)
     }
 
     fn plan_admitter(&self) -> Option<std::sync::Arc<dyn broca_fetch_plan::PlanAdmitter>> {
@@ -3180,6 +3213,22 @@ impl ServeHandler for crate::LineageRegistry {
             page.next_from_ordinal = None;
         }
         let prompt_len = page.prompt_len;
+        let creations: std::collections::BTreeMap<_, _> = if req.include_display_facts {
+            page.messages
+                .iter()
+                .filter_map(|entry| entry.created_at.map(|at| (entry.ordinal, at)))
+                .collect()
+        } else {
+            Default::default()
+        };
+        let completions: std::collections::BTreeMap<_, _> = if req.include_display_facts {
+            page.messages
+                .iter()
+                .filter_map(|entry| entry.completed_at.map(|at| (entry.ordinal, at)))
+                .collect()
+        } else {
+            Default::default()
+        };
         let mut response = session_read_response(page, tools);
         response.history_version = snapshot.history_version;
         response.incarnation = snapshot.incarnation;
@@ -3198,6 +3247,25 @@ impl ServeHandler for crate::LineageRegistry {
                     )
                     .await?;
                 for entry in &mut response.messages {
+                    entry.created_at = creations.get(&(entry.ordinal - 1)).copied();
+                    if entry.message.role == broca_protocol::Role::Assistant {
+                        entry.completed_at = completions.get(&(entry.ordinal - 1)).copied();
+                        entry.reasoning_summaries = entry
+                            .message
+                            .content
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(part, block)| {
+                                let stored = serde_json::to_value(block).ok()?;
+                                let text =
+                                    cortexkit_role_llm_runner::display::reasoning_summary(&stored)?;
+                                Some(cortexkit_role_llm_runner::read::ReasoningSummary::new(
+                                    u32::try_from(part).ok()?,
+                                    text,
+                                ))
+                            })
+                            .collect();
+                    }
                     if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
                         if entry.message.role == broca_protocol::Role::User {
                             entry.client_message_id = facts.client_message_id.clone();
@@ -4125,6 +4193,21 @@ impl ServeHandler for crate::LineageRegistry {
         if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
             return Err(SessionChangeError::OwnerMismatch(Box::new(mismatch)));
         }
+        let opener = records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.record {
+                broca_wal::WalRecord::RunStarted {
+                    scope: Some(scope), ..
+                } => scope_plan_opener(scope),
+                _ => None,
+            });
+        let senders =
+            broca_fetch_plan::plan_senders(&plan).map_err(SessionChangeError::FetchRefused)?;
+        cortexkit_role_llm_runner::scope_admission::check_plan_senders(opener.as_deref(), &senders)
+            .map_err(|field| {
+                SessionChangeError::FetchRefused(broca_fetch_plan::Refusal::invalid(field))
+            })?;
         if !rungs::ALL.contains(&policy.as_str()) {
             return Err(SessionChangeError::InvalidParams {
                 field: "policy".into(),
@@ -4893,6 +4976,7 @@ mod context_ceiling_tests {
 fn media_preflight_error(error: broca_core::RunError) -> ServeError {
     match error {
         broca_core::RunError::Upload(error) => ServeError::Upload(error),
+        broca_core::RunError::MediaTooLarge(detail) => ServeError::MediaTooLarge(detail),
         broca_core::RunError::MediaUnsupported(message) => ServeError::DeliveryRefused {
             code: "media_unsupported",
             message,

@@ -409,7 +409,9 @@ pub struct HeldPrefix {
 /// One materialized message row, preserving its lineage ordinal.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePageRow {
+    pub created_at: Option<u64>,
     pub written_at: Option<u64>,
+    pub completed_at: Option<u64>,
     pub ordinal: u64,
     pub message: Message,
     pub run: Option<crate::RunAttribution>,
@@ -1619,7 +1621,9 @@ pub fn emit_lineage_usage_exports(
 /// prompt ordinal, which is kept out of [`Message`]'s serde shape for render byte stability.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionReadMessage {
+    pub created_at: Option<u64>,
     pub written_at: Option<u64>,
+    pub completed_at: Option<u64>,
     pub ordinal: u64,
     pub message: Message,
     pub run: Option<crate::RunAttribution>,
@@ -1747,7 +1751,9 @@ pub fn read_session_page(
                 })
                 .cloned()
                 .map(|row| SessionReadMessage {
+                    created_at: row.created_at,
                     written_at: row.written_at,
+                    completed_at: row.completed_at,
                     ordinal: row.ordinal,
                     message: row.message,
                     run: row.run,
@@ -1797,7 +1803,9 @@ pub fn read_session_page_owned_with_dispatches(
                     !discard_materialized_seed && row.ordinal >= start && row.ordinal < end
                 })
                 .map(|row| SessionReadMessage {
+                    created_at: row.created_at,
                     written_at: row.written_at,
+                    completed_at: row.completed_at,
                     ordinal: row.ordinal,
                     message: row.message,
                     run: row.run,
@@ -1853,21 +1861,20 @@ fn read_session_page_from_rows(
     } else {
         snapshot.prefix_len
     });
-    let times = if mode3 {
-        let seed = if discard_materialized_seed {
+    let creations = crate::creation_times::project(
+        framed_tail.iter().map(|frame| &frame.record),
+        placement.clone(),
+        queued.clone(),
+        if discard_materialized_seed {
             Default::default()
         } else {
             snapshot
                 .head
                 .as_ref()
-                .and_then(|head| head.mode3_times.clone())
+                .and_then(|head| head.creation_times.clone())
                 .unwrap_or_default()
-        };
-        crate::message_times::mode3_written_times(records, placement, queued, seed)
-            .map(|fold| fold.times)
-    } else {
-        crate::message_times::written_times_with_queued(records, placement, queued)
-    }
+        },
+    )
     .map_err(|reason| crate::ReplayError::CorruptLineage {
         episode_run_id: snapshot
             .last_run_id
@@ -1875,6 +1882,26 @@ fn read_session_page_from_rows(
             .unwrap_or_else(|| RunId(String::new())),
         reason,
     })?;
+    let seed = if mode3 && !discard_materialized_seed {
+        snapshot
+            .head
+            .as_ref()
+            .and_then(|head| head.mode3_times.clone())
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let time_facts =
+        crate::message_times::fold(records, placement, queued, mode3, seed).map_err(|reason| {
+            crate::ReplayError::CorruptLineage {
+                episode_run_id: snapshot
+                    .last_run_id
+                    .clone()
+                    .unwrap_or_else(|| RunId(String::new())),
+                reason,
+            }
+        })?;
+    let times = time_facts.times;
     let mut tail_state = crate::replay::replay_seeded(
         framed_tail.iter().map(|framed| &framed.record),
         snapshot.trailing_origin.clone(),
@@ -1907,6 +1934,12 @@ fn read_session_page_from_rows(
     } else {
         snapshot.prefix_len
     };
+    let completions = crate::compaction_v2::entries::completion_times(
+        &tail_state.prompt,
+        prefix_len,
+        &times,
+        &time_facts.native_assistants,
+    );
     let prompt_len = prefix_len.saturating_add(tail_len);
     let start = match from_ordinal {
         Some(from) => from.min(prompt_len),
@@ -1926,7 +1959,9 @@ fn read_session_page_from_rows(
                 let ordinal = prefix_len + tail_start + index as u64;
                 message.ordinal = Some(ordinal);
                 SessionReadMessage {
+                    created_at: creations.times.get(&ordinal).copied(),
                     written_at: times.get(&ordinal).copied(),
+                    completed_at: completions[(tail_start as usize) + index],
                     ordinal,
                     message,
                     run: tail_state.message_runs[(tail_start + index as u64) as usize].clone(),
@@ -2222,6 +2257,8 @@ fn read_session_page_full(
         .cloned()
         .enumerate()
         .map(|(index, message)| SessionReadMessage {
+            created_at: None,
+            completed_at: None,
             written_at: None,
             run: runs[(start + index as u64) as usize].clone(),
             ordinal: message.ordinal.unwrap_or(start + index as u64),
@@ -3647,7 +3684,9 @@ mod tests {
                 let ordinal = index as u64;
                 message.ordinal = Some(ordinal);
                 StorePageRow {
+                    created_at: None,
                     written_at: None,
+                    completed_at: None,
                     ordinal,
                     message,
                     run: runs[index].clone(),
@@ -3830,7 +3869,9 @@ mod tests {
                 );
                 message.ordinal = Some(ordinal);
                 StorePageRow {
+                    created_at: None,
                     written_at: None,
+                    completed_at: None,
                     ordinal,
                     message,
                     run: None,

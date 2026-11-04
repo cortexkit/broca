@@ -1033,6 +1033,7 @@ pub enum RunError {
     CompactionContextLimitMissing,
     /// Person media failed admission before a record could name it.
     MediaUnsupported(String),
+    MediaTooLarge(cortexkit_role_llm_runner::errors::MediaTooLargeDetail),
     /// Preserve the upload contract's refusal code and retry class before admission.
     Upload(crate::media_uploads::UploadError),
     /// Unsupported reasoning variant, refused before durable admission.
@@ -1162,6 +1163,7 @@ impl RunError {
             Self::Config(_)
             | Self::CompactionContextLimitMissing
             | Self::MediaUnsupported(_)
+            | Self::MediaTooLarge(_)
             | Self::VariantUnsupported(_)
             | Self::ToolAliasInvalid(_)
             | Self::SendIdReuse { .. }
@@ -1210,6 +1212,7 @@ impl std::fmt::Display for RunError {
             RunError::Config(s) => write!(f, "run resolution failed: {s}"),
             RunError::CompactionContextLimitMissing => write!(f, "context_limit is required for mode-3 compaction"),
             RunError::MediaUnsupported(s) => write!(f, "{s}"),
+            RunError::MediaTooLarge(_) => write!(f, "committed image exceeds a reported image limit"),
             RunError::Upload(error) => write!(f, "{error}"),
             RunError::Transient(s) => write!(f, "run admission temporarily unavailable: {s}"),
             RunError::SendIdReuse { differing } => write!(

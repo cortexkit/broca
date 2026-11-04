@@ -171,6 +171,7 @@ fn scope(flow: bool) -> SendScope {
     SendScope::Stamped(BindScope {
         scope: SessionScope {
             owner: principal(),
+            agent_id_frozen: false,
             scope_ref: "stamped-scope".into(),
             scope_epoch: 1,
             flow_id: flow.then(|| "flow".into()),

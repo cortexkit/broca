@@ -1909,6 +1909,7 @@ async fn assert_historical_session_ops_do_not_fork(forked_stub: bool) {
                         owner: broca_protocol::BindPrincipal::Reserved {
                             module_id: "core".into(),
                         },
+                        agent_id_frozen: false,
                         scope_ref: "work".into(),
                         scope_epoch: 1,
                         flow_id: None,
@@ -2842,6 +2843,7 @@ async fn check_scoped_session_reads(agent_run: bool) {
             *principal = sender.clone().or_else(|| Some(owner.clone()));
             *scope = Some(broca_protocol::SessionScope {
                 owner,
+                agent_id_frozen: false,
                 scope_ref: "head-1".into(),
                 scope_epoch: 3,
                 flow_id: None,

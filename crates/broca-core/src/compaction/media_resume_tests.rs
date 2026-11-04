@@ -117,6 +117,8 @@ impl crate::MaterializedStore for MediaResumeStore {
                         .is_some_and(|ordinal| from <= ordinal && ordinal < from + limit)
                 })
                 .map(|message| crate::context::StorePageRow {
+                    created_at: None,
+                    completed_at: None,
                     ordinal: message.ordinal.unwrap(),
                     written_at: None,
                     message: message.clone(),

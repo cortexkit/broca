@@ -4740,6 +4740,7 @@ async fn every_batch_carries_the_runs_frozen_scope() {
         owner: broca_protocol::BindPrincipal::Reserved {
             module_id: "prefrontal".into(),
         },
+        agent_id_frozen: false,
         scope_ref: "head-1".into(),
         scope_epoch: 4,
         flow_id: None,

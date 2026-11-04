@@ -201,6 +201,7 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
         owner: broca_protocol::BindPrincipal::Reserved {
             module_id: OWNER.into(),
         },
+        agent_id_frozen: false,
         scope_ref: SCOPE_REF.into(),
         scope_epoch: SCOPE_EPOCH,
         flow_id: None,
@@ -1203,6 +1204,7 @@ async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity()
         frozen,
         [(
             Some(broca_protocol::SessionScope {
+                agent_id_frozen: false,
                 owner: owner_principal.clone(),
                 scope_ref: SCOPE_REF.into(),
                 scope_epoch: SCOPE_EPOCH,
@@ -1333,6 +1335,7 @@ async fn an_ordered_first_send_freezes_the_stamped_scope() {
     assert_eq!(
         scopes,
         [Some(broca_protocol::SessionScope {
+            agent_id_frozen: false,
             owner: broca_protocol::BindPrincipal::Reserved {
                 module_id: OWNER.into(),
             },
@@ -1423,6 +1426,7 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
         scopes,
         [(
             Some(broca_protocol::SessionScope {
+                agent_id_frozen: true,
                 owner: broca_protocol::BindPrincipal::Reserved {
                     module_id: OWNER.into()
                 },
@@ -1430,7 +1434,7 @@ async fn real_flow_carrier_freezes_identity_refuses_tools_changes_and_adoption()
                 scope_epoch: SCOPE_EPOCH,
                 flow_id: Some("flow-a".into()),
                 sender: Some(sender.clone()),
-                agent_id: None,
+                agent_id: Some("owner-agent".into()),
                 run_id: None,
             }),
             Some(sender)
@@ -1933,10 +1937,12 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
             let before = std::fs::read(&path).unwrap_or_default();
             let index_before = admission_index_rows(&rig);
             let error = send(&conn, &other_route, "wrong-sender").await.unwrap_err();
-            assert!(
-                error.to_string().contains("scope_owner_mismatch"),
-                "{module}: {error}"
-            );
+            let expected = if key == &session {
+                "scope_sender_mismatch"
+            } else {
+                "scope_owner_mismatch"
+            };
+            assert_eq!(error.code(), Some(expected), "{module}: {error}");
             assert_eq!(
                 std::fs::read(&path).unwrap_or_default(),
                 before,
@@ -1968,13 +1974,20 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
         let changed = open_scoped(&basal, &session).await.unwrap();
         let before = std::fs::read(&path).unwrap();
         let index_before = admission_index_rows(&rig);
-        let error = send(&basal, &changed, "changed-identity")
+        let body = serde_json::json!({"method":"session.send","params":{
+            "prompt":"hi","send_id":"changed-identity","model":{"provider":"mock","model":"mock-model"}
+        }});
+        let error = basal
+            .route_unary_reply(
+                &changed,
+                serde_json::to_vec(&body).unwrap(),
+                Duration::from_secs(20),
+            )
             .await
+            .unwrap()
             .unwrap_err();
-        assert!(
-            error.to_string().contains("scope_run_mismatch") && error.to_string().contains(field),
-            "{error}"
-        );
+        assert_eq!(error.code, format!("scope_{field}_mismatch"));
+        assert_eq!(error.detail.unwrap()["field"], field);
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,

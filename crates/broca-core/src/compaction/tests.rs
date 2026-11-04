@@ -980,6 +980,8 @@ fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
             .cloned()
             .enumerate()
             .map(|(i, message)| crate::StorePageRow {
+                created_at: None,
+                completed_at: None,
                 written_at: None,
                 run: None,
                 ordinal: i as u64,

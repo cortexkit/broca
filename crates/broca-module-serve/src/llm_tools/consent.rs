@@ -727,6 +727,7 @@ fn session(row: &HeldCall) -> SessionScope {
     };
     SessionScope {
         owner,
+        agent_id_frozen: false,
         scope_ref: row.scope.scope_ref.clone(),
         scope_epoch: row.scope.scope_epoch,
         agent_id: Some(row.agent_id.clone()),

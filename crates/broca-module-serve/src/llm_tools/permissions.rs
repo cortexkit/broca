@@ -113,6 +113,7 @@ impl Permissions {
                 };
                 io.run_live(&SessionScope {
                     owner,
+                    agent_id_frozen: false,
                     scope_ref: scope.scope_ref.clone(),
                     scope_epoch: scope.scope_epoch,
                     agent_id: Some(grant.holder.clone()),

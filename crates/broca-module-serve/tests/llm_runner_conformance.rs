@@ -53,6 +53,87 @@ const OWNER_MODULE: &str = "conformance-owner";
 const SENDER_MODULE: &str = "conformance-sender";
 const HEAD_SENDER_MODULE: &str = "conformance-head-sender";
 const STRANGER_MODULE: &str = "conformance-stranger";
+const PLAIN_SCOPE_REF: &str = "conformance-plain";
+const FLOW_SCOPE_REF: &str = "conformance-flow";
+// The supervised stub's scope.sync correlations start at 1_000_001.
+const FIRST_SCOPE_SYNC_CORR: u64 = 1_000_001;
+
+fn scope_fixture_records() -> Value {
+    json!([
+        {"ref":PLAIN_SCOPE_REF,"scope_epoch":1,"kind":"head","attributes":{},
+         "carriers":[{"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]}]},
+        {"ref":FLOW_SCOPE_REF,"scope_epoch":1,"kind":"head",
+         "attributes":{"flow_id":"conformance-flow","agent_id":"conformance-agent"},
+         "carriers":[{"principal":{"kind":"reserved","module_id":SENDER_MODULE},"targets":["broca"]}]}
+    ])
+}
+
+fn scope_fixture_stamps(reference: &str) -> (RouteStamp, RouteStamp) {
+    let scope = cortexkit_role_harness::ScopeStamp {
+        owner: format!("reserved:{OWNER_MODULE}"),
+        scope_ref: reference.into(),
+        scope_epoch: 1,
+    };
+    (
+        RouteStamp {
+            principal: format!("reserved:{SENDER_MODULE}"),
+            scope: Some(scope.clone()),
+        },
+        RouteStamp {
+            principal: scope.owner.clone(),
+            scope: Some(scope),
+        },
+    )
+}
+
+/// Publish both records through the supervised owner's real scope.sync, then require
+/// its correlated daemon acknowledgement before opening any scope fixture route.
+async fn publish_scope_fixtures(path: &Path, events: &Path) -> Result<(), HarnessError> {
+    let staging = path.with_extension("staging");
+    std::fs::write(
+        &staging,
+        serde_json::to_vec(&scope_fixture_records()).unwrap(),
+    )
+    .and_then(|_| std::fs::rename(&staging, path))
+    .map_err(|error| HarnessError::new(format!("publishing scope fixtures: {error}")))?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let reply = std::fs::read_to_string(events)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| {
+                event["corr"] == FIRST_SCOPE_SYNC_CORR
+                    && (event["kind"] == "scope_sync_response" || event["kind"] == "error")
+            });
+        if let Some(reply) = reply {
+            let accepted = reply["kind"] == "scope_sync_response"
+                && reply["body_json"]["results"]
+                    .as_array()
+                    .is_some_and(|results| {
+                        results.len() == 2
+                            && results.iter().all(|result| {
+                                result["outcome"]
+                                    .as_str()
+                                    .is_some_and(|outcome| outcome != "refused")
+                            })
+                    });
+            return if accepted {
+                Ok(())
+            } else {
+                Err(HarnessError::new(format!(
+                    "scope fixture sync refused: {reply}"
+                )))
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err(HarnessError::new(
+                "the scope fixture owner's initial sync never answered",
+            ));
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
 
 fn caller_module_nonce<'a>(
     principal: &'a str,
@@ -319,6 +400,7 @@ struct Shared {
     read_part_keys: Mutex<HashMap<String, Vec<String>>>,
     read_entries: Mutex<HashMap<(String, String), Value>>,
     plan_sessions: Mutex<BTreeSet<String>>,
+    flow_scope_sessions: Mutex<BTreeSet<String>>,
     output_refs_sessions: Mutex<BTreeSet<String>>,
     model_id_marker_sessions: Mutex<BTreeSet<String>>,
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
@@ -1353,10 +1435,20 @@ impl BrocaSubject {
         std::fs::create_dir_all(&runtime_dir).map_err(|e| fail(e.to_string()))?;
         let owner_nonce = root.join("owner.nonce");
         reset_caller_nonce_files(&owner_nonce)?;
+        let scope_sync = root.join("owner-scopes.json");
+        let scope_events = root.join("owner-scope-events.jsonl");
+        for path in [&scope_sync, &scope_events] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(fail(format!("resetting scope fixture state: {error}"))),
+            }
+        }
         let connection_file = runtime_dir.join("subc-connection.json");
         let _ = std::fs::remove_file(&connection_file);
         let config = json!({
             "version": 1,
+            "scope_authority_owners": [OWNER_MODULE],
             "modules": {
                 "broca": {
                     "program": broca_test_support::ckdev_binary(
@@ -1379,6 +1471,8 @@ impl BrocaSubject {
                     "env": {
                         "FAKE_AFT_MODULE_ID": OWNER_MODULE,
                         "FAKE_AFT_LAUNCH_NONCE_PATH": owner_nonce,
+                        "FAKE_AFT_SCOPE_SYNC_PATH": scope_sync,
+                        "FAKE_AFT_EVENTS_PATH": scope_events,
                     },
                     "enabled": true,
                     "reserved": true,
@@ -1498,6 +1592,7 @@ impl BrocaSubject {
             None => None,
         };
         *self.shared.fixture_connection.lock().unwrap() = Some(connection_file.clone());
+        publish_scope_fixtures(&scope_sync, &scope_events).await?;
         Ok(Live {
             daemon: Some(daemon),
             connection_file,
@@ -1574,6 +1669,39 @@ impl BrocaSubject {
                 Err(_) => sleep(Duration::from_millis(100)).await,
             }
         }
+    }
+
+    async fn open_scope(
+        &self,
+        connection: &SubcConnection,
+        session: &broca_protocol::BindIdentity,
+        scope: &cortexkit_role_harness::ScopeStamp,
+    ) -> Result<RouteHandle, HarnessError> {
+        let module = scope
+            .owner
+            .strip_prefix("reserved:")
+            .ok_or_else(|| HarnessError::new("scope fixtures require a reserved owner"))?;
+        let selector = subc_protocol::scope::ScopeSelector::new(
+            subc_protocol::Principal::Reserved {
+                module_id: module.into(),
+            },
+            &scope.scope_ref,
+            Some(scope.scope_epoch),
+        );
+        connection
+            .route_open_management_scoped_within(
+                "broca",
+                session,
+                selector,
+                broca_subc::RouteOpenRetry {
+                    budget: Duration::from_secs(30),
+                    max_interval: Duration::from_millis(100),
+                },
+            )
+            .await
+            .map_err(|error| {
+                HarnessError::new(format!("opening the attested scope fixture: {error}"))
+            })
     }
 
     /// The records of `session`'s WAL on `live`'s state root.
@@ -2415,8 +2543,32 @@ impl LlmRunnerSubject for BrocaSubject {
         if broca_module_serve::RETENTION_WRITER_ENABLED {
             capabilities.extend([Capability::Retention, Capability::RetentionClock]);
         }
-        capabilities.insert(Capability::Attachments);
+        capabilities.extend([Capability::Attachments, Capability::MediaOnlySend]);
         capabilities
+    }
+
+    fn reports_read_completed_at(&self) -> bool {
+        true
+    }
+
+    async fn seed_host_created_at(
+        &self,
+        _session: &str,
+        _mid: &str,
+        _created_at_ms: u64,
+    ) -> Result<bool, HarnessError> {
+        // Broca has no operation to rewrite an existing host acceptance/request stamp.
+        // Editing the rebuildable read cache would fabricate a fact not backed by WAL.
+        eprintln!("seed_host_created_at unavailable: recorded host facts are immutable; no independent host-creation write path exists, and cache-only edits are not host facts");
+        Ok(false)
+    }
+
+    fn scoped_session_start_stamps(&self) -> Option<(RouteStamp, RouteStamp)> {
+        Some(scope_fixture_stamps(PLAIN_SCOPE_REF))
+    }
+
+    fn flow_session_start_stamps(&self) -> Option<(RouteStamp, RouteStamp)> {
+        Some(scope_fixture_stamps(FLOW_SCOPE_REF))
     }
 
     fn session_usage_fixtures(&self) -> bool {
@@ -2468,7 +2620,21 @@ impl LlmRunnerSubject for BrocaSubject {
             .insert(session.to_owned(), handle.state_root.clone());
         let identity = self.raw_bind_identity(session);
         let started = Instant::now();
-        let route = self.open(&connection, &identity).await?;
+        let route = match &stamp.scope {
+            Some(scope) => self.open_scope(&connection, &identity, scope).await?,
+            None => self.open(&connection, &identity).await?,
+        };
+        if stamp
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.scope_ref == FLOW_SCOPE_REF)
+        {
+            self.shared
+                .flow_scope_sessions
+                .lock()
+                .unwrap()
+                .insert(session.into());
+        }
         self.shared
             .session_bindings
             .lock()
@@ -2605,14 +2771,17 @@ impl LlmRunnerSubject for BrocaSubject {
         members: &Map<String, Value>,
     ) -> Option<Map<String, Value>> {
         let mut members = members.clone();
-        // The shared-send-id case uses the stranger's route label as a plan module.
-        // Translate this fixture label to the module the daemon actually attests.
+        // Harness principals include the reserved: label; plan sender modules use only
+        // the daemon-attested module id, including the flow fixture's opener.
         if let Some(senders) = members.get_mut("senders").and_then(Value::as_array_mut) {
             for sender in senders {
-                if sender.get("module").and_then(Value::as_str)
-                    == Some(format!("reserved:{STRANGER_MODULE}").as_str())
-                {
-                    sender["module"] = STRANGER_MODULE.into();
+                let module = sender
+                    .get("module")
+                    .and_then(Value::as_str)
+                    .and_then(|module| module.strip_prefix("reserved:"))
+                    .map(str::to_owned);
+                if let Some(module) = module {
+                    sender["module"] = module.into();
                 }
             }
         }
@@ -2627,9 +2796,20 @@ impl LlmRunnerSubject for BrocaSubject {
             // Null explicitly clears those legacy defaults; the plan owns this surface.
             fields.insert("tools".into(), Value::Null);
             fields.insert("system".into(), Value::Null);
-            let composition = json!({"providers":[{"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]}],"step_transform_items":[]});
+            let flow = self
+                .shared
+                .flow_scope_sessions
+                .lock()
+                .unwrap()
+                .contains(session);
+            let providers = if flow {
+                json!([])
+            } else {
+                json!([{"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]}])
+            };
+            let composition = json!({"providers":providers,"step_transform_items":[]});
             let mut plan = json!({
-                "tool_items":[{"provider":TOOL_MODULE,"preset":"conformance","params":{}}],
+                "tool_items":if flow {json!([])} else {json!([{"provider":TOOL_MODULE,"preset":"conformance","params":{}}])},
                 "system_text_items":[],
                 "step_transform_items":[],
                 "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
@@ -3632,6 +3812,57 @@ const REQUIRED_RETRACT_OWN_SEND_CASES: &[&str] = &[
 
 const STREAMED_SIBLINGS_INAPPLICABLE: &str = "submit_streamed_siblings is not declared; the strict rule is checked by structured_output_sibling_never_dispatched";
 
+const REQUIRED_SCOPE_DISPLAY_MEDIA_CASES: &[&str] = &[
+    "scoped_session_start_owner_only",
+    "frozen_plan_senders_send_refused",
+    "frozen_plan_senders_refresh_refused",
+    "read_display_facts_completed_at",
+    "media_only_send",
+];
+
+fn fixture_outcome_matches(name: &str, outcome: &CaseOutcome) -> bool {
+    let reason = match name {
+        // Both groups are declared, so these undeclared-feature questions do not apply.
+        "sender_succession_undeclared_refused" | "read_display_facts_undeclared_refused" => {
+            Some("describe groups do not support this question")
+        }
+        // The native fixture has no controlled delivery clock; this is not a retry failure.
+        "delivery_deadline_retry_keeps_original_expiry" => {
+            Some("adapter supplies no controlled delivery clock")
+        }
+        // Existing host creation stamps are immutable; the fixture has no independent
+        // host-fact writer, and changing a read cache would not seed recorded host data.
+        "read_display_facts_created_at" => {
+            Some("adapter could not seed a host creation time via seed_host_created_at")
+        }
+        // Native receipts have real clocks; the adapter cannot author the kit's synthetic
+        // per-call stored times. Production read bytes and times have separate serve tests.
+        "read_display_facts_default_absent" | "read_display_facts_opt_in_envelope" => {
+            Some("adapter cannot seed stored read tool times")
+        }
+        _ => None,
+    };
+    matches!(outcome, CaseOutcome::Passed)
+        || matches!(outcome, CaseOutcome::Inapplicable { reason: actual } if reason == Some(actual.as_str()))
+}
+
+/// A process-kill-disabled fixture lacks only the case's declared kill points.
+/// Missing unrelated prerequisites must not disguise an unchecked contract case.
+fn disabled_kill_case(
+    case: &cortexkit_role_llm_runner_conformance::CaseReport,
+    disabled: bool,
+) -> bool {
+    let expected: Vec<_> = case
+        .requires
+        .iter()
+        .filter(|cap| matches!(cap, Capability::KillAt(_)))
+        .cloned()
+        .collect();
+    disabled
+        && !expected.is_empty()
+        && matches!(&case.outcome, CaseOutcome::Skipped { missing } if missing == &expected)
+}
+
 /// Additive kit cases must not turn an undeclared capability into a required pass.
 /// Check the contracts this adapter implements by name, not by a shared name prefix's size.
 fn check_named_contract_cases(
@@ -3643,17 +3874,13 @@ fn check_named_contract_cases(
         .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
         .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
         .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
+        .chain(REQUIRED_SCOPE_DISPLAY_MEDIA_CASES)
     {
         let case = cases
             .iter()
             .find(|case| case.case == *name)
             .ok_or_else(|| format!("the suite has no case {name}"))?;
-        let skipped_kill = crash_kills_disabled
-            && case
-                .requires
-                .iter()
-                .any(|cap| matches!(cap, Capability::KillAt(_)))
-            && matches!(case.outcome, CaseOutcome::Skipped { .. });
+        let skipped_kill = disabled_kill_case(case, crash_kills_disabled);
         if case.outcome != CaseOutcome::Passed && !skipped_kill {
             return Err(format!("{name}: {:?}", case.outcome));
         }
@@ -3683,6 +3910,7 @@ mod named_contract_case_tests {
                     || case.name.starts_with("structured_output_")
                     || case.name.starts_with("retract_own_send_")
                     || case.name.starts_with("run_cancel_by_interrupt_")
+                    || REQUIRED_SCOPE_DISPLAY_MEDIA_CASES.contains(&case.name)
             })
             .map(|case| CaseReport {
                 case: case.name,
@@ -3699,6 +3927,55 @@ mod named_contract_case_tests {
     }
 
     #[test]
+    fn new_runner_cases_cannot_be_missing_skipped_or_partial() {
+        let new_names = [
+            "scoped_session_start_owner_only",
+            "frozen_plan_senders_send_refused",
+            "frozen_plan_senders_refresh_refused",
+            "read_display_facts_completed_at",
+            "media_only_send",
+        ];
+        for name in new_names {
+            let mut cases = outcomes();
+            if !cases.iter().any(|case| case.case == name) {
+                let spec = CASES.iter().find(|spec| spec.name == name).unwrap();
+                cases.push(CaseReport {
+                    case: spec.name,
+                    requires: spec.requires.to_vec(),
+                    outcome: CaseOutcome::Passed,
+                });
+            }
+            cases
+                .iter_mut()
+                .find(|case| case.case == name)
+                .unwrap()
+                .outcome = CaseOutcome::Skipped {
+                missing: Vec::new(),
+            };
+            assert!(
+                check_named_contract_cases(&cases, false).is_err(),
+                "{name} skipped without detection"
+            );
+            cases
+                .iter_mut()
+                .find(|case| case.case == name)
+                .unwrap()
+                .outcome = CaseOutcome::PassedWithInapplicableRule {
+                reason: "not checked".into(),
+            };
+            assert!(
+                check_named_contract_cases(&cases, false).is_err(),
+                "{name} partially checked without detection"
+            );
+            cases.retain(|case| case.case != name);
+            assert!(
+                check_named_contract_cases(&cases, false).is_err(),
+                "{name} missing without detection"
+            );
+        }
+    }
+
+    #[test]
     fn named_contract_cases_accept_the_undeclared_streamed_sibling_case() {
         assert_eq!(check_named_contract_cases(&outcomes(), false), Ok(()));
     }
@@ -3710,6 +3987,7 @@ mod named_contract_case_tests {
             .chain(REQUIRED_STRUCTURED_OUTPUT_CASES)
             .chain(REQUIRED_RETRACT_OWN_SEND_CASES)
             .chain(REQUIRED_INTERRUPT_CANCEL_CASES)
+            .chain(REQUIRED_SCOPE_DISPLAY_MEDIA_CASES)
             .copied()
             .chain(std::iter::once("structured_output_streamed_siblings"))
         {
@@ -3735,15 +4013,30 @@ mod named_contract_case_tests {
     #[test]
     fn named_contract_cases_skip_only_declared_kill_cases_when_kills_are_disabled() {
         let mut cases = outcomes();
-        let frozen = cases
-            .iter_mut()
-            .find(|case| case.case == "structured_output_frozen_across_restart")
+        let index = cases
+            .iter()
+            .position(|case| case.case == "structured_output_frozen_across_restart")
             .unwrap();
-        frozen.outcome = CaseOutcome::Skipped {
-            missing: Vec::new(),
+        let missing: Vec<_> = cases[index]
+            .requires
+            .iter()
+            .filter(|cap| matches!(cap, Capability::KillAt(_)))
+            .cloned()
+            .collect();
+        assert!(!missing.is_empty());
+        cases[index].outcome = CaseOutcome::Skipped {
+            missing: missing.clone(),
         };
         assert!(check_named_contract_cases(&cases, false).is_err());
         assert_eq!(check_named_contract_cases(&cases, true), Ok(()));
+        cases[index].outcome = CaseOutcome::Skipped {
+            missing: Vec::new(),
+        };
+        assert!(
+            check_named_contract_cases(&cases, true).is_err(),
+            "an empty missing-capability list is not a disabled-kill outcome"
+        );
+        cases[index].outcome = CaseOutcome::Skipped { missing };
         cases
             .iter_mut()
             .find(|case| case.case == "input_token_cap_at_limit")
@@ -3806,7 +4099,6 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         .cases
         .iter()
         .filter(|case| matches!(case.outcome, CaseOutcome::Failed { .. }))
-        .filter(|case| known_kit_defect(case.case, &case.outcome).is_none())
         .collect();
     if !failed.is_empty() {
         // Print before asserting: the panic message keeps only the report, and CI keeps only
@@ -3814,9 +4106,8 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
-    // Runner-room request #1723 tracks the kit's caller-cap prerequisite. Broca cannot
-    // promise that cap on every provider, so preserve the kit's exact missing-capability
-    // outcome rather than disguising it as an inapplicable provider-limit check.
+    // Broca does not promise caller-selected output caps on every provider. Only that
+    // prerequisite is skipped; provider-limit finish normalization must still pass below.
     assert_eq!(
         report
             .cases
@@ -3839,6 +4130,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "delivery_deadline_retry_keeps_original_expiry",
         "read_display_facts_default_absent",
         "read_display_facts_opt_in_envelope",
+        "read_display_facts_created_at",
         "read_display_facts_undeclared_refused",
     ] {
         let case = report
@@ -3847,10 +4139,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             .find(|case| case.case == name)
             .expect(name);
         assert!(
-            matches!(
-                case.outcome,
-                CaseOutcome::Passed | CaseOutcome::Inapplicable { .. }
-            ),
+            fixture_outcome_matches(name, &case.outcome),
             "{}",
             report.render()
         );
@@ -3867,7 +4156,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         matches!(
             &message_senders.outcome,
             CaseOutcome::PassedWithInapplicableRule { reason }
-                if reason.contains("message_senders_timing_at_message_started")
+                if reason == "message_senders_timing_at_message_started: adapter has no live observation hook"
         ),
         "{}",
         report.render()
@@ -3948,20 +4237,13 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             .iter()
             .find(|case| case.case == name)
             .unwrap_or_else(|| panic!("the suite has no case {name}"));
-        if known_kit_defect(name, &case.outcome).is_some() {
-            continue;
-        }
         if skip_crash_kills()
             && case
                 .requires
                 .iter()
                 .any(|cap| matches!(cap, Capability::KillAt(_)))
         {
-            assert!(
-                matches!(case.outcome, CaseOutcome::Skipped { .. }),
-                "{name}: {:?}",
-                case.outcome
-            );
+            assert!(disabled_kill_case(case, true), "{name}: {:?}", case.outcome);
             continue;
         }
         assert_eq!(
@@ -3994,14 +4276,16 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             reason: "the adapter's host does not fix its tool set at start".into(),
         }
     );
-    // The kit's rich-UI hook is separate from its tool-refresh fixture.
+    // Rich-UI stamps identify the UI dialect and catalog digest frozen on a run. The
+    // fixture cannot publish a replacement stamp through replan_rich_ui; that missing
+    // test setup is not evidence that production refresh failed.
     let follows = report
         .cases
         .iter()
         .find(|case| case.case == "rich_ui_stamp_head_follows_last_run")
         .unwrap();
     assert!(
-        matches!(&follows.outcome, CaseOutcome::Inapplicable { reason } if reason.contains("replan_rich_ui"))
+        matches!(&follows.outcome, CaseOutcome::Inapplicable { reason } if reason == "the adapter cannot replan a session's rich UI stamp (replan_rich_ui)")
     );
     // broca does not declare archive_prunes_reasoning, so every archive-pruning case the kit
     // carries must report exactly that, whichever cases a kit version adds or retires.
@@ -4027,25 +4311,19 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         );
         println!("New non-stamp kit case {name}: {:?}", case.outcome);
     }
-    for name in [
-        "output_refs_unsupported_plan",
-        "output_refs_writing_request",
-        "output_refs_held_placeholder",
-        "output_refs_snapshot_size",
-        "output_refs_rewind",
-        "output_refs_compaction",
-    ] {
-        let case = report
-            .cases
-            .iter()
-            .find(|case| case.case == name)
-            .unwrap_or_else(|| panic!("the suite has no case {name}"));
-        assert!(
-            matches!(case.outcome, CaseOutcome::Inapplicable { .. }),
-            "{name}: {:?}",
-            case.outcome
-        );
-    }
+    // Broca supports output_refs; only a runner without the group can exercise this
+    // negative question. Numbered-plan cases were checked against their exact reason above.
+    let unsupported = report
+        .cases
+        .iter()
+        .find(|case| case.case == "output_refs_unsupported_plan")
+        .expect("output_refs_unsupported_plan");
+    assert_eq!(
+        unsupported.outcome,
+        CaseOutcome::Inapplicable {
+            reason: "the runner declares output_refs".into(),
+        }
+    );
     check_named_contract_cases(&report.cases, skip_crash_kills()).unwrap();
     for name in [
         "service_tier_unsupported_before_model",
@@ -6092,6 +6370,7 @@ async fn conformance_subject_always_declares_attachments() {
     let root = broca_test_support::scratch_root().join("subject-attachments");
     let subject = BrocaSubject::new(&root).await;
     assert!(subject.capabilities().contains(&Capability::Attachments));
+    assert!(subject.capabilities().contains(&Capability::MediaOnlySend));
     assert!(subject.image_tool_result("old-image-rule").is_some());
 }
 
@@ -6100,7 +6379,7 @@ fn attachment_contract_gaps(
 ) -> Vec<&'static str> {
     let specs = cortexkit_role_llm_runner_conformance::CASES
         .iter()
-        .filter(|spec| spec.name.starts_with("attachments_"))
+        .filter(|spec| spec.name.starts_with("attachments_") || spec.name == "media_only_send")
         .collect::<Vec<_>>();
     assert!(
         !specs.is_empty(),
@@ -6119,7 +6398,7 @@ fn attachment_report_guard_rejects_missing_or_skipped_cases() {
     let mut report = SuiteReport {
         cases: CASES
             .iter()
-            .filter(|spec| spec.name.starts_with("attachments_"))
+            .filter(|spec| spec.name.starts_with("attachments_") || spec.name == "media_only_send")
             .map(|spec| CaseReport {
                 case: spec.name,
                 requires: spec.requires.to_vec(),
@@ -6232,28 +6511,144 @@ fn assertion_address_lookup_does_not_contend_with_a_held_writer() {
     }
 }
 
-/// Kit 0.17.2 cases SUBC confirmed as kit defects against llm-runner 0.8.1 (Mode 3 room
-/// #2150-#2152). Each is excused only with its exact failure, so any other outcome of these
-/// cases still fails the suite. Remove an entry when the kit that fixes it is pinned.
-fn known_kit_defect(case: &str, outcome: &CaseOutcome) -> Option<&'static str> {
-    let CaseOutcome::Failed { reason } = outcome else {
-        return None;
-    };
-    match case {
-        // Its result is 131,072 bytes, over the 0.8 runner's 65,536-byte limit, so broca
-        // correctly refuses it at intake. Kit 0.17.3 uses a 32 KiB result.
-        "display_without_limits_is_whole"
-            if reason.starts_with("a display read without limits served arguments of") =>
-        {
-            Some("kit 0.17.2 sends a result over the 64 KiB limit; fixed in kit 0.17.3")
-        }
-        // retention.rs:463-464 demands the faithful fake's own identity for a never-written
-        // read, contradicting §4.3. Fixed in kit 0.17.4.
-        "retention_honoured"
-            if reason == "never-written session did not keep its empty success" =>
-        {
-            Some("kit 0.17.2 pins a fixed identity for a never-written read; fixed in kit 0.17.4")
-        }
-        _ => None,
+#[tokio::test]
+async fn conformance_subject_reports_recorded_completion_facts() {
+    let root = broca_test_support::scratch_root().join("subject-completion-facts");
+    let subject = BrocaSubject::new(&root).await;
+    assert!(subject.reports_read_completed_at());
+}
+
+#[tokio::test]
+async fn conformance_subject_exposes_plain_and_flow_scope_fixtures() {
+    let root = broca_test_support::scratch_root().join("subject-scope-fixtures");
+    let subject = BrocaSubject::new(&root).await;
+    for fixture in [
+        subject.scoped_session_start_stamps(),
+        subject.flow_session_start_stamps(),
+    ] {
+        let (carrier, owner) = fixture.expect("scope fixture must be available");
+        assert_ne!(carrier.principal, owner.principal);
+        assert_eq!(carrier.scope, owner.scope);
+        assert_eq!(owner.scope.as_ref().unwrap().owner, owner.principal);
     }
+}
+
+#[test]
+fn conformance_scope_records_match_the_daemon_schema() {
+    let records: Vec<subc_protocol::scope::ScopeRecord> =
+        serde_json::from_value(scope_fixture_records()).unwrap();
+    assert_eq!(records.len(), 2);
+    let value = serde_json::to_value(records).unwrap();
+    assert!(value[0]["attributes"].get("flow_id").is_none());
+    assert!(value[0]["attributes"].get("run_id").is_none());
+    assert_eq!(value[1]["attributes"]["flow_id"], "conformance-flow");
+    assert_eq!(value[1]["attributes"]["agent_id"], "conformance-agent");
+}
+
+#[tokio::test]
+async fn conformance_flow_plan_is_model_only_and_names_the_attested_opener() {
+    let root = broca_test_support::scratch_root().join("subject-flow-plan");
+    let subject = BrocaSubject::new(&root).await;
+    let session = "synthetic-flow-plan";
+    subject
+        .shared
+        .flow_scope_sessions
+        .lock()
+        .unwrap()
+        .insert(session.into());
+    let (opener, _) = subject.flow_session_start_stamps().unwrap();
+    let members = json!({"senders":[{"module":opener.principal,"idle_start":true}]})
+        .as_object()
+        .unwrap()
+        .clone();
+    let fields = subject
+        .send_fields_with_plan(session, true, &members)
+        .unwrap();
+    let plan = broca_fetch_plan::parse_plan(
+        fields.get("plan").unwrap(),
+        broca_fetch_plan::CompactionSupport::Supported,
+    )
+    .unwrap();
+    assert!(plan.tool_items.is_empty());
+    assert!(fields["tools"].is_null());
+    assert!(fields["system"].is_null());
+    assert_eq!(plan.senders[0].module, SENDER_MODULE);
+}
+
+#[test]
+fn fixture_exclusions_reject_unrelated_inapplicability_and_any_failure() {
+    for (name, reason) in [
+        (
+            "read_display_facts_created_at",
+            "adapter could not seed a host creation time via seed_host_created_at",
+        ),
+        (
+            "sender_succession_undeclared_refused",
+            "describe groups do not support this question",
+        ),
+        (
+            "read_display_facts_undeclared_refused",
+            "describe groups do not support this question",
+        ),
+        (
+            "delivery_deadline_retry_keeps_original_expiry",
+            "adapter supplies no controlled delivery clock",
+        ),
+        (
+            "read_display_facts_default_absent",
+            "adapter cannot seed stored read tool times",
+        ),
+        (
+            "read_display_facts_opt_in_envelope",
+            "adapter cannot seed stored read tool times",
+        ),
+    ] {
+        assert!(fixture_outcome_matches(
+            name,
+            &CaseOutcome::Inapplicable {
+                reason: reason.into()
+            }
+        ));
+        assert!(!fixture_outcome_matches(
+            name,
+            &CaseOutcome::Inapplicable {
+                reason: format!("{reason}; another unchecked rule")
+            }
+        ));
+        assert!(!fixture_outcome_matches(
+            name,
+            &CaseOutcome::Failed {
+                reason: reason.into()
+            }
+        ));
+    }
+    for name in [
+        "sender_succession_same_payload_receipt",
+        "display_without_limits_is_whole",
+        "retention_honoured",
+    ] {
+        assert!(fixture_outcome_matches(name, &CaseOutcome::Passed));
+        assert!(!fixture_outcome_matches(
+            name,
+            &CaseOutcome::Inapplicable {
+                reason: "an unrelated gap".into()
+            }
+        ));
+        assert!(!fixture_outcome_matches(
+            name,
+            &CaseOutcome::Failed {
+                reason: "a real failure".into()
+            }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn conformance_creation_seed_refuses_to_fabricate_a_host_fact() {
+    let root = broca_test_support::scratch_root().join("subject-creation-seed");
+    let subject = BrocaSubject::new(&root).await;
+    assert!(!subject
+        .seed_host_created_at("synthetic-session", "m0", 600)
+        .await
+        .unwrap());
 }

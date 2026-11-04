@@ -84,6 +84,7 @@ impl RetentionScopeIdentity {
     pub fn to_scope(&self) -> SessionScope {
         SessionScope {
             owner: self.owner.to_principal(),
+            agent_id_frozen: false,
             scope_ref: self.scope_ref.clone(),
             scope_epoch: self.scope_epoch,
             flow_id: self.flow_id.clone(),
@@ -441,6 +442,7 @@ mod tests {
         ] {
             let scope = SessionScope {
                 owner,
+                agent_id_frozen: false,
                 scope_ref: "reference".into(),
                 scope_epoch: 7,
                 flow_id: Some("flow".into()),

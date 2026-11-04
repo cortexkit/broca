@@ -4355,6 +4355,7 @@ async fn scoped_wal_attach_streams_control_units() {
                     owner: broca_protocol::BindPrincipal::Reserved {
                         module_id: "prefrontal-core".into(),
                     },
+                    agent_id_frozen: false,
                     scope_ref: "head-1".into(),
                     scope_epoch: 3,
                     flow_id: None,
@@ -5655,6 +5656,7 @@ impl PreparedWalRoute {
                     owner: broca_protocol::BindPrincipal::Reserved {
                         module_id: "prefrontal-core".into(),
                     },
+                    agent_id_frozen: false,
                     scope_ref: "flow-1".into(),
                     scope_epoch: 1,
                     flow_id: Some("flow-1".into()),

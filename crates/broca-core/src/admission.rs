@@ -6388,6 +6388,7 @@ mod tests {
         };
         let scope = |epoch| SessionScope {
             owner: core.clone(),
+            agent_id_frozen: false,
             scope_ref: "head-1".into(),
             scope_epoch: epoch,
             flow_id: None,

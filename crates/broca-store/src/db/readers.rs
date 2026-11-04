@@ -689,7 +689,7 @@ fn page(
             .2
             .map(|off| sources.indexed_frame(tx, key, off))
             .transpose()?;
-        let (mut message, written_at, turn) =
+        let (mut message, written_at, completed_at, created_at, turn) =
             hydrate_message(&frames, &source, started.as_ref(), mode3)?;
         if source.flags & 2 != 0 {
             let mut high = source
@@ -727,6 +727,8 @@ fn page(
             );
         }
         messages.push(broca_core::SessionReadMessage {
+            created_at,
+            completed_at,
             ordinal,
             written_at,
             message,
@@ -751,12 +753,21 @@ fn page(
                 )
             }
             .map_err(invalid)?;
+            let creations = broca_core::creation_times::project(
+                tail_frames.iter().map(|frame| &frame.record),
+                broca_core::placement::Placement::new(ordinal_base),
+                head.queued_times().clone(),
+                head.creation_times.clone().unwrap_or_default(),
+            )
+            .map_err(invalid)?;
             dispatches.extend(broca_core::dispatches_of_turns(
                 &tail_frames,
                 &[(0, step)],
                 session.count,
             ));
             messages.push(broca_core::SessionReadMessage {
+                created_at: creations.times.get(&session.count).copied(),
+                completed_at: None,
                 ordinal: session.count,
                 message,
                 written_at: times.get(&session.count).copied(),
@@ -882,12 +893,20 @@ fn page(
     })
 }
 
+type HydratedMessage = (
+    Message,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<usize>,
+);
+
 fn hydrate_message(
     frames: &[FramedRecord],
     source: &OffsetSource,
     started: Option<&FramedRecord>,
     mode3: bool,
-) -> Result<(Message, Option<u64>, Option<usize>), DbError> {
+) -> Result<HydratedMessage, DbError> {
     let first = frames
         .first()
         .ok_or_else(|| invalid("empty raw message source"))?;
@@ -896,6 +915,14 @@ fn hydrate_message(
             "mode3 budget timestamp source",
         )));
     }
+    let creations = broca_core::creation_times::project(
+        frames.iter().map(|frame| &frame.record),
+        broca_core::placement::Placement::default(),
+        Default::default(),
+        Default::default(),
+    )
+    .map_err(invalid)?;
+    let created_at = creations.times.get(&source.input_start).copied();
     let input = match &first.record {
         WalRecord::RunStarted { input, .. }
         | WalRecord::Steered { input, .. }
@@ -948,7 +975,7 @@ fn hydrate_message(
                 "mode3 historical timestamp source",
             )));
         }
-        return Ok((message, time, None));
+        return Ok((message, time, None, created_at, None));
     }
     if frames.iter().any(|f| {
         matches!(
@@ -978,25 +1005,33 @@ fn hydrate_message(
     }
     // The turn range includes all result/no-dispatch frames, so timestamps and
     // dispatch ordering use the same folds as a full transcript read.
-    let times = if mode3 {
-        broca_core::message_times::mode3_written_times(
-            frames.iter().map(|f| &f.record),
-            broca_core::placement::Placement::default(),
-            Default::default(),
-            Default::default(),
-        )
-        .map(|fold| fold.times)
-    } else {
-        broca_core::message_times::written_times(
-            frames.iter().map(|f| &f.record),
-            broca_core::placement::Placement::default(),
-        )
-    }
+    let time_facts = broca_core::message_times::fold(
+        frames.iter().map(|f| &f.record),
+        broca_core::placement::Placement::default(),
+        Default::default(),
+        mode3,
+        Default::default(),
+    )
     .map_err(invalid)?;
+    let completions = broca_core::compaction_v2::entries::completion_times(
+        &replay.prompt,
+        0,
+        &time_facts.times,
+        &time_facts.native_assistants,
+    );
     let turn = (source.input_start == 0)
         .then(|| replay.committed_tool_turns.first().map(|(_, index)| *index))
         .flatten();
-    Ok((message, times.get(&source.input_start).copied(), turn))
+    Ok((
+        message,
+        time_facts.times.get(&source.input_start).copied(),
+        completions
+            .get(source.input_start as usize)
+            .copied()
+            .flatten(),
+        created_at,
+        turn,
+    ))
 }
 
 fn full_page(

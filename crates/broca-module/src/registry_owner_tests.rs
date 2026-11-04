@@ -27,6 +27,7 @@ fn reserved(module_id: &str) -> BindPrincipal {
 fn scope(owner: &str) -> SessionScope {
     SessionScope {
         owner: reserved(owner),
+        agent_id_frozen: false,
         scope_ref: "work".into(),
         scope_epoch: 7,
         flow_id: Some("flow".into()),

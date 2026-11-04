@@ -26,6 +26,7 @@ fn scope(run: &str) -> SessionScope {
         owner: BindPrincipal::Reserved {
             module_id: "owner".into(),
         },
+        agent_id_frozen: false,
         scope_ref: run.into(),
         scope_epoch: 1,
         agent_id: Some("agent".into()),

@@ -236,21 +236,12 @@ pub fn project(
             };
             parts.push(Part::new(index.to_string(), body).with_seal(seal));
         }
-        let final_tools = parts.iter().all(|part| match &part.body {
-            PartBody::Tool(tool) => matches!(
-                tool.status,
-                ToolStatus::Completed | ToolStatus::Error | ToolStatus::Denied
-            ),
-            _ => true,
-        });
         let mut entry = Entry::new(facts.ordinal, &facts.mid, role, facts.written_at, parts);
         if let Some(notice) = &facts.notice {
             entry = entry.with_notice(notice.clone());
         }
-        if message.role == HostRole::Assistant && final_tools {
-            entry.completed_at =
-                crate::message_times::completed_at(message.role, facts.completed_at, final_tools);
-        }
+        entry.completed_at =
+            project_completion(message, messages.get(position + 1), facts.completed_at);
         entry.usage = facts.usage;
         entry.generated_under = facts.generated_under.clone();
         let base = facts.tag_base.unwrap_or(high);
@@ -264,6 +255,63 @@ pub fn project(
         entries.push(entry);
     }
     entries
+}
+
+/// Project the host finish only after every tool call has its stored final result.
+/// Every stored ToolOutput variant is final; a held or running call has no result.
+/// Compaction's session.entries projection and transcript display facts use this rule.
+pub fn project_completion(
+    message: &Message,
+    following: Option<&Message>,
+    at: Option<u64>,
+) -> Option<u64> {
+    if message.role != HostRole::Assistant || at.is_none() {
+        return None;
+    }
+    let mut results = HashMap::<&str, usize>::new();
+    if let Some(next) = following.filter(|next| next.role == HostRole::Tool) {
+        for block in &next.content {
+            if let ContentBlock::ToolResult(result) = block {
+                *results.entry(&result.tool_call_id.0).or_default() += 1;
+            }
+        }
+    }
+    let final_tools = message.content.iter().all(|block| {
+        let ContentBlock::ToolCall(call) = block else {
+            return true;
+        };
+        let Some(count) = results.get_mut(call.tool_call_id.0.as_str()) else {
+            return false;
+        };
+        if *count == 0 {
+            return false;
+        }
+        *count -= 1;
+        true
+    });
+    crate::message_times::completed_at(message.role, at, final_tools)
+}
+
+/// Project completion from already-folded host stamps and native source positions,
+/// excluding supplied assistant input without reading another record or a clock.
+pub fn completion_times(
+    messages: &[Message],
+    first: u64,
+    times: &std::collections::BTreeMap<u64, u64>,
+    native_assistants: &std::collections::BTreeSet<u64>,
+) -> Vec<Option<u64>> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let position = first + index as u64;
+            let at = native_assistants
+                .contains(&position)
+                .then(|| times.get(&position).copied())
+                .flatten();
+            project_completion(message, messages.get(index + 1), at)
+        })
+        .collect()
 }
 
 pub(super) fn neutral_reply(text: &str, accepts_empty_text: bool) -> String {

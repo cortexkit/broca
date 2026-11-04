@@ -134,6 +134,7 @@ fn stamped() -> SendScope {
     SendScope::Stamped(broca_protocol::BindScope {
         scope: broca_protocol::SessionScope {
             owner: principal(),
+            agent_id_frozen: false,
             scope_ref: "run".into(),
             scope_epoch: 1,
             flow_id: None,

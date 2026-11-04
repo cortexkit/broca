@@ -558,6 +558,7 @@ mod tests {
                 owner: broca_protocol::BindPrincipal::Reserved {
                     module_id: "owner".into(),
                 },
+                agent_id_frozen: false,
                 scope_ref: "run".into(),
                 scope_epoch: epoch,
                 flow_id: None,
@@ -578,6 +579,7 @@ mod tests {
                 owner: broca_protocol::BindPrincipal::Reserved {
                     module_id: "owner".into(),
                 },
+                agent_id_frozen: false,
                 scope_ref: "flow".into(),
                 scope_epoch: epoch,
                 flow_id: Some("tool-flow".into()),

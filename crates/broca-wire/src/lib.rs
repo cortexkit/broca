@@ -655,8 +655,53 @@ impl SendParams {
         legacy_delivery(self.delivery.as_ref())
     }
 
-    /// Decode the ordered-delivery members. Templates require a list and are rendered from
-    /// the attested sender's frozen plan before the send is recorded.
+    /// Check prompt presence with the role's media-only policy; native block validation
+    /// remains in the converter so it can name an invalid block precisely.
+    pub fn check_prompt_for(&self, media_only_send: bool) -> Result<(), &'static str> {
+        self.role_admission_request()
+            .check_prompt_for(media_only_send)
+    }
+
+    fn role_admission_request(&self) -> cortexkit_role_llm_runner::send::SendRequest {
+        use cortexkit_role_llm_runner::delivery_order::{
+            DEDUPE_KEY_FIELD, EXPIRES_AT_FIELD, TEMPLATE_FIELD,
+        };
+        // prompt_blocks is checked by the native converter, without joining or replacing its
+        // blocks. This pure shape check only needs to know that a block prompt was supplied.
+        let prompt = if self.prompt_blocks.is_some() {
+            "prompt_blocks".into()
+        } else {
+            self.prompt.clone()
+        };
+        let mut request = cortexkit_role_llm_runner::send::SendRequest::new(prompt, "admission")
+            .with_content(self.content.clone());
+        if let Some(SendDelivery::Order(modes)) = &self.delivery {
+            request.delivery_order = Some(modes.clone());
+        }
+        if let Some(key) = &self.dedupe_key {
+            request
+                .runner_params
+                .insert(DEDUPE_KEY_FIELD.into(), key.clone().into());
+        }
+        if let Some(at) = self.expires_at_ms {
+            request
+                .runner_params
+                .insert(EXPIRES_AT_FIELD.into(), at.into());
+        }
+        if let Some(template) = &self.template {
+            request.runner_params.insert(
+                TEMPLATE_FIELD.into(),
+                serde_json::to_value(template).expect("template serializes"),
+            );
+            if self.prompt.is_empty() && self.prompt_blocks.is_none() {
+                request.prompt = None;
+            }
+        }
+        request
+    }
+
+    /// Decode the ordered-delivery members with media-only prompt admission. Templates require
+    /// a list and are rendered before the send is recorded.
     pub fn delivery_order(
         &self,
     ) -> Result<Option<broca_protocol::DeliveryOrder>, (&'static str, String)> {
@@ -666,15 +711,16 @@ impl SendParams {
                 "template is valid only when delivery is an ordered list".into(),
             ));
         }
-        let mut order = delivery_order(
-            self.delivery.as_ref(),
-            self.dedupe_key.as_deref(),
-            self.expires_at_ms,
-        )?;
-        if let Some(order) = &mut order {
-            order.template = self.template.clone();
-        }
-        Ok(order)
+        let request = self.role_admission_request();
+        let order = request
+            .delivery_order_for(true)
+            .map_err(|field| (field, format!("invalid ordered delivery member {field}")))?;
+        Ok(order.map(|order| broca_protocol::DeliveryOrder {
+            modes: order.modes,
+            dedupe_key: order.dedupe_key,
+            expires_at_ms: order.expires_at_ms,
+            template: order.template,
+        }))
     }
 }
 
@@ -1103,6 +1149,12 @@ fn serialize_read_message<S: serde::Serializer>(
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_summaries: Vec<cortexkit_role_llm_runner::read::ReasoningSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_times: Vec<cortexkit_role_llm_runner::read::ToolTime>,
@@ -1192,6 +1244,12 @@ impl Serialize for SessionReadMessage {
             client_message_id: &'a Option<String>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             tool_times: &'a [cortexkit_role_llm_runner::read::ToolTime],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            completed_at: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            created_at: Option<u64>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            reasoning_summaries: &'a [cortexkit_role_llm_runner::read::ReasoningSummary],
         }
         Wire {
             written_at: self.written_at,
@@ -1207,6 +1265,9 @@ impl Serialize for SessionReadMessage {
             rich_ui: &self.rich_ui,
             client_message_id: &self.client_message_id,
             tool_times: &self.tool_times,
+            completed_at: self.completed_at,
+            created_at: self.created_at,
+            reasoning_summaries: &self.reasoning_summaries,
         }
         .serialize(serializer)
     }
@@ -5215,9 +5276,14 @@ mod delivery_order_params {
                 assert_eq!(refused.0, member, "{delivery:?}");
             }
         }
-        let listed =
-            send(serde_json::json!({"delivery": ["steer"], "template": {"id": "t", "digest": "a".repeat(64), "slots": {}}}))
-                .unwrap();
+        let with_prompt = send(serde_json::json!({"delivery":["steer"],"template":{"id":"t","digest":"a".repeat(64),"slots":{}}})).unwrap();
+        assert_eq!(with_prompt.delivery_order().unwrap_err().0, "template");
+        let listed: SendParams = serde_json::from_value(serde_json::json!({
+            "model":{"provider":"mock","model":"m"},
+            "delivery":["steer"],
+            "template":{"id":"t","digest":"a".repeat(64),"slots":{}}
+        }))
+        .unwrap();
         assert_eq!(
             listed
                 .delivery_order()
@@ -5788,7 +5854,8 @@ mod late_page_goldens {
 /// A reader-only build cannot freeze or advance a session under an agent-run scope.
 pub const AGENT_RUN_SCOPES_UNSUPPORTED: &str = "agent_run_scopes_unsupported";
 /// A later send changed the agent-run or agent identifier frozen on the session.
-pub const SCOPE_RUN_MISMATCH: &str = "scope_run_mismatch";
+pub const SCOPE_RUN_ID_MISMATCH: &str = "scope_run_id_mismatch";
+pub const SCOPE_AGENT_ID_MISMATCH: &str = "scope_agent_id_mismatch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -5818,7 +5885,11 @@ impl ScopeRunMismatch {
             RunMismatchField::AgentId => "agent_id",
         };
         Self {
-            code: SCOPE_RUN_MISMATCH.into(),
+            code: match field {
+                RunMismatchField::RunId => SCOPE_RUN_ID_MISMATCH,
+                RunMismatchField::AgentId => SCOPE_AGENT_ID_MISMATCH,
+            }
+            .into(),
             message: format!("this send differs from the session's frozen {name}"),
             detail: RunMismatchDetail { field },
         }
@@ -5873,11 +5944,11 @@ mod agent_run_scope_tests {
         for (field, pinned) in [
             (
                 RunMismatchField::RunId,
-                r#"{"code":"scope_run_mismatch","message":"this send differs from the session's frozen run_id","detail":{"field":"run_id"}}"#,
+                r#"{"code":"scope_run_id_mismatch","message":"this send differs from the session's frozen run_id","detail":{"field":"run_id"}}"#,
             ),
             (
                 RunMismatchField::AgentId,
-                r#"{"code":"scope_run_mismatch","message":"this send differs from the session's frozen agent_id","detail":{"field":"agent_id"}}"#,
+                r#"{"code":"scope_agent_id_mismatch","message":"this send differs from the session's frozen agent_id","detail":{"field":"agent_id"}}"#,
             ),
         ] {
             assert_eq!(
@@ -5983,6 +6054,9 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            created_at: None,
+            completed_at: None,
+            reasoning_summaries: Vec::new(),
             client_message_id: None,
             tool_times: Vec::new(),
             rich_ui: None,
@@ -6369,6 +6443,9 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            created_at: None,
+            completed_at: None,
+            reasoning_summaries: Vec::new(),
             client_message_id: None,
             tool_times: Vec::new(),
             rich_ui: None,

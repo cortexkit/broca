@@ -1375,6 +1375,8 @@ impl crate::MaterializedStore for PagedStore {
                 .iter()
                 .filter(|m| m.ordinal.is_some_and(|o| from <= o && o < end))
                 .map(|m| crate::context::StorePageRow {
+                    created_at: None,
+                    completed_at: None,
                     written_at: None,
                     ordinal: m.ordinal.unwrap(),
                     message: m.clone(),

@@ -61,6 +61,7 @@ pub(crate) fn flow_operations() -> Vec<String> {
             owner: BindPrincipal::Reserved {
                 module_id: "prefrontal-core".into(),
             },
+            agent_id_frozen: false,
             scope_ref: "flow-discovery".into(),
             scope_epoch: 1,
             flow_id: Some("flow-discovery".into()),

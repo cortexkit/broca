@@ -62,7 +62,7 @@ pub fn stage(
                 .read_committed(identity, id, now_seconds())
                 .map_err(RunError::Upload)?;
             let reference =
-                broca_core::media_validation::validate_media(&bytes, &mime).map_err(|reason| {
+                broca_core::media_validation::inspect_media(&bytes, &mime).map_err(|reason| {
                     let kind = if mime == "application/pdf" {
                         MediaKind::Document
                     } else if mime.starts_with("audio/") {
@@ -110,7 +110,45 @@ pub fn check(
     model: &str,
     input: &[Message],
 ) -> Result<(), RunError> {
+    if let Some(profile) = profile {
+        let (max_bytes, max_dimension) = profile.image_limits();
+        let mut exceeded_bytes = None;
+        let mut exceeded_dimension = None;
+        for media in broca_provider::person_media::references(input)
+            .filter(|media| media.kind == broca_protocol::MediaKind::Image)
+        {
+            if let Some(limit) = max_bytes.filter(|limit| media.byte_size > *limit) {
+                exceeded_bytes = Some(limit);
+            }
+            if let Some(limit) = max_dimension.filter(|limit| {
+                media
+                    .width
+                    .zip(media.height)
+                    .is_some_and(|(width, height)| width.max(height) > *limit)
+            }) {
+                exceeded_dimension = Some(limit);
+            }
+        }
+        if exceeded_bytes.is_some() || exceeded_dimension.is_some() {
+            return Err(RunError::MediaTooLarge(
+                cortexkit_role_llm_runner::errors::MediaTooLargeDetail::new(
+                    exceeded_bytes,
+                    exceeded_dimension,
+                ),
+            ));
+        }
+    }
     for media in broca_provider::person_media::references(input) {
+        if media.byte_size > broca_core::media_validation::store_max_bytes(media.kind) {
+            return Err(RunError::MediaUnsupported(
+                broca_provider::person_media::refusal(
+                    model,
+                    media.kind,
+                    broca_protocol::content::MediaMarkerReason::TooLarge,
+                )
+                .to_string(),
+            ));
+        }
         check_item(profile, model, media)
             .map_err(|refusal| RunError::MediaUnsupported(refusal.to_string()))?;
     }
@@ -152,6 +190,7 @@ pub fn publish(
 pub(crate) fn outcome(error: RunError) -> crate::actor::SendOutcome {
     match error {
         RunError::Upload(error) => crate::actor::SendOutcome::Upload(error),
+        RunError::MediaTooLarge(detail) => crate::actor::SendOutcome::MediaTooLarge(detail),
         RunError::MediaUnsupported(message) => crate::actor::SendOutcome::DeliveryRefused {
             code: "media_unsupported",
             field: "content",

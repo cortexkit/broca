@@ -399,6 +399,7 @@ pub enum SendOutcome {
     VariantUnsupported(broca_core::run::VariantRefusal),
     ToolAliasInvalid(broca_core::run::ToolAliasInvalid),
     Upload(broca_core::media_uploads::UploadError),
+    MediaTooLarge(cortexkit_role_llm_runner::errors::MediaTooLargeDetail),
     /// The run started immediately (the lineage was idle).
     Active {
         run_id: RunId,
@@ -4532,6 +4533,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(StartRunFailure::Admission(RunError::MediaUnsupported(message))) => {
                     crate::person_media::outcome(RunError::MediaUnsupported(message))
                 }
+                Err(StartRunFailure::Admission(RunError::MediaTooLarge(detail))) => {
+                    SendOutcome::MediaTooLarge(detail)
+                }
                 Err(StartRunFailure::Admission(RunError::Upload(error))) => {
                     SendOutcome::Upload(error)
                 }
@@ -8414,10 +8418,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         submission_id,
                         run_id,
                         error.to_string(),
-                        if matches!(error, RunError::MediaUnsupported(_)) {
-                            "media_unsupported"
-                        } else {
-                            "queued_admission_failed"
+                        match error {
+                            RunError::MediaUnsupported(_) => "media_unsupported",
+                            RunError::MediaTooLarge(_) => "media_too_large",
+                            _ => "queued_admission_failed",
                         },
                     )
                     .await?;

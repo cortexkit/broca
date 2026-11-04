@@ -81,13 +81,13 @@ cortexkit-role-harness = "=0.1.0"
 cortexkit-role-tool-provider = "=0.15.0"
 cortexkit-llm-tools = "=0.2.1"
 cortexkit-role-tool-provider-conformance = "=0.15.0"
-cortexkit-role-llm-runner = "=0.8.1"
+cortexkit-role-llm-runner = "=0.8.5"
 # Recorded v1 requests must keep the exact tag-rendering bytes of their original contract.
 cortexkit-role-llm-runner-v1 = { package = "cortexkit-role-llm-runner", version = "=0.7.48" }
 cortexkit-bus-naming = "=0.2.7"
 cortexkit-bus-trait = "=0.3.0"
 cortexkit-bus-nats = "=0.3.1"
-cortexkit-role-llm-runner-conformance = "=0.17.2"
+cortexkit-role-llm-runner-conformance = "=0.17.6"
 # Draft 2020-12 validation of structured-output values. Default features are off so the
 # validator has no HTTP or file retriever: a schema can never make broca fetch anything.
 jsonschema = { version = "=0.58.6", default-features = false }

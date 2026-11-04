@@ -77,6 +77,12 @@ impl SendParamsExt for SendParams {
         session: BindIdentity,
         run_id: RunId,
     ) -> Result<SendRequest, broca_core::RunError> {
+        let order = self
+            .delivery_order()
+            .map_err(|(_, message)| broca_core::RunError::Config(message))?;
+        self.check_prompt_for(true).map_err(|field| {
+            broca_core::RunError::Config(format!("invalid send prompt shape for {field}"))
+        })?;
         let SendParams {
             route_decision_id,
             content,
@@ -107,19 +113,11 @@ impl SendParamsExt for SendParams {
             service_tier,
             one_shot,
             delivery,
-            dedupe_key,
-            expires_at_ms,
+            dedupe_key: _,
+            expires_at_ms: _,
             template,
             append_episode,
         } = self;
-        // The one decode of the `delivery_order` group; the serve adapter has already refused a
-        // malformed one by field, so an error here is a caller bug surfaced as a config refusal.
-        let mut order =
-            broca_wire::delivery_order(delivery.as_ref(), dedupe_key.as_deref(), expires_at_ms)
-                .map_err(|(_, message)| broca_core::RunError::Config(message))?;
-        if let Some(order) = &mut order {
-            order.template = template.clone();
-        }
         let delivery = broca_wire::legacy_delivery(delivery.as_ref());
         // The serve adapter fills an omitted model before converting, from the session's frozen
         // one where the send may omit it, and refuses the send otherwise.
@@ -131,11 +129,6 @@ impl SendParamsExt for SendParams {
                 return Err(broca_core::RunError::Config(
                     "caller sent both non-empty prompt and prompt_blocks; send exactly one prompt input"
                         .into(),
-                ));
-            }
-            None if prompt.is_empty() && template.is_none() => {
-                return Err(broca_core::RunError::Config(
-                    "caller sent neither prompt nor prompt_blocks; send one prompt input".into(),
                 ));
             }
             Some(blocks) if blocks.len() < 2 => {
@@ -167,6 +160,9 @@ impl SendParamsExt for SendParams {
                         .collect(),
                     Some(prefix_count),
                 )
+            }
+            None if prompt.is_empty() && !content.is_empty() && template.is_none() => {
+                (Vec::new(), None)
             }
             None => (vec![ContentBlock::Text { text: prompt }], None),
         };
@@ -728,6 +724,24 @@ mod tests {
         assert_eq!(request.request.input[0].cache_prefix_blocks, None);
     }
 
+    #[test]
+    fn media_only_conversion_keeps_the_user_slot_without_placeholder_text() {
+        let mut params = make_send_params(None, "");
+        params.content = serde_json::from_value(
+            serde_json::json!([{"type":"upload","upload_id":"synthetic-photo"}]),
+        )
+        .unwrap();
+        let request = params
+            .into_send_request(
+                BindIdentity::new("/synthetic", "h", "photo"),
+                RunId("r".into()),
+            )
+            .unwrap();
+        assert_eq!(request.request.input.len(), 1);
+        assert!(request.request.input[0].content.is_empty());
+        assert_eq!(request.request.content.len(), 1);
+    }
+
     fn config_error(params: SendParams) -> String {
         match params.into_send_request(BindIdentity::new("/tmp", "h", "s"), RunId("invalid".into()))
         {
@@ -749,7 +763,7 @@ mod tests {
     fn missing_prompt_and_prompt_blocks_are_refused_as_config() {
         let params = make_send_params(None, "");
         let message = config_error(params);
-        assert!(message.contains("neither prompt nor prompt_blocks"));
+        assert_eq!(message, "invalid send prompt shape for template");
     }
 
     #[test]
