@@ -89,6 +89,7 @@ pub enum FrameError {
 }
 
 /// A data key with the id frames name it by.
+#[derive(Clone)]
 pub struct FrameKey {
     id: u16,
     cipher: XChaCha20Poly1305,

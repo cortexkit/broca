@@ -2,16 +2,20 @@
 //! (read, decrypt, decode), what its history would cost sealed (zstd in 16 KiB blocks, with and
 //! without opaque reasoning pruned), and what appending it costs with real barriers.
 //!
-//! Frames here are real encrypted frames. Batching, sync claims and checkpoints aren't built yet:
-//! each record is its own one-frame batch, which slightly overstates frame count but not bytes.
+//! Frames here are real encrypted frames. The size and load measurements frame each record as its
+//! own one-frame batch, which slightly overstates frame count but not bytes. The append
+//! measurement writes through the open log's writer, in real batches with real barriers, and
+//! loads the file back. Checkpoints aren't built yet: a written log's checkpoint is empty.
 
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
 use broca_protocol::content::ContentBlock;
+use broca_session_store::fold::conversation::Conversation;
+use broca_session_store::fold::operations::Operations;
 use broca_session_store::frame::{open, seal, FrameHeader, FrameKey, FrameRead, FrameStream};
+use broca_session_store::log::{ChainBase, LogEnd, LogWriter};
 use broca_session_store::record::{Record, Stream};
 
 use crate::Converted;
@@ -219,39 +223,77 @@ pub struct AppendMeasure {
     pub total_ms: f64,
     /// Microseconds per barrier: write the batch, then sync it to the device.
     pub barrier_us: Vec<u64>,
+    /// Microseconds to load the written log: read the file, read and decrypt every frame,
+    /// and fold both streams.
+    pub load_us: u64,
 }
 
-/// Appends a log's frames to `file_path` batch by batch, syncing at each barrier, as the live
-/// writer would. On macOS, `sync_all` issues `F_FULLFSYNC`, today's barrier.
+/// Writes a log to `file_path` through the open log's writer, as the live writer would: each
+/// group of records up to a barrier is one batch, written in one call and then synced. On
+/// macOS, `sync_all` issues `F_FULLFSYNC`, today's barrier. Then it loads the file back, checks
+/// it reads clean with every record, and times that load.
 pub fn append_log(
     records: &[Record],
     key: &FrameKey,
     bind: &[u8],
     file_path: &Path,
 ) -> Result<AppendMeasure, String> {
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .open(file_path)
         .map_err(|e| e.to_string())?;
     let mut measure = AppendMeasure::default();
-    let mut pending = Vec::new();
     let started = Instant::now();
+    let mut writer = LogWriter::create(
+        file,
+        key.clone(),
+        bind.to_vec(),
+        &[],
+        1,
+        ChainBase::default(),
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let mut batch_start = 0;
     for (index, record) in records.iter().enumerate() {
-        pending.extend(frame_log(std::slice::from_ref(record), key, bind)?);
         if barrier_after(record, records.get(index + 1)) || index + 1 == records.len() {
             let barrier = Instant::now();
-            file.write_all(&pending).map_err(|e| e.to_string())?;
-            file.sync_all().map_err(|e| e.to_string())?;
+            writer
+                .append(&records[batch_start..=index])
+                .map_err(|e| format!("{e:?}"))?;
+            writer.barrier().map_err(|e| format!("{e:?}"))?;
             measure
                 .barrier_us
                 .push(barrier.elapsed().as_micros() as u64);
             measure.barriers += 1;
-            measure.bytes += pending.len() as u64;
-            pending.clear();
+            batch_start = index + 1;
         }
     }
+    measure.bytes = writer.offset();
     measure.total_ms = started.elapsed().as_secs_f64() * 1000.0;
+    drop(writer);
+
+    let load = Instant::now();
+    let bytes = std::fs::read(file_path).map_err(|e| e.to_string())?;
+    let log = broca_session_store::log::read(&bytes, key, bind, 0, ChainBase::default())
+        .map_err(|e| format!("{e:?}"))?;
+    let mut conversation = Conversation::new(false);
+    let mut operations = Operations::default();
+    for (_, record) in &log.records {
+        match record.stream() {
+            Stream::Transcript => conversation.apply(record).map_err(|e| format!("{e:?}"))?,
+            Stream::Ledger => operations.apply(record).map_err(|e| format!("{e:?}"))?,
+        }
+    }
+    measure.load_us = load.elapsed().as_micros() as u64;
+    if log.end != LogEnd::Clean || log.records.len() != records.len() {
+        return Err(format!(
+            "read back {:?} with {} of {} records",
+            log.end,
+            log.records.len(),
+            records.len()
+        ));
+    }
     Ok(measure)
 }

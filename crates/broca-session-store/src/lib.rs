@@ -13,9 +13,12 @@
 //! - `content`: encodings for the renderer's message and content types.
 //! - `record`: the records of a session log, in two streams.
 //! - `frame`: how one record sits in an open log, encrypted.
+//! - `fold`: rebuilding a session's state from its records, one fold per stream.
+//! - `log`: the open log, written in all-or-nothing batches and read with its end classified.
 
 pub mod codec;
 pub mod content;
 pub mod fold;
 pub mod frame;
+pub mod log;
 pub mod record;

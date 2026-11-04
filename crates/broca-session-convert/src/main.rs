@@ -1058,8 +1058,13 @@ struct AppendReport {
     bytes: u64,
     /// Write plus device sync per barrier, in microseconds.
     barrier_us: Percentiles,
-    /// Per log: total append time against today's file size.
-    per_log: Vec<(u64, u64, u64, f64)>,
+    /// Loading a written log, in microseconds: read the file, read and decrypt every frame, and
+    /// fold both streams.
+    load_us: Percentiles,
+    /// Per log: the size of the session's log in today's format, records, barriers, total append time in milliseconds, the
+    /// written log's size, and its load time in microseconds.
+    per_log: Vec<(u64, u64, u64, f64, u64, u64)>,
+    failures: Vec<String>,
 }
 
 fn run_append(args: &Args) {
@@ -1085,6 +1090,7 @@ fn run_append(args: &Args) {
     let key = measurement_key();
     let mut report = AppendReport::default();
     let mut latencies = Vec::new();
+    let mut loads = Vec::new();
     for (index, file) in chosen.iter().enumerate() {
         let old = match broca_wal::replay_file(file, u64::MAX) {
             Ok(old) => old,
@@ -1110,13 +1116,17 @@ fn run_append(args: &Args) {
                     converted.records.len() as u64,
                     measured.barriers,
                     measured.total_ms,
+                    measured.bytes,
+                    measured.load_us,
                 ));
                 latencies.extend(measured.barrier_us);
+                loads.push(measured.load_us);
             }
-            Err(e) => eprintln!("{}: {e}", file.display()),
+            Err(e) => report.failures.push(format!("{}: {e}", file.display())),
         }
         let _ = std::fs::remove_file(&target);
     }
     report.barrier_us = percentiles(latencies);
+    report.load_us = percentiles(loads);
     write_report(&report, args.out_file.as_deref());
 }
