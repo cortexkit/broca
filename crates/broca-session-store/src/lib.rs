@@ -22,6 +22,9 @@
 //! - `session`: creating, loading and appending to a session.
 //! - `prune`: removing opaque reasoning from records that leave the open log.
 //! - `segment`: sealed segments, the immutable objects records move to when they leave the log.
+//! - `directory`: which sealed segment holds each record sequence number, as a small tree of
+//!   immutable pages.
+//! - `setup`: the setup store, where the parts runs are started with live once per deployment.
 
 pub mod backend;
 pub mod checkpoint;
@@ -37,3 +40,4 @@ pub mod prune;
 pub mod record;
 pub mod segment;
 pub mod session;
+pub mod setup;

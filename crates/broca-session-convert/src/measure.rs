@@ -13,12 +13,14 @@ use std::time::Instant;
 
 use broca_protocol::content::ContentBlock;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
+use broca_session_store::codec::Digest;
 use broca_session_store::codec::Message as _;
 use broca_session_store::frame::{open, seal, FrameHeader, FrameKey, FrameRead, FrameStream};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
-use broca_session_store::record::{Placement, Record, Stream};
+use broca_session_store::record::{PartRef, Placement, Record, Stream};
 use broca_session_store::session::Session;
+use broca_session_store::setup::SetupStore;
 use futures::executor::block_on;
 
 use crate::Converted;
@@ -235,6 +237,20 @@ pub struct AppendMeasure {
     pub seal_us: Vec<u64>,
     /// Whether a cut was sealed.
     pub cut: bool,
+    /// Microseconds per setup part stored before the batch that names it. A part the store
+    /// already held (from this session or an earlier one) asks the backend nothing and isn't
+    /// timed.
+    pub setup_put_us: Vec<u64>,
+}
+
+/// The setup parts `record` names.
+fn named_parts(record: &Record) -> &[PartRef] {
+    match record {
+        Record::RunStart(start) => &start.setup,
+        Record::SetupStub(stub) => &stub.parts,
+        Record::SessionRefresh(refresh) => &refresh.setup,
+        _ => &[],
+    }
 }
 
 /// Writes a converted log as a real session on local files under `root`, as the live writer
@@ -243,11 +259,17 @@ pub struct AppendMeasure {
 /// after a restart) loads the session through the real load path, which must give the state the
 /// writer held; that load is timed.
 ///
+/// Every setup part a batch names is stored in `setup` before the batch is appended, as admission
+/// must do (a record never names a part that isn't durable). After the reload, every named part
+/// must read back from a store with nothing cached, checked against its digest.
+///
 /// Then it seals twice: a cut at the newest run input where a cut may fall, which must leave the
 /// window as exactly the messages from there on, and a ledger seal on top. After each, the
 /// session reloads to the state its writer held.
 pub fn append_log(
     records: &[Record],
+    parts: &std::collections::BTreeMap<Digest, Vec<u8>>,
+    setup: &SetupStore<'_, LocalBackend>,
     appends_in_conversation: bool,
     deployment: &DeploymentKey,
     root: &Path,
@@ -275,6 +297,22 @@ pub fn append_log(
         let mut run_inputs = Vec::new();
         for (index, record) in records.iter().enumerate() {
             if barrier_after(record, records.get(index + 1)) || index + 1 == records.len() {
+                for part in records[batch_start..=index].iter().flat_map(named_parts) {
+                    let bytes = parts
+                        .get(&part.digest)
+                        .ok_or("a record names a part the converter didn't keep")?;
+                    let put = Instant::now();
+                    let (stored, wrote) = setup
+                        .put(part.kind, bytes)
+                        .await
+                        .map_err(|e| format!("setup put: {e:?}"))?;
+                    if stored != *part {
+                        return Err("a stored part's reference differs from the record's".into());
+                    }
+                    if wrote {
+                        measure.setup_put_us.push(put.elapsed().as_micros() as u64);
+                    }
+                }
                 let barrier = Instant::now();
                 let first = session
                     .append(&records[batch_start..=index], true)
@@ -310,6 +348,13 @@ pub fn append_log(
         return Err("the loaded session's state differs from the writer's".into());
     }
     drop(loaded);
+    let fresh = SetupStore::new(setup.backend(), setup.key());
+    for part in records.iter().flat_map(named_parts) {
+        let bytes = block_on(fresh.get(part)).map_err(|e| format!("setup get: {e:?}"))?;
+        if parts.get(&part.digest).map(Vec::as_slice) != Some(&*bytes) {
+            return Err("a setup part read back differs from the converter's".into());
+        }
+    }
 
     let sealed = block_on(async {
         let mut session = Session::load(&reopened, addr.clone(), &triple, deployment)

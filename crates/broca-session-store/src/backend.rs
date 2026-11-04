@@ -12,8 +12,10 @@
 //! Besides the head and logs, a session has immutable objects: sealed segments and directory
 //! pages. Each belongs to the change that wrote it, and its name starts with that change's id
 //! (`<change id>/<name>`), so a change that never committed is undone by deleting its prefix.
-//! Storage shared across sessions (the tool definitions, system text and plans that runs are
-//! started with, stored once each) comes later, with its own operations.
+//! Storage shared across sessions is the setup store: the parts runs are started with (tool
+//! definitions, system text, plans), stored once each per deployment and never deleted (see
+//! `setup`). It isn't fenced: a part is named by its content, so two writers storing the same
+//! name store the same bytes.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -142,6 +144,11 @@ pub trait SessionBackend {
         change: &Id128,
         at: Version,
     ) -> Result<(), BackendError>;
+    /// Stores setup part `name`, unless a part of that name is already stored: names are derived
+    /// from content, so the stored part already holds these bytes. Durable on return, name
+    /// included.
+    async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError>;
+    async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError>;
 }
 
 /// The change id an object's name starts with.
@@ -153,6 +160,7 @@ pub fn object_change(name: &str) -> &str {
 #[derive(Default)]
 pub struct MemoryBackend {
     sessions: Mutex<HashMap<SessionAddr, MemorySession>>,
+    setup: Mutex<HashMap<String, Vec<u8>>>,
     /// Mutations left before the backend "crashes": every mutation after that fails. Tests only.
     crash_after: Mutex<Option<usize>>,
     /// Mutations left before exactly one of them fails. Tests only.
@@ -226,6 +234,16 @@ impl MemoryBackend {
             .get(s)
             .map(|session| session.logs.keys().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Replaces a stored setup part's bytes, as damage would leave them. Tests only.
+    pub fn set_setup(&self, name: &str, bytes: Vec<u8>) {
+        self.setup.lock().unwrap().insert(name.into(), bytes);
+    }
+
+    /// Every setup part name stored. Tests only.
+    pub fn setup_names(&self) -> Vec<String> {
+        self.setup.lock().unwrap().keys().cloned().collect()
     }
 
     /// Replaces a log's bytes, as a crash or damage would leave them. Tests only.
@@ -421,6 +439,20 @@ impl SessionBackend for MemoryBackend {
         session.objects.retain(|name, _| !name.starts_with(&prefix));
         Ok(())
     }
+
+    async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError> {
+        self.mutate()?;
+        self.setup
+            .lock()
+            .unwrap()
+            .entry(name.into())
+            .or_insert_with(|| bytes.to_vec());
+        Ok(())
+    }
+
+    async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        Ok(self.setup.lock().unwrap().get(name).cloned())
+    }
 }
 
 /// A backend on local files:
@@ -431,6 +463,8 @@ impl SessionBackend for MemoryBackend {
 ///   `sync_all`, which issues `F_FULLFSYNC` on macOS and survives power loss.
 /// - `<root>/objects/<addr>/<change id>/<name>`: immutable objects, one folder per change, so
 ///   undoing a change deletes one folder.
+/// - `<root>/setup/<name>`: setup parts, shared by every session. Written to a temporary file,
+///   synced, and renamed into place, so a part is either whole or absent.
 ///
 /// Only one process may write a session: the caller holds the session's lease (an OS file
 /// lock) for as long as it writes. So the head version the fences compare against is kept in
@@ -485,6 +519,14 @@ impl LocalBackend {
             ));
         }
         Ok(self.object_dir(s).join(name))
+    }
+
+    /// A setup part's path. A name is lowercase hex only, so it can't leave the setup folder.
+    fn setup_path(&self, name: &str) -> Result<PathBuf, BackendError> {
+        if name.is_empty() || !name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(BackendError::Corrupt("setup part name is not hex"));
+        }
+        Ok(self.root.join("setup").join(name))
     }
 
     fn read_head_file(&self, s: &SessionAddr) -> Result<Option<(Vec<u8>, Version)>, BackendError> {
@@ -767,5 +809,33 @@ impl SessionBackend for LocalBackend {
             Err(error) => return Err(error.into()),
         }
         Ok(())
+    }
+
+    async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError> {
+        let path = self.setup_path(name)?;
+        if path.exists() {
+            return Ok(());
+        }
+        let dir = path
+            .parent()
+            .expect("a setup part lives in the setup folder");
+        std::fs::create_dir_all(dir)?;
+        // A unique temporary name, so two writers storing the same part never share a file.
+        let temp = dir.join(format!(".{name}.{}.tmp", hex(&crate::keys::random_id().0)));
+        let mut file = File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, &path)?;
+        sync_dir(dir)?;
+        Ok(())
+    }
+
+    async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        match std::fs::read(self.setup_path(name)?) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 }

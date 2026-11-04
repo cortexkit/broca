@@ -1075,6 +1075,14 @@ struct AppendReport {
     seal_us: Percentiles,
     /// Logs where a cut was sealed; the rest had no run input where a cut may fall.
     cuts: u64,
+    /// Setup parts stored across every session of the run, each once, and their bytes on disk
+    /// (encrypted).
+    setup_parts_stored: u64,
+    setup_bytes_stored: u64,
+    /// Parts written, and microseconds per write (encrypt, write, sync, rename, sync the folder).
+    /// A part an earlier session already stored writes nothing and isn't counted.
+    setup_parts_written: u64,
+    setup_put_us: Percentiles,
     /// Per log: the size of the session's log in today's format, records, barriers, total append time in milliseconds, the
     /// written log's size, and its load time in microseconds.
     per_log: Vec<(u64, u64, u64, f64, u64, u64)>,
@@ -1103,7 +1111,14 @@ fn run_append(args: &Args) {
 
     // Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
     let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let setup_key = deployment.setup_key();
+    // One setup store for the whole run, as a deployment has: later sessions reuse parts that
+    // earlier ones stored.
+    let setup_root = dir.join("append-setup");
+    let setup_backend = broca_session_store::backend::LocalBackend::new(&setup_root);
+    let setup = broca_session_store::setup::SetupStore::new(&setup_backend, &setup_key);
     let mut report = AppendReport::default();
+    let mut setup_puts = Vec::new();
     let mut latencies = Vec::new();
     let mut loads = Vec::new();
     let mut seals = Vec::new();
@@ -1123,6 +1138,8 @@ fn run_append(args: &Args) {
         let appends_in_conversation = !broca_core::is_mode3_log(&records);
         match append_log(
             &converted.records,
+            &converted.parts,
+            &setup,
             appends_in_conversation,
             &deployment,
             &target,
@@ -1145,6 +1162,7 @@ fn run_append(args: &Args) {
                 loads.push(measured.load_us);
                 seals.extend(measured.seal_us);
                 report.cuts += u64::from(measured.cut);
+                setup_puts.extend(measured.setup_put_us);
             }
             Err(e) => report.failures.push(format!("{}: {e}", file.display())),
         }
@@ -1153,6 +1171,15 @@ fn run_append(args: &Args) {
     report.barrier_us = percentiles(latencies);
     report.load_us = percentiles(loads);
     report.seal_us = percentiles(seals);
+    report.setup_parts_written = setup_puts.len() as u64;
+    report.setup_put_us = percentiles(setup_puts);
+    if let Ok(entries) = std::fs::read_dir(setup_root.join("setup")) {
+        for entry in entries.flatten() {
+            report.setup_parts_stored += 1;
+            report.setup_bytes_stored += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&setup_root);
     write_report(&report, args.out_file.as_deref());
 }
 

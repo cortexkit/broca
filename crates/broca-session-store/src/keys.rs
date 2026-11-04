@@ -31,6 +31,7 @@ pub fn random_id() -> Id128 {
 pub struct DeploymentKey {
     id: u16,
     cipher: XChaCha20Poly1305,
+    bytes: [u8; 32],
 }
 
 impl DeploymentKey {
@@ -38,11 +39,21 @@ impl DeploymentKey {
         Self {
             id,
             cipher: XChaCha20Poly1305::new(Key::from_slice(key)),
+            bytes: *key,
         }
     }
 
     pub fn id(&self) -> u16 {
         self.id
+    }
+
+    /// The keys of the deployment's setup store, derived from this key for that purpose only.
+    pub fn setup_key(&self) -> crate::setup::SetupKey {
+        crate::setup::SetupKey::new(
+            self.id,
+            &crate::prune::keyed_digest(&self.bytes, b"broca-setup-encrypt-v1").0,
+            crate::prune::keyed_digest(&self.bytes, b"broca-setup-name-v1").0,
+        )
     }
 }
 
