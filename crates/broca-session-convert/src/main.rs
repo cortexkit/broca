@@ -143,6 +143,8 @@ struct Args {
     out_file: Option<PathBuf>,
     limit: usize,
     sample: usize,
+    /// Visit only the archived log at this session address.
+    only: Option<String>,
     dir: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
@@ -155,6 +157,7 @@ fn parse_args() -> Args {
         out_file: None,
         limit: usize::MAX,
         sample: 40,
+        only: None,
         dir: None,
         files: Vec::new(),
     };
@@ -171,6 +174,7 @@ fn parse_args() -> Args {
             }
             "--limit" => parsed.limit = number(),
             "--sample" => parsed.sample = number(),
+            "--only" => parsed.only = Some(args.next().unwrap_or_else(|| usage())),
             "--dir" => parsed.dir = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             _ => paths.push(PathBuf::from(arg)),
         }
@@ -207,6 +211,7 @@ fn main() {
     match args.command.as_str() {
         "check" => run_check(&args),
         "prompt" => run_prompt(&args),
+        "trace" => run_trace(&args),
         "measure" => run_measure(&args),
         "append" => run_append(&args),
         _ => usage(),
@@ -392,6 +397,50 @@ fn run_prompt(args: &Args) {
         }
     });
     write_report(&report, args.out_file.as_deref());
+}
+
+/// Prints, for one log, its old record types in order and the roles of today's prompt beside
+/// the rebuilt conversation's. Types and roles only, never content, so a mismatch can be
+/// located without reading the session.
+fn run_trace(args: &Args) {
+    each_log(args, |item| {
+        let Item::Log {
+            name, old: Ok(old), ..
+        } = item
+        else {
+            return;
+        };
+        println!("== {name}");
+        for framed in &old {
+            let kind = serde_json::to_value(&framed.record)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+                .unwrap_or_default();
+            println!("  {:>5} {kind}", framed.seq);
+        }
+        let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
+        let today = broca_core::replay::replay(&records)
+            .map(|s| s.prompt)
+            .unwrap_or_default();
+        let mut conversation = Conversation::new(!broca_core::is_mode3_log(&records));
+        if let Ok(converted) = convert(&old) {
+            for record in converted
+                .records
+                .iter()
+                .filter(|r| r.stream() == Stream::Transcript)
+            {
+                if let Err(e) = conversation.apply(record) {
+                    println!("  fold refused: {e:?}");
+                    break;
+                }
+            }
+        }
+        let roles = |m: &[broca_protocol::content::Message]| -> Vec<String> {
+            m.iter().map(|m| format!("{:?}", m.role)).collect()
+        };
+        println!("  today:   {}", roles(&today).join(" "));
+        println!("  rebuilt: {}", roles(&conversation.messages).join(" "));
+    });
 }
 
 /// Accumulates one report over many logs.
@@ -616,6 +665,9 @@ fn each_log(args: &Args, mut visit: impl FnMut(Item)) {
             },
         };
         for addr in members {
+            if args.only.as_ref().is_some_and(|only| &addr != only) {
+                continue;
+            }
             members_seen += 1;
             addresses.insert(addr.clone());
             let name = format!("{label}#{addr}");

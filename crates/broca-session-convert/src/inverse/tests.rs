@@ -100,16 +100,41 @@ fn a_steer_is_recorded_where_it_is_placed_and_round_trips() {
     assert_round_trip(&old);
 }
 
-/// A steer no boundary placed before a new run started never reached the conversation, so its
-/// messages stay in the steer's record.
+/// A steer no boundary placed never reached the conversation, so it gets no transcript copy;
+/// its record keeps the messages either way.
 #[test]
-fn an_unplaced_steer_keeps_its_messages_and_round_trips() {
+fn an_unplaced_steer_gets_no_copy_and_round_trips() {
     let old = log(&[&RUN.replace("RUN", "r"), STEER]);
     let converted = convert(&old).unwrap();
     assert!(!converted.records.iter().any(
         |r| matches!(r, broca_session_store::record::Record::Input(i) if i.receipt_seq.is_some())
     ));
     assert_round_trip(&old);
+}
+
+/// A copy that no longer equals the message its record kept refuses.
+#[test]
+fn a_placed_copy_that_differs_from_its_record_refuses() {
+    use broca_protocol::content::ContentBlock;
+    use broca_session_store::record::Record;
+    let old = log(&[
+        &RUN.replace("RUN", "r"),
+        STEER,
+        r#"{"type":"step_started","step_id":1}"#,
+    ]);
+    let mut converted = convert(&old).unwrap();
+    let Some(Record::Input(copy)) = converted
+        .records
+        .iter_mut()
+        .find(|r| matches!(r, Record::Input(i) if i.receipt_seq.is_some()))
+    else {
+        panic!("the placed copy");
+    };
+    copy.message.content = vec![ContentBlock::Text {
+        text: "changed".into(),
+    }];
+    let error = invert(&converted.records, &converted.parts).unwrap_err();
+    assert!(error.contains("steered"), "{error}");
 }
 
 #[test]

@@ -146,6 +146,10 @@ message! {
         /// When the last content arrived, from which the entry's `completed_at` comes.
         7 opt last_content_at_ms: u64,
         8 opt tags_v1: serde_json::Value,
+        /// The run's last step, taken after its tool-call budget asked the model to finish. Any
+        /// calls in it are never run, so the message enters the conversation without them; the
+        /// record keeps them as the model wrote them.
+        9 opt budget_finalize: bool,
     }
 }
 

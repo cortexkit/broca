@@ -48,6 +48,7 @@ fn assistant(calls: &[&str]) -> Record {
         usage: None,
         written_at_ms: None,
         last_content_at_ms: None,
+        budget_finalize: None,
         tags_v1: None,
     })
 }
@@ -160,6 +161,25 @@ fn a_new_run_drops_a_turn_its_interrupted_run_left_unanswered() {
     let roles: Vec<Role> = conversation.messages.iter().map(|m| m.role).collect();
     assert_eq!(roles, [Role::User, Role::User]);
     assert!(conversation.open_tool_turn().is_none());
+}
+
+#[test]
+fn a_budget_finalize_step_enters_at_once_without_its_calls() {
+    let Record::Assistant(mut step) = assistant(&["a"]) else {
+        unreachable!()
+    };
+    step.message.content.push(ContentBlock::Text {
+        text: "summary".into(),
+    });
+    step.budget_finalize = Some(true);
+    let conversation = fold(&[Record::Assistant(step)], false).unwrap();
+    assert!(conversation.open_tool_turn().is_none());
+    assert_eq!(
+        conversation.messages[0].content,
+        [ContentBlock::Text {
+            text: "summary".into()
+        }]
+    );
 }
 
 #[test]

@@ -7,6 +7,11 @@
 //! the anchor, except a run start's input entries, which follow it. So the inverse buffers
 //! transcript records until the next ledger record claims them, and refuses a log where a
 //! transcript record is left unclaimed or claimed by the wrong anchor.
+//!
+//! Steered and delivered messages are the exception: their ledger record keeps them whole, and
+//! the transcript holds copies where the conversation places them, each naming its record by
+//! seq. The inverse rebuilds those records from the ledger alone and checks each copy against
+//! the record it names.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -381,55 +386,43 @@ fn event(event: &Event, claimed: &[&Record]) -> Result<Value, String> {
             .ok_or_else(|| format!("{} claimed records it doesn't split into", event.name))
     };
     match event.name.as_str() {
-        "steered" => {
-            expect(replies.is_empty() && appends.is_empty())?;
-            expect(inputs.iter().all(|i| i.placement == Placement::Steer))?;
-            // Placed messages come back from their entries. A steer never placed kept its
-            // messages in the body, and a steer of no messages gets its empty list back.
-            if inputs.is_empty() {
-                object
-                    .entry("input")
-                    .or_insert_with(|| Value::Array(Vec::new()));
-            } else {
-                object.insert(
-                    "input".into(),
-                    Value::Array(inputs.iter().map(|i| json(&i.message)).collect()),
-                );
-                set(&mut object, "written_at_ms", inputs[0].written_at_ms);
-                set(
-                    &mut object,
-                    "tags",
-                    tags(inputs.iter().map(|i| i.tags_v1.clone())),
-                );
+        "steered" | "send_delivered" => {
+            // The record keeps everything it accepted. Its transcript entries are copies: each
+            // placed message must equal the record's message in the same position, and text
+            // delivered with a tool result must equal the record's.
+            expect(replies.is_empty() && appends.len() <= 1)?;
+            let messages = match object.get("input") {
+                Some(Value::Array(messages)) => messages.as_slice(),
+                _ => &[],
+            };
+            let copied = inputs.len() == messages.len()
+                && inputs.iter().zip(messages).all(|(input, message)| {
+                    without_nulls(&json(&input.message)) == without_nulls(message)
+                });
+            expect(inputs.is_empty() || copied)?;
+            if let Some(append) = appends.first() {
+                expect(
+                    object.get("appended_text") == Some(&json(&append.text))
+                        && object.get("tool_call_id") == Some(&json(&append.tool_call_id)),
+                )?;
             }
         }
         "budget_fired" => {
+            // The record keeps what it stored. The transcript copy is the message the
+            // conversation took: the stored text when there is one, else the text the budget
+            // had due, which older records didn't store.
             expect(replies.is_empty() && appends.is_empty() && inputs.len() <= 1)?;
             if let Some(input) = inputs.first() {
                 let text = match input.message.content.as_slice() {
                     [broca_protocol::content::ContentBlock::Text { text }] => text.clone(),
                     _ => return Err("budget nudge is not one text block".into()),
                 };
-                object.insert("caller_text".into(), json(text));
-                set(&mut object, "tags", input.tags_v1.as_ref());
-            }
-        }
-        "send_delivered" => {
-            expect(replies.is_empty() && appends.len() <= 1)?;
-            if !inputs.is_empty() {
-                object.insert(
-                    "input".into(),
-                    Value::Array(inputs.iter().map(|i| json(&i.message)).collect()),
-                );
-                set(
-                    &mut object,
-                    "tags",
-                    tags(inputs.iter().map(|i| i.tags_v1.clone())),
-                );
-            }
-            if let Some(append) = appends.first() {
-                object.insert("appended_text".into(), json(&append.text));
-                object.insert("tool_call_id".into(), json(&append.tool_call_id));
+                expect(
+                    object
+                        .get("caller_text")
+                        .is_none_or(|stored| stored == &json(text)),
+                )?;
+                expect(object.get("tags") == input.tags_v1.as_ref())?;
             }
         }
         "recovery_call_closed" => {

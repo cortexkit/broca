@@ -81,6 +81,13 @@ pub(crate) struct Due {
     pub text: String,
 }
 
+/// The text of the next firing due, the message a budget firing places when its record didn't
+/// store the text. Replay reconstructs older records' messages this way, and so does any tool
+/// that rebuilds a conversation from them.
+pub fn next_due_text(state: &BudgetReplayStateV1, config: &BudgetConfig) -> Option<String> {
+    decide(state, config).first().map(|due| due.text.clone())
+}
+
 /// Return all outstanding firings in threshold order, with nudges before a tied finalize.
 /// Deciding does not spend an allowance: only applying its durable firing does.
 pub(crate) fn decide(state: &BudgetReplayStateV1, config: &BudgetConfig) -> Vec<Due> {

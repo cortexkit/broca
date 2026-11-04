@@ -88,54 +88,33 @@ struct State {
     model: Option<ModelHandle>,
     setup: Vec<PartRef>,
     call_inputs: HashMap<String, Value>,
-    /// Steered and delivered messages accepted but not placed yet. Today's log records them
-    /// where they arrived; the conversation takes them at the next step boundary or run end,
-    /// which is where the new transcript records them.
+    /// Copies of steered and delivered messages accepted but not placed yet. Today's log
+    /// records them where they arrived; the conversation takes them at the next step boundary
+    /// or run end, which is where the new transcript records its copies.
     held: Vec<Input>,
+    /// Whether the current run was frozen with a tool-call budget. Only then does a budget
+    /// firing place a message in today's conversation.
+    budget_configured: bool,
+    /// The text the current run's budget had due when the record being converted fired, for an
+    /// older firing record that didn't store it.
+    due_budget_text: Option<String>,
+    /// Whether the step being converted is a run's budget-finalize step.
+    finalize_step: bool,
 }
 
-/// Writes the held messages as transcript entries at the boundary that places them.
+/// Writes the held copies as transcript entries at the boundary that places them.
 fn place_held(state: &mut State, out: &mut Converted) {
     out.records.extend(state.held.drain(..).map(Record::Input));
 }
 
-/// Puts messages that were never placed back into the ledger record that accepted them: they
-/// never reached the conversation, so they stay part of that record's body.
-fn unplace_held(state: &mut State, out: &mut Converted) {
-    for input in state.held.drain(..) {
-        let seq = input.receipt_seq.expect("held messages name their receipt");
-        let Some(Record::Event(event)) = out.records.get_mut(seq as usize - 1) else {
-            unreachable!("a held message's receipt is a ledger event");
-        };
-        let body = event.body.get_or_insert_with(|| Value::Object(Map::new()));
-        let Value::Object(body) = body else {
-            unreachable!("event bodies are objects");
-        };
-        let messages = body
-            .entry("input")
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Value::Array(messages) = messages {
-            messages.push(serde_json::to_value(&input.message).expect("messages serialize"));
-        }
-        if let Some(tags) = input.tags_v1 {
-            if let Value::Array(list) = body
-                .entry("tags")
-                .or_insert_with(|| Value::Array(Vec::new()))
-            {
-                list.push(tags);
-            }
-        }
-        if let Some(written) = input.written_at_ms {
-            body.entry("written_at_ms").or_insert(written.into());
-        }
-    }
-}
-
-/// Holds messages accepted by the ledger event about to be written, until a boundary places
-/// them.
+/// Holds copies of messages accepted by the ledger record about to be written, until a boundary
+/// places them. Copies never placed are dropped: they never reached the conversation, and the
+/// accepting record keeps the messages.
 fn hold(inputs: Vec<Input>, state: &mut State, out: &Converted) {
     let receipt = out.records.len() as u64 + 1;
+    let run_id = state.run_id.clone();
     state.held.extend(inputs.into_iter().map(|input| Input {
+        run_id: run_id.clone(),
         receipt_seq: Some(receipt),
         ..input
     }));
@@ -144,10 +123,41 @@ fn hold(inputs: Vec<Input>, state: &mut State, out: &Converted) {
 pub fn convert(old: &[FramedRecord]) -> Result<Converted, ConvertError> {
     let mut out = Converted::default();
     let mut state = State::default();
+    // Today's placement rules track the budget a firing record without its text needs. They
+    // read each record before it is converted, as today's replay does.
+    let mut placement = broca_core::placement::Placement::default();
+    let mut budget = None;
     for framed in old {
+        match &framed.record {
+            WalRecord::RunStarted { config, .. } => {
+                budget = config.budget.clone();
+                state.budget_configured = budget.is_some();
+            }
+            WalRecord::BudgetFired {
+                caller_text: None, ..
+            } => {
+                state.due_budget_text = budget
+                    .as_ref()
+                    .and_then(|budget| broca_core::next_due_text(placement.budget(), budget));
+            }
+            _ => {}
+        }
+        // A record today's placement refuses is one today's replay refuses too; the conversion
+        // still carries it, and the conversation check reports the log.
+        let actions = placement.observe(&framed.record).unwrap_or_default();
+        // A step taken after the budget's finalize firing enters today's conversation at once,
+        // calls and all.
+        state.finalize_step = actions.iter().any(|action| {
+            matches!(
+                action,
+                broca_core::placement::PlacementAction::Append {
+                    kind: broca_core::placement::AppendKind::Finalize,
+                    ..
+                }
+            )
+        });
         convert_one(&framed.record, &mut state, &mut out)?;
     }
-    unplace_held(&mut state, &mut out);
     Ok(out)
 }
 
@@ -208,6 +218,15 @@ impl Fields {
     /// A field's value, left in place for whatever carries the rest of the record.
     fn peek(&self, key: &str) -> Option<&Value> {
         self.object.get(key).filter(|v| !v.is_null())
+    }
+
+    /// A field parsed as `T`, left in place like `peek`.
+    fn peek_parse<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, ConvertError> {
+        let path = format!("{}.{key}", self.path);
+        self.peek(key)
+            .cloned()
+            .map(|v| serde_json::from_value(v).map_err(|e| err(format!("{path}: {e}"))))
+            .transpose()
     }
 
     fn u64(&mut self, key: &str) -> Option<u64> {
@@ -355,36 +374,26 @@ fn convert_one(
             }));
         }
         "steered" => {
-            let input: Vec<Message> = f.parse("input")?.unwrap_or_default();
-            // When the steer has messages, its `written_at_ms` and `tags` move onto their input
-            // records; otherwise they stay in the steer's ledger event.
-            let written = if input.is_empty() {
-                None
-            } else {
-                f.u64("written_at_ms")
-            };
-            let tags = per_message_tags(&mut f, input.len());
-            let inputs = input
-                .into_iter()
-                .enumerate()
-                .map(|(index, message)| Input {
-                    run_id: state.run_id.clone(),
-                    placement: Placement::Steer,
-                    message,
-                    written_at_ms: written,
-                    submission_id: None,
-                    notice: None,
-                    tags_v1: tags_at(&tags, index),
-                    receipt_seq: None,
-                })
-                .collect();
-            hold(inputs, state, out);
-            // The receipt (send id, delivery, retention, sender) is the queue's.
+            let written = f.peek("written_at_ms").and_then(Value::as_u64);
+            let copies = message_copies(&mut f, Placement::Steer, written, None)?;
+            hold(copies, state, out);
+            // The record keeps everything it accepted: the messages, and the receipt (send id,
+            // delivery, retention, sender) the queue reads.
             event(&mut f, kind.clone(), out);
         }
         "send_delivered" => send_delivered(&mut f, state, out)?,
         "budget_fired" => {
-            if let Some(text) = f.string("caller_text") {
+            // The record keeps what it stored; the transcript gets the message the conversation
+            // took, written right after the record and naming it. Older records didn't store
+            // the text, and today's conversation then takes the text the run's budget had due.
+            let stored = f
+                .peek("caller_text")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let text = stored.or_else(|| state.due_budget_text.take());
+            let tags = f.peek("tags").cloned();
+            event(&mut f, kind.clone(), out);
+            if let (Some(text), true) = (text, state.budget_configured) {
                 out.records.push(Record::Input(Input {
                     run_id: state.run_id.clone(),
                     placement: Placement::BudgetNudge,
@@ -392,11 +401,10 @@ fn convert_one(
                     written_at_ms: None,
                     submission_id: None,
                     notice: None,
-                    tags_v1: f.take("tags"),
-                    receipt_seq: None,
+                    tags_v1: tags,
+                    receipt_seq: Some(out.records.len() as u64),
                 }));
             }
-            event(&mut f, kind.clone(), out);
         }
         "queued" => queued(&mut f, out)?,
         "session_refresh_accepted" => {
@@ -535,21 +543,42 @@ fn tags_at(tags: &Option<Value>, index: usize) -> Option<Value> {
     }
 }
 
-/// Takes a record's v1 `tags` to spread over its `messages` input messages, one entry each. With
-/// no messages the tags stay on the record; a list of any other length is reported, since it
-/// couldn't be spread back exactly.
-fn per_message_tags(f: &mut Fields, messages: usize) -> Option<Value> {
-    if messages == 0 {
-        return None;
-    }
-    let tags = f.take("tags")?;
-    match &tags {
-        Value::Array(list) if list.len() == messages => Some(tags),
-        other => {
-            f.lose("tags (not one entry per message)".into(), json_len(other));
+/// Copies of the messages a steer or delivered send carries, to place in the transcript. The
+/// record keeps its own messages, `tags` (the part numbers its run showed the model) and time;
+/// each copy takes its message's entry from `tags`. A `tags` list that doesn't hold one entry
+/// per message is reported, since the copies couldn't carry it exactly.
+fn message_copies(
+    f: &mut Fields,
+    placement: Placement,
+    written: Option<u64>,
+    submission: Option<String>,
+) -> Result<Vec<Input>, ConvertError> {
+    let messages: Vec<Message> = f.peek_parse("input")?.unwrap_or_default();
+    let tags = match f.peek("tags") {
+        Some(Value::Array(list)) if list.len() == messages.len() => {
+            Some(Value::Array(list.clone()))
+        }
+        Some(other) if !messages.is_empty() => {
+            let bytes = json_len(other);
+            f.lose("tags (not one entry per message)".into(), bytes);
             None
         }
-    }
+        _ => None,
+    };
+    Ok(messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| Input {
+            run_id: String::new(),
+            placement,
+            message,
+            written_at_ms: written,
+            submission_id: submission.clone(),
+            notice: None,
+            tags_v1: tags_at(&tags, index),
+            receipt_seq: None,
+        })
+        .collect())
 }
 
 /// Carries the rest of an old record whole, as a ledger event under its old type name. The run
@@ -681,9 +710,9 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
         choices.insert("record".into(), rest);
     }
     start.run_choices = (!choices.is_empty()).then_some(Value::Object(choices));
-    // Messages still held when a new run starts were never placed; today's conversation drops
-    // them, so they stay with the record that accepted them.
-    unplace_held(state, out);
+    // Copies still held when a new run starts were never placed: today's conversation drops
+    // those messages, and the records that accepted them keep them.
+    state.held.clear();
     out.records.push(Record::RunStart(Box::new(start)));
     for (index, message) in input.into_iter().enumerate() {
         out.records.push(Record::Input(Input {
@@ -741,6 +770,7 @@ fn model_step_finished(
         written_at_ms: f.u64("written_at_ms"),
         last_content_at_ms: None,
         tags_v1: f.take("tags"),
+        budget_finalize: std::mem::take(&mut state.finalize_step).then_some(true),
     }));
     let finish_reason: Option<FinishReason> = f.parse("finish_reason")?;
     out.records.push(Record::StepEnd(StepEnd {
@@ -935,9 +965,10 @@ fn tool_no_dispatch(
     Ok(())
 }
 
-/// A queued send placed into a running run. Its delivery facts (submission, mode, run, time)
-/// stay on a ledger event; the placed text becomes transcript entries, which copy the time and
-/// submission, so rebuilding the conversation never needs to read the ledger event.
+/// A queued send placed into a running run. Its record keeps everything as written: the
+/// delivery facts and the messages it delivered. The transcript gets copies: the messages where
+/// the next step boundary places them, and text delivered with a tool result right away, which
+/// is where the conversation takes it.
 fn send_delivered(
     f: &mut Fields,
     state: &mut State,
@@ -967,37 +998,22 @@ fn send_delivered(
             Placement::Delivered
         }
     };
-    let input: Vec<Message> = f.parse("input")?.unwrap_or_default();
-    if mode == "tool_result" && !input.is_empty() {
+    let copies = message_copies(f, placement, written, submission)?;
+    if mode == "tool_result" && !copies.is_empty() {
         f.lose("input (with mode tool_result)".into(), 0);
     }
-    let tags = per_message_tags(f, input.len());
-    let inputs: Vec<Input> = input
-        .into_iter()
-        .enumerate()
-        .map(|(index, message)| Input {
-            run_id: state.run_id.clone(),
-            placement,
-            message,
-            written_at_ms: written,
-            submission_id: submission.clone(),
-            notice: None,
-            tags_v1: tags_at(&tags, index),
-            receipt_seq: None,
-        })
-        .collect();
-    if f.has("appended_text") && f.has("tool_call_id") {
-        let call: Option<ToolCallId> = f.parse("tool_call_id")?;
+    let call: Option<ToolCallId> = f.peek_parse("tool_call_id")?;
+    let text = f.peek("appended_text").and_then(Value::as_str);
+    if let (Some(call), Some(text)) = (call, text) {
         out.records.push(Record::ResultAppend(ResultAppend {
             run_id: state.run_id.clone(),
-            tool_call_id: call.expect("checked present"),
-            text: f.req_string("appended_text"),
+            tool_call_id: call,
+            text: text.to_owned(),
             notice: None,
             written_at_ms: written,
         }));
     }
-    // Delivered messages are placed at the next step boundary, like steers.
-    hold(inputs, state, out);
+    hold(copies, state, out);
     event(f, "send_delivered".into(), out);
     Ok(())
 }

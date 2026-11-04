@@ -2,7 +2,8 @@
 //!
 //! Transcript records are written in the order their messages take in the conversation, so the
 //! fold appends them as they come, with one exception: an assistant message that calls tools is
-//! held until every one of its calls has a reply. It then enters the conversation together with
+//! held until every one of its calls has a reply. A run's budget-finalize step is the other
+//! exception: its calls are never run, so its message enters at once without them. It then enters the conversation together with
 //! one tool message carrying the replies in the order the assistant made the calls, which is
 //! the shape every provider requires: a call is never sent without its result.
 //!
@@ -99,7 +100,16 @@ impl Conversation {
                         _ => None,
                     })
                     .collect();
-                if calls.is_empty() {
+                if assistant.budget_finalize == Some(true) {
+                    // A run's budget-finalize step is its last, and the calls a provider emits in
+                    // it anyway are never run, so they have no results. Its message enters at
+                    // once without them, keeping its text.
+                    let mut message = assistant.message.clone();
+                    message
+                        .content
+                        .retain(|block| !matches!(block, ContentBlock::ToolCall(_)));
+                    self.messages.push(message);
+                } else if calls.is_empty() {
                     self.messages.push(assistant.message.clone());
                 } else {
                     self.open = Some(ToolTurn {

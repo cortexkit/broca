@@ -56,6 +56,7 @@ fn one_of_each() -> Vec<Record> {
             usage: Some(usage),
             written_at_ms: Some(2),
             last_content_at_ms: None,
+            budget_finalize: None,
             tags_v1: None,
         }),
         Record::ToolReply(ToolReply {

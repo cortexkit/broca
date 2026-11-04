@@ -3315,11 +3315,7 @@ fn replay_seeded_with_compaction<'a>(
                     .or(seeded_budget.as_ref())
             })
             .flatten()
-            .and_then(|budget| {
-                crate::budget_kernel::decide(placement.budget(), budget)
-                    .first()
-                    .map(|due| due.text.clone())
-            });
+            .and_then(|budget| crate::budget_kernel::next_due_text(placement.budget(), budget));
         let actions = placement
             .observe(rec)
             .map_err(|reason| ReplayError::CorruptLineage {
