@@ -315,6 +315,29 @@ pub struct RouteHandle {
     pub(crate) call_keepalive: bool,
     /// The route was opened declaring `tool-provider: v1`.
     pub(crate) tool_provider_v1: bool,
+    /// The route binds the session's own harness, not the tool-module `runner`.
+    pub(crate) session_identity: bool,
+}
+
+/// How a route that carries a session's tool calls is opened. A cached route is reused only by
+/// a batch that would open it the same way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RouteShape {
+    /// Ask for `tool-result/v1` bodies (the provider declared that format in the plan).
+    pub(crate) tool_result_v1: bool,
+    /// Ask for call keepalives (the provider declared them in the plan).
+    pub(crate) call_keepalive: bool,
+    /// Declare `tool-provider: v1`: the session's plan fetch answered this provider's catalog,
+    /// over a route declaring that role. A module may treat a route without the role as
+    /// discovery-only, serving `role.describe` and `tool.catalog` but refusing its tools
+    /// (Magic Context does).
+    pub(crate) tool_provider_v1: bool,
+    /// Bind the session's own harness and session, as the session's compaction route does,
+    /// because this provider is also the session's compaction provider. Other tool modules get
+    /// the `runner` harness (see [`TOOL_MODULE_HARNESS`]). Without it, the provider would key
+    /// the tool calls to a different session than the one it compacts, and answer notes and
+    /// expansions from an empty session.
+    pub(crate) session_identity: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -355,6 +378,7 @@ impl RouteHandle {
             reads_held_reply: false,
             call_keepalive: false,
             tool_provider_v1: false,
+            session_identity: false,
         }
     }
 
@@ -1408,22 +1432,23 @@ impl SubcConnection {
     }
 
     /// ONE `route.open` attempt for the route that carries a session's tool calls to
-    /// `module_id`. `tool_provider_v1` declares `tool-provider: v1` on it. A provider whose
-    /// catalog the session's plan fetch answered was fetched over such a route, and a module may
-    /// treat a route without the role as discovery-only, serving `role.describe` and
-    /// `tool.catalog` but refusing its tools (Magic Context does). A session admitted without a
-    /// plan fetch keeps a route without the role, so a provider it never fetched sees nothing new.
-    #[allow(clippy::too_many_arguments)]
+    /// `module_id`, opened as `shape` says (see [`RouteShape`]). A session admitted without a plan
+    /// fetch keeps a route without the role and with the `runner` harness, so a provider it never
+    /// fetched sees nothing new.
     pub(crate) async fn route_open_dispatch_single_attempt(
         &self,
         module_id: &str,
         identity: &BindIdentity,
         scope: Option<&subc_protocol::scope::ScopeSelector>,
-        tool_result_v1: bool,
+        shape: RouteShape,
         provider_held_installed: bool,
-        call_keepalive: bool,
-        tool_provider_v1: bool,
     ) -> ConnResult<RouteHandle> {
+        let RouteShape {
+            tool_result_v1,
+            call_keepalive,
+            tool_provider_v1,
+            session_identity,
+        } = shape;
         let mut capabilities = if provider_held_installed {
             Some(vec![
                 cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
@@ -1441,16 +1466,26 @@ impl SubcConnection {
         let role_versions = tool_provider_v1.then(|| {
             std::collections::BTreeMap::from([("tool-provider".to_owned(), "v1".to_owned())])
         });
-        self.route_open_target_with_capabilities(
-            RouteTarget::ToolProvider {
-                module_id: module_id.into(),
-            },
-            identity,
-            scope.cloned(),
-            role_versions,
-            capabilities,
-        )
-        .await
+        let target = RouteTarget::ToolProvider {
+            module_id: module_id.into(),
+        };
+        if !session_identity {
+            return self
+                .route_open_target_with_capabilities(
+                    target,
+                    identity,
+                    scope.cloned(),
+                    role_versions,
+                    capabilities,
+                )
+                .await;
+        }
+        let bind = SubcBindIdentity::new(identity.harness.as_str(), identity.session.clone());
+        let mut handle = self
+            .route_open_wire_target(target, bind, scope.cloned(), role_versions, capabilities)
+            .await?;
+        handle.session_identity = true;
+        Ok(handle)
     }
 
     /// ONE `route.open` attempt to a tool provider that declares `tool-provider: v1`, asking
@@ -4911,7 +4946,14 @@ mod tests {
             session: "session".into(),
         };
         let open = conn.route_open_dispatch_single_attempt(
-            "provider", &identity, None, false, false, false, true,
+            "provider",
+            &identity,
+            None,
+            RouteShape {
+                tool_provider_v1: true,
+                ..RouteShape::default()
+            },
+            false,
         );
         tokio::pin!(open);
         let request = tokio::select! {
@@ -4927,6 +4969,48 @@ mod tests {
         answer_route_open(&pending, &request, 7);
         let route = open.await.unwrap();
         assert!(route.tool_provider_v1);
+        assert!(!route.session_identity);
+    }
+
+    /// The route to the session's own compaction provider binds the session's harness and
+    /// session, exactly as its compaction route does, with the role and the scope unchanged. Any
+    /// other tool module still sees the `runner` harness.
+    #[tokio::test]
+    async fn the_compaction_providers_tool_route_binds_the_sessions_own_harness() {
+        let (conn, mut write_rx, pending) = route_open_test_connection();
+        let identity = broca_protocol::BindIdentity {
+            project_root: "/project".into(),
+            harness: "broca".into(),
+            session: "alfonso:bg_x".into(),
+        };
+        let open = conn.route_open_dispatch_single_attempt(
+            "magic-context",
+            &identity,
+            None,
+            RouteShape {
+                tool_provider_v1: true,
+                session_identity: true,
+                ..RouteShape::default()
+            },
+            false,
+        );
+        tokio::pin!(open);
+        let request = tokio::select! {
+            result = &mut open => panic!("premature result: {result:?}"),
+            request = write_rx.recv() => request.unwrap(),
+        };
+        let raw: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            raw["identity"],
+            serde_json::json!({"harness": "broca", "session": "alfonso:bg_x"})
+        );
+        assert_eq!(
+            raw["role_versions"],
+            serde_json::json!({"tool-provider": "v1"})
+        );
+        answer_route_open(&pending, &request, 7);
+        let route = open.await.unwrap();
+        assert!(route.session_identity && route.tool_provider_v1);
     }
 
     #[tokio::test]
@@ -4939,7 +5023,14 @@ mod tests {
                 session: "session".into(),
             };
             let open = conn.route_open_dispatch_single_attempt(
-                "provider", &identity, None, result_v1, installed, false, false,
+                "provider",
+                &identity,
+                None,
+                RouteShape {
+                    tool_result_v1: result_v1,
+                    ..RouteShape::default()
+                },
+                installed,
             );
             tokio::pin!(open);
             let request = tokio::select! {
@@ -4973,6 +5064,7 @@ mod tests {
             assert_eq!(route.reads_held_reply, installed);
             assert_eq!(route.reads_tool_result, result_v1 || installed);
             assert!(!route.tool_provider_v1);
+            assert!(!route.session_identity);
         }
         let (conn, mut write_rx, pending) = route_open_test_connection();
         let identity = broca_protocol::BindIdentity {

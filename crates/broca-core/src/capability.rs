@@ -54,6 +54,9 @@ pub struct ToolManifest {
     /// The providers whose catalog the plan fetch answered at admission. Each was fetched over
     /// a route declaring `tool-provider: v1`, so its dispatch route declares the same role.
     fetched_providers: HashSet<String>,
+    /// The session's compaction provider, from the plan's compaction item. Its tool route binds
+    /// the session's own identity, so it sees the calls and the compaction as one session.
+    compaction_provider: Option<String>,
 }
 
 impl ToolManifest {
@@ -89,6 +92,7 @@ impl ToolManifest {
             provider_replies: HashMap::new(),
             provider_declarations: HashMap::new(),
             fetched_providers: HashSet::new(),
+            compaction_provider: None,
         }
     }
 
@@ -98,6 +102,9 @@ impl ToolManifest {
         manifest: &broca_wal::PlanManifest,
     ) -> Result<Self, serde_json::Error> {
         let plan: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text())?;
+        self.compaction_provider = plan["compaction_item"]["provider"]
+            .as_str()
+            .map(str::to_owned);
         if let Some(items) = plan["tool_items"].as_array() {
             for item in items {
                 if let (Some(provider), Some(preset)) =
@@ -151,6 +158,12 @@ impl ToolManifest {
         provider: &str,
     ) -> Option<&broca_wal::FrozenProviderDeclarations> {
         self.provider_declarations.get(provider)
+    }
+
+    /// Whether `provider` is the session's compaction provider, named by the plan's compaction
+    /// item.
+    pub fn is_compaction_provider(&self, provider: &str) -> bool {
+        self.compaction_provider.as_deref() == Some(provider)
     }
 
     /// Whether the session's plan fetch answered `provider`'s catalog at admission. False for a

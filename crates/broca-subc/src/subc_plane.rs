@@ -48,8 +48,8 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::{
     retry_route_open, retry_route_open_waiting_out_outage, retry_route_open_with_scope_hold,
     route_failure_is_known_dead, ConnError, GateTarget, ModuleGate, OutageWait, RouteHandle,
-    RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection, ROUTE_OPEN_RETRY_DEADLINE,
-    ROUTE_OPEN_RETRY_INTERVAL, ROUTE_OPEN_RETRY_MAX_INTERVAL,
+    RouteOpenError, RouteOpenRetry, RouteShape, ScopeHold, SubcConnection,
+    ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL, ROUTE_OPEN_RETRY_MAX_INTERVAL,
 };
 use crate::scope_describe::{DescribedScope, ScopeDescriber};
 use crate::tool_deadline::tool_reply_deadline;
@@ -410,16 +410,13 @@ trait ToolPlaneConnection: Send + Sync {
         None
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn route_open_dispatch(
         &self,
         module_id: &str,
         identity: &BindIdentity,
         scope: Option<&ScopeSelector>,
-        _tool_result_v1: bool,
+        _shape: RouteShape,
         _provider_held_installed: bool,
-        _call_keepalive: bool,
-        _tool_provider_v1: bool,
     ) -> Result<RouteHandle, ConnError> {
         self.route_open(module_id, identity, scope).await
     }
@@ -517,25 +514,20 @@ impl ToolPlaneConnection for SubcConnection {
         SubcConnection::consumer_module_id(self)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn route_open_dispatch(
         &self,
         module_id: &str,
         identity: &BindIdentity,
         scope: Option<&ScopeSelector>,
-        tool_result_v1: bool,
+        shape: RouteShape,
         provider_held_installed: bool,
-        call_keepalive: bool,
-        tool_provider_v1: bool,
     ) -> Result<RouteHandle, ConnError> {
         self.route_open_dispatch_single_attempt(
             module_id,
             identity,
             scope,
-            tool_result_v1,
+            shape,
             provider_held_installed,
-            call_keepalive,
-            tool_provider_v1,
         )
         .await
     }
@@ -794,6 +786,21 @@ pub struct FrozenContract {
     /// The plan fetch answered this provider's catalog, over a route declaring
     /// `tool-provider: v1`, so its dispatch route declares the same role.
     pub fetched: bool,
+    /// The provider is the session's compaction provider, so its tool route binds the
+    /// session's own identity.
+    pub compaction_provider: bool,
+}
+
+impl FrozenContract {
+    /// How this provider's tool route is opened.
+    fn route_shape(&self) -> RouteShape {
+        RouteShape {
+            tool_result_v1: self.tool_result_v1,
+            call_keepalive: self.call_keepalive,
+            tool_provider_v1: self.fetched,
+            session_identity: self.compaction_provider,
+        }
+    }
 }
 
 struct ProviderHeldSupport {
@@ -830,6 +837,7 @@ impl SubcToolPlane {
         let declarations = manifest.provider_declarations(module);
         FrozenContract {
             fetched: manifest.provider_fetched(module),
+            compaction_provider: manifest.is_compaction_provider(module),
             call_keepalive: declarations
                 .and_then(|declarations| declarations.call_keepalive)
                 .unwrap_or(false),
@@ -1669,9 +1677,7 @@ impl SubcToolPlane {
                 guard.deadline,
                 guard,
                 patience,
-                self.frozen_contract(ctx, module_id).tool_result_v1,
-                self.frozen_contract(ctx, module_id).call_keepalive,
-                self.frozen_contract(ctx, module_id).fetched,
+                self.frozen_contract(ctx, module_id).route_shape(),
             )
             .await
             .map_err(|error| map_tool_open_refusal(error, module_id))
@@ -2298,8 +2304,8 @@ impl SubcToolPlane {
         module_id: &str,
         guard: &ToolOpenGuard,
     ) -> Result<(RouteHandle, Arc<Semaphore>), ToolPlaneError> {
-        let contract = self.frozen_contract(ctx, module_id);
-        if !contract.tool_result_v1 && !contract.call_keepalive && !contract.fetched {
+        let shape = self.frozen_contract(ctx, module_id).route_shape();
+        if shape == RouteShape::default() {
             return self
                 .ensure_route(&ctx.bind, ctx.scope.as_ref(), module_id, guard)
                 .await;
@@ -2313,9 +2319,7 @@ impl SubcToolPlane {
             guard.deadline,
             guard,
             TOOL_DISPATCH_PATIENCE,
-            contract.tool_result_v1,
-            contract.call_keepalive,
-            contract.fetched,
+            shape,
         )
         .await
         .map_err(|error| map_tool_open_refusal(error, module_id))
@@ -2335,9 +2339,7 @@ impl SubcToolPlane {
         retry_deadline: Option<Instant>,
         guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
-        tool_result_v1: bool,
-        call_keepalive: bool,
-        tool_provider_v1: bool,
+        shape: RouteShape,
     ) -> Result<(RouteHandle, Option<ScopeStamp>), RouteEnsureError> {
         // One computed deadline keeps the caller budget authoritative while retaining a short
         // per-iteration cap. Using either bound alone would either overshoot a short warm timeout
@@ -2379,10 +2381,8 @@ impl SubcToolPlane {
                     module_id,
                     bind,
                     selector.as_ref(),
-                    tool_result_v1,
+                    shape,
                     self.held_reply_declared(),
-                    call_keepalive,
-                    tool_provider_v1,
                 )
             };
             return match outage {
@@ -2472,10 +2472,8 @@ impl SubcToolPlane {
                     module_id,
                     bind,
                     Some(&selector),
-                    tool_result_v1,
+                    shape,
                     self.held_reply_declared(),
-                    call_keepalive,
-                    tool_provider_v1,
                 )
             };
             let opened = match outage {
@@ -2573,9 +2571,7 @@ impl SubcToolPlane {
             retry_deadline,
             guard,
             patience,
-            false,
-            false,
-            false,
+            RouteShape::default(),
         )
         .await
     }
@@ -2590,9 +2586,7 @@ impl SubcToolPlane {
         retry_deadline: Option<Instant>,
         guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
-        tool_result_v1: bool,
-        call_keepalive: bool,
-        tool_provider_v1: bool,
+        shape: RouteShape,
     ) -> Result<(RouteHandle, Arc<Semaphore>), RouteEnsureError> {
         let key = Self::route_key(bind, scope, module_id);
         if lifecycle.is_cancelled() {
@@ -2618,9 +2612,11 @@ impl SubcToolPlane {
         let obsolete = {
             let mut routes = self.routes.lock().unwrap();
             if let Some(r) = routes.get_mut(&key) {
-                if r.handle.reads_tool_result == (tool_result_v1 || self.held_reply_declared())
-                    && r.handle.call_keepalive == call_keepalive
-                    && r.handle.tool_provider_v1 == tool_provider_v1
+                if r.handle.reads_tool_result
+                    == (shape.tool_result_v1 || self.held_reply_declared())
+                    && r.handle.call_keepalive == shape.call_keepalive
+                    && r.handle.tool_provider_v1 == shape.tool_provider_v1
+                    && r.handle.session_identity == shape.session_identity
                 {
                     r.last_used = Instant::now();
                     return Ok((r.handle, Arc::clone(&r.sem)));
@@ -2648,9 +2644,7 @@ impl SubcToolPlane {
                 retry_deadline,
                 guard,
                 patience,
-                tool_result_v1,
-                call_keepalive,
-                tool_provider_v1,
+                shape,
             )
             .await?;
         let sem = Arc::new(Semaphore::new(window));
@@ -3375,9 +3369,7 @@ impl SubcToolPlane {
                 guard.deadline,
                 guard,
                 TOOL_DISPATCH_PATIENCE,
-                self.frozen_contract(ctx, &module_id).tool_result_v1,
-                self.frozen_contract(ctx, &module_id).call_keepalive,
-                self.frozen_contract(ctx, &module_id).fetched,
+                self.frozen_contract(ctx, &module_id).route_shape(),
             )
             .await
             .map_err(|error| map_tool_open_refusal(error, &module_id))
@@ -3630,10 +3622,8 @@ impl SubcToolPlane {
                     &module,
                     &ctx.bind,
                     Some(&selector),
-                    self.frozen_contract(ctx, &module).tool_result_v1,
+                    self.frozen_contract(ctx, &module).route_shape(),
                     self.held_reply_declared(),
-                    self.frozen_contract(ctx, &module).call_keepalive,
-                    self.frozen_contract(ctx, &module).fetched,
                 )
             },
         )
@@ -7466,26 +7456,21 @@ mod tests {
             .await
         }
 
-        #[allow(clippy::too_many_arguments)]
         async fn route_open_dispatch(
             &self,
             module_id: &str,
             identity: &BindIdentity,
             scope: Option<&ScopeSelector>,
-            tool_result_v1: bool,
+            shape: RouteShape,
             provider_held_installed: bool,
-            call_keepalive: bool,
-            tool_provider_v1: bool,
         ) -> Result<RouteHandle, ConnError> {
             self.conn
                 .route_open_dispatch_single_attempt(
                     module_id,
                     identity,
                     scope,
-                    tool_result_v1,
+                    shape,
                     provider_held_installed,
-                    call_keepalive,
-                    tool_provider_v1,
                 )
                 .await
         }

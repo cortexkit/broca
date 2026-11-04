@@ -31,6 +31,8 @@ struct Rig {
     opened_result: Mutex<Vec<bool>>,
     /// Whether each tool route this rig opened declared `tool-provider: v1`.
     opened_role: Mutex<Vec<bool>>,
+    /// Whether each tool route this rig opened bound the session's own harness.
+    opened_session_identity: Mutex<Vec<bool>>,
 }
 
 impl Rig {
@@ -52,6 +54,7 @@ impl Rig {
             opened_declaring: Mutex::new(Vec::new()),
             opened_result: Mutex::new(Vec::new()),
             opened_role: Mutex::new(Vec::new()),
+            opened_session_identity: Mutex::new(Vec::new()),
             release_registration: tokio::sync::Notify::new(),
         })
     }
@@ -84,17 +87,24 @@ impl ToolPlaneConnection for Rig {
     ) -> Result<RouteHandle, ConnError> {
         Ok(RouteHandle::synthetic(7))
     }
-    #[allow(clippy::too_many_arguments)]
     async fn route_open_dispatch(
         &self,
         _: &str,
         _: &BindIdentity,
         _: Option<&ScopeSelector>,
-        tool_result_v1: bool,
+        shape: RouteShape,
         installed: bool,
-        call_keepalive: bool,
-        tool_provider_v1: bool,
     ) -> Result<RouteHandle, ConnError> {
+        let RouteShape {
+            tool_result_v1,
+            call_keepalive,
+            tool_provider_v1,
+            session_identity,
+        } = shape;
+        self.opened_session_identity
+            .lock()
+            .unwrap()
+            .push(session_identity);
         self.opened_declaring.lock().unwrap().push(installed);
         self.opened_result.lock().unwrap().push(tool_result_v1);
         self.opened_role.lock().unwrap().push(tool_provider_v1);
@@ -103,6 +113,7 @@ impl ToolPlaneConnection for Rig {
         route.reads_held_reply = installed && self.declared_route;
         route.call_keepalive = call_keepalive;
         route.tool_provider_v1 = tool_provider_v1;
+        route.session_identity = session_identity;
         Ok(route)
     }
     async fn route_close(&self, _: &RouteHandle) -> Result<(), ConnError> {
@@ -1058,4 +1069,57 @@ async fn the_dispatch_route_declares_tool_provider_v1_only_for_a_fetched_provide
         plane.batch_finished(&ctx).await.unwrap();
     }
     assert_eq!(*rig.opened_role.lock().unwrap(), [false, true]);
+    assert_eq!(*rig.opened_session_identity.lock().unwrap(), [false, false]);
+}
+
+/// A provider that is also the session's compaction provider (the plan's compaction item names
+/// it) gets a tool route bound with the session's own identity, so it sees the session's tool
+/// calls and its compaction as one session. The route still declares the role.
+#[tokio::test]
+async fn the_compaction_providers_tool_route_binds_the_sessions_identity() {
+    let plan = PlanManifest {
+        rich_ui: None,
+        declarations: Vec::new(),
+        plan: OpaqueJson::from_json_text(
+            json!({
+                "tool_items": [{"provider": "provider"}],
+                "compaction_item": {"provider": "provider", "preset": "worker"},
+            })
+            .to_string(),
+        )
+        .unwrap(),
+        plan_identity: String::new(),
+        composition_digest: String::new(),
+        fetches: vec![ProviderFetch {
+            provider: "provider".into(),
+            outcome: FetchOutcome::Answered {
+                catalog_digest: "digest".into(),
+                tools: Vec::new().into(),
+                text: None,
+                result_ops: None,
+                reply: None,
+                declarations_frozen: None,
+                reference_slots: None,
+            },
+        }],
+        tools: Vec::new().into(),
+        system_text: String::new(),
+        system_digest: String::new(),
+        join_version: 1,
+        role_versions: Default::default(),
+    };
+    let manifest = ToolManifest::from_tools(vec![serde_json::from_value(json!({"name":"tool","description":"","input_schema":{},"module":"provider","execution_mode":"parallel"})).unwrap()])
+        .with_plan_manifest(&plan)
+        .unwrap();
+    let rig = Rig::new(true, true, false, false);
+    let plane = rig.plane(false);
+    let ctx = ctx();
+    let call = call("call");
+    plane
+        .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
+        .await
+        .unwrap();
+    completed(plane.dispatch(&ctx, &call).await);
+    assert_eq!(*rig.opened_role.lock().unwrap(), [true]);
+    assert_eq!(*rig.opened_session_identity.lock().unwrap(), [true]);
 }
