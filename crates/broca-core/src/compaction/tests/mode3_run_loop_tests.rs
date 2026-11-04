@@ -69,6 +69,16 @@ async fn drive_as(
     run: &str,
     mode: crate::StartMode,
 ) -> (Result<crate::RunSummary, crate::RunError>, PrefixBound) {
+    drive_events(shared, plane, run, mode, model_events()).await
+}
+
+async fn drive_events(
+    shared: &Shared,
+    plane: Arc<Plane>,
+    run: &str,
+    mode: crate::StartMode,
+    events: Vec<broca_protocol::NormalizedEvent>,
+) -> (Result<crate::RunSummary, crate::RunError>, PrefixBound) {
     let writer = shared.writer();
     let (mut request, mut control, _) = history_request();
     request.run_id = broca_protocol::RunId(run.into());
@@ -77,7 +87,7 @@ async fn drive_as(
     control.new_log_compaction_plan_version = Some(cortexkit_compaction_view::PLAN_VERSION);
     control.compaction_plane = Some(plane);
     control.compaction_views = None;
-    let model = PrefixBound(crate::StubProvider::new(vec![model_events()]));
+    let model = PrefixBound(crate::StubProvider::new(vec![events]));
     let (out, _events) = tokio::sync::mpsc::channel(256);
     let result = crate::run_loop_on_writer(
         request,
@@ -360,6 +370,147 @@ async fn compaction_v2_crash_after_marker_before_notice_reports_marker_after_set
         event,
         v2::protocol::notice::Event::MarkerWritten { version: 1 }
     )));
+}
+
+/// A template's `part_tag` slot renders the number the session's next request shows: the
+/// newest accepted view when it still fits, else the applied one. Message ids are mode-3 ids,
+/// and a part is named by its entry part id or by its `<mid>#<id>` read key.
+#[tokio::test]
+async fn compaction_v2_next_request_numbers_follow_the_view_the_next_request_renders() {
+    use v2::protocol::part::PartBody;
+    let numbers_of = |records: &[WalRecord]| {
+        let frames: Vec<_> = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| FramedRecord {
+                seq: index as u64 + 1,
+                fence: 1,
+                record: record.clone(),
+            })
+            .collect();
+        let state = v2::session::load(&bind(), &frames).unwrap();
+        let transcript =
+            v2::transcript::project(&frames, &fixture_lineage_id().to_string()).unwrap();
+        let (config, _) = v2::host::frozen(&frames).unwrap();
+        let conditions = v2::host::conditions(&config, &transcript.entries, false).unwrap();
+        (
+            v2::shown::next_request(&state, &transcript.entries, &conditions).unwrap(),
+            transcript.entries,
+        )
+    };
+    let (mut records, _) = live_view().await;
+    let (applied, entries) = numbers_of(&records);
+    let question = entries
+        .iter()
+        .find(|entry| {
+            entry.parts.iter().any(
+                |part| matches!(&part.body, PartBody::Text { text } if text == "second question"),
+            )
+        })
+        .unwrap();
+    assert!(
+        question.mid.contains('.'),
+        "a mode-3 message id: {}",
+        question.mid
+    );
+    let part = question.parts[0].id.clone();
+    assert_eq!(v2::shown::lookup(&applied, &question.mid, &part), Some(3));
+    assert_eq!(
+        v2::shown::lookup(&applied, &question.mid, &format!("{}#{part}", question.mid)),
+        Some(3)
+    );
+    let first = &entries[0];
+    assert_eq!(
+        v2::shown::lookup(&applied, &question.mid, &format!("{}#{part}", first.mid)),
+        None,
+        "a read key naming another message matches nothing"
+    );
+    assert_eq!(
+        v2::shown::lookup(&applied, &first.mid, &first.parts[0].id),
+        None,
+        "the applied view cuts the first message"
+    );
+
+    // A newer accepted view without the cut renders at the next boundary, so its numbers count.
+    let newer = View::seal(2, vec![]);
+    records.push(WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
+        version: 2,
+        checksum: newer.checksum.clone(),
+        edits: v2::storage::encode(None, &newer.into()),
+    }));
+    let (pending, _) = numbers_of(&records);
+    assert_eq!(
+        v2::shown::lookup(&pending, &first.mid, &first.parts[0].id),
+        Some(1)
+    );
+    assert_eq!(v2::shown::lookup(&pending, &question.mid, &part), Some(3));
+}
+
+/// The provider measures a session's fill only from `conditions.last_prompt_tokens`. It is
+/// absent before any request has reported its input, then every later notice and ride states
+/// the newest reported prompt: uncached input plus cache reads plus cache writes.
+#[tokio::test]
+async fn compaction_v2_notices_and_rides_state_the_newest_reported_prompt_size() {
+    use broca_protocol::{NormalizedEvent, ProviderControl};
+    let reported = vec![
+        NormalizedEvent::Control(ProviderControl::AssistantMessage {
+            message: broca_protocol::AssistantMessage {
+                message_id: broca_protocol::MessageId("a".into()),
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+            },
+        }),
+        NormalizedEvent::Control(ProviderControl::Finished {
+            usage: Usage {
+                input_tokens: Some(700),
+                cached_input_tokens: Some(200),
+                cache_write_tokens: Some(100),
+                output_tokens: Some(5),
+                ..Usage::default()
+            },
+            finish_reason: FinishReason::Stop,
+            retries_used: 0,
+        }),
+    ];
+    let prompt_sizes = |calls: &[(String, Value)]| -> Vec<Option<u64>> {
+        calls
+            .iter()
+            .filter(|(method, _)| method == "compaction.notice" || method == "compaction.ride")
+            .map(|(_, params)| params["conditions"]["last_prompt_tokens"].as_u64())
+            .collect()
+    };
+    let shared = Shared::default();
+    let plane = Arc::new(Plane::default());
+    let (first, _) = drive_events(
+        &shared,
+        plane.clone(),
+        "run-1",
+        crate::StartMode::FreshOrResume,
+        reported,
+    )
+    .await;
+    first.unwrap();
+    let before = plane.calls.lock().unwrap().len();
+    let sizes = prompt_sizes(&plane.calls.lock().unwrap());
+    assert!(!sizes.is_empty(), "the first run sends a notice");
+    assert_eq!(sizes[0], None, "no request has reported its input yet");
+
+    let (second, _) = drive_as(
+        &shared,
+        plane.clone(),
+        "run-2",
+        crate::StartMode::FreshOrResume,
+    )
+    .await;
+    second.unwrap();
+    let calls = plane.calls.lock().unwrap();
+    let sizes = prompt_sizes(&calls[before..]);
+    assert!(!sizes.is_empty(), "the second run sends a notice or ride");
+    assert!(
+        sizes.iter().all(|size| *size == Some(1_000)),
+        "every later notice and ride states the newest reported prompt: {sizes:?}"
+    );
 }
 
 #[tokio::test]
@@ -781,7 +932,7 @@ async fn compaction_v2_context_folds_refreezes_and_tracks_accepted_attempts_befo
             true,
             false,
             0,
-            &v2::host::conditions(&config, false).unwrap()
+            &v2::host::conditions(&config, &[], false).unwrap()
         ),
         vec![
             v2::protocol::ride::RideCause::TierChange,

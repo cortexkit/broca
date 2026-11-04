@@ -8,6 +8,59 @@ use broca_wal::{FramedRecord, WalRecord};
 use cortexkit_compaction_view::render::{self, PlanItem};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use super::protocol::{notice::Conditions, read::Entry};
+
+/// The numbers the session's next request shows, keyed by `(mid, part id)`. That request
+/// renders the newest accepted view when it still passes the boundary check, else the applied
+/// view: the same choice `State::apply` makes at the next step boundary. A part the view drops,
+/// or one that shows no number, is absent.
+pub fn next_request(
+    state: &super::state::State,
+    entries: &[Entry],
+    conditions: &Conditions,
+) -> Result<HashMap<(String, String), u64>, String> {
+    let view = state
+        .latest()
+        .filter(|view| {
+            super::views::check_boundary(
+                entries,
+                view,
+                &conditions.rules,
+                conditions.accepts_images == Some(true),
+            )
+            .is_ok()
+        })
+        .or_else(|| state.applied());
+    let edits = view.map_or(&[][..], |view| view.edits.as_slice());
+    let edits = render::edits_for_transcript(entries, edits);
+    let plan = render::plan(entries, &edits)
+        .map_err(|error| format!("next request render plan refused: {error:?}"))?;
+    let mut numbers = HashMap::new();
+    for item in plan.items {
+        let PlanItem::Entry { mid, parts, .. } = item else {
+            continue;
+        };
+        for part in parts {
+            if let Some(tag) = part.tag.filter(|_| part.prefix) {
+                numbers.insert((mid.clone(), part.id), tag);
+            }
+        }
+    }
+    Ok(numbers)
+}
+
+/// The number `numbers` holds for a template `part_tag` reference. `part` is either the part id
+/// `session.entries` serves or the part key `<mid>#<id>` `session.read` serves; a key naming
+/// another message matches nothing.
+pub fn lookup(numbers: &HashMap<(String, String), u64>, mid: &str, part: &str) -> Option<u64> {
+    let id = match part.split_once('#') {
+        Some((key_mid, id)) if key_mid == mid => id,
+        Some(_) => return None,
+        None => part,
+    };
+    numbers.get(&(mid.to_owned(), id.to_owned())).copied()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShownPart {
     pub mid: String,

@@ -6179,18 +6179,19 @@ where
             let transcript = crate::compaction_v2::transcript::project(&frames, &lineage)
                 .map_err(RunError::Wal)?;
             let (config, _) = crate::compaction_v2::host::frozen(&frames).map_err(RunError::Wal)?;
-            let conditions = match crate::compaction_v2::host::conditions(&config, false) {
-                Ok(conditions) => conditions,
-                Err(message) => {
-                    terminal_error = Some(crate::compaction::runtime::error(
-                        None,
-                        &message,
-                        Some("compaction_unavailable".into()),
-                        false,
-                    ));
-                    break RunFinishReason::Error;
-                }
-            };
+            let conditions =
+                match crate::compaction_v2::host::conditions(&config, &transcript.entries, false) {
+                    Ok(conditions) => conditions,
+                    Err(message) => {
+                        terminal_error = Some(crate::compaction::runtime::error(
+                            None,
+                            &message,
+                            Some("compaction_unavailable".into()),
+                            false,
+                        ));
+                        break RunFinishReason::Error;
+                    }
+                };
             let next_mid =
                 crate::message_mid(true, Some(&lineage), transcript.entries.len() as u64)
                     .map_err(RunError::Wal)?;
@@ -6385,18 +6386,20 @@ where
                 == Some(crate::compaction_provider::notice::HistoryEditCost::FullResend);
             // A missing frozen limit ends the run as `compaction_unavailable` before any model
             // I/O, the same way the step boundary does; it is never a WAL error.
-            let conditions = match crate::compaction_v2::host::conditions(&config, chained) {
-                Ok(conditions) => conditions,
-                Err(message) => {
-                    terminal_error = Some(crate::compaction::runtime::error(
-                        None,
-                        &message,
-                        Some("compaction_unavailable".into()),
-                        false,
-                    ));
-                    break RunFinishReason::Error;
-                }
-            };
+            let conditions =
+                match crate::compaction_v2::host::conditions(&config, &transcript.entries, chained)
+                {
+                    Ok(conditions) => conditions,
+                    Err(message) => {
+                        terminal_error = Some(crate::compaction::runtime::error(
+                            None,
+                            &message,
+                            Some("compaction_unavailable".into()),
+                            false,
+                        ));
+                        break RunFinishReason::Error;
+                    }
+                };
             let current = crate::compaction_v2::host::context(&config, manifest);
             let previous = crate::compaction_v2::host::previous(&frames);
             let now = control.now_ms().unwrap_or_else(crate::compaction::now);

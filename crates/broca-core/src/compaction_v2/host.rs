@@ -2,7 +2,7 @@
 
 use super::{
     conditions::{self, SendContext},
-    protocol::{notice::Conditions, setup::ModelRef},
+    protocol::{notice::Conditions, read::Entry, setup::ModelRef},
 };
 use broca_wal::{FramedRecord, PlanManifest, RunConfig, WalRecord};
 
@@ -34,7 +34,14 @@ pub fn context(config: &RunConfig, manifest: Option<&PlanManifest>) -> SendConte
     }
 }
 
-pub fn conditions(config: &RunConfig, chained: bool) -> Result<Conditions, String> {
+/// The conditions a notice, ride or view check states. `entries` is the session's transcript as
+/// `session.entries` serves it; the newest reported prompt size comes from it, so the provider
+/// reads the same number in these conditions as in that entry's `usage.prompt_tokens`.
+pub fn conditions(
+    config: &RunConfig,
+    entries: &[Entry],
+    chained: bool,
+) -> Result<Conditions, String> {
     let window = config
         .context_limit
         .ok_or("compaction requires a frozen context_limit")?;
@@ -50,7 +57,20 @@ pub fn conditions(config: &RunConfig, chained: bool) -> Result<Conditions, Strin
         .frozen_render_config
         .pointer("/media/modalities/image")
         .and_then(serde_json::Value::as_bool);
+    // The provider measures the session's fill from this field alone; without it a session
+    // never reaches the provider's compaction threshold.
+    conditions.last_prompt_tokens = last_prompt_tokens(entries);
     Ok(conditions)
+}
+
+/// The prompt size of the newest request a provider reported: the newest entry's
+/// `usage.prompt_tokens` (uncached input plus cache reads plus cache writes). Absent until a
+/// request has reported its input.
+pub fn last_prompt_tokens(entries: &[Entry]) -> Option<u64> {
+    entries
+        .iter()
+        .rev()
+        .find_map(|entry| entry.usage.as_ref()?.prompt_tokens)
 }
 
 /// Ride causes compare the last accepted request's frozen session model.
@@ -183,7 +203,7 @@ pub async fn notice(
         .ok_or("mode-3 compaction requires a WAL lineage")?
         .to_string();
     let transcript = super::transcript::project(&frames, &lineage)?;
-    let conditions = conditions(&config, false)?;
+    let conditions = conditions(&config, &transcript.entries, false)?;
     let applied = session.state.lock().await.applied_identity();
     let mut setup = conditions::setup_request(&preset, &conditions, crate::compaction::now());
     setup.applied_view = applied.clone();

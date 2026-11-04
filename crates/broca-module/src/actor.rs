@@ -6430,9 +6430,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .map(|sender| sender.templates.as_slice())
             .unwrap_or_default();
         // A `part_tag` slot names a part by its host identity and renders the number the
-        // transcript shows for it now. Broca renders a template once, at admission, so the
-        // lookup is against the transcript as it stands when the send is admitted.
+        // session's next request shows for it. Broca renders a template once, at admission, so
+        // the lookup is against the session as it stands when the send is admitted. On a mode-3
+        // session with a compaction provider that is the view the next request renders;
+        // otherwise it is the replayed transcript's numbering.
         let mut transcript = Vec::new();
+        let mut next_request = None;
         if templates
             .iter()
             .flat_map(|template| template.slots.values())
@@ -6443,16 +6446,27 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 )
             })
         {
-            let records = self.read_wal_records().await.map_err(SendOutcome::Error)?;
-            if !records.is_empty() {
-                transcript = broca_core::replay(&records)
-                    .map_err(|e| SendOutcome::Error(e.to_string()))?
-                    .prompt;
+            next_request = self
+                .next_request_numbers()
+                .await
+                .map_err(SendOutcome::Error)?;
+            if next_request.is_none() {
+                let records = self.read_wal_records().await.map_err(SendOutcome::Error)?;
+                if !records.is_empty() {
+                    transcript = broca_core::replay(&records)
+                        .map_err(|e| SendOutcome::Error(e.to_string()))?
+                        .prompt;
+                }
             }
         }
         let rendered =
             cortexkit_role_llm_runner::delivery_order::render(templates, template, |part| {
-                shown_number(&transcript, part)
+                match &next_request {
+                    Some(numbers) => {
+                        broca_core::compaction_v2::shown::lookup(numbers, &part.mid, &part.part)
+                    }
+                    None => shown_number(&transcript, part),
+                }
             });
         // A part the transcript does not show ends the send by name, not as a malformed slot.
         if let Err(cortexkit_role_llm_runner::delivery_order::TemplateProblem::PartGone(slot)) =
