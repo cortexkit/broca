@@ -1614,7 +1614,8 @@ fences reads with retryable `history_rewriting` until its writer has durably fin
 
 **Display facts (opt-in).** Broca declares `read_display_facts`. On transcript reads,
 `include_display_facts: true` also exposes the recorded assistant `completed_at` and readable Responses `reasoning_summaries` indexed by stored content part, never opaque or encrypted reasoning; default message bytes and digests are unchanged.
-Rows cached before completion metadata was recorded omit `completed_at`; adding the nullable completion column performs no startup backfill.
+`created_at` is an opt-in host creation fact on any role: send entries use recorded acceptance (including original queue/steer acceptance), and native assistants use the producing request's recorded send time, never row-write, ingest, finish or serve time. Unknown facts stay absent; `written_at` keeps its existing meaning, and host clock steps impose no ordering against completion.
+Rows cached before display-fact timestamps were recorded omit those facts; the nullable columns are added without defaults, backfill or an index in the `store.schema` boot step `message_display_fact_times`.
 `include_display_facts: true` adds a stored `client_message_id` to its user entry and
 `tool_times` to an assistant entry carrying calls, beside `mid`, never inside `message`.
 Calls remain in message order. `started_at` is the recorded dispatch time;

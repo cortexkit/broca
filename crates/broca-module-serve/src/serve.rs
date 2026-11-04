@@ -6752,6 +6752,7 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    created_at: None,
                     completed_at: None,
                     reasoning_summaries: Vec::new(),
                     client_message_id: None,
@@ -6775,6 +6776,7 @@ mod tests {
                     part_digests: None,
                 },
                 SessionReadMessage {
+                    created_at: None,
                     completed_at: None,
                     reasoning_summaries: Vec::new(),
                     client_message_id: None,

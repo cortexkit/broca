@@ -80,6 +80,8 @@ pub struct HeadProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode3_times: Option<crate::message_times::MessageTimeSeed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_times: Option<crate::creation_times::CreationTimeSeed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_rich_ui: Option<broca_protocol::RichUiStamp>,
     pub model: Option<HeadModel>,
     pub usage: Option<SessionUsage>,
@@ -100,6 +102,7 @@ impl Default for HeadProjection {
         Self {
             mode3: None,
             mode3_times: None,
+            creation_times: None,
             last_run_rich_ui: None,
             model: None,
             usage: None,

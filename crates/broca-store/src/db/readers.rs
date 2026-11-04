@@ -689,7 +689,7 @@ fn page(
             .2
             .map(|off| sources.indexed_frame(tx, key, off))
             .transpose()?;
-        let (mut message, written_at, completed_at, turn) =
+        let (mut message, written_at, completed_at, created_at, turn) =
             hydrate_message(&frames, &source, started.as_ref(), mode3)?;
         if source.flags & 2 != 0 {
             let mut high = source
@@ -727,6 +727,7 @@ fn page(
             );
         }
         messages.push(broca_core::SessionReadMessage {
+            created_at,
             completed_at,
             ordinal,
             written_at,
@@ -752,12 +753,20 @@ fn page(
                 )
             }
             .map_err(invalid)?;
+            let creations = broca_core::creation_times::project(
+                tail_frames.iter().map(|frame| &frame.record),
+                broca_core::placement::Placement::new(ordinal_base),
+                head.queued_times().clone(),
+                head.creation_times.clone().unwrap_or_default(),
+            )
+            .map_err(invalid)?;
             dispatches.extend(broca_core::dispatches_of_turns(
                 &tail_frames,
                 &[(0, step)],
                 session.count,
             ));
             messages.push(broca_core::SessionReadMessage {
+                created_at: creations.times.get(&session.count).copied(),
                 completed_at: None,
                 ordinal: session.count,
                 message,
@@ -884,7 +893,13 @@ fn page(
     })
 }
 
-type HydratedMessage = (Message, Option<u64>, Option<u64>, Option<usize>);
+type HydratedMessage = (
+    Message,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<usize>,
+);
 
 fn hydrate_message(
     frames: &[FramedRecord],
@@ -900,6 +915,14 @@ fn hydrate_message(
             "mode3 budget timestamp source",
         )));
     }
+    let creations = broca_core::creation_times::project(
+        frames.iter().map(|frame| &frame.record),
+        broca_core::placement::Placement::default(),
+        Default::default(),
+        Default::default(),
+    )
+    .map_err(invalid)?;
+    let created_at = creations.times.get(&source.input_start).copied();
     let input = match &first.record {
         WalRecord::RunStarted { input, .. }
         | WalRecord::Steered { input, .. }
@@ -952,7 +975,7 @@ fn hydrate_message(
                 "mode3 historical timestamp source",
             )));
         }
-        return Ok((message, time, None, None));
+        return Ok((message, time, None, created_at, None));
     }
     if frames.iter().any(|f| {
         matches!(
@@ -1006,6 +1029,7 @@ fn hydrate_message(
             .get(source.input_start as usize)
             .copied()
             .flatten(),
+        created_at,
         turn,
     ))
 }

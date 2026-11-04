@@ -165,6 +165,7 @@ mod tests {
                     .iter()
                     .filter(|m| m.ordinal >= from && m.ordinal < from.map(|o| o + limit))
                     .map(|m| StorePageRow {
+                        created_at: None,
                         written_at: None,
                         completed_at: None,
                         ordinal: m.ordinal.unwrap(),

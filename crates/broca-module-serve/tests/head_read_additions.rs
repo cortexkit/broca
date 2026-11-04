@@ -119,6 +119,18 @@ fn seed_history_with_content(
     stamp: Option<broca_protocol::RichUiStamp>,
     content: serde_json::Value,
 ) {
+    seed_history_with_fact_times(rig, planned, owner, stamp, content, None, None);
+}
+
+fn seed_history_with_fact_times(
+    rig: &Rig,
+    planned: bool,
+    owner: Option<&str>,
+    stamp: Option<broca_protocol::RichUiStamp>,
+    content: serde_json::Value,
+    accepted_at: Option<u64>,
+    sent_at: Option<u64>,
+) {
     let mut start: WalRecord = serde_json::from_str(
         include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
             .lines()
@@ -131,6 +143,7 @@ fn seed_history_with_content(
         session,
         principal,
         ts_ms,
+        written_at_ms,
         manifest,
         ..
     } = &mut start
@@ -141,6 +154,7 @@ fn seed_history_with_content(
             module_id: owner.into(),
         });
         *ts_ms = Some(500);
+        *written_at_ms = accepted_at;
         *manifest = Some(Box::new(broca_wal::PlanManifest {
             rich_ui: stamp,
             plan: broca_wal::OpaqueJson::from_json_text(
@@ -169,7 +183,7 @@ fn seed_history_with_content(
         serde_json::from_value(json!({"type":"step_started","step_id":1})).unwrap(),
         serde_json::from_value(json!({"type":"model_attempt_finished","step_id":1,"attempt":0,
             "request_body_len":0,"request_body_sha256":"a","response_body_len":0,"response_body_sha256":"b",
-            "outcome":"complete","ts_ms":505})).unwrap(),
+            "outcome":"complete","ts_ms":505,"sent_at_ms":sent_at})).unwrap(),
         serde_json::from_value(json!({"type":"model_step_finished","step_id":1,
             "assistant_message":{"message_id":"a","content":content},
             "usage":{"input_tokens":7,"output_tokens":3},"retries_used":0})).unwrap(),
@@ -825,6 +839,48 @@ async fn responses_summary_and_completion_are_display_only_with_stable_bytes_and
     assert_eq!(
         again.body, history.body,
         "display reads changed default history bytes"
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn created_at_uses_recorded_acceptance_and_request_send_time_only_when_opted_in() {
+    let mut rig = Rig::start("synthetic-created-at").await;
+    seed_history_with_fact_times(
+        &rig,
+        false,
+        Some("owner"),
+        None,
+        json!([{"type":"text","text":"answer"}]),
+        Some(250),
+        Some(600),
+    );
+    let plain = rig
+        .request(
+            7,
+            json!({"method":"session.read","params":{"media":"descriptors"}}),
+        )
+        .await;
+    let opted = rig.request(7, json!({"method":"session.read","params":{"media":"descriptors","include_display_facts":true}})).await;
+    capture_runner_display_sample("session.read.created_at.json", &opted);
+    let answer = result(&opted);
+    assert_eq!(answer["messages"][0]["created_at"], 250);
+    assert_eq!(answer["messages"][0]["written_at"], 250);
+    assert_eq!(answer["messages"][1]["created_at"], 600);
+    assert_eq!(answer["messages"][1]["written_at"], 505);
+    assert_eq!(answer["messages"][1]["completed_at"], 505);
+    let mut stripped = String::from_utf8(opted.body.clone()).unwrap();
+    for field in [
+        ",\"created_at\":250",
+        ",\"created_at\":600",
+        ",\"completed_at\":505",
+    ] {
+        stripped = stripped.replace(field, "");
+    }
+    assert_eq!(
+        stripped.as_bytes(),
+        plain.body,
+        "creation facts changed default bytes or message/part digests"
     );
     rig.finish().await;
 }

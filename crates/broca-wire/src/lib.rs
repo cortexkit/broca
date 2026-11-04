@@ -1149,6 +1149,8 @@ fn serialize_read_message<S: serde::Serializer>(
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_summaries: Vec<cortexkit_role_llm_runner::read::ReasoningSummary>,
@@ -1244,6 +1246,8 @@ impl Serialize for SessionReadMessage {
             tool_times: &'a [cortexkit_role_llm_runner::read::ToolTime],
             #[serde(skip_serializing_if = "Option::is_none")]
             completed_at: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            created_at: Option<u64>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             reasoning_summaries: &'a [cortexkit_role_llm_runner::read::ReasoningSummary],
         }
@@ -1262,6 +1266,7 @@ impl Serialize for SessionReadMessage {
             client_message_id: &self.client_message_id,
             tool_times: &self.tool_times,
             completed_at: self.completed_at,
+            created_at: self.created_at,
             reasoning_summaries: &self.reasoning_summaries,
         }
         .serialize(serializer)
@@ -6049,6 +6054,7 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            created_at: None,
             completed_at: None,
             reasoning_summaries: Vec::new(),
             client_message_id: None,
@@ -6437,6 +6443,7 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            created_at: None,
             completed_at: None,
             reasoning_summaries: Vec::new(),
             client_message_id: None,

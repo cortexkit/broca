@@ -2551,6 +2551,18 @@ impl LlmRunnerSubject for BrocaSubject {
         true
     }
 
+    async fn seed_host_created_at(
+        &self,
+        _session: &str,
+        _mid: &str,
+        _created_at_ms: u64,
+    ) -> Result<bool, HarnessError> {
+        // Broca has no operation to rewrite an existing host acceptance/request stamp.
+        // Editing the rebuildable read cache would fabricate a fact not backed by WAL.
+        eprintln!("seed_host_created_at unavailable: recorded host facts are immutable; no independent host-creation write path exists, and cache-only edits are not host facts");
+        Ok(false)
+    }
+
     fn scoped_session_start_stamps(&self) -> Option<(RouteStamp, RouteStamp)> {
         Some(scope_fixture_stamps(PLAIN_SCOPE_REF))
     }
@@ -3818,6 +3830,11 @@ fn fixture_outcome_matches(name: &str, outcome: &CaseOutcome) -> bool {
         "delivery_deadline_retry_keeps_original_expiry" => {
             Some("adapter supplies no controlled delivery clock")
         }
+        // Existing host creation stamps are immutable; the fixture has no independent
+        // host-fact writer, and changing a read cache would not seed recorded host data.
+        "read_display_facts_created_at" => {
+            Some("adapter could not seed a host creation time via seed_host_created_at")
+        }
         // Native receipts have real clocks; the adapter cannot author the kit's synthetic
         // per-call stored times. Production read bytes and times have separate serve tests.
         "read_display_facts_default_absent" | "read_display_facts_opt_in_envelope" => {
@@ -4113,6 +4130,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "delivery_deadline_retry_keeps_original_expiry",
         "read_display_facts_default_absent",
         "read_display_facts_opt_in_envelope",
+        "read_display_facts_created_at",
         "read_display_facts_undeclared_refused",
     ] {
         let case = report
@@ -6561,6 +6579,10 @@ async fn conformance_flow_plan_is_model_only_and_names_the_attested_opener() {
 fn fixture_exclusions_reject_unrelated_inapplicability_and_any_failure() {
     for (name, reason) in [
         (
+            "read_display_facts_created_at",
+            "adapter could not seed a host creation time via seed_host_created_at",
+        ),
+        (
             "sender_succession_undeclared_refused",
             "describe groups do not support this question",
         ),
@@ -6619,4 +6641,14 @@ fn fixture_exclusions_reject_unrelated_inapplicability_and_any_failure() {
             }
         ));
     }
+}
+
+#[tokio::test]
+async fn conformance_creation_seed_refuses_to_fabricate_a_host_fact() {
+    let root = broca_test_support::scratch_root().join("subject-creation-seed");
+    let subject = BrocaSubject::new(&root).await;
+    assert!(!subject
+        .seed_host_created_at("synthetic-session", "m0", 600)
+        .await
+        .unwrap());
 }
