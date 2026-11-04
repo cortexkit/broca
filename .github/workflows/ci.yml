@@ -113,6 +113,8 @@ jobs:
       - name: Train preconditions
         run: python3 scripts/check-train-preconditions.py
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      # The pre-push coverage audit tests itself against a real `cargo nextest list` inventory.
+      - uses: taiki-e/install-action@2eb6de229bc778f7df20e106e4b34e9a364c73e6 # nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: scripts
