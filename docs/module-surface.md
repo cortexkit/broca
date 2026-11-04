@@ -1612,6 +1612,8 @@ fences reads with retryable `history_rewriting` until its writer has durably fin
 `session.resolve`, tag rows and model-view read pages are not served in llm-runner 0.8.
 
 **Display facts (opt-in).** Broca declares `read_display_facts`. On transcript reads,
+`include_display_facts: true` also exposes the recorded assistant `completed_at` and readable Responses `reasoning_summaries` indexed by stored content part, never opaque or encrypted reasoning; default message bytes and digests are unchanged.
+Rows cached before completion metadata was recorded omit `completed_at`; adding the nullable completion column performs no startup backfill.
 `include_display_facts: true` adds a stored `client_message_id` to its user entry and
 `tool_times` to an assistant entry carrying calls, beside `mid`, never inside `message`.
 Calls remain in message order. `started_at` is the recorded dispatch time;

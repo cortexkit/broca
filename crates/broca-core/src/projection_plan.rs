@@ -148,6 +148,7 @@ pub struct PreparedProjection {
     pub refusal_json: String,
     pub head_json: String,
     pub message_times: Vec<Option<u64>>,
+    pub message_completions: Vec<Option<u64>>,
     pub episode_spans: Vec<std::ops::Range<u64>>,
     pub open_episode_span: Option<u64>,
     /// Every episode's render inputs, in lineage order. Read by a resumed run under an applied
@@ -433,30 +434,19 @@ pub fn plan_projection(
     let queued_times = timing_head
         .map(|head| head.queued_times().clone())
         .unwrap_or_default();
-    let (times, mode3_times) = if mode3 {
-        let folded = crate::message_times::mode3_written_times(
-            time_records,
-            time_placement,
-            queued_times,
-            timing_head
-                .and_then(|head| head.mode3_times.clone())
-                .unwrap_or_default(),
-        )
-        .map_err(|_| ProjectionPlanError::InconsistentSnapshot("message time placement failed"))?;
-        (folded.times, Some(folded.seed))
-    } else {
-        (
-            crate::message_times::written_times_with_queued(
-                time_records,
-                time_placement,
-                queued_times,
-            )
-            .map_err(|_| {
-                ProjectionPlanError::InconsistentSnapshot("message time placement failed")
-            })?,
-            None,
-        )
-    };
+    let folded = crate::message_times::fold(
+        time_records,
+        time_placement,
+        queued_times,
+        mode3,
+        timing_head
+            .and_then(|head| head.mode3_times.clone())
+            .unwrap_or_default(),
+    )
+    .map_err(|_| ProjectionPlanError::InconsistentSnapshot("message time placement failed"))?;
+    let times = folded.times;
+    let native_assistants = folded.native_assistants;
+    let mode3_times = mode3.then_some(folded.seed);
     let (
         truncate_prefix_to,
         mut new_messages,
@@ -593,6 +583,7 @@ pub fn plan_projection(
     let mut message_compaction_compact_json = Vec::new();
     let mut compaction_delivery_updates = Vec::new();
     let mut compaction_tags = None;
+    let mut completion_markers = None;
     if crate::compaction_v2::projection::configured(mode3, admission_checkpoint.ownership.as_ref())
     {
         let continuation = match compaction_metadata {
@@ -631,7 +622,25 @@ pub fn plan_projection(
         message_compaction_compact_json = projected.compact;
         compaction_delivery_updates = projected.deliveries;
         compaction_tags = Some(projected.tags);
+        completion_markers = Some(projected.completed);
     }
+    let message_completions = match completion_markers {
+        Some(markers) => markers
+            .into_iter()
+            .enumerate()
+            .map(|(index, complete)| {
+                complete
+                    .then(|| times.get(&(next_ord as u64 + index as u64)).copied())
+                    .flatten()
+            })
+            .collect(),
+        None => crate::compaction_v2::entries::completion_times(
+            &new_messages,
+            next_ord as u64,
+            &times,
+            &native_assistants,
+        ),
+    };
     let message_json = new_messages
         .iter()
         .map(serde_json::to_string)
@@ -744,6 +753,7 @@ pub fn plan_projection(
             state: refusal,
         })?,
         message_times,
+        message_completions,
         head_json: serde_json::to_string(&admission_checkpoint.head)?,
         episode_spans,
         open_episode_span,

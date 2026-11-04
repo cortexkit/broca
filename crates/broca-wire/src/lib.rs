@@ -1103,6 +1103,10 @@ fn serialize_read_message<S: serde::Serializer>(
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_summaries: Vec<cortexkit_role_llm_runner::read::ReasoningSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_times: Vec<cortexkit_role_llm_runner::read::ToolTime>,
@@ -1192,6 +1196,10 @@ impl Serialize for SessionReadMessage {
             client_message_id: &'a Option<String>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             tool_times: &'a [cortexkit_role_llm_runner::read::ToolTime],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            completed_at: Option<u64>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            reasoning_summaries: &'a [cortexkit_role_llm_runner::read::ReasoningSummary],
         }
         Wire {
             written_at: self.written_at,
@@ -1207,6 +1215,8 @@ impl Serialize for SessionReadMessage {
             rich_ui: &self.rich_ui,
             client_message_id: &self.client_message_id,
             tool_times: &self.tool_times,
+            completed_at: self.completed_at,
+            reasoning_summaries: &self.reasoning_summaries,
         }
         .serialize(serializer)
     }
@@ -5988,6 +5998,8 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            completed_at: None,
+            reasoning_summaries: Vec::new(),
             client_message_id: None,
             tool_times: Vec::new(),
             rich_ui: None,
@@ -6374,6 +6386,8 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            completed_at: None,
+            reasoning_summaries: Vec::new(),
             client_message_id: None,
             tool_times: Vec::new(),
             rich_ui: None,

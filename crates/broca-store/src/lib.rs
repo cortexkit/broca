@@ -543,6 +543,7 @@ struct PreparedProjection {
     recovery_epoch: Option<i64>,
     head_json: String,
     message_times: Vec<Option<u64>>,
+    message_completions: Vec<Option<u64>>,
     episode_spans: Vec<std::ops::Range<u64>>,
     open_episode_span: Option<u64>,
     /// Every episode's render inputs as JSON, in lineage order (see
@@ -1443,6 +1444,9 @@ impl SqliteStore {
         if !message_columns.contains("written_at_ms") {
             conn.execute("ALTER TABLE message ADD COLUMN written_at_ms INTEGER", [])?;
         }
+        if !message_columns.contains("completed_at_ms") {
+            conn.execute("ALTER TABLE message ADD COLUMN completed_at_ms INTEGER", [])?;
+        }
         if !message_columns.contains("compaction_json") {
             conn.execute("ALTER TABLE message ADD COLUMN compaction_json TEXT", [])?;
         }
@@ -1905,6 +1909,7 @@ impl SqliteStore {
                         message_tags_json: prepared.message_tags_json,
                         message_compaction_json: prepared.message_compaction_json,
                         message_compaction_compact_json: prepared.message_compaction_compact_json,
+                        message_completions: prepared.message_completions,
                         compaction_delivery_updates: prepared.compaction_delivery_updates,
                         final_run_json: prepared.final_run_json,
                         completed_steps: prepared.completed_steps,
@@ -2094,6 +2099,7 @@ impl SqliteStore {
         let mut message_times = prepared.message_times.into_iter();
         let mut compaction_json = prepared.message_compaction_json.into_iter();
         let mut compaction_compact_json = prepared.message_compaction_compact_json.into_iter();
+        let mut message_completions = prepared.message_completions.into_iter();
         for (json, run_json) in prepared
             .message_json
             .into_iter()
@@ -2115,8 +2121,8 @@ impl SqliteStore {
                 }
             }
             tx.execute(
-                "INSERT OR REPLACE INTO message (session, ord, json, run_json, tags_json, written_at_ms, compaction_json, compaction_compact_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                rusqlite::params![key, next_ord, json, run_json, tags_json, message_times.next().flatten().map(broca_core::projection_plan::u64_to_i64).transpose()?, compaction_json.next().flatten(), compaction_compact_json.next().flatten()],
+                "INSERT OR REPLACE INTO message (session, ord, json, run_json, tags_json, written_at_ms, compaction_json, compaction_compact_json, completed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![key, next_ord, json, run_json, tags_json, message_times.next().flatten().map(broca_core::projection_plan::u64_to_i64).transpose()?, compaction_json.next().flatten(), compaction_compact_json.next().flatten(), message_completions.next().flatten().map(broca_core::projection_plan::u64_to_i64).transpose()?],
             )?;
             next_ord += 1;
         }
@@ -2826,7 +2832,7 @@ impl SqliteStore {
         );
         let mut stmt = tx
             .prepare(
-                "SELECT ord, json, run_json, tags_json, written_at_ms FROM message
+                "SELECT ord, json, run_json, tags_json, written_at_ms, completed_at_ms FROM message
                  WHERE session=?1 AND ord>=?2 AND ord<?3 ORDER BY ord ASC",
             )
             .map_err(|e| e.to_string())?;
@@ -2842,12 +2848,13 @@ impl SqliteStore {
                             row.get::<_, Option<String>>(2)?,
                             row.get::<_, Option<String>>(3)?,
                             row.get::<_, Option<u64>>(4)?,
+                            row.get::<_, Option<u64>>(5)?,
                         ))
                     },
                 )
                 .map_err(|e| e.to_string())?;
             for encoded_row in encoded {
-                let (ordinal, json, run_json, tags_json, written_at) =
+                let (ordinal, json, run_json, tags_json, written_at, completed_at) =
                     encoded_row.map_err(|e| e.to_string())?;
                 let run_json = run_json.ok_or(broca_core::StorePageReadError::AttributionStale)?;
                 let run = serde_json::from_str(&run_json).map_err(|e| e.to_string())?;
@@ -2856,6 +2863,7 @@ impl SqliteStore {
                 message.ordinal = Some(ordinal);
                 rows.push(StorePageRow {
                     written_at,
+                    completed_at,
                     ordinal,
                     message,
                     run,
@@ -5151,6 +5159,78 @@ mod tests {
         };
         let row = store.lookup_run("legacy-run").unwrap().unwrap();
         assert_eq!(row.title, None);
+    }
+
+    #[test]
+    fn completion_column_upgrade_preserves_existing_message_rows_without_backfill() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE message (session TEXT NOT NULL, ord INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(session,ord)); INSERT INTO message VALUES ('legacy',0,'unchanged');").unwrap();
+        SqliteStore::init(&conn).unwrap();
+        let (body, completion): (String, Option<u64>) = conn
+            .query_row(
+                "SELECT json,completed_at_ms FROM message WHERE session='legacy' AND ord=0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(body, "unchanged");
+        assert_eq!(completion, None);
+        let default: Option<String> = conn
+            .query_row(
+                "SELECT dflt_value FROM pragma_table_info('message') WHERE name='completed_at_ms'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(default, None);
+    }
+
+    #[test]
+    fn completed_at_agrees_before_and_after_materialization_and_excludes_supplied_assistants() {
+        use crate::conformance::{base_records, session, text_turn};
+        use broca_core::{context::ReadView, MaterializedStore, StorePageSnapshot};
+        use broca_wal::WalRecord;
+        let store = sqlite_store();
+        let session = session("completion-parity");
+        let mut records = base_records(&session);
+        if let WalRecord::RunStarted { input, .. } = &mut records[0].record {
+            std::sync::Arc::make_mut(input).push(broca_protocol::Message::new(
+                broca_protocol::Role::Assistant,
+                vec![broca_protocol::ContentBlock::Text {
+                    text: "supplied answer".into(),
+                }],
+            ));
+        }
+        records.extend(text_turn(2, 1, "native answer"));
+        if let WalRecord::ModelStepFinished { written_at_ms, .. } = &mut records[1].record {
+            *written_at_ms = Some(42);
+        }
+        let tail =
+            broca_core::read_session_page(&StorePageSnapshot::empty(), &records, Some(0), Some(10))
+                .unwrap();
+        assert_eq!(tail.messages[1].completed_at, None);
+        assert_eq!(tail.messages[2].completed_at, Some(42));
+        store.project(&session, &records).unwrap();
+        let snapshot = MaterializedStore::read_page_with_attribution(
+            &store,
+            &session,
+            Some(0),
+            10,
+            ReadView::Raw,
+        )
+        .unwrap();
+        let cached = broca_core::read_session_page(&snapshot, &[], Some(0), Some(10)).unwrap();
+        assert_eq!(
+            tail.messages
+                .iter()
+                .map(|entry| (entry.ordinal, entry.completed_at))
+                .collect::<Vec<_>>(),
+            cached
+                .messages
+                .iter()
+                .map(|entry| (entry.ordinal, entry.completed_at))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

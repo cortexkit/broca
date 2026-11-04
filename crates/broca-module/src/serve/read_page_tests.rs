@@ -6,6 +6,8 @@ const THREE_MIB: usize = 3 * 1024 * 1024;
 
 fn message(ordinal: u64, len: usize) -> SessionReadMessage {
     SessionReadMessage {
+        completed_at: None,
+        reasoning_summaries: Vec::new(),
         client_message_id: None,
         tool_times: Vec::new(),
         rich_ui: None,

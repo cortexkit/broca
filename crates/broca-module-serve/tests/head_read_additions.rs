@@ -103,6 +103,22 @@ fn seed_history_with_stamp(
     owner: Option<&str>,
     stamp: Option<broca_protocol::RichUiStamp>,
 ) {
+    seed_history_with_content(
+        rig,
+        planned,
+        owner,
+        stamp,
+        json!([{"type":"text","text":"answer"}]),
+    );
+}
+
+fn seed_history_with_content(
+    rig: &Rig,
+    planned: bool,
+    owner: Option<&str>,
+    stamp: Option<broca_protocol::RichUiStamp>,
+    content: serde_json::Value,
+) {
     let mut start: WalRecord = serde_json::from_str(
         include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
             .lines()
@@ -155,7 +171,7 @@ fn seed_history_with_stamp(
             "request_body_len":0,"request_body_sha256":"a","response_body_len":0,"response_body_sha256":"b",
             "outcome":"complete","ts_ms":505})).unwrap(),
         serde_json::from_value(json!({"type":"model_step_finished","step_id":1,
-            "assistant_message":{"message_id":"a","content":[{"type":"text","text":"answer"}]},
+            "assistant_message":{"message_id":"a","content":content},
             "usage":{"input_tokens":7,"output_tokens":3},"retries_used":0})).unwrap(),
         serde_json::from_value(json!({"type":"turn_finished","step_id":1})).unwrap(),
         serde_json::from_value(json!({"type":"run_finished","reason":"completed","ts_ms":506,
@@ -721,5 +737,94 @@ async fn reasoning_tokens_are_an_output_breakdown_on_run_and_session_spend() {
         json!(["tool_result", "turn_system", "steer", "idle_start"])
     );
     capture_known_with_run(&head, "session_head.reasoning_usage.json", Some(&run));
+    rig.finish().await;
+}
+
+fn capture_runner_display_sample(name: &str, frame: &subc_protocol::Frame) {
+    if let Some(root) = std::env::var_os("BROCA_LLM_RUNNER_SAMPLE_DIR") {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(name), &frame.body).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn responses_summary_and_completion_are_display_only_with_stable_bytes_and_digests() {
+    let mut rig = Rig::start("synthetic-responses-summary").await;
+    let summary = json!({"type":"reasoning","id":"synthetic-reasoning",
+        "summary":[{"type":"summary_text","text":"I checked the arithmetic."}],
+        "encrypted_content":"synthetic-opaque-must-not-be-a-summary"})
+    .to_string();
+    seed_history_with_content(
+        &rig,
+        false,
+        Some("owner"),
+        None,
+        json!([
+            {"type":"text","text":"answer"},
+            {"type":"redacted_reasoning","provider_format":"open_ai_responses","data":summary},
+            {"type":"redacted_reasoning","provider_format":"open_router","data":"opaque-synthetic"}
+        ]),
+    );
+    let plain = rig
+        .request(
+            7,
+            json!({"method":"session.read","params":{"media":"blocks"}}),
+        )
+        .await;
+    assert_eq!(
+        plain.header.ty,
+        subc_protocol::FrameType::Response,
+        "{plain:?}"
+    );
+    capture_known(&plain, "session_read.responses_before_display_facts.json");
+    let history = rig
+        .request(7, json!({"method":"session.history","params":{}}))
+        .await;
+    capture_known(
+        &history,
+        "session_history.responses_before_display_facts.json",
+    );
+    let descriptors = rig
+        .request(
+            7,
+            json!({"method":"session.read","params":{"media":"descriptors"}}),
+        )
+        .await;
+    capture_known(
+        &descriptors,
+        "session_read.responses_descriptors_before_display_facts.json",
+    );
+    let opted = rig.request(7, json!({"method":"session.read","params":{"media":"descriptors","include_display_facts":true}})).await;
+    capture_runner_display_sample("session.read.display_facts.json", &opted);
+    let body = result(&opted);
+    let assistant = &body["messages"][1];
+    assert_eq!(
+        assistant["reasoning_summaries"],
+        json!([{"part":1,"text":"I checked the arithmetic."}])
+    );
+    assert_eq!(assistant["completed_at"], 505);
+    assert!(body["messages"][0].get("completed_at").is_none());
+    assert!(body["messages"][0].get("reasoning_summaries").is_none());
+    let mut stripped = String::from_utf8(opted.body.clone()).unwrap();
+    stripped = stripped.replace(",\"completed_at\":505", "");
+    stripped = stripped.replace(
+        ",\"reasoning_summaries\":[{\"part\":1,\"text\":\"I checked the arithmetic.\"}]",
+        "",
+    );
+    assert_eq!(
+        stripped.as_bytes(),
+        descriptors.body,
+        "display facts changed default entry bytes or digests"
+    );
+    let again = rig
+        .request(7, json!({"method":"session.history","params":{}}))
+        .await;
+    assert_eq!(
+        again.body, history.body,
+        "display reads changed default history bytes"
+    );
     rig.finish().await;
 }

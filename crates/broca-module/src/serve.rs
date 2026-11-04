@@ -465,6 +465,8 @@ fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                completed_at: None,
+                reasoning_summaries: Vec::new(),
                 client_message_id: None,
                 tool_times: Vec::new(),
                 rich_ui: None,
@@ -3207,6 +3209,14 @@ impl ServeHandler for crate::LineageRegistry {
             page.next_from_ordinal = None;
         }
         let prompt_len = page.prompt_len;
+        let completions: std::collections::BTreeMap<_, _> = if req.include_display_facts {
+            page.messages
+                .iter()
+                .filter_map(|entry| entry.completed_at.map(|at| (entry.ordinal, at)))
+                .collect()
+        } else {
+            Default::default()
+        };
         let mut response = session_read_response(page, tools);
         response.history_version = snapshot.history_version;
         response.incarnation = snapshot.incarnation;
@@ -3225,6 +3235,24 @@ impl ServeHandler for crate::LineageRegistry {
                     )
                     .await?;
                 for entry in &mut response.messages {
+                    if entry.message.role == broca_protocol::Role::Assistant {
+                        entry.completed_at = completions.get(&(entry.ordinal - 1)).copied();
+                        entry.reasoning_summaries = entry
+                            .message
+                            .content
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(part, block)| {
+                                let stored = serde_json::to_value(block).ok()?;
+                                let text =
+                                    cortexkit_role_llm_runner::display::reasoning_summary(&stored)?;
+                                Some(cortexkit_role_llm_runner::read::ReasoningSummary::new(
+                                    u32::try_from(part).ok()?,
+                                    text,
+                                ))
+                            })
+                            .collect();
+                    }
                     if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
                         if entry.message.role == broca_protocol::Role::User {
                             entry.client_message_id = facts.client_message_id.clone();

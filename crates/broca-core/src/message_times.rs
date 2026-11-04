@@ -35,6 +35,8 @@ pub struct MessageTimeSeed {
 pub struct MessageTimeFold {
     pub times: BTreeMap<u64, u64>,
     pub seed: MessageTimeSeed,
+    /// Source-derived positions of host-produced assistants, excluding supplied input.
+    pub native_assistants: std::collections::BTreeSet<u64>,
 }
 
 /// Mode-3 timestamps look only backward, so appends cannot change an already served value.
@@ -47,7 +49,8 @@ pub fn mode3_written_times<'a>(
     fold(records, placement, queued, true, seed)
 }
 
-fn fold<'a>(
+/// Fold recorded entry stamps and native assistant positions in one placement pass.
+pub fn fold<'a>(
     records: impl IntoIterator<Item = &'a WalRecord>,
     mut placement: Placement,
     mut queued: BTreeMap<String, u64>,
@@ -56,6 +59,7 @@ fn fold<'a>(
 ) -> Result<MessageTimeFold, String> {
     let mut first_ordinal = placement.next_ordinal();
     let mut times = BTreeMap::new();
+    let mut native_assistants = std::collections::BTreeSet::new();
     let mut attempts = BTreeMap::new();
     let mut steers = std::collections::VecDeque::new();
     let mut assistant = None;
@@ -64,6 +68,7 @@ fn fold<'a>(
     for record in records {
         if matches!(record, WalRecord::RunStarted { .. }) {
             times.split_off(&placement.next_ordinal());
+            native_assistants.split_off(&placement.next_ordinal());
             attempts.clear();
             steers.clear();
             assistant = None;
@@ -170,6 +175,7 @@ fn fold<'a>(
                     kind: AppendKind::ToolTurn,
                 } => {
                     if count > 0 {
+                        native_assistants.insert(first);
                         if let Some(at) = assistant.take() {
                             times.insert(first, at);
                         }
@@ -180,7 +186,10 @@ fn fold<'a>(
                         }
                     }
                 }
-                PlacementAction::Append { first, count, .. } => {
+                PlacementAction::Append { first, count, kind } => {
+                    if kind == AppendKind::Assistant {
+                        native_assistants.extend(first..first + count);
+                    }
                     if let Some(at) = source_time {
                         for ordinal in first..first + count {
                             times.insert(ordinal, at);
@@ -189,6 +198,7 @@ fn fold<'a>(
                 }
                 PlacementAction::Truncate { to } => {
                     times.split_off(&to);
+                    native_assistants.split_off(&to);
                     first_ordinal = first_ordinal.min(to);
                     if to == 0 {
                         seed.last_entry_ms = 0;
@@ -200,6 +210,9 @@ fn fold<'a>(
         // after ToolDispatchIntent or ToolCallDeferred makes it survive recovery, before results commit.
         if let (Some(ordinal), Some(at)) = (placement.held_assistant_ordinal(), assistant) {
             times.insert(ordinal, at);
+        }
+        if let Some(ordinal) = placement.held_assistant_ordinal() {
+            native_assistants.insert(ordinal);
         }
         seed.last_record_ms = record_written_ms(record).or(seed.last_record_ms);
     }
@@ -214,7 +227,11 @@ fn fold<'a>(
             seed.last_entry_ms = at;
         }
     }
-    Ok(MessageTimeFold { times, seed })
+    Ok(MessageTimeFold {
+        times,
+        seed,
+        native_assistants,
+    })
 }
 
 /// Event/write times, excluding future expiry and deadline hints.

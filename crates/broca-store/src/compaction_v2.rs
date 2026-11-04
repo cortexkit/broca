@@ -478,6 +478,15 @@ mod tests {
         assert_eq!(page.entries[0].written_at, 10);
         assert_eq!(page.entries[1].written_at, 20);
         assert_eq!(page.entries[1].completed_at, Some(20));
+        let raw = broca_core::MaterializedStore::read_page_with_attribution(
+            &store,
+            &session,
+            Some(0),
+            10,
+            broca_core::context::ReadView::Raw,
+        )
+        .unwrap();
+        assert_eq!(raw.rows[1].completed_at, page.entries[1].completed_at);
         assert_eq!(page.entries[0].parts[0].tag, Some(1));
         assert_eq!(page.entries[1].parts[0].tag, Some(2));
         assert!(page.head.unwrap().compaction_metadata.unwrap().is_current());

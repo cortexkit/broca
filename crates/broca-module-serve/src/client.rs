@@ -644,6 +644,8 @@ mod tests {
             // An unframed legacy log has a minted snapshot incarnation, but no lineage frame.
             lineage_id: None,
             messages: vec![broca_wire::SessionReadMessage {
+                completed_at: None,
+                reasoning_summaries: Vec::new(),
                 client_message_id: None,
                 tool_times: Vec::new(),
                 rich_ui: None,

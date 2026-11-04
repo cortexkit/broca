@@ -29,6 +29,7 @@ pub struct Prepared {
     pub newest: Option<Cursor>,
     pub full: Vec<Option<String>>,
     pub compact: Vec<Option<String>>,
+    pub completed: Vec<bool>,
     pub tags: Vec<Option<String>>,
     pub deliveries: Vec<DeliveryUpdate>,
 }
@@ -53,6 +54,7 @@ pub fn prepare(
         newest: previous_newest.filter(|cursor| cursor.ordinal <= first_new),
         full: Vec::new(),
         compact: Vec::new(),
+        completed: Vec::new(),
         tags: Vec::new(),
         deliveries: deliveries
             .into_iter()
@@ -74,6 +76,7 @@ pub fn prepare(
             metadata::source_frames(metadata, frames)?,
         )?;
         prepared.newest = Some(Cursor::new(entry.ordinal, &entry.mid, &entry.digest));
+        prepared.completed.push(entry.completed_at.is_some());
         prepared.full.push(Some(
             serde_json::to_string(&entry).map_err(|error| error.to_string())?,
         ));
