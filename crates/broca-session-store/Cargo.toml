@@ -1,0 +1,24 @@
+[package]
+name = "broca-session-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "broca's session storage format: typed records, their compact tagged encoding, and the session store built on them. Shares no code with the legacy WAL or run-index storage."
+publish = false
+
+[dependencies]
+# Content types and renderer inputs only. This crate must never depend on broca-wal,
+# broca-store or broca-core: the new format is built standalone, and a converter crate is
+# the only place that reads both.
+broca-protocol = { path = "../broca-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+# Decision S3: XChaCha20-Poly1305 on every platform, with random 192-bit nonces.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+crc32c = "0.6"
+getrandom = "0.2"
+
+[dev-dependencies]
+proptest = { version = "1.11", default-features = false, features = ["std"] }

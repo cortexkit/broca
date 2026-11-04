@@ -1,0 +1,24 @@
+[package]
+name = "broca-session-convert"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Converts today's session logs into broca's new session storage format and measures the result. The only crate that reads both formats."
+publish = false
+
+[[bin]]
+name = "session-convert"
+path = "src/main.rs"
+
+[dependencies]
+broca-core = { path = "../broca-core" }
+broca-protocol = { path = "../broca-protocol" }
+broca-session-store = { path = "../broca-session-store" }
+broca-wal = { path = "../broca-wal" }
+serde.workspace = true
+serde_json.workspace = true
+serde_jcs.workspace = true
+sha2.workspace = true
+zstd = "0.14"

@@ -26,6 +26,8 @@ members = [
     "crates/broca-diagnostics",
     "crates/broca-heap-profile",
     "crates/broca-memory-relief",
+    "crates/broca-session-store",
+    "crates/broca-session-convert",
 ]
 
 # broca workspace.
