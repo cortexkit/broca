@@ -283,14 +283,18 @@ pub(crate) fn warm_reached_the_cache(
 }
 
 /// Whether a model request attempt reached the provider and was accepted for processing, so its
-/// prompt prefix was read into or written to the provider's cache. Only a 2xx status says so:
+/// prompt prefix was read into or written to the provider's cache. A 2xx status says so, and so
+/// does 101 with an answer: a request on a WebSocket connection records 101, the socket's upgrade
+/// status, at the moment it is sent on the open socket, and its outcome says whether the provider
+/// answered it. Before this counted them, every ChatGPT WebSocket request was left out, so the
+/// session's last send looked hours old and its cache looked expired. Not counted:
 /// - no status at all (`connect_failed`, `header_timeout`, `no_status`, or a cancel or shutdown
 ///   before the status line) means the provider may never have seen the request;
 /// - a 4xx or 5xx status is a refusal before any generation, which leaves the cache alone;
 /// - `provider_error` (an error event inside a 2xx body, such as an overload) and an outcome
 ///   this build does not know may also be refusals, so they are not counted either.
 ///
-/// Counted: `complete`, and the 2xx attempts that broke off while the response streamed
+/// Counted: `complete`, and the 2xx or 101 attempts that broke off while the response streamed
 /// (`eof_before_completion`, `chunk_error`, `idle_timeout`, `content_timeout`, `byte_limit`,
 /// `decode_error`, `rate_floor`, `cancelled`, `sealed_in_flight`). Leaving out a doubtful attempt
 /// only falls back to an earlier send, which errs early.
@@ -298,7 +302,7 @@ pub(crate) fn attempt_reached_the_cache(
     http_status: Option<u16>,
     outcome: &AttemptOutcome,
 ) -> bool {
-    http_status.is_some_and(|status| (200..300).contains(&status))
+    http_status.is_some_and(|status| (200..300).contains(&status) || status == 101)
         && !matches!(
             outcome,
             AttemptOutcome::ProviderError | AttemptOutcome::Unknown(_)
@@ -1148,6 +1152,43 @@ pub fn last_recorded_request_with_lineage(
         request_body_sha256: request_body_sha256.clone(),
         route,
     })
+}
+
+#[cfg(test)]
+mod websocket_clock_tests {
+    use broca_wal::WalRecord;
+
+    fn attempt(http_status: Option<u16>, outcome: &str, sent_at_ms: u64) -> WalRecord {
+        let mut record = serde_json::json!({
+            "type":"model_attempt_finished","step_id":1,"attempt":0,
+            "request_body_len":12,"request_body_sha256":"request",
+            "response_body_len":0,"response_body_sha256":"response",
+            "outcome":outcome,"ts_ms":sent_at_ms + 5,"sent_at_ms":sent_at_ms
+        });
+        if let Some(status) = http_status {
+            record["http_status"] = status.into();
+        }
+        serde_json::from_value(record).unwrap()
+    }
+
+    /// A request sent on an open WebSocket and answered reached the cache, so the clock moves to
+    /// it. A WebSocket request that ended without an answer, and one with no status, don't.
+    #[test]
+    fn an_answered_websocket_request_moves_the_cache_clock() {
+        let http = attempt(Some(200), "complete", 1_000);
+        let socket = attempt(Some(101), "complete", 9_000);
+        assert_eq!(
+            super::last_cache_send_at_ms(&[http.clone(), socket]),
+            Some(9_000)
+        );
+        let refused = attempt(Some(101), "provider_error", 9_000);
+        assert_eq!(
+            super::last_cache_send_at_ms(&[http.clone(), refused]),
+            Some(1_000)
+        );
+        let unsent = attempt(None, "connect_failed", 9_000);
+        assert_eq!(super::last_cache_send_at_ms(&[http, unsent]), Some(1_000));
+    }
 }
 
 #[cfg(test)]
