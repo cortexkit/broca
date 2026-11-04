@@ -40,7 +40,30 @@ pub fn render_step_with_provenance(
     max_output_tokens: Option<u32>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
 ) -> Result<(FrozenRenderConfig, CallOptions, Vec<u8>), String> {
-    let (frozen, mut opts, state) = boundary_options(prefix, config, run_id, step)?;
+    render_step_with_lineage(
+        None,
+        prefix,
+        config,
+        run_id,
+        step,
+        max_output_tokens,
+        provenance,
+    )
+}
+
+/// Mode-3 message ids include the WAL lineage. Pass the actual reader's lineage, not a
+/// substitute session address, and include view applications through the attempt boundary.
+pub fn render_step_with_lineage(
+    lineage: Option<&str>,
+    prefix: &[WalRecord],
+    config: &RunConfig,
+    run_id: &str,
+    step: u64,
+    max_output_tokens: Option<u32>,
+    provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+) -> Result<(FrozenRenderConfig, CallOptions, Vec<u8>), String> {
+    let (frozen, mut opts, state) =
+        boundary_options_with_lineage(lineage, prefix, config, run_id, step)?;
     let family = broca_provider::registry::wire_family(frozen.family_id)
         .ok_or("no wire family implementation for the frozen family id")?;
     if let Some(state) = state.state() {
@@ -66,6 +89,40 @@ pub fn boundary_options(
     ),
     String,
 > {
+    boundary_options_with_lineage(None, prefix, config, run_id, step)
+}
+
+pub fn boundary_options_with_lineage(
+    lineage: Option<&str>,
+    prefix: &[WalRecord],
+    config: &RunConfig,
+    run_id: &str,
+    step: u64,
+) -> Result<
+    (
+        FrozenRenderConfig,
+        CallOptions,
+        broca_core::compaction::CompactionCheckpoint,
+    ),
+    String,
+> {
+    let mode3 = broca_core::head::is_mode3_log(prefix);
+    let frames = mode3.then(|| {
+        prefix
+            .iter()
+            .enumerate()
+            .map(|(index, record)| broca_wal::FramedRecord {
+                seq: index as u64 + 1,
+                fence: 0,
+                record: record.clone(),
+            })
+            .collect::<Vec<_>>()
+    });
+    let current = frames
+        .as_deref()
+        .map(broca_core::compaction_v2::host::frozen)
+        .transpose()?;
+    let config = current.as_ref().map_or(config, |(config, _)| config);
     let mut prior =
         broca_core::replay::replay(prefix).map_err(|e| format!("replay WAL prefix: {e}"))?;
     // Replay retains raw tool outputs. Before sending them to the model, the live runner
@@ -79,12 +136,12 @@ pub fn boundary_options(
         restore_repetition_guidance(&mut prior.prompt[span]);
     }
     // A run frozen with `render_tags` sent tagged user and tool-result text with its tag prefix.
-    if config.render_tags {
+    if !mode3 && config.render_tags {
         broca_protocol::tags::render_tags_into(
             &mut prior.prompt,
             broca_protocol::tags::TagRendering::for_render_config(&config.frozen_render_config),
         );
-    } else {
+    } else if !mode3 {
         // Model text a run under the computed rules marked for cleaning went out cleaned on
         // every request since; a structured-output run's final text went out unchanged.
         broca_protocol::tags::clean_computed_into(&mut prior.prompt);
@@ -100,7 +157,11 @@ pub fn boundary_options(
         render_episodes: Arc::new(prior.render_episodes.unwrap_or_default().into()),
         prompt: prior.prompt,
         tools: Arc::clone(&config.tools),
-        tool_choice: Arc::new(config.tool_choice.clone()),
+        tool_choice: Arc::new(if mode3 && prior.budget_finalize_pending {
+            broca_protocol::ToolChoice::None
+        } else {
+            config.tool_choice.clone()
+        }),
         response_format: Arc::new(config.response_format.clone()),
         generation: Arc::new(config.generation.clone()),
         provider_options: Arc::new(config.provider_options.clone()),
@@ -114,8 +175,26 @@ pub fn boundary_options(
         }),
         target_model: Some(config.model.clone()),
     };
-    if prior.compaction.state().is_some() {
+    if mode3 || prior.compaction.state().is_some() {
         broca_protocol::content::stamp_ordinals(&mut opts.prompt);
+    }
+    if mode3 {
+        let lineage = lineage.ok_or("mode-3 request reconstruction requires the WAL lineage")?;
+        let frames = frames.as_deref().expect("mode-3 frames built above");
+        let session = prefix
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::RunStarted { session, .. } => Some(session),
+                _ => None,
+            })
+            .ok_or("mode-3 log has no run")?;
+        let state = broca_core::compaction_v2::session::load(session, frames)?;
+        opts = broca_core::compaction_v2::render::request_options(
+            frames,
+            lineage,
+            &opts,
+            state.view_for_step(step),
+        )?;
     }
     Ok((frozen, opts, prior.compaction))
 }

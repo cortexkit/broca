@@ -17,6 +17,35 @@ use cortexkit_role_compaction::{
     view::{Edit, EditOp, InsertAt, InsertedImage},
 };
 
+/// Assemble a mode-3 request from the durable transcript and the view applied to this step.
+/// The boundary options retain live-only settings and decorated tool outputs; callers rebuilding
+/// offline must restore those decorations before calling. Image capture belongs to the live
+/// boundary, so this pure renderer only recreates content-addressed image references.
+pub fn request_options(
+    records: &[broca_wal::FramedRecord],
+    lineage: &str,
+    boundary: &broca_protocol::CallOptions,
+    applied: Option<&cortexkit_role_compaction::view::View>,
+) -> Result<broca_protocol::CallOptions, String> {
+    let transcript = super::transcript::project(records, lineage)?;
+    let (config, manifest) = super::host::frozen(records)?;
+    let prompt = if manifest.is_some_and(crate::compaction::has_compaction) {
+        prompt(
+            &boundary.prompt,
+            &transcript.entries,
+            applied.map_or(&[], |view| view.edits.as_slice()),
+            super::host::image_reference,
+        )?
+    } else {
+        deliveries_only(&boundary.prompt, &transcript.entries)?
+    };
+    let mut opts = options(boundary, prompt);
+    opts.ephemeral_session |=
+        crate::retention::is_retention_records(records.iter().map(|frame| &frame.record));
+    let globals = super::systems::frozen(true, &config, manifest)?;
+    Ok(super::systems::view(&opts, &globals)?.unwrap_or(opts))
+}
+
 /// Images are captured into the runner's media store before provider rendering.
 /// Keeping capture at the host boundary also makes resumed requests use the same
 /// content-addressed reference, rather than a second encoding of the view's data.

@@ -6504,13 +6504,18 @@ where
                     });
                     break RunFinishReason::ContextCeiling;
                 }
-                crate::compaction_v2::request::Prepared::Ready {
-                    prompt, applied, ..
-                } => {
+                crate::compaction_v2::request::Prepared::Ready { applied, .. } => {
                     provider.set_cache_evidence_view(applied.map(|view| view.version));
-                    model_opts = Some(Arc::new(crate::compaction_v2::render::options(
-                        &opts, prompt,
-                    )));
+                    let view = session.state.lock().await.view_for_step(step_id.0).cloned();
+                    model_opts = Some(Arc::new(
+                        crate::compaction_v2::render::request_options(
+                            &frames,
+                            &lineage,
+                            &opts,
+                            view.as_ref(),
+                        )
+                        .map_err(RunError::Wal)?,
+                    ));
                 }
             }
         }
@@ -6524,14 +6529,10 @@ where
                     RunError::Wal("mode-3 delivery rendering requires a WAL lineage".into())
                 })?
                 .to_string();
-            let transcript = crate::compaction_v2::transcript::project(&frames, &lineage)
-                .map_err(RunError::Wal)?;
-            let prompt =
-                crate::compaction_v2::render::deliveries_only(&opts.prompt, &transcript.entries)
-                    .map_err(RunError::Wal)?;
-            model_opts = Some(Arc::new(crate::compaction_v2::render::options(
-                &opts, prompt,
-            )));
+            model_opts = Some(Arc::new(
+                crate::compaction_v2::render::request_options(&frames, &lineage, &opts, None)
+                    .map_err(RunError::Wal)?,
+            ));
         }
         if let Some(runtime) = compaction_runtime
             .as_ref()
@@ -6869,14 +6870,6 @@ where
             .and_then(|text| crate::plan_system::view(sent_opts, &opts.prompt, text))
             .map(Arc::new);
         let sent_opts = system_view.as_ref().unwrap_or(sent_opts);
-        let v2_system_view = if mode3 {
-            crate::compaction_v2::systems::view(sent_opts, &v2_globals)
-                .map_err(RunError::Wal)?
-                .map(Arc::new)
-        } else {
-            None
-        };
-        let sent_opts = v2_system_view.as_ref().unwrap_or(sent_opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
             break RunFinishReason::Cancelled;
         }
