@@ -305,8 +305,9 @@ across rollback. Existing records are not rewritten: reads expose only recorded 
 successful-attempt times, and tool results' recorded `tool-times/v1` finish times. Unknown times
 stay absent, never zero. The same placement rules attach these facts before and after projection.
 
-`session.head.model` is the latest recorded next-send selection. Under `head_selection`, an
-admitted creating plan or durably accepted refresh can select
+`session.head.model` is the latest recorded next-send selection. Broca declares the
+`head_selection` capability group in `role.describe`; it lets an admitted creating plan or
+durably accepted refresh select
 `plan.model: {provider, model, variant?, service_tier?}`. A changed choice appears on head
 immediately, regardless of when the refresh applies its text or tools. An absent model member
 leaves the selection alone; a present model's omitted tier means standard. Top-level
