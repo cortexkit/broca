@@ -3,8 +3,9 @@ use std::{io::Read, str::FromStr};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use subc_protocol::{scope::ScopeSelector, Principal};
 
+/// An owner's scope selector, without its privately supplied bind proof.
 #[derive(Debug, Clone)]
-pub(crate) struct CarrierScope {
+pub struct CarrierScope {
     owner: String,
     reference: String,
     epoch: u64,
@@ -35,7 +36,8 @@ impl FromStr for CarrierScope {
 }
 
 impl CarrierScope {
-    pub(crate) fn read_proof(&self, input: &mut impl Read) -> Result<ScopeSelector, &'static str> {
+    /// Read the owner's private hex proof without retaining or reporting its input bytes.
+    pub fn read_proof(&self, input: &mut impl Read) -> Result<ScopeSelector, &'static str> {
         // Bound malformed input without ever including it in diagnostics. The owner closes
         // the private pipe after one proof, so EOF is part of the handoff protocol.
         let mut bytes = Vec::with_capacity(67);
@@ -67,6 +69,44 @@ impl CarrierScope {
         )
         .with_bind_proof(Some(URL_SAFE_NO_PAD.encode(proof))))
     }
+}
+
+/// Refuse a Direct carrier when the daemon cannot enforce its scope and private proof.
+/// Older daemons may otherwise ignore the selector and open an unscoped route.
+pub async fn verify_direct_carrier_scope(
+    conn: &crate::SubcConnection,
+    selector: &ScopeSelector,
+) -> Result<(), &'static str> {
+    if conn.consumer_module_id().is_some() {
+        return Err("scope_unsupported: a private carrier selector requires a Direct connection");
+    }
+    if selector.bind_proof.is_none() {
+        return Err(
+            "scope_bind_proof_required: a Direct carrier must supply its private bind proof",
+        );
+    }
+    let capabilities = conn
+        .server_capabilities()
+        .await
+        .map_err(|_| "scope_unverifiable: could not read the daemon's scope capabilities")?;
+    if !capabilities
+        .iter()
+        .any(|cap| cap == subc_protocol::scope::CAP_SCOPES_V1)
+        || !capabilities
+            .iter()
+            .any(|cap| cap == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1)
+    {
+        return Err("scope_unsupported: the daemon must advertise scopes/v1 and scope-bind-proof/v1 for a Direct carrier");
+    }
+    Ok(())
+}
+
+/// Keep a route refusal's code without exposing a diagnostic that may quote the private proof.
+pub fn private_route_error(error: crate::ConnError) -> crate::ConnError {
+    crate::ConnError::Rejected(crate::connection::RejectedMessage::structured(
+        error.code().unwrap_or("scope_unverifiable").into(),
+        "the Direct carrier route could not be opened".into(),
+    ))
 }
 
 #[cfg(test)]

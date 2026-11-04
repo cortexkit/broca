@@ -41,6 +41,9 @@ const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 #[path = "scope_real_daemon_e2e/compaction_routes.rs"]
 mod compaction_routes;
 
+#[path = "scope_real_daemon_e2e/compose_plan.rs"]
+mod compose_plan;
+
 #[derive(Default)]
 struct AcceptanceCatalog {
     fetched: std::sync::atomic::AtomicBool,

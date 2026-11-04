@@ -50,6 +50,23 @@ prefixed global flags are refused by command name before any session lookup.
 These commands refuse `--subc` by command name,
 whether the daemon flag appears before or after the subcommand, without binding.
 
+`broca-session --subc CONNECTION compose-plan --items FILE [--scope OWNER/REF/EPOCH]`
+composes a tool-only plan from live provider catalogs without creating a session or sending
+a turn. With `--scope`, every provider's catalog is fetched on a scoped `tool-provider: v1`
+route as a Direct carrier. The scope owner must authorize `direct` as a carrier for those
+providers. Like [`broca-run --scope`](broca-run.md), the command reads the private 32-byte
+bind proof as exactly 64 hex characters on stdin, optionally followed by a newline, and
+requires EOF. A missing or malformed proof is refused before connecting to the daemon;
+the proof never belongs in argv, an environment variable, the items file, or diagnostics.
+Without `--scope`, catalog fetches and plan output are unchanged and stdin is not read.
+The flag belongs only to `compose-plan`: it does not scope `send`, `run`, `read`, or any
+other `broca-session` route. Creating a scoped session remains the scope owner's job;
+a carrier may compose its plan but cannot create the session.
+The daemon must advertise `scopes/v1` and `scope-bind-proof/v1`; unsupported daemons
+are refused rather than silently falling back to unscoped routing. Scope selectors
+are sent only in `route.open`, never in catalog request bodies. Tool presets come
+from the plan's tool items, so there is no `--preset` flag.
+
 ---
 
 ## 1. What it is
