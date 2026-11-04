@@ -432,6 +432,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     }
 }
 
+mod read;
 mod seal;
 pub use seal::{Sealed, GRACE_MS};
 

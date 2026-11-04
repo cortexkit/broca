@@ -61,6 +61,10 @@ crate::message! {
         2 req offset: u64,
         3 req len: u64,
         4 req records: u64,
+        /// In a transcript segment: the ordinal the first message placed in this block gets
+        /// (see `fold::conversation`). A block always starts a group, where no tool turn is
+        /// open, so its messages can be rebuilt from it alone.
+        5 opt first_ordinal: u64,
     }
 }
 
@@ -128,6 +132,10 @@ pub struct SegmentMeta {
     pub prefixes: Vec<Id128>,
     pub leading: Option<Vec<u8>>,
     pub trailer: Option<Vec<u8>>,
+    /// For a transcript segment, one entry per record: how many messages the conversation had
+    /// placed before it. Blocks record the ordinal their first message gets from it. Empty when
+    /// the caller doesn't track ordinals.
+    pub placed_before: Vec<u64>,
 }
 
 /// Splits transcript records into groups that must share a block: each user input or assistant
@@ -171,6 +179,9 @@ pub fn build(
     if records.windows(2).any(|pair| pair[1].0 <= pair[0].0) {
         return Err(SegmentError::BadRecords("seqs not increasing"));
     }
+    if !meta.placed_before.is_empty() && meta.placed_before.len() != records.len() {
+        return Err(SegmentError::BadRecords("one placed count per record"));
+    }
     let header = SegmentHeader {
         format: u32::from(SEGMENT_FORMAT),
         session_id: meta.session_id,
@@ -200,17 +211,22 @@ pub fn build(
             body: ByteBuf(record.encode_body()),
         })
         .collect();
+    let placed_before = meta.placed_before;
     let mut entries = Vec::new();
     let mut block: Vec<StoredRecord> = Vec::new();
     let mut block_bytes = 0usize;
+    // Index of the current block's first record in `records`.
+    let mut block_first = 0usize;
     let mut flush = |block: &mut Vec<StoredRecord>,
                      block_bytes: &mut usize,
+                     block_first: usize,
                      out: &mut Vec<u8>|
      -> Result<(), SegmentError> {
         if block.is_empty() {
             return Ok(());
         }
         let first_seq = block[0].seq;
+        let first_ordinal = placed_before.get(block_first).map(|placed| placed + 1);
         let count = block.len() as u64;
         let plain = BlockBody {
             records: std::mem::take(block),
@@ -225,6 +241,7 @@ pub fn build(
             offset: out.len() as u64,
             len: sealed.len() as u64,
             records: count,
+            first_ordinal,
         });
         out.extend_from_slice(&sealed);
         *block_bytes = 0;
@@ -236,15 +253,18 @@ pub fn build(
             .map(|record| record.body.0.len() + 16)
             .sum();
         if !block.is_empty() && block_bytes + group_bytes > BLOCK_TARGET {
-            flush(&mut block, &mut block_bytes, &mut out)?;
+            flush(&mut block, &mut block_bytes, block_first, &mut out)?;
+        }
+        if block.is_empty() {
+            block_first = range.start;
         }
         block.extend(stored[range].iter().cloned());
         block_bytes += group_bytes;
         if block_bytes >= BLOCK_TARGET {
-            flush(&mut block, &mut block_bytes, &mut out)?;
+            flush(&mut block, &mut block_bytes, block_first, &mut out)?;
         }
     }
-    flush(&mut block, &mut block_bytes, &mut out)?;
+    flush(&mut block, &mut block_bytes, block_first, &mut out)?;
 
     let index = SegmentIndex {
         blocks: entries,
@@ -347,6 +367,19 @@ impl<'a> Segment<'a> {
                     .map_err(SegmentError::Decode)
             })
             .collect()
+    }
+
+    /// The block whose messages include `ordinal`, in a transcript segment built with placed
+    /// counts: the last block whose first message's ordinal is at most `ordinal`. A block that
+    /// places no message shares its first ordinal with the next, which is where the message is.
+    pub fn block_for_ordinal(&self, ordinal: u64) -> Option<usize> {
+        let blocks = &self.index.blocks;
+        if blocks.iter().any(|entry| entry.first_ordinal.is_none()) {
+            return None;
+        }
+        blocks
+            .partition_point(|entry| entry.first_ordinal.is_some_and(|first| first <= ordinal))
+            .checked_sub(1)
     }
 
     /// The record with `seq`, read from the one block that can hold it, or `None` when the

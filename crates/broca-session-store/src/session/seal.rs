@@ -244,6 +244,10 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let mut transcript_dir = self.head.transcript_dir.clone();
         if !transcript.is_empty() {
             let object = format!("{name}/t");
+            let (placed_before, placed_after) =
+                placed_counts(&checkpoint.conversation, &transcript).map_err(SessionError::Fold)?;
+            let ordinals =
+                (placed_after > placed_before[0]).then(|| (placed_before[0] + 1, placed_after));
             let bytes = segment::build(
                 &key,
                 object.as_bytes(),
@@ -254,6 +258,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                     prefixes: Vec::new(),
                     leading: Some(checkpoint.conversation.encode()),
                     trailer: None,
+                    placed_before,
                 },
             )
             .map_err(SessionError::Segment)?;
@@ -264,7 +269,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             let appended = pages
                 .append(
                     transcript_dir.as_ref(),
-                    entry(object, &transcript, bytes.len(), now_ms),
+                    entry(object, &transcript, bytes.len(), now_ms, ordinals),
                     &format!("{name}/dt"),
                     self.version,
                 )
@@ -284,6 +289,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 prefixes: Vec::new(),
                 leading: None,
                 trailer: Some(settled.encode()),
+                placed_before: Vec::new(),
             },
         )
         .map_err(SessionError::Segment)?;
@@ -294,7 +300,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let appended = pages
             .append(
                 self.head.ledger_dir.as_ref(),
-                entry(object, &ledger, bytes.len(), now_ms),
+                entry(object, &ledger, bytes.len(), now_ms, None),
                 &format!("{name}/dl"),
                 self.version,
             )
@@ -522,13 +528,41 @@ fn record_run(record: &Record) -> Option<&str> {
     }
 }
 
-fn entry(object: String, records: &[(u64, Record)], size: usize, now_ms: u64) -> DirEntry {
+/// How many messages the conversation had placed before each of `transcript`'s records,
+/// folding from `start`, and how many after the last. Only the count is kept, so the fold drops
+/// each placed message at once.
+fn placed_counts(
+    start: &Conversation,
+    transcript: &[(u64, Record)],
+) -> Result<(Vec<u64>, u64), String> {
+    let mut conversation = start.clone();
+    conversation.messages.clear();
+    let mut counts = Vec::with_capacity(transcript.len());
+    for (_, record) in transcript {
+        counts.push(conversation.placed);
+        conversation
+            .apply(record)
+            .map_err(|e| format!("conversation: {e:?}"))?;
+        conversation.messages.clear();
+    }
+    Ok((counts, conversation.placed))
+}
+
+fn entry(
+    object: String,
+    records: &[(u64, Record)],
+    size: usize,
+    now_ms: u64,
+    ordinals: Option<(u64, u64)>,
+) -> DirEntry {
     DirEntry {
         object,
         first_seq: records.first().map_or(0, |(seq, _)| *seq),
         last_seq: records.last().map_or(0, |(seq, _)| *seq),
         size: size as u64,
         sealed_at_ms: now_ms,
+        first_ordinal: ordinals.map(|(first, _)| first),
+        last_ordinal: ordinals.map(|(_, last)| last),
     }
 }
 

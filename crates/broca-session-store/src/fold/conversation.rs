@@ -67,7 +67,7 @@ state! {
         /// conversation. Sessions on the first compaction protocol stored it that way; sessions
         /// on the current contract keep the result as returned and add the text when a request
         /// renders.
-        3 req appends_in_conversation: bool => {
+        3 req pub appends_in_conversation: bool => {
             owner: "admission",
             reset: "never",
             bound: Bound::Fixed,
@@ -76,6 +76,15 @@ state! {
         /// its first kept entry.
         4 opt pub marker: Marker => {
             owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// How many messages the conversation has ever placed, the window's included. A message's
+        /// ordinal is its place in the whole conversation, counting from 1, so the window's first
+        /// message has ordinal `placed - messages.len() + 1`, and older ones are in sealed
+        /// segments.
+        5 req pub placed: u64 => {
+            owner: "run loop",
             reset: "never",
             bound: Bound::Fixed,
         },
@@ -89,7 +98,26 @@ impl Conversation {
             open: None,
             appends_in_conversation,
             marker: None,
+            placed: 0,
         }
+    }
+
+    /// The ordinal of the window's first message, or the next ordinal when the window is empty.
+    pub fn window_start(&self) -> u64 {
+        self.placed - self.messages.len() as u64 + 1
+    }
+
+    /// The window message with `ordinal`, if it's in the window.
+    pub fn window_message(&self, ordinal: u64) -> Option<&Message> {
+        let start = self.window_start();
+        (ordinal >= start)
+            .then(|| self.messages.get((ordinal - start) as usize))
+            .flatten()
+    }
+
+    fn place(&mut self, message: Message) {
+        self.messages.push(message);
+        self.placed += 1;
     }
 
     /// The assistant message still waiting for replies, if any.
@@ -112,7 +140,7 @@ impl Conversation {
                     }
                     self.open = None;
                 }
-                self.messages.push(input.message.clone());
+                self.place(input.message.clone());
             }
             Record::Assistant(assistant) => {
                 if self.open.is_some() {
@@ -135,9 +163,9 @@ impl Conversation {
                     message
                         .content
                         .retain(|block| !matches!(block, ContentBlock::ToolCall(_)));
-                    self.messages.push(message);
+                    self.place(message);
                 } else if calls.is_empty() {
-                    self.messages.push(assistant.message.clone());
+                    self.place(assistant.message.clone());
                 } else {
                     self.open = Some(ToolTurn {
                         assistant: assistant.message.clone(),
@@ -169,8 +197,8 @@ impl Conversation {
                             ContentBlock::ToolResult(turn.replies.swap_remove(at))
                         })
                         .collect();
-                    self.messages.push(turn.assistant);
-                    self.messages.push(Message::new(Role::Tool, results));
+                    self.place(turn.assistant);
+                    self.place(Message::new(Role::Tool, results));
                 }
             }
             Record::ResultAppend(append) => {

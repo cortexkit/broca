@@ -237,6 +237,12 @@ pub struct AppendMeasure {
     pub seal_us: Vec<u64>,
     /// Whether a cut was sealed.
     pub cut: bool,
+    /// Microseconds per read of a sealed message by its ordinal, from a fresh load after the
+    /// seals: the directory, the segment's index and one block, through the session's read path.
+    pub expand_us: Vec<u64>,
+    /// Messages read back by ordinal (window and sealed), each equal to the message the
+    /// conversation placed there.
+    pub read_back: u64,
     /// Microseconds per setup part stored before the batch that names it. A part the store
     /// already held (from this session or an earlier one) asks the backend nothing and isn't
     /// timed.
@@ -360,12 +366,8 @@ pub fn append_log(
         let mut session = Session::load(&reopened, addr.clone(), &triple, deployment)
             .await
             .map_err(|e| format!("load to seal: {e:?}"))?;
-        let before: Vec<Vec<u8>> = session
-            .conversation
-            .messages
-            .iter()
-            .map(|message| message.encode())
-            .collect();
+        let whole = session.conversation.messages.clone();
+        let before: Vec<Vec<u8>> = whole.iter().map(|message| message.encode()).collect();
         for cut in run_inputs.iter().rev() {
             let started = Instant::now();
             match session.seal(Some(*cut), 0).await {
@@ -395,13 +397,36 @@ pub fn append_log(
         measure.seal_us.push(started.elapsed().as_micros() as u64);
         let state = (session.conversation.encode(), session.operations.encode());
         session.close().await.map_err(|e| format!("close: {e:?}"))?;
-        Ok::<_, String>(state)
+        Ok::<_, String>((state, whole))
     })?;
+    let (sealed, whole) = sealed;
     let after_seals = LocalBackend::new(root);
     let loaded = block_on(Session::load(&after_seals, addr, &triple, deployment))
         .map_err(|e| format!("load after seals: {e:?}"))?;
     if (loaded.conversation.encode(), loaded.operations.encode()) != sealed {
         return Err("the session loaded after the seals differs from its writer's state".into());
+    }
+    // Every message reads back by its ordinal. A sealed message of a finished run lost its
+    // opaque reasoning, so both sides are compared with opaque payloads removed.
+    let window_start = loaded.conversation.window_start();
+    let normalized = |message: &broca_protocol::content::Message| {
+        let mut message = message.clone();
+        broca_session_store::prune::prune(&mut message, &[0; 32]);
+        message
+    };
+    for (index, expected) in whole.iter().enumerate() {
+        let ordinal = index as u64 + 1;
+        let started = Instant::now();
+        let read = block_on(loaded.message(ordinal))
+            .map_err(|e| format!("read message {ordinal}: {e:?}"))?
+            .ok_or_else(|| format!("message {ordinal} reads as absent"))?;
+        if ordinal < window_start {
+            measure.expand_us.push(started.elapsed().as_micros() as u64);
+        }
+        if normalized(&read) != normalized(expected) {
+            return Err(format!("message {ordinal} reads back differently"));
+        }
+        measure.read_back += 1;
     }
     Ok(measure)
 }

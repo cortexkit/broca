@@ -13,6 +13,8 @@ fn entry(n: u64) -> DirEntry {
         last_seq: n * 10 + 9,
         size: 1,
         sealed_at_ms: n,
+        first_ordinal: None,
+        last_ordinal: None,
     }
 }
 
@@ -93,4 +95,66 @@ async fn out_of_order() {
         pages.append(Some(&root), entry(1), "c2/d", 1).await,
         Err(DirectoryError::OutOfOrder)
     ));
+}
+
+/// Lookups by ordinal walk a tree several levels deep too. Each entry places four messages,
+/// every third places none (ordinals absent), and pages carry the ordinal range of what they
+/// hold, so the walk takes the one child that holds the ordinal.
+#[test]
+fn ordinal_lookups_walk_a_deep_tree() {
+    block_on(async {
+        let backend = MemoryBackend::default();
+        let addr = SessionAddr("a".into());
+        backend.write_head(&addr, b"h", None, 1).await.unwrap();
+        let key = FrameKey::new(1, &[7; 32]);
+        let pages = Pages {
+            backend: &backend,
+            addr: &addr,
+            session: Id128([1; 16]),
+            key: &key,
+            fanout: 3,
+        };
+        let mut root = None;
+        let mut placed = 0u64;
+        let mut expected = Vec::new();
+        for n in 1..=40u64 {
+            let mut item = entry(n);
+            if n % 3 != 0 {
+                item.first_ordinal = Some(placed + 1);
+                item.last_ordinal = Some(placed + 4);
+                placed += 4;
+            }
+            expected.push(item.clone());
+            root = Some(
+                pages
+                    .append(root.as_ref(), item, &format!("c{n}/d"), 1)
+                    .await
+                    .unwrap()
+                    .root,
+            );
+        }
+        let root = root.unwrap();
+        assert_eq!(
+            (root.first_ordinal, root.last_ordinal),
+            (Some(1), Some(placed))
+        );
+        for item in expected.iter().filter(|item| item.first_ordinal.is_some()) {
+            for ordinal in [item.first_ordinal.unwrap(), item.last_ordinal.unwrap()] {
+                assert_eq!(
+                    pages
+                        .find_ordinal(Some(&root), ordinal)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    Some(item),
+                    "ordinal {ordinal}"
+                );
+            }
+        }
+        assert_eq!(pages.find_ordinal(Some(&root), 0).await.unwrap(), None);
+        assert_eq!(
+            pages.find_ordinal(Some(&root), placed + 1).await.unwrap(),
+            None
+        );
+    });
 }

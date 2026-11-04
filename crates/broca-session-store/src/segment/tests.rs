@@ -16,6 +16,7 @@ fn meta() -> SegmentMeta {
         prefixes: Vec::new(),
         leading: Some(b"leading state".to_vec()),
         trailer: None,
+        placed_before: Vec::new(),
     }
 }
 

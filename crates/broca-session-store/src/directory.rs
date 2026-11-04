@@ -31,6 +31,10 @@ crate::message! {
         /// The segment object's size in bytes.
         4 req size: u64,
         5 req sealed_at_ms: u64,
+        /// In a transcript directory: the ordinals of the first and last messages the segment
+        /// places. Absent when it places none.
+        6 opt first_ordinal: u64,
+        7 opt last_ordinal: u64,
     }
 }
 
@@ -45,6 +49,9 @@ crate::message! {
         4 req last_seq: u64,
         /// Entries or children the page holds.
         5 req count: u32,
+        /// The ordinal range of the messages the page's segments place, as in [`DirEntry`].
+        6 opt first_ordinal: u64,
+        7 opt last_ordinal: u64,
     }
 }
 
@@ -85,17 +92,29 @@ fn aad(session: &Id128, name: &str) -> Vec<u8> {
 }
 
 fn page_ref(object: String, page: &Page) -> PageRef {
-    let (first_seq, last_seq, count) = if page.level == 0 {
+    // Ordinals increase with seq, so a page's range runs from its first item that places a
+    // message to its last one.
+    let (first_seq, last_seq, count, first_ordinal, last_ordinal) = if page.level == 0 {
         (
             page.entries.first().map_or(0, |entry| entry.first_seq),
             page.entries.last().map_or(0, |entry| entry.last_seq),
             page.entries.len(),
+            page.entries.iter().find_map(|entry| entry.first_ordinal),
+            page.entries
+                .iter()
+                .rev()
+                .find_map(|entry| entry.last_ordinal),
         )
     } else {
         (
             page.children.first().map_or(0, |child| child.first_seq),
             page.children.last().map_or(0, |child| child.last_seq),
             page.children.len(),
+            page.children.iter().find_map(|child| child.first_ordinal),
+            page.children
+                .iter()
+                .rev()
+                .find_map(|child| child.last_ordinal),
         )
     };
     PageRef {
@@ -104,7 +123,16 @@ fn page_ref(object: String, page: &Page) -> PageRef {
         first_seq,
         last_seq,
         count: count as u32,
+        first_ordinal,
+        last_ordinal,
     }
+}
+
+/// Whether an item whose messages span `first..=last` holds `ordinal`.
+fn holds_ordinal(first: Option<u64>, last: Option<u64>, ordinal: u64) -> bool {
+    first
+        .zip(last)
+        .is_some_and(|(first, last)| first <= ordinal && ordinal <= last)
 }
 
 /// Reads and writes one session's directory pages.
@@ -266,6 +294,34 @@ impl<B: SessionBackend> Pages<'_, B> {
                 .map(|(page, _)| page.object.clone())
                 .collect(),
         })
+    }
+
+    /// The entry whose segment places the message with `ordinal`, if any.
+    pub async fn find_ordinal(
+        &self,
+        root: Option<&PageRef>,
+        ordinal: u64,
+    ) -> Result<Option<DirEntry>, DirectoryError> {
+        let Some(root) = root else {
+            return Ok(None);
+        };
+        let mut page = self.read(root).await?;
+        loop {
+            if page.level == 0 {
+                return Ok(page.entries.into_iter().find(|entry| {
+                    holds_ordinal(entry.first_ordinal, entry.last_ordinal, ordinal)
+                }));
+            }
+            let Some(child) = page
+                .children
+                .iter()
+                .find(|child| holds_ordinal(child.first_ordinal, child.last_ordinal, ordinal))
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            page = self.read(&child).await?;
+        }
     }
 
     /// The entry whose segment holds `seq`, if any.

@@ -1075,6 +1075,11 @@ struct AppendReport {
     seal_us: Percentiles,
     /// Logs where a cut was sealed; the rest had no run input where a cut may fall.
     cuts: u64,
+    /// Messages read back by ordinal after the seals, every one equal to what was placed, and
+    /// of those, the sealed ones and microseconds per sealed read.
+    read_back: u64,
+    expanded: u64,
+    expand_us: Percentiles,
     /// Setup parts stored across every session of the run, each once, and their bytes on disk
     /// (encrypted).
     setup_parts_stored: u64,
@@ -1119,6 +1124,7 @@ fn run_append(args: &Args) {
     let setup = broca_session_store::setup::SetupStore::new(&setup_backend, &setup_key);
     let mut report = AppendReport::default();
     let mut setup_puts = Vec::new();
+    let mut expands = Vec::new();
     let mut latencies = Vec::new();
     let mut loads = Vec::new();
     let mut seals = Vec::new();
@@ -1163,6 +1169,8 @@ fn run_append(args: &Args) {
                 seals.extend(measured.seal_us);
                 report.cuts += u64::from(measured.cut);
                 setup_puts.extend(measured.setup_put_us);
+                report.read_back += measured.read_back;
+                expands.extend(measured.expand_us);
             }
             Err(e) => report.failures.push(format!("{}: {e}", file.display())),
         }
@@ -1171,6 +1179,8 @@ fn run_append(args: &Args) {
     report.barrier_us = percentiles(latencies);
     report.load_us = percentiles(loads);
     report.seal_us = percentiles(seals);
+    report.expanded = expands.len() as u64;
+    report.expand_us = percentiles(expands);
     report.setup_parts_written = setup_puts.len() as u64;
     report.setup_put_us = percentiles(setup_puts);
     if let Ok(entries) = std::fs::read_dir(setup_root.join("setup")) {
@@ -1296,6 +1306,7 @@ fn run_seal(args: &Args) {
             prefixes: Vec::new(),
             leading: None,
             trailer: None,
+            placed_before: Vec::new(),
         };
         report.logs += 1;
         report.today_bytes += size;
