@@ -1,9 +1,15 @@
-//! `session-convert measure <path>...`: converts every session log under the given files or
-//! folders in memory, writes nothing, and reports what the new format would store, how long
-//! each log takes to load, and what its history would cost sealed.
+//! Paths may name session logs (`.wal`), WAL archive containers (`.ark`), or folders of either.
+//! An archived log is written to a scratch file under `--dir` (or the system temporary folder)
+//! and read back with the ordinary log reader.
 //!
-//! `session-convert archive --dir <scratch> <path>...`: the same measurement over the session
-//! logs stored inside WAL archive containers (`.ark`).
+//! `session-convert measure <path>...`: converts every session log in memory, writes nothing,
+//! and reports what the new format would store, and how long each log takes to load. It also
+//! reports the size of each log *sealed*: its records compressed with zstd in 16 KiB blocks and
+//! encrypted, which is how the new format stores history no longer being appended to.
+//!
+//! `session-convert check <path>...`: converts every session log, rebuilds today's records from
+//! the new ones, and compares them with the originals. A log passes when every record comes back
+//! exactly; differences are reported by record type and key path, never by value.
 //!
 //! `session-convert append --dir <scratch> [--sample N] <path>...`: replays a sample of logs
 //! through real barrier writes into files under `--dir`, then removes them, and reports barrier
@@ -16,6 +22,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use broca_session_convert::inverse::{comparable, first_difference, invert, without_nulls};
 use broca_session_convert::measure::{append_log, measure};
 use broca_session_convert::{convert, Tally};
 use broca_session_store::codec::Digest;
@@ -104,12 +111,13 @@ fn percentiles(mut values: Vec<u64>) -> Percentiles {
     }
 }
 
-fn collect(path: &Path, extension: &str, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+/// Session logs (`.wal`) and archive containers (`.ark`) under `path`, or `path` itself.
+fn collect(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     if path.is_dir() {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let child = entry.path();
-            if child.is_file() && child.extension().is_some_and(|e| e == extension) {
+            if child.is_file() && child.extension().is_some_and(|e| e == "wal" || e == "ark") {
                 out.push(child);
             }
         }
@@ -121,8 +129,8 @@ fn collect(path: &Path, extension: &str, out: &mut Vec<PathBuf>) -> std::io::Res
 
 fn usage() -> ! {
     eprintln!(
-        "usage: session-convert measure [--out FILE] [--limit N] PATH...\n       \
-         session-convert archive --dir SCRATCH [--out FILE] [--limit N] PATH...\n       \
+        "usage: session-convert measure [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
+         session-convert check [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert append --dir SCRATCH [--sample N] [--out FILE] PATH..."
     );
     std::process::exit(64);
@@ -165,14 +173,8 @@ fn parse_args() -> Args {
             _ => paths.push(PathBuf::from(arg)),
         }
     }
-    // Archive containers are `.ark` files; everything else measures session logs.
-    let extension = if parsed.command == "archive" {
-        "ark"
-    } else {
-        "wal"
-    };
     for path in &paths {
-        if let Err(e) = collect(path, extension, &mut parsed.files) {
+        if let Err(e) = collect(path, &mut parsed.files) {
             eprintln!("{}: {e}", path.display());
             std::process::exit(1);
         }
@@ -181,7 +183,7 @@ fn parse_args() -> Args {
     parsed.files.truncate(parsed.limit);
     if parsed.files.is_empty() {
         // A measurement over nothing must not look like a measurement of nothing to store.
-        eprintln!("no .{extension} files found under the given paths");
+        eprintln!("no .wal or .ark files found under the given paths");
         std::process::exit(2);
     }
     parsed
@@ -201,11 +203,76 @@ fn write_report<T: Serialize>(report: &T, out_file: Option<&Path>) {
 fn main() {
     let args = parse_args();
     match args.command.as_str() {
+        "check" => run_check(&args),
         "measure" => run_measure(&args),
-        "archive" => run_archive(&args),
         "append" => run_append(&args),
         _ => usage(),
     }
+}
+
+#[derive(Default, Serialize)]
+struct CheckReport {
+    logs: u64,
+    /// Logs whose every record rebuilds exactly from the new records.
+    exact: u64,
+    records: u64,
+    /// The first difference of each mismatching log, by old record type and path. Paths name
+    /// keys only, never values.
+    mismatches: BTreeMap<String, u64>,
+    /// Logs that failed to read, convert or rebuild, with the reason.
+    failures: BTreeMap<String, u64>,
+}
+
+/// Converts each log, rebuilds today's records from the new ones, and compares them with the
+/// original, record by record: the proof that a conversion keeps everything.
+fn run_check(args: &Args) {
+    let mut report = CheckReport::default();
+    each_log(args, |item| {
+        let Item::Log { old, .. } = item else {
+            return;
+        };
+        report.logs += 1;
+        let old = match old {
+            Ok(old) => old,
+            Err(e) => {
+                *report.failures.entry(e).or_default() += 1;
+                return;
+            }
+        };
+        let converted = match convert(&old) {
+            Ok(converted) => converted,
+            Err(e) => {
+                *report.failures.entry(format!("convert: {e}")).or_default() += 1;
+                return;
+            }
+        };
+        let rebuilt = match invert(&converted.records, &converted.parts) {
+            Ok(rebuilt) => rebuilt,
+            Err(e) => {
+                *report.failures.entry(format!("rebuild: {e}")).or_default() += 1;
+                return;
+            }
+        };
+        let original = comparable(&old);
+        report.records += original.len() as u64;
+        if original.len() != rebuilt.len() {
+            let count = format!("record count {} against {}", original.len(), rebuilt.len());
+            *report.mismatches.entry(count).or_default() += 1;
+            return;
+        }
+        let difference = original.iter().zip(&rebuilt).find_map(|(a, b)| {
+            let b = without_nulls(b);
+            first_difference(a, &b, "").map(|path| {
+                let kind = a.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                format!("{kind}{path}")
+            })
+        });
+        match difference {
+            None => report.exact += 1,
+            Some(path) => *report.mismatches.entry(path).or_default() += 1,
+        }
+    });
+    write_report(&report, args.out_file.as_deref());
 }
 
 /// Accumulates one report over many logs.
@@ -329,104 +396,151 @@ impl Measuring {
 
 fn run_measure(args: &Args) {
     let mut measuring = Measuring::new();
+    each_log(args, |item| match item {
+        Item::Log {
+            name,
+            size,
+            old: Ok(old),
+            read_ms,
+        } => {
+            measuring.report.read_ms += read_ms;
+            measuring.log(&name, size, &old);
+        }
+        Item::Log {
+            name, old: Err(e), ..
+        } => measuring.fail(&name, e),
+        Item::Note(label, note) => measuring.report.errors.push((label, note)),
+    });
+    measuring.finish(args.out_file.as_deref());
+}
+
+/// One log to measure or check, or a note about how a container was read.
+enum Item {
+    Log {
+        name: String,
+        /// Its size as stored today.
+        size: u64,
+        old: Result<Vec<FramedRecord>, String>,
+        read_ms: u128,
+    },
+    Note(String, String),
+}
+
+/// Visits every session log under the given paths: `.wal` files directly, and the members of
+/// `.ark` WAL archive containers. A member is written to a scratch file (under `--dir`, or the
+/// system temporary folder), read back with the ordinary log reader, and removed.
+fn each_log(args: &Args, mut visit: impl FnMut(Item)) {
+    let dir = args.dir.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("session-convert-{}", std::process::id()))
+    });
+    let scratch = dir.join("member.wal");
+    let mut members_seen = 0u64;
+    let mut addresses = std::collections::BTreeSet::new();
+    let read = |path: &Path| {
+        let started = Instant::now();
+        let old = broca_wal::replay_file(path, u64::MAX).map_err(|e| format!("read: {e}"));
+        (old, started.elapsed().as_millis())
+    };
     for (index, file) in args.files.iter().enumerate() {
         if index % 1000 == 0 {
             eprintln!("{index}/{}", args.files.len());
         }
-        let name = file
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-        let started = Instant::now();
-        match broca_wal::replay_file(file, u64::MAX) {
-            Ok(old) => {
-                measuring.report.read_ms += started.elapsed().as_millis();
-                measuring.log(&name, size, &old);
-            }
-            Err(e) => measuring.fail(&name, format!("read: {e}")),
+        let label = file.display().to_string();
+        if file.extension().is_some_and(|e| e == "wal") {
+            let name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+            let (old, read_ms) = read(file);
+            visit(Item::Log {
+                name,
+                size,
+                old,
+                read_ms,
+            });
+            continue;
         }
-    }
-    measuring.finish(args.out_file.as_deref());
-}
-
-/// Archive containers hold whole session logs as members. Each member is written to a scratch
-/// file under `--dir`, read back with the ordinary log reader, measured, and removed.
-fn run_archive(args: &Args) {
-    let dir = args.dir.clone().unwrap_or_else(|| usage());
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
-        eprintln!("{}: {e}", dir.display());
-        std::process::exit(1);
-    });
-    let scratch = dir.join("member.wal");
-    let mut measuring = Measuring::new();
-    let mut members_seen = 0u64;
-    let mut addresses = std::collections::BTreeSet::new();
-    for container in &args.files {
-        let label = container.display().to_string();
-        let mut reader = match broca_wal::archive::ArchiveReader::open(container, u64::MAX) {
+        let refused = |reason: String| Item::Log {
+            name: label.clone(),
+            size: 0,
+            old: Err(reason),
+            read_ms: 0,
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            visit(refused(format!("scratch folder: {e}")));
+            continue;
+        }
+        let mut reader = match broca_wal::archive::ArchiveReader::open(file, u64::MAX) {
             Ok(reader) => reader,
             Err(e) => {
-                measuring.fail(&label, format!("open container: {e}"));
+                visit(refused(format!("open container: {e}")));
                 continue;
             }
         };
         // A verified index names every member; without one, a header walk stops at the first
-        // damaged member, so report that the container was read that way.
+        // damaged member, so the note says the container was read that way.
         let members: Vec<String> = match reader.verified_members() {
             Ok(Some(members)) => members.into_iter().map(|m| m.session_addr).collect(),
             Ok(None) | Err(_) => match reader.rescan() {
                 Ok(members) => {
-                    measuring.report.errors.push((
+                    visit(Item::Note(
                         label.clone(),
                         "no verified index; read by header walk".into(),
                     ));
                     members.into_iter().map(|m| m.session_addr).collect()
                 }
                 Err(e) => {
-                    measuring.fail(&label, format!("list members: {e}"));
+                    visit(refused(format!("list members: {e}")));
                     continue;
                 }
             },
         };
-        eprintln!("{label}: {} members", members.len());
         for addr in members {
             members_seen += 1;
             addresses.insert(addr.clone());
             let name = format!("{label}#{addr}");
-            let member = match reader.read_member(&addr) {
-                Ok(Some(member)) => member,
-                Ok(None) => {
-                    measuring.fail(&name, "listed member not found".into());
-                    continue;
-                }
-                Err(e) => {
-                    measuring.fail(&name, format!("read member: {e}"));
-                    continue;
-                }
+            let item = match reader.read_member(&addr) {
+                Ok(Some(member)) => match std::fs::write(&scratch, &member.payload) {
+                    Ok(()) => {
+                        let (old, read_ms) = read(&scratch);
+                        Item::Log {
+                            name,
+                            size: member.payload.len() as u64,
+                            old,
+                            read_ms,
+                        }
+                    }
+                    Err(e) => Item::Log {
+                        name,
+                        size: 0,
+                        old: Err(format!("scratch write: {e}")),
+                        read_ms: 0,
+                    },
+                },
+                Ok(None) => Item::Log {
+                    name,
+                    size: 0,
+                    old: Err("listed member not found".into()),
+                    read_ms: 0,
+                },
+                Err(e) => Item::Log {
+                    name,
+                    size: 0,
+                    old: Err(format!("read member: {e}")),
+                    read_ms: 0,
+                },
             };
-            let size = member.payload.len() as u64;
-            let started = Instant::now();
-            let old = std::fs::write(&scratch, &member.payload)
-                .map_err(|e| e.to_string())
-                .and_then(|()| {
-                    broca_wal::replay_file(&scratch, u64::MAX).map_err(|e| e.to_string())
-                });
-            match old {
-                Ok(old) => {
-                    measuring.report.read_ms += started.elapsed().as_millis();
-                    measuring.log(&name, size, &old);
-                }
-                Err(e) => measuring.fail(&name, format!("read: {e}")),
-            }
+            visit(item);
         }
     }
     let _ = std::fs::remove_file(&scratch);
-    eprintln!(
-        "{members_seen} members, {} distinct session addresses",
-        addresses.len()
-    );
-    measuring.finish(args.out_file.as_deref());
+    if members_seen > 0 {
+        eprintln!(
+            "{members_seen} archived logs, {} distinct session addresses",
+            addresses.len()
+        );
+    }
 }
 
 #[derive(Default, Serialize)]

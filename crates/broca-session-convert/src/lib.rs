@@ -30,6 +30,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
+pub mod inverse;
 pub mod measure;
 
 /// A count of old records, fields or values, and their stored JSON size.
@@ -150,6 +151,11 @@ impl Fields {
 
     fn take(&mut self, key: &str) -> Option<Value> {
         self.object.remove(key).filter(|v| !v.is_null())
+    }
+
+    /// A field's value, left in place for whatever carries the rest of the record.
+    fn peek(&self, key: &str) -> Option<&Value> {
+        self.object.get(key).filter(|v| !v.is_null())
     }
 
     fn u64(&mut self, key: &str) -> Option<u64> {
@@ -293,9 +299,15 @@ fn convert_one(
             }));
         }
         "steered" => {
-            let written = f.u64("written_at_ms");
             let input: Vec<Message> = f.parse("input")?.unwrap_or_default();
-            let tags = f.take("tags");
+            // When the steer has messages, its `written_at_ms` and `tags` move onto their input
+            // records; otherwise they stay in the steer's ledger event.
+            let written = if input.is_empty() {
+                None
+            } else {
+                f.u64("written_at_ms")
+            };
+            let tags = per_message_tags(&mut f, input.len());
             for (index, message) in input.into_iter().enumerate() {
                 out.records.push(Record::Input(Input {
                     run_id: state.run_id.clone(),
@@ -308,7 +320,7 @@ fn convert_one(
                 }));
             }
             // The receipt (send id, delivery, retention, sender) is the queue's.
-            event(&mut f, kind.clone(), state, out);
+            event(&mut f, kind.clone(), out);
         }
         "send_delivered" => send_delivered(&mut f, state, out)?,
         "budget_fired" => {
@@ -323,7 +335,7 @@ fn convert_one(
                     tags_v1: f.take("tags"),
                 }));
             }
-            event(&mut f, kind.clone(), state, out);
+            event(&mut f, kind.clone(), out);
         }
         "queued" => queued(&mut f, out)?,
         "session_refresh_accepted" => {
@@ -366,7 +378,7 @@ fn convert_one(
                 finished_at_ms: None,
                 tags_v1: None,
             }));
-            event(&mut f, kind.clone(), state, out);
+            event(&mut f, kind.clone(), out);
         }
         "approval_recorded" => {
             if let Some(result) = f.parse::<ToolResult>("closing_result")? {
@@ -378,13 +390,13 @@ fn convert_one(
                     tags_v1: f.take("tags"),
                 }));
             }
-            event(&mut f, kind.clone(), state, out);
+            event(&mut f, kind.clone(), out);
         }
         "turn_finished" | "visibility_late" => {
             f.rest();
             tally(&mut out.dropped, kind, size);
         }
-        _ => event(&mut f, kind.clone(), state, out),
+        _ => event(&mut f, kind.clone(), out),
     }
     f.finish(out);
     Ok(())
@@ -400,10 +412,9 @@ fn add_part(
     out.part_bytes_per_run += bytes.len() as u64;
     let digest = sha256(&bytes);
     out.parts.entry(digest).or_insert(bytes);
-    let part = PartRef { kind, digest };
-    if !parts.contains(&part) {
-        parts.push(part);
-    }
+    // Kept even when an equal part is already listed: a run's config and its manifest both
+    // name their tools, often identical, and the position says which member a part fills.
+    parts.push(PartRef { kind, digest });
     Ok(())
 }
 
@@ -463,14 +474,29 @@ fn tags_at(tags: &Option<Value>, index: usize) -> Option<Value> {
     }
 }
 
-/// Carries the rest of an old record whole, as a ledger event under its old type name.
-fn event(f: &mut Fields, name: String, state: &State, out: &mut Converted) {
-    let run_id = f
-        .string("run_id")
-        .or_else(|| (!state.run_id.is_empty()).then(|| state.run_id.clone()));
+/// Takes a record's v1 `tags` to spread over its `messages` input messages, one entry each. With
+/// no messages the tags stay on the record; a list of any other length is reported, since it
+/// couldn't be spread back exactly.
+fn per_message_tags(f: &mut Fields, messages: usize) -> Option<Value> {
+    if messages == 0 {
+        return None;
+    }
+    let tags = f.take("tags")?;
+    match &tags {
+        Value::Array(list) if list.len() == messages => Some(tags),
+        other => {
+            f.lose("tags (not one entry per message)".into(), json_len(other));
+            None
+        }
+    }
+}
+
+/// Carries the rest of an old record whole, as a ledger event under its old type name. The run
+/// id is the record's own, never inferred, so the event reads back exactly as written.
+fn event(f: &mut Fields, name: String, out: &mut Converted) {
     out.records.push(Record::Event(Event {
         name,
-        run_id,
+        run_id: f.string("run_id"),
         body: f.rest(),
     }));
 }
@@ -844,20 +870,28 @@ fn tool_no_dispatch(
     Ok(())
 }
 
+/// A queued send placed into a running run. Its delivery facts (submission, mode, run, time)
+/// stay on a ledger event; the placed text becomes transcript entries, which copy the time and
+/// submission, so rebuilding the conversation never needs to read the ledger event.
 fn send_delivered(
     f: &mut Fields,
     state: &mut State,
     out: &mut Converted,
 ) -> Result<(), ConvertError> {
-    let written = f.u64("written_at_ms");
-    let submission = f.string("submission_id");
+    let written = f.peek("written_at_ms").and_then(Value::as_u64);
+    let submission = f
+        .peek("submission_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     // The run it was delivered into is the current one; anything else is reported.
-    let run_id = f.req_string("run_id");
-    if run_id != state.run_id {
-        f.lose("run_id (not the current run)".into(), run_id.len());
+    if f.peek("run_id").and_then(Value::as_str) != Some(state.run_id.as_str()) {
+        f.lose("run_id (not the current run)".into(), 0);
     }
-    let tags = f.take("tags");
-    let mode = f.req_string("mode");
+    let mode = f
+        .peek("mode")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     let placement = match mode.as_str() {
         "steer" => Placement::Delivered,
         "turn_system" => Placement::DeliveredTurnSystem,
@@ -872,6 +906,7 @@ fn send_delivered(
     if mode == "tool_result" && !input.is_empty() {
         f.lose("input (with mode tool_result)".into(), 0);
     }
+    let tags = per_message_tags(f, input.len());
     for (index, message) in input.into_iter().enumerate() {
         out.records.push(Record::Input(Input {
             run_id: state.run_id.clone(),
@@ -883,17 +918,17 @@ fn send_delivered(
             tags_v1: tags_at(&tags, index),
         }));
     }
-    let text = f.string("appended_text");
-    let call: Option<ToolCallId> = f.parse("tool_call_id")?;
-    if let (Some(text), Some(call)) = (text, call) {
+    if f.has("appended_text") && f.has("tool_call_id") {
+        let call: Option<ToolCallId> = f.parse("tool_call_id")?;
         out.records.push(Record::ResultAppend(ResultAppend {
             run_id: state.run_id.clone(),
-            tool_call_id: call,
-            text,
+            tool_call_id: call.expect("checked present"),
+            text: f.req_string("appended_text"),
             notice: None,
             written_at_ms: written,
         }));
     }
+    event(f, "send_delivered".into(), out);
     Ok(())
 }
 

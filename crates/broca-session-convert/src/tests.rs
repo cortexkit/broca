@@ -91,8 +91,9 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
     ));
     assert!(matches!(
         &converted.records[11],
+        // The event names a run only when the old record did.
         Record::Event(event) if event.name == "input_token_cap_frozen"
-            && event.run_id.as_deref() == Some("run-1")
+            && event.run_id.is_none()
             && event.body == Some(serde_json::json!({"limit": 5}))
     ));
     assert!(matches!(
