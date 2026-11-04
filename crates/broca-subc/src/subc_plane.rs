@@ -1006,6 +1006,7 @@ impl SubcToolPlane {
     }
 
     fn with_connection(conn: Arc<dyn ToolPlaneConnection>, module_id: impl Into<String>) -> Self {
+        std::sync::LazyLock::force(&crate::tool_result_diagnostics::TOOL_RESULT_JSON_DUMPS);
         let module_id = module_id.into();
         let default_module_id = (!module_id.trim().is_empty()).then_some(module_id);
         let shared = conn.shared_route_closer();
@@ -1912,6 +1913,13 @@ impl SubcToolPlane {
                     )
                 };
                 let result = tool_capture::capture(ctx, result, captures).await;
+                crate::tool_result_diagnostics::observe_inline_result(
+                    ctx,
+                    call,
+                    module_id,
+                    key.map(|key| key.call_key),
+                    &result,
+                );
                 // Build the fence copy before taking the process-wide guard. Tool payloads can be
                 // large, while the critical section only needs to update the bounded maps.
                 let fenced_result = result.clone();

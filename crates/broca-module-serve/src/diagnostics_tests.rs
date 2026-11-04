@@ -259,6 +259,11 @@ fn scope(owner: BindPrincipal, kind: ScopeKind, flow: bool, authorized: bool) ->
 }
 fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
     Evidence {
+        tool_result_json_dumps: Ok(broca_subc::tool_result_diagnostics::Snapshot {
+            since_ms: NOW - 1000,
+            truncated: false,
+            tools: vec![],
+        }),
         recovery_cuts: Vec::new(),
         runs: store.diagnostic_evidence(since, NOW).unwrap(),
         late_fence_ms: None,
@@ -1105,6 +1110,79 @@ fn vector(name: &str, value: Value) {
         println!("VECTOR {name}\n{bytes}END VECTOR");
     }
     assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
+}
+
+#[test]
+fn tool_result_json_dump_finding_shape() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("diagnostics-json-dump-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
+    let tally = broca_subc::tool_result_diagnostics::Tally::new(NOW - 1000);
+    for offset in 1..=7 {
+        tally.record(
+            NOW - offset,
+            "tools",
+            "search",
+            "sample-session",
+            Some("call-key"),
+            200,
+        );
+    }
+    tally.record(NOW - 8, "other-tools", "search", "other-session", None, 300);
+    let head = scope(principal(), ScopeKind::Head, false, true);
+    let reply = answer(json!({}), Some(&principal()), &head, NOW, |since| {
+        let mut evidence = healthy(&store, since);
+        evidence.tool_result_json_dumps = tally.snapshot(since, NOW);
+        Ok(evidence)
+    })
+    .unwrap();
+    assert_eq!(reply.findings.len(), 2);
+    let f = &reply.findings[0];
+    assert_eq!(f.check, "tool_result_json_dump");
+    assert_eq!(f.key, r#"["tools","search"]"#);
+    assert_eq!(f.severity, Severity::Warn);
+    assert_eq!(
+        (f.count, f.first_seen_ms, f.last_seen_ms),
+        (7, NOW - 7, NOW - 1)
+    );
+    assert_eq!(
+        f.summary,
+        "A tool provider dumped raw JSON into model-visible text."
+    );
+    assert_eq!(f.hint, "The tool provider should shape its output into concise model-facing text instead of dumping raw JSON.");
+    assert_eq!(
+        f.samples,
+        vec![
+            json!({
+                "module_id":"tools", "tool_name":"search", "session":"sample-session",
+                "call_key":"call-key", "text_bytes":200, "coverage_since_ms":NOW - 1000
+            });
+            5
+        ]
+    );
+    assert_eq!(reply.findings[1].count, 1);
+    assert_eq!(reply.findings[1].key, r#"["other-tools","search"]"#);
+    assert!(reply.findings[1].samples[0]["call_key"].is_null());
+    vector("reply-tool-result-json-dump.json", json!({"result":reply}));
+}
+
+#[test]
+fn tool_result_json_dump_unavailable_evidence_is_not_clean() {
+    let root = broca_test_support::scratch_root().join(format!(
+        "diagnostics-json-unavailable-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
+    let mut evidence = healthy(&store, NOW - 1000);
+    evidence.tool_result_json_dumps = Err("poisoned".into());
+    let reply = report(evidence, NOW, 1000);
+    assert_eq!(reply.findings.len(), 1);
+    assert_eq!(reply.findings[0].check, "tool_result_json_dump");
+    assert_eq!(reply.findings[0].key, "evidence_unavailable");
+    assert_eq!(reply.findings[0].severity, Severity::Error);
 }
 
 #[test]

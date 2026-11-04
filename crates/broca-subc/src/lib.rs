@@ -38,6 +38,7 @@ pub mod session_door;
 pub mod subc_plane;
 pub mod tcp_connect;
 pub mod tool_deadline;
+pub mod tool_result_diagnostics;
 pub mod vault;
 
 pub use compaction_plane::SubcCompactionPlane;
