@@ -3822,9 +3822,13 @@ const REQUIRED_SCOPE_DISPLAY_MEDIA_CASES: &[&str] = &[
 
 fn fixture_outcome_matches(name: &str, outcome: &CaseOutcome) -> bool {
     let reason = match name {
-        // Both groups are declared, so these undeclared-feature questions do not apply.
-        "sender_succession_undeclared_refused" | "read_display_facts_undeclared_refused" => {
-            Some("describe groups do not support this question")
+        // Both groups are declared, so these undeclared-feature questions do not apply. Kit
+        // 0.17.6 names the declared group in its reason.
+        "sender_succession_undeclared_refused" => {
+            Some("the subject declares every one of sender_succession, so none is left to refuse")
+        }
+        "read_display_facts_undeclared_refused" => {
+            Some("the subject declares every one of read_display_facts, so none is left to refuse")
         }
         // The native fixture has no controlled delivery clock; this is not a retry failure.
         "delivery_deadline_retry_keeps_original_expiry" => {
@@ -6584,11 +6588,11 @@ fn fixture_exclusions_reject_unrelated_inapplicability_and_any_failure() {
         ),
         (
             "sender_succession_undeclared_refused",
-            "describe groups do not support this question",
+            "the subject declares every one of sender_succession, so none is left to refuse",
         ),
         (
             "read_display_facts_undeclared_refused",
-            "describe groups do not support this question",
+            "the subject declares every one of read_display_facts, so none is left to refuse",
         ),
         (
             "delivery_deadline_retry_keeps_original_expiry",
