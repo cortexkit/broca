@@ -43,15 +43,17 @@ const NOT_FOLDED: &[&str] = &[
     "tool_call_deferred",
 ];
 
-/// One planned call of an open tool batch, with what the ledger recorded about it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Call {
-    pub id: ToolCallId,
-    /// A dispatch intent was recorded: the call may have left.
-    pub intent: bool,
-    /// A provider took the call to answer later; `Some(true)` when later calls wait for it.
-    pub held: Option<bool>,
-    pub terminal: Option<CallOutcome>,
+crate::message! {
+    /// One planned call of an open tool batch, with what the ledger recorded about it.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Call {
+        1 req id: ToolCallId,
+        /// A dispatch intent was recorded: the call may have left.
+        2 req intent: bool,
+        /// A provider took the call to answer later; `Some(true)` when later calls wait for it.
+        3 opt held: bool,
+        4 opt terminal: CallOutcome,
+    }
 }
 
 /// What a resume may do with one call of an open batch.
@@ -73,9 +75,9 @@ state! {
     /// A tool batch whose calls don't all have outcomes yet.
     #[derive(Debug, Clone, PartialEq)]
     pub struct OpenBatch {
-        pub batch_id: String => { owner: "tool router", reset: "batch_start", bound: Bound::Fixed },
-        pub step_id: u64 => { owner: "tool router", reset: "batch_start", bound: Bound::Fixed },
-        pub calls: Vec<Call> => {
+        1 req pub batch_id: String => { owner: "tool router", reset: "batch_start", bound: Bound::Fixed },
+        2 req pub step_id: u64 => { owner: "tool router", reset: "batch_start", bound: Bound::Fixed },
+        3 rep pub calls: Call => {
             owner: "tool router",
             reset: "batch_start",
             bound: Bound::OpenWork("one step's tool calls"),
@@ -155,13 +157,18 @@ impl OpenBatch {
     }
 }
 
-/// A step that made no tool call, which ends the run unless a steer extends it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NaturalEnd {
-    /// `Completed` when one of the run's stop conditions was met.
-    pub stop: Option<RunFinishReason>,
-    /// Whether a steer that arrived during the step makes the run take one more step.
-    pub extendable: bool,
+crate::message! {
+    /// A step that made no tool call, which ends the run unless a steer extends it. A steer is a
+    /// message a caller sent into the running run; it reaches the conversation at the next step
+    /// boundary.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct NaturalEnd {
+        /// `Completed` when one of the run's stop conditions was met.
+        1 opt stop: RunFinishReason,
+        /// Whether a steered message that arrived during the step makes the run take one more
+        /// step.
+        2 req extendable: bool,
+    }
 }
 
 state! {
@@ -169,14 +176,14 @@ state! {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct Budget {
         /// The nudges that fired, by their index in the run's frozen budget.
-        pub nudges_fired: Vec<u64> => {
+        1 rep pub nudges_fired: u64 => {
             owner: "run loop",
             reset: "run_start",
             bound: Bound::Config("the frozen budget's nudge list"),
         },
-        pub finalize_fired: bool => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+        2 req pub finalize_fired: bool => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
         /// The finalize firing asked for one last step, and it hasn't happened yet.
-        pub finalize_pending: bool => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+        3 req pub finalize_pending: bool => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
     }
 }
 
@@ -184,88 +191,88 @@ state! {
     /// The latest run.
     #[derive(Debug, Clone, PartialEq)]
     pub struct Run {
-        pub run_id: String => { owner: "admission", reset: "run_start", bound: Bound::Fixed },
-        pub finished: Option<RunFinishReason> => {
+        1 req pub run_id: String => { owner: "admission", reset: "run_start", bound: Bound::Fixed },
+        2 opt pub finished: RunFinishReason => {
             owner: "run loop",
             reset: "run_start",
             bound: Bound::Fixed,
         },
-        pub paused: Option<PauseReason> => {
+        3 opt pub paused: PauseReason => {
             owner: "run loop",
             reset: "run_start",
             bound: Bound::Fixed,
         },
         /// Seeded from an import or fork: it never calls a provider.
-        pub seeded: bool => { owner: "admission", reset: "run_start", bound: Bound::Fixed },
-        pub completed_steps: u64 => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
-        pub tool_call_count: u64 => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
-        pub usage: Usage => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
-        pub retries_used: u32 => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
-        pub last_finish_reason: Option<FinishReason> => {
+        4 req pub seeded: bool => { owner: "admission", reset: "run_start", bound: Bound::Fixed },
+        5 req pub completed_steps: u64 => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+        6 req pub tool_call_count: u64 => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+        7 req pub usage: Usage => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+        8 req pub retries_used: u32 => { owner: "run loop", reset: "run_start", bound: Bound::Fixed },
+        9 opt pub last_finish_reason: FinishReason => {
             owner: "run loop",
             reset: "run_start",
             bound: Bound::Fixed,
         },
-        pub natural_end: Option<NaturalEnd> => {
+        10 opt pub natural_end: NaturalEnd => {
             owner: "run loop",
             reset: "step_start",
             bound: Bound::Fixed,
         },
-        pub open_batch: Option<OpenBatch> => {
+        11 opt pub open_batch: OpenBatch => {
             owner: "tool router",
             reset: "batch_end",
             bound: Bound::OpenWork("one step's tool calls"),
         },
         /// Calls whose outcome is unknown, from closed batches.
-        pub unknown: Vec<ToolCallId> => {
+        12 rep pub unknown: ToolCallId => {
             owner: "tool router",
             reset: "run_start",
             bound: Bound::PerRun("one step's tool calls"),
         },
         /// Set when a closed batch was all stop-limit outcomes.
-        pub hard_stopped: Option<RunFinishReason> => {
+        13 opt pub hard_stopped: RunFinishReason => {
             owner: "run loop",
             reset: "run_start",
             bound: Bound::Fixed,
         },
         /// Steered or delivered messages waiting for a step boundary.
-        pub pending_steers: usize => {
+        14 req pub pending_steers: usize => {
             owner: "queue",
             reset: "step_start",
             bound: Bound::Fixed,
         },
-        pub cancel: Option<CancelPoint> => {
+        15 opt pub cancel: CancelPoint => {
             owner: "admission",
             reset: "run_start",
             bound: Bound::Fixed,
         },
-        pub budget: Budget => { owner: "run loop", reset: "run_start", bound: Bound::Declared },
+        16 req pub budget: Budget => { owner: "run loop", reset: "run_start", bound: Bound::Declared },
         /// The whole usage of the latest completed step.
-        pub last_step_usage: Option<Usage> => {
+        17 opt pub last_step_usage: Usage => {
             owner: "run loop",
             reset: "run_start",
             bound: Bound::Fixed,
         },
         /// A step started, so a provider was attempted even if no step finished.
-        pub provider_call_started: bool => {
+        18 req pub provider_call_started: bool => {
             owner: "run loop",
             reset: "run_start",
             bound: Bound::Fixed,
         },
         /// Owned by the run loop: why and until when a pause for an account limit waits. Cleared
         /// when the run continues or ends.
-        pub account_limit_pause: Option<serde_json::Value> => {
+        19 opt pub account_limit_pause: serde_json::Value => {
             owner: "run loop",
             reset: "step_start",
             bound: Bound::Fixed,
         },
         /// Owned by admission: the run's keep-warm and restart policies, as frozen.
-        pub keep_warm: Option<serde_json::Value> => {
+        20 opt pub keep_warm: serde_json::Value => {
             owner: "admission",
             reset: "run_start",
             bound: Bound::Fixed,
         },
-        pub on_restart: Option<serde_json::Value> => {
+        21 opt pub on_restart: serde_json::Value => {
             owner: "admission",
             reset: "run_start",
             bound: Bound::Fixed,
@@ -389,19 +396,32 @@ impl Run {
     }
 }
 
-/// A compaction view, by its version and checksum.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ViewSlot {
-    pub version: u64,
-    pub checksum: String,
+crate::message! {
+    /// A compaction view, by its version and checksum.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ViewSlot {
+        1 req version: u64,
+        2 req checksum: String,
+    }
 }
 
-/// One send waiting in the queue.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pending {
-    pub submission_id: String,
-    /// Queued by an interrupting send: it drains ahead of every plain send.
-    pub interrupt: bool,
+crate::message! {
+    /// The view a step rendered with.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AppliedView {
+        1 req step_id: u64,
+        2 req view: ViewSlot,
+    }
+}
+
+crate::message! {
+    /// One send waiting in the queue.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Pending {
+        1 req submission_id: String,
+        /// Queued by an interrupting send: it drains ahead of every plain send.
+        2 req interrupt: bool,
+    }
 }
 
 state! {
@@ -409,34 +429,34 @@ state! {
     #[derive(Debug, Clone, Default)]
     pub struct Operations {
         /// Only the latest run: an earlier run's state is replaced when the next one starts.
-        pub run: Option<Run> => {
+        1 opt pub run: Run => {
             owner: "run loop",
             reset: "run_start",
             bound: Bound::Declared,
         },
         /// Owned by the run loop: the refusal-fallback schedule. Session-scoped: each run start
         /// records the schedule it starts with, and steps record its changes.
-        pub refusal_schedule: Option<serde_json::Value> => {
+        2 opt pub refusal_schedule: serde_json::Value => {
             owner: "run loop",
             reset: "run_start",
             bound: Bound::Fixed,
         },
         /// Sends waiting to run or to be delivered, in drain order: interrupts first, then
         /// plain sends, each in the order they were queued.
-        pub queue: Vec<Pending> => {
+        3 rep pub queue: Pending => {
             owner: "queue",
             reset: "never",
             bound: Bound::OpenWork("sends waiting to run"),
         },
         /// The newest compaction view the provider handed over, which applies at the next step
         /// boundary, as its version and checksum. Its edits stay in its record.
-        pub view_accepted: Option<ViewSlot> => {
+        4 opt pub view_accepted: ViewSlot => {
             owner: "compaction",
             reset: "never",
             bound: Bound::Fixed,
         },
         /// The view the latest step rendered with, and that step.
-        pub view_applied: Option<(u64, ViewSlot)> => {
+        5 opt pub view_applied: AppliedView => {
             owner: "compaction",
             reset: "never",
             bound: Bound::Fixed,
@@ -489,13 +509,13 @@ impl Operations {
                 });
             }
             Record::ViewApplied(applied) => {
-                self.view_applied = Some((
-                    applied.step_id,
-                    ViewSlot {
+                self.view_applied = Some(AppliedView {
+                    step_id: applied.step_id,
+                    view: ViewSlot {
                         version: applied.version,
                         checksum: applied.checksum.clone(),
                     },
-                ));
+                });
             }
             _ => {}
         }

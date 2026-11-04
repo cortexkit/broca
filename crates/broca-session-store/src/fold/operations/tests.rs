@@ -330,7 +330,7 @@ fn the_queue_drains_interrupts_first_and_drops_consumed_and_retracted_sends() {
 /// An accepted view doesn't replace the applied one until a step applies it.
 #[test]
 fn an_accepted_view_waits_for_a_step_to_apply_it() {
-    use super::ViewSlot;
+    use super::{AppliedView, ViewSlot};
     let view = |version: u64| {
         Record::View(crate::record::View {
             version,
@@ -353,13 +353,13 @@ fn an_accepted_view_waits_for_a_step_to_apply_it() {
     );
     assert_eq!(
         operations.view_applied,
-        Some((
-            1,
-            ViewSlot {
+        Some(AppliedView {
+            step_id: 1,
+            view: ViewSlot {
                 version: 1,
                 checksum: "c1".into()
             }
-        ))
+        })
     );
 }
 

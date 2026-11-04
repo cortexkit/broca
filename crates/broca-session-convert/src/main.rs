@@ -15,6 +15,10 @@
 //! through real barrier writes into files under `--dir`, then removes them, and reports barrier
 //! latency.
 //!
+//! `session-convert split <path>...`: converts every session log and checks that loading from a
+//! checkpoint gives the state folding the whole log gives: at every split point of a short log,
+//! and at its ends and 8 points between them for a longer one.
+//!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
 
@@ -24,6 +28,7 @@ use std::time::Instant;
 
 use broca_session_convert::inverse::{comparable, first_difference, invert, without_nulls};
 use broca_session_convert::measure::{append_log, measure};
+use broca_session_convert::split::{check_splits, split_points};
 use broca_session_convert::{convert, Tally};
 use broca_session_store::codec::Digest;
 use broca_session_store::fold::conversation::Conversation;
@@ -133,7 +138,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: session-convert measure [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert check [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
-         session-convert append --dir SCRATCH [--sample N] [--out FILE] PATH..."
+         session-convert append --dir SCRATCH [--sample N] [--out FILE] PATH...\n       \
+         session-convert split [--dir SCRATCH] [--out FILE] [--limit N] PATH..."
     );
     std::process::exit(64);
 }
@@ -228,6 +234,7 @@ fn main() {
         "ops" => run_ops(&args),
         "measure" => run_measure(&args),
         "append" => run_append(&args),
+        "split" => run_split(&args),
         _ => usage(),
     }
 }
@@ -1128,5 +1135,54 @@ fn run_append(args: &Args) {
     }
     report.barrier_us = percentiles(latencies);
     report.load_us = percentiles(loads);
+    write_report(&report, args.out_file.as_deref());
+}
+
+#[derive(Default, Serialize)]
+struct SplitReport {
+    logs: u64,
+    points: u64,
+    /// Logs with a split point where loading from the checkpoint gave a different state.
+    differing_logs: u64,
+    differing_points: u64,
+    /// Logs a fold refuses, by the first part of the reason; they aren't split.
+    refused: BTreeMap<String, u64>,
+    examples: Vec<String>,
+}
+
+fn run_split(args: &Args) {
+    let mut report = SplitReport::default();
+    each_log(args, |item| {
+        let Item::Log {
+            name, old: Ok(old), ..
+        } = item
+        else {
+            return;
+        };
+        let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
+        let appends_in_conversation = !broca_core::is_mode3_log(&records);
+        let Ok(converted) = convert(&old) else {
+            *report.refused.entry("convert".into()).or_default() += 1;
+            return;
+        };
+        let points = split_points(converted.records.len(), 64, 8);
+        match check_splits(&converted.records, appends_in_conversation, &points) {
+            Ok(check) => {
+                report.logs += 1;
+                report.points += check.points;
+                if !check.differing.is_empty() {
+                    report.differing_logs += 1;
+                    report.differing_points += check.differing.len() as u64;
+                    if report.examples.len() < 10 {
+                        report.examples.push(name);
+                    }
+                }
+            }
+            Err(e) => {
+                let key = e.split('(').next().unwrap_or_default().to_owned();
+                *report.refused.entry(key).or_default() += 1;
+            }
+        }
+    });
     write_report(&report, args.out_file.as_deref());
 }

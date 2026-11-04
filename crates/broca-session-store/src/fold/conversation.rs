@@ -10,8 +10,6 @@
 //! Compaction and setup records don't change the conversation. A compaction view is applied when
 //! a request is rendered, never to the conversation itself.
 
-use std::collections::HashMap;
-
 use broca_protocol::content::{ContentBlock, Message, Role, ToolResult};
 use broca_protocol::ids::ToolCallId;
 
@@ -35,13 +33,17 @@ pub enum FoldError {
     AssistantInsideToolTurn,
 }
 
-/// An assistant message that called tools, held until each call has its reply.
-#[derive(Debug, Clone)]
-struct ToolTurn {
-    assistant: Message,
-    /// The calls in the order the assistant made them.
-    calls: Vec<ToolCallId>,
-    replies: HashMap<ToolCallId, ToolResult>,
+crate::message! {
+    /// An assistant message that called tools, held until each call has its reply.
+    #[derive(Debug, Clone)]
+    struct ToolTurn {
+        1 req assistant: Message,
+        /// The calls in the order the assistant made them.
+        2 rep calls: ToolCallId,
+        /// The replies in the order they arrived. A turn holds one step's calls, so finding
+        /// one by its call id is a short scan.
+        3 rep replies: ToolResult,
+    }
 }
 
 state! {
@@ -51,12 +53,12 @@ state! {
         /// The messages in conversation order. An assistant message whose calls aren't all
         /// answered isn't here yet. In a stored session this starts at the open log's
         /// checkpoint, so it holds the active window, never the whole history.
-        pub messages: Vec<Message> => {
+        1 rep pub messages: Message => {
             owner: "run loop",
             reset: "never",
             bound: Bound::Window,
         },
-        open: Option<ToolTurn> => {
+        2 opt open: ToolTurn => {
             owner: "run loop",
             reset: "tool replies",
             bound: Bound::OpenWork("one assistant message's tool calls"),
@@ -65,14 +67,14 @@ state! {
         /// conversation. Sessions on the first compaction protocol stored it that way; sessions
         /// on the current contract keep the result as returned and add the text when a request
         /// renders.
-        appends_in_conversation: bool => {
+        3 req appends_in_conversation: bool => {
             owner: "admission",
             reset: "never",
             bound: Bound::Fixed,
         },
         /// The latest compaction marker: where the provider's cut falls. Requests render from
         /// its first kept entry.
-        pub marker: Option<Marker> => {
+        4 opt pub marker: Marker => {
             owner: "compaction",
             reset: "never",
             bound: Bound::Fixed,
@@ -140,7 +142,7 @@ impl Conversation {
                     self.open = Some(ToolTurn {
                         assistant: assistant.message.clone(),
                         calls,
-                        replies: HashMap::new(),
+                        replies: Vec::new(),
                     });
                 }
             }
@@ -149,22 +151,22 @@ impl Conversation {
                 let Some(turn) = self.open.as_mut().filter(|turn| turn.calls.contains(id)) else {
                     return Err(FoldError::ReplyWithoutCall(id.0.clone()));
                 };
-                if turn
-                    .replies
-                    .insert(id.clone(), reply.result.clone())
-                    .is_some()
-                {
+                if turn.replies.iter().any(|known| &known.tool_call_id == id) {
                     return Err(FoldError::SecondReply(id.0.clone()));
                 }
+                turn.replies.push(reply.result.clone());
                 if turn.replies.len() == turn.calls.len() {
                     let mut turn = self.open.take().expect("checked above");
                     let results = turn
                         .calls
                         .iter()
                         .map(|id| {
-                            ContentBlock::ToolResult(
-                                turn.replies.remove(id).expect("every call has a reply"),
-                            )
+                            let at = turn
+                                .replies
+                                .iter()
+                                .position(|reply| &reply.tool_call_id == id)
+                                .expect("every call has a reply");
+                            ContentBlock::ToolResult(turn.replies.swap_remove(at))
                         })
                         .collect();
                     self.messages.push(turn.assistant);

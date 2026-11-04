@@ -34,6 +34,7 @@ use sha2::{Digest as _, Sha256};
 
 pub mod inverse;
 pub mod measure;
+pub mod split;
 
 /// A count of old records, fields or values, and their stored JSON size.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]

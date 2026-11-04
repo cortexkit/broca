@@ -15,7 +15,9 @@
 //! - `frame`: how one record sits in an open log, encrypted.
 //! - `fold`: rebuilding a session's state from its records, one fold per stream.
 //! - `log`: the open log, written in all-or-nothing batches and read with its end classified.
+//! - `checkpoint`: the state a log's records fold onto, carried in its first batch.
 
+pub mod checkpoint;
 pub mod codec;
 pub mod content;
 pub mod fold;

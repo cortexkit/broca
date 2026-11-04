@@ -40,16 +40,19 @@ pub struct FieldSpec {
     pub bound: Bound,
 }
 
-/// Declares a fold state struct together with its schema, `SCHEMA`: one [`FieldSpec`] per field,
-/// in declaration order. Each field is written as
-/// `name: Type => { owner: "...", reset: "...", bound: Bound::... },`.
+/// Declares a fold state struct together with its schema, `SCHEMA` (one [`FieldSpec`] per
+/// field, in declaration order), and its encoding, which a log's checkpoint carries. Each field
+/// is written as
+/// `<number> <cardinality> name: Type => { owner: "...", reset: "...", bound: Bound::... },`,
+/// where the number and cardinality mean what they mean in the codec's `message!`: `req` holds
+/// `Type`, `opt` an `Option<Type>`, `rep` a `Vec<Type>`.
 macro_rules! state {
     (
         $(#[$meta:meta])*
         $vis:vis struct $name:ident {
             $(
                 $(#[$field_meta:meta])*
-                $field_vis:vis $field:ident: $ty:ty => {
+                $num:literal $card:ident $field_vis:vis $field:ident: $ty:ty => {
                     owner: $owner:literal,
                     reset: $reset:literal,
                     bound: $bound:expr $(,)?
@@ -61,9 +64,61 @@ macro_rules! state {
         $vis struct $name {
             $(
                 $(#[$field_meta])*
-                $field_vis $field: $ty,
+                $field_vis $field: $crate::__codec_field_ty!($card $ty),
             )*
         }
+
+        const _: () = assert!(
+            $crate::codec::ascending(&[$($num),*]),
+            concat!("field numbers of ", stringify!($name), " must ascend from 1")
+        );
+
+        impl $crate::codec::Value for $name {
+            const WIRE: $crate::codec::Wire = $crate::codec::Wire::Len;
+            const NAME: &'static str = stringify!($name);
+
+            fn write(&self, out: &mut ::std::vec::Vec<u8>) {
+                $(
+                    $crate::__codec_put!($card, out, $num, false, &self.$field);
+                )*
+            }
+
+            fn read(
+                raw: $crate::codec::Raw<'_>,
+            ) -> ::std::result::Result<Self, $crate::codec::DecodeError> {
+                let at = stringify!($name);
+                let bytes = $crate::codec::len_payload(raw, at)?;
+                $(
+                    let mut $field: $crate::__codec_slot_ty!($card $ty) =
+                        ::std::default::Default::default();
+                )*
+                for field in $crate::codec::Fields::new(bytes, at) {
+                    let field = field?;
+                    match field.number {
+                        $(
+                            $num => $crate::__codec_take!(
+                                $card,
+                                &mut $field,
+                                field,
+                                concat!(stringify!($name), ".", stringify!($field))
+                            )?,
+                        )*
+                        _ => $crate::codec::skip_unknown(field, at)?,
+                    }
+                }
+                Ok(Self {
+                    $(
+                        $field: $crate::__codec_finish!(
+                            $card,
+                            $field,
+                            concat!(stringify!($name), ".", stringify!($field))
+                        ),
+                    )*
+                })
+            }
+        }
+
+        impl $crate::codec::Message for $name {}
 
         impl $name {
             pub const SCHEMA: &'static [$crate::fold::FieldSpec] = &[
