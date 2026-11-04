@@ -552,6 +552,24 @@ fn append(path: &PathBuf, line: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_root(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "fake-surface-{label}-{}-{nonce}", std::process::id()
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+
     #[test]
     fn cingulate_accepts_agent_run_scopes_like_the_real_provider() {
         let manifest = super::manifest("cingulate");
@@ -578,9 +596,7 @@ mod tests {
 
     #[test]
     fn image_resolution_fixtures_are_scoped_by_handle_and_answer_binary() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("target/scratch/image-fixtures-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = fixture_root("image-fixtures");
         let path = root.join("fixtures.json");
         let image = b"abc";
         // SHA-256 of `abc`, so the test needs no hash dependency for three fixture bytes.
@@ -647,9 +663,7 @@ mod tests {
         // whole-file SHA-256 e860efcd7db12298f7af82758e8a72bc66b5e0ede81ada0c7fba40c1aa29acb2
         // crates/cerebellum/tests/vectors/private-content-query-v1/unknown-field.json
         // whole-file SHA-256 7cc2ec06859a700a91c1e6a1a57643c66ab9af848debcf9b4beb6ecaa7aeb2bc
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("target/scratch/cerebellum-fixtures-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = fixture_root("cerebellum-fixtures");
         let fixture = root.join("fixtures.json");
         for body in [
             r#"{"private_content":true,"sources":["signed_in_site"]}"#,
@@ -683,9 +697,7 @@ mod tests {
 
     #[test]
     fn basal_fixtures_preserve_wrapped_successes_and_error_frames() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("target/scratch/basal-fixtures-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = fixture_root("basal-fixtures");
         let fixture = root.join("fixtures.json");
         for (body, refused) in [
             (r#"{"result":{"flow_id":"flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":["typesafe","openai"]}}"#, false),

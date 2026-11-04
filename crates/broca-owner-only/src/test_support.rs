@@ -64,6 +64,21 @@ fn powershell(path: &Path, script: &str) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+fn write_security(path: &Path, script: &str) -> String {
+    let native = r#"
+        Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class BrocaFixtureSecurity {
+    [DllImport("advapi32.dll", EntryPoint="SetFileSecurityW", ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool Write(string path, uint information, byte[] descriptor);
+}
+'@;
+    "#;
+    powershell(path, &[native, script].concat())
+}
+
 pub fn acl_snapshot(path: &Path) -> String {
     powershell(path, "(Get-Acl -LiteralPath $p).Sddl")
 }
@@ -101,18 +116,42 @@ pub fn broaden(path: &Path) {
     powershell(
         path,
         r#"
-        $acl=Get-Acl -LiteralPath $p;
+        $item=Get-Item -LiteralPath $p -Force;
+        $acl=$item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access);
         $sid=New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0');
         if (Test-Path -LiteralPath $p -PathType Container) {
             $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow');
         } else { $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','Allow') };
-        $acl.AddAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl;
+        $acl.AddAccessRule($rule); $item.SetAccessControl($acl);
     "#,
     );
 }
 
-pub fn set_owner_to_administrators(path: &Path) {
-    powershell(path, "$acl=Get-Acl -LiteralPath $p; $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544'))); Set-Acl -LiteralPath $p -AclObject $acl");
+/// Assign the distinct owner when the token permits it; report an actual owner/privilege
+/// refusal as `false` so callers can name the unproved case rather than silently pass it.
+pub fn set_owner_to_administrators(path: &Path) -> bool {
+    let result = write_security(
+        path,
+        r#"
+        $acl=New-Object System.Security.AccessControl.FileSecurity;
+        $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')));
+        if ([BrocaFixtureSecurity]::Write($p,1,$acl.GetSecurityDescriptorBinaryForm())) { 'assigned' }
+        else {
+            $code=[System.Runtime.InteropServices.Marshal]::GetLastWin32Error();
+            $invalidOwner=1307; $privilegeNotHeld=1314;
+            if ($code -eq $invalidOwner -or $code -eq $privilegeNotHeld) { 'unavailable:'+$code }
+            else { throw (New-Object System.ComponentModel.Win32Exception($code)) };
+        };
+    "#,
+    );
+    if result == "assigned" {
+        true
+    } else if let Some(code) = result.strip_prefix("unavailable:") {
+        eprintln!("foreign-owner fixture probe refused with Win32 {code}");
+        false
+    } else {
+        panic!("unexpected owner fixture result: {result}");
+    }
 }
 
 /// Makes the file's ACL unreadable without removing existing WRITE_DAC grants used for cleanup.
@@ -123,7 +162,8 @@ pub fn deny_acl_read(path: &Path) {
     powershell(
         path,
         r#"
-        $acl=Get-Acl -LiteralPath $p;
+        $item=Get-Item -LiteralPath $p -Force;
+        $acl=$item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access);
         $user=[System.Security.Principal.WindowsIdentity]::GetCurrent().User;
         $acl.SetOwner($user);
         $ownerRights=New-Object System.Security.Principal.SecurityIdentifier('S-1-3-4');
@@ -131,7 +171,7 @@ pub fn deny_acl_read(path: &Path) {
             $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'ReadPermissions','Deny');
             $acl.AddAccessRule($rule);
         }
-        Set-Acl -LiteralPath $p -AclObject $acl;
+        $item.SetAccessControl($acl);
     "#,
     );
 }
@@ -140,7 +180,7 @@ pub fn reset_acl(path: &Path) {
     // `deny_acl_read` leaves the ACL unreadable, and icacls must read it before resetting.
     // Writing a whole new DACL needs only WRITE_DAC, which the account's own full-control
     // entry still grants, so replace it blind first and let icacls reset from there.
-    powershell(
+    write_security(
         path,
         r#"
         $user=[System.Security.Principal.WindowsIdentity]::GetCurrent().User;
@@ -148,12 +188,13 @@ pub fn reset_acl(path: &Path) {
         if (Test-Path -LiteralPath $p -PathType Container) {
             $s=New-Object System.Security.AccessControl.DirectorySecurity;
             foreach ($sid in @($user,$sys)) { $s.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) };
-            [System.IO.Directory]::SetAccessControl($p,$s);
         } else {
             $s=New-Object System.Security.AccessControl.FileSecurity;
             foreach ($sid in @($user,$sys)) { $s.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','Allow'))) };
-            [System.IO.File]::SetAccessControl($p,$s);
         }
+        if (-not [BrocaFixtureSecurity]::Write($p,0x20000004,$s.GetSecurityDescriptorBinaryForm())) {
+            throw (New-Object System.ComponentModel.Win32Exception([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()));
+        };
     "#,
     );
     let output = Command::new("icacls.exe")

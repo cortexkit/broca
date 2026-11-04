@@ -70,11 +70,12 @@ esac
 ''',
                 "cargo": '''#!/bin/sh
 printf '%s\n' "$*" > "$CARGO_LOG"
-mkdir -p target/release
+target="${CARGO_TARGET_DIR:-target}/release"
+mkdir -p "$target"
 for name in ck-broca broca-session broca-run; do
  case " $* " in *" --bin $name "*) ;; *) continue ;; esac
- printf '#!/bin/sh\necho "%s 0.0.2"\n' "$name" > "target/release/$name"
- chmod 755 "target/release/$name"
+ printf '#!/bin/sh\necho "%s 0.0.2"\n' "$name" > "$target/$name"
+ chmod 755 "$target/$name"
 done
 ''',
                 "uname": "#!/bin/sh\necho Darwin\n",
@@ -99,12 +100,14 @@ exec "$REAL_MV" "$@"
             real_mv = shutil.which("mv")
             assert real_mv is not None
             env = dict(os.environ, HOME=str(root / "home"), PATH=f"{tools}:{os.environ['PATH']}",
-                       PUBLISH_LOG=str(log), CARGO_LOG=str(root / "cargo.log"), REAL_MV=real_mv)
+                       PUBLISH_LOG=str(log), CARGO_LOG=str(root / "cargo.log"), REAL_MV=real_mv,
+                       CARGO_TARGET_DIR=str(root / "custom target"))
             result = subprocess.run(["bash", str(script)], cwd=root, env=env, text=True,
                                     capture_output=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             args = (root / "cargo.log").read_text()
             self.assertIn("-p broca-module-serve -p broca-run", args)
+            self.assertFalse((root / "target/release").exists())
             seam = root / "home/.local/share/cortexkit/staging"
             renames = log.read_text().splitlines()
             for name in ("ck-broca", "broca-session", "broca-run"):

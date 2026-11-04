@@ -703,8 +703,7 @@ async fn source_legacy_warm_and_export_follow_the_refused_digest_not_the_fallbac
         .iter()
         .any(|f| f.segment.as_session().unwrap().model == FALLBACK));
     let sample = serde_json::json!({"cache_warmed_record": &warms[0], "export_fact": warm});
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.cortexkit/internal-docs/investigations/source-warm-serializer-sample.json");
+    let path = broca_test_support::scratch_root().join("source-warm-serializer-sample.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, serde_json::to_vec_pretty(&sample).unwrap()).unwrap();
     f.stop().await;

@@ -7660,12 +7660,10 @@ mod tests {
     }
 
     fn attempt_scratch(label: &str) -> PathBuf {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/scratch")
-            .join(format!(
-                "{label}-{}",
-                broca_core::attempt_id::mint_attempt_id().unwrap().as_str()
-            ));
+        let root = broca_test_support::scratch_root().join(format!(
+            "{label}-{}",
+            broca_core::attempt_id::mint_attempt_id().unwrap().as_str()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         root.canonicalize().unwrap()
     }

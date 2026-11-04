@@ -14,6 +14,7 @@ import tempfile
 import tarfile
 import tomllib
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import yaml
@@ -32,6 +33,10 @@ elif args[:2] == ['nextest', 'run']:
     if not os.environ.get('NO_CLOCK_PASS'):
         print('PASS [0.01s] ( 1/1) broca-module::it test_clock::test_clock_feature_is_enabled_for_retention_tests')
     print('Summary [0.01s] 1 test run: 1 passed')
+    if os.environ.get('UNRUN_SHARD') and '--partition' in args:
+        print('warning: 1/2 tests were not run')
+        print('error: test run failed')
+        sys.exit(100)
     sys.exit(int(os.environ.get('RUN_EXIT', '0')))
 elif args[0] == 'test' and '--list' in args:
     for binary in ('fixture', 'live', 'live_e2e'):
@@ -103,34 +108,128 @@ class PrepushDispatch(unittest.TestCase):
         self.root = Path(self.tmp.name)
         (self.root / 'scripts').mkdir()
         shutil.copy(ROOT / 'scripts/prepush.sh', self.root / 'scripts/prepush.sh')
+        (self.root / 'scripts/lib').mkdir()
+        shutil.copy(ROOT / 'scripts/lib/prepush-report.sh', self.root / 'scripts/lib/prepush-report.sh')
+        shutil.copy(ROOT / 'scripts/lib/prepush-motor-timing.py', self.root / 'scripts/lib/prepush-motor-timing.py')
+        (self.root / 'scripts/prepare-prepush-windows.py').write_text('''import argparse
+from pathlib import Path
+p=argparse.ArgumentParser()
+p.add_argument('--output'); p.add_argument('--source-cache'); p.add_argument('--cache')
+p.add_argument('--require-snapshot-visible',action='store_true')
+a=p.parse_args(); Path(a.output).mkdir(parents=True, exist_ok=True)
+(Path(a.output)/'fixture-input').write_text('verified fixture')
+''')
+        (self.root / '.gitignore').write_text('target/\nlane-pool/\n.prepush-runtime/\nbin/\nevents\n*.started\n')
+        subprocess.run(['git', 'init', '-q', str(self.root)], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.root), 'add', 'scripts', '.gitignore'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.invalid', '-c', 'core.hooksPath=/dev/null',
+                        'commit', '-qm', 'fixture'], check=True, capture_output=True)
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         ck = self.bin / 'ck'
         ck.write_text('''#!/usr/bin/env python3
-import os, pathlib, sys, time
+import atexit, fcntl, json, os, pathlib, sys, time
 lane = sys.argv[-1].split()[-1]
 root = pathlib.Path(os.environ['FIXTURE'])
+cpus = int(sys.argv[sys.argv.index('--vcpus') + 1]) if '--vcpus' in sys.argv else 2
+def reserve(delta):
+    with (root / 'target/cpu.lock').open('a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = root / 'target/cpus.json'
+        state = json.loads(path.read_text()) if path.exists() else {'active': 0, 'peak': 0, 'starts': 0}
+        state['active'] += delta
+        state['peak'] = max(state['peak'], state['active'])
+        if delta > 0 and lane != 'fast':
+            state['starts'] += 1
+            if state['starts'] <= 5:
+                state.setdefault('first_wave', []).append(lane)
+        path.write_text(json.dumps(state))
+        return state['starts']
+barrier = os.open(root / 'target/barrier', os.O_RDWR) if os.environ.get('CPU_BARRIER') and lane != 'fast' else None
+starts = reserve(cpus)
+atexit.register(reserve, -cpus)
+if barrier is not None:
+    if starts <= 5:
+        if starts == 5:
+            os.write(barrier, b'x' * 5)
+        os.read(barrier, 1)
+    os.close(barrier)
+record = pathlib.Path(sys.argv[sys.argv.index('--record-file') + 1])
+record.write_text('{"type":"accepted"}\\n')
 with (root / 'events').open('a') as out:
     out.write(' '.join(sys.argv[1:]) + '\\n')
+if lane == os.environ.get('REFUSE_LANE'):
+    print('ck motor run: refused before start: runner_full: hosted_capacity')
+    sys.exit(200)
+if lane == os.environ.get('UNKNOWN_LANE') or (os.environ.get('UNKNOWN_ALL') and lane != 'fast'):
+    print('ck motor run: connection lost; outcome unknown')
+    sys.exit(201)
 (root / (lane + '.started')).touch()
-if lane == 'linux':
-    deadline = time.monotonic() + 5
-    while not (root / 'windows.started').exists():
-        if time.monotonic() >= deadline:
-            sys.exit('Windows was not launched in parallel')
-        time.sleep(.01)
+with record.open('a') as events:
+    import json
+    events.write(json.dumps({'type':'started','started_at_ms':time.time_ns()//1000000})+'\\n')
+    events.write(json.dumps({'type':'terminal','wall_ms':17,'queue_wait_ms':1})+'\\n')
 if lane == os.environ.get('FAIL_LANE'):
+    if lane == 'linux-msrv':
+        print('error[E0599]: fixture MSRV compiler error')
     print('FAIL broca-module::it permissions::warming_route')
     sys.exit(19)
+if lane == 'windows' and os.environ.get('OWNER_PARTIAL'):
+    print('owner-distinct check not run: token cannot assign a foreign owner')
 print('Summary: 1 test run: 1 passed')
 ''')
         ck.chmod(0o755)
 
-    def run_prepush(self, **extra):
+    def run_prepush(self, *, checkout=None, **extra):
         env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
-                   FIXTURE=str(self.root), **extra)
-        return subprocess.run(['bash', 'scripts/prepush.sh'], cwd=self.root,
-                              env=env, capture_output=True, text=True)
+                   FIXTURE=str(self.root), BROCA_PREPUSH_LANE_POOL=str(self.root / 'lane-pool'))
+        env.update(extra)
+        return subprocess.run(['bash', 'scripts/prepush.sh'], cwd=checkout or self.root,
+                               env=env, capture_output=True, text=True)
+
+    def test_generated_inputs_are_never_tracked(self):
+        tracked = subprocess.check_output(['git', 'ls-files', '--', 'prepush-inputs'],
+                                          cwd=ROOT, text=True)
+        self.assertEqual(tracked, '', 'generated prepush-inputs paths must not be committed')
+
+    def test_tracked_inputs_refuse_dispatch_even_in_a_clean_candidate(self):
+        inputs = self.root / 'prepush-inputs'
+        inputs.mkdir()
+        (inputs / 'fixture-input').write_text('generated bytes')
+        subprocess.run(['git', 'add', 'prepush-inputs'], cwd=self.root, check=True)
+        subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                        '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'tracked input fixture'],
+                       cwd=self.root, check=True)
+        result = self.run_prepush()
+        self.assertEqual(result.returncode, 200, result.stdout + result.stderr)
+        self.assertIn('generated prepush-inputs paths must not be tracked', result.stderr)
+        self.assertIn('prepush-inputs/fixture-input', result.stderr)
+        self.assertFalse((self.root / 'events').exists())
+
+    def test_default_lane_pool_is_checkout_specific_and_outside_worker_pool(self):
+        home = self.root / 'target/home'
+        result = self.run_prepush(BROCA_PREPUSH_LANE_POOL='', HOME=str(home), FAIL_LANE='fast')
+        self.assertNotEqual(result.returncode, 0)
+        physical_root = self.root.resolve()
+        checkout_id = physical_root.name + '-' + hashlib.sha256(str(physical_root).encode()).hexdigest()[:12]
+        expected = home / 'Work/Projects/CortexKit-scratch/broca-prepush-lanes' / checkout_id / 'fast'
+        event = shlex.split((self.root / 'events').read_text())
+        self.assertEqual(Path(event[event.index('--cwd') + 1]), expected)
+        self.assertTrue(expected.is_dir())
+
+    def test_default_lane_pool_id_is_stable_through_a_checkout_symlink(self):
+        alias = self.bin / 'checkout-alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        home = self.root / 'target/home'
+        result = self.run_prepush(checkout=alias, BROCA_PREPUSH_LANE_POOL='', HOME=str(home), FAIL_LANE='fast')
+        self.assertNotEqual(result.returncode, 0)
+        physical_root = self.root.resolve()
+        checkout_id = physical_root.name + '-' + hashlib.sha256(str(physical_root).encode()).hexdigest()[:12]
+        expected = home / 'Work/Projects/CortexKit-scratch/broca-prepush-lanes' / checkout_id / 'fast'
+        event = shlex.split((self.root / 'events').read_text())
+        self.assertEqual(Path(event[event.index('--cwd') + 1]), expected)
+        self.assertTrue(expected.is_dir())
 
     def test_fast_failure_prevents_heavy_dispatch_and_replays_failure(self):
         result = self.run_prepush(FAIL_LANE='fast')
@@ -144,45 +243,648 @@ print('Summary: 1 test run: 1 passed')
         self.assertGreaterEqual(result.stdout.count('permissions::warming_route'), 2)
 
     def test_heavy_lanes_parallel_and_windows_failure_not_hidden(self):
-        result = self.run_prepush(FAIL_LANE='windows')
+        (self.root / 'target').mkdir()
+        os.mkfifo(self.root / 'target/barrier')
+        # Hold the first wave until all five jobs have started so checkout duration
+        # does not affect the parallel-dispatch check.
+        result = self.run_prepush(FAIL_LANE='windows', CPU_BARRIER='1')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         events = (self.root / 'events').read_text().splitlines()
-        self.assertEqual(len(events), 4)
+        self.assertEqual(len(events), 13)
         self.assertIn('--lane fast', events[0])
-        self.assertTrue(any('--vcpus 16' in e and '--lane linux' in e for e in events))
+        self.assertTrue(any('--vcpus 8' in e and '--lane linux-lint' in e for e in events))
         self.assertTrue(any('--platform windows' in e and '--lane windows' in e for e in events))
+        windows = next(e for e in events if '--platform windows' in e)
+        self.assertNotIn('--net', windows)
+        self.assertNotIn('--sibling', windows)
+        self.assertIn('--vcpus 8', windows)
+        self.assertIn('export CARGO_TARGET_DIR=', windows)
+        requests = {e.split('--lane ')[-1].strip("'\""): shlex.split(e) for e in events}
+        sizes = {'fast': 2, 'linux-small': 2, 'linux-production': 4, 'macos': 2,
+                 'linux-lint': 8, 'linux-unit': 4, 'windows': 8, 'linux-msrv': 8, 'linux-deploy': 8,
+                 **{f'linux-integration-{shard}': 8 for shard in range(1, 5)}}
+        for name, cpus in sizes.items():
+            args = requests[name]
+            self.assertEqual(args[args.index('--vcpus') + 1], str(cpus))
+        linux = [shlex.split(e) for e in events if '--lane linux-' in e]
+        self.assertEqual(len(linux), 10)
+        self.assertEqual(len({e[e.index('--cwd') + 1] for e in linux}), 10)
+        self.assertTrue(any('--lane linux-small' in e for e in events))
+        for old in ('linux-operator', 'linux-wal', 'linux-portable'):
+            self.assertNotIn(old, requests)
         self.assertIn('FAILED windows', result.stdout)
         self.assertNotIn('FAILED linux', result.stdout)
         self.assertGreaterEqual(result.stdout.count('permissions::warming_route'), 2)
+        self.assertFalse((self.root / 'lane-pool/windows/prepush-inputs').exists())
+        state = json.loads((self.root / 'target/cpus.json').read_text())
+        self.assertEqual(state['peak'], 32)
+        self.assertEqual(set(state['first_wave']), {'linux-unit', 'linux-production', 'windows',
+                                                   'linux-integration-4', 'linux-integration-2'})
 
     def test_success_reports_every_lane_and_wall_time(self):
         result = self.run_prepush()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('prepush lane summary', result.stdout)
         self.assertIn('total wall', result.stdout)
-        for lane in ('fast', 'linux', 'windows', 'macos'):
-            self.assertRegex(result.stdout, rf'{lane}\s+exit=0\s+\d+s')
+        for lane in ('fast', 'linux-small', 'linux-lint', 'linux-unit', 'windows', 'macos'):
+            self.assertRegex(result.stdout, rf'{lane}\s+PASS\s+exit=0\s+wall=\d+s')
+        self.assertIn('request-to-start=', result.stdout)
+        self.assertIn('run=0.017s', result.stdout)
+        self.assertIn('measured critical path ends at', result.stdout)
+        self.assertIn('known reservation-time floor at 32 vCPUs', result.stdout)
+        common = subprocess.check_output(['git', '-C', str(self.root), 'rev-parse',
+                                          '--path-format=absolute', '--git-common-dir'], text=True).strip()
+        lane_common = subprocess.check_output(['git', '-C', str(self.root / 'lane-pool/linux-unit'),
+                                               'rev-parse', '--path-format=absolute', '--git-common-dir'], text=True).strip()
+        self.assertEqual(lane_common, common)
+
+    def test_windows_foreign_owner_gap_is_named_partial_not_full_pass(self):
+        result = self.run_prepush(OWNER_PARTIAL='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r'windows\s+PARTIAL\s+exit=0')
+        self.assertNotRegex(result.stdout, r'windows\s+PASS\s+exit=0')
+        self.assertIn('owner-distinct check not run: token cannot assign a foreign owner', result.stdout)
+
+    def test_windows_summary_records_runner_instance(self):
+        import re
+        source = (ROOT / 'scripts/lib/prepush-lane.sh').read_text()
+        summary = re.search(r'^summary\(\) \{.*?^\}', source, re.M | re.S)
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        script = ('set -euo pipefail\nlane=windows; labels=(); codes=(); times=(); files=(); '
+                  'owner_partial=0; begin=$SECONDS; log_dir=fixture; scratch=fixture\n' +
+                  summary.group(0) + '\nsummary\n')
+        for host in ('ally', 'windows', None):
+            with self.subTest(host=host):
+                env = dict(os.environ)
+                env.pop('MOTOR_RUNNER_INSTANCE', None)
+                if host is not None:
+                    env['MOTOR_RUNNER_INSTANCE'] = host
+                result = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('==> windows summary', result.stdout)
+                self.assertIn('prepush: Windows runner instance=' + (host or 'unreported'), result.stdout)
+
+    def test_linux_fixture_builds_omit_empty_offline_config_arrays(self):
+        import re
+        source = (ROOT / 'scripts/lib/prepush-lane.sh').read_text()
+        function = re.search(r'^fixtures\(\) \{.*?^\}', source, re.M | re.S)
+        self.assertIsNotNone(function)
+        assert function is not None
+        shutil.copy(ROOT / 'scripts/ci-fixture-revisions.conf', self.root / 'scripts/ci-fixture-revisions.conf')
+        scratch = self.root / 'target/fixture scratch'
+        target = self.root / 'target/build cache'
+        (target / 'debug').mkdir(parents=True)
+        for name in ('ck-subc', 'fake-aft-stub', 'ck', 'ck-claustrum', 'ck-auth'):
+            (target / 'debug' / name).write_text('fixture binary')
+        surface = target / 'fake-surface-target/debug'
+        surface.mkdir(parents=True)
+        (surface / 'fake-surface').write_text('fixture binary')
+        script = '''set -euo pipefail
+platform=linux; lane=linux-unit
+checkout_pin() {
+  mkdir -p "$3/crates/credentials-module/tests/fixtures"
+  printf '{}' > "$3/crates/credentials-module/tests/fixtures/enrollment_wire_contract.json"
+}
+cargo() {
+  python3 -c 'import json,sys; open("cargo-args", "a").write(json.dumps(sys.argv[1:])+"\\n")' "$@"
+}
+bash() { :; }
+''' + function.group(0) + '\nfixtures\n'
+        env = dict(os.environ, scratch=str(scratch), CARGO_TARGET_DIR=str(target))
+        result = subprocess.run(['bash', '-c', script], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = [json.loads(line) for line in (self.root / 'cargo-args').read_text().splitlines()]
+        self.assertEqual(len(commands), 3)
+        for command, package in zip(commands, ('subc-core', 'credentials-module')):
+            self.assertEqual(command[:3], ['build', '--locked', '--manifest-path'])
+            self.assertEqual(command[-3:], ['-p', package, '--bins'])
+            self.assertNotIn('', command)
+            self.assertNotIn('--offline', command)
+        self.assertTrue((scratch / 'fixtures.tar.gz').is_file())
+
+    def test_linux_broker_setup_passes_no_empty_option_word(self):
+        import re
+        source = (ROOT / 'scripts/lib/prepush-lane.sh').read_text()
+        function = re.search(r'^broker\(\) \{.*?^\}', source, re.M | re.S)
+        self.assertIsNotNone(function)
+        assert function is not None
+        script = '''set -euo pipefail
+platform=linux
+python3() {
+  [[ "$RUNNER_TEMP" == "$scratch" && "$GITHUB_ENV" == "$scratch/nats.env" ]]
+  printf '%s\\n' "$#" "$@" > "$scratch/broker-args"
+}
+''' + function.group(0) + '\nbroker\n'
+        result = subprocess.run(['bash', '-c', script], env=dict(os.environ, scratch=str(self.root)),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / 'broker-args').read_text().splitlines(),
+                         ['1', 'scripts/install-ci-nats.py'])
+
+    def test_concurrent_cpu_requests_never_exceed_32(self):
+        (self.root / 'target').mkdir()
+        os.mkfifo(self.root / 'target/barrier')
+        result = self.run_prepush(CPU_BARRIER='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        state = json.loads((self.root / 'target/cpus.json').read_text())
+        self.assertEqual(state['active'], 0)
+        self.assertEqual(state['peak'], 32)
+        self.assertEqual(set(state['first_wave']), {'linux-unit', 'linux-production', 'windows',
+                                                   'linux-integration-4', 'linux-integration-2'})
+        self.assertIn('at most 32 concurrent (76 across queued lanes)', result.stdout)
+
+    def test_capacity_refusal_keeps_its_name_and_does_not_skip_other_lanes(self):
+        result = self.run_prepush(REFUSE_LANE='linux-integration-3')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stdout, r'linux-integration-3\s+NOT-RUN\s+exit=200')
+        self.assertIn('runner_full: hosted_capacity', result.stdout)
+        self.assertNotRegex(result.stdout, r'linux-integration-3\s+PASS')
+        self.assertTrue((self.root / 'linux-unit.started').exists())
+        self.assertTrue((self.root / 'linux-small.started').exists())
+
+    def test_caller_selects_installed_tomllib_python_over_old_default(self):
+        real_python = shlex.quote(sys.executable)
+        scripts = {
+            'python3': 'if [ "$1" = -c ] && [ "$2" = "import tomllib" ]; then exit 1; fi\n'
+                       f'exec {real_python} "$@"',
+            'python3.14': 'if [ "$1" = scripts/prepare-prepush-windows.py ]; then touch "$FIXTURE/selected-prepare.started"; fi\n'
+                          f'exec {real_python} "$@"',
+        }
+        for name, body in scripts.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        result = self.run_prepush()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.root / 'selected-prepare.started').exists())
+
+    def test_missing_tomllib_interpreter_is_named_not_run(self):
+        body = ('#!/bin/sh\nif [ "$1" = -c ] && [ "$2" = "import tomllib" ]; then exit 1; fi\n'
+                f'exec {shlex.quote(sys.executable)} "$@"\n')
+        for name in ('python3', 'python3.14', 'python3.13', 'python3.12', 'python3.11', 'python'):
+            path = self.bin / name
+            path.write_text(body)
+            path.chmod(0o755)
+        result = self.run_prepush()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stdout, r'windows\s+NOT-RUN\s+exit=204')
+        self.assertIn('requires an installed Python 3.11+', result.stdout)
+        self.assertFalse((self.root / 'windows.started').exists())
+
+    def test_unknown_jobs_do_not_release_cpu_budget_for_more_requests(self):
+        result = self.run_prepush(UNKNOWN_ALL='1')
+        self.assertNotEqual(result.returncode, 0)
+        events = (self.root / 'events').read_text().splitlines()
+        self.assertEqual(len(events), 6)
+        for lane in ('linux-lint', 'linux-small', 'linux-msrv', 'linux-deploy',
+                     'linux-integration-1', 'linux-integration-3', 'macos'):
+            self.assertRegex(result.stdout, rf'{lane}\s+NOT-RUN\s+exit=204')
+            self.assertFalse((self.root / (lane + '.started')).exists())
+        self.assertIn('UNKNOWN jobs still hold the remaining vCPU budget', result.stdout)
+
+    def test_small_lane_keeps_independent_checks_after_operator_failure(self):
+        import re
+        source = (ROOT / 'scripts/lib/prepush-lane.sh').read_text()
+        for name in ('fixtures', 'deploy'):
+            source = re.sub(r'^' + name + r'\(\) \{.*?^\}',
+                            name + '() { echo ' + name + ' >> "$FIXTURE/order"; }',
+                            source, flags=re.M | re.S)
+        (self.root / 'scripts/lib/prepush-lane.sh').write_text(source)
+        (self.root / 'scripts/script-suites.sh').write_text('echo operator >> "$FIXTURE/order"; exit 19\n')
+        for name, body in {
+            'rustc': 'echo fixture rustc', 'git': 'exit 0', 'uname': 'echo Linux',
+            'cargo': 'echo "cargo $* jobs=$CARGO_BUILD_JOBS" >> "$FIXTURE/order"',
+        }.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        home = self.root / 'home'
+        home.mkdir(mode=0o700)
+        result = subprocess.run(['bash', 'scripts/prepush.sh', '--lane', 'linux-small'], cwd=self.root,
+                                env=dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
+                                         HOME=str(home), FIXTURE=str(self.root),
+                                         CARGO_TARGET_DIR=str(self.root / 'target-cache')),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        order = (self.root / 'order').read_text().splitlines()
+        for command in ('cargo fetch --locked jobs=2',
+                        'cargo test --locked -p broca-wal-reader jobs=2',
+                        'cargo test --locked -p broca-wal --lib framing::tests::v4 jobs=2',
+                        'operator'):
+            self.assertIn(command, order)
+        self.assertNotIn('fixtures', order)
+        self.assertNotIn('deploy', order)
+        self.assertFalse(any('+1.96' in command for command in order))
+        self.assertIn('operator scripts, pins and dependency guards', result.stdout)
+
+    def test_dirty_persistent_worktree_is_not_checked_out_or_dispatched(self):
+        pool = self.root / 'lane-pool'
+        pool.mkdir()
+        lane = pool / 'fast'
+        subprocess.run(['git', '-C', str(self.root), 'worktree', 'add', '-q', '--detach', str(lane), 'HEAD'],
+                       check=True, capture_output=True)
+        dirty = lane / 'scripts/prepush.sh'
+        dirty.write_text(dirty.read_text() + '\n# local work\n')
+        result = self.run_prepush()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('lane worktree is dirty', result.stdout)
+        self.assertIn('NOT-RUN fast', result.stdout)
+        self.assertTrue(dirty.read_text().endswith('# local work\n'))
+        self.assertFalse((self.root / 'events').exists())
+
+    def test_existing_windows_inputs_are_not_adopted_or_deleted(self):
+        pool = self.root / 'lane-pool'
+        pool.mkdir()
+        lane = pool / 'windows'
+        subprocess.run(['git', '-C', str(self.root), 'worktree', 'add', '-q', '--detach', str(lane), 'HEAD'],
+                       check=True, capture_output=True)
+        inputs = lane / 'prepush-inputs'
+        inputs.mkdir()
+        (inputs / 'user-data').write_text('do not delete')
+        result = self.run_prepush()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('NOT-RUN windows', result.stdout)
+        self.assertEqual((inputs / 'user-data').read_text(), 'do not delete')
+        self.assertFalse((self.root / 'windows.started').exists())
+
+    def test_ignored_existing_windows_inputs_are_not_overwritten_or_deleted(self):
+        pool = self.root / 'lane-pool'
+        pool.mkdir()
+        lane = pool / 'windows'
+        subprocess.run(['git', '-C', str(self.root), 'worktree', 'add', '-q', '--detach', str(lane), 'HEAD'],
+                       check=True, capture_output=True)
+        exclude = Path(subprocess.check_output(['git', '-C', str(lane), 'rev-parse',
+                                               '--git-path', 'info/exclude'], text=True).strip())
+        with exclude.open('a') as out:
+            out.write('\n/prepush-inputs/\n')
+        inputs = lane / 'prepush-inputs'
+        inputs.mkdir()
+        (inputs / 'user-data').write_text('do not delete')
+        result = self.run_prepush()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((inputs / 'user-data').is_file(), 'ignored input data was deleted')
+        self.assertEqual((inputs / 'user-data').read_text(), 'do not delete')
+        self.assertIn('refusing existing Windows input path', result.stdout)
+        self.assertFalse((self.root / 'windows.started').exists())
+
+    def test_unknown_windows_outcome_retains_inputs_and_refuses_reuse(self):
+        result = self.run_prepush(UNKNOWN_LANE='windows')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertRegex(result.stdout, r'windows\s+UNKNOWN\s+exit=201')
+        inputs = self.root / 'lane-pool/windows/prepush-inputs'
+        self.assertEqual((inputs / 'fixture-input').read_text(), 'verified fixture')
+        (self.root / 'events').unlink()
+        result = self.run_prepush()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('NOT-RUN windows', result.stdout)
+        self.assertNotIn('--lane windows', (self.root / 'events').read_text())
+        self.assertTrue(inputs.is_dir())
+
+    def test_clean_persistent_lane_is_reused_at_the_exact_new_candidate(self):
+        pool = self.root / 'lane-pool'
+        pool.mkdir()
+        lane = pool / 'fast'
+        subprocess.run(['git', '-C', str(self.root), 'worktree', 'add', '-q', '--detach', str(lane), 'HEAD'],
+                       check=True, capture_output=True)
+        inode = lane.stat().st_ino
+        (self.root / 'candidate.txt').write_text('new candidate\n')
+        subprocess.run(['git', '-C', str(self.root), 'add', 'candidate.txt'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.invalid', '-c', 'core.hooksPath=/dev/null',
+                        'commit', '-qm', 'new candidate'], check=True, capture_output=True)
+        expected = subprocess.check_output(['git', '-C', str(self.root), 'rev-parse', 'HEAD'], text=True).strip()
+        result = self.run_prepush()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(lane.stat().st_ino, inode)
+        actual = subprocess.check_output(['git', '-C', str(lane), 'rev-parse', 'HEAD'], text=True).strip()
+        self.assertEqual(actual, expected)
+        self.assertEqual((lane / 'candidate.txt').read_text(), 'new candidate\n')
+
+    def test_lint_reuses_the_existing_portable_checkout_and_warm_target(self):
+        pool = self.root / 'lane-pool'
+        pool.mkdir()
+        lane = pool / 'linux-portable'
+        subprocess.run(['git', '-C', str(self.root), 'worktree', 'add', '-q', '--detach', str(lane), 'HEAD'],
+                       check=True, capture_output=True)
+        (lane / 'target').mkdir()
+        marker = lane / 'target/warm-marker'
+        marker.write_text('existing portable compiler cache')
+        inode = lane.stat().st_ino
+        result = self.run_prepush()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event = next(shlex.split(line) for line in (self.root / 'events').read_text().splitlines()
+                     if '--lane linux-lint' in line)
+        self.assertEqual(event[event.index('--cwd')+1], str(lane))
+        self.assertEqual(lane.stat().st_ino, inode)
+        self.assertEqual(marker.read_text(), 'existing portable compiler cache')
+        self.assertFalse((pool / 'linux-lint').exists())
+
+    def test_refused_windows_is_not_run_and_fails_gate_by_name(self):
+        result = self.run_prepush(REFUSE_LANE='windows')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r'windows\s+NOT-RUN\s+exit=200')
+        self.assertIn('NOT-RUN windows: complete output', result.stdout)
+        self.assertNotIn('FAILED windows', result.stdout)
+        self.assertFalse((self.root / 'windows.started').exists())
+
+    def test_operator_failure_is_required_but_does_not_block_native_dispatch(self):
+        result = self.run_prepush(FAIL_LANE='linux-small')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('FAILED linux-small', result.stdout)
+        self.assertTrue((self.root / 'linux-unit.started').exists())
+        self.assertTrue((self.root / 'windows.started').exists())
+        self.assertTrue((self.root / 'linux-msrv.started').exists())
+        self.assertTrue((self.root / 'linux-deploy.started').exists())
+
+    def test_msrv_failure_summary_prints_first_error_and_complete_output(self):
+        result = self.run_prepush(FAIL_LANE='linux-msrv')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        summary = result.stdout.split('==> prepush lane summary', 1)[1]
+        self.assertIn('FIRST ERRORS linux-msrv', summary)
+        self.assertIn('error[E0599]: fixture MSRV compiler error', summary)
+        self.assertIn('FAILED linux-msrv: complete output', summary)
+
+    def test_msrv_uses_installed_patch_toolchain_not_syncing_minor_alias(self):
+        shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', self.root / 'scripts/lib/prepush-lane.sh')
+        cargo = self.bin / 'cargo'
+        cargo.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+with (pathlib.Path(os.environ['FIXTURE']) / 'cargo-calls').open('a') as out:
+    out.write(json.dumps(sys.argv[1:]) + '\\n')
+(pathlib.Path(os.environ['FIXTURE']) / 'supplied-target').write_text(os.environ['CARGO_TARGET_DIR'])
+(pathlib.Path(os.environ['FIXTURE']) / 'supplied-jobs').write_text(os.environ['CARGO_BUILD_JOBS'])
+if '+1.96' in sys.argv:
+    sys.exit('error: could not create temp file: Read-only file system')
+print('fixture cargo completed')
+''')
+        cargo.chmod(0o755)
+        for name, body in {'rustc': 'echo fixture rustc', 'git': 'exit 0',
+                           'uname': 'echo Linux'}.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        home = self.root / 'home'
+        home.mkdir(mode=0o700)
+        env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
+                   HOME=str(home), FIXTURE=str(self.root),
+                   CARGO_TARGET_DIR=str(self.root / 'target-cache'))
+        result = subprocess.run(['bash', 'scripts/prepush.sh', '--lane', 'linux-msrv'],
+                                cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = [json.loads(line) for line in (self.root / 'cargo-calls').read_text().splitlines()]
+        self.assertIn(['+1.96.0', 'check', '--locked', '--workspace', '--all-targets'], calls)
+        self.assertFalse(any('+1.96' in args for args in calls))
+        self.assertEqual((self.root / 'supplied-target').read_text(), str(self.root / 'target-cache'))
+        self.assertEqual((self.root / 'supplied-jobs').read_text(), '8')
+
+    def test_lint_lane_retains_both_workspace_clippies_and_all_ci_features(self):
+        shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', self.root / 'scripts/lib/prepush-lane.sh')
+        cargo = self.bin / 'cargo'
+        cargo.write_text('''#!/usr/bin/env python3
+import json,os,pathlib,sys
+assert os.environ['CARGO_BUILD_JOBS']=='8'
+with (pathlib.Path(os.environ['FIXTURE'])/'lint-calls').open('a') as output:
+    output.write(json.dumps(sys.argv[1:])+'\\n')
+''')
+        cargo.chmod(0o755)
+        for name, body in {'git': 'exit 0', 'uname': 'echo Linux'}.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        home = self.root / 'home'
+        home.mkdir(mode=0o700)
+        result = subprocess.run(['bash', 'scripts/prepush.sh', '--lane', 'linux-lint'], cwd=self.root,
+                                env=dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
+                                         HOME=str(home), FIXTURE=str(self.root)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = [json.loads(line) for line in (self.root / 'lint-calls').read_text().splitlines()]
+        self.assertEqual(calls[0], ['fmt', '--all', '--', '--check'])
+        self.assertEqual(len(calls), 3)
+        for command in calls[1:]:
+            self.assertEqual(command[:4], ['clippy', '--locked', '--workspace', '--all-targets'])
+            self.assertEqual(command[-3:], ['--', '-D', 'warnings'])
+            for feature in ('broca-provider/live', 'broca-provider/test-harness',
+                            'broca-catalog/live', 'broca-module-serve/test-clock'):
+                self.assertIn(feature, command)
+        self.assertNotIn('--target', calls[1])
+        self.assertEqual(calls[2][calls[2].index('--target')+1], 'x86_64-pc-windows-gnu')
 
     def test_missing_file_tool_refuses_before_running_checks(self):
         lib = self.root / 'scripts/lib'
-        lib.mkdir()
+        lib.mkdir(exist_ok=True)
         shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', lib / 'prepush-lane.sh')
         tools = self.root / 'minimal-tools'
         tools.mkdir()
-        for tool in ('bash', 'dirname', 'mkdir', 'mktemp', 'cat'):
+        for tool in ('bash', 'dirname', 'mkdir', 'mktemp', 'chmod', 'cat'):
             binary = shutil.which(tool)
             assert binary is not None
             (tools / tool).symlink_to(binary)
         uname = tools / 'uname'
         uname.write_text('#!/bin/sh\necho Linux\n')
         uname.chmod(0o755)
-        env = dict(os.environ, PATH=str(tools))
+        home = self.root / 'home'
+        home.mkdir(mode=0o700)
+        env = dict(os.environ, PATH=str(tools), HOME=str(home))
         result = subprocess.run([str(tools / 'bash'), 'scripts/prepush.sh', '--lane', 'fast'],
                                 cwd=self.root, env=env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('MOTOR Linux build image is missing file(1)', result.stdout)
         self.assertNotIn('==> fast: fmt', result.stdout)
         self.assertNotIn('operator scripts, pins and dependency guards', result.stdout)
+
+    def run_private_scratch_probe(self):
+        lib = self.root / 'scripts/lib'
+        lib.mkdir(exist_ok=True)
+        shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', lib / 'prepush-lane.sh')
+        logs = self.root / 'target/scratch'
+        logs.mkdir(parents=True)
+        logs.chmod(0o775)
+        checkout = logs / 'checkouts/worker'
+        (checkout / 'scripts/lib').mkdir(parents=True)
+        for name in ('scripts/prepush.sh', 'scripts/lib/prepush-lane.sh', 'scripts/lib/prepush-report.sh'):
+            shutil.copy(ROOT / name, checkout / name)
+        home = self.root / 'home'
+        home.mkdir(mode=0o700)
+        tools = self.root / 'minimal-tools'
+        tools.mkdir()
+        for tool in ('bash', 'dirname', 'mkdir', 'mktemp', 'chmod', 'cat'):
+            binary = shutil.which(tool)
+            assert binary is not None
+            (tools / tool).symlink_to(binary)
+        for name, body in {
+            'uname': 'echo Linux',
+            'cc': 'exit 0',
+            'file': 'printf "TEST_TMPDIR=%s\\nTEST_UMASK=%s\\n" "$TMPDIR" "$(umask)"; exit 1',
+        }.items():
+            path = tools / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        env = dict(os.environ, PATH=str(tools), HOME=str(home))
+        result = subprocess.run([str(tools / 'bash'), 'scripts/prepush.sh', '--lane', 'fast'],
+                                cwd=checkout, env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result, logs
+
+    def test_test_processes_use_ci_umask_not_private_setup_umask(self):
+        result, _ = self.run_private_scratch_probe()
+        ambient = next(line.split('=', 1)[1] for line in result.stdout.splitlines()
+                       if line.startswith('TEST_UMASK='))
+        self.assertEqual(int(ambient, 8), 0o022,
+                         'owner-only tests must distinguish explicit modes from the ambient default')
+
+    def test_daemon_tmpdir_is_private_and_outside_group_writable_log_root(self):
+        result, logs = self.run_private_scratch_probe()
+        temporary = Path(next(line.split('=', 1)[1] for line in result.stdout.splitlines()
+                              if line.startswith('TEST_TMPDIR=')))
+        self.assertNotIn(logs, temporary.parents,
+                         'daemon connection files must not descend from the 0775 log directory')
+        self.assertEqual(temporary.stat().st_mode & 0o777, 0o700)
+        for parent in temporary.parents:
+            if parent == self.root:
+                break
+            self.assertEqual(parent.stat().st_mode & 0o022, 0, str(parent))
+
+    def test_windows_scratch_bootstrap_never_requests_unix_modes(self):
+        shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', self.root / 'scripts/lib/prepush-lane.sh')
+        real_mkdir = shutil.which('mkdir')
+        assert real_mkdir is not None
+        stubs = {
+            'uname': 'echo MINGW64_NT',
+            'cygpath': 'for value; do :; done; printf "%s\\n" "$value"',
+            'mkdir': 'for value; do case "$value" in -m|--mode*) echo "POSIX mode refused" >&2; exit 77;; esac; done\n'
+                     f'exec {shlex.quote(real_mkdir)} "$@"',
+            'chmod': 'echo "POSIX chmod refused" >&2; exit 77',
+            'rustc': 'printf reached > "$FIXTURE/toolchain-reached"; exit 66',
+            'powershell.exe': 'mkdir -p "$FIXTURE/target/scratch"; printf "%s\\n" "$FIXTURE/offline tools" > "$FIXTURE/target/scratch/prepush-windows.paths"',
+        }
+        for name, body in stubs.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        cargo = self.bin / 'cargo'
+        cargo.write_text('''#!/usr/bin/env python3
+import os,pathlib,sys
+assert 'prepush_scratch' in sys.argv and '--offline' in sys.argv
+root=pathlib.Path(os.environ['FIXTURE'])
+assert os.environ['PATH'].split(os.pathsep)[0] == str(root/'offline tools')
+(root/'native-helper-called').touch()
+scratch=root/'native-private-temp'; scratch.mkdir()
+print(scratch)
+''')
+        cargo.chmod(0o755)
+        env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', FIXTURE=str(self.root),
+                   CARGO_TARGET_DIR=str(self.root / 'cargo-cache'))
+        result = subprocess.run(['bash', 'scripts/prepush.sh', '--lane', 'windows'],
+                                cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 66, result.stdout + result.stderr)
+        self.assertTrue((self.root / 'native-helper-called').exists())
+        self.assertTrue((self.root / 'toolchain-reached').exists())
+        self.assertNotIn('POSIX', result.stderr)
+
+    def test_windows_input_refusal_precedes_any_cargo_bootstrap(self):
+        shutil.copy(ROOT / 'scripts/lib/prepush-lane.sh', self.root / 'scripts/lib/prepush-lane.sh')
+        stubs = {
+            'uname': 'echo MINGW64_NT',
+            'cygpath': 'for value; do :; done; printf "%s\\n" "$value"',
+            'powershell.exe': '''case "$*" in
+  *verify-prepush-inputs.ps1*"-InputsDirectory $PWD/prepush-inputs "*"-ToolsDirectory "*"-PathFile "*) ;;
+  *) echo 'wrong verifier invocation' >&2; exit 88;;
+esac
+echo 'prepush: NOT-RUN windows: offline input manifest.json is missing on the runner' >&2
+exit 200''',
+            'cargo': 'touch "$FIXTURE/cargo-reached"; exit 99',
+        }
+        for name, body in stubs.items():
+            path = self.bin / name
+            path.write_text('#!/bin/sh\n' + body + '\n')
+            path.chmod(0o755)
+        result = subprocess.run(['bash', 'scripts/prepush.sh', '--lane', 'windows'], cwd=self.root,
+                                env=dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}',
+                                         FIXTURE=str(self.root)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 200, result.stdout + result.stderr)
+        self.assertIn('offline input manifest.json', result.stderr)
+        self.assertFalse((self.root / 'cargo-reached').exists())
+
+    def test_windows_clean_check_allows_only_the_input_directory(self):
+        import re
+        source = (ROOT / 'scripts/lib/prepush-lane.sh').read_text()
+        match = re.search(r'^clean\(\) \{.*?^\}', source, re.M | re.S)
+        assert match is not None
+        command = match.group(0) + '\nplatform=windows; git() { if [ "$1" = status ]; then printf "%s" "$STATUS"; fi; }; clean\n'
+        for status, passed in (
+            ('', True), ('?? prepush-inputs/', True), ('?? other/', False),
+            ('?? prepush-inputs/\n M scripts/prepush.sh', False),
+        ):
+            with self.subTest(status=status):
+                result = subprocess.run(['bash', '-c', command], env=dict(os.environ, STATUS=status),
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, passed)
+
+
+class MotorTiming(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('motor_timing', ROOT / 'scripts/lib/prepush-motor-timing.py')
+        assert spec is not None and spec.loader is not None
+        self.timing = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.timing)
+        self.tmp = tempfile.TemporaryDirectory(prefix='prepush-timing-')
+        self.addCleanup(self.tmp.cleanup)
+        self.events = Path(self.tmp.name) / 'events.jsonl'
+
+    def test_request_gap_is_not_the_runner_reported_queue(self):
+        self.events.write_text('\n'.join(json.dumps(event) for event in (
+            {'type': 'accepted'},
+            {'type': 'started', 'started_at_ms': 1_501_000},
+            {'type': 'terminal', 'wall_ms': 227_000, 'queue_wait_ms': 8},
+        )))
+        result = self.timing.summarize(self.events, 1000, 300, 1_728_000)
+        self.assertEqual(result['request_to_start_ms'], 1_500_000)
+        self.assertEqual(result['run_ms'], 227_000)
+        self.assertEqual(result['reported_queue_ms'], 8)
+
+    def test_refused_job_has_no_execution_time(self):
+        self.events.write_text('{"type":"accepted"}\n')
+        result = self.timing.summarize(self.events, 1000, 100, 500)
+        self.assertIsNone(result['request_to_start_ms'])
+        self.assertIsNone(result['run_ms'])
+
+    def test_partial_record_does_not_hide_known_metadata_or_clock_skew(self):
+        self.events.write_text('{"type":"started","started_at_ms":900}\n{"partial":')
+        result = self.timing.summarize(self.events, 1000, 0, 500)
+        self.assertEqual(result['request_to_start_ms'], -100)
+        self.assertIsNone(result['run_ms'])
+
+    def test_critical_path_reports_last_finish_longest_runner_and_cpu_floor(self):
+        directory = self.events.parent
+        for name, start, run, cpus in (('portable', 1000, 1_300_000, 8),
+                                       ('second-wave', 1_000_000, 600_000, 8),
+                                       ('refused', None, None, 8)):
+            (directory / f'{name}.timing.json').write_text(json.dumps(
+                {'started_at_ms': start, 'run_ms': run, 'vcpus': cpus}))
+        result = self.timing.critical_path(directory, 1000, 1_601_000, 32)
+        self.assertEqual(result['longest_runner']['lane'], 'portable')
+        self.assertEqual(result['last_runner']['lane'], 'second-wave')
+        self.assertEqual(result['last_runner']['finish_after_start_ms'], 1_599_000)
+        self.assertEqual(result['end_to_end_ms'], 1_600_000)
+        self.assertEqual(result['known_reservation_floor_ms'], 475_000)
+        self.assertEqual(result['incomplete_lanes'], ['refused'])
+        with patch('sys.stdout', new_callable=io.StringIO) as output:
+            self.timing.print_critical_path(directory, 1000, 1_601_000, 32)
+        self.assertIn('20-minute floor exceeded: portable alone took 1300.000s', output.getvalue())
+        self.assertIn('timing coverage INCOMPLETE: refused', output.getvalue())
+        self.assertTrue((directory / 'critical-path.json').exists())
+
+    def test_no_runner_completion_does_not_claim_a_measured_critical_path(self):
+        directory = self.events.parent
+        (directory / 'refused.timing.json').write_text(json.dumps(
+            {'started_at_ms': None, 'run_ms': None, 'vcpus': 8}))
+        result = self.timing.critical_path(directory, 1000, 2000, 32)
+        self.assertIsNone(result['longest_runner'])
+        self.assertIsNone(result['last_runner'])
+        with patch('sys.stdout', new_callable=io.StringIO) as output:
+            self.timing.print_critical_path(directory, 1000, 2000, 32)
+        self.assertIn('critical path UNKNOWN', output.getvalue())
 
 
 class ArchiveShards(unittest.TestCase):
@@ -232,6 +934,20 @@ class ArchiveShards(unittest.TestCase):
         self.assertIn('differs from independent libtest', result.stderr)
         self.assertFalse(self.archive.exists())
 
+    def test_archive_build_uses_exported_target_but_replay_does_not_mix_build_options(self):
+        result = self.run_mode('build', str(self.archive), CARGO_TARGET_DIR='C:/t')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        archive = self.commands()[-1]
+        self.assertEqual(archive[archive.index('--target-dir')+1], 'C:/t')
+        self.events.unlink()
+        extracted = self.root / 'private-temp/replay'
+        result = self.run_mode('run', str(self.archive), '2/4', CARGO_TARGET_DIR='C:/t',
+                               BROCA_PREPUSH_ARCHIVE_EXTRACT_TO=str(extracted))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for command in self.commands():
+            self.assertNotIn('--target-dir', command)
+            self.assertEqual(command[command.index('--extract-to')+1], str(extracted))
+
     def test_run_uses_archive_partition_and_original_selection_without_compiling(self):
         result = self.run_mode('run', str(self.archive), '3/4')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -256,6 +972,11 @@ class ArchiveShards(unittest.TestCase):
     def test_test_failure_is_not_masked_by_tee(self):
         result = self.run_mode('run', str(self.archive), '1/4', RUN_EXIT='19')
         self.assertEqual(result.returncode, 19)
+
+    def test_unrun_warning_fails_shard_even_if_every_printed_test_passed(self):
+        result = self.run_mode('run', str(self.archive), '2/4', UNRUN_SHARD='1')
+        self.assertEqual(result.returncode, 100, result.stdout + result.stderr)
+        self.assertIn('tests were not run', result.stdout + result.stderr)
 
     def test_shard_reports_failure_output_immediately_without_stopping_other_tests(self):
         result = self.run_mode('run', str(self.archive), '1/4')
@@ -608,6 +1329,532 @@ class NatsInstall(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'no pinned NATS archive'):
                 self.installer.install(self.destination, 'Linux', 'aarch64')
         download.assert_not_called()
+
+    def test_windows_staged_archive_is_verified_without_network(self):
+        archive = self.archive('Windows')
+        source = Path(self.tmp.name) / 'staged.tar.gz'
+        source.write_bytes(archive)
+        target = self.installer.ARCHIVES['Windows'][0]
+        with patch.dict(self.installer.ARCHIVES, {
+            'Windows': (target, hashlib.sha256(archive).hexdigest())
+        }), patch.object(self.installer.urllib.request, 'urlopen') as download, \
+                patch.object(self.installer.subprocess, 'run', return_value=
+                             subprocess.CompletedProcess([], 0, 'nats-server: v2.10.26\n')):
+            binary = self.installer.install(self.destination, 'Windows', 'AMD64', source)
+        self.assertEqual(binary.read_bytes(), b'broker fixture')
+        download.assert_not_called()
+
+    def test_corrupt_staged_archive_refuses_without_network_or_execution(self):
+        source = Path(self.tmp.name) / 'corrupt.tar.gz'
+        source.write_bytes(b'corrupt')
+        with patch.object(self.installer.urllib.request, 'urlopen') as download, \
+                patch.object(self.installer.subprocess, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                self.installer.install(self.destination, 'Windows', 'AMD64', source)
+        download.assert_not_called()
+        run.assert_not_called()
+
+
+class WindowsOfflineInputs(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('prepush_inputs', ROOT / 'scripts/prepare-prepush-windows.py')
+        assert spec is not None and spec.loader is not None
+        self.inputs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.inputs)
+        self.tmp = tempfile.TemporaryDirectory(prefix='broca-offline-inputs-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_input_cache_is_verified_before_use_without_downloading_again(self):
+        cache = self.root / 'cache'
+        cache.mkdir()
+        (cache / 'asset').write_bytes(b'fixture')
+        with patch.object(self.inputs.urllib.request, 'urlopen') as download:
+            self.inputs.download('https://example.invalid/asset', self.root / 'output/asset',
+                                 'sha256', hashlib.sha256(b'fixture').digest(), cache)
+        self.assertEqual((self.root / 'output/asset').read_bytes(), b'fixture')
+        download.assert_not_called()
+
+    def test_corrupt_offline_input_is_not_silently_replaced(self):
+        cache = self.root / 'cache'
+        cache.mkdir()
+        (cache / 'asset').write_bytes(b'bad')
+        with patch.object(self.inputs.urllib.request, 'urlopen') as download:
+            with self.assertRaisesRegex(ValueError, 'mismatch for offline input'):
+                self.inputs.download('https://example.invalid/asset', self.root / 'output/asset',
+                                     'sha256', hashlib.sha256(b'fixture').digest(), cache)
+        self.assertFalse((self.root / 'output/asset').exists())
+        download.assert_not_called()
+
+    def test_runtime_pins_are_literal_and_complete(self):
+        assets = self.inputs.settings(ROOT / 'scripts/lib/prepush-assets.conf')
+        prefixes = ('NODE_LINUX', 'NODE_WINDOWS', 'CMAKE_WINDOWS', 'NINJA_WINDOWS')
+        self.assertEqual(set(assets), {p + suffix for p in prefixes for suffix in ('_URL', '_SHA256')})
+        for prefix in prefixes:
+            self.assertTrue(assets[prefix + '_URL'].startswith('https://'))
+            self.assertRegex(assets[prefix + '_SHA256'], r'^[a-f0-9]{64}$')
+
+    def test_windows_runtime_download_helper_is_not_available(self):
+        result = subprocess.run(['bash', str(ROOT / 'scripts/lib/prepush-tools.sh'),
+                                 'windows', str(self.root)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('runtime downloads are Linux-only', result.stderr)
+
+    def test_snapshot_visibility_rejects_ignored_inputs(self):
+        repository = self.root / 'repo'
+        subprocess.run(['git', 'init', '-q', str(repository)], check=True, capture_output=True)
+        (repository / '.gitignore').write_text('/target/\n')
+        inputs = repository / 'prepush-inputs'
+        inputs.mkdir()
+        (inputs / 'manifest.json').write_text('{}')
+        self.inputs.require_snapshot_visibility(inputs)
+        (repository / '.gitignore').write_text('/prepush-inputs/\n')
+        with self.assertRaisesRegex(ValueError, 'directory is ignored'):
+            self.inputs.require_snapshot_visibility(inputs)
+
+    def test_snapshot_visibility_rejects_motor_excluded_target_without_gitignore(self):
+        repository = self.root / 'repo'
+        subprocess.run(['git', 'init', '-q', str(repository)], check=True, capture_output=True)
+        inputs = repository / 'target/prepush-inputs'
+        inputs.mkdir(parents=True)
+        (inputs / 'manifest.json').write_text('{}')
+        with self.assertRaisesRegex(ValueError, 'worktree-root prepush-inputs/'):
+            self.inputs.require_snapshot_visibility(inputs)
+
+    def test_snapshot_visibility_checks_individual_files_against_git_excludes_and_index(self):
+        repository = self.root / 'repo'
+        subprocess.run(['git', 'init', '-q', str(repository)], check=True, capture_output=True)
+        inputs = repository / 'prepush-inputs'
+        inputs.mkdir()
+        (inputs / 'manifest.json').write_text('{}')
+        (inputs / 'package.tgz').write_bytes(b'package')
+        with (repository / '.git/info/exclude').open('a') as out:
+            out.write('\n*.tgz\n')
+        with self.assertRaisesRegex(ValueError, 'ignored or tracked.*package.tgz'):
+            self.inputs.require_snapshot_visibility(inputs)
+        (inputs / 'package.tgz').unlink()
+        subprocess.run(['git', '-C', str(repository), 'add', 'prepush-inputs/manifest.json'], check=True)
+        with self.assertRaisesRegex(ValueError, 'ignored or tracked.*manifest.json'):
+            self.inputs.require_snapshot_visibility(inputs)
+
+    def test_ignored_input_directory_is_refused_before_downloading(self):
+        repository = self.root / 'repo'
+        subprocess.run(['git', 'init', '-q', str(repository)], check=True, capture_output=True)
+        (repository / '.gitignore').write_text('/prepush-inputs/\n')
+        with patch.object(self.inputs, 'download') as download:
+            with self.assertRaisesRegex(ValueError, 'directory is ignored'):
+                self.inputs.prepare(repository / 'prepush-inputs', self.root / 'sources',
+                                    self.root / 'cache', snapshot_visible=True)
+        download.assert_not_called()
+
+    def test_shallow_bundle_refusal_is_reproduced_then_staged_history_imports(self):
+        origin = self.root / 'origin'
+        subprocess.run(['git', 'init', '-q', str(origin)], check=True, capture_output=True)
+        for text in ('first\n', 'pinned\n'):
+            (origin / 'source.txt').write_text(text)
+            subprocess.run(['git', '-C', str(origin), 'add', 'source.txt'], check=True, capture_output=True)
+            subprocess.run(['git', '-C', str(origin), '-c', 'user.name=Test',
+                            '-c', 'user.email=test@example.invalid', '-c', 'core.hooksPath=/dev/null',
+                            'commit', '-qm', 'fixture'], check=True, capture_output=True)
+        pin = subprocess.check_output(['git', '-C', str(origin), 'rev-parse', 'HEAD'], text=True).strip()
+        parent = subprocess.check_output(['git', '-C', str(origin), 'rev-parse', 'HEAD^'], text=True).strip()
+        siblings = self.root / 'siblings'
+        siblings.mkdir()
+        shallow = siblings / 'subconscious'
+        subprocess.run(['git', 'clone', '-q', '--depth', '1', origin.as_uri(), str(shallow)],
+                       check=True, capture_output=True)
+        bad_bundle = self.root / 'shallow.bundle'
+        subprocess.run(['git', '-C', str(shallow), 'bundle', 'create', str(bad_bundle), 'HEAD'],
+                       check=True, capture_output=True)
+        receiver = self.root / 'receiver'
+        subprocess.run(['git', 'init', '-q', str(receiver)], check=True, capture_output=True)
+        refused = subprocess.run(['git', '-C', str(receiver), 'fetch', str(bad_bundle), 'HEAD'],
+                                 capture_output=True, text=True)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(parent, refused.stderr)
+        self.assertIn('Failed to traverse parents of commit ' + pin, refused.stderr)
+        self.assertIn('did not send all necessary objects', refused.stderr)
+        print('reproduced shallow-input refusal:', refused.stderr.strip())
+
+        output, cache = self.root / 'inputs', self.root / 'cache'
+        real_settings, real_checkout = self.inputs.settings, self.inputs.checkout
+
+        def settings(path):
+            return {'SUBC_REV': pin, 'CLAUSTRUM_REV': pin} if path.name == 'ci-fixture-revisions.conf' else real_settings(path)
+
+        def checkout(repository, revision, destination, **kwargs):
+            return real_checkout(repository, revision, destination, remote_url=origin.as_uri(), **kwargs)
+
+        def download(url, destination, algorithm, expected, cache):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b'fixture')
+            cache.mkdir(parents=True, exist_ok=True)
+
+        def cargo_vendor(output, sources, source_cache):
+            for name in ('fixture-cargo-sources.tar.gz', 'fixture-cargo-subconscious.toml', 'fixture-cargo-claustrum.toml'):
+                (output / name).write_bytes(b'fixture')
+            return {'file': 'fixture-cargo-sources.tar.gz', 'graphs': {}}
+
+        with patch.object(self.inputs, 'settings', side_effect=settings), \
+                patch.object(self.inputs, 'checkout', side_effect=checkout), \
+                patch.object(self.inputs, 'download', side_effect=download), \
+                patch.object(self.inputs, 'prepare_cargo_vendor', side_effect=cargo_vendor):
+            self.inputs.prepare(output, siblings, cache)
+        self.assertEqual(subprocess.check_output(['git', '-C', str(shallow), 'rev-parse',
+                                                 '--is-shallow-repository'], text=True).strip(), 'false')
+        good_bundle = output / 'subconscious-source.bundle'
+        fetched = subprocess.run(['git', '-C', str(receiver), 'fetch', str(good_bundle), 'HEAD'],
+                                 capture_output=True, text=True)
+        self.assertEqual(fetched.returncode, 0, fetched.stderr)
+        self.assertEqual(subprocess.check_output(['git', '-C', str(receiver), 'show',
+                                                 'FETCH_HEAD:source.txt'], text=True), 'pinned\n')
+        extracted = self.root / 'plain-vault'
+        self.inputs.extract_source(output, 'claustrum', pin, extracted)
+        self.assertEqual((extracted / 'source.txt').read_text(), 'pinned\n')
+        self.assertFalse((extracted / '.git').exists())
+        transport = json.loads((output / 'transport-manifest.json').read_text())
+        listed = {entry['name']: entry for entry in transport['files']}
+        self.assertEqual(set(listed), {path.name for path in output.iterdir()} - {'transport-manifest.json'})
+        self.assertTrue(set(listed) - {'manifest.json', 'subconscious-source.bundle',
+                                     'claustrum-source.tar'})
+        tool_archives = {'node-v24.11.1-win-x64.zip', 'cmake-4.4.5-windows-x86_64.zip', 'ninja-win.zip'}
+        cargo_files = {'fixture-cargo-sources.tar.gz', 'fixture-cargo-subconscious.toml', 'fixture-cargo-claustrum.toml'}
+        self.assertTrue(tool_archives <= set(listed))
+        self.assertTrue(cargo_files <= set(listed))
+        self.assertTrue(all(name in {'manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar'} | tool_archives | cargo_files
+                            or name.endswith('.tgz') for name in listed))
+        self.assertIn('manifest.json', listed)
+        self.assertIn('subconscious-source.bundle', listed)
+        self.assertIn('claustrum-source.tar', listed)
+        for name, entry in listed.items():
+            data = (output / name).read_bytes()
+            self.assertEqual(entry['size'], len(data))
+            self.assertEqual(entry['sha256'], hashlib.sha256(data).hexdigest())
+
+    def test_source_archive_checksum_and_pin_are_required_before_extracting(self):
+        inputs = self.root / 'inputs'
+        inputs.mkdir()
+        (inputs / 'source.tar').write_bytes(b'corrupt')
+        manifest = {'source_archives': {'claustrum': {
+            'revision': 'a' * 40, 'file': 'source.tar',
+            'sha256': hashlib.sha256(b'approved').hexdigest(),
+        }}}
+        (inputs / 'manifest.json').write_text(json.dumps(manifest))
+        destination = self.root / 'extracted'
+        with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+            self.inputs.extract_source(inputs, 'claustrum', 'a' * 40, destination)
+        with self.assertRaisesRegex(ValueError, 'pinned revision'):
+            self.inputs.extract_source(inputs, 'claustrum', 'b' * 40, destination)
+        self.assertFalse(destination.exists())
+
+
+class CargoVendorInputs(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('vendor_inputs', ROOT / 'scripts/prepare-prepush-windows.py')
+        assert spec is not None and spec.loader is not None
+        self.helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.helper)
+        self.tmp = tempfile.TemporaryDirectory(prefix='broca-vendor-inputs-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.vendor = self.root / 'vendor'
+        self.vendor.mkdir()
+        self.lock = self.root / 'Cargo.lock'
+        self.lock.write_text('''version = 4
+[[package]]
+name = "fixture"
+version = "0.1.0"
+[[package]]
+name = "registry-dependency"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "''' + '1' * 64 + '''"
+[[package]]
+name = "tryhard"
+version = "0.5.0"
+source = "git+https://example.invalid/commons?rev=012345#012345"
+[[package]]
+name = "windows-sys"
+version = "0.61.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "''' + '2' * 64 + '''"
+''')
+        for name, version, checksum in (('registry-dependency', '1.0.0', '1' * 64),
+                                         ('tryhard', '0.5.0', None), ('windows-sys', '0.61.0', '2' * 64)):
+            directory = self.vendor / f'{name}-{version}'
+            directory.mkdir()
+            (directory / 'Cargo.toml').write_text(f'[package]\nname = "{name}"\nversion = "{version}"\n')
+            (directory / '.cargo-checksum.json').write_text(json.dumps({'package': checksum, 'files': {}}))
+
+    def test_staged_registry_covers_every_locked_registry_git_and_windows_package(self):
+        packages = self.helper.locked_packages(self.lock)
+        inventory = self.helper.verify_vendor_coverage(packages, self.vendor)
+        self.assertEqual({package['name'] for package in inventory},
+                         {'registry-dependency', 'tryhard', 'windows-sys'})
+        self.assertTrue(next(package for package in inventory if package['name'] == 'tryhard')['source'].startswith('git+'))
+
+    def test_missing_git_or_target_specific_package_is_not_a_complete_closure(self):
+        for name in ('tryhard-0.5.0', 'windows-sys-0.61.0'):
+            with self.subTest(name=name):
+                path = self.vendor / name
+                removed = self.root / name
+                path.rename(removed)
+                try:
+                    with self.assertRaisesRegex(ValueError, 'missing vendored Cargo package'):
+                        self.helper.verify_vendor_coverage(self.helper.locked_packages(self.lock), self.vendor)
+                finally:
+                    removed.rename(path)
+
+    def test_registry_package_checksum_must_match_the_lockfile(self):
+        checksum = self.vendor / 'registry-dependency-1.0.0/.cargo-checksum.json'
+        checksum.write_text(json.dumps({'package': '9' * 64, 'files': {}}))
+        with self.assertRaisesRegex(ValueError, 'registry-dependency 1.0.0'):
+            self.helper.verify_vendor_coverage(self.helper.locked_packages(self.lock), self.vendor)
+
+    def stage(self):
+        output = self.root / 'inputs'
+        output.mkdir()
+        sources = {}
+        for name in ('subconscious', 'claustrum'):
+            source = self.root / name
+            source.mkdir()
+            shutil.copy(self.lock, source / 'Cargo.lock')
+            sources[name] = source
+
+        def vendor(command, **kwargs):
+            self.assertEqual(command[:4], ['cargo', 'vendor', '--locked', '--versioned-dirs'])
+            self.assertEqual(kwargs['env']['CARGO_NET_OFFLINE'], 'false')
+            destination = Path(command[-1])
+            shutil.copytree(self.vendor, destination)
+            return '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = ' + json.dumps(str(destination)) + '\n'
+
+        with patch.object(self.helper.subprocess, 'check_output', side_effect=vendor):
+            entry = self.helper.prepare_cargo_vendor(output, sources, self.root)
+        (output / 'manifest.json').write_text(json.dumps({'cargo_vendor': entry}))
+        return output, entry, {name: source / 'Cargo.lock' for name, source in sources.items()}
+
+    def test_each_fixture_gets_an_independent_verified_offline_source_config(self):
+        output, entry, locks = self.stage()
+        destination = self.root / 'extracted'
+        self.helper.extract_cargo_vendor(output, destination, locks)
+        for name in ('subconscious', 'claustrum'):
+            config = tomllib.loads((destination / '.configs' / f'{name}.toml').read_text())
+            self.assertEqual(config['source']['vendored-sources']['directory'], (destination / name).as_posix())
+            self.assertEqual(len(entry['graphs'][name]['packages']), 3)
+            self.assertTrue((destination / name / 'tryhard-0.5.0/Cargo.toml').exists())
+
+    def test_changed_lockfile_cannot_use_a_different_staged_closure(self):
+        output, _, locks = self.stage()
+        locks['subconscious'].write_text(self.lock.read_text() + '\n# different lock\n')
+        with self.assertRaisesRegex(ValueError, 'pinned lockfile'):
+            self.helper.extract_cargo_vendor(output, self.root / 'extracted', locks)
+
+    def test_verified_source_cache_reuse_preserves_cargo_input_mtimes(self):
+        output, _, locks = self.stage()
+        destination = self.root / 'extracted'
+        self.helper.extract_cargo_vendor(output, destination, locks)
+        paths = [destination / 'subconscious/tryhard-0.5.0/Cargo.toml',
+                 destination / '.configs/subconscious.toml']
+        for path in paths:
+            os.utime(path, ns=(100_000_000, 100_000_000))
+        self.helper.extract_cargo_vendor(output, destination, locks)
+        self.assertEqual([path.stat().st_mtime_ns for path in paths], [100_000_000, 100_000_000])
+
+    def test_cargo_archive_checksum_is_checked_before_extraction(self):
+        output, entry, locks = self.stage()
+        (output / entry['file']).write_bytes(b'bad archive')
+        destination = self.root / 'extracted'
+        with self.assertRaisesRegex(ValueError, 'checksum/name mismatch'):
+            self.helper.extract_cargo_vendor(output, destination, locks)
+        self.assertFalse(destination.exists())
+
+
+class WindowsInputVerification(unittest.TestCase):
+    def setUp(self):
+        self.powershell = shutil.which('powershell.exe') or shutil.which('pwsh')
+        if self.powershell is None:
+            self.skipTest('PowerShell is required to execute the native Windows input verifier')
+        self.tmp = tempfile.TemporaryDirectory(prefix='broca-input-verification-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.inputs = self.root / 'inputs'
+        self.inputs.mkdir()
+        self.files = []
+        for name in ('manifest.json', 'subconscious-source.bundle', 'claustrum-source.tar', 'package.tgz',
+                     'fixture-cargo-sources.tar.gz', 'fixture-cargo-subconscious.toml', 'fixture-cargo-claustrum.toml'):
+            data = ('verified fixture ' + name).encode()
+            (self.inputs / name).write_bytes(data)
+            self.files.append({'name': name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        archives = {
+            'node-v24.11.1-win-x64.zip': ('node-v24.11.1-win-x64/node.exe', 'node-v24.11.1-win-x64/npm.cmd'),
+            'cmake-4.4.5-windows-x86_64.zip': ('cmake-4.4.5-windows-x86_64/bin/cmake.exe',),
+            'ninja-win.zip': ('ninja.exe',),
+        }
+        for name, members in archives.items():
+            data = io.BytesIO()
+            with zipfile.ZipFile(data, 'w') as archive:
+                for member in members:
+                    archive.writestr(member, b'fixture executable')
+            content = data.getvalue()
+            (self.inputs / name).write_bytes(content)
+            self.files.append({'name': name, 'size': len(content), 'sha256': hashlib.sha256(content).hexdigest()})
+        self.write_manifest()
+        self.tools = {
+            'python.exe': 'Python 3.14.0', 'node.exe': 'v24.11.1', 'npm.cmd': '11.6.0',
+            'nats-server.exe': 'nats-server: v2.15.0',
+            'cmake.exe': 'cmake version 4.4.5\n\nCMake suite maintained and supported by Kitware',
+            'ninja.exe': '1.13.2', 'bun.exe': '1.4.4',
+        }
+
+    def write_manifest(self):
+        (self.inputs / 'transport-manifest.json').write_text(json.dumps({'version': 1, 'files': self.files}))
+
+    def verify(self, *, missing=None, bad_exit=None, usable_fallback=False):
+        def quote(value):
+            return "'" + str(value).replace("'", "''") + "'"
+        functions = []
+        offline = {'node.exe': 'v24.11.1', 'npm.cmd': '11.6.0',
+                   'cmake.exe': 'cmake version 4.4.5', 'ninja.exe': '1.13.2'}
+        for name, version in self.tools.items():
+            body = "throw 'fixture tool is missing'" if name == missing else (
+                f"Write-Host 'TOOL-CALLED {name}'; Write-Output {quote(version)}; "
+                f"$global:LASTEXITCODE = {9 if name == bad_exit else 0}")
+            if usable_fallback and name in ('node.exe', 'npm.cmd', 'cmake.exe', 'ninja.exe'):
+                body = (f"if (Test-Path {quote(self.root / 'tools')}) {{ "
+                        f"if (Get-ChildItem -LiteralPath {quote(self.root / 'tools')} -Recurse -Filter {quote(name)}) {{ "
+                        f"Write-Output {quote(offline[name])}; $global:LASTEXITCODE = 0; return }} }}; " + body)
+            functions.append(f'function global:{name} {{ {body} }}')
+        command = '\n'.join(functions) + (
+            f"\n& {quote(ROOT / 'scripts/lib/verify-prepush-inputs.ps1')} -InputsDirectory {quote(self.inputs)} "
+            f"-ToolsDirectory {quote(self.root / 'tools')} -PathFile {quote(self.root / 'paths')}; "
+            'exit $LASTEXITCODE')
+        assert self.powershell is not None
+        return subprocess.run([self.powershell, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                               '-Command', command], capture_output=True, text=True)
+
+    def assert_refused(self, result, name):
+        self.assertEqual(result.returncode, 200, result.stdout + result.stderr)
+        self.assertIn('NOT-RUN windows:', result.stderr)
+        self.assertIn(name.lower(), result.stderr.lower())
+
+    def test_valid_inputs_check_every_image_tool(self):
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('verified 10 offline input files', result.stdout)
+        self.assertEqual(result.stdout.count('TOOL-CALLED'), 7)
+        for name in self.tools:
+            self.assertIn('TOOL-CALLED ' + name, result.stdout)
+        self.assertFalse((self.root / 'tools').exists())
+        self.assertEqual((self.root / 'paths').read_text(), '')
+
+    def test_bun_1_4_patch_versions_are_accepted(self):
+        for version in ('1.4.0', '1.4.2', '1.4.4', '1.4.99'):
+            with self.subTest(version=version):
+                self.tools['bun.exe'] = version
+                result = self.verify()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('prepush: tool Bun ' + version, result.stdout)
+
+    def test_missing_manifest_refuses_before_tools(self):
+        (self.inputs / 'transport-manifest.json').unlink()
+        result = self.verify()
+        self.assert_refused(result, 'transport-manifest.json')
+        self.assertNotIn('TOOL-CALLED', result.stdout)
+
+    def test_missing_size_or_digest_mismatch_refuses_before_tools(self):
+        path = self.inputs / 'package.tgz'
+        original = path.read_bytes()
+        for label, data in (('missing', None), ('size', b'truncated'), ('SHA256', b'x' * len(original))):
+            with self.subTest(label=label):
+                path.unlink(missing_ok=True)
+                if data is not None:
+                    path.write_bytes(data)
+                result = self.verify()
+                self.assert_refused(result, 'package.tgz')
+                self.assertIn(label, result.stderr)
+                self.assertNotIn('TOOL-CALLED', result.stdout)
+
+    def test_invalid_manifest_metadata_is_not_run(self):
+        self.files[0]['size'] = 'not a size'
+        self.write_manifest()
+        result = self.verify()
+        self.assert_refused(result, 'manifest.json')
+        self.assertNotIn('TOOL-CALLED', result.stdout)
+
+    def test_incomplete_or_duplicate_inventory_refuses(self):
+        self.files.pop(0)
+        self.write_manifest()
+        result = self.verify()
+        self.assert_refused(result, 'manifest.json')
+        self.files.append(dict(self.files[0], name=self.files[0]['name'].upper()))
+        self.write_manifest()
+        self.assert_refused(self.verify(), self.files[0]['name'].upper())
+
+    def test_unlisted_file_refuses(self):
+        (self.inputs / 'unlisted.zip').write_bytes(b'not inventoried')
+        result = self.verify()
+        self.assert_refused(result, 'unlisted.zip')
+        self.assertNotIn('TOOL-CALLED', result.stdout)
+
+    def test_each_missing_or_wrong_tool_refuses_when_no_usable_fallback(self):
+        for name in self.tools:
+            with self.subTest(missing=name):
+                self.assert_refused(self.verify(missing=name), name.split('.')[0])
+            with self.subTest(wrong=name):
+                version = self.tools[name]
+                self.tools[name] = 'unsupported version'
+                try:
+                    self.assert_refused(self.verify(), name.split('.')[0])
+                finally:
+                    self.tools[name] = version
+
+    def test_supported_format_but_wrong_pinned_tool_version_refuses(self):
+        for name, wrong in (('python.exe', 'Python 3.13.5'), ('node.exe', 'v20.20.2'),
+                            ('nats-server.exe', 'nats-server: v2.10.26'), ('bun.exe', '1.3.9'),
+                            ('bun.exe', '1.5.0'), ('bun.exe', '1.4.4-canary')):
+            with self.subTest(name=name):
+                version = self.tools[name]
+                self.tools[name] = wrong
+                try:
+                    self.assert_refused(self.verify(), name.split('.')[0])
+                finally:
+                    self.tools[name] = version
+
+    def test_tool_failure_is_not_hidden_by_valid_version_output(self):
+        self.assert_refused(self.verify(bad_exit='node.exe'), 'Node')
+
+    def test_missing_node_and_wrong_cmake_ninja_use_verified_offline_tools(self):
+        self.tools['cmake.exe'] = 'cmake version 3.31.0'
+        self.tools['ninja.exe'] = '1.12.1'
+        result = self.verify(missing='node.exe', usable_fallback=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for archive in ('node-v24.11.1-win-x64.zip', 'cmake-4.4.5-windows-x86_64.zip', 'ninja-win.zip'):
+            self.assertIn('from ' + archive, result.stdout)
+        paths = (self.root / 'paths').read_text().splitlines()
+        self.assertEqual(len(paths), 3)
+        self.assertTrue(all(Path(path).is_dir() for path in paths))
+
+    def test_missing_npm_replaces_node_and_npm_together(self):
+        result = self.verify(missing='npm.cmd', usable_fallback=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('using verified offline Node/npm', result.stdout)
+        self.assertNotIn('using verified offline CMake', result.stdout)
+        self.assertNotIn('using verified offline Ninja', result.stdout)
+        self.assertEqual(len((self.root / 'paths').read_text().splitlines()), 1)
+
+    def test_runtime_archive_bytes_are_checked_even_when_image_tools_match(self):
+        for name in ('node-v24.11.1-win-x64.zip', 'cmake-4.4.5-windows-x86_64.zip', 'ninja-win.zip'):
+            path = self.inputs / name
+            data = path.read_bytes()
+            for broken in (None, b'x' * len(data)):
+                with self.subTest(name=name, missing=broken is None):
+                    path.unlink()
+                    if broken is not None:
+                        path.write_bytes(broken)
+                    result = self.verify(usable_fallback=True)
+                    self.assert_refused(result, name)
+                    self.assertNotIn('TOOL-CALLED', result.stdout)
+                    path.write_bytes(data)
 
 
 class FixtureUnpack(unittest.TestCase):

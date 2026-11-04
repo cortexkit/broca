@@ -9,6 +9,9 @@ trap - EXIT
 mode="${1:-}"
 archive="${2:-}"
 [[ -n "$archive" ]] || { echo 'usage: ci-integration.sh build ARCHIVE | run ARCHIVE K/N' >&2; exit 2; }
+target_args=()
+# Build options are incompatible with --archive-file during nextest replay.
+[[ -z "${CARGO_TARGET_DIR:-}" ]] || target_args=(--target-dir "$CARGO_TARGET_DIR")
 case "$mode" in
   build)
     cargo_count="$(count_cargo_integration_tests)"
@@ -18,14 +21,17 @@ case "$mode" in
       echo 'integration inventory is empty or differs from independent libtest discovery' >&2
       exit 1
     fi
-    cargo nextest archive --locked --workspace "${cargo_feature_args[@]}" --archive-file "$archive"
+    # Bash 3.2 treats an empty array as unset under nounset; omit optional words.
+    cargo nextest archive --locked --workspace "${cargo_feature_args[@]}" ${target_args[@]+"${target_args[@]}"} --archive-file "$archive"
     ;;
   run)
     partition="${3:-}"
     [[ "$partition" =~ ^[1-9][0-9]*/[1-9][0-9]*$ ]] || { echo 'expected partition K/N' >&2; exit 2; }
-    # Hosted jobs check out to the same absolute path. Extract to that checkout,
-    # not a temporary target: some tests embed Cargo's binary path at build time.
-    base=(cargo nextest run --archive-file "$archive" --workspace-remap "$root" --extract-to "$root" --extract-overwrite -P ci)
+    # Hosted CI keeps its checkout extraction. Same-job Windows prepush retains
+    # the original built binaries and extracts privately to avoid its target junction.
+    extract_to="${BROCA_PREPUSH_ARCHIVE_EXTRACT_TO:-$root}"
+    mkdir -p "$extract_to"
+    base=(cargo nextest run --archive-file "$archive" --workspace-remap "$root" --extract-to "$extract_to" --extract-overwrite -P ci)
     # Run the feature-only clock proof on every shard as well as in its normal
     # partition. A listed test is not evidence that the feature actually works.
     clock_output="$(mktemp)"
