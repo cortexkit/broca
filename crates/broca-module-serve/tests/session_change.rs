@@ -840,3 +840,108 @@ async fn pending_model_mismatch_writes_nothing_keeps_pending_and_allows_both_rec
         rig.finish().await;
     }
 }
+
+fn capture_runner_scope_sample(name: &str, frame: &Frame) {
+    if let Some(root) = std::env::var_os("BROCA_LLM_RUNNER_SAMPLE_DIR") {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(name), &frame.body).unwrap();
+    }
+}
+
+async fn unwritten_flow_ready(tag: &str) -> (Rig, Arc<Admitter>, Value) {
+    let mut rig = Rig::start_with_scopes(tag).await;
+    let stamp = serde_json::from_value(json!({
+        "owner":{"kind":"reserved","module_id":"owner-module"},
+        "ref":"synthetic-flow","scope_epoch":1,"kind":"head","owner_authorized":true,
+        "attributes":{"flow_id":"synthetic-flow"}
+    }))
+    .unwrap();
+    rig.bind_with_scope(
+        7,
+        Some(Principal::Reserved {
+            module_id: "flow-carrier".into(),
+        }),
+        Some(stamp),
+    )
+    .await;
+    let admitter = Arc::new(Admitter::default());
+    rig.registry().set_plan_admitter(admitter.clone());
+    let initial = plan(&[], "original system");
+    (rig, admitter, initial)
+}
+
+async fn frozen_flow_ready(tag: &str) -> (Rig, Arc<Admitter>, Value) {
+    let (mut rig, admitter, initial) = unwritten_flow_ready(tag).await;
+    rig.script.push(&[Step::Text("first")]);
+    let sent = send(&mut rig, "first", Some(initial.clone()), "fake").await;
+    assert_eq!(sent.header.ty, FrameType::Response, "{sent:?}");
+    rig.wait_idle().await;
+    (rig, admitter, initial)
+}
+
+#[tokio::test]
+async fn frozen_flow_send_refuses_other_plan_senders_before_writes() {
+    let (mut rig, admitter, mut changed) = frozen_flow_ready("frozen-plan-send").await;
+    changed["senders"] = json!([{"module":"owner-module"}]);
+    let before = rig.wal_bytes();
+    let fetched = admitter.0.load(Ordering::SeqCst);
+    let refused = send(&mut rig, "refused", Some(changed), "fake").await;
+    capture_runner_scope_sample("plan.senders.send.json", &refused);
+    assert_eq!(refused.header.ty, FrameType::Error);
+    let error: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(error["code"], "invalid_params");
+    assert_eq!(error["detail"]["field"], "plan.senders");
+    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(admitter.0.load(Ordering::SeqCst), fetched);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn frozen_flow_refresh_refuses_other_plan_senders_before_writes() {
+    let (mut rig, admitter, mut changed) = frozen_flow_ready("frozen-plan-refresh").await;
+    rig.bind_as(
+        7,
+        Some(Principal::Reserved {
+            module_id: "owner-module".into(),
+        }),
+    )
+    .await;
+    changed["senders"] = json!([{"module":"owner-module"}]);
+    let before = rig.wal_bytes();
+    let fetched = admitter.0.load(Ordering::SeqCst);
+    let refused = refresh(&mut rig, &changed, "immediately", 1).await;
+    capture_runner_scope_sample("plan.senders.refresh.json", &refused);
+    assert_eq!(refused.header.ty, FrameType::Error);
+    let error: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(error["code"], "invalid_params");
+    assert_eq!(error["detail"]["field"], "plan.senders");
+    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(admitter.0.load(Ordering::SeqCst), fetched);
+    changed["senders"] = json!([{"module":"flow-carrier"}]);
+    assert_eq!(
+        refresh(&mut rig, &changed, "immediately", 1)
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn flow_creation_refuses_other_plan_senders_before_actor_open() {
+    let (mut rig, admitter, mut changed) = unwritten_flow_ready("frozen-plan-create").await;
+    changed["senders"] = json!([{"module":"owner-module"}]);
+    let before = rig.wal_bytes();
+    let refused = send(&mut rig, "refused", Some(changed), "fake").await;
+    assert_eq!(refused.header.ty, FrameType::Error);
+    let error: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(error["code"], "invalid_params");
+    assert_eq!(error["detail"]["field"], "plan.senders");
+    assert_eq!(rig.wal_bytes(), before);
+    assert_eq!(admitter.0.load(Ordering::SeqCst), 0);
+    rig.finish().await;
+}

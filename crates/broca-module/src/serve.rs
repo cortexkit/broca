@@ -620,6 +620,19 @@ fn baseline_owner_mismatch(
     }
 }
 
+/// A frozen automation's plan may grant sends only to the sender recorded in its
+/// flow/run scope. Reserved principals use the module spelling carried by `plan.senders`,
+/// not the owner spelling.
+pub fn scope_plan_opener(scope: &broca_protocol::SessionScope) -> Option<String> {
+    if scope.flow_id.is_none() && scope.run_id.is_none() {
+        return None;
+    }
+    scope.sender.as_ref().map(|sender| match sender {
+        broca_protocol::BindPrincipal::Reserved { module_id } => module_id.clone(),
+        other => other.as_owner_string(),
+    })
+}
+
 /// The final assistant message of the completed run `run_id`: the last assistant message of the
 /// transcript as it stood when that run's episode ended. Its text parts are joined in order with
 /// nothing inserted, and its reasoning parts are left out.
@@ -2173,6 +2186,12 @@ pub trait ServeHandler: Send + Sync {
         PlanState::Unknown
     }
 
+    /// The durable flow/run opener, if this session has frozen one. Reads and ordinary
+    /// unscoped or plain-scoped sessions keep their existing admission policy.
+    async fn frozen_scope_opener(&self, _session: &LineageKey) -> Option<String> {
+        None
+    }
+
     /// What admits a send's fetch plan. The default has none, so such a send is refused.
     fn plan_admitter(&self) -> Option<std::sync::Arc<dyn broca_fetch_plan::PlanAdmitter>> {
         None
@@ -2894,6 +2913,14 @@ impl ServeHandler for crate::LineageRegistry {
                     .map(|manifest| manifest.plan_identity.clone()),
             },
         }
+    }
+
+    async fn frozen_scope_opener(&self, session: &LineageKey) -> Option<String> {
+        self.session_ownership_for_bind(session)
+            .await
+            .and_then(|ownership| ownership.scope)
+            .as_ref()
+            .and_then(scope_plan_opener)
     }
 
     fn plan_admitter(&self) -> Option<std::sync::Arc<dyn broca_fetch_plan::PlanAdmitter>> {
@@ -4125,6 +4152,21 @@ impl ServeHandler for crate::LineageRegistry {
         if let Some(mismatch) = baseline_owner_mismatch(start, principal, scope) {
             return Err(SessionChangeError::OwnerMismatch(Box::new(mismatch)));
         }
+        let opener = records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.record {
+                broca_wal::WalRecord::RunStarted {
+                    scope: Some(scope), ..
+                } => scope_plan_opener(scope),
+                _ => None,
+            });
+        let senders =
+            broca_fetch_plan::plan_senders(&plan).map_err(SessionChangeError::FetchRefused)?;
+        cortexkit_role_llm_runner::scope_admission::check_plan_senders(opener.as_deref(), &senders)
+            .map_err(|field| {
+                SessionChangeError::FetchRefused(broca_fetch_plan::Refusal::invalid(field))
+            })?;
         if !rungs::ALL.contains(&policy.as_str()) {
             return Err(SessionChangeError::InvalidParams {
                 field: "policy".into(),

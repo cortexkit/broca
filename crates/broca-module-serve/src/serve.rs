@@ -5126,6 +5126,15 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
         Err(refusal) => return Err(refusal.into()),
     };
     let plan_state = handler.plan_state(session).await;
+    let opener = handler
+        .frozen_scope_opener(session)
+        .await
+        .or_else(|| scope.and_then(broca_module::serve::scope_plan_opener));
+    cortexkit_role_llm_runner::scope_admission::check_plan_senders(
+        opener.as_deref(),
+        &parsed.senders,
+    )
+    .map_err(broca_fetch_plan::Refusal::invalid)?;
     // A new plan names its compaction preset before any other send member is weighed, so a
     // missing preset is refused as itself (llm-runner 0.8 kit `compaction_item_preset_required`).
     // A re-send of the session's frozen plan, including a legacy one without a preset, passes.
