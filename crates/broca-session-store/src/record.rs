@@ -802,6 +802,16 @@ macro_rules! records {
     };
 }
 
+message! {
+    /// A writer opened the log: it committed a new generation in the head and may now mint
+    /// identities from (generation, seq). Written as a barrier before the writer's first other
+    /// record, so the head and the log can't name different generations.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct WriterOpened {
+        1 req generation: crate::codec::Id128,
+    }
+}
+
 records! {
     transcript {
         1 Input,
@@ -838,6 +848,7 @@ records! {
         85 DeliveryOrdered,
         86 View,
         87 ViewApplied,
+        88 WriterOpened,
     }
 }
 

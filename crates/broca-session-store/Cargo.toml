@@ -22,3 +22,4 @@ getrandom = "0.2"
 
 [dev-dependencies]
 proptest = { version = "1.11", default-features = false, features = ["std"] }
+futures = { workspace = true, features = ["executor"] }

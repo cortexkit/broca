@@ -4,19 +4,22 @@
 //!
 //! Frames here are real encrypted frames. The size and load measurements frame each record as its
 //! own one-frame batch, which slightly overstates frame count but not bytes. The append
-//! measurement writes through the open log's writer, in real batches with real barriers, and
-//! loads the file back. Checkpoints aren't built yet: a written log's checkpoint is empty.
+//! measurement writes a real session on local files, in real batches with real barriers, and
+//! loads it back through the real load path.
 
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
 use broca_protocol::content::ContentBlock;
-use broca_session_store::fold::conversation::Conversation;
-use broca_session_store::fold::operations::Operations;
+use broca_session_store::backend::{LocalBackend, SessionAddr};
+use broca_session_store::codec::Message as _;
 use broca_session_store::frame::{open, seal, FrameHeader, FrameKey, FrameRead, FrameStream};
-use broca_session_store::log::{ChainBase, LogEnd, LogWriter};
+use broca_session_store::head::SessionTriple;
+use broca_session_store::keys::DeploymentKey;
 use broca_session_store::record::{Record, Stream};
+use broca_session_store::session::Session;
+use futures::executor::block_on;
 
 use crate::Converted;
 
@@ -223,77 +226,71 @@ pub struct AppendMeasure {
     pub total_ms: f64,
     /// Microseconds per barrier: write the batch, then sync it to the device.
     pub barrier_us: Vec<u64>,
-    /// Microseconds to load the written log: read the file, read and decrypt every frame,
-    /// and fold both streams.
+    /// Microseconds to load the written session: read and open its head, read the open log,
+    /// decrypt and decode every frame, fold both streams from the checkpoint, and open the
+    /// writer (one head update and a `WriterOpened` barrier).
     pub load_us: u64,
 }
 
-/// Writes a log to `file_path` through the open log's writer, as the live writer would: each
-/// group of records up to a barrier is one batch, written in one call and then synced. On
-/// macOS, `sync_all` issues `F_FULLFSYNC`, today's barrier. Then it loads the file back, checks
-/// it reads clean with every record, and times that load.
+/// Writes a converted log as a real session on local files under `root`, as the live writer
+/// would: it creates the session, then appends each group of records up to a barrier as one
+/// batch, synced. On macOS a sync is `F_FULLFSYNC`, today's barrier. Then a fresh backend (as
+/// after a restart) loads the session through the real load path, which must give the state the
+/// writer held; that load is timed.
 pub fn append_log(
     records: &[Record],
-    key: &FrameKey,
-    bind: &[u8],
-    file_path: &Path,
+    appends_in_conversation: bool,
+    deployment: &DeploymentKey,
+    root: &Path,
 ) -> Result<AppendMeasure, String> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(file_path)
-        .map_err(|e| e.to_string())?;
+    let addr = SessionAddr("measure".into());
+    let triple = SessionTriple {
+        project_root: "/measure".into(),
+        harness: "measure".into(),
+        session: "measure".into(),
+    };
+    let backend = LocalBackend::new(root);
     let mut measure = AppendMeasure::default();
     let started = Instant::now();
-    let mut writer = LogWriter::create(
-        file,
-        key.clone(),
-        bind.to_vec(),
-        &[],
-        1,
-        ChainBase::default(),
-    )
-    .map_err(|e| format!("{e:?}"))?;
-    let mut batch_start = 0;
-    for (index, record) in records.iter().enumerate() {
-        if barrier_after(record, records.get(index + 1)) || index + 1 == records.len() {
-            let barrier = Instant::now();
-            writer
-                .append(&records[batch_start..=index])
-                .map_err(|e| format!("{e:?}"))?;
-            writer.barrier().map_err(|e| format!("{e:?}"))?;
-            measure
-                .barrier_us
-                .push(barrier.elapsed().as_micros() as u64);
-            measure.barriers += 1;
-            batch_start = index + 1;
+    let written = block_on(async {
+        let mut session = Session::create(
+            &backend,
+            addr.clone(),
+            triple.clone(),
+            deployment,
+            appends_in_conversation,
+        )
+        .await
+        .map_err(|e| format!("create: {e:?}"))?;
+        let mut batch_start = 0;
+        for (index, record) in records.iter().enumerate() {
+            if barrier_after(record, records.get(index + 1)) || index + 1 == records.len() {
+                let barrier = Instant::now();
+                session
+                    .append(&records[batch_start..=index], true)
+                    .await
+                    .map_err(|e| format!("append: {e:?}"))?;
+                measure
+                    .barrier_us
+                    .push(barrier.elapsed().as_micros() as u64);
+                measure.barriers += 1;
+                batch_start = index + 1;
+            }
         }
-    }
-    measure.bytes = writer.offset();
+        measure.bytes = session.open_log().1;
+        let state = (session.conversation.encode(), session.operations.encode());
+        session.close().await.map_err(|e| format!("close: {e:?}"))?;
+        Ok::<_, String>(state)
+    })?;
     measure.total_ms = started.elapsed().as_secs_f64() * 1000.0;
-    drop(writer);
 
+    let reopened = LocalBackend::new(root);
     let load = Instant::now();
-    let bytes = std::fs::read(file_path).map_err(|e| e.to_string())?;
-    let log = broca_session_store::log::read(&bytes, key, bind, 0, ChainBase::default())
-        .map_err(|e| format!("{e:?}"))?;
-    let mut conversation = Conversation::new(false);
-    let mut operations = Operations::default();
-    for (_, record) in &log.records {
-        match record.stream() {
-            Stream::Transcript => conversation.apply(record).map_err(|e| format!("{e:?}"))?,
-            Stream::Ledger => operations.apply(record).map_err(|e| format!("{e:?}"))?,
-        }
-    }
+    let loaded = block_on(Session::load(&reopened, addr, &triple, deployment))
+        .map_err(|e| format!("load: {e:?}"))?;
     measure.load_us = load.elapsed().as_micros() as u64;
-    if log.end != LogEnd::Clean || log.records.len() != records.len() {
-        return Err(format!(
-            "read back {:?} with {} of {} records",
-            log.end,
-            log.records.len(),
-            records.len()
-        ));
+    if (loaded.conversation.encode(), loaded.operations.encode()) != written {
+        return Err("the loaded session's state differs from the writer's".into());
     }
     Ok(measure)
 }

@@ -16,11 +16,19 @@
 //! - `fold`: rebuilding a session's state from its records, one fold per stream.
 //! - `log`: the open log, written in all-or-nothing batches and read with its end classified.
 //! - `checkpoint`: the state a log's records fold onto, carried in its first batch.
+//! - `keys`: session data keys, wrapped under the deployment key.
+//! - `head`: the session head, the one small mutable object that names everything else.
+//! - `backend`: where a session's bytes live: memory for tests, and local files.
+//! - `session`: creating, loading and appending to a session.
 
+pub mod backend;
 pub mod checkpoint;
 pub mod codec;
 pub mod content;
 pub mod fold;
 pub mod frame;
+pub mod head;
+pub mod keys;
 pub mod log;
 pub mod record;
+pub mod session;

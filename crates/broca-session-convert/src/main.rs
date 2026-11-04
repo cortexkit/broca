@@ -33,6 +33,7 @@ use broca_session_convert::{convert, Tally};
 use broca_session_store::codec::Digest;
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::frame::{FrameKey, FRAME_OVERHEAD};
+use broca_session_store::keys::DeploymentKey;
 use broca_session_store::record::{CancelPoint, Stream};
 use broca_wal::FramedRecord;
 use serde::Serialize;
@@ -1094,7 +1095,8 @@ fn run_append(args: &Args) {
     chosen.extend(by_size.iter().rev().take(5).map(|(_, f)| *f));
     chosen.dedup();
 
-    let key = measurement_key();
+    // Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
+    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
     let mut report = AppendReport::default();
     let mut latencies = Vec::new();
     let mut loads = Vec::new();
@@ -1109,9 +1111,15 @@ fn run_append(args: &Args) {
         let Ok(converted) = convert(&old) else {
             continue;
         };
-        let target = dir.join(format!("append-{index}.log"));
-        let bind = format!("{index}");
-        match append_log(&converted.records, &key, bind.as_bytes(), &target) {
+        let target = dir.join(format!("append-{index}"));
+        let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
+        let appends_in_conversation = !broca_core::is_mode3_log(&records);
+        match append_log(
+            &converted.records,
+            appends_in_conversation,
+            &deployment,
+            &target,
+        ) {
             Ok(measured) => {
                 let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
                 report.logs += 1;
@@ -1131,7 +1139,7 @@ fn run_append(args: &Args) {
             }
             Err(e) => report.failures.push(format!("{}: {e}", file.display())),
         }
-        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir_all(&target);
     }
     report.barrier_us = percentiles(latencies);
     report.load_us = percentiles(loads);

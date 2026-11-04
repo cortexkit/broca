@@ -53,8 +53,12 @@ fn sample() -> (Vec<u8>, Vec<u64>) {
     (writer.into_file(), starts)
 }
 
+fn no_base(_: &[u8]) -> Result<ChainBase, String> {
+    Ok(ChainBase::default())
+}
+
 fn read_all(bytes: &[u8]) -> super::ReadLog {
-    read(bytes, &key(), BIND, 0, ChainBase::default()).unwrap()
+    read(bytes, &key(), BIND, 0, no_base).unwrap()
 }
 
 #[test]
@@ -142,7 +146,7 @@ fn a_removed_batch_is_an_index_gap() {
 #[test]
 fn a_log_read_under_another_name_fails_authentication() {
     let (bytes, _) = sample();
-    let log = read(&bytes, &key(), b"session-1/log-2", 0, ChainBase::default()).unwrap();
+    let log = read(&bytes, &key(), b"session-1/log-2", 0, no_base).unwrap();
     assert_eq!(
         log.end,
         LogEnd::Damaged {
@@ -160,7 +164,7 @@ fn the_durable_bound_follows_barriers_and_claim_only_frames() {
     // The barrier after the first batch covers it; later frames claim that much.
     assert_eq!(read_all(&bytes).durable_bound, starts[1]);
     // The length synced when the log was created counts too.
-    let created = read(&bytes, &key(), BIND, starts[0], ChainBase::default()).unwrap();
+    let created = read(&bytes, &key(), BIND, starts[0], no_base).unwrap();
     assert_eq!(created.durable_bound, starts[1]);
 
     let mut writer = LogWriter::create(

@@ -63,6 +63,10 @@ pub enum LogError {
         offset: u64,
         error: DecodeError,
     },
+    /// A record batch was encoded before the log's checkpoint, or a checkpoint after it.
+    CheckpointNotFirst,
+    /// The checkpoint authenticated, so its bytes are what was written, but it doesn't decode.
+    Checkpoint(String),
 }
 
 impl From<io::Error> for LogError {
@@ -101,9 +105,25 @@ fn frame_stream(stream: Stream) -> FrameStream {
     }
 }
 
-/// Appends batches to one log. It is the log's only writer.
-pub struct LogWriter<F: LogFile> {
-    file: F,
+/// One encoded append: the bytes to write in one call, and what the log looks like once they
+/// land.
+#[derive(Debug, Clone)]
+pub struct Encoded {
+    pub bytes: Vec<u8>,
+    frames: u32,
+    /// The seq the batch's first record takes; `None` for frames that carry no record.
+    pub first_seq: Option<u64>,
+    next_seq: u64,
+    last: ChainBase,
+}
+
+/// Encodes the frames of one log. It holds the log's position (frame index, length, sync claim,
+/// next seq and each stream's last record) but does no I/O, so any backend can write what it
+/// encodes. An encoded append changes nothing until [`written`](Self::written) reports that it
+/// landed; a writer whose write fails stops and reloads, so it never encodes past a write it
+/// isn't sure of.
+#[derive(Clone)]
+pub struct LogEncoder {
     key: FrameKey,
     bind: Vec<u8>,
     frame_index: u32,
@@ -113,22 +133,12 @@ pub struct LogWriter<F: LogFile> {
     last: ChainBase,
 }
 
-impl<F: LogFile> LogWriter<F> {
-    /// Writes a new log's checkpoint batch and syncs it. `bind` names the log (the session id
-    /// and the log's name); every reader must pass the same bytes. `next_seq` is the first seq
-    /// a record in this log may take, and `base` names the last record of each stream before
-    /// it. The returned writer's [`offset`](Self::offset) is the length synced when the log was
-    /// created, which the session head records with the log's name.
-    pub fn create(
-        file: F,
-        key: FrameKey,
-        bind: Vec<u8>,
-        checkpoint: &[u8],
-        next_seq: u64,
-        base: ChainBase,
-    ) -> Result<Self, LogError> {
-        let mut writer = Self {
-            file,
+impl LogEncoder {
+    /// An encoder for a new, empty log. `bind` names the log (the session id and the log's
+    /// name); every reader must pass the same bytes. `next_seq` is the first seq a record in
+    /// this log may take, and `base` names the last record of each stream before it.
+    pub fn new(key: FrameKey, bind: Vec<u8>, next_seq: u64, base: ChainBase) -> Self {
+        Self {
             key,
             bind,
             frame_index: 0,
@@ -136,12 +146,22 @@ impl<F: LogFile> LogWriter<F> {
             synced_through: 0,
             next_seq,
             last: base,
-        };
-        let header = writer.header_without_record(0);
-        let bytes = frame::seal(&header, checkpoint, &writer.key, &writer.bind)?;
-        writer.write(&bytes, 1)?;
-        writer.barrier()?;
-        Ok(writer)
+        }
+    }
+
+    /// An encoder that continues a log read back with [`read`], once its torn tail (if any) is
+    /// removed. What the earlier writer wrote past the durable bound may not be durable yet, so
+    /// the sync claim restarts from the bound, and the next barrier claims the rest.
+    pub fn resume(key: FrameKey, bind: Vec<u8>, log: &ReadLog, next_seq: u64) -> Self {
+        Self {
+            key,
+            bind,
+            frame_index: log.frames,
+            offset: log.complete_through,
+            synced_through: log.durable_bound.min(log.complete_through),
+            next_seq,
+            last: log.last,
+        }
     }
 
     fn header_without_record(&self, flags: u8) -> FrameHeader {
@@ -160,16 +180,31 @@ impl<F: LogFile> LogWriter<F> {
         }
     }
 
-    fn write(&mut self, bytes: &[u8], frames: u32) -> Result<(), LogError> {
-        self.file.write_all(bytes)?;
-        self.offset += bytes.len() as u64;
-        self.frame_index += frames;
-        Ok(())
+    fn without_record(&self, flags: u8, body: &[u8]) -> Result<Encoded, LogError> {
+        let header = self.header_without_record(flags);
+        Ok(Encoded {
+            bytes: frame::seal(&header, body, &self.key, &self.bind)?,
+            frames: 1,
+            first_seq: None,
+            next_seq: self.next_seq,
+            last: self.last,
+        })
     }
 
-    /// Appends `records` as one batch, in one write, and returns the first seq they took. The
-    /// batch is not durable until a later [`barrier`](Self::barrier) returns.
-    pub fn append(&mut self, records: &[Record]) -> Result<u64, LogError> {
+    /// The log's checkpoint batch, which must be its first frame.
+    pub fn checkpoint(&self, body: &[u8]) -> Result<Encoded, LogError> {
+        if self.frame_index != 0 {
+            return Err(LogError::CheckpointNotFirst);
+        }
+        self.without_record(0, body)
+    }
+
+    /// `records` as one batch, to be written in one call. The batch is not durable until a
+    /// barrier after it returns.
+    pub fn batch(&self, records: &[Record]) -> Result<Encoded, LogError> {
+        if self.frame_index == 0 {
+            return Err(LogError::CheckpointNotFirst);
+        }
         let count = u16::try_from(records.len())
             .ok()
             .filter(|count| *count > 0)
@@ -201,28 +236,34 @@ impl<F: LogFile> LogWriter<F> {
                 &self.bind,
             )?);
         }
-        self.write(&bytes, u32::from(count))?;
-        self.next_seq = first + u64::from(count);
-        self.last = last;
-        Ok(first)
+        Ok(Encoded {
+            bytes,
+            frames: u32::from(count),
+            first_seq: Some(first),
+            next_seq: first + u64::from(count),
+            last,
+        })
     }
 
-    /// Makes everything written so far durable. Later frames claim it as synced.
-    pub fn barrier(&mut self) -> Result<(), LogError> {
-        self.file.flush()?;
-        self.file.barrier()?;
-        self.synced_through = self.offset;
-        Ok(())
-    }
-
-    /// Appends a claim-only frame, which carries no record, only the claim of the last barrier.
-    /// A writer appends one when it goes idle or closes, so the log's last barrier counts toward
+    /// A claim-only frame, which carries no record, only the claim of the last barrier. A
+    /// writer appends one when it goes idle or closes, so the log's last barrier counts toward
     /// the durable bound even though no later batch claims it. It needs no barrier of its own:
     /// a claim that survives and authenticates is true.
-    pub fn claim(&mut self) -> Result<(), LogError> {
-        let header = self.header_without_record(FLAG_CLAIM_ONLY);
-        let bytes = frame::seal(&header, &[], &self.key, &self.bind)?;
-        self.write(&bytes, 1)
+    pub fn claim(&self) -> Result<Encoded, LogError> {
+        self.without_record(FLAG_CLAIM_ONLY, &[])
+    }
+
+    /// Records that `encoded` was written at the end of the log.
+    pub fn written(&mut self, encoded: &Encoded) {
+        self.offset += encoded.bytes.len() as u64;
+        self.frame_index += encoded.frames;
+        self.next_seq = encoded.next_seq;
+        self.last = encoded.last;
+    }
+
+    /// Records that a barrier made everything written so far durable. Later frames claim it.
+    pub fn synced(&mut self) {
+        self.synced_through = self.offset;
     }
 
     /// The log's length so far.
@@ -233,6 +274,79 @@ impl<F: LogFile> LogWriter<F> {
     /// The seq the next record will take.
     pub fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    /// Each stream's last record so far.
+    pub fn last(&self) -> ChainBase {
+        self.last
+    }
+}
+
+/// Appends batches to one log held in a [`LogFile`]: an encoder plus the file it writes. It is
+/// the log's only writer.
+pub struct LogWriter<F: LogFile> {
+    file: F,
+    encoder: LogEncoder,
+}
+
+impl<F: LogFile> LogWriter<F> {
+    /// Writes a new log's checkpoint batch and syncs it. The returned writer's
+    /// [`offset`](Self::offset) is the length synced when the log was created, which the
+    /// session head records with the log's name.
+    pub fn create(
+        file: F,
+        key: FrameKey,
+        bind: Vec<u8>,
+        checkpoint: &[u8],
+        next_seq: u64,
+        base: ChainBase,
+    ) -> Result<Self, LogError> {
+        let mut writer = Self {
+            file,
+            encoder: LogEncoder::new(key, bind, next_seq, base),
+        };
+        let encoded = writer.encoder.checkpoint(checkpoint)?;
+        writer.write(&encoded)?;
+        writer.barrier()?;
+        Ok(writer)
+    }
+
+    fn write(&mut self, encoded: &Encoded) -> Result<(), LogError> {
+        self.file.write_all(&encoded.bytes)?;
+        self.encoder.written(encoded);
+        Ok(())
+    }
+
+    /// Appends `records` as one batch, in one write, and returns the first seq they took. The
+    /// batch is not durable until a later [`barrier`](Self::barrier) returns.
+    pub fn append(&mut self, records: &[Record]) -> Result<u64, LogError> {
+        let encoded = self.encoder.batch(records)?;
+        self.write(&encoded)?;
+        Ok(encoded.first_seq.expect("a batch holds records"))
+    }
+
+    /// Makes everything written so far durable. Later frames claim it as synced.
+    pub fn barrier(&mut self) -> Result<(), LogError> {
+        self.file.flush()?;
+        self.file.barrier()?;
+        self.encoder.synced();
+        Ok(())
+    }
+
+    /// Appends a claim-only frame; see [`LogEncoder::claim`].
+    pub fn claim(&mut self) -> Result<(), LogError> {
+        let encoded = self.encoder.claim()?;
+        self.write(&encoded)
+    }
+
+    /// The log's length so far.
+    pub fn offset(&self) -> u64 {
+        self.encoder.offset()
+    }
+
+    /// The seq the next record will take.
+    pub fn next_seq(&self) -> u64 {
+        self.encoder.next_seq()
     }
 
     pub fn into_file(self) -> F {
@@ -287,6 +401,12 @@ pub struct ReadLog {
     pub durable_bound: u64,
     /// Where the complete batches end: the length a writer resumes appending at.
     pub complete_through: u64,
+    /// Frames in the complete batches, the checkpoint and claim-only frames included: the
+    /// frame index a writer resumes at.
+    pub frames: u32,
+    /// Each stream's last record in the complete batches, or the checkpoint's base when a
+    /// stream has none.
+    pub last: ChainBase,
 }
 
 /// A batch read so far, kept apart until its last frame arrives.
@@ -300,13 +420,15 @@ struct OpenBatch {
 }
 
 /// Reads a log from its bytes. `created_len` is the length synced when the log was created,
-/// which counts toward the durable bound, and `base` the chain base its checkpoint names.
+/// which counts toward the durable bound. `base` reads the chain base from the checkpoint's
+/// body: each stream's first record must link back to exactly that base, and every later record
+/// to the record before it in its stream.
 pub fn read(
     bytes: &[u8],
     key: &FrameKey,
     bind: &[u8],
     created_len: u64,
-    base: ChainBase,
+    base: impl FnOnce(&[u8]) -> Result<ChainBase, String>,
 ) -> Result<ReadLog, LogError> {
     let mut log = ReadLog {
         checkpoint: Vec::new(),
@@ -314,11 +436,14 @@ pub fn read(
         end: LogEnd::Clean,
         durable_bound: created_len,
         complete_through: 0,
+        frames: 0,
+        last: ChainBase::default(),
     };
     let mut offset = 0usize;
     let mut index = 0u32;
     let mut last_seq: Option<u64> = None;
-    let mut chain = base;
+    let mut chain = ChainBase::default();
+    let mut base = Some(base);
     let mut open: Option<OpenBatch> = None;
     let damaged = |log: &mut ReadLog, at: usize, damage: Damage| {
         log.end = LogEnd::Damaged {
@@ -362,8 +487,12 @@ pub fn read(
                 damaged(&mut log, at as usize, Damage::NoCheckpoint);
                 return Ok(log);
             }
+            let read_base = base.take().expect("the checkpoint is the first frame");
+            chain = read_base(&body).map_err(LogError::Checkpoint)?;
             log.checkpoint = body;
             log.complete_through = offset as u64;
+            log.frames = index;
+            log.last = chain;
             continue;
         }
         if header.stream == FrameStream::None {
@@ -372,6 +501,7 @@ pub fn read(
                 return Ok(log);
             }
             log.complete_through = offset as u64;
+            log.frames = index;
             continue;
         }
 
@@ -418,7 +548,7 @@ pub fn read(
             }
         };
         let expected_link = *batch.last.slot(stream);
-        if expected_link.is_some() && header.prev_in_stream != expected_link {
+        if header.prev_in_stream != expected_link {
             damaged(
                 &mut log,
                 at as usize,
@@ -440,6 +570,8 @@ pub fn read(
             chain = batch.last;
             log.records.extend(batch.records);
             log.complete_through = offset as u64;
+            log.frames = index;
+            log.last = chain;
         }
     }
     if let Some(batch) = open {
