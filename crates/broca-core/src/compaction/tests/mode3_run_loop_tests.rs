@@ -106,6 +106,113 @@ async fn drive_events(
     (result, model)
 }
 
+#[tokio::test]
+async fn live_reply_deltas_follow_the_writing_runs_clean_flag() {
+    use broca_protocol::{DisplayEvent, MessageId, NormalizedEvent, ProviderControl};
+    for (mode3, render) in [(false, false), (false, true), (true, false)] {
+        let shared = Shared::default();
+        let writer = shared.writer();
+        let (mut request, mut control, _) = history_request();
+        request.context_limit = Some(100_000);
+        control.admitted_context_limit = request.context_limit;
+        control.legacy_compaction_fixture = false;
+        control.compaction_views = None;
+        let mut manifest = control.manifest.as_deref().unwrap().clone();
+        let mut plan = json!({"render_tags": render, "composition": {}});
+        if mode3 {
+            plan["compaction_item"] = json!({"provider":"provider", "preset":"head", "params":{}});
+            control.new_log_compaction_plan_version = Some(cortexkit_compaction_view::PLAN_VERSION);
+            control.compaction_plane = Some(Arc::new(Plane::default()));
+        } else {
+            control.compaction_plane = None;
+        }
+        manifest.plan = OpaqueJson::from_json_text(plan.to_string()).unwrap();
+        control.manifest = Some(Arc::new(manifest));
+        let text = |delta: &str| DisplayEvent::TextDelta {
+            mid: None,
+            part: Some(1),
+            message_id: MessageId("a".into()),
+            tool_call_id: None,
+            delta: delta.into(),
+        };
+        let reasoning = DisplayEvent::ReasoningDelta {
+            mid: None,
+            part: Some(0),
+            message_id: MessageId("a".into()),
+            delta: "§8§ thought".into(),
+        };
+        let tool = DisplayEvent::ToolInputDelta {
+            mid: None,
+            part: Some(2),
+            tool_call_id: broca_protocol::ToolCallId("call".into()),
+            delta: "{\"text\":\"§9§ args\"}".into(),
+        };
+        let mut script = vec![NormalizedEvent::Display(reasoning.clone())];
+        script.extend(
+            ["§3", "2§ I have", " read it"].map(|delta| NormalizedEvent::Display(text(delta))),
+        );
+        script.push(NormalizedEvent::Display(tool.clone()));
+        script.extend([
+            NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                message: broca_protocol::AssistantMessage {
+                    message_id: MessageId("a".into()),
+                    content: vec![ContentBlock::Text {
+                        text: "§32§ I have read it".into(),
+                    }],
+                },
+            }),
+            NormalizedEvent::Control(ProviderControl::Finished {
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+                retries_used: 0,
+            }),
+        ]);
+        let model = crate::StubProvider::new(vec![script]);
+        let (out, mut events) = tokio::sync::mpsc::channel(256);
+        let result = crate::run_loop_on_writer(
+            request,
+            &writer,
+            crate::StartMode::FreshOrResume,
+            &model,
+            &crate::StubToolPlane::new(),
+            &crate::AllowAll,
+            &shared,
+            None,
+            control,
+            &out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.reason, RunFinishReason::Completed);
+        drop(out);
+        let mut display = Vec::new();
+        while let Some(event) = events.recv().await {
+            if let crate::OutputEvent::Display(event) = event {
+                display.push(event);
+            }
+        }
+        assert_eq!(display.first(), Some(&reasoning));
+        assert_eq!(display.last(), Some(&tool));
+        let text_deltas: Vec<_> = display
+            .iter()
+            .filter_map(|event| match event {
+                DisplayEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        if render || mode3 {
+            assert_eq!(text_deltas.concat(), "I have read it", "mode3={mode3}");
+        } else {
+            assert_eq!(text_deltas, ["§3", "2§ I have", " read it"]);
+        }
+        assert!(shared.records().iter().any(|record| matches!(record,
+            WalRecord::ModelStepFinished { assistant_message, .. }
+            if assistant_message.content == vec![ContentBlock::Text { text: "§32§ I have read it".into() }]
+        )), "stored reply stays raw");
+        writer.shutdown().await.unwrap();
+    }
+}
+
 async fn drive_frozen_legacy(shared: &Shared) -> PrefixBound {
     let writer = shared.writer();
     let (request, mut control, _) = history_request();

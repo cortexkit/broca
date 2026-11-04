@@ -5949,6 +5949,17 @@ where
         crate::tags::rules_for(computed_tags, render_tags, &provider.render_config_blob()),
         computed_tags,
     );
+    // Use the same frozen decision as message exposure, without loading history.
+    // Compaction-view requests show numbers even when the legacy render_tags bit is false.
+    let clean_reply = if mode3 {
+        crate::compaction_v2::metadata::clean_replies(
+            render_tags || compaction_item.is_some(),
+            &provider.render_config_blob(),
+        )
+    } else {
+        crate::tags::rules_for(computed_tags, render_tags, &provider.render_config_blob())
+            .is_some_and(|rules| rules.clean)
+    };
     if let Some(high) = held_tag_high {
         // The held prompt shows only some of the transcript's numbers; numbering continues
         // after the highest the whole transcript shows.
@@ -7180,7 +7191,7 @@ where
                 &step_opts,
                 first_attempt,
                 control,
-                out,
+                display_text::DisplayOutput::new(out, clean_reply),
                 AttemptCallbacks {
                     record: &record_attempt,
                     before_send: attempt_hook,
@@ -7736,7 +7747,7 @@ where
                     )
                     .await;
                     if message_changed {
-                        restream_message(&message, out).await;
+                        restream_message(&message, out, clean_reply).await;
                     }
                     let _ = send(
                         out,
@@ -7812,7 +7823,7 @@ where
                     cut_resume = resume;
                 }
                 if message_changed {
-                    restream_message(&message, out).await;
+                    restream_message(&message, out, clean_reply).await;
                 }
                 if let (Some(session), Some(_)) = (&v2_session, &compaction_item) {
                     crate::compaction_v2::host::notice(
@@ -10273,7 +10284,7 @@ async fn run_step_watched<P: Provider>(
     opts: &Arc<CallOptions>,
     first_attempt: u32,
     control: &RunControl,
-    out: &mpsc::Sender<OutputEvent>,
+    mut display: display_text::DisplayOutput<'_>,
     attempts: AttemptCallbacks<'_>,
 ) -> Result<Result<StepOutcome, RunFinishReason>, WalWriteError> {
     let AttemptCallbacks {
@@ -10328,7 +10339,7 @@ async fn run_step_watched<P: Provider>(
             first_attempt,
             &step_cancel,
             watchdog_deadline,
-            out,
+            &mut display,
             &mut events,
             on_attempt,
             control.shutdown_seal.as_ref(),
@@ -10358,6 +10369,9 @@ async fn run_step_watched<P: Provider>(
             }
         }
     };
+    // The filter outlives the selected step future, so cancellation and watchdog expiry
+    // also flush any unresolved text before the caller publishes the terminal control.
+    display.finish().await;
     let outcome = attribute_step_failure_to_cancel(outcome?, is_cancelled(control));
     // A cancel or watchdog stops the step cooperatively: the provider records its in-flight
     // attempt and then closes the stream. Keep reading until then (bounded), so that record is
@@ -10437,7 +10451,7 @@ async fn run_step<P: Provider>(
     first_attempt: u32,
     cancel: &CancellationToken,
     deadline: Option<tokio::time::Instant>,
-    out: &mpsc::Sender<OutputEvent>,
+    display: &mut display_text::DisplayOutput<'_>,
     events: &mut Option<mpsc::Receiver<NormalizedEvent>>,
     on_attempt: &AttemptSink<'_>,
     shutdown_seal: Option<&crate::ShutdownSeal>,
@@ -10445,7 +10459,7 @@ async fn run_step<P: Provider>(
     attempt_hook: Option<Arc<dyn AttemptHook>>,
 ) -> Result<StepOutcome, WalWriteError> {
     let _ = send(
-        out,
+        display.out,
         OutputEvent::Control(ControlUnit::StepStarted { step_id }),
     )
     .await;
@@ -10479,7 +10493,7 @@ async fn run_step<P: Provider>(
     while let Some(ev) = rx.recv().await {
         match ev {
             NormalizedEvent::Display(d) => {
-                let _ = send(out, OutputEvent::Display(d)).await;
+                display.send(d).await;
             }
             NormalizedEvent::Control(c) => match c {
                 ProviderControl::AssistantMessage { message: m } => message = Some(m),
@@ -12886,6 +12900,7 @@ mod boundary_cancel_tests;
 #[cfg(test)]
 #[path = "run/delivery_order_tests.rs"]
 mod delivery_order_tests;
+mod display_text;
 #[path = "run/hook_dispatch.rs"]
 mod hook_dispatch;
 use hook_dispatch::{
@@ -13102,7 +13117,7 @@ mod tests {
             &opts,
             0,
             &control,
-            &out,
+            display_text::DisplayOutput::new(&out, false),
             AttemptCallbacks {
                 record: &|_| Box::pin(async { Ok(()) }),
                 before_send: Some(hook),
@@ -16677,7 +16692,7 @@ mod tests {
             &Arc::new(CallOptions::new(Vec::new())),
             0,
             &control,
-            &out,
+            display_text::DisplayOutput::new(&out, false),
             AttemptCallbacks {
                 record: &|_| Box::pin(async { Ok(()) }),
                 before_send: None,
@@ -16710,7 +16725,7 @@ mod tests {
             &opts,
             0,
             &control,
-            &out,
+            display_text::DisplayOutput::new(&out, false),
             AttemptCallbacks {
                 record: &|_| Box::pin(async { Ok(()) }),
                 before_send: None,
@@ -16768,7 +16783,7 @@ mod tests {
             0,
             &CancellationToken::new(),
             None,
-            &out,
+            &mut display_text::DisplayOutput::new(&out, false),
             &mut None,
             &|_| Box::pin(async { Ok(()) }),
             None,

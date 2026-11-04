@@ -2708,7 +2708,7 @@ async fn post_hook_restream_counts_delta_less_stored_blocks() {
         ],
     };
     let (out, mut events) = mpsc::channel(8);
-    restream_message(&message, &out).await;
+    restream_message(&message, &out, false).await;
     assert_eq!(
         events.try_recv().unwrap(),
         OutputEvent::Display(DisplayEvent::DisplayReset)
@@ -2720,6 +2720,39 @@ async fn post_hook_restream_counts_delta_less_stored_blocks() {
         })
         .collect();
     assert_eq!(parts, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn post_hook_restream_cleans_only_assistant_text() {
+    let message = AssistantMessage {
+        message_id: broca_protocol::MessageId("hooked".into()),
+        content: vec![
+            ContentBlock::Text {
+                text: "§32§ answer  ".into(),
+            },
+            ContentBlock::Reasoning {
+                text: "§8§ thought".into(),
+                signature: None,
+            },
+        ],
+    };
+    for clean in [true, false] {
+        let (out, mut events) = mpsc::channel(8);
+        restream_message(&message, &out, clean).await;
+        assert_eq!(
+            events.try_recv().unwrap(),
+            OutputEvent::Display(DisplayEvent::DisplayReset)
+        );
+        assert!(matches!(events.try_recv().unwrap(),
+            OutputEvent::Display(DisplayEvent::TextDelta { delta, part: Some(0), .. })
+            if delta == if clean { "answer" } else { "§32§ answer  " }
+        ));
+        assert!(matches!(events.try_recv().unwrap(),
+            OutputEvent::Display(DisplayEvent::ReasoningDelta { delta, part: Some(1), .. })
+            if delta == "§8§ thought"
+        ));
+        assert!(events.try_recv().is_err());
+    }
 }
 
 /// Records the late-results and keepalive declarations each batch's manifest carries for the tool's

@@ -265,8 +265,8 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, RowMetadat
 /// The pure projection for broca's canonical stored message schema. Part keys are the same
 /// stable part keys served by session.read, including unnumbered tool calls.
 pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRow {
-    let parts = entry
-        .message
+    let exposed = broca_protocol::tags::exposed_message(&entry.message);
+    let parts = exposed
         .content
         .iter()
         .enumerate()
@@ -651,6 +651,40 @@ pub async fn read<H: ServeHandler + ?Sized>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn display_reply_matches_session_read_exposure() {
+        let mut entry: SessionReadMessage = serde_json::from_value(json!({
+            "ordinal": 1, "mid": "m0", "written_at": 123,
+            "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "§32§ I have read it  "},
+                {"type": "reasoning", "text": "§8§ thought"},
+                {"type": "tool_call", "tool_call_id": "call", "tool_name": "work", "input": {"text": "§9§ args"}},
+                {"type": "tool_result", "tool_call_id": "call", "is_error": false, "output": {"kind": "text", "text": "§10§ result"}}
+            ]}
+        })).unwrap();
+        let raw = entry.message.clone();
+        for clean in [true, false] {
+            broca_protocol::tags::number_message(
+                &mut entry.message,
+                broca_protocol::tags::ComputedRules {
+                    render: true,
+                    clean,
+                },
+                &mut 0,
+            )
+            .unwrap();
+            let served = serde_json::to_value(&entry).unwrap();
+            let row = serde_json::to_value(project(&entry, None)).unwrap();
+            assert_eq!(row["text"], served["message"]["content"][0]["text"]);
+            assert_eq!(row["parts"][1]["text"], "§8§ thought");
+            assert_eq!(row["parts"][2]["arguments"], "{\"text\":\"§9§ args\"}");
+            assert_eq!(row["parts"][3]["content"], "§10§ result");
+            assert_eq!(entry.message.content, raw.content);
+        }
+        entry.message.role = Role::User;
+        assert_eq!(project(&entry, None).text, "§32§ I have read it  ");
+    }
 
     #[test]
     fn projection_preserves_native_part_order_keys_media_and_utf8_limits() {

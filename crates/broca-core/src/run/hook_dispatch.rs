@@ -22,7 +22,11 @@ pub(super) async fn record_model_hook(
     }
 }
 
-pub(super) async fn restream_message(message: &AssistantMessage, out: &mpsc::Sender<OutputEvent>) {
+pub(super) async fn restream_message(
+    message: &AssistantMessage,
+    out: &mpsc::Sender<OutputEvent>,
+    clean_reply: bool,
+) {
     let _ = send(out, OutputEvent::Display(DisplayEvent::DisplayReset)).await;
     for (index, part) in message.content.iter().enumerate() {
         let event = match part {
@@ -32,7 +36,7 @@ pub(super) async fn restream_message(message: &AssistantMessage, out: &mpsc::Sen
                     part: None,
                     message_id: message.message_id.clone(),
                     tool_call_id: None,
-                    delta: text.clone(),
+                    delta: broca_protocol::tags::exposed_model_text(clean_reply, text).into_owned(),
                 }
             }
             ContentBlock::Reasoning { text, .. } => DisplayEvent::ReasoningDelta {

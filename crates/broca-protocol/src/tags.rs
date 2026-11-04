@@ -25,9 +25,13 @@ pub mod v1 {
     };
 }
 pub use cortexkit_role_llm_runner_v1::tags::NumberingOverflow;
-use cortexkit_role_llm_runner_v1::tags::{PartKind, RenderedPart, TextWriter};
+use cortexkit_role_llm_runner_v1::tags::{PartKind, RenderedPart};
 
 use crate::content::{ContentBlock, Message, Role, ToolOutput};
+
+#[cfg(test)]
+#[path = "tags/clean_comparison_tests.rs"]
+mod clean_comparison_tests;
 
 /// The contract spelling of tag `tag`: `§N§`.
 pub fn tag_mark(tag: u64) -> String {
@@ -467,14 +471,13 @@ fn parts_numbering(
 }
 
 /// The model's text as every exposure shows it: cleaned of tag notation when `clean`, else as
-/// stored (llm-runner `tags::exposed_model_text`).
+/// stored. The view library owns the reply-cleaning contract.
 pub fn exposed_model_text(clean: bool, text: &str) -> std::borrow::Cow<'_, str> {
-    let writer = if clean {
-        TextWriter::TagRenderingRun
+    if clean {
+        std::borrow::Cow::Owned(cortexkit_compaction_view::clean::clean_reply(text).text)
     } else {
-        TextWriter::UntaggedRun
-    };
-    cortexkit_role_llm_runner_v1::tags::exposed_model_text(writer, text)
+        std::borrow::Cow::Borrowed(text)
+    }
 }
 
 /// Number `message`, written under `rules`, after `high`, the highest number shown before it,
