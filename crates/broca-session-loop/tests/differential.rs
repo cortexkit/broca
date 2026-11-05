@@ -4169,6 +4169,50 @@ async fn a_cut_through_a_run_keeps_its_repetition_counts() {
     compare_compacted(repetition_across_a_cut_scenario(), repetition_cut()).await;
 }
 
+/// The run the cut splits isn't the session's first, and another run follows it: the new run's
+/// numbering continues after the highest part number shown, counted with the split run's own
+/// rules for its messages at the window's start, and its first steps count repetitions afresh.
+#[tokio::test]
+async fn a_run_after_a_cut_through_an_earlier_run_continues_alike() {
+    let mut scenario = repetition_across_a_cut_scenario();
+    scenario.steps.insert(0, text_step("a0", "hello"));
+    scenario.steps.extend([
+        answer(
+            "a6",
+            vec![call("c6", "grep", json!({"pattern": "x"}))],
+            FinishReason::ToolCalls,
+        ),
+        answer(
+            "a7",
+            vec![call("c7", "grep", json!({"pattern": "x"}))],
+            FinishReason::ToolCalls,
+        ),
+        text_step("a8", "still nothing"),
+    ]);
+    LAYOUT
+        .scope(
+            Some(cortexkit_compaction_view::PLAN_VERSION),
+            COMPACTION.scope(
+                Some(Arc::new(CompactionScript {
+                    // The first run's answer adds to the token estimate per request byte, so the
+                    // window is a little larger than the single-run scenario's.
+                    context_limit: 1_600,
+                    // The first run's entries are 1-2, so the cut and drop move up by two.
+                    rides: vec![Ride::CutAndDrop(5, 8)],
+                })),
+                Box::pin(compare_runs_in(
+                    scenario,
+                    &[
+                        ("r0", vec![user("hi")]),
+                        ("r1", vec![user("find x")]),
+                        ("r2", vec![user("try again")]),
+                    ],
+                )),
+            ),
+        )
+        .await;
+}
+
 #[tokio::test]
 async fn every_cut_of_a_run_split_by_a_compaction_cut_resumes_alike() {
     compare_compacted_every_cut(repetition_across_a_cut_scenario(), repetition_cut()).await;

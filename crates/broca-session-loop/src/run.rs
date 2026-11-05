@@ -1236,9 +1236,12 @@ async fn shown_high<W: Writer>(writer: &W, parts: &dyn Parts) -> Result<u64, Loo
     };
     // Each window run's frozen choices: whether it rendered numbers (its start's run config), and
     // whether its replies were cleaned (that and its render config).
+    // A request lists the runs sealed before the window first; only the window's own place
+    // messages here.
     let rendered = render_episodes(writer, parts)?;
+    let window_runs = &rendered[conversation.sealed_episodes.len()..];
     let mut runs = Vec::new();
-    for (episode, render_input) in conversation.episodes.iter().zip(&rendered) {
+    for (episode, render_input) in conversation.episodes.iter().zip(window_runs) {
         let start_record = writer.run_start(&episode.run_id).await?.ok_or_else(|| {
             LoopError::Parts(format!(
                 "the window names run {} but the session holds no start for it",
