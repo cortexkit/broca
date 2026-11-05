@@ -23,10 +23,11 @@ use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::record::{
     Assistant, Attempt, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome, CancelPoint,
-    CancelRequest, CeilingDecided, OutputCapLowered, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker,
-    Notice, PartKind, PartRef, Pause, Placement, QueuedSend, Record, Redo, ResultAppend, Resumed,
-    Retraction, RunEnd, RunStart, SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepStart,
-    Stream, StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, View, ViewApplied,
+    CancelRequest, CeilingDecided, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker,
+    Notice, OutputCapLowered, PartKind, PartRef, Pause, Placement, QueuedSend, Record, Redo,
+    ResultAppend, Resumed, Retraction, RunEnd, RunStart, SendEnded, SessionRefresh, SetupStub,
+    Steer, StepEnd, StepStart, Stream, StructuredResult, ToolHeld, ToolIntent, ToolOutcome,
+    ToolReply, View, ViewApplied,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;

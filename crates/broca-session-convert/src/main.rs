@@ -390,7 +390,11 @@ fn run_render(args: &Args) {
                 .iter()
                 .position(|record| matches!(record, WalRecord::ModelAttemptFinished { .. }))
                 .map_or(records.len(), |offset| end + 1 + offset);
-            let prefix = if contract { &records[..view_end] } else { prefix };
+            let prefix = if contract {
+                &records[..view_end]
+            } else {
+                prefix
+            };
             let end = if contract { view_end - 1 } else { end };
             let cap = if contract {
                 broca_core::output_reservation::recorded_cap(prefix, broca_protocol::StepId(*step))

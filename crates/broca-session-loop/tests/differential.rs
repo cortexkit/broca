@@ -65,6 +65,10 @@ impl ScriptedProvider {
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
+        output().map(|script| script.limits)
+    }
+
     async fn step(&self, _step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         self.sent.lock().unwrap().push(opts.clone());
         let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
@@ -561,6 +565,30 @@ tokio::task_local! {
     static COMPACTION: Option<Arc<CompactionScript>>;
 }
 
+tokio::task_local! {
+    /// The output cap the provider's requests carry and the context limit the run freezes, for
+    /// a comparison of how a step's cap is lowered. `None` runs with neither.
+    static OUTPUT: Option<OutputScript>;
+}
+
+#[derive(Clone, Copy)]
+struct OutputScript {
+    limits: broca_core::output_reservation::OutputLimits,
+    context_limit: u64,
+}
+
+/// The output script the comparison running in this task uses.
+fn output() -> Option<OutputScript> {
+    OUTPUT.try_with(|script| *script).ok().flatten()
+}
+
+/// The context limit both loops freeze: the compaction script's, else the output script's.
+fn frozen_context_limit() -> Option<u64> {
+    compaction()
+        .map(|script| script.context_limit)
+        .or(output().map(|script| script.context_limit))
+}
+
 /// The compaction script the comparison running in this task uses.
 fn compaction() -> Option<Arc<CompactionScript>> {
     COMPACTION.try_with(Clone::clone).ok().flatten()
@@ -806,7 +834,7 @@ impl Scenario {
             stop_when: self.stop_when.clone(),
             submission_id: None,
             budget: None,
-            context_limit: compaction().map(|script| script.context_limit),
+            context_limit: frozen_context_limit(),
             work_class: None,
             context_management: None,
             variant: None,
@@ -846,7 +874,7 @@ impl Scenario {
             compaction_plan_version: layout(),
             render_tags: false,
             budget: None,
-            context_limit: compaction().map(|script| script.context_limit),
+            context_limit: frozen_context_limit(),
         }
     }
 }
@@ -907,7 +935,7 @@ async fn today_from(
             compaction_plane: spy
                 .clone()
                 .map(|spy| spy as Arc<dyn broca_core::CompactionPlane>),
-            admitted_context_limit: compaction().map(|script| script.context_limit),
+            admitted_context_limit: frozen_context_limit(),
             ..Default::default()
         },
         &tx,
@@ -1847,7 +1875,7 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         compaction_plane: spy
             .clone()
             .map(|spy| spy as Arc<dyn broca_core::CompactionPlane>),
-        admitted_context_limit: compaction().map(|script| script.context_limit),
+        admitted_context_limit: frozen_context_limit(),
         ..Default::default()
     };
     let lease = FileLeaseStore::new(dir.join("lease"));
@@ -4375,4 +4403,88 @@ async fn two_runs_frozen_with_part_numbers_number_on_from_the_first() {
         ],
     )
     .await;
+}
+
+/// Two tool steps, then an answer. Each step reports an attempt with its body length, so a later
+/// step's input can be estimated from the measured one before it.
+fn measured_scenario() -> Scenario {
+    let tools = vec![tool("read", ExecutionMode::Parallel)];
+    Scenario {
+        input: vec![user("read a and b")],
+        manifest: None,
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            attempted(
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                vec![attempt(1, 200, "complete")],
+            ),
+            attempted(
+                answer(
+                    "a2",
+                    vec![call("c2", "read", json!({"path": "b"}))],
+                    FinishReason::ToolCalls,
+                ),
+                vec![attempt(1, 200, "complete")],
+            ),
+            attempted(text_step("a3", "done"), vec![attempt(1, 200, "complete")]),
+        ],
+    }
+}
+
+/// A context limit whose room beside the estimated input is below the frozen cap and above the
+/// floor: each step after the first has its cap lowered, durable before it is sent.
+fn lowering() -> OutputScript {
+    OutputScript {
+        limits: broca_core::output_reservation::OutputLimits::new(32_000, 0),
+        context_limit: 1_024 + 100 + 10_000,
+    }
+}
+
+/// A context limit with no room for even the floor beside the estimated input: the second step
+/// is never sent and the run ends with the overflow error.
+fn overflowing() -> OutputScript {
+    OutputScript {
+        limits: broca_core::output_reservation::OutputLimits::new(32_000, 0),
+        context_limit: 1_024 + 100 + 1_000,
+    }
+}
+
+#[tokio::test]
+async fn a_step_whose_cap_would_pass_the_context_limit_is_sent_with_a_lowered_cap() {
+    OUTPUT
+        .scope(Some(lowering()), compare(measured_scenario()))
+        .await;
+}
+
+#[tokio::test]
+async fn a_lowered_cap_survives_every_crash_cut() {
+    OUTPUT
+        .scope(Some(lowering()), compare_every_cut(measured_scenario()))
+        .await;
+}
+
+#[tokio::test]
+async fn a_step_with_no_room_for_output_ends_the_run_unsent() {
+    OUTPUT
+        .scope(Some(overflowing()), compare(measured_scenario()))
+        .await;
+}
+
+#[tokio::test]
+async fn a_compacted_step_whose_cap_would_pass_the_context_limit_is_lowered() {
+    let script = CompactionScript {
+        context_limit: lowering().context_limit,
+        rides: Vec::new(),
+    };
+    OUTPUT
+        .scope(
+            Some(lowering()),
+            compare_compacted(measured_scenario(), script),
+        )
+        .await;
 }

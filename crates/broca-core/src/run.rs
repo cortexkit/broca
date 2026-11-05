@@ -7153,11 +7153,14 @@ where
                 (provider.output_limits(), step_context_limit)
             {
                 // The estimate costs a render of the whole request, so it is made only when a
-                // measured earlier step on this model makes one possible. A compaction boundary
-                // already rendered the request, unless refusal fallback changed its route.
+                // measured earlier step on this model makes one possible. A first-protocol
+                // compaction boundary already rendered the request and recorded its size, unless
+                // refusal fallback changed its route. On the current compaction contract nothing
+                // records that size (`notice_request_bytes` belongs to the first protocol and
+                // stays 0 or holds an earlier step's), so the request is rendered here.
                 let estimate = if output_history.has_measurement(step_model) {
                     let bytes = match &model_opts {
-                        Some(_) if fallback_model.is_none() => notice_request_bytes,
+                        Some(_) if fallback_model.is_none() && !mode3 => notice_request_bytes,
                         _ => provider
                             .try_render_request(&step_opts)
                             .map_err(|error| RunError::Wal(error.message))?
@@ -9821,7 +9824,9 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
 
 /// The `context_overflow` refusal of a request whose estimated input leaves less room for output
 /// than the provider's floor. Nothing was sent; compacting the conversation is what helps.
-fn output_reservation_overflow(
+/// The error a run ends with when not even the provider's smallest output cap fits beside a
+/// step's estimated input: the request is not sent.
+pub fn output_reservation_overflow(
     estimate: u64,
     available: u64,
     floor: u32,

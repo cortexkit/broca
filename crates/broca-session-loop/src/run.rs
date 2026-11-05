@@ -1092,6 +1092,23 @@ where
                     .await?;
             }
         }
+        let opts = match crate::output::reserve(writer, seams.provider, admission, step_id, opts)
+            .await?
+        {
+            crate::output::Reserved::Send(opts) => *opts,
+            crate::output::Reserved::Overflow(error) => {
+                let now = (seams.now_ms)();
+                let mut record = run_end(writer, &admission.run_id, RunFinishReason::Error, now);
+                if let Record::RunEnd(end) = &mut record {
+                    end.error = Some(
+                        serde_json::to_value(&*error)
+                            .map_err(|e| LoopError::Parts(e.to_string()))?,
+                    );
+                }
+                append_end(writer, &admission.run_id, vec![record]).await?;
+                return Ok(finished(writer, RunFinishReason::Error));
+            }
+        };
         let outcome = model_step(writer, seams, &admission.run_id, step_id, opts).await?;
         let step = match outcome {
             Ok(step) => step,
