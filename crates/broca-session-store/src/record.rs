@@ -432,6 +432,10 @@ message! {
         /// Owned by diagnostics: stream event counts, cache evidence, WebSocket and input
         /// transformation details.
         18 opt telemetry: serde_json::Value,
+        /// Whether the provider accepted the request for processing, so its prompt prefix was
+        /// read into or written to the provider's cache, as the run loop decides it when it
+        /// records the attempt. Absent means it didn't, or isn't known to have.
+        19 opt reached_cache: bool,
     }
 }
 

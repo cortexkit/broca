@@ -25,10 +25,11 @@
 //!
 //! What this build covers: runs with text steps and tool batches, stop conditions, provider
 //! errors, steers and ordered deliveries, cancels, pauses, hooks, the approval policy, calls a
-//! provider holds, repetition guidance and media in tool results. Compaction views, approval
-//! questions, budgets and the rest of today's loop come in later stages, each proven against
-//! today's loop by the differential tests in `tests/`.
+//! provider holds, repetition guidance and media in tool results. It doesn't cover compaction
+//! views, approval questions, budgets or the rest of today's loop yet. Each part it covers is
+//! proven against today's loop by the differential tests in `tests/`.
 
+pub mod compaction;
 pub mod entries;
 pub mod media;
 pub mod parts;

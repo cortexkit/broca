@@ -3016,6 +3016,11 @@ fn attempt_record(run_id: &str, step_id: u64, attempt: ModelAttempt) -> Result<R
         served_account_ref: attempt.served_account_ref.clone(),
         billing: None,
         telemetry,
+        reached_cache: broca_core::cache_warm::attempt_reached_the_cache(
+            attempt.http_status,
+            &attempt.outcome,
+        )
+        .then_some(true),
     }))
 }
 

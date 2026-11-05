@@ -758,6 +758,7 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         return OpsOutcome::FoldRefused(format!("{e:?}"));
     }
     let refusal_schedule = operations.refusal_schedule.clone();
+    let sends = send_differences(&records, &operations);
     let folded_queue: Vec<String> = operations
         .queue
         .iter()
@@ -894,6 +895,7 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
     });
     check("cancel", today_cancel == run.cancel);
     check("queue", today_queue == folded_queue);
+    differs.extend(sends);
     let mut set = Vec::new();
     for (field, value) in [
         ("account_limit_pause", json_of(&today.account_limit_pause)),
@@ -924,6 +926,71 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         ("run.pending_steers", run.pending_messages() as u64),
     ];
     OpsOutcome::Compared(differs, sizes, set)
+}
+
+/// Where the fold's latest send facts differ from what today's compaction code folds from the
+/// same records: the request-size estimate (`CompactionHistory`), the run of the newest accepted
+/// request (what `host::previous` reads) and the newest cache send (`last_cache_send_at_ms`).
+/// Two kinds of cache-send difference are expected and named apart: a cache warm, which the
+/// fold doesn't read yet, and an attempt without a send time, which today dates from a lower
+/// bound.
+fn send_differences(
+    records: &[broca_wal::WalRecord],
+    operations: &broca_session_store::fold::operations::Operations,
+) -> Vec<String> {
+    use broca_wal::WalRecord;
+    let mut differs = Vec::new();
+    let mut today = broca_core::compaction::CompactionHistory::default();
+    let mut current_run = None;
+    let mut today_run = None;
+    let mut warmed = false;
+    let mut undated = false;
+    for record in records {
+        today.fold(record);
+        match record {
+            WalRecord::RunStarted { run_id, .. } => current_run = Some(run_id.0.clone()),
+            WalRecord::ModelStepFinished { .. } => today_run = current_run.clone(),
+            WalRecord::ModelAttemptFinished {
+                http_status,
+                outcome,
+                sent_at_ms,
+                ..
+            } if broca_core::cache_warm::attempt_reached_the_cache(*http_status, outcome) => {
+                today_run = current_run.clone();
+                undated |= sent_at_ms.is_none();
+            }
+            WalRecord::CacheWarmed { .. } => warmed = true,
+            _ => {}
+        }
+    }
+    let folded = operations
+        .estimate
+        .as_ref()
+        .map(broca_session_loop::compaction::history)
+        .unwrap_or_default();
+    if today.usage() != folded.usage()
+        || today.previous_model != folded.previous_model
+        || today.current_request_bytes != folded.current_request_bytes
+        || today.previous_request_bytes != folded.previous_request_bytes
+    {
+        differs.push("estimate".into());
+    }
+    if today_run != operations.last_send_run {
+        differs.push("last_send_run".into());
+    }
+    let today_cache = broca_core::cache_warm::last_cache_send_at_ms(records);
+    let folded_cache = operations
+        .last_cache_send
+        .as_ref()
+        .map(|send| send.sent_at_ms);
+    if today_cache != folded_cache {
+        differs.push(match (warmed, undated) {
+            (true, _) => "last_cache_send (a cache warm)".into(),
+            (false, true) => "last_cache_send (an attempt without a send time)".into(),
+            (false, false) => "last_cache_send".into(),
+        });
+    }
+    differs
 }
 
 /// Runs the operational comparison on each log, or with `--prefixes` on every prefix of it

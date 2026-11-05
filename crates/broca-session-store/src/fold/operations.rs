@@ -592,6 +592,57 @@ state! {
             reset: "queued_send",
             bound: Bound::Fixed,
         },
+        /// What compaction estimates the next request's size from: the newest step and the
+        /// request body lengths around it. Session-scoped, so a new run's first estimate still
+        /// counts from the previous run's last step.
+        12 opt pub estimate: Estimate => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The run of the newest request the provider accepted: a step's end, or an attempt
+        /// that reached the cache. A compaction ride compares that run's model, tier, account
+        /// and surface with the current run's.
+        13 opt pub last_send_run: String => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The newest request that reached the provider's cache, by when it was sent: the cache's
+        /// lifetime counts from it.
+        14 opt pub last_cache_send: CacheSend => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+crate::message! {
+    /// The facts compaction's request-size estimate reads, as today's loop folds them.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct Estimate {
+        /// The current run's model.
+        1 opt run_model: broca_protocol::request::ModelHandle,
+        /// The newest step's end: its run's model, its usage and its fallback (owned by the run
+        /// loop: the model that served it and any server-side iterations).
+        2 opt step_model: broca_protocol::request::ModelHandle,
+        3 opt step_usage: broca_protocol::usage::Usage,
+        4 opt step_fallback: serde_json::Value,
+        /// Whether a step has ended in this session at all.
+        5 req stepped: bool,
+        /// The newest attempt's request body length, and the one before the newest step's end.
+        6 opt current_request_bytes: u64,
+        7 opt previous_request_bytes: u64,
+    }
+}
+
+crate::message! {
+    /// When a request that reached the provider's cache was sent, and its run.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CacheSend {
+        1 req sent_at_ms: u64,
+        2 req run_id: String,
     }
 }
 
@@ -670,6 +721,48 @@ impl Operations {
         self.apply_at(None, record)
     }
 
+    /// The session's latest sends: a run's start names the current model, an attempt its
+    /// request's size and whether it reached the cache, and a step's end the newest step.
+    fn apply_sends(&mut self, record: &Record) {
+        match record {
+            Record::RunStart(start) => {
+                self.estimate
+                    .get_or_insert_with(Estimate::default)
+                    .run_model = Some(start.model.clone());
+            }
+            Record::Attempt(attempt) => {
+                self.estimate
+                    .get_or_insert_with(Estimate::default)
+                    .current_request_bytes = Some(attempt.request_body_len);
+                if attempt.reached_cache == Some(true) {
+                    self.last_send_run = Some(attempt.run_id.clone());
+                    if let Some(sent_at_ms) = attempt.sent_at_ms {
+                        if self
+                            .last_cache_send
+                            .as_ref()
+                            .is_none_or(|latest| sent_at_ms >= latest.sent_at_ms)
+                        {
+                            self.last_cache_send = Some(CacheSend {
+                                sent_at_ms,
+                                run_id: attempt.run_id.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            Record::StepEnd(step) => {
+                let estimate = self.estimate.get_or_insert_with(Estimate::default);
+                estimate.step_model = estimate.run_model.clone();
+                estimate.step_usage = step.usage;
+                estimate.step_fallback = step.fallback.clone();
+                estimate.stepped = true;
+                estimate.previous_request_bytes = estimate.current_request_bytes;
+                self.last_send_run = Some(step.run_id.clone());
+            }
+            _ => {}
+        }
+    }
+
     /// Folds `record`, which has `seq` in its log. A pending input remembers the seq of the
     /// record that accepted it, so the copy a boundary places can name it.
     pub fn apply_at(&mut self, seq: Option<u64>, record: &Record) -> Result<(), FoldError> {
@@ -727,6 +820,7 @@ impl Operations {
             }
             _ => {}
         }
+        self.apply_sends(record);
         if let Record::RunStart(start) = record {
             self.run = Some(Run::new(start));
             self.refusal_schedule = start.refusal_schedule.clone();

@@ -1060,13 +1060,22 @@ fn model_attempt(f: &mut Fields, state: &mut State, out: &mut Converted) {
             billing.insert(key.into(), value);
         }
     }
+    let outcome = f.req_string("outcome");
+    let http_status = f.u64("http_status").map(|v| v as u32);
+    // Decided by today's rule, which the new format records instead of working out again.
+    let reached_cache = broca_core::cache_warm::attempt_reached_the_cache(
+        http_status.and_then(|status| u16::try_from(status).ok()),
+        &serde_json::from_value(Value::String(outcome.clone())).unwrap_or(
+            broca_protocol::provider::AttemptOutcome::Unknown(outcome.clone()),
+        ),
+    );
     let attempt = Attempt {
         run_id: state.run_id.clone(),
         step_id: f.req_u64("step_id"),
         attempt: f.req_u64("attempt") as u32,
         attempt_id: f.string("attempt_id"),
-        outcome: f.req_string("outcome"),
-        http_status: f.u64("http_status").map(|v| v as u32),
+        outcome,
+        http_status,
         request_body_len: f.req_u64("request_body_len"),
         request_body_sha256: digest_field(f, "request_body_sha256"),
         response_body_len: f.req_u64("response_body_len"),
@@ -1079,6 +1088,7 @@ fn model_attempt(f: &mut Fields, state: &mut State, out: &mut Converted) {
         served_account_ref: f.string("served_account_ref"),
         billing: (!billing.is_empty()).then_some(Value::Object(billing)),
         telemetry: f.rest(),
+        reached_cache: reached_cache.then_some(true),
     };
     out.records.push(Record::Attempt(attempt));
 }
