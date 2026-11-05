@@ -130,6 +130,15 @@ state! {
             reset: "tool replies",
             bound: Bound::OpenWork("one assistant message's tool calls"),
         },
+        /// A revert into sealed history left no window: the messages before the new run are in
+        /// sealed segments only. Reads serve them from there, and nothing may render until a
+        /// window is copied back in, after the compaction provider answers an `over_limit`
+        /// notice (not built yet).
+        8 req pub window_pending: bool => {
+            owner: "revert",
+            reset: "a window copied back in",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -143,6 +152,7 @@ impl Conversation {
             placed: 0,
             entries: Vec::new(),
             open_entry: None,
+            window_pending: false,
         }
     }
 

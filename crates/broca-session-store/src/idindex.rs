@@ -149,7 +149,8 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
         | Record::ViewApplied(_)
         | Record::WriterOpened(_)
         | Record::ChangeIntent(_)
-        | Record::ChangeAborted(_) => {}
+        | Record::ChangeAborted(_)
+        | Record::TranscriptReverted(_) => {}
     }
     ids
 }

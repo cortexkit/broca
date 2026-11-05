@@ -471,6 +471,21 @@ state! {
             reset: "change_aborted",
             bound: Bound::Fixed,
         },
+        /// After a revert: the ordinal from which the compaction provider must read the
+        /// transcript again, owed in the next notice as `transcript_changed`. Two reverts before
+        /// a notice owe the lower one.
+        7 opt pub transcript_changed: u64 => {
+            owner: "compaction",
+            reset: "a notice carrying it answered",
+            bound: Bound::Fixed,
+        },
+        /// The session's history version, which every revert moves. The head holds it too; the
+        /// fold carries it so a rebuild from records reproduces it.
+        8 req pub history_version: u64 => {
+            owner: "writer",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -530,6 +545,13 @@ impl Operations {
                     version: view.version,
                     checksum: view.checksum.clone(),
                 });
+            }
+            Record::TranscriptReverted(reverted) => {
+                self.transcript_changed = Some(
+                    self.transcript_changed
+                        .map_or(reverted.ordinal, |owed| owed.min(reverted.ordinal)),
+                );
+                self.history_version = reverted.history_version;
             }
             Record::ViewApplied(applied) => {
                 self.view_applied = Some(AppliedView {

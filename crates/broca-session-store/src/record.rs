@@ -881,6 +881,9 @@ crate::values! {
         1 Cut,
         /// Seals every ledger record and keeps the transcript open.
         2 LedgerSeal,
+        /// Ends the transcript branch before an earlier user input and starts a new run there
+        /// with an edited input (see `session::revert`). Seals every ledger record.
+        3 Revert,
     }
 }
 
@@ -893,8 +896,26 @@ message! {
     pub struct ChangeIntent {
         1 req change: crate::codec::Id128,
         2 req kind: ChangeKind,
-        /// For a cut, the seq of the first record kept above the cut.
+        /// For a cut, the seq of the first record kept above the cut. For a revert, the seq of
+        /// the first transcript record the branch drops.
         3 opt cut: u64,
+    }
+}
+
+message! {
+    /// A revert ended the transcript branch before message `ordinal` and started a new run
+    /// there. Its records stay in the ledger: spend, tool side effects and accepted sends aren't
+    /// undone. Only a revert's own ledger segment holds this record, never the log the revert
+    /// replaced, so a revert that never committed leaves no trace of it.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct TranscriptReverted {
+        1 req change: crate::codec::Id128,
+        /// The seq of the first transcript record dropped, and of the last one the branch held.
+        2 req from_seq: u64,
+        3 req through_seq: u64,
+        4 req ordinal: u64,
+        /// The session's history version after the revert.
+        5 req history_version: u64,
     }
 }
 
@@ -947,6 +968,7 @@ records! {
         88 WriterOpened,
         89 ChangeIntent,
         90 ChangeAborted,
+        91 TranscriptReverted,
     }
 }
 

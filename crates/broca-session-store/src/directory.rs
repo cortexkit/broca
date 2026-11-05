@@ -9,6 +9,12 @@
 //! object under the change that adds the segment, and the pages it replaces are retired with that
 //! change. A lookup by seq walks from the root to one leaf.
 //!
+//! A revert cuts the branch at a seq: `truncate` keeps every segment wholly before it, gives the
+//! segment holding it an entry whose `last_seq` ends just before it, and drops the rest. Pages
+//! wholly before the cut are shared, and only the path to the cut is rewritten. An entry's
+//! `last_seq` can therefore end before its segment's last record, and every reader of a segment
+//! ignores records above it (`DirEntry::keeps`).
+//!
 //! Pages are encrypted under the session's frame key, with the session id and the page's own name
 //! in their authenticated data, so a page can't be served under another name or session.
 
@@ -35,6 +41,14 @@ crate::message! {
         /// places. Absent when it places none.
         6 opt first_ordinal: u64,
         7 opt last_ordinal: u64,
+    }
+}
+
+impl DirEntry {
+    /// Whether this branch keeps the segment's record at `seq`: a revert can end an entry
+    /// before its segment does.
+    pub fn keeps(&self, seq: u64) -> bool {
+        self.first_seq <= seq && seq <= self.last_seq
     }
 }
 
@@ -150,6 +164,15 @@ pub struct Appended {
     pub root: PageRef,
     /// The pages the new root no longer names, which retire with the change.
     pub replaced: Vec<String>,
+}
+
+/// The objects a branch cut at a seq no longer names: pages on the path to the cut, and pages
+/// and segments wholly after it. The segment that holds the cut stays: the new branch keeps its
+/// first part.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Abandoned {
+    pub pages: Vec<String>,
+    pub segments: Vec<String>,
 }
 
 impl<B: SessionBackend> Pages<'_, B> {
@@ -296,6 +319,132 @@ impl<B: SessionBackend> Pages<'_, B> {
         })
     }
 
+    /// The directory rooted at `root` cut just before `cut`: segments wholly before it kept,
+    /// the one holding it ended at `cut - 1`, later ones dropped. `last_ordinal` is the last
+    /// message the kept part places, which the caller knows from its conversation fold. New pages
+    /// are named `<prefix>-t<n>`. `None` when nothing before `cut` is sealed.
+    pub async fn truncate(
+        &self,
+        root: Option<&PageRef>,
+        cut: u64,
+        last_ordinal: Option<u64>,
+        prefix: &str,
+        at: Version,
+    ) -> Result<Option<PageRef>, DirectoryError> {
+        let Some(root) = root else {
+            return Ok(None);
+        };
+        if cut <= root.first_seq {
+            return Ok(None);
+        }
+        if root.last_seq < cut {
+            return Ok(Some(root.clone()));
+        }
+        let mut names = 0u32;
+        let mut path = Vec::new();
+        let mut page = self.read(root).await?;
+        // Walk down the path to the cut, keeping each page's items before it.
+        let leaf = loop {
+            if page.level == 0 {
+                break page;
+            }
+            let mut kept: Vec<PageRef> = page
+                .children
+                .iter()
+                .filter(|child| child.first_seq < cut)
+                .cloned()
+                .collect();
+            let straddling = kept.last().filter(|child| child.last_seq >= cut).cloned();
+            let level = page.level;
+            page = match straddling {
+                Some(child) => {
+                    kept.pop();
+                    path.push((level, kept));
+                    self.read(&child).await?
+                }
+                None => {
+                    path.push((level, kept));
+                    Page {
+                        level: 0,
+                        entries: Vec::new(),
+                        children: Vec::new(),
+                    }
+                }
+            };
+        };
+        let mut entries: Vec<DirEntry> = leaf
+            .entries
+            .into_iter()
+            .filter(|entry| entry.first_seq < cut)
+            .collect();
+        if let Some(entry) = entries.last_mut().filter(|entry| entry.last_seq >= cut) {
+            entry.last_seq = cut - 1;
+            match last_ordinal
+                .filter(|last| entry.first_ordinal.is_some_and(|first| first <= *last))
+            {
+                Some(last) => entry.last_ordinal = Some(last),
+                None => {
+                    entry.first_ordinal = None;
+                    entry.last_ordinal = None;
+                }
+            }
+        }
+        // Rebuild upwards: each level's kept children plus the rewritten page below, if it
+        // still holds anything.
+        let mut carried = if entries.is_empty() {
+            None
+        } else {
+            names += 1;
+            let page = Page {
+                level: 0,
+                entries,
+                children: Vec::new(),
+            };
+            Some(self.write(format!("{prefix}-t{names}"), &page, at).await?)
+        };
+        for (level, mut children) in path.into_iter().rev() {
+            children.extend(carried.take());
+            if children.is_empty() {
+                continue;
+            }
+            names += 1;
+            let page = Page {
+                level,
+                entries: Vec::new(),
+                children,
+            };
+            carried = Some(self.write(format!("{prefix}-t{names}"), &page, at).await?);
+        }
+        Ok(carried)
+    }
+
+    /// What the directory rooted at `old` names that a branch cut before `cut` doesn't, so a
+    /// revert's deletion can find it from the old root and the cut alone. Pages and segments
+    /// wholly before the cut are shared with the new branch, so the walk never descends into
+    /// them.
+    pub async fn abandoned(
+        &self,
+        old: Option<&PageRef>,
+        cut: u64,
+    ) -> Result<Abandoned, DirectoryError> {
+        let mut out = Abandoned::default();
+        let mut stack: Vec<PageRef> = old.into_iter().cloned().collect();
+        while let Some(page_ref) = stack.pop() {
+            if page_ref.last_seq < cut {
+                continue;
+            }
+            let page = self.read(&page_ref).await?;
+            out.pages.push(page_ref.object.clone());
+            stack.extend(page.children);
+            for entry in page.entries {
+                if entry.first_seq >= cut {
+                    out.segments.push(entry.object);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The entry whose segment places the message with `ordinal`, if any.
     pub async fn find_ordinal(
         &self,
@@ -316,6 +465,38 @@ impl<B: SessionBackend> Pages<'_, B> {
                 .children
                 .iter()
                 .find(|child| holds_ordinal(child.first_ordinal, child.last_ordinal, ordinal))
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            page = self.read(&child).await?;
+        }
+    }
+
+    /// The last entry whose segment starts before `seq`: the one holding the branch's latest
+    /// records before it.
+    pub async fn find_before(
+        &self,
+        root: Option<&PageRef>,
+        seq: u64,
+    ) -> Result<Option<DirEntry>, DirectoryError> {
+        let Some(root) = root else {
+            return Ok(None);
+        };
+        let mut page = self.read(root).await?;
+        loop {
+            if page.level == 0 {
+                return Ok(page
+                    .entries
+                    .into_iter()
+                    .rev()
+                    .find(|entry| entry.first_seq < seq));
+            }
+            let Some(child) = page
+                .children
+                .iter()
+                .rev()
+                .find(|child| child.first_seq < seq)
                 .cloned()
             else {
                 return Ok(None);

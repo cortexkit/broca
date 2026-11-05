@@ -30,15 +30,16 @@
 //! encrypted reasoning) and some require it back on later requests of the same run, so resuming
 //! a run may need its own.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::SessionBackend;
 use crate::checkpoint::Checkpoint;
 use crate::codec::{hex, Id128, Message as _};
 use crate::directory::{DirEntry, Pages, FANOUT};
 use crate::fold::conversation::Conversation;
+use crate::fold::operations::Operations;
 use crate::head::{self, LastChange, OpenLog, PendingDeletion};
-use crate::idindex::{self, IndexPages, IndexRoot, Retired};
+use crate::idindex::{self, IndexPages, IndexRoot, OpenIds, Retired};
 use crate::keys::random_id;
 use crate::log::{self, ChainBase, LogEncoder};
 use crate::record::{ChangeAborted, ChangeIntent, ChangeKind, Record, Stream};
@@ -71,16 +72,36 @@ pub struct Sealed {
 }
 
 /// What the create step built, which the commit then names.
-struct Created {
-    sealed: Sealed,
-    encoder: LogEncoder,
-    conversation: Conversation,
-    transcript_dir: Option<crate::directory::PageRef>,
-    ledger_dir: Option<crate::directory::PageRef>,
-    id_index: String,
+pub(super) struct Created {
+    pub(super) sealed: Sealed,
+    pub(super) encoder: LogEncoder,
+    /// The session's state once the change commits.
+    pub(super) conversation: Conversation,
+    pub(super) operations: Operations,
+    /// The new log's `EntryFacts` records, by seq, and its ledger records' ids.
+    pub(super) window_facts: BTreeMap<u64, u64>,
+    pub(super) open_ids: OpenIds,
+    pub(super) transcript_dir: Option<crate::directory::PageRef>,
+    pub(super) ledger_dir: Option<crate::directory::PageRef>,
+    pub(super) id_index: String,
     /// The id-index list of runs merges retired, deleted after the grace period.
-    retired_index: Option<String>,
-    replaced: Vec<String>,
+    pub(super) retired_index: Option<String>,
+    pub(super) replaced: Vec<String>,
+    /// A revert's new history version, and its list of abandoned objects.
+    pub(super) history_version: Option<u64>,
+    pub(super) abandoned: Option<String>,
+}
+
+/// What sealing a change's ledger records wrote.
+pub(super) struct LedgerSealed {
+    pub(super) ledger_dir: Option<crate::directory::PageRef>,
+    pub(super) replaced: Vec<String>,
+    pub(super) id_index: String,
+    pub(super) retired_index: Option<String>,
+    pub(super) bytes: u64,
+    pub(super) index_entries: usize,
+    pub(super) merged_entries: u64,
+    pub(super) forced_merges: u32,
 }
 
 impl<'b, B: SessionBackend> Session<'b, B> {
@@ -132,7 +153,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     }
 
     /// The open log's records, its batches and its checkpoint, read back from the backend.
-    async fn read_open_log(
+    pub(super) async fn read_open_log(
         &self,
     ) -> Result<(Vec<(u64, Record)>, Vec<std::ops::Range<usize>>, Checkpoint), SessionError> {
         let open = self.head.open_log.clone().ok_or(SessionError::Backend(
@@ -295,78 +316,12 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             replaced.extend(appended.replaced);
             transcript_dir = Some(appended.root);
         }
-        let object = format!("{name}/l");
-        let bytes = segment::build(
-            &key,
-            object.as_bytes(),
-            &ledger,
-            SegmentMeta {
-                session_id: self.head.session_id,
-                created_at_ms: now_ms,
-                prefixes: Vec::new(),
-                leading: None,
-                trailer: Some(settled.encode()),
-                placed_before: Vec::new(),
-            },
-        )
-        .map_err(SessionError::Segment)?;
-        sealed.ledger_bytes = bytes.len() as u64;
-        self.backend
-            .put_object(&self.addr, &object, &bytes, self.version)
-            .await?;
-        let appended = pages
-            .append(
-                self.head.ledger_dir.as_ref(),
-                entry(object, &ledger, bytes.len(), now_ms, None),
-                &format!("{name}/dl"),
-                self.version,
-            )
-            .await
-            .map_err(SessionError::Directory)?;
-        replaced.extend(appended.replaced);
-        let ledger_dir = Some(appended.root);
-
-        // The sealed ledger records' ids, filed in the id index.
-        let index = IndexPages {
-            backend: self.backend,
-            addr: &self.addr,
-            session: self.head.session_id,
-            key: &key,
-        };
-        let root: IndexRoot = match &self.head.id_index {
-            Some(name) => index.read(name).await.map_err(SessionError::Index)?,
-            None => IndexRoot::default(),
-        };
-        let entries = idindex::entries_for(&idindex::hash_key(&self.key), &ledger);
-        sealed.index_entries = entries.len();
-        let updated = index
-            .update(root, entries, &name, self.version)
-            .await
-            .map_err(SessionError::Index)?;
-        sealed.merged_entries = updated.merged_entries;
-        sealed.forced_merges = updated.forced;
-        let id_index = format!("{name}/ix");
-        index
-            .write(&id_index, &updated.root, self.version)
-            .await
-            .map_err(SessionError::Index)?;
-        replaced.extend(self.head.id_index.clone());
-        let retired_index = if updated.retired.is_empty() {
-            None
-        } else {
-            let object = format!("{name}/ixd");
-            index
-                .write(
-                    &object,
-                    &Retired {
-                        refs: updated.retired,
-                    },
-                    self.version,
-                )
-                .await
-                .map_err(SessionError::Index)?;
-            Some(object)
-        };
+        let ledger_sealed = self.seal_ledger(&name, &ledger, &settled, now_ms).await?;
+        sealed.ledger_bytes = ledger_sealed.bytes;
+        sealed.index_entries = ledger_sealed.index_entries;
+        sealed.merged_entries = ledger_sealed.merged_entries;
+        sealed.forced_merges = ledger_sealed.forced_merges;
+        replaced.extend(ledger_sealed.replaced);
 
         // The new open log: a checkpoint, then the transcript records that stay open, copied
         // batch by batch with their seqs.
@@ -392,14 +347,16 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                     covers_through: intent_seq,
                     next_seq: self.encoder.next_seq(),
                     conversation: at_cut.clone(),
-                    operational: settled,
+                    operational: settled.clone(),
                     transcript_base,
                     ledger_base: Some(intent_seq),
                 }
                 .encode(),
             )?
             .into_written(&mut encoder);
+        let settled_after = settled;
         let mut conversation = at_cut;
+        let mut window_facts = BTreeMap::new();
         for batch in batches {
             let kept: Vec<(u64, &Record)> = records[batch.clone()]
                 .iter()
@@ -411,10 +368,13 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             if kept.is_empty() {
                 continue;
             }
-            for (_, record) in &kept {
+            for (seq, record) in &kept {
                 conversation
                     .apply(record)
                     .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
+                if let Record::EntryFacts(facts) = record {
+                    window_facts.insert(*seq, facts.ordinal);
+                }
             }
             sealed.kept_records += kept.len();
             bytes.extend(encoder.copy_batch(&kept)?.into_written(&mut encoder));
@@ -430,17 +390,119 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             sealed,
             encoder,
             conversation,
+            operations: settled_after,
+            window_facts,
+            open_ids: OpenIds::default(),
             transcript_dir,
-            ledger_dir,
+            ledger_dir: ledger_sealed.ledger_dir,
+            id_index: ledger_sealed.id_index,
+            retired_index: ledger_sealed.retired_index,
+            replaced,
+            history_version: None,
+            abandoned: None,
+        })
+    }
+
+    /// Seals a change's ledger records into one ledger segment, with `settled` (the operational
+    /// state once the change commits) as its trailer, and files their ids in the id index.
+    pub(super) async fn seal_ledger(
+        &self,
+        name: &str,
+        ledger: &[(u64, Record)],
+        settled: &Operations,
+        now_ms: u64,
+    ) -> Result<LedgerSealed, SessionError> {
+        let key = self.key.frame_key();
+        let pages = Pages {
+            backend: self.backend,
+            addr: &self.addr,
+            session: self.head.session_id,
+            key: &key,
+            fanout: FANOUT,
+        };
+        let mut replaced = Vec::new();
+        let object = format!("{name}/l");
+        let bytes = segment::build(
+            &key,
+            object.as_bytes(),
+            ledger,
+            SegmentMeta {
+                session_id: self.head.session_id,
+                created_at_ms: now_ms,
+                prefixes: Vec::new(),
+                leading: None,
+                trailer: Some(settled.encode()),
+                placed_before: Vec::new(),
+            },
+        )
+        .map_err(SessionError::Segment)?;
+        let size = bytes.len() as u64;
+        self.backend
+            .put_object(&self.addr, &object, &bytes, self.version)
+            .await?;
+        let appended = pages
+            .append(
+                self.head.ledger_dir.as_ref(),
+                entry(object, ledger, bytes.len(), now_ms, None),
+                &format!("{name}/dl"),
+                self.version,
+            )
+            .await
+            .map_err(SessionError::Directory)?;
+        replaced.extend(appended.replaced);
+        let index = IndexPages {
+            backend: self.backend,
+            addr: &self.addr,
+            session: self.head.session_id,
+            key: &key,
+        };
+        let root: IndexRoot = match &self.head.id_index {
+            Some(name) => index.read(name).await.map_err(SessionError::Index)?,
+            None => IndexRoot::default(),
+        };
+        let entries = idindex::entries_for(&idindex::hash_key(&self.key), ledger);
+        let index_entries = entries.len();
+        let updated = index
+            .update(root, entries, name, self.version)
+            .await
+            .map_err(SessionError::Index)?;
+        let id_index = format!("{name}/ix");
+        index
+            .write(&id_index, &updated.root, self.version)
+            .await
+            .map_err(SessionError::Index)?;
+        replaced.extend(self.head.id_index.clone());
+        let retired_index = if updated.retired.is_empty() {
+            None
+        } else {
+            let object = format!("{name}/ixd");
+            index
+                .write(
+                    &object,
+                    &Retired {
+                        refs: updated.retired,
+                    },
+                    self.version,
+                )
+                .await
+                .map_err(SessionError::Index)?;
+            Some(object)
+        };
+        Ok(LedgerSealed {
+            ledger_dir: Some(appended.root),
+            replaced,
             id_index,
             retired_index,
-            replaced,
+            bytes: size,
+            index_entries,
+            merged_entries: updated.merged_entries,
+            forced_merges: updated.forced,
         })
     }
 
     /// The commit: one compare-and-swap of the head. A refusal or an unknown outcome poisons the
     /// writer, which never undoes a change it can't tell didn't commit: the next load decides.
-    async fn commit(
+    pub(super) async fn commit(
         &mut self,
         change: Id128,
         intent_seq: u64,
@@ -457,12 +519,16 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         head.ledger_dir = created.ledger_dir;
         head.id_index = Some(created.id_index);
         head.next_seq = created.encoder.next_seq();
+        if let Some(version) = created.history_version {
+            head.history_version = version;
+        }
         head.pending.push(PendingDeletion {
             change,
             unreferenced_at_ms: now_ms,
             logs: vec![self.log],
             objects: created.replaced,
             retired_index: created.retired_index,
+            abandoned: created.abandoned,
         });
         self.poisoned = true;
         let version = self
@@ -479,12 +545,11 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         self.log = change;
         self.encoder = created.encoder;
         self.conversation = created.conversation;
-        self.operations.open_change = None;
-        // Every ledger record the old log held is sealed, and its ids are in the index now.
-        self.open_ids.clear();
-        // Facts of messages that left the window are found through the directory now.
-        let start = self.conversation.window_start();
-        self.window_facts.retain(|_, ordinal| *ordinal >= start);
+        self.operations = created.operations;
+        // Every ledger record the old log held is sealed, and its ids are in the index now;
+        // facts of messages that left the window are found through the directory.
+        self.open_ids = created.open_ids;
+        self.window_facts = created.window_facts;
         self.poisoned = false;
         Ok(created.sealed)
     }
@@ -492,7 +557,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     /// Undoes a change that failed before its commit: deletes what it created and reopens the
     /// log. If that fails too (another writer took the head, or the backend is down), the writer
     /// is poisoned and the next load undoes the change.
-    async fn abort(&mut self, change: Id128) {
+    pub(super) async fn abort(&mut self, change: Id128) {
         let undone = async {
             self.backend
                 .delete_change(&self.addr, &change, self.version)
@@ -551,6 +616,23 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                             .delete_retired(&retired.refs, self.version)
                             .await
                             .map_err(SessionError::Index)?;
+                        self.backend
+                            .delete_object(&self.addr, list, self.version)
+                            .await?;
+                    }
+                    Err(idindex::IndexError::Missing(_)) => {}
+                    Err(error) => return Err(SessionError::Index(error)),
+                }
+            }
+            // A revert's list of abandoned objects, likewise read first and deleted last.
+            if let Some(list) = &pending.abandoned {
+                match index.read::<Retired>(list).await {
+                    Ok(abandoned) => {
+                        for object in &abandoned.refs {
+                            self.backend
+                                .delete_object(&self.addr, object, self.version)
+                                .await?;
+                        }
                         self.backend
                             .delete_object(&self.addr, list, self.version)
                             .await?;

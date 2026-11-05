@@ -58,6 +58,8 @@ pub enum SessionError {
     Directory(crate::directory::DirectoryError),
     Segment(crate::segment::SegmentError),
     Index(crate::idindex::IndexError),
+    /// A revert was refused; nothing was written.
+    RevertRefused(revert::RevertRefusal),
 }
 
 impl From<BackendError> for SessionError {
@@ -478,6 +480,8 @@ impl<'b, B: SessionBackend> Session<'b, B> {
 
 mod read;
 pub use read::StoredEntry;
+mod revert;
+pub use revert::{RevertRefusal, Reverted};
 mod seal;
 pub use seal::{Sealed, GRACE_MS};
 

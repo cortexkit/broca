@@ -114,7 +114,12 @@ impl<B: SessionBackend> Session<'_, B> {
                     .expect("block_for_ordinal only answers when every block has an ordinal");
                 let mut conversation = Conversation::new(self.conversation.appends_in_conversation);
                 conversation.placed = first - 1;
-                for (_, record) in segment.block(position).map_err(SessionError::Segment)? {
+                for (_, record) in segment
+                    .block(position)
+                    .map_err(SessionError::Segment)?
+                    .into_iter()
+                    .filter(|(seq, _)| entry.keeps(*seq))
+                {
                     conversation
                         .apply(&record)
                         .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
@@ -255,7 +260,12 @@ impl<B: SessionBackend> Session<'_, B> {
             .expect("block_for_ordinal only answers when every block has an ordinal");
         let mut conversation = Conversation::new(self.conversation.appends_in_conversation);
         conversation.placed = first - 1;
-        for (_, record) in segment.block(position).map_err(SessionError::Segment)? {
+        for (_, record) in segment
+            .block(position)
+            .map_err(SessionError::Segment)?
+            .into_iter()
+            .filter(|(seq, _)| entry.keeps(*seq))
+        {
             conversation
                 .apply(&record)
                 .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;

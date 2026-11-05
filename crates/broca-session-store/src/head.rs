@@ -75,6 +75,9 @@ crate::message! {
         /// An id-index list of retired runs (see `idindex::Retired`): their data pages and ref
         /// pages are deleted with the list, so the head doesn't carry every page's name.
         5 opt retired_index: String,
+        /// A revert's list of the sealed segments and directory pages its branch stopped
+        /// naming (an `idindex::Retired` object), deleted with the list.
+        6 opt abandoned: String,
     }
 }
 
