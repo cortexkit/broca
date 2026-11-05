@@ -1489,6 +1489,7 @@ fn render_episodes<W: Writer>(
 /// The request for step `step_id`: the conversation as the folds hold it, under the run's
 /// frozen settings, with the render inputs today's loop gives a request: each message's
 /// position, its part numbers under the run's tag rules, and the run's place in the prompt.
+#[allow(clippy::too_many_arguments)]
 fn call_options<W: Writer>(
     writer: &W,
     admission: &Admission,
