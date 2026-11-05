@@ -334,6 +334,7 @@ impl Writer for Recording<'_, '_> {
         self.flush().await?;
         let records = build(&self.session.conversation, &self.session.operations);
         if !records.is_empty() {
+            let barrier = barrier || broca_session_loop::writer::ends_run(&records);
             self.append(&records, barrier).await?;
         }
         Ok(records)
@@ -1022,11 +1023,22 @@ async fn a_second_run_on_the_same_session() {
     .await;
 }
 
-/// Where a scripted provider sends the messages it steers in while answering a step: a
-/// `steered` record as the session actor would write it.
+/// What the session actor does while the provider answers a step.
+#[derive(Clone)]
+enum Action {
+    /// Steers these messages into the run.
+    Steer(Vec<Message>),
+    /// Cancels the run at its next step boundary.
+    CancelAtBoundary,
+}
+
+/// Where a scripted provider sends what the session actor does while a step is answered.
 #[async_trait]
 trait SteerSink: Send + Sync {
+    /// Writes a `steered` record as the actor would.
     async fn steer(&self, record: WalRecord);
+    /// Records the caller's cancel at the run's next step boundary, as the actor would.
+    async fn cancel_at_boundary(&self);
 }
 
 /// Today's actor: the record is written under the run's steer inbox lock and synced.
@@ -1048,6 +1060,13 @@ impl SteerSink for TodaySink {
             None
         }));
         self.writer.sync().await.expect("the steer is durable");
+    }
+
+    async fn cancel_at_boundary(&self) {
+        self.inbox
+            .request_boundary_cancel(&self.writer, &RunId("r1".into()))
+            .await
+            .expect("the cancel is durable");
     }
 }
 
@@ -1077,14 +1096,23 @@ impl SteerSink for NewSink {
                 receipt,
             }));
     }
+
+    async fn cancel_at_boundary(&self) {
+        self.injected.lock().unwrap().push(Record::CancelRequest(
+            broca_session_store::record::CancelRequest {
+                run_id: "r1".into(),
+                at: broca_session_store::record::CancelPoint::StepBoundary,
+            },
+        ));
+    }
 }
 
 /// A scripted provider that steers messages in while answering given calls.
 struct SteeringProvider {
     inner: ScriptedProvider,
     calls: std::sync::atomic::AtomicUsize,
-    /// `(call, messages)`: during the provider's `call`th request (from 1), these are steered in.
-    steers: Mutex<Vec<(usize, Vec<Message>)>>,
+    /// `(call, action)`: during the provider's `call`th request (from 1), the actor does this.
+    steers: Mutex<Vec<(usize, Action)>>,
     sink: Arc<dyn SteerSink>,
 }
 
@@ -1092,14 +1120,17 @@ struct SteeringProvider {
 impl Provider for SteeringProvider {
     async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let due: Vec<Vec<Message>> = {
+        let due: Vec<Action> = {
             let mut steers = self.steers.lock().unwrap();
             let (due, rest) = steers.drain(..).partition(|(at, _)| *at == call);
             *steers = rest;
-            due.into_iter().map(|(_, messages)| messages).collect()
+            due.into_iter().map(|(_, action)| action).collect()
         };
-        for (index, messages) in due.into_iter().enumerate() {
-            self.sink.steer(steered(call, index, messages)).await;
+        for (index, action) in due.into_iter().enumerate() {
+            match action {
+                Action::Steer(messages) => self.sink.steer(steered(call, index, messages)).await,
+                Action::CancelAtBoundary => self.sink.cancel_at_boundary().await,
+            }
         }
         self.inner.step(step_id, opts).await
     }
@@ -1123,7 +1154,7 @@ fn steered(call: usize, index: usize, messages: Vec<Message>) -> WalRecord {
 
 /// Runs `scenario` once through each loop, steering `steers` in while the provider answers,
 /// and compares everything both did.
-async fn compare_steered(scenario: Scenario, steers: Vec<(usize, Vec<Message>)>) {
+async fn compare_steered(scenario: Scenario, steers: Vec<(usize, Action)>) {
     // Today's loop, on a writer this test owns so its actor side can write steers.
     let dir = broca_test_support::scratch_root().join(format!(
         "session-loop-differential-{}-{}",
@@ -1294,7 +1325,7 @@ async fn a_steer_during_a_tool_step_enters_at_the_next_boundary() {
                 text_step("a2", "done"),
             ],
         },
-        vec![(1, vec![user("also read b")])],
+        vec![(1, Action::Steer(vec![user("also read b")]))],
     )
     .await;
 }
@@ -1308,7 +1339,7 @@ async fn a_steer_during_the_last_answer_takes_one_more_step() {
             stop_when: Vec::new(),
             steps: vec![text_step("a1", "hi"), text_step("a2", "and again")],
         },
-        vec![(1, vec![user("one more thing")])],
+        vec![(1, Action::Steer(vec![user("one more thing")]))],
     )
     .await;
 }
@@ -1322,7 +1353,7 @@ async fn a_steer_after_a_limiting_stop_ends_with_the_run() {
             stop_when: vec![StopCondition::StepCount { n: 1 }],
             steps: vec![text_step("a1", "hi")],
         },
-        vec![(1, vec![user("too late"), user("and this")])],
+        vec![(1, Action::Steer(vec![user("too late"), user("and this")]))],
     )
     .await;
 }
@@ -1340,7 +1371,59 @@ async fn a_steer_during_a_step_that_hits_the_step_limit_ends_with_the_run() {
                 FinishReason::ToolCalls,
             )],
         },
-        vec![(1, vec![user("never mind")])],
+        vec![(1, Action::Steer(vec![user("never mind")]))],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_boundary_cancel_during_a_tool_step_ends_after_its_batch() {
+    compare_steered(
+        Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "never asked for"),
+            ],
+        },
+        vec![(1, Action::CancelAtBoundary)],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_boundary_cancel_during_the_last_answer_lets_it_complete() {
+    compare_steered(
+        Scenario {
+            input: vec![user("hello")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![text_step("a1", "hi")],
+        },
+        vec![(1, Action::CancelAtBoundary)],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_boundary_cancel_with_a_steer_ends_at_the_extra_boundary() {
+    compare_steered(
+        Scenario {
+            input: vec![user("hello")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![text_step("a1", "hi"), text_step("a2", "never asked for")],
+        },
+        vec![
+            (1, Action::Steer(vec![user("wait")])),
+            (1, Action::CancelAtBoundary),
+        ],
     )
     .await;
 }

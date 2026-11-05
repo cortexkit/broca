@@ -396,28 +396,42 @@ where
         }
     }
     loop {
-        if seams.cancel.is_cancelled() {
-            return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await;
-        }
         let completed_steps = run_state(writer).completed_steps;
         // Step ids count from 1 within a run, as today's loop numbers them.
         let step_id = completed_steps + 1;
         // The boundary: messages steered or delivered since the last one enter the conversation
-        // here, in the same batch as the step's start.
+        // here, in the same batch as either the step's start or, when a caller cancelled the run
+        // now or at this boundary, the run's end. The run's state is read as the batch is built,
+        // so a cancel recorded while the last step ran ends the run here.
         let run_id = admission.run_id.clone();
-        writer
+        let cancelled_now = seams.cancel.is_cancelled();
+        let mut cancelled_end = Some(run_end(
+            writer,
+            &run_id,
+            RunFinishReason::Cancelled,
+            (seams.now_ms)(),
+        ));
+        let boundary = writer
             .append_with(
                 &mut |_, operations| {
+                    let run = operations.run.as_ref().expect("a run is active");
                     let mut batch = placed_copies(operations, &run_id);
-                    batch.push(Record::StepStart(StepStart {
-                        run_id: run_id.clone(),
-                        step_id,
-                    }));
+                    if cancelled_now || run.cancel.is_some() {
+                        batch.extend(cancelled_end.take());
+                    } else {
+                        batch.push(Record::StepStart(StepStart {
+                            run_id: run_id.clone(),
+                            step_id,
+                        }));
+                    }
                     batch
                 },
                 false,
             )
             .await?;
+        if matches!(boundary.last(), Some(Record::RunEnd(_))) {
+            return Ok(finished(writer, RunFinishReason::Cancelled));
+        }
         let opts = call_options(writer, admission, &tools, &episodes, seams, step_id)?;
         let outcome = model_step(seams, step_id, opts).await;
         let step = match outcome {

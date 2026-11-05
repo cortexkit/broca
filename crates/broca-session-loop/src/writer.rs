@@ -22,7 +22,9 @@ pub trait Writer {
     /// Appends the batch `build` makes from the folds as they stand at that moment, and returns
     /// it. A writer shared with other appenders (the session actor appends steers and queued
     /// sends during a run) calls `build` and appends its batch with nothing in between, so the
-    /// batch can't miss a record another appender added. An empty batch appends nothing.
+    /// batch can't miss a record another appender added. An empty batch appends nothing. A
+    /// batch that ends or pauses the run is appended with a barrier whatever `barrier` says: a
+    /// run's end is durable before anyone learns of it.
     async fn append_with(
         &mut self,
         build: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations) -> Vec<Record> + Send),
@@ -55,6 +57,7 @@ impl<B: SessionBackend> Writer for Session<'_, B> {
     ) -> Result<Vec<Record>, SessionError> {
         let records = build(&self.conversation, &self.operations);
         if !records.is_empty() {
+            let barrier = barrier || ends_run(&records);
             Session::append(self, &records, barrier).await?;
         }
         Ok(records)
@@ -75,4 +78,11 @@ impl<B: SessionBackend> Writer for Session<'_, B> {
     fn next_seq(&self) -> u64 {
         Session::next_seq(self)
     }
+}
+
+/// Whether `records` end or pause the run, so their batch must be durable when appended.
+pub fn ends_run(records: &[Record]) -> bool {
+    records
+        .iter()
+        .any(|record| matches!(record, Record::RunEnd(_) | Record::Pause(_)))
 }
