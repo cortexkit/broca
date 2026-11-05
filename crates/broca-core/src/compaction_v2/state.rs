@@ -1,7 +1,6 @@
 //! Accepted and applied views are separate durable facts. An acknowledgement
 //! confirms storage, not a change to a request already in progress.
 
-use async_trait::async_trait;
 use cortexkit_role_compaction::{
     notice::Event,
     read::Entry,
@@ -26,8 +25,12 @@ pub struct State {
 
 /// Each method returns only after its record has crossed the durability barrier.
 /// The WAL adapter owns record encoding, including deduplication of stored edits.
-#[async_trait]
-pub trait Journal: Send + Sync {
+///
+/// Its methods are plain `async fn`s, so a journal whose writer's futures can't move between
+/// threads can implement it too; a caller whose future must be `Send` gets that from the
+/// journal it passes, since every function here takes the journal by its concrete type.
+#[allow(async_fn_in_trait)]
+pub trait Journal {
     async fn accepted(
         &self,
         previous: Option<&ReceivedView>,
@@ -148,7 +151,7 @@ impl State {
 
     pub async fn accept(
         &mut self,
-        journal: &dyn Journal,
+        journal: &impl Journal,
         entries: &[Entry],
         received: impl Into<ReceivedView>,
         rules: &ProviderRules,
@@ -170,7 +173,7 @@ impl State {
     /// the cut covers the whole current transcript.
     pub async fn apply(
         &mut self,
-        journal: &dyn Journal,
+        journal: &impl Journal,
         boundary: Boundary<'_>,
     ) -> Result<Vec<Event>, String> {
         let Some(received) = self.latest.as_ref() else {
@@ -206,7 +209,7 @@ impl State {
     /// that marker for the frozen step without adopting a newer accepted view.
     pub async fn recover_marker(
         &mut self,
-        journal: &dyn Journal,
+        journal: &impl Journal,
         boundary: Boundary<'_>,
     ) -> Result<Vec<Event>, String> {
         let Some(view) = self.view_for_step(boundary.step) else {

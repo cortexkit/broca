@@ -1,6 +1,5 @@
 //! The durability barrier precedes both provider acknowledgements and model I/O.
 
-use async_trait::async_trait;
 use broca_protocol::BindIdentity;
 use broca_wal::{CompactionViewV2, WalRecord};
 use cortexkit_role_compaction::view::View;
@@ -26,7 +25,6 @@ impl WalJournal<'_> {
     }
 }
 
-#[async_trait]
 impl Journal for WalJournal<'_> {
     async fn accepted(
         &self,
