@@ -77,7 +77,7 @@ fn fill_manifest(manifest: &mut Map<String, Value>, kind: PartKind, value: Value
         PartKind::Declarations => {
             manifest.insert("declarations".into(), value);
         }
-        PartKind::ResponseFormat | PartKind::GlobalSystem => {}
+        PartKind::ResponseFormat | PartKind::GlobalSystem | PartKind::RenderConfig => {}
     }
 }
 
@@ -149,11 +149,6 @@ fn run_started(
         "route_decision_id",
         start.route_decision_id.as_ref(),
     );
-    set(
-        &mut config,
-        "frozen_render_config",
-        start.render_config.as_ref(),
-    );
     set(&mut config, "auth_selection", start.auth_selection.as_ref());
 
     // The config's parts come first (its tools, then its response format, which every run
@@ -172,6 +167,9 @@ fn run_started(
             }
             PartKind::GlobalSystem => {
                 config.insert("global_system".into(), value);
+            }
+            PartKind::RenderConfig => {
+                config.insert("frozen_render_config".into(), value);
             }
             kind => fill_manifest(manifest.get_or_insert_with(Map::new), kind, value),
         }

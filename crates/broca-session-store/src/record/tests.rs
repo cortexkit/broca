@@ -101,7 +101,6 @@ fn one_of_each() -> Vec<Record> {
             service_tier: None,
             route_decision_id: None,
             compaction_plan_version: Some(2),
-            render_config: Some(serde_json::json!({"wire": "anthropic"})),
             auth_selection: None,
             run_choices: Some(serde_json::json!({"generation": {"max_output_tokens": 2048}})),
             origin: Some(serde_json::json!({"kind": "fresh"})),

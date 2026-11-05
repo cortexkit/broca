@@ -31,7 +31,6 @@ fn start() -> Record {
         service_tier: None,
         route_decision_id: None,
         compaction_plan_version: None,
-        render_config: None,
         auth_selection: None,
         run_choices: None,
         origin: None,

@@ -842,6 +842,7 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
         ("tools", PartKind::Tools),
         ("response_format", PartKind::ResponseFormat),
         ("global_system", PartKind::GlobalSystem),
+        ("frozen_render_config", PartKind::RenderConfig),
     ] {
         if let Some(value) = config.take(key) {
             add_part(kind, &value, &mut parts, out)?;
@@ -895,7 +896,6 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
         service_tier: config.string("service_tier"),
         route_decision_id: config.string("route_decision_id"),
         compaction_plan_version: f.u64("compaction_plan_version").map(|v| v as u32),
-        render_config: config.take("frozen_render_config"),
         auth_selection: config.take("auth_selection"),
         run_choices: None,
         origin: f.take("origin"),

@@ -20,7 +20,7 @@ use broca_protocol::content::{ContentBlock, Message, Role, ToolResult};
 use broca_protocol::ids::ToolCallId;
 
 use crate::fold::Bound;
-use crate::record::{EntryFacts, Marker, Notice, Placement, Record, Stream};
+use crate::record::{EntryFacts, Marker, Notice, PartKind, PartRef, Placement, Record, Stream};
 
 /// Why a record can't be folded into the conversation. Each one means the records don't
 /// describe a conversation a provider would accept, so the fold refuses rather than guess.
@@ -60,6 +60,22 @@ crate::message! {
         /// Absent for sessions written before entry facts were recorded.
         1 opt facts: EntryFacts,
         2 rep delivered: Delivered,
+    }
+}
+
+crate::message! {
+    /// Where one run's input sits in the window, and the render config it ran under. A
+    /// request carries every window run's place and config, so a renderer can tell each run's
+    /// requests apart from the next one's.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Episode {
+        1 req run_id: String,
+        /// The ordinal of the run's first input message.
+        2 req start: u64,
+        /// The ordinal of its first user message, if its input has one.
+        3 opt first_user: u64,
+        /// The render config part in force when the run started.
+        4 opt render_config: PartRef,
     }
 }
 
@@ -139,6 +155,18 @@ state! {
             reset: "a window copied back in",
             bound: Bound::Fixed,
         },
+        /// The render config part the latest setup marker named.
+        9 opt pub render_config: PartRef => {
+            owner: "admission",
+            reset: "setup_stub",
+            bound: Bound::Fixed,
+        },
+        /// One per run whose input is in the window, in run order.
+        10 rep pub episodes: Episode => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Window,
+        },
     }
 }
 
@@ -153,6 +181,8 @@ impl Conversation {
             entries: Vec::new(),
             open_entry: None,
             window_pending: false,
+            render_config: None,
+            episodes: Vec::new(),
         }
     }
 
@@ -161,6 +191,7 @@ impl Conversation {
     pub fn clear_window(&mut self) {
         self.messages.clear();
         self.entries.clear();
+        self.episodes.clear();
     }
 
     /// The window message with `ordinal` and its entry state.
@@ -199,6 +230,28 @@ impl Conversation {
         self.placed += 1;
     }
 
+    /// A run's input message is about to be placed: the first one of a run starts its episode,
+    /// and the first user message among them is the episode's first user message.
+    fn note_run_input(&mut self, input: &crate::record::Input) {
+        let ordinal = self.placed + 1;
+        let starts = self
+            .episodes
+            .last()
+            .is_none_or(|episode| episode.run_id != input.run_id);
+        if starts {
+            self.episodes.push(Episode {
+                run_id: input.run_id.clone(),
+                start: ordinal,
+                first_user: None,
+                render_config: self.render_config.clone(),
+            });
+        }
+        let episode = self.episodes.last_mut().expect("pushed above");
+        if episode.first_user.is_none() && input.message.role == Role::User {
+            episode.first_user = Some(ordinal);
+        }
+    }
+
     /// The assistant message still waiting for replies, if any.
     pub fn open_tool_turn(&self) -> Option<&Message> {
         self.open.as_ref().map(|turn| &turn.assistant)
@@ -219,6 +272,9 @@ impl Conversation {
                     }
                     self.open = None;
                     self.open_entry = None;
+                }
+                if input.placement == Placement::RunInput {
+                    self.note_run_input(input);
                 }
                 self.place(input.message.clone(), EntryState::default());
             }
@@ -305,7 +361,14 @@ impl Conversation {
                 // message itself isn't held: a fold that keeps only counts drops both.
             }
             Record::Marker(marker) => self.marker = Some(marker.clone()),
-            Record::SetupStub(_) | Record::Compaction(_) => {}
+            Record::SetupStub(stub) => {
+                self.render_config = stub
+                    .parts
+                    .iter()
+                    .find(|part| part.kind == PartKind::RenderConfig)
+                    .cloned();
+            }
+            Record::Compaction(_) => {}
             _ => unreachable!("every transcript kind is matched above"),
         }
         Ok(())

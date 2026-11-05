@@ -146,6 +146,10 @@ impl Scenario {
     }
 
     fn request(&self) -> RunRequest {
+        self.request_for("r1", &self.input)
+    }
+
+    fn request_for(&self, run_id: &str, input: &[Message]) -> RunRequest {
         RunRequest {
             route_decision_id: None,
             input_written_at_ms: None,
@@ -160,10 +164,10 @@ impl Scenario {
             request_identity_digest: None,
             project_id: None,
             principal: None,
-            run_id: RunId("r1".into()),
+            run_id: RunId(run_id.into()),
             session: bind(),
             model: ModelHandle::new("stub", "m"),
-            input: self.input.clone(),
+            input: input.to_vec(),
             tools: self.tools.clone(),
             policy_allowed: self.tools.iter().map(|t| t.name.clone()).collect(),
             tool_choice: ToolChoice::Auto,
@@ -183,10 +187,19 @@ impl Scenario {
     }
 
     fn admission(&self, provider: &ScriptedProvider) -> Admission {
+        self.admission_for(provider, "r1", &self.input)
+    }
+
+    fn admission_for(
+        &self,
+        provider: &ScriptedProvider,
+        run_id: &str,
+        input: &[Message],
+    ) -> Admission {
         Admission {
-            run_id: "r1".into(),
+            run_id: run_id.into(),
             model: ModelHandle::new("stub", "m"),
-            input: self.input.clone(),
+            input: input.to_vec(),
             tools: self.tools.clone(),
             tool_choice: ToolChoice::Auto,
             generation: GenerationConfig::default(),
@@ -819,5 +832,160 @@ async fn every_cut_of_an_unsent_call_resumes_alike() {
             text_step("a2", "it failed"),
         ],
     })
+    .await;
+}
+
+/// Runs `runs` one after another on one session through today's loop (the first with
+/// `run_loop`, later ones as appended episodes) and through the new loop, with one scripted
+/// provider and tool plane per loop, and compares everything both did.
+async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
+    // Today's loop.
+    let dir = broca_test_support::scratch_root().join(format!(
+        "session-loop-differential-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let provider = ScriptedProvider::new(scenario.steps.clone());
+    let plane = scenario.plane();
+    let lease = FileLeaseStore::new(dir.join("lease"));
+    let wal = FileWalStore::new(dir.join("wal"));
+    for (index, (run_id, input)) in runs.iter().enumerate() {
+        let (tx, mut rx) = mpsc::channel(512);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let request = scenario.request_for(run_id, input);
+        if index == 0 {
+            run_loop(request, &provider, &plane, &lease, &AllowAll, &wal, &tx)
+                .await
+                .expect("today's first run");
+        } else {
+            broca_core::run_loop_append_episode(
+                request, &provider, &plane, &lease, &AllowAll, &wal, None, &tx,
+            )
+            .await
+            .expect("today's later run");
+        }
+        drop(tx);
+        drain.await.unwrap();
+    }
+    let file = std::fs::read_dir(dir.join("wal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
+        .expect("today's loop wrote a log");
+    let converted = broca_session_convert::convert(&LogImage::read(&file).framed(), None)
+        .expect("the log converts");
+    let _ = std::fs::remove_dir_all(&dir);
+    let today = Outcome {
+        records: normalized(&converted.records),
+        requests: sent_requests(&provider),
+        calls: plane
+            .log()
+            .iter()
+            .map(|event| format!("{event:?}"))
+            .collect(),
+    };
+
+    // The new loop.
+    let backend = MemoryBackend::default();
+    let triple = SessionTriple {
+        project_root: "/project".into(),
+        harness: "differential".into(),
+        session: "s1".into(),
+    };
+    let mut session = Session::create(
+        &backend,
+        SessionAddr("0123456789abcdef".into()),
+        triple,
+        &DeploymentKey::new(1, &[7; 32]),
+        false,
+    )
+    .await
+    .unwrap();
+    let provider = ScriptedProvider::new(scenario.steps.clone());
+    let plane = scenario.plane();
+    let mut writer = Recording {
+        session: &mut session,
+        records: Vec::new(),
+    };
+    let mut parts = MemoryParts::default();
+    let now = || 0u64;
+    let bind = bind();
+    let seams = Seams {
+        provider: &provider,
+        tools: &plane,
+        bind: bind.clone(),
+        out: None,
+        cancel: Default::default(),
+        now_ms: &now,
+        session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+    };
+    for (run_id, input) in runs {
+        run(
+            &mut writer,
+            &mut parts,
+            scenario.admission_for(&provider, run_id, input),
+            &seams,
+        )
+        .await
+        .expect("the new loop runs");
+    }
+    let new = Outcome {
+        records: normalized(&writer.records),
+        requests: sent_requests(&provider),
+        calls: plane
+            .log()
+            .iter()
+            .map(|event| format!("{event:?}"))
+            .collect(),
+    };
+
+    if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
+        for (index, record) in today.records.iter().enumerate() {
+            eprintln!("today {index}: {record}");
+        }
+        for (index, record) in new.records.iter().enumerate() {
+            eprintln!("new   {index}: {record}");
+        }
+    }
+    assert_eq!(new.requests.len(), today.requests.len(), "request count");
+    for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
+        assert_eq!(new, today, "request {index}");
+    }
+    for (index, (new, today)) in new.records.iter().zip(&today.records).enumerate() {
+        assert_eq!(new, today, "record {index}");
+    }
+    assert_eq!(new.records.len(), today.records.len(), "record count");
+    assert_eq!(new.calls, today.calls, "tool calls");
+}
+
+#[tokio::test]
+async fn a_second_run_on_the_same_session() {
+    compare_runs(
+        Scenario {
+            input: Vec::new(),
+            tools: vec![tool("read", ExecutionMode::Sequential)],
+            stop_when: vec![StopCondition::StepCount { n: 8 }],
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+                answer(
+                    "a3",
+                    vec![call("c2", "read", json!({"path": "b"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a4", "done again"),
+            ],
+        },
+        &[
+            ("r1", vec![system("You are careful."), user("first task")]),
+            ("r2", vec![user("second task")]),
+        ],
+    )
     .await;
 }

@@ -20,7 +20,7 @@ use broca_core::tags::TagNumbering;
 use broca_core::tool_plane::{BatchCtx, DispatchResult, ToolPlane};
 use broca_protocol::caller::RunFinishReason;
 use broca_protocol::content::{
-    stamp_ordinals_from, AssistantMessage, Message, Role, ToolCall, ToolOutput, ToolResult,
+    stamp_ordinals_from, AssistantMessage, Message, ToolCall, ToolOutput, ToolResult,
 };
 use broca_protocol::error::ProviderError;
 use broca_protocol::provider::{NormalizedEvent, ProviderControl};
@@ -126,13 +126,8 @@ where
     P: Provider,
     T: ToolPlane,
 {
-    // Only the session's first run is supported yet: a later run also needs every earlier
-    // run's place in the prompt and render config, which requests carry.
-    if !writer.conversation().messages.is_empty() {
-        return Err(LoopError::Unsupported("a session's second run"));
-    }
     admit(writer, parts, &admission).await?;
-    drive(writer, &admission, seams).await
+    drive(writer, parts, &admission, seams).await
 }
 
 /// Continues the session's latest run from its last durable record, after a crash or a
@@ -161,7 +156,7 @@ where
     let resumed = resumed_record(writer, &resolution);
     writer.append(&[Record::Resumed(resumed)], false).await?;
     match resolution {
-        Resolution::Resume => drive(writer, &admission, seams).await,
+        Resolution::Resume => drive(writer, parts, &admission, seams).await,
         Resolution::Idle(reason) => finish(writer, seams, &admission.run_id, reason).await,
         Resolution::Interrupted(_) => close_interrupted(writer, seams, &admission.run_id).await,
         Resolution::ProviderHeld(_) => Err(LoopError::Unsupported("calls a provider holds")),
@@ -330,7 +325,7 @@ fn frozen_admission(
         generation: decode(member("generation"))?.unwrap_or_default(),
         response_format: decode(part(PartKind::ResponseFormat)?)?.unwrap_or_default(),
         provider_options: member("provider_options").unwrap_or(Value::Null),
-        render_config: start.render_config.clone().unwrap_or(Value::Null),
+        render_config: decode::<Value>(part(PartKind::RenderConfig)?)?.unwrap_or(Value::Null),
         renderer_version: start.renderer_version,
         stop_when: decode(member("stop_when"))?.unwrap_or_default(),
         ts_ms: start.ts_ms,
@@ -341,6 +336,7 @@ fn frozen_admission(
 /// Model steps and tool batches from the run's current state until a decision ends the run.
 async fn drive<W, P, T>(
     writer: &mut W,
+    parts: &dyn Parts,
     admission: &Admission,
     seams: &Seams<'_, P, T>,
 ) -> Result<Finished, LoopError>
@@ -349,15 +345,9 @@ where
     P: Provider,
     T: ToolPlane,
 {
-    let episode = EpisodeRenderInput {
-        prompt_start: 0,
-        first_user: writer
-            .conversation()
-            .messages
-            .iter()
-            .position(|message| message.role == Role::User),
-        frozen_config: admission.render_config.clone(),
-    };
+    // Each window run's place in the prompt and render config. A run adds no episode once
+    // its input is placed, so these hold for the whole run.
+    let episodes = render_episodes(writer, parts)?;
     let tools = Arc::new(admission.tools.clone());
     let manifest = ToolManifest::from_tools(admission.tools.clone());
     let stop_when = if admission.stop_when.is_empty() {
@@ -421,7 +411,7 @@ where
                 false,
             )
             .await?;
-        let opts = call_options(writer, admission, &tools, &episode, seams, step_id)?;
+        let opts = call_options(writer, admission, &tools, &episodes, seams, step_id)?;
         let outcome = model_step(seams, step_id, opts).await;
         let step = match outcome {
             Ok(step) => step,
@@ -526,8 +516,12 @@ async fn admit<W: Writer>(
             PartKind::ResponseFormat,
             serde_json::to_value(&admission.response_format),
         ),
+        (PartKind::RenderConfig, Ok(admission.render_config.clone())),
     ] {
         let value = value.map_err(|e| LoopError::Parts(e.to_string()))?;
+        if value.is_null() {
+            continue;
+        }
         setup.push(parts.put(kind, &value).map_err(LoopError::Parts)?);
     }
     let tool_names = admission
@@ -576,8 +570,6 @@ async fn admit<W: Writer>(
         service_tier: None,
         route_decision_id: None,
         compaction_plan_version: None,
-        render_config: (!admission.render_config.is_null())
-            .then(|| admission.render_config.clone()),
         auth_selection: None,
         run_choices: Some(json!({
             "config": config,
@@ -609,6 +601,31 @@ async fn admit<W: Writer>(
     Ok(())
 }
 
+/// Every window run's place in the prompt (its first message's index, and its first user
+/// message's) and the render config it ran under, as requests carry them.
+fn render_episodes<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+) -> Result<Vec<EpisodeRenderInput>, LoopError> {
+    let conversation = writer.conversation();
+    let start = conversation.window_start();
+    conversation
+        .episodes
+        .iter()
+        .map(|episode| {
+            let index = |ordinal: u64| (ordinal - start) as usize;
+            Ok(EpisodeRenderInput {
+                prompt_start: index(episode.start),
+                first_user: episode.first_user.map(index),
+                frozen_config: match &episode.render_config {
+                    Some(part) => parts.get(part).map_err(LoopError::Parts)?,
+                    None => Value::Null,
+                },
+            })
+        })
+        .collect()
+}
+
 /// The request for step `step_id`: the conversation as the folds hold it, under the run's
 /// frozen settings, with the render inputs today's loop gives a request: each message's
 /// position, its part numbers under the run's tag rules, and the run's place in the prompt.
@@ -616,7 +633,7 @@ fn call_options<W: Writer, P, T>(
     writer: &W,
     admission: &Admission,
     tools: &Arc<Vec<Tool>>,
-    episode: &EpisodeRenderInput,
+    episodes: &[EpisodeRenderInput],
     seams: &Seams<'_, P, T>,
     step_id: u64,
 ) -> Result<CallOptions, LoopError> {
@@ -635,7 +652,7 @@ fn call_options<W: Writer, P, T>(
     clean_computed_into(&mut prompt);
     let mut opts = CallOptions::new(prompt);
     opts.marker_order_version = Some(MARKER_ORDER_VERSION);
-    opts.render_episodes = Arc::new(vec![episode.clone()].into());
+    opts.render_episodes = Arc::new(episodes.to_vec().into());
     opts.tools = Arc::clone(tools);
     opts.tool_choice = Arc::new(admission.tool_choice.clone());
     opts.response_format = Arc::new(admission.response_format.clone());

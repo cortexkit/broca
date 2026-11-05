@@ -262,6 +262,9 @@ values! {
         6 ResponseFormat,
         /// Global instructions of a run without a plan.
         7 GlobalSystem,
+        /// The provider's frozen render config, from which the renderer of each of the run's
+        /// requests is rebuilt. Opaque to the store and the run loop.
+        8 RenderConfig,
     }
 }
 
@@ -307,8 +310,6 @@ message! {
         14 opt service_tier: String,
         15 opt route_decision_id: String,
         16 opt compaction_plan_version: u32,
-        /// Owned by the provider: the frozen render config the renderer is rebuilt from.
-        17 opt render_config: serde_json::Value,
         /// Owned by the vault client: the credential and account chosen for the run.
         18 opt auth_selection: serde_json::Value,
         /// The run loop's remaining frozen choices (generation settings, budgets, stop
