@@ -582,6 +582,7 @@ async fn today_from(
     let wal = FileWalStore::new(dir.join("wal"));
     let (tx, mut rx) = mpsc::channel(512);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let cancel = CancellationToken::new();
     run_loop_with_control(
         scenario.request(),
         &provider,
@@ -593,7 +594,8 @@ async fn today_from(
         RunControl {
             provider_held_lifecycle: Some(plane.lifecycle()),
             manifest: scenario.manifest.clone(),
-            hook_plane: Some(harness_hooks()),
+            cancel: Some(cancel.clone()),
+            hook_plane: Some(harness_hooks_cancelling(cancel)),
             ..Default::default()
         },
         &tx,
@@ -760,16 +762,17 @@ async fn new_from(
         ended: Default::default(),
     };
     let now = || 0u64;
+    let cancel = CancellationToken::new();
     let seams = Seams {
         provider: &provider,
         tools: &plane,
         bind: bind.clone(),
         out: None,
-        cancel: Default::default(),
+        cancel: cancel.clone(),
         stop: Default::default(),
         held: Some(&*lifecycle),
         approval: &HarnessPolicy,
-        hook_plane: Some(harness_hooks()),
+        hook_plane: Some(harness_hooks_cancelling(cancel)),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -2948,7 +2951,13 @@ async fn every_cut_of_a_run_admitted_with_a_fetch_plan_resumes_alike() {
 /// The hook provider both loops call, keyed by the tool a call names: the mutate hook rewrites
 /// a `mutated` call's input to `{"path":"mutated"}`, the validate hook denies a `vetoed` call,
 /// the provider is unavailable for a `hook_down` call, and every other call passes.
-struct HarnessHooks;
+///
+/// Its post-assistant hook cancels the run (through `cancel`, the loop's immediate cancel) when
+/// the answer's text says "cancel me": a caller's cancel landing after the model's answer is
+/// complete and before its tool calls are sent, at the same point in both loops.
+struct HarnessHooks {
+    cancel: Option<CancellationToken>,
+}
 
 #[async_trait::async_trait]
 impl broca_core::hooks::HookPlane for HarnessHooks {
@@ -2966,6 +2975,15 @@ impl broca_core::hooks::HookPlane for HarnessHooks {
         use cortexkit_role_step_transform_provider::hook::Subject;
         use cortexkit_role_step_transform_provider::subscription::Phase;
         if let Subject::PostAssistant { blocks, .. } = &call.subject {
+            if blocks
+                .first()
+                .is_some_and(|text| text.contains("cancel me"))
+            {
+                if let Some(cancel) = &self.cancel {
+                    cancel.cancel();
+                }
+                return Ok(HookAnswer::Pass);
+            }
             if !blocks
                 .first()
                 .is_some_and(|text| text.contains("review me"))
@@ -3008,7 +3026,14 @@ impl broca_core::hooks::HookPlane for HarnessHooks {
 }
 
 fn harness_hooks() -> Arc<dyn broca_core::hooks::HookPlane> {
-    Arc::new(HarnessHooks)
+    Arc::new(HarnessHooks { cancel: None })
+}
+
+/// The hook provider, able to cancel the loop that `cancel` belongs to.
+fn harness_hooks_cancelling(cancel: CancellationToken) -> Arc<dyn broca_core::hooks::HookPlane> {
+    Arc::new(HarnessHooks {
+        cancel: Some(cancel),
+    })
 }
 
 /// A planned manifest whose one hook provider subscribes to the pre-tool mutate phase (passing
@@ -3229,4 +3254,61 @@ async fn a_later_run_that_fails_before_its_first_step() {
         ],
     )
     .await;
+}
+
+/// A caller's cancel that lands after the model asked for tools and before they're sent: the
+/// post-assistant hook fires it, so it lands at the same point in both loops.
+fn cancel_before_batch_scenario() -> Scenario {
+    let tools = vec![tool("read", ExecutionMode::Parallel)];
+    Scenario {
+        input: vec![user("read it")],
+        manifest: Some(hooked_manifest(&tools)),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    ContentBlock::Text {
+                        text: "reading it, cancel me".into(),
+                    },
+                    call("c1", "read", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "never reached"),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_before_the_batch_refuses_it() {
+    compare(cancel_before_batch_scenario()).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_cancel_before_the_batch_resumes_alike() {
+    compare_every_cut(cancel_before_batch_scenario()).await;
+}
+
+/// The same refused batch, with the model repeating a call id.
+fn cancel_before_batch_with_a_repeated_id_scenario() -> Scenario {
+    let mut scenario = cancel_before_batch_scenario();
+    scenario.steps[0] = answer(
+        "a1",
+        vec![
+            ContentBlock::Text {
+                text: "reading it, cancel me".into(),
+            },
+            call("c1", "read", json!({"path": "a"})),
+            call("c1", "read", json!({"path": "b"})),
+        ],
+        FinishReason::ToolCalls,
+    );
+    scenario
+}
+
+#[tokio::test]
+async fn a_refused_batch_still_answers_a_repeated_call_id_as_a_duplicate() {
+    compare(cancel_before_batch_with_a_repeated_id_scenario()).await;
 }

@@ -873,8 +873,12 @@ where
         if let Some(stop) = stop {
             return hard_stop(writer, seams, &admission.run_id, step_id, &calls, &stop).await;
         }
-        if seams.stop.is_cancelled() {
-            return stopped_batch(writer, seams, &admission.run_id, step_id, &calls).await;
+        // A stop, or a caller's cancel that arrived after the model's answer, refuses the batch
+        // before any call is gated, so no pre-tool hook runs and the plane is never told.
+        if seams.stop.is_cancelled() || seams.cancel.is_cancelled() {
+            let cancelled = seams.cancel.is_cancelled();
+            return stopped_batch(writer, seams, &admission.run_id, step_id, &calls, cancelled)
+                .await;
         }
         match batch(
             writer,
@@ -1984,16 +1988,17 @@ async fn hard_stop<W: Writer, P, T>(
     Ok(finished(writer, reason))
 }
 
-/// The runner asked the run to stop before its batch was dispatched. No call is sent: each
-/// gets a result saying so, the tool plane is never told the batch started, and the run ends
-/// interrupted whatever its restart policy, as today's loop does. The batch and the run's end
-/// are two barriers, as there.
+/// The runner asked the run to stop, or the caller cancelled it, before its batch was
+/// dispatched. No call is sent: each gets a result saying so, the tool plane is never told the
+/// batch started, and the run ends cancelled (`cancelled`) or interrupted whatever its restart
+/// policy, as today's loop does. The batch and the run's end are two barriers, as there.
 async fn stopped_batch<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
     run_id: &str,
     step_id: u64,
     calls: &[ToolCall],
+    cancelled: bool,
 ) -> Result<Finished, LoopError> {
     let batch_id = format!("{run_id}-b{step_id}");
     let now = (seams.now_ms)();
@@ -2003,7 +2008,21 @@ async fn stopped_batch<W: Writer, P, T>(
         step_id,
         planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
     })];
+    let mut seen = std::collections::HashSet::new();
     for call in calls {
+        // A repeated call id still gets today's duplicate error, not "not run".
+        if !seen.insert(call.tool_call_id.clone()) {
+            terminal_with_reason(
+                &mut records,
+                run_id,
+                &batch_id,
+                error_result(&call.tool_call_id, "duplicate tool_call_id from provider"),
+                CallOutcome::Completed,
+                None,
+                Some(now),
+            );
+            continue;
+        }
         let result = ToolResult {
             tool_call_id: call.tool_call_id.clone(),
             output: ToolOutput::error(NOT_DISPATCHED.to_string()),
@@ -2023,12 +2042,20 @@ async fn stopped_batch<W: Writer, P, T>(
         batch_id,
     }));
     writer.append(&records, true).await?;
-    let mut end = run_end(writer, run_id, RunFinishReason::Interrupted, now);
+    // A caller's cancel ends the run cancelled; a stop ends it interrupted by the shutdown.
+    let reason = if cancelled {
+        RunFinishReason::Cancelled
+    } else {
+        RunFinishReason::Interrupted
+    };
+    let mut end = run_end(writer, run_id, reason, now);
     if let Record::RunEnd(end) = &mut end {
-        end.interrupt_reason = Some("runner_shutdown".into());
+        if !cancelled {
+            end.interrupt_reason = Some("runner_shutdown".into());
+        }
     }
     append_end(writer, run_id, vec![end]).await?;
-    Ok(finished(writer, RunFinishReason::Interrupted))
+    Ok(finished(writer, reason))
 }
 
 /// A queued send with a delivery order, as a boundary delivers it.
