@@ -57,6 +57,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::entries::{Placed, Tags};
 use crate::parts::{canonical, Parts};
 use crate::writer::Writer;
 
@@ -93,6 +94,16 @@ pub struct Admission {
     /// The session's frozen plan manifest, for a session admitted with a fetch plan: the tools
     /// its providers answered with, its system text and the hooks it declares.
     pub manifest: Option<std::sync::Arc<broca_wal::PlanManifest>>,
+    /// For a session on the current compaction contract, the system text every request renders
+    /// above the conversation, which is never part of its transcript: the plan's system text for
+    /// a planned run, otherwise the system messages the caller sent, or the previous run's when
+    /// it sent none. [`run`] takes it out of `input`; a caller leaves it empty.
+    pub global_system: Vec<Message>,
+    /// For a session's first run: the compaction plan version the session starts under, so it
+    /// records and renders under the current compaction contract; `None` keeps the established
+    /// layout. Today's actor asks for it when the plan names a compaction provider. A later run
+    /// keeps its session's layout whatever this says.
+    pub compaction_plan_version: Option<u32>,
 }
 
 /// The seams a run calls. None of them is owned by the run.
@@ -143,6 +154,8 @@ pub enum LoopError {
     /// The tool plane refused something the run can't go on without, such as registering a
     /// batch's call keys for late results.
     Tools(String),
+    /// A run sent system text other than the session's; nothing was written.
+    SystemPromptChanged,
 }
 
 impl From<SessionError> for LoopError {
@@ -163,8 +176,68 @@ where
     P: Provider,
     T: ToolPlane,
 {
-    admit(writer, parts, &admission).await?;
-    drive(writer, parts, &admission, seams).await
+    // A session keeps the layout its first run started under; a new run on it freezes the view
+    // library's current plan version, as today's loop does.
+    let mut admission = admission;
+    let contract = match writer
+        .operations()
+        .run
+        .as_ref()
+        .and_then(|run| run.start.as_ref())
+    {
+        Some(start) => start.compaction_plan_version.is_some(),
+        None => admission.compaction_plan_version.is_some(),
+    };
+    admission.compaction_plan_version = contract.then_some(cortexkit_compaction_view::PLAN_VERSION);
+    if contract {
+        let mut input = std::mem::take(&mut admission.input);
+        admission.global_system = global_system(writer, parts, &mut input, &admission)?;
+        admission.input = input;
+    }
+    let mut placed = Placed {
+        facts: contract
+            .then(|| Tags::for_run(admission.manifest.as_deref(), &admission.render_config)),
+        inner: writer,
+        view: None,
+    };
+    admit(&mut placed, parts, &admission).await?;
+    drive(&mut placed, parts, &admission, seams).await
+}
+
+/// Takes the system messages out of a run's input and decides the system text its requests
+/// render, as today's loop does for a session on the current compaction contract: a planned
+/// run renders its plan's system text and ignores what it was sent; any other run renders what
+/// it was sent, or the previous run's text when it sent none, and is refused when it sent text
+/// that differs from the previous run's.
+fn global_system<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    input: &mut Vec<Message>,
+    admission: &Admission,
+) -> Result<Vec<Message>, LoopError> {
+    let supplied = broca_core::compaction_v2::systems::take_globals(input);
+    if let Some(manifest) = &admission.manifest {
+        return Ok(broca_core::compaction_v2::systems::from_manifest(manifest));
+    }
+    let previous = match writer
+        .operations()
+        .run
+        .as_ref()
+        .and_then(|run| run.start.as_ref())
+        .and_then(|start| {
+            start
+                .setup
+                .iter()
+                .find(|part| part.kind == PartKind::GlobalSystem)
+        }) {
+        Some(part) => decode::<Vec<Message>>(Some(parts.get(part).map_err(LoopError::Parts)?))?,
+        None => None,
+    };
+    match previous {
+        Some(previous) if supplied.is_empty() => Ok(previous),
+        Some(previous) if previous != supplied => Err(LoopError::SystemPromptChanged),
+        _ => Ok(supplied),
+    }
 }
 
 /// Continues the session's latest run from its last durable record, after a crash or a
@@ -190,6 +263,14 @@ where
         return Ok(finished(writer, reason));
     }
     let resolution = run.resolution();
+    let mut placed = Placed {
+        facts: admission
+            .compaction_plan_version
+            .map(|_| Tags::for_run(admission.manifest.as_deref(), &admission.render_config)),
+        inner: writer,
+        view: None,
+    };
+    let writer = &mut placed;
     let resumed = resumed_record(writer, &resolution);
     writer.append(&[Record::Resumed(resumed)], false).await?;
     match resolution {
@@ -517,6 +598,12 @@ fn frozen_admission(
     let start = run.start.as_ref().ok_or(LoopError::Unsupported(
         "a run whose start isn't in the fold",
     ))?;
+    // An unfinished run on the current compaction contract renders exactly as it started, so it
+    // resumes only under the plan version it froze.
+    if let (Some(version), None) = (start.compaction_plan_version, run.finished) {
+        broca_core::compaction_v2::conditions::check_plan_version(version)
+            .map_err(LoopError::Parts)?;
+    }
     let part = |kind: PartKind| -> Result<Option<Value>, LoopError> {
         start
             .setup
@@ -547,6 +634,17 @@ fn frozen_admission(
         on_restart: decode(start.on_restart.clone())?,
         ts_ms: start.ts_ms,
         written_at_ms: start.written_at_ms,
+        global_system: match (
+            start.compaction_plan_version,
+            frozen_manifest(start, parts)?,
+        ) {
+            (None, _) => Vec::new(),
+            (Some(_), Some(manifest)) => {
+                broca_core::compaction_v2::systems::from_manifest(&manifest)
+            }
+            (Some(_), None) => decode(part(PartKind::GlobalSystem)?)?.unwrap_or_default(),
+        },
+        compaction_plan_version: start.compaction_plan_version,
         manifest: frozen_manifest(start, parts)?,
     })
 }
@@ -749,7 +847,7 @@ where
                 false,
             )
             .await?;
-        match boundary.last() {
+        match decision(&boundary) {
             Some(Record::RunEnd(end)) => return Ok(finished(writer, end.reason)),
             Some(Record::Pause(_)) => {
                 let mut paused = finished(writer, RunFinishReason::Interrupted);
@@ -922,12 +1020,19 @@ async fn admit<W: Writer>(
     admission: &Admission,
 ) -> Result<(), LoopError> {
     let mut setup = Vec::new();
+    // A planned run's system text is part of its manifest; any other run's is its own part.
+    let global_system = (admission.manifest.is_none() && !admission.global_system.is_empty())
+        .then(|| serde_json::to_value(&admission.global_system))
+        .transpose()
+        .map_err(|e| LoopError::Parts(e.to_string()))?
+        .unwrap_or(Value::Null);
     for (kind, value) in [
         (PartKind::Tools, serde_json::to_value(&admission.tools)),
         (
             PartKind::ResponseFormat,
             serde_json::to_value(&admission.response_format),
         ),
+        (PartKind::GlobalSystem, Ok(global_system)),
         (PartKind::RenderConfig, Ok(admission.render_config.clone())),
     ] {
         let value = value.map_err(|e| LoopError::Parts(e.to_string()))?;
@@ -996,7 +1101,7 @@ async fn admit<W: Writer>(
         context_limit: None,
         service_tier: None,
         route_decision_id: None,
-        compaction_plan_version: None,
+        compaction_plan_version: admission.compaction_plan_version,
         auth_selection: None,
         run_choices: Some(Value::Object(choices)),
         origin: Some(json!({ "kind": "fresh" })),
@@ -1078,7 +1183,12 @@ fn call_options<W: Writer, P, T>(
     )
     .number_new(&mut prompt)
     .map_err(|_| LoopError::Unsupported("part numbers past the numbering limit"))?;
-    clean_computed_into(&mut prompt);
+    // A session on the current compaction contract renders its numbers from the entries below;
+    // one on the established layout renders them in place.
+    let contract = admission.compaction_plan_version.is_some();
+    if !contract {
+        clean_computed_into(&mut prompt);
+    }
     let mut opts = CallOptions::new(prompt);
     opts.marker_order_version = Some(MARKER_ORDER_VERSION);
     opts.render_episodes = Arc::new(episodes.to_vec().into());
@@ -1096,7 +1206,26 @@ fn call_options<W: Writer, P, T>(
         account_ref: None,
         max_output_tokens: None,
     });
-    Ok(opts)
+    if !contract {
+        return Ok(opts);
+    }
+    // On the current compaction contract a request renders from the entries, as today's loop
+    // renders one: text delivered with a tool result is added to the result's copy, and the
+    // system text goes above the conversation.
+    let conversation = writer.conversation();
+    let entries = broca_session_store::session::window_entries(conversation, 1, usize::MAX)
+        .iter()
+        .map(crate::entries::project)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(LoopError::Parts)?;
+    let prompt = broca_core::compaction_v2::render::deliveries_only(&opts.prompt, &entries)
+        .map_err(LoopError::Parts)?;
+    let opts = broca_core::compaction_v2::render::options(&opts, prompt);
+    Ok(
+        broca_core::compaction_v2::systems::view(&opts, &admission.global_system)
+            .map_err(LoopError::Parts)?
+            .unwrap_or(opts),
+    )
 }
 
 /// Adds today's repetition guidance to the copies of tool results the request sends, never to
@@ -2676,6 +2805,15 @@ fn resolve(call: &ToolCall, result: DispatchResult) -> (ToolResult, CallOutcome)
 
 /// The run's state as the operational fold holds it. Admission appended its start, so it
 /// exists for the whole run.
+/// A batch's last record apart from the entry facts after it: what a boundary batch decided,
+/// whether the run's end, a pause or the step's start.
+fn decision(records: &[Record]) -> Option<&Record> {
+    records
+        .iter()
+        .rev()
+        .find(|record| !matches!(record, Record::EntryFacts(_)))
+}
+
 fn run_state<W: Writer>(writer: &W) -> &broca_session_store::fold::operations::Run {
     writer
         .operations()
@@ -2753,7 +2891,7 @@ async fn pause<W: Writer, P, T>(
             true,
         )
         .await?;
-    if matches!(batch.last(), Some(Record::RunEnd(_))) {
+    if matches!(decision(&batch), Some(Record::RunEnd(_))) {
         return Ok(finished(writer, RunFinishReason::Cancelled));
     }
     let mut paused = finished(writer, RunFinishReason::Interrupted);

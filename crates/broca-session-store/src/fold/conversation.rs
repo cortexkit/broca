@@ -186,6 +186,24 @@ impl Conversation {
         }
     }
 
+    /// A copy without the window: the count of placed messages, the held tool turn and its
+    /// entry, and the marker. Applying records to it tells which ordinals they place, for the
+    /// cost of one tool turn rather than the window.
+    pub fn without_window(&self) -> Self {
+        Self {
+            messages: Vec::new(),
+            open: self.open.clone(),
+            appends_in_conversation: self.appends_in_conversation,
+            marker: self.marker.clone(),
+            placed: self.placed,
+            entries: Vec::new(),
+            open_entry: self.open_entry.clone(),
+            window_pending: self.window_pending,
+            render_config: self.render_config.clone(),
+            episodes: Vec::new(),
+        }
+    }
+
     /// Empties the window, keeping the count of placed messages and any held tool turn. A
     /// checkpoint carries no window: it's rebuilt from the log's own records.
     pub fn clear_window(&mut self) {

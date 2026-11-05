@@ -51,8 +51,9 @@ fn canonical_u64(digits: &str) -> Option<u64> {
     canonical.then(|| digits.parse().ok()).flatten()
 }
 
-/// The entries of `conversation`'s window from `from` on, at most `limit` of them.
-fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> Vec<StoredEntry> {
+/// The entries of `conversation`'s window from `from` on, at most `limit` of them: one per
+/// window message, so a request's prompt and its entries line up.
+pub fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> Vec<StoredEntry> {
     let start = conversation.window_start().max(from);
     (start..=conversation.placed)
         .take(limit)

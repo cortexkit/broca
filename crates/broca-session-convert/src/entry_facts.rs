@@ -11,11 +11,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use broca_core::compaction_v2::metadata::{Fold, Metadata};
-use broca_protocol::content::Role;
 use broca_session_store::record::{EntryFacts, Notice, StepUsage, ViewRef};
-use broca_session_store::session::StoredEntry;
 use broca_wal::{FramedRecord, WalRecord};
-use cortexkit_role_compaction::read::Entry;
 
 /// What today's projection derives for a mode-3 log.
 #[derive(Debug, Default)]
@@ -25,6 +22,12 @@ pub struct Legacy {
     /// Who delivered the text a tool-result delivery carried, by the seq of today's record
     /// that delivered it.
     pub delivery_notices: HashMap<u64, Notice>,
+    /// The tool-results message of an assistant message still waiting in today's projection,
+    /// at the position after it. Today's projection places a tool turn when its batch ends; the
+    /// new format places it when its last call has a result, so a log a crash cut between the
+    /// two places this message only in the new format. Its facts are today's for that message
+    /// when the batch ends: the part numbers so far, and no parts of its own.
+    pub pending_results: Option<(u64, (Metadata, u64, String))>,
 }
 
 /// Today's facts for `old`, or `None` when it isn't a mode-3 log. `lineage` is the log's lineage
@@ -51,6 +54,7 @@ pub fn legacy(old: &[FramedRecord], lineage: Option<&str>) -> Result<Option<Lega
         rows.extend(fold.observe(frame)?.rows);
     }
     let mut placed = stored;
+    let mut pending_results = None;
     // An assistant message still waiting for its tool results is served at its reserved
     // position, with the time of the step that wrote it.
     if let Some((position, metadata)) = fold.pending_assistant() {
@@ -77,6 +81,15 @@ pub fn legacy(old: &[FramedRecord], lineage: Option<&str>) -> Result<Option<Lega
         }
         rows.insert(position, metadata.clone());
         placed += 1;
+        pending_results = Some((
+            position + 1,
+            Metadata {
+                tag_base: fold.high(),
+                source_seq: metadata.source_seq,
+                render_tags: metadata.render_tags,
+                ..Metadata::default()
+            },
+        ));
     }
     let mut legacy = Legacy::default();
     let mut prior = 0;
@@ -96,6 +109,10 @@ pub fn legacy(old: &[FramedRecord], lineage: Option<&str>) -> Result<Option<Lega
         }
         let mid = broca_core::message_mid(true, lineage, position)?;
         legacy.rows.insert(position, (metadata, prior, mid));
+    }
+    if let Some((position, metadata)) = pending_results {
+        let mid = broca_core::message_mid(true, lineage, position)?;
+        legacy.pending_results = Some((position, (metadata, prior, mid)));
     }
     Ok(Some(legacy))
 }
@@ -133,87 +150,4 @@ pub fn record(ordinal: u64, metadata: &Metadata, written_at_ms: u64, mid: String
         clean_reply: metadata.clean_reply,
         mid,
     }
-}
-
-/// The compaction entry for a message the new format stored, built only from what it stored:
-/// the message, the message after it, its entry facts and the text delivered with its calls.
-/// Projected with today's projection function, so the result can be compared with today's
-/// entry.
-pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
-    use broca_core::compaction_v2::entries::{project, Deliveries, EntryFacts as Facts};
-    let facts = stored
-        .state
-        .facts
-        .as_ref()
-        .ok_or_else(|| format!("message {} has no entry facts", stored.ordinal))?;
-    let mid = facts.mid.as_str();
-    let usage = facts.usage.map(|usage| {
-        let mut out = cortexkit_role_compaction::read::StepUsage::default();
-        out.prompt_tokens = usage.prompt_tokens;
-        out.cache_read_tokens = usage.cache_read_tokens;
-        out.cache_write_tokens = usage.cache_write_tokens;
-        out.output_tokens = usage.output_tokens;
-        out.reasoning_tokens = usage.reasoning_tokens;
-        out
-    });
-    let generated_under = facts
-        .generated_under
-        .as_ref()
-        .map(|view| {
-            serde_json::from_value(serde_json::json!({
-                "version": view.version,
-                "checksum": view.checksum,
-            }))
-        })
-        .transpose()
-        .map_err(|e| e.to_string())?;
-    let notice = facts.notice.as_ref().map(|notice| {
-        let mut origin = cortexkit_role_compaction::read::NoticeOrigin::new(&notice.sender);
-        origin.template = notice.template.clone();
-        origin
-    });
-    let first = Facts {
-        mid: mid.to_owned(),
-        ordinal: stored.ordinal,
-        tag_base: Some(facts.tag_base),
-        written_at: facts.written_at_ms,
-        completed_at: (stored.message.role == Role::Assistant && facts.native)
-            .then_some(facts.written_at_ms),
-        notice,
-        usage,
-        generated_under,
-    };
-    let mut messages = vec![stored.message.clone()];
-    let mut all = vec![first];
-    if let Some(next) = &stored.next {
-        messages.push(next.clone());
-        all.push(Facts {
-            mid: format!("{mid}:next"),
-            ordinal: stored.ordinal + 1,
-            tag_base: Some(facts.tag_base),
-            written_at: facts.written_at_ms,
-            ..Facts::default()
-        });
-    }
-    let mut deliveries = Deliveries::new();
-    for delivered in &stored.state.delivered {
-        let notice = delivered
-            .notice
-            .as_ref()
-            .ok_or("delivered text has no sender")?;
-        let text = delivered
-            .text
-            .strip_prefix("\n\n")
-            .unwrap_or(&delivered.text);
-        let mut out = cortexkit_role_compaction::part::Delivered::new(&notice.sender, text);
-        out.template = notice.template.clone();
-        deliveries
-            .entry((mid.to_owned(), delivered.part.to_string()))
-            .or_default()
-            .push(out);
-    }
-    project(&messages, &all, &deliveries, true)
-        .into_iter()
-        .next()
-        .ok_or_else(|| "empty projection".into())
 }

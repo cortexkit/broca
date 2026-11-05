@@ -232,8 +232,13 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 known = known.max(counts.placed + u64::from(reserved));
             }
             for ordinal in *emitted + 1..=known {
+                let pending = legacy
+                    .pending_results
+                    .as_ref()
+                    .filter(|(position, _)| *position == ordinal - 1)
+                    .map(|(_, row)| row);
                 let (metadata, written_at, mid) =
-                    legacy.rows.get(&(ordinal - 1)).ok_or_else(|| {
+                    legacy.rows.get(&(ordinal - 1)).or(pending).ok_or_else(|| {
                         err(format!(
                             "entry facts: today's projection has no message {ordinal}"
                         ))
@@ -249,7 +254,11 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
         }
     }
     if let Some((legacy, _, emitted)) = &facts {
-        if emitted != &(legacy.rows.len() as u64) {
+        let results_placed = legacy
+            .pending_results
+            .as_ref()
+            .is_some_and(|(position, _)| *position < *emitted);
+        if *emitted != legacy.rows.len() as u64 + u64::from(results_placed) {
             return Err(err(format!(
                 "entry facts: today's projection has {} messages, the conversion placed {emitted}",
                 legacy.rows.len()

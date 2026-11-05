@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 broca-core = { path = "../broca-core" }
 broca-protocol = { path = "../broca-protocol" }
+broca-session-loop = { path = "../broca-session-loop" }
 broca-session-store = { path = "../broca-session-store" }
 broca-wal = { path = "../broca-wal" }
 cortexkit-role-compaction.workspace = true

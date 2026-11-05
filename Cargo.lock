@@ -608,6 +608,7 @@ version = "0.3.315"
 dependencies = [
  "broca-core",
  "broca-protocol",
+ "broca-session-loop",
  "broca-session-store",
  "broca-wal",
  "cortexkit-role-compaction",
@@ -632,6 +633,8 @@ dependencies = [
  "broca-session-store",
  "broca-test-support",
  "broca-wal",
+ "cortexkit-compaction-view",
+ "cortexkit-role-compaction",
  "cortexkit-role-step-transform-provider",
  "futures",
  "serde",

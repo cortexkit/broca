@@ -505,12 +505,18 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     /// writer generation, so the pair never repeats. Converted ids start with `m`, so the two
     /// forms never meet.
     pub fn message_id(&self, offset: u64) -> String {
-        let generation = crate::codec::hex(&self.head.generation.0);
         format!(
-            "g{}.{}",
-            &generation[..16],
+            "{}.{}",
+            self.message_id_prefix(),
             self.encoder.next_seq() + offset
         )
+    }
+
+    /// What every new message id starts with under this writer: `g<generation>`, so the id of
+    /// a message whose `EntryFacts` record takes seq `s` is `<prefix>.<s>`.
+    pub fn message_id_prefix(&self) -> String {
+        let generation = crate::codec::hex(&self.head.generation.0);
+        format!("g{}", &generation[..16])
     }
 }
 
@@ -519,7 +525,7 @@ use media::OpenLogIndex;
 pub use media::{MediaError, NewMedia};
 
 mod read;
-pub use read::StoredEntry;
+pub use read::{window_entries, StoredEntry};
 mod cold;
 pub use cold::Cold;
 mod recover;

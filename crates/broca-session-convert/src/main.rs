@@ -282,7 +282,6 @@ struct EntriesReport {
 /// format serves from the converted records, first from the open log, then after sealing.
 /// Every entry must be equal, digests included.
 fn run_entries(args: &Args) {
-    use broca_session_convert::entry_facts;
     let mut report = EntriesReport::default();
     let deployment = DeploymentKey::new(1, &[0x5a; 32]);
     each_log(args, |item| {
@@ -346,7 +345,7 @@ fn run_entries(args: &Args) {
             }
             let mut equal = 0;
             for (stored, expected) in served.iter().zip(&today) {
-                let got = match entry_facts::project(stored) {
+                let got = match broca_session_loop::entries::project(stored) {
                     Ok(entry) => serde_json::to_value(entry).expect("entries serialize"),
                     Err(e) => {
                         *mismatches.entry(format!("project: {e}")).or_default() += 1;

@@ -17,11 +17,19 @@
 //! [`broca_core::tool_plane::ToolPlane`] for tool calls, so every provider family and tool
 //! route works unchanged.
 //!
-//! What this build covers: fresh runs with text steps and tool batches, stop conditions, and
-//! provider errors. Steers, pauses, hooks, approvals, held calls, compaction, budgets and the
-//! rest of today's loop come in later stages, each proven against today's loop by the
-//! differential tests in `tests/`.
+//! A session runs in the layout its first run started under, as in today's loop: the
+//! established one, or the current compaction contract, which today's actor picks for a session
+//! whose plan names a compaction provider. On the contract the system text is run setup, not
+//! transcript, every message gets its entry facts when it's placed (see [`entries`]), and a
+//! request renders from those entries as today's loop renders one.
+//!
+//! What this build covers: runs with text steps and tool batches, stop conditions, provider
+//! errors, steers and ordered deliveries, cancels, pauses, hooks, the approval policy, calls a
+//! provider holds, repetition guidance and media in tool results. Compaction views, approval
+//! questions, budgets and the rest of today's loop come in later stages, each proven against
+//! today's loop by the differential tests in `tests/`.
 
+pub mod entries;
 pub mod media;
 pub mod parts;
 pub mod run;

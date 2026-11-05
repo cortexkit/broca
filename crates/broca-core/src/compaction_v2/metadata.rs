@@ -16,7 +16,7 @@ use crate::placement::{AppendKind, HoldKind, Placement, PlacementAction};
 
 /// Compaction-view metadata and live display use the same frozen render configuration
 /// to decide whether assistant replies are cleaned.
-pub(crate) fn clean_replies(render_tags: bool, frozen_render_config: &serde_json::Value) -> bool {
+pub fn clean_replies(render_tags: bool, frozen_render_config: &serde_json::Value) -> bool {
     render_tags
         && !broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(
             Some(frozen_render_config),

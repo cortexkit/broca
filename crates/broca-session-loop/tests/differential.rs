@@ -21,9 +21,8 @@ use broca_core::tool_plane::{
     ProviderHeldReply, ToolOpenGuard, ToolPlane, ToolPlaneError,
 };
 use broca_core::{
-    provider::Provider, run_loop, run_loop_on_writer, run_loop_with_control, FileLeaseStore,
-    FileWalStore, RunControl, RunRequest, StartMode, SteerInbox, StubReply, StubToolPlane,
-    WalHandle, WalStore,
+    provider::Provider, run_loop_on_writer, run_loop_with_control, FileLeaseStore, FileWalStore,
+    RunControl, RunRequest, StartMode, SteerInbox, StubReply, StubToolPlane, WalHandle, WalStore,
 };
 use broca_crash_harness::wal::LogImage;
 use broca_protocol::caller::PauseReason;
@@ -535,7 +534,24 @@ fn lineage(image: &LogImage) -> Option<String> {
     image.lineage_id().map(|lineage| lineage.to_string())
 }
 
+tokio::task_local! {
+    /// The layout a comparison's session starts under: the current compaction contract (a plan
+    /// version), or the established layout (`None`). Every comparison runs once in each.
+    static LAYOUT: Option<u32>;
+}
+
+/// The layout the comparison running in this task uses.
+fn layout() -> Option<u32> {
+    LAYOUT.try_with(|layout| *layout).unwrap_or(None)
+}
+
+/// Both layouts a new session can start under. Today's actor starts a session under the
+/// current compaction contract only when its plan names a compaction provider, but a later run
+/// may drop it, so a session on the contract can run without one too.
+const LAYOUTS: [Option<u32>; 2] = [None, Some(cortexkit_compaction_view::PLAN_VERSION)];
+
 /// One scenario: what the caller sends and what the provider and tools answer.
+#[derive(Clone)]
 struct Scenario {
     input: Vec<Message>,
     tools: Vec<Tool>,
@@ -627,6 +643,8 @@ impl Scenario {
             ts_ms: Some(0),
             written_at_ms: Some(0),
             manifest: self.manifest.clone(),
+            global_system: Vec::new(),
+            compaction_plan_version: layout(),
         }
     }
 }
@@ -682,6 +700,7 @@ async fn today_from(
             manifest: scenario.manifest.clone(),
             cancel: Some(cancel.clone()),
             hook_plane: Some(harness_hooks_cancelling(cancel)),
+            new_log_compaction_plan_version: layout(),
             ..Default::default()
         },
         &tx,
@@ -790,6 +809,10 @@ impl Writer for Recording<'_, '_> {
     fn next_seq(&self) -> u64 {
         self.session.next_seq()
     }
+
+    fn message_id_prefix(&self) -> String {
+        self.session.message_id_prefix()
+    }
     fn media(&self) -> Option<Arc<dyn MediaCapture>> {
         Some(Arc::clone(&self.media) as Arc<dyn MediaCapture>)
     }
@@ -830,6 +853,9 @@ async fn new_from(
     .await
     .unwrap();
     let mut parts = MemoryParts::default();
+    // The records the session already held, so the appended ones' message ids number on from
+    // theirs, as in today's whole log.
+    let mut held = Vec::new();
     let resuming = match start {
         Some(converted)
             if converted
@@ -838,6 +864,7 @@ async fn new_from(
                 .any(|r| matches!(r, Record::RunStart(_))) =>
         {
             session.append(&converted.records, true).await.unwrap();
+            held = converted.records;
             parts.parts = converted.parts;
             true
         }
@@ -885,8 +912,9 @@ async fn new_from(
     if !resuming {
         media_reads_back(writer.session).await;
     }
+    let all: Vec<Record> = held.iter().chain(&records).cloned().collect();
     Outcome {
-        records: normalized(&records),
+        records: normalized(&all)[held.len()..].to_vec(),
         requests: sent_requests(&provider),
         calls: plane
             .log()
@@ -917,12 +945,31 @@ const NORMALIZED: &[&str] = &[
     "receipt_seq",
 ];
 
+/// Records as the comparison reads them. Message ids differ by design: today's are
+/// `m<lineage prefix>.<position>`, the new loop's `g<generation>.<seq>`. So each id becomes its
+/// order of first appearance, and the same id always maps to the same number; two outcomes
+/// compare equal only if their ids line up one to one.
 fn normalized(records: &[Record]) -> Vec<Value> {
+    let mut ids: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut id = |mid: &mut Value| {
+        if let Some(text) = mid.as_str() {
+            let next = ids.len();
+            *mid = json!(format!(
+                "mid#{}",
+                *ids.entry(text.to_owned()).or_insert(next)
+            ));
+        }
+    };
     records
         .iter()
         .map(|record| {
             let mut value = serde_json::to_value(record).expect("records serialize");
             scrub(&mut value);
+            for key in ["mid", "first_kept_mid"] {
+                if let Some(mid) = value.get_mut(key) {
+                    id(mid);
+                }
+            }
             json!({ record.name(): value })
         })
         .collect()
@@ -981,7 +1028,16 @@ fn scrub(value: &mut Value) {
     }
 }
 
+/// Runs [`compare_in`] in both layouts.
 async fn compare(scenario: Scenario) {
+    for layout in LAYOUTS {
+        LAYOUT
+            .scope(layout, Box::pin(compare_in(scenario.clone())))
+            .await;
+    }
+}
+
+async fn compare_in(scenario: Scenario) {
     let today = today(&scenario).await;
     let dump = std::env::var_os("DIFFERENTIAL_DUMP").is_some();
     if dump {
@@ -1162,7 +1218,16 @@ async fn a_call_whose_outcome_is_unknown() {
 /// cut twice: today's loop resumes the cut log, and the new loop resumes a session holding the
 /// same records converted. Both must send the same requests, run the same tool calls, and
 /// append the same records.
+/// Runs [`compare_every_cut_in`] in both layouts.
 async fn compare_every_cut(scenario: Scenario) {
+    for layout in LAYOUTS {
+        LAYOUT
+            .scope(layout, Box::pin(compare_every_cut_in(scenario.clone())))
+            .await;
+    }
+}
+
+async fn compare_every_cut_in(scenario: Scenario) {
     let (_, full, name) = today_from(&scenario, None, scenario.steps.clone()).await;
     let records = full.framed().len();
     assert!(records > 2, "the scenario wrote a log to cut");
@@ -1416,7 +1481,16 @@ async fn every_cut_of_an_unsent_call_resumes_alike() {
 /// Runs `runs` one after another on one session through today's loop (the first with
 /// `run_loop`, later ones as appended episodes) and through the new loop, with one scripted
 /// provider and tool plane per loop, and compares everything both did.
+/// Runs [`compare_runs_in`] in both layouts.
 async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
+    for layout in LAYOUTS {
+        LAYOUT
+            .scope(layout, Box::pin(compare_runs_in(scenario.clone(), runs)))
+            .await;
+    }
+}
+
+async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
     // Today's loop.
     let dir = broca_test_support::scratch_root().join(format!(
         "session-loop-differential-{}-{}",
@@ -1434,13 +1508,18 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let request = scenario.request_for(run_id, input);
         if index == 0 {
-            run_loop(
+            run_loop_with_control(
                 request,
                 &provider,
                 &plane,
                 &lease,
                 &HarnessPolicy,
                 &wal,
+                None,
+                RunControl {
+                    new_log_compaction_plan_version: layout(),
+                    ..Default::default()
+                },
                 &tx,
             )
             .await
@@ -1838,7 +1917,27 @@ async fn compare_steered(scenario: Scenario, steers: Vec<(usize, Action)>) {
 /// Like `compare_steered`, with the run's restart policy set to `on_restart`. A run that pauses
 /// for a restart is resumed once, as the runner does after it starts again, and both loops'
 /// reports for each run are compared too.
+/// Runs [`compare_actions_in`] in both layouts.
 async fn compare_actions(
+    scenario: Scenario,
+    steers: Vec<(usize, Action)>,
+    on_restart: Option<OnRestart>,
+) {
+    for layout in LAYOUTS {
+        LAYOUT
+            .scope(
+                layout,
+                Box::pin(compare_actions_in(
+                    scenario.clone(),
+                    steers.clone(),
+                    on_restart,
+                )),
+            )
+            .await;
+    }
+}
+
+async fn compare_actions_in(
     scenario: Scenario,
     steers: Vec<(usize, Action)>,
     on_restart: Option<OnRestart>,
@@ -1889,6 +1988,7 @@ async fn compare_actions(
         stop_requested: Some(stop),
         provider_held_lifecycle: Some(plane.lifecycle()),
         cancel: Some(cancel),
+        new_log_compaction_plan_version: layout(),
         ..Default::default()
     };
     let first = run_loop_on_writer(
@@ -1923,6 +2023,7 @@ async fn compare_actions(
             None,
             RunControl {
                 provider_held_lifecycle: Some(plane.lifecycle()),
+                new_log_compaction_plan_version: layout(),
                 ..Default::default()
             },
             &tx,
@@ -2229,7 +2330,16 @@ fn auth_failure() -> Vec<NormalizedEvent> {
 /// Runs `scenario` once through each loop: the run pauses for re-authentication, then resumes
 /// after it, as the session actor would once the credential is refreshed. Compares
 /// everything both did.
+/// Runs [`compare_auth_pause_in`] in both layouts.
 async fn compare_auth_pause(scenario: Scenario) {
+    for layout in LAYOUTS {
+        LAYOUT
+            .scope(layout, Box::pin(compare_auth_pause_in(scenario.clone())))
+            .await;
+    }
+}
+
+async fn compare_auth_pause_in(scenario: Scenario) {
     // Today's loop, pausing and resuming on one writer.
     let dir = broca_test_support::scratch_root().join(format!(
         "session-loop-differential-{}-{}",
@@ -2256,7 +2366,10 @@ async fn compare_auth_pause(scenario: Scenario) {
             &HarnessPolicy,
             &wal,
             None,
-            RunControl::default(),
+            RunControl {
+                new_log_compaction_plan_version: layout(),
+                ..Default::default()
+            },
             &tx,
         )
         .await
