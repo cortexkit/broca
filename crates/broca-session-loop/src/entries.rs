@@ -147,6 +147,14 @@ impl<W: Writer> Writer for Placed<'_, W> {
         self.inner.seal_at_entry(ordinal, carry, now_ms).await
     }
 
+    async fn seal_ledger(
+        &mut self,
+        carry: &broca_session_store::session::Carry<'_>,
+        now_ms: u64,
+    ) -> Result<(), SessionError> {
+        self.inner.seal_ledger(carry, now_ms).await
+    }
+
     async fn entry_by_mid(
         &self,
         mid: &str,

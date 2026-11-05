@@ -55,6 +55,9 @@ pub enum SessionError {
     ChangeOpen,
     /// A cut that doesn't name the first record of an entry in the open log.
     BadCut(u64),
+    /// A seal would move the records of a compaction view the session still names out of the
+    /// open log without carrying a copy of it: see [`Carry::records`].
+    ViewNotCarried,
     Directory(crate::directory::DirectoryError),
     Segment(crate::segment::SegmentError),
     Index(crate::idindex::IndexError),

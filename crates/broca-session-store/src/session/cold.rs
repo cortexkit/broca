@@ -36,14 +36,22 @@ pub enum Cold {
 }
 
 impl<'b, B: SessionBackend> Session<'b, B> {
-    /// Runs the cold step if the session has had no activity for `idle_ms`.
-    pub async fn cold(&mut self, now_ms: u64, idle_ms: u64) -> Result<Cold, SessionError> {
+    /// Runs the cold step if the session has had no activity for `idle_ms`. It seals the ledger,
+    /// so a session with compaction views passes copies of them in `carry` (see
+    /// [`Carry::records`]).
+    pub async fn cold(
+        &mut self,
+        now_ms: u64,
+        idle_ms: u64,
+        carry: &super::seal::Carry<'_>,
+    ) -> Result<Cold, SessionError> {
         if self.poisoned {
             return Err(SessionError::Poisoned);
         }
         if self.operations.open_change.is_some() {
             return Err(SessionError::ChangeOpen);
         }
+        self.check_views_carried(carry)?;
         let open = self.read_open_log().await?;
         let Some(last_active_ms) = open
             .0
@@ -63,14 +71,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             .is_none_or(|run| matches!(run.resolution(), Resolution::Idle(_)));
         let pruned = run_idle && self.conversation.open_tool_turn().is_none();
         let sealed = self
-            .seal_read(
-                ChangeKind::Cold,
-                None,
-                pruned,
-                &super::seal::Carry::default(),
-                open,
-                now_ms,
-            )
+            .seal_read(ChangeKind::Cold, None, pruned, carry, open, now_ms)
             .await?;
         Ok(Cold::Applied { sealed, pruned })
     }

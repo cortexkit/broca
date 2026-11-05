@@ -346,44 +346,12 @@ pub async fn seal_at_cut<W: Writer, P, T>(
     ctx: &Ctx,
     first_kept_ordinal: u64,
 ) -> Result<(), LoopError> {
-    let step = writer
-        .operations()
-        .view_applied
-        .as_ref()
-        .ok_or_else(|| LoopError::Parts("a cut was marked with no view applied".into()))?
-        .step_id;
-    let carry = {
-        let state = ctx.session.state.lock().await;
-        let applied = state
-            .applied_received()
-            .ok_or_else(|| LoopError::Parts("a cut was marked with no view applied".into()))?;
-        let full = |previous: Option<&ReceivedView>, view: &ReceivedView| {
-            serde_json::to_value(v2::storage::encode(previous, view))
-                .map(|edits| {
-                    Record::View(View {
-                        version: view.view().version,
-                        checksum: view.view().checksum.clone(),
-                        edits,
-                    })
-                })
-                .map_err(|error| LoopError::Parts(error.to_string()))
-        };
-        let mut carry = vec![
-            full(None, applied)?,
-            Record::ViewApplied(ViewApplied {
-                step_id: step,
-                version: applied.view().version,
-                checksum: applied.view().checksum.clone(),
-            }),
-        ];
-        if let Some(latest) = state
-            .latest_received()
-            .filter(|latest| latest.view().version != applied.view().version)
-        {
-            carry.push(full(Some(applied), latest)?);
-        }
-        carry
-    };
+    if writer.operations().view_applied.is_none() {
+        return Err(LoopError::Parts(
+            "a cut was marked with no view applied".into(),
+        ));
+    }
+    let carry = carried_views(&*ctx.session.state.lock().await, writer.operations())?;
     let window_repetition = spanning_repetition(writer.conversation(), first_kept_ordinal)?;
     writer
         .seal_at_entry(
@@ -396,6 +364,69 @@ pub async fn seal_at_cut<W: Writer, P, T>(
         )
         .await?;
     Ok(())
+}
+
+/// Seals the session's ledger with no cut, carrying copies of its compaction views, as a seal
+/// must (see `Carry::records`). `session` is the session's compaction state, as the actor holds
+/// it.
+pub async fn seal_ledger<W: Writer>(
+    writer: &mut W,
+    session: &v2::session::Session,
+    now_ms: u64,
+) -> Result<(), LoopError> {
+    let carry = carried_views(&*session.state.lock().await, writer.operations())?;
+    writer
+        .seal_ledger(
+            &broca_session_store::session::Carry {
+                records: &carry,
+                window_repetition: None,
+            },
+            now_ms,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Whole copies of the views a seal must carry into the new log: the applied view and a
+/// `ViewApplied` naming it for the step that applied it, then the accepted view when it's a
+/// newer one, stored as its change against the applied view carried just before it. Empty when
+/// the session names no view.
+pub fn carried_views(state: &State, operations: &Operations) -> Result<Vec<Record>, LoopError> {
+    let record = |previous: Option<&ReceivedView>, view: &ReceivedView| {
+        serde_json::to_value(v2::storage::encode(previous, view))
+            .map(|edits| {
+                Record::View(View {
+                    version: view.view().version,
+                    checksum: view.view().checksum.clone(),
+                    edits,
+                })
+            })
+            .map_err(|error| LoopError::Parts(error.to_string()))
+    };
+    let mut carry = Vec::new();
+    let applied = match (state.applied_received(), &operations.view_applied) {
+        (Some(applied), Some(slot)) => {
+            carry.push(record(None, applied)?);
+            carry.push(Record::ViewApplied(ViewApplied {
+                step_id: slot.step_id,
+                version: applied.view().version,
+                checksum: applied.view().checksum.clone(),
+            }));
+            Some(applied)
+        }
+        (None, None) => None,
+        _ => {
+            return Err(LoopError::Parts(
+                "the compaction state and the store disagree on the applied view".into(),
+            ))
+        }
+    };
+    if let Some(latest) = state.latest_received().filter(|latest| {
+        applied.is_none_or(|applied| latest.view().version != applied.view().version)
+    }) {
+        carry.push(record(applied, latest)?);
+    }
+    Ok(carry)
 }
 
 /// The repetition counters a cut before ordinal `first_kept` must keep: when the cut splits a

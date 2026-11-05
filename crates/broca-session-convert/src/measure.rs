@@ -386,6 +386,11 @@ pub fn append_log(
             .map_err(|e| format!("load to seal: {e:?}"))?;
         let whole = session.conversation.messages.clone();
         let before: Vec<Vec<u8>> = whole.iter().map(|message| message.encode()).collect();
+        // A seal must carry whole copies of the session's compaction views, which only the run
+        // loop's compaction code can build, so this measurement leaves such sessions out.
+        if session.operations.view_accepted.is_some() || session.operations.view_applied.is_some() {
+            return Err("compaction views: a seal needs the run loop's copies of them".into());
+        }
         for cut in run_inputs.iter().rev() {
             let started = Instant::now();
             match session.seal(Some(*cut), 0).await {
@@ -416,7 +421,11 @@ pub fn append_log(
         measure.open_before_cold = session.open_log().1;
         let far_future = u64::MAX / 2;
         match session
-            .cold(far_future, 7 * 24 * 60 * 60 * 1000)
+            .cold(
+                far_future,
+                7 * 24 * 60 * 60 * 1000,
+                &broca_session_store::session::Carry::default(),
+            )
             .await
             .map_err(|e| format!("cold: {e:?}"))?
         {

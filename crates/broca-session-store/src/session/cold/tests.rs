@@ -4,6 +4,7 @@ use broca_protocol::ids::MessageId;
 use broca_protocol::request::ModelHandle;
 use futures::executor::block_on;
 
+use super::super::Carry;
 use super::Cold;
 use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
 use crate::codec::Message as _;
@@ -176,7 +177,7 @@ fn a_finished_idle_session_goes_cold_with_its_reasoning_pruned() {
         let mut session = finished(&backend, 1_000).await;
         assert_eq!(opaque(&session.conversation.messages).len(), 2);
         let now = 1_000 + IDLE + 1;
-        let cold = session.cold(now, IDLE).await.unwrap();
+        let cold = session.cold(now, IDLE, &Carry::default()).await.unwrap();
         assert!(
             matches!(cold, Cold::Applied { pruned: true, .. }),
             "{cold:?}"
@@ -210,7 +211,10 @@ fn an_active_session_is_left_alone() {
         let mut session = finished(&backend, 1_000).await;
         let before = (session.conversation.encode(), session.operations.encode());
         let logs = backend.log_names(&addr());
-        let cold = session.cold(1_000 + IDLE - 1, IDLE).await.unwrap();
+        let cold = session
+            .cold(1_000 + IDLE - 1, IDLE, &Carry::default())
+            .await
+            .unwrap();
         assert_eq!(
             cold,
             Cold::Active {
@@ -234,7 +238,13 @@ fn a_session_with_no_timed_record_is_left_alone() {
         let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
             .await
             .unwrap();
-        assert_eq!(session.cold(100 * DAY, IDLE).await.unwrap(), Cold::Unknown);
+        assert_eq!(
+            session
+                .cold(100 * DAY, IDLE, &Carry::default())
+                .await
+                .unwrap(),
+            Cold::Unknown
+        );
         assert!(backend.object_names(&addr()).is_empty());
     });
 }
@@ -251,7 +261,10 @@ fn an_unfinished_run_keeps_its_reasoning() {
             .append(&[input("c", "ask c", 1_000), answer("c", "c", 1_000)], true)
             .await
             .unwrap();
-        let cold = session.cold(1_000 + IDLE, IDLE).await.unwrap();
+        let cold = session
+            .cold(1_000 + IDLE, IDLE, &Carry::default())
+            .await
+            .unwrap();
         assert!(
             matches!(cold, Cold::Applied { pruned: false, .. }),
             "{cold:?}"
@@ -273,10 +286,13 @@ fn a_cold_step_that_fails_before_its_commit_undoes_itself() {
     block_on(async {
         let mut session = finished(&backend, 1_000).await;
         backend.fail_once(2);
-        assert!(session.cold(1_000 + IDLE, IDLE).await.is_err());
+        assert!(session
+            .cold(1_000 + IDLE, IDLE, &Carry::default())
+            .await
+            .is_err());
         assert!(backend.object_names(&addr()).is_empty());
         assert_eq!(stored_cold_since(&backend).await, None);
-        let cold = session.cold(1_000 + IDLE, IDLE).await;
+        let cold = session.cold(1_000 + IDLE, IDLE, &Carry::default()).await;
         assert!(
             matches!(cold, Ok(Cold::Applied { pruned: true, .. })),
             "{cold:?}"

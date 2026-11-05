@@ -154,6 +154,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 "a seal carries only ledger records into the new log".into(),
             ));
         }
+        self.check_views_carried(carry)?;
         let open = self.read_open_log().await?;
         if let Some(cut) = cut {
             self.check_cut(&open.0, &open.2, cut)?;
@@ -180,6 +181,35 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let (records, _, checkpoint) = self.read_open_log().await?;
         let cut = placing_seq(&checkpoint, &records, ordinal)?;
         self.seal_carrying(Some(cut), carry, now_ms).await
+    }
+
+    /// Every seal moves the ledger out of the open log, and with it the `View` records the
+    /// session's accepted and applied views are stored in. Those are stored as changes against
+    /// earlier views, which only the compaction code can turn back into whole views, so the store
+    /// can't keep them itself: the caller carries a copy of each view the session names, and a
+    /// `ViewApplied` naming the applied one. A seal that would lose either refuses before it
+    /// writes anything.
+    pub(super) fn check_views_carried(&self, carry: &Carry<'_>) -> Result<(), SessionError> {
+        let view = |slot: &crate::fold::operations::ViewSlot| {
+            carry.records.iter().any(|record| {
+                matches!(record, Record::View(view)
+                    if view.version == slot.version && view.checksum == slot.checksum)
+            })
+        };
+        let accepted = self.operations.view_accepted.as_ref().is_none_or(view);
+        let applied = self.operations.view_applied.as_ref().is_none_or(|applied| {
+            view(&applied.view)
+                && carry.records.iter().any(|record| {
+                    matches!(record, Record::ViewApplied(named)
+                        if named.version == applied.view.version
+                            && named.checksum == applied.view.checksum)
+                })
+        });
+        if accepted && applied {
+            Ok(())
+        } else {
+            Err(SessionError::ViewNotCarried)
+        }
     }
 
     /// Runs a seal over an open log already read. `prune_window` also prunes finished runs'

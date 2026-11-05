@@ -551,6 +551,11 @@ fn run_model(run_id: &str) -> &str {
 }
 
 tokio::task_local! {
+    /// Whether the multi-run comparison seals the new loop's ledger after each run but the last.
+    static LEDGER_SEAL_BETWEEN_RUNS: bool;
+}
+
+tokio::task_local! {
     /// The compaction provider a comparison's plan names, scripted: what it answers each ride
     /// and the window the run freezes. `None` runs without one.
     static COMPACTION: Option<Arc<CompactionScript>>;
@@ -1035,6 +1040,14 @@ impl Writer for Recording<'_, '_> {
         Writer::seal_at_entry(&mut *self.session, ordinal, carry, now_ms).await
     }
 
+    async fn seal_ledger(
+        &mut self,
+        carry: &broca_session_store::session::Carry<'_>,
+        now_ms: u64,
+    ) -> Result<(), SessionError> {
+        Writer::seal_ledger(&mut *self.session, carry, now_ms).await
+    }
+
     async fn entry_by_mid(
         &self,
         mid: &str,
@@ -1235,11 +1248,21 @@ async fn sealed_at_the_cut(
     triple: &SessionTriple,
     bind: &broca_protocol::BindIdentity,
 ) {
-    use broca_session_store::codec::Message as _;
     assert!(
         Writer::conversation(session).window_start() > 1,
         "the new loop sealed nothing at the cut"
     );
+    reloads_with_its_views(session, triple, bind).await;
+}
+
+/// A fresh load of a sealed session holds exactly the state the writer holds, and rebuilds both
+/// compaction view slots from the new open log alone.
+async fn reloads_with_its_views(
+    session: &Session<'_, MemoryBackend>,
+    triple: &SessionTriple,
+    bind: &broca_protocol::BindIdentity,
+) {
+    use broca_session_store::codec::Message as _;
     let loaded = Session::load(
         session.backend(),
         SessionAddr("0123456789abcdef".into()),
@@ -1932,7 +1955,7 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         // One session state for the session's life, as the actor keeps it across runs.
         compaction_session: Some(Arc::default()),
     };
-    for (run_id, input) in runs {
+    for (index, (run_id, input)) in runs.iter().enumerate() {
         run(
             &mut writer,
             &mut parts,
@@ -1941,6 +1964,24 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         )
         .await
         .expect("the new loop runs");
+        // A scenario may seal the new loop's ledger between runs, which today's loop never
+        // does; the next run must still send the same requests.
+        if LEDGER_SEAL_BETWEEN_RUNS
+            .try_with(|seal| *seal)
+            .unwrap_or(false)
+            && index + 1 < runs.len()
+        {
+            broca_session_loop::compaction::seal_ledger(
+                &mut writer,
+                seams
+                    .compaction_session
+                    .as_deref()
+                    .expect("a compaction session"),
+                0,
+            )
+            .await
+            .expect("the ledger seals");
+        }
     }
     keys_match(writer.session, &plane).await;
     if compaction().is_some_and(|script| {
@@ -1950,6 +1991,12 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
             .any(|ride| matches!(ride, Ride::Cut(_) | Ride::CutAndDrop(..)))
     }) {
         sealed_at_the_cut(writer.session, &triple, &bind).await;
+    }
+    if LEDGER_SEAL_BETWEEN_RUNS
+        .try_with(|seal| *seal)
+        .unwrap_or(false)
+    {
+        reloads_with_its_views(writer.session, &triple, &bind).await;
     }
     let new = Outcome {
         records: normalized(&writer.records),
@@ -4216,4 +4263,37 @@ async fn a_run_after_a_cut_through_an_earlier_run_continues_alike() {
 #[tokio::test]
 async fn every_cut_of_a_run_split_by_a_compaction_cut_resumes_alike() {
     compare_compacted_every_cut(repetition_across_a_cut_scenario(), repetition_cut()).await;
+}
+
+/// A view lands in the first run, then the new loop seals its ledger before the second run, which
+/// moves the view's records out of the open log. The seal carries copies of the view, so the
+/// second run restores the same compaction state and sends the same requests.
+#[tokio::test]
+async fn a_ledger_seal_between_runs_keeps_the_compaction_views() {
+    LEDGER_SEAL_BETWEEN_RUNS
+        .scope(
+            true,
+            LAYOUT.scope(
+                Some(cortexkit_compaction_view::PLAN_VERSION),
+                COMPACTION.scope(
+                    Some(Arc::new(CompactionScript {
+                        context_limit: 1_200,
+                        rides: vec![Ride::Drop(2)],
+                    })),
+                    Box::pin(compare_runs_in(
+                        compacted_scenario(vec![
+                            answer(
+                                "a1",
+                                vec![call("c1", "big", json!({}))],
+                                FinishReason::ToolCalls,
+                            ),
+                            text_step("a2", "done"),
+                            text_step("a3", "again"),
+                        ]),
+                        &[("r1", vec![user("read a")]), ("r2", vec![user("more")])],
+                    )),
+                ),
+            ),
+        )
+        .await;
 }

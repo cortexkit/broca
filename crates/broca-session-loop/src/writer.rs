@@ -74,6 +74,14 @@ pub trait Writer {
         now_ms: u64,
     ) -> Result<(), SessionError>;
 
+    /// Seals the open log's ledger with no cut, starting the new log with what `carry` names
+    /// (see `Session::seal_carrying`).
+    async fn seal_ledger(
+        &mut self,
+        carry: &broca_session_store::session::Carry<'_>,
+        now_ms: u64,
+    ) -> Result<(), SessionError>;
+
     /// The entry whose message id is `mid`, read back from sealed history when it's no longer in
     /// the window. `None` when no entry of the session has that id.
     async fn entry_by_mid(
@@ -150,6 +158,16 @@ impl<B: SessionBackend> Writer for Session<'_, B> {
         now_ms: u64,
     ) -> Result<(), SessionError> {
         Session::seal_at_entry(self, ordinal, carry, now_ms)
+            .await
+            .map(|_| ())
+    }
+
+    async fn seal_ledger(
+        &mut self,
+        carry: &broca_session_store::session::Carry<'_>,
+        now_ms: u64,
+    ) -> Result<(), SessionError> {
+        Session::seal_carrying(self, None, carry, now_ms)
             .await
             .map(|_| ())
     }
