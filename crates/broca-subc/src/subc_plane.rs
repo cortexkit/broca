@@ -287,8 +287,8 @@ fn scope_key(scope: Option<&SessionScope>) -> ScopeKey {
     })
 }
 
-/// A subc route is scoped by session identity, the scope it was opened under, and target
-/// module. The scope is part of the key so a route opened under one scope, or none, is never
+/// A subc route is scoped by session identity, target module, scope and full wire shape.
+/// The scope is part of the key so a route opened under one scope, or none, is never
 /// reused for a run admitted under another. The durability fence deliberately stays keyed only
 /// by `(session, tool_call_id)` so a caller re-driving the same batch cannot duplicate a tool
 /// call through another module route.
@@ -297,6 +297,27 @@ struct RouteKey {
     session: SessionKey,
     scope: ScopeKey,
     module_id: String,
+    shape: RouteShape,
+    held_reply_v1: bool,
+}
+
+impl RouteKey {
+    fn with_handle(mut self, handle: RouteHandle) -> Self {
+        self.shape = RouteShape {
+            tool_result_v1: handle.reads_tool_result,
+            call_keepalive: handle.call_keepalive,
+            tool_provider_v1: handle.tool_provider_v1,
+            session_identity: handle.session_identity,
+        };
+        self.held_reply_v1 = handle.reads_held_reply;
+        self
+    }
+
+    fn same_target(&self, other: &Self) -> bool {
+        self.session == other.session
+            && self.scope == other.scope
+            && self.module_id == other.module_id
+    }
 }
 
 /// What one run has learned that holds for the rest of its calls.
@@ -783,12 +804,11 @@ pub struct FrozenContract {
     pub content_v1: bool,
     pub tool_result_v1: bool,
     pub late_results: bool,
-    /// The plan fetch answered this provider's catalog, over a route declaring
-    /// `tool-provider: v1`, so its dispatch route declares the same role.
+    /// The plan fetch answered this provider's catalog. The daemon manifest independently
+    /// decides whether the route declares `tool-provider: v1`, including unplanned sessions.
     pub fetched: bool,
-    /// The provider is the session's compaction provider, so its tool route binds the
-    /// session's own identity.
-    pub compaction_provider: bool,
+    /// A compaction or hook route at this provider already binds the session's own identity.
+    pub session_identity: bool,
 }
 
 impl FrozenContract {
@@ -798,7 +818,7 @@ impl FrozenContract {
             tool_result_v1: self.tool_result_v1,
             call_keepalive: self.call_keepalive,
             tool_provider_v1: self.fetched,
-            session_identity: self.compaction_provider,
+            session_identity: self.session_identity,
         }
     }
 }
@@ -837,7 +857,7 @@ impl SubcToolPlane {
         let declarations = manifest.provider_declarations(module);
         FrozenContract {
             fetched: manifest.provider_fetched(module),
-            compaction_provider: manifest.is_compaction_provider(module),
+            session_identity: manifest.uses_session_identity(module),
             call_keepalive: declarations
                 .and_then(|declarations| declarations.call_keepalive)
                 .unwrap_or(false),
@@ -1081,7 +1101,13 @@ impl SubcToolPlane {
         module_id: &str,
     ) -> Option<bool> {
         let key = Self::route_key(bind, scope, module_id);
-        let handle = self.routes.lock().unwrap().get(&key)?.handle;
+        let routes = self.routes.lock().unwrap();
+        let handle = routes
+            .iter()
+            .filter(|(candidate, _)| candidate.same_target(&key))
+            .max_by_key(|(_, route)| route.last_used)?
+            .1
+            .handle;
         Some(self.conn.route_is_open(&handle))
     }
 
@@ -1407,6 +1433,8 @@ impl SubcToolPlane {
             session: Self::session_key(bind),
             scope: scope_key(scope),
             module_id: module_id.to_string(),
+            shape: RouteShape::default(),
+            held_reply_v1: false,
         }
     }
 
@@ -1454,7 +1482,7 @@ impl SubcToolPlane {
     /// Forget `handle`, `ctx`'s route to `module_id`, if it is still the cached one. The daemon
     /// has closed it (or is draining it), so no GOODBYE is sent.
     fn forget_route(&self, ctx: &BatchCtx, module_id: &str, handle: RouteHandle) {
-        let key = Self::route_key(&ctx.bind, ctx.scope.as_ref(), module_id);
+        let key = Self::route_key(&ctx.bind, ctx.scope.as_ref(), module_id).with_handle(handle);
         let mut routes = self.routes.lock().unwrap();
         if routes.get(&key).is_some_and(|route| route.handle == handle) {
             routes.remove(&key);
@@ -1538,7 +1566,7 @@ impl SubcToolPlane {
         module_id: &str,
         handle: RouteHandle,
     ) -> Option<ScopeStamp> {
-        let key = Self::route_key(bind, scope, module_id);
+        let key = Self::route_key(bind, scope, module_id).with_handle(handle);
         self.routes
             .lock()
             .unwrap()
@@ -1692,6 +1720,15 @@ impl SubcToolPlane {
                 };
                 self.latch_gone(ctx, &code);
                 return drained(&code);
+            }
+            Err(ToolPlaneError::Permanent { code, detail }) => {
+                return self.permanent_refusal_result(
+                    ctx,
+                    call,
+                    &code,
+                    detail.as_ref(),
+                    &fence_key,
+                );
             }
             Err(ToolPlaneError::ModuleUnavailable {
                 module,
@@ -2001,7 +2038,15 @@ impl SubcToolPlane {
                 // it does not authorize a retry after a provider received the call. Only a
                 // route.open refusal, where nothing was sent, is held and retried. A test
                 // (`a_provider_scope_not_synced_refusal_is_recorded_and_never_resent`) pins this.
-                let output = ToolOutput::error(format!("tool/route rejected: {msg}"));
+                let output =
+                    if msg.code() == cortexkit_role_tool_provider::errors::TOOL_ROLE_NOT_DECLARED {
+                        broca_core::tool_plane::permanent_refusal_output(
+                            msg.code(),
+                            msg.provider_detail(),
+                        )
+                    } else {
+                        ToolOutput::error(format!("tool/route rejected: {msg}"))
+                    };
                 let result = ToolResult {
                     tool_call_id: call.tool_call_id.clone(),
                     output,
@@ -2257,7 +2302,11 @@ impl SubcToolPlane {
         if let Some(w) = self.windows.lock().unwrap().get(module_id).copied() {
             return Ok(w);
         }
-        let catalog = self.conn.catalog_list().await.map_err(conn_to_plane)?;
+        let catalog = Arc::new(self.conn.catalog_list().await.map_err(conn_to_plane)?);
+        self.catalog_memo
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| Arc::clone(&catalog));
         let window = catalog
             .iter()
             .find(|e| e.module_id == module_id)
@@ -2586,14 +2635,38 @@ impl SubcToolPlane {
         retry_deadline: Option<Instant>,
         guard: &ToolOpenGuard,
         patience: RouteOpenPatience,
-        shape: RouteShape,
+        mut shape: RouteShape,
     ) -> Result<(RouteHandle, Arc<Semaphore>), RouteEnsureError> {
-        let key = Self::route_key(bind, scope, module_id);
+        let mut key = Self::route_key(bind, scope, module_id);
         if lifecycle.is_cancelled() {
             return Err(RouteEnsureError::Plane(ToolPlaneError::Unavailable(
                 "session closed before route open".into(),
             )));
         }
+        // A cold standalone route needs both concurrency and role metadata. Keep the
+        // manifest read for its window so declaring the role does not add another query.
+        let cold_catalog = self.catalog_memo.lock().unwrap().is_none();
+        let cold_window = !self.windows.lock().unwrap().contains_key(module_id);
+        if cold_catalog && cold_window {
+            self.resolve_window(module_id)
+                .await
+                .map_err(RouteEnsureError::Plane)?;
+        }
+        let catalog = self
+            .catalog_snapshot()
+            .await
+            .map_err(RouteEnsureError::Plane)?;
+        let policy = crate::connection::ToolProviderRoutePolicy::for_provider(
+            &catalog,
+            module_id,
+            shape.session_identity,
+        );
+        shape.tool_provider_v1 = policy.declares_role;
+        key.shape = RouteShape {
+            tool_result_v1: shape.tool_result_v1 || self.held_reply_declared(),
+            ..shape
+        };
+        key.held_reply_v1 = self.held_reply_declared();
         // Deliberately no in-flight placeholder: two concurrent misses on one key both open
         // a route, and `cache_route_state` keeps one and closes the loser.
         //
@@ -2609,26 +2682,15 @@ impl SubcToolPlane {
         // the module is down, whatever route each waiter wants. When the module returns, each
         // waiting call makes one open of its own: a bounded burst, after which this cache keeps
         // one route per key as before.
-        let obsolete = {
+        {
             let mut routes = self.routes.lock().unwrap();
-            if let Some(r) = routes.get_mut(&key) {
-                if r.handle.reads_tool_result
-                    == (shape.tool_result_v1 || self.held_reply_declared())
-                    && r.handle.call_keepalive == shape.call_keepalive
-                    && r.handle.tool_provider_v1 == shape.tool_provider_v1
-                    && r.handle.session_identity == shape.session_identity
-                {
-                    r.last_used = Instant::now();
-                    return Ok((r.handle, Arc::clone(&r.sem)));
-                }
+            if let Some(route) = routes.get_mut(&key) {
+                route.last_used = Instant::now();
+                return Ok((route.handle, Arc::clone(&route.sem)));
             }
-            routes.remove(&key)
-        };
-        // A warm bind may predate plan admission. Rebind before sending if the frozen
-        // catalog now selects a different result format; never infer it from reply shape.
-        if let Some(obsolete) = obsolete {
-            self.close_route_best_effort(obsolete.handle);
         }
+        // A route may be opened before the session has a plan. Keep different role, identity
+        // and reply-format declarations in separate cache entries, even when opens race.
         // Resolve the window from THIS route's provider at open time (per-provider, cached
         // per module_id) — not a single global memo.
         let window = self
@@ -2773,9 +2835,10 @@ impl SubcToolPlane {
     }
 
     fn take_route_if_owned(&self, key: &RouteKey, handle: RouteHandle) -> Option<RouteState> {
+        let key = key.clone().with_handle(handle);
         let mut routes = self.routes.lock().unwrap();
-        if routes.get(key).is_some_and(|route| route.handle == handle) {
-            routes.remove(key)
+        if routes.get(&key).is_some_and(|route| route.handle == handle) {
+            routes.remove(&key)
         } else {
             None
         }
@@ -2809,8 +2872,10 @@ impl SubcToolPlane {
         self.routes
             .lock()
             .unwrap()
-            .get(&key)
-            .map(|r| r.handle.channel)
+            .iter()
+            .filter(|(candidate, _)| candidate.same_target(&key))
+            .max_by_key(|(_, route)| route.last_used)
+            .map(|(_, route)| route.handle.channel)
     }
 
     /// Close all of a session's module routes: send route GOODBYE for each cached channel so
@@ -3064,6 +3129,26 @@ impl SubcToolPlane {
         DispatchResult::Completed(result)
     }
 
+    fn permanent_refusal_result(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        code: &str,
+        detail: Option<&serde_json::Value>,
+        fence_key: &FenceKey,
+    ) -> DispatchResult {
+        let result = ToolResult {
+            tool_call_id: call.tool_call_id.clone(),
+            output: broca_core::tool_plane::permanent_refusal_output(code, detail),
+            is_error: true,
+        };
+        self.fence
+            .lock()
+            .unwrap()
+            .insert(&ctx.batch_id, fence_key.clone(), result.clone());
+        DispatchResult::Completed(result)
+    }
+
     /// The not-sent result for a call whose run was cancelled or stopped before its request
     /// was enqueued. An approved call keeps the reason its records have always carried.
     fn stopped_before_send(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
@@ -3182,6 +3267,15 @@ impl SubcToolPlane {
             Ok(rs) => rs,
             // The run was cancelled or stopped during the open: never sent.
             Err(_) if guard.interrupted() => return self.stopped_before_send(ctx, call),
+            Err(ToolPlaneError::Permanent { code, detail }) => {
+                return self.permanent_refusal_result(
+                    ctx,
+                    call,
+                    &code,
+                    detail.as_ref(),
+                    &fence_key,
+                );
+            }
             Err(ToolPlaneError::ModuleUnavailable {
                 module,
                 code,
@@ -3382,6 +3476,15 @@ impl SubcToolPlane {
             Err(_) if guard.interrupted() => return self.stopped_before_send(ctx, call),
             // A module that stays down for the whole tool-dispatch patience ends the call
             // with the attributed unavailable result, proven never sent, not a reopen error.
+            Err(ToolPlaneError::Permanent { code, detail }) => {
+                return self.permanent_refusal_result(
+                    ctx,
+                    call,
+                    &code,
+                    detail.as_ref(),
+                    &fence_key,
+                );
+            }
             Err(ToolPlaneError::ModuleUnavailable {
                 module,
                 code,
@@ -3459,6 +3562,15 @@ impl SubcToolPlane {
         let (fresh_handle, fresh_sem) = match self.ensure_batch_route(ctx, module_id, guard).await {
             Ok(route) => route,
             Err(_) if guard.interrupted() => return self.stopped_before_send(ctx, call),
+            Err(ToolPlaneError::Permanent { code, detail }) => {
+                return self.permanent_refusal_result(
+                    ctx,
+                    call,
+                    &code,
+                    detail.as_ref(),
+                    &fence_key,
+                );
+            }
             Err(ToolPlaneError::ModuleUnavailable {
                 module,
                 code,
@@ -3872,7 +3984,7 @@ fn cache_route_state(
     sem: Arc<Semaphore>,
     stamp: Option<ScopeStamp>,
 ) -> CachedRoute {
-    match routes.entry(key) {
+    match routes.entry(key.with_handle(handle)) {
         std::collections::hash_map::Entry::Vacant(entry) => {
             entry.insert(RouteState {
                 handle,
@@ -3903,8 +4015,9 @@ fn route_matches(
     handle: RouteHandle,
     sem: &Arc<Semaphore>,
 ) -> bool {
+    let key = key.clone().with_handle(handle);
     routes
-        .get(key)
+        .get(&key)
         .map(|route| route.handle == handle && Arc::ptr_eq(&route.sem, sem))
         .unwrap_or(false)
 }
@@ -4042,7 +4155,17 @@ fn scoped_open_refusal(
 /// loop turns it into a graceful is_error result. A tool EXECUTION error rides
 /// inside a successful CallToolResult (`isError: true`) instead.
 fn conn_to_plane(e: ConnError) -> ToolPlaneError {
-    ToolPlaneError::Unavailable(e.to_string())
+    match e {
+        ConnError::Rejected(refusal)
+            if refusal.code() == cortexkit_role_tool_provider::errors::TOOL_ROLE_NOT_DECLARED =>
+        {
+            ToolPlaneError::Permanent {
+                code: refusal.code().to_owned(),
+                detail: refusal.provider_detail().cloned(),
+            }
+        }
+        e => ToolPlaneError::Unavailable(e.to_string()),
+    }
 }
 
 /// Preserve every tool-dispatch route-open refusal, including terminal codes the protocol
@@ -4051,6 +4174,11 @@ fn conn_to_plane(e: ConnError) -> ToolPlaneError {
 /// Scoped refusals have already taken their separate scope-specific path.
 fn map_tool_open_refusal(error: RouteEnsureError, module_id: &str) -> ToolPlaneError {
     match error {
+        RouteEnsureError::Connection(ConnError::Rejected(message))
+            if message.code() == cortexkit_role_tool_provider::errors::TOOL_ROLE_NOT_DECLARED =>
+        {
+            conn_to_plane(ConnError::Rejected(message))
+        }
         RouteEnsureError::Connection(ConnError::Rejected(message)) => {
             ToolPlaneError::ModuleUnavailable {
                 module: module_id.to_owned(),
@@ -4786,7 +4914,10 @@ mod tests {
     #[tokio::test]
     async fn approved_before_push_stale_handle_reopens_and_resends_once() {
         let conn = ScriptedToolPlaneConnection::new(
-            vec![vec![catalog_entry("aft", &["edit"])]],
+            vec![
+                vec![catalog_entry("aft", &["edit"])],
+                vec![catalog_entry("aft", &["edit"])],
+            ],
             vec![successful_tool_reply("done")],
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
@@ -5030,6 +5161,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
         let bind = BindIdentity::new("/tmp/route-open-retry", "test", "session");
         let lifecycle = CancellationToken::new();
         tokio::time::pause();
@@ -5066,6 +5198,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
         let bind = BindIdentity::new("/tmp/route-open-retry-deadline", "test", "session");
         let lifecycle = CancellationToken::new();
         tokio::time::pause();
@@ -5104,6 +5237,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
         let bind = BindIdentity::new("/tmp/warm-short-timeout", "test", "session");
         let lifecycle = CancellationToken::new();
 
@@ -5135,6 +5269,7 @@ mod tests {
         );
         let plane = Arc::new(SubcToolPlane::with_connection(conn.clone(), "aft"));
         plane.windows.lock().unwrap().insert("aft".into(), 1);
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
         let bind = BindIdentity::new("/tmp/warm-cap", "test", "session");
         let lifecycle = CancellationToken::new();
 
@@ -5187,6 +5322,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
         let bind = BindIdentity::new("/tmp/route-open-terminal", "test", "session");
         let lifecycle = CancellationToken::new();
         let started = Instant::now();
@@ -5220,6 +5356,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
         let bind = BindIdentity::new("/tmp/route-open-unknown", "test", "session");
         let lifecycle = CancellationToken::new();
         let started = Instant::now();
@@ -5250,6 +5387,7 @@ mod tests {
         conn.script_route_open_sequence("aft", vec![RouteOpenScript::transport("socket lost")]);
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
         let bind = BindIdentity::new("/tmp/route-open-transport", "test", "session");
         let lifecycle = CancellationToken::new();
         let started = Instant::now();
@@ -5283,6 +5421,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
         let bind = BindIdentity::new("/tmp/warm-terminal", "test", "session");
         let lifecycle = CancellationToken::new();
         let started = Instant::now();
@@ -5312,6 +5451,7 @@ mod tests {
         conn.script_route_open_sequence("aft", vec![RouteOpenScript::rejected_body(&body)]);
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
         let bind = BindIdentity::new("/tmp/warm-structured-terminal", "test", "session");
         let started = Instant::now();
 
@@ -5345,6 +5485,7 @@ mod tests {
         );
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
         let bind = BindIdentity::new("/tmp/warm-structured-retry", "test", "session");
 
         let result = plane
@@ -5366,6 +5507,7 @@ mod tests {
         conn.script_route_open_sequence("aft", vec![RouteOpenScript::transport("socket lost")]);
         let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
         plane.windows.lock().unwrap().insert("aft".into(), 1);
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
         let bind = BindIdentity::new("/tmp/warm-transport", "test", "session");
         let lifecycle = CancellationToken::new();
         let started = Instant::now();
@@ -5983,6 +6125,8 @@ mod tests {
             session: session_key(project_root, harness, session),
             scope: None,
             module_id: module_id.into(),
+            shape: RouteShape::default(),
+            held_reply_v1: false,
         }
     }
 
@@ -6621,6 +6765,52 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn tool_role_refusals_are_permanent_keep_detail_and_never_resend() {
+        let refusal = cortexkit_role_tool_provider::errors::tool_role_not_declared(None);
+        let conn = ScriptedToolPlaneConnection::new(
+            vec![Vec::new(), Vec::new()],
+            vec![Err(ConnError::Rejected(
+                crate::connection::decode_error_body(&serde_json::to_vec(&refusal).unwrap()),
+            ))],
+        );
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let ctx = batch_ctx("role-refusal");
+        let call = call("read");
+        let manifest = ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]);
+        plane
+            .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let DispatchResult::Completed(result) = plane.dispatch(&ctx, &call).await else {
+                panic!("not terminal")
+            };
+            assert!(result.is_error);
+            assert_eq!(
+                result.output,
+                ToolOutput::Json {
+                    value: serde_json::json!({
+                        "class":"permanent", "code":"tool_role_not_declared",
+                        "detail":{"role":"tool-provider", "declared":null}
+                    })
+                }
+            );
+        }
+        assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
+
+        let error = map_tool_open_refusal(
+            RouteEnsureError::Connection(ConnError::Rejected(
+                crate::connection::decode_error_body(&serde_json::to_vec(&refusal).unwrap()),
+            )),
+            "aft",
+        );
+        assert!(
+            matches!(error, ToolPlaneError::Permanent { ref code, ref detail }
+            if code == "tool_role_not_declared" && *detail == refusal.detail)
+        );
+    }
+
     /// A RESTART LONGER THAN THE DEFAULT 3s STILL RETRIES THROUGH.
     ///
     /// This is the arm the first version of the fix did not have, and why that version was
@@ -7235,6 +7425,149 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&second.sem, &first_sem));
         assert_eq!(routes.get(&key).unwrap().handle, first_handle);
+    }
+
+    #[test]
+    fn route_cache_separates_every_wire_shape_member() {
+        let mut routes = HashMap::new();
+        let key = route_key("/project", "broca", "session", "provider");
+        for member in 0..6 {
+            let mut handle = RouteHandle::synthetic(7 + member);
+            handle.reads_tool_result = member == 1;
+            handle.reads_held_reply = member == 2;
+            handle.call_keepalive = member == 3;
+            handle.tool_provider_v1 = member == 4;
+            handle.session_identity = member == 5;
+            let cached = cache_route_state(
+                &mut routes,
+                key.clone(),
+                handle,
+                Arc::new(Semaphore::new(1)),
+                None,
+            );
+            assert_eq!(cached.handle, handle);
+            assert!(cached.loser_handle.is_none());
+        }
+        assert_eq!(routes.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_non_compaction_hook_providers_tool_and_hook_routes_share_one_identity() {
+        let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+        let conn = Arc::new(conn);
+        let plane = SubcToolPlane::with_connection(conn.clone(), "dual");
+        plane
+            .windows
+            .lock()
+            .unwrap()
+            .extend([("dual".into(), 1), ("only-tools".into(), 1)]);
+        let ctx = batch_ctx("hook-tool-identity");
+        let manifest = broca_wal::PlanManifest {
+            rich_ui: None,
+            declarations: Vec::new(),
+            plan: broca_wal::OpaqueJson::from_json_text(
+                serde_json::json!({
+                    "tool_items":[{"provider":"dual"},{"provider":"only-tools"}],
+                    "step_transform_items":[{"provider":"dual","subscriptions":[]}],
+                    "compaction_item":{"provider":"different-compactor"}
+                })
+                .to_string(),
+            )
+            .unwrap(),
+            plan_identity: String::new(),
+            composition_digest: String::new(),
+            fetches: Vec::new(),
+            tools: Vec::new().into(),
+            system_text: String::new(),
+            system_digest: String::new(),
+            join_version: 1,
+            role_versions: Default::default(),
+        };
+        let manifest = ToolManifest::from_tools(vec![
+            request_tool("dual_tool", Some("dual")),
+            request_tool("plain_tool", Some("only-tools")),
+        ])
+        .with_plan_manifest(&manifest)
+        .unwrap();
+        let open = async {
+            plane
+                .batch_started(&ctx, &[call("dual_tool"), call("plain_tool")], &manifest)
+                .await
+                .unwrap();
+            conn.route_open_role_within(
+                "dual",
+                &ctx.bind,
+                "step-transform-provider",
+                "v2",
+                None,
+                crate::RouteOpenRetry::default_patience(),
+            )
+            .await
+            .unwrap();
+        };
+        let serve = async {
+            let inventory = daemon.next_request().await;
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&inventory.body).unwrap()["op"],
+                "catalog.list"
+            );
+            let modules: Vec<_> = ["dual", "only-tools"]
+                .iter()
+                .map(|module| {
+                    let mut entry = catalog_entry(module, &[]);
+                    entry.capabilities = Some(
+                        serde_json::from_value(
+                            serde_json::json!({"provides":["tool-provider/v1"]}),
+                        )
+                        .unwrap(),
+                    );
+                    entry
+                })
+                .collect();
+            daemon.reply(
+                &inventory,
+                serde_json::to_vec(&subc_control::ClientControlResponse::CatalogList {
+                    generation: 1,
+                    modules,
+                    subc_ops: Vec::new(),
+                })
+                .unwrap(),
+            );
+            let mut identities = HashMap::new();
+            for channel in 7..=9 {
+                let request = daemon.next_request().await;
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let is_hook = body["role_versions"]["step-transform-provider"] == "v2";
+                assert_eq!(body["op"], "route.open", "unexpected request: {body}");
+                let key = if is_hook {
+                    "hook".to_owned()
+                } else {
+                    body["target"]["module_id"]
+                        .as_str()
+                        .expect("tool route target")
+                        .to_owned()
+                };
+                identities.insert(key, body["identity"].clone());
+                daemon.reply(
+                    &request,
+                    serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
+                        route_channel: channel,
+                        route_epoch: 1,
+                    })
+                    .unwrap(),
+                );
+            }
+            assert_eq!(
+                identities["only-tools"],
+                serde_json::json!({"harness":"runner", "session":ctx.bind.session})
+            );
+            assert_eq!(
+                identities["hook"],
+                serde_json::json!({"harness":ctx.bind.harness, "session":ctx.bind.session})
+            );
+            assert_eq!(identities["dual"], identities["hook"]);
+        };
+        tokio::join!(open, serve);
     }
 
     #[test]
@@ -8695,6 +9028,13 @@ mod approval_digest_contract_tests {
 
 #[cfg(test)]
 mod approved_queue_contract_tests {
+    // The queue probes inject already-open, role-less routes. Seed their matching catalog
+    // snapshot too, so only the enqueue boundary can consume the scripted transport.
+    fn cached_plane(conn: SubcConnection) -> SubcToolPlane {
+        let plane = SubcToolPlane::new(conn, "aft");
+        *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new()));
+        plane
+    }
     #[tokio::test]
     async fn ordinary_send_certainty_tracks_the_real_enqueue_boundary() {
         for pre_enqueue in [true, false] {
@@ -8702,7 +9042,7 @@ mod approved_queue_contract_tests {
             if pre_enqueue {
                 module.close_writer_for_test();
             }
-            let plane = SubcToolPlane::new(conn, "aft");
+            let plane = cached_plane(conn);
             let ctx = BatchCtx {
                 media_capture: None,
                 batch_id: BatchId("ordinary".into()),
@@ -8802,7 +9142,7 @@ mod approved_queue_contract_tests {
     #[tokio::test]
     async fn approved_failure_after_real_push_remains_unknown() {
         let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
-        let plane = SubcToolPlane::new(conn, "aft");
+        let plane = cached_plane(conn);
         let ctx = BatchCtx {
             media_capture: None,
             batch_id: broca_protocol::BatchId("after-push".into()),
@@ -8844,7 +9184,7 @@ mod approved_queue_contract_tests {
     async fn approved_closed_writer_queue_is_not_sent() {
         let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
         module.close_writer_for_test();
-        let plane = SubcToolPlane::new(conn, "aft");
+        let plane = cached_plane(conn);
         let ctx = BatchCtx {
             media_capture: None,
             batch_id: broca_protocol::BatchId("closed-queue".into()),
@@ -8882,7 +9222,7 @@ mod approved_queue_contract_tests {
     async fn approved_cancel_and_stop_while_writer_queue_is_full_are_not_sent() {
         for cancel in [true, false] {
             let (conn, route, mut module) = SubcConnection::in_process_full_writer_for_test(5, 3);
-            let plane = SubcToolPlane::new(conn, "aft");
+            let plane = cached_plane(conn);
             let ctx = BatchCtx {
                 media_capture: None,
                 batch_id: broca_protocol::BatchId("queue".into()),
@@ -8947,7 +9287,7 @@ mod approved_queue_contract_tests {
     async fn ordinary_cancel_and_stop_while_writer_queue_is_full_are_not_sent() {
         for cancel in [true, false] {
             let (conn, route, mut module) = SubcConnection::in_process_full_writer_for_test(5, 3);
-            let plane = SubcToolPlane::new(conn, "aft");
+            let plane = cached_plane(conn);
             let ctx = BatchCtx {
                 media_capture: None,
                 batch_id: broca_protocol::BatchId("ordinary-queue".into()),

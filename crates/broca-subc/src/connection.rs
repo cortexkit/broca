@@ -180,6 +180,10 @@ impl RejectedMessage {
         self.code.as_deref().unwrap_or("")
     }
 
+    pub(crate) fn provider_detail(&self) -> Option<&serde_json::Value> {
+        self.detail.as_ref()
+    }
+
     /// The daemon's detail for this refusal: its structured `detail` when it sent one (a
     /// string as given, anything else as compact JSON), otherwise the message after the code.
     pub(crate) fn detail(&self) -> String {
@@ -321,23 +325,61 @@ pub struct RouteHandle {
 
 /// How a route that carries a session's tool calls is opened. A cached route is reused only by
 /// a batch that would open it the same way.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct RouteShape {
     /// Ask for `tool-result/v1` bodies (the provider declared that format in the plan).
     pub(crate) tool_result_v1: bool,
     /// Ask for call keepalives (the provider declared them in the plan).
     pub(crate) call_keepalive: bool,
-    /// Declare `tool-provider: v1`: the session's plan fetch answered this provider's catalog,
-    /// over a route declaring that role. A module may treat a route without the role as
-    /// discovery-only, serving `role.describe` and `tool.catalog` but refusing its tools
-    /// (Magic Context does).
+    /// Declare `tool-provider: v1` when the daemon manifest lists that role.
     pub(crate) tool_provider_v1: bool,
-    /// Bind the session's own harness and session, as the session's compaction route does,
-    /// because this provider is also the session's compaction provider. Other tool modules get
+    /// Bind the session's own harness and session, as its compaction and hook routes do,
+    /// because this provider also serves one of those roles for the session. Other tool modules get
     /// the `runner` harness (see [`TOOL_MODULE_HARNESS`]). Without it, the provider would key
     /// the tool calls to a different session than the one it compacts, and answer notes and
     /// expansions from an empty session.
     pub(crate) session_identity: bool,
+}
+
+/// Role declaration and bind policy shared by all of a session's tool-provider routes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolProviderRoutePolicy {
+    pub(crate) declares_role: bool,
+    pub(crate) session_identity: bool,
+}
+
+impl ToolProviderRoutePolicy {
+    pub(crate) fn for_provider(
+        catalog: &[CatalogEntry],
+        provider: &str,
+        session_identity: bool,
+    ) -> Self {
+        Self {
+            declares_role: catalog.iter().any(|entry| {
+                entry.module_id == provider
+                    && entry.capabilities.as_ref().is_some_and(|caps| {
+                        caps.provides
+                            .iter()
+                            .any(|role| role == cortexkit_role_tool_provider::PROVIDES)
+                    })
+            }),
+            session_identity,
+        }
+    }
+
+    fn bind(self, identity: &BindIdentity) -> SubcBindIdentity {
+        let harness = if self.session_identity {
+            identity.harness.as_str()
+        } else {
+            TOOL_MODULE_HARNESS
+        };
+        SubcBindIdentity::new(harness, identity.session.clone())
+    }
+
+    fn role_versions(self) -> Option<std::collections::BTreeMap<String, String>> {
+        self.declares_role
+            .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())]))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1432,9 +1474,8 @@ impl SubcConnection {
     }
 
     /// ONE `route.open` attempt for the route that carries a session's tool calls to
-    /// `module_id`, opened as `shape` says (see [`RouteShape`]). A session admitted without a plan
-    /// fetch keeps a route without the role and with the `runner` harness, so a provider it never
-    /// fetched sees nothing new.
+    /// `module_id`, opened as `shape` says (see [`RouteShape`]). Result formats remain frozen
+    /// by the plan; declaring the role does not change request or result encodings.
     pub(crate) async fn route_open_dispatch_single_attempt(
         &self,
         module_id: &str,
@@ -1463,43 +1504,53 @@ impl SubcConnection {
                 .get_or_insert_with(Vec::new)
                 .push(cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY.into());
         }
-        let role_versions = tool_provider_v1.then(|| {
-            std::collections::BTreeMap::from([("tool-provider".to_owned(), "v1".to_owned())])
-        });
+        let policy = ToolProviderRoutePolicy {
+            declares_role: tool_provider_v1,
+            session_identity,
+        };
         let target = RouteTarget::ToolProvider {
             module_id: module_id.into(),
         };
-        if !session_identity {
-            return self
-                .route_open_target_with_capabilities(
-                    target,
-                    identity,
-                    scope.cloned(),
-                    role_versions,
-                    capabilities,
-                )
-                .await;
-        }
-        let bind = SubcBindIdentity::new(identity.harness.as_str(), identity.session.clone());
         let mut handle = self
-            .route_open_wire_target(target, bind, scope.cloned(), role_versions, capabilities)
+            .route_open_wire_target(
+                target,
+                policy.bind(identity),
+                scope.cloned(),
+                policy.role_versions(),
+                capabilities,
+            )
             .await?;
-        handle.session_identity = true;
+        handle.session_identity = session_identity;
         Ok(handle)
     }
 
-    /// ONE `route.open` attempt to a tool provider that declares `tool-provider: v1`, asking
-    /// the module to serve its v1 role surface on the route: `tool.catalog` with its system
-    /// text, and its declarations. Only fetch-plan admission opens such routes, and its own
-    /// deadline bounds the retries, so this makes one attempt.
+    /// Open a known v1 provider with the ordinary tool-module identity. Callers with a
+    /// session's compaction-provider context use the shared policy opener instead.
     pub async fn route_open_tool_provider_v1(
         &self,
         module_id: &str,
         identity: &BindIdentity,
         scope: Option<subc_protocol::scope::ScopeSelector>,
     ) -> ConnResult<RouteHandle> {
-        let mut role_versions = std::collections::BTreeMap::new();
-        role_versions.insert("tool-provider".to_owned(), "v1".to_owned());
+        self.route_open_tool_provider_with_policy(
+            module_id,
+            identity,
+            scope,
+            ToolProviderRoutePolicy {
+                declares_role: true,
+                session_identity: false,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn route_open_tool_provider_with_policy(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        scope: Option<subc_protocol::scope::ScopeSelector>,
+        policy: ToolProviderRoutePolicy,
+    ) -> ConnResult<RouteHandle> {
         // One attempt, so it does not wait at the module's gate: while the module is known to
         // be unavailable this answers with the module's latest refusal at once, unless it is
         // this open's turn to probe. Fetch-plan admission retries a refusal with its own
@@ -1517,15 +1568,20 @@ impl SubcConnection {
             GateAdmission::Retired => None,
         };
         let outcome = self
-            .route_open_target(
+            .route_open_wire_target(
                 RouteTarget::ToolProvider {
                     module_id: module_id.to_string(),
                 },
-                identity,
+                policy.bind(identity),
                 scope,
-                Some(role_versions),
+                policy.role_versions(),
+                None,
             )
-            .await;
+            .await
+            .map(|mut handle| {
+                handle.session_identity = policy.session_identity;
+                handle
+            });
         if let Some(ticket) = ticket {
             ticket.report(&outcome);
         }
@@ -1849,9 +1905,7 @@ impl SubcConnection {
             // Scoped tool and management clients first check the daemon advertises `scopes/v1`:
             // an older daemon drops the field and would open an unscoped route instead.
             scope,
-            // Role routes declare their surface. A dispatch route declares `tool-provider: v1`
-            // only for a provider the session's plan fetch answered (see
-            // `route_open_dispatch_single_attempt`).
+            // Tool routes declare the role only when the daemon manifest lists it.
             role_versions,
         };
         let body = serde_json::to_vec(&req).map_err(|e| ConnError::Transport(e.to_string()))?;
@@ -4591,10 +4645,16 @@ fn to_subc_bind(
                         })
                 }) =>
         {
-            identity.harness.as_str()
+            return ToolProviderRoutePolicy {
+                declares_role: false,
+                session_identity: true,
+            }
+            .bind(identity);
         }
         // Tool modules run a closed enum and reject anything else at bind.
-        RouteTarget::ToolProvider { .. } => TOOL_MODULE_HARNESS,
+        RouteTarget::ToolProvider { .. } => {
+            return ToolProviderRoutePolicy::default().bind(identity)
+        }
         // Management and internal surfaces do not constrain the field -- subc-protocol carries
         // a free String -- so the caller's own value travels. Verified with both consumers
         // before scoping: claustrum's RouteBind destructures `{ route_channel, epoch,
@@ -5011,6 +5071,144 @@ mod tests {
         answer_route_open(&pending, &request, 7);
         let route = open.await.unwrap();
         assert!(route.session_identity && route.tool_provider_v1);
+    }
+
+    #[tokio::test]
+    async fn every_session_tool_route_uses_one_provider_identity() {
+        let (conn, mut write_rx, pending) = route_open_test_connection();
+        let mut catalog = Vec::new();
+        for module in ["compactor", "aft"] {
+            let mut entry = CatalogEntry::new(module, Vec::new(), Vec::new());
+            entry.capabilities = Some(
+                serde_json::from_value(serde_json::json!({
+                    "provides": ["tool-provider/v1"]
+                }))
+                .unwrap(),
+            );
+            catalog.push(entry);
+        }
+        for session in ["session-one", "session-two"] {
+            let identity = BindIdentity::new("/project", "broca", session);
+            for provider in ["compactor", "aft"] {
+                let policy = ToolProviderRoutePolicy::for_provider(
+                    &catalog,
+                    provider,
+                    provider == "compactor",
+                );
+                for kind in ["catalog", "dispatch", "withdraw", "user_command.invoke"] {
+                    let open = async {
+                        if matches!(kind, "dispatch" | "user_command.invoke") {
+                            conn.route_open_dispatch_single_attempt(
+                                provider,
+                                &identity,
+                                None,
+                                RouteShape {
+                                    tool_provider_v1: policy.declares_role,
+                                    session_identity: policy.session_identity,
+                                    ..RouteShape::default()
+                                },
+                                false,
+                            )
+                            .await
+                        } else {
+                            conn.route_open_tool_provider_with_policy(
+                                provider, &identity, None, policy,
+                            )
+                            .await
+                        }
+                    };
+                    tokio::pin!(open);
+                    let request = tokio::select! {
+                        result = &mut open => panic!("premature result: {result:?}"),
+                        request = write_rx.recv() => request.unwrap(),
+                    };
+                    let raw: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(
+                        raw["identity"],
+                        serde_json::json!({
+                            "harness": if provider == "compactor" { "broca" } else { "runner" },
+                            "session": session,
+                        }),
+                        "{kind} to {provider}"
+                    );
+                    assert_eq!(
+                        raw["role_versions"],
+                        serde_json::json!({"tool-provider":"v1"})
+                    );
+                    answer_route_open(&pending, &request, 7);
+                    open.await.unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn global_late_results_feed_keeps_its_maintenance_identity_even_at_a_compactor() {
+        let (mut conn, mut write_rx, pending) = route_open_test_connection();
+        Arc::get_mut(&mut conn.shared).unwrap().consumer_identity =
+            Some(subc_control::ConsumerIdentity {
+                module_id: "broca".into(),
+                launch_nonce: "test".into(),
+            });
+        let identity = BindIdentity::new("/state-root", "broca", "late-results");
+        let open = crate::LateResultsFeed::open(Arc::new(conn), "compactor", &identity);
+        tokio::pin!(open);
+        let catalog = tokio::select! {
+            _ = &mut open => panic!("feed opened before discovery"),
+            request = write_rx.recv() => request.unwrap(),
+        };
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&catalog.body).unwrap()["op"],
+            "catalog.list"
+        );
+        let mut entry = CatalogEntry::new("compactor", Vec::new(), Vec::new());
+        entry.capabilities = Some(
+            serde_json::from_value(
+                serde_json::json!({"provides":["tool-provider/v1", "compaction-provider/v2"]}),
+            )
+            .unwrap(),
+        );
+        let sender = match pending.lock().unwrap().get(&(0, 0, catalog.header.corr)) {
+            Some(PendingEntry::Live { sender, .. }) => sender.clone(),
+            _ => panic!("catalog request not pending"),
+        };
+        sender
+            .send(
+                Frame::build(
+                    FrameType::Response,
+                    control_flags(),
+                    0,
+                    0,
+                    catalog.header.corr,
+                    serde_json::to_vec(&ClientControlResponse::CatalogList {
+                        generation: 1,
+                        modules: vec![entry],
+                        subc_ops: Vec::new(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let request = tokio::select! {
+            _ = &mut open => panic!("feed opened before route bind"),
+            request = write_rx.recv() => request.unwrap(),
+        };
+        let raw: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            raw["identity"],
+            serde_json::json!({"harness":"runner", "session":"late-results"})
+        );
+        assert_ne!(
+            raw["identity"],
+            serde_json::json!({"harness":"broca", "session":"conversation"})
+        );
+        assert_eq!(
+            raw["role_versions"],
+            serde_json::json!({"tool-provider":"v1"})
+        );
+        answer_route_open(&pending, &request, 7);
+        assert!(open.await.is_ok());
     }
 
     #[tokio::test]

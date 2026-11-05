@@ -6410,6 +6410,7 @@ mod tests {
             async fn withdraw(
                 &self,
                 _: &broca_core::tool_plane::LateResultRegistration,
+                _: bool,
             ) -> (
                 cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
                 serde_json::Value,

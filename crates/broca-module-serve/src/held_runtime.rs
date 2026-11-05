@@ -132,11 +132,12 @@ impl WithdrawTransport for FeedRoutes {
     async fn withdraw(
         &self,
         call: &broca_core::tool_plane::LateResultRegistration,
+        session_identity: bool,
     ) -> (
         cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
         serde_json::Value,
     ) {
-        broca_subc::late_results::withdraw_held_call(&self.conn, call).await
+        broca_subc::late_results::withdraw_held_call(&self.conn, call, session_identity).await
     }
 }
 

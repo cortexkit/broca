@@ -4657,6 +4657,60 @@ async fn a_scope_refusal_at_batch_start_is_a_no_dispatch_naming_its_code() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[tokio::test]
+async fn a_tool_role_refusal_at_batch_start_keeps_permanent_code_and_detail() {
+    let (store, dir) = tmp_lease_store("tool-role-refused");
+    let provider = StubProvider::new(vec![
+        tool_step(&[("toolu_1", "edit", json!({"path":"a"}))]),
+        text_step("done"),
+    ]);
+    let plane = StubToolPlane::new().with_canned_text("edit", "must not run");
+    plane.fail_next_batch_start(ToolPlaneError::Permanent {
+        code: "tool_role_not_declared".into(),
+        detail: Some(json!({"role":"tool-provider", "declared":null})),
+    });
+    let (summary, records) = drive_wal(
+        req(
+            "tool-role-refused",
+            vec![tool("edit", ExecutionMode::Parallel)],
+            vec![],
+        ),
+        provider,
+        &plane,
+        &store,
+        &AllowAll,
+    )
+    .await;
+    assert_eq!(summary.expect("run ok").reason, RunFinishReason::Completed);
+    assert_eq!(plane.exec_count(&ToolCallId("toolu_1".into())), 0);
+    assert!(!records
+        .iter()
+        .any(|record| matches!(record, WalRecord::ToolDispatchIntent { .. })));
+    let results = tool_results_in(&records);
+    assert_eq!(results.len(), 1);
+    let (_, outcome, is_error, reason, _) = &results[0];
+    assert_eq!(*outcome, DispatchOutcome::Completed);
+    assert!(is_error);
+    assert_eq!(reason.as_deref(), Some("tool_role_not_declared"));
+    let output = records
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::ToolResult { result, .. } => Some(&result.output),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        output,
+        &ToolOutput::Json {
+            value: json!({
+                "class":"permanent", "code":"tool_role_not_declared",
+                "detail":{"role":"tool-provider", "declared":null}
+            })
+        }
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A module down past the tool-dispatch patience fails the batch with the stable message
 /// plus the attribution: the result's message stays exactly "tool plane unavailable"
 /// (callers match on it), while the module, the daemon's code and its detail ride in

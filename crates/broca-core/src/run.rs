@@ -10978,6 +10978,10 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     // are planned: `None` dispatches them; otherwise each gets a durable terminal record and is
     // never sent to the tool plane.
     enum BatchRefusal {
+        Permanent {
+            code: String,
+            detail: Option<serde_json::Value>,
+        },
         /// The tool plane is unavailable or refused the route: each call gets a durable
         /// `tool_no_dispatch`. `detail` is the stable matchable message; a refusal the
         /// plane attributed to a module outage additionally names the module, the daemon's
@@ -11009,6 +11013,9 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
             .await
         {
             Ok(()) => None,
+            Err(ToolPlaneError::Permanent { code, detail }) => {
+                Some(BatchRefusal::Permanent { code, detail })
+            }
             // An ordinary tool-plane failure keeps the exact detail text it always had: sessions
             // already on disk hold it as their durable no-dispatch reason.
             Err(ToolPlaneError::Unavailable(_)) => Some(BatchRefusal::Unavailable {
@@ -11104,6 +11111,17 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         }
         match &batch_refusal {
             None => {}
+            Some(BatchRefusal::Permanent { code, detail }) => {
+                plan.push(CallPlan::Synthetic {
+                    result: Arc::new(ToolResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        output: crate::tool_plane::permanent_refusal_output(code, detail.as_ref()),
+                        is_error: true,
+                    }),
+                    reason: Some(code.clone()),
+                });
+                continue;
+            }
             Some(BatchRefusal::Unavailable {
                 detail,
                 module,
@@ -17455,12 +17473,25 @@ mod approval_gate {
             .await
         {
             Ok(()) => None,
+            Err(ToolPlaneError::Permanent { code, detail }) => {
+                let mut resolution = CallResolution::plain(
+                    ToolResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        output: crate::tool_plane::permanent_refusal_output(&code, detail.as_ref()),
+                        is_error: true,
+                    },
+                    Some(DispatchOutcome::Completed),
+                );
+                resolution.reason = Some(code);
+                Some(resolution)
+            }
             Err(error) => {
                 let reason = match error {
                     ToolPlaneError::ScopeDrained { reason } => reason,
                     ToolPlaneError::ScopeRefused { code, .. } => code,
                     ToolPlaneError::Unavailable(reason) => reason,
                     ToolPlaneError::ModuleUnavailable { module, .. } => module,
+                    ToolPlaneError::Permanent { .. } => unreachable!("handled above"),
                 };
                 let mut result = CallResolution::plain(
                     route_drained_result(&call.tool_call_id, &reason),

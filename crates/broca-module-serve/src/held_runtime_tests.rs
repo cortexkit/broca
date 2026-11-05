@@ -63,6 +63,7 @@ impl WithdrawTransport for NoWithdraw {
     async fn withdraw(
         &self,
         _: &LateResultRegistration,
+        _: bool,
     ) -> (
         cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
         serde_json::Value,
