@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use broca_core::capability::ApprovalPolicy;
 use broca_core::capability::ToolManifest;
 use broca_core::delivery_order::{appended_text, choose_mode, Boundary};
 use broca_core::provider::{Provider, StepRuntime};
@@ -22,6 +23,7 @@ use broca_core::tool_plane::{
     BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ProviderHeldLifecycle,
     ProviderHeldRecorder, ProviderHeldReply, ToolOpenGuard, ToolPlane,
 };
+use broca_protocol::approval::ApprovalResponse;
 use broca_protocol::caller::{PauseReason, RunFinishReason};
 use broca_protocol::content::{
     stamp_ordinals_from, AssistantMessage, Message, Role, ToolCall, ToolOutput, ToolResult,
@@ -107,6 +109,8 @@ pub struct Seams<'a, P, T> {
     /// The late-result runtime's waiting slots for calls a provider holds. Without it a held
     /// call is never answered, as in today's loop, and its run pauses.
     pub held: Option<&'a dyn ProviderHeldLifecycle>,
+    /// Decides each valid call before it is sent: allow it, narrow its input, or deny it.
+    pub approval: &'a dyn ApprovalPolicy,
     /// Milliseconds since the epoch, for the times records carry.
     pub now_ms: &'a (dyn Fn() -> u64 + Sync),
     /// The session's address, given to the provider for its diagnostics only.
@@ -350,6 +354,7 @@ fn known_calls<W: Writer>(writer: &W) -> Vec<Known> {
         .map(|position| Known {
             id: batch.id(position).clone(),
             key: batch.key(position).map(str::to_owned),
+            args: batch.args(position).cloned(),
             held: batch.held_reply(position).map(|held| ProviderHeldReply {
                 tool_call_id: held.tool_call_id.clone(),
                 call_key: held.call_key.clone(),
@@ -1074,6 +1079,9 @@ pub(crate) struct Known {
     pub id: ToolCallId,
     pub key: Option<String>,
     pub held: Option<ProviderHeldReply>,
+    /// The input its intent recorded, when an approval policy narrowed it; sent instead of the
+    /// model's.
+    pub args: Option<serde_json::Value>,
 }
 
 /// How a tool batch ended.
@@ -1133,7 +1141,23 @@ where
             .is_some_and(|tool| tool.execution_mode == ExecutionMode::Sequential)
     });
     let known_of = |call: &ToolCall| known.iter().find(|known| known.id == call.tool_call_id);
-    let plans = plan_calls(calls, known, refusal.as_ref(), manifest);
+    // The policy may narrow a call's input, so the batch works from its own copy of the calls. A
+    // call a resume already knows goes out with the input its intent recorded.
+    let mut calls = calls.to_vec();
+    for call in &mut calls {
+        if let Some(args) = known_of(call).and_then(|known| known.args.clone()) {
+            call.input = args.into();
+        }
+    }
+    let plans = plan_calls(
+        &mut calls,
+        known,
+        refusal.as_ref(),
+        manifest,
+        seams.approval,
+    )
+    .await;
+    let calls = &calls[..];
     let session = writer.session_id();
     let now = (seams.now_ms)();
     let mut prepared = Vec::with_capacity(calls.len());
@@ -1376,90 +1400,110 @@ enum CallPlan {
 
 /// Decides each call's plan in the message's order, as today's gate does: a call a resume
 /// already knows is sent; a repeated call id gets an error; a refused batch refuses every call;
-/// a call the run's manifest doesn't allow is never sent.
-fn plan_calls(
-    calls: &[ToolCall],
+/// a call the run's manifest doesn't allow is never sent; the approval policy then allows a
+/// call, narrows its input (in `calls`, so the intent records what is sent), or denies it.
+async fn plan_calls(
+    calls: &mut [ToolCall],
     known: &[Known],
     refusal: Option<&broca_core::tool_plane::ToolPlaneError>,
     manifest: &ToolManifest,
+    approval: &dyn ApprovalPolicy,
 ) -> Vec<CallPlan> {
-    use broca_core::tool_plane::ToolPlaneError;
     let mut seen = std::collections::HashSet::new();
-    calls
-        .iter()
-        .map(|call| {
-            let first = seen.insert(call.tool_call_id.clone());
-            if known.iter().any(|known| known.id == call.tool_call_id) {
-                return CallPlan::Dispatch;
-            }
-            if !first {
-                return CallPlan::Synthetic {
-                    result: error_result(
-                        &call.tool_call_id,
-                        "duplicate tool_call_id from provider",
-                    ),
-                    reason: None,
-                };
-            }
-            match refusal {
-                None => {}
-                Some(ToolPlaneError::Permanent { code, detail }) => {
-                    return CallPlan::Synthetic {
-                        result: ToolResult {
-                            tool_call_id: call.tool_call_id.clone(),
-                            output: broca_core::tool_plane::permanent_refusal_output(
-                                code,
-                                detail.as_ref(),
-                            ),
-                            is_error: true,
-                        },
-                        reason: Some(code.clone()),
-                    };
+    let mut plans = Vec::with_capacity(calls.len());
+    for call in calls.iter_mut() {
+        let first = seen.insert(call.tool_call_id.clone());
+        let plan = match gate_call(call, first, known, refusal, manifest) {
+            Some(plan) => plan,
+            None => match approval.decide(call).await {
+                ApprovalResponse::Allow { .. } => CallPlan::Dispatch,
+                ApprovalResponse::AllowNarrowed { input, .. } => {
+                    call.input = input.into();
+                    CallPlan::Dispatch
                 }
-                Some(ToolPlaneError::Unavailable(_)) => {
-                    // The stable message, which sessions already on disk hold as their reason.
-                    return CallPlan::NoDispatch(NoDispatchReason::Unavailable {
-                        detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
-                        module: None,
-                        code: None,
-                        refusal_detail: None,
-                    });
+                ApprovalResponse::Deny { reason, .. } => {
+                    CallPlan::NoDispatch(NoDispatchReason::Denied { reason })
                 }
-                Some(ToolPlaneError::ModuleUnavailable {
-                    module,
-                    code,
-                    detail,
-                }) => {
-                    return CallPlan::NoDispatch(NoDispatchReason::Unavailable {
-                        detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
-                        module: Some(module.clone()),
-                        code: Some(code.clone()),
-                        refusal_detail: (!detail.is_empty()).then(|| detail.clone()),
-                    });
-                }
-                Some(error @ ToolPlaneError::ScopeRefused { .. }) => {
-                    return CallPlan::NoDispatch(NoDispatchReason::Unavailable {
-                        detail: error.to_string(),
-                        module: None,
-                        code: None,
-                        refusal_detail: None,
-                    });
-                }
-                Some(ToolPlaneError::ScopeDrained { reason }) => {
-                    return CallPlan::Synthetic {
-                        result: broca_core::run::route_drained_result(&call.tool_call_id, reason),
-                        reason: Some(reason.clone()),
-                    };
-                }
-            }
-            if let Err(invalid) = manifest.validate_call(call) {
-                return CallPlan::NoDispatch(NoDispatchReason::ValidationFailed {
-                    detail: invalid.to_string(),
-                });
-            }
-            CallPlan::Dispatch
-        })
-        .collect()
+            },
+        };
+        plans.push(plan);
+    }
+    plans
+}
+
+/// The checks that come before the approval policy. `None` means the call reaches the policy. A
+/// call a resume already knows is sent as it was, without asking the policy again.
+fn gate_call(
+    call: &ToolCall,
+    first: bool,
+    known: &[Known],
+    refusal: Option<&broca_core::tool_plane::ToolPlaneError>,
+    manifest: &ToolManifest,
+) -> Option<CallPlan> {
+    use broca_core::tool_plane::ToolPlaneError;
+    if known.iter().any(|known| known.id == call.tool_call_id) {
+        return Some(CallPlan::Dispatch);
+    }
+    if !first {
+        return Some(CallPlan::Synthetic {
+            result: error_result(&call.tool_call_id, "duplicate tool_call_id from provider"),
+            reason: None,
+        });
+    }
+    match refusal {
+        None => {}
+        Some(ToolPlaneError::Permanent { code, detail }) => {
+            return Some(CallPlan::Synthetic {
+                result: ToolResult {
+                    tool_call_id: call.tool_call_id.clone(),
+                    output: broca_core::tool_plane::permanent_refusal_output(code, detail.as_ref()),
+                    is_error: true,
+                },
+                reason: Some(code.clone()),
+            });
+        }
+        Some(ToolPlaneError::Unavailable(_)) => {
+            // The stable message, which sessions already on disk hold as their reason.
+            return Some(CallPlan::NoDispatch(NoDispatchReason::Unavailable {
+                detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                module: None,
+                code: None,
+                refusal_detail: None,
+            }));
+        }
+        Some(ToolPlaneError::ModuleUnavailable {
+            module,
+            code,
+            detail,
+        }) => {
+            return Some(CallPlan::NoDispatch(NoDispatchReason::Unavailable {
+                detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                module: Some(module.clone()),
+                code: Some(code.clone()),
+                refusal_detail: (!detail.is_empty()).then(|| detail.clone()),
+            }));
+        }
+        Some(error @ ToolPlaneError::ScopeRefused { .. }) => {
+            return Some(CallPlan::NoDispatch(NoDispatchReason::Unavailable {
+                detail: error.to_string(),
+                module: None,
+                code: None,
+                refusal_detail: None,
+            }));
+        }
+        Some(ToolPlaneError::ScopeDrained { reason }) => {
+            return Some(CallPlan::Synthetic {
+                result: broca_core::run::route_drained_result(&call.tool_call_id, reason),
+                reason: Some(reason.clone()),
+            });
+        }
+    }
+    if let Err(invalid) = manifest.validate_call(call) {
+        return Some(CallPlan::NoDispatch(NoDispatchReason::ValidationFailed {
+            detail: invalid.to_string(),
+        }));
+    }
+    None
 }
 
 /// A call that was never sent: today's no-dispatch result in the transcript and its reason in

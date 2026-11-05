@@ -20,9 +20,9 @@ use broca_core::tool_plane::{
     ProviderHeldReply, ToolOpenGuard, ToolPlane, ToolPlaneError,
 };
 use broca_core::{
-    provider::Provider, run_loop, run_loop_on_writer, run_loop_with_control, AllowAll,
-    FileLeaseStore, FileWalStore, RunControl, RunRequest, StartMode, SteerInbox, StubReply,
-    StubToolPlane, WalHandle, WalStore,
+    provider::Provider, run_loop, run_loop_on_writer, run_loop_with_control, FileLeaseStore,
+    FileWalStore, RunControl, RunRequest, StartMode, SteerInbox, StubReply, StubToolPlane,
+    WalHandle, WalStore,
 };
 use broca_crash_harness::wal::LogImage;
 use broca_protocol::caller::PauseReason;
@@ -351,7 +351,7 @@ impl ToolPlane for Spy {
     }
 
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
-        self.note(format!("dispatch {}", call.tool_call_id.0));
+        self.note(format!("dispatch {} {}", call.tool_call_id.0, call.input));
         self.inner.dispatch(ctx, call).await
     }
 
@@ -363,8 +363,9 @@ impl ToolPlane for Spy {
     ) -> DispatchResult {
         let token = self.key(&call.tool_call_id, key.call_key);
         self.note(format!(
-            "dispatch_keyed {} {token} recorder={}",
+            "dispatch_keyed {} {} {token} recorder={}",
             call.tool_call_id.0,
+            call.input,
             key.held_recorder.is_some()
         ));
         self.inner.dispatch_keyed(ctx, call, key).await
@@ -385,8 +386,9 @@ impl ToolPlane for Spy {
             )
         });
         self.note(format!(
-            "dispatch_guarded {} {}",
+            "dispatch_guarded {} {} {}",
             call.tool_call_id.0,
+            call.input,
             keyed.as_deref().unwrap_or("unkeyed")
         ));
         if let (
@@ -582,7 +584,7 @@ async fn today_from(
         &provider,
         &plane,
         &lease,
-        &AllowAll,
+        &HarnessPolicy,
         &wal,
         None,
         RunControl {
@@ -761,6 +763,7 @@ async fn new_from(
         cancel: Default::default(),
         stop: Default::default(),
         held: Some(&*lifecycle),
+        approval: &HarnessPolicy,
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -1285,12 +1288,27 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let request = scenario.request_for(run_id, input);
         if index == 0 {
-            run_loop(request, &provider, &plane, &lease, &AllowAll, &wal, &tx)
-                .await
-                .expect("today's first run");
+            run_loop(
+                request,
+                &provider,
+                &plane,
+                &lease,
+                &HarnessPolicy,
+                &wal,
+                &tx,
+            )
+            .await
+            .expect("today's first run");
         } else {
             broca_core::run_loop_append_episode(
-                request, &provider, &plane, &lease, &AllowAll, &wal, None, &tx,
+                request,
+                &provider,
+                &plane,
+                &lease,
+                &HarnessPolicy,
+                &wal,
+                None,
+                &tx,
             )
             .await
             .expect("today's later run");
@@ -1354,6 +1372,7 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         cancel: Default::default(),
         stop: Default::default(),
         held: None,
+        approval: &HarnessPolicy,
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -1729,7 +1748,7 @@ async fn compare_actions(
         StartMode::FreshOrResume,
         &provider,
         &plane,
-        &AllowAll,
+        &HarnessPolicy,
         &wal,
         None,
         control,
@@ -1750,7 +1769,7 @@ async fn compare_actions(
             StartMode::FreshOrResume,
             &provider,
             &plane,
-            &AllowAll,
+            &HarnessPolicy,
             &wal,
             None,
             RunControl {
@@ -1840,6 +1859,7 @@ async fn compare_actions(
         cancel: Default::default(),
         stop: stop.clone(),
         held: None,
+        approval: &HarnessPolicy,
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -2075,7 +2095,7 @@ async fn compare_auth_pause(scenario: Scenario) {
             mode,
             &provider,
             &plane,
-            &AllowAll,
+            &HarnessPolicy,
             &wal,
             None,
             RunControl::default(),
@@ -2144,6 +2164,7 @@ async fn compare_auth_pause(scenario: Scenario) {
         cancel: Default::default(),
         stop: Default::default(),
         held: None,
+        approval: &HarnessPolicy,
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -2673,6 +2694,131 @@ async fn a_batch_the_tool_plane_refuses() {
                 vec![
                     call("c1", "read", json!({"path": "a"})),
                     call("c2", "down", json!({})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    })
+    .await;
+}
+
+/// The approval policy both loops run under, keyed by tool name so a scenario picks it by the
+/// tool it calls: `forbidden` is denied, `narrow` has its input narrowed to `{"path":"narrowed"}`,
+/// and every other call is allowed.
+struct HarnessPolicy;
+
+#[async_trait::async_trait]
+impl broca_core::capability::ApprovalPolicy for HarnessPolicy {
+    async fn decide(&self, call: &ToolCall) -> broca_protocol::approval::ApprovalResponse {
+        use broca_protocol::approval::ApprovalResponse;
+        let tool_call_id = call.tool_call_id.clone();
+        match call.tool_name.as_str() {
+            "forbidden" => ApprovalResponse::Deny {
+                tool_call_id,
+                reason: "denied by the harness policy".into(),
+            },
+            "narrow" => ApprovalResponse::AllowNarrowed {
+                tool_call_id,
+                input: json!({"path": "narrowed"}),
+            },
+            _ => ApprovalResponse::Allow { tool_call_id },
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_approval_policy_denies_and_narrows() {
+    compare(Scenario {
+        input: vec![user("read a")],
+        tools: vec![
+            tool("read", ExecutionMode::Parallel),
+            tool("forbidden", ExecutionMode::Parallel),
+            tool("narrow", ExecutionMode::Parallel),
+        ],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c2", "forbidden", json!({"path": "a"})),
+                    call("c3", "narrow", json!({"path": "everything"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_narrowed_call_resumes_alike() {
+    compare_every_cut(Scenario {
+        input: vec![user("read a")],
+        tools: vec![
+            tool("narrow", ExecutionMode::Sequential),
+            tool("forbidden", ExecutionMode::Sequential),
+        ],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "narrow", json!({"path": "everything"})),
+                    call("c2", "forbidden", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_narrowed_call_queued_behind_a_held_call_goes_out_narrowed() {
+    compare_steered(
+        Scenario {
+            input: vec![user("run in order")],
+            tools: vec![
+                tool("hold", ExecutionMode::Sequential),
+                tool("narrow", ExecutionMode::Sequential),
+            ],
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![
+                        call("c1", "hold", json!({"job": 1})),
+                        call("c2", "narrow", json!({"path": "everything"})),
+                    ],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        },
+        Vec::new(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_narrowed_call_behind_a_held_call_resumes_alike() {
+    compare_every_cut(Scenario {
+        input: vec![user("run in order")],
+        tools: vec![
+            tool("hold_brief", ExecutionMode::Sequential),
+            tool("narrow", ExecutionMode::Sequential),
+        ],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "hold_brief", json!({"job": 1})),
+                    call("c2", "narrow", json!({"path": "everything"})),
                 ],
                 FinishReason::ToolCalls,
             ),

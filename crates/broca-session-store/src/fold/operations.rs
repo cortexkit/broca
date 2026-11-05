@@ -60,6 +60,9 @@ crate::message! {
         5 opt key: String,
         /// The provider's held reply, which a resume rejoins the call's wait with.
         6 opt held_reply: crate::record::ToolHeld,
+        /// The input its intent recorded when it differs from the model's message (an approval
+        /// policy narrowed it); a resume that sends the call again sends this.
+        7 opt args: serde_json::Value,
     }
 }
 
@@ -121,6 +124,12 @@ impl OpenBatch {
     /// The key the intent of the planned call at `position` recorded, if it has one.
     pub fn key(&self, position: usize) -> Option<&str> {
         self.calls[position].key.as_deref()
+    }
+
+    /// The input the intent of the planned call at `position` recorded, when it differs from the
+    /// model's message.
+    pub fn args(&self, position: usize) -> Option<&serde_json::Value> {
+        self.calls[position].args.as_ref()
     }
 
     /// The provider's held reply for the planned call at `position`, if a provider holds it.
@@ -807,6 +816,7 @@ impl Operations {
                             held: None,
                             key: None,
                             held_reply: None,
+                            args: None,
                             terminal: None,
                         })
                         .collect(),
@@ -821,6 +831,7 @@ impl Operations {
                     {
                         call.intent = true;
                         call.key = intent.call_key.clone();
+                        call.args = intent.args.clone();
                     }
                 }
             }
