@@ -703,7 +703,8 @@ with (pathlib.Path(os.environ['FIXTURE'])/'lint-calls').open('a') as output:
         logs.chmod(0o775)
         checkout = logs / 'checkouts/worker'
         (checkout / 'scripts/lib').mkdir(parents=True)
-        for name in ('scripts/prepush.sh', 'scripts/lib/prepush-lane.sh', 'scripts/lib/prepush-report.sh'):
+        for name in ('scripts/prepush.sh', 'scripts/lib/prepush-lane.sh', 'scripts/lib/prepush-report.sh',
+                     'scripts/lib/exit-guard.sh'):
             shutil.copy(ROOT / name, checkout / name)
         home = self.root / 'home'
         home.mkdir(mode=0o700)

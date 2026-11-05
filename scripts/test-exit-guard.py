@@ -100,6 +100,34 @@ class ExitGuardStructureTests(unittest.TestCase):
         ))
 
 
+class WorkflowSourcedGateTests(unittest.TestCase):
+    """A CI step that sources the gate inherits its guarded exit trap, so the step must mark
+    itself done when it ends, or clear the trap; otherwise a green step exits 1."""
+
+    def test_steps_sourcing_the_gate_mark_completion(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        blocks = re.findall(r"run: \|\n((?:[ ]{10}.*\n|\n)+)", workflow)
+        sourcing = [block for block in blocks if "source scripts/rust-test-gate.sh" in block]
+        self.assertGreaterEqual(len(sourcing), 2, "steps sourcing the gate disappeared from the scan")
+        for block in sourcing:
+            with self.subTest(step=block.strip().splitlines()[0]):
+                lines = [line.strip() for line in block.splitlines() if line.strip()]
+                self.assertTrue(
+                    lines[-1] == "BROCA_EXIT_GUARD_FINISHED=1" or "trap - EXIT" in lines,
+                    "a step that sources scripts/rust-test-gate.sh must end with "
+                    "BROCA_EXIT_GUARD_FINISHED=1 or clear the trap",
+                )
+
+    def test_a_sourced_gate_fails_an_unmarked_step_and_passes_a_marked_one(self):
+        for marker, expected in (("", 1), ("BROCA_EXIT_GUARD_FINISHED=1", 0)):
+            with self.subTest(marker=marker or "unmarked"):
+                result = subprocess.run(
+                    [BASH, "-c", f"source scripts/rust-test-gate.sh\nrun_phase probe true\n{marker}"],
+                    cwd=ROOT, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+
 class ExitGuardBehaviorTests(unittest.TestCase):
     def run_script(self, body, cleanup="printf 'cleaned\\n'"):
         scratch_root = ROOT / "target/scratch"

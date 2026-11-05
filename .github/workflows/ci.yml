@@ -79,6 +79,8 @@ jobs:
           source scripts/rust-test-gate.sh
           run_phase fmt cargo fmt --all -- --check
           run_phase clippy cargo clippy --locked --workspace --all-targets "${cargo_feature_args[@]}" -- -D warnings
+          # The sourced gate's exit trap fails a step that ends without marking itself done.
+          BROCA_EXIT_GUARD_FINISHED=1
       - name: Verify clean worktree
         run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
 
@@ -487,6 +489,8 @@ jobs:
           if [[ "$doc_count" -gt 0 ]]; then
             run_phase 'doctests' cargo test --locked --workspace --doc "${cargo_feature_args[@]}" --quiet
           fi
+          # The sourced gate's exit trap fails a step that ends without marking itself done.
+          BROCA_EXIT_GUARD_FINISHED=1
 
 
       - name: Upload process cleanup diagnostics
