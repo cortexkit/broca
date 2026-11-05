@@ -15,6 +15,7 @@
 //! - `frame`: how one record sits in an open log, encrypted.
 //! - `fold`: rebuilding a session's state from its records, one fold per stream.
 //! - `log`: the open log, written in all-or-nothing batches and read with its end classified.
+//! - `damage`: reading a damaged log: every frame that still authenticates, and what may be lost.
 //! - `checkpoint`: the state a log's records fold onto, carried in its first batch.
 //! - `keys`: session data keys, wrapped under the deployment key.
 //! - `head`: the session head, the one small mutable object that names everything else.
@@ -31,6 +32,7 @@ pub mod backend;
 pub mod checkpoint;
 pub mod codec;
 pub mod content;
+pub mod damage;
 pub mod directory;
 pub mod fold;
 pub mod frame;

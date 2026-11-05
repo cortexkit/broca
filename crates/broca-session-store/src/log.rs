@@ -98,6 +98,14 @@ pub struct ChainBase {
 }
 
 impl ChainBase {
+    /// The last record of `stream` this base names.
+    pub fn get(&self, stream: Stream) -> Option<u64> {
+        match stream {
+            Stream::Transcript => self.transcript,
+            Stream::Ledger => self.ledger,
+        }
+    }
+
     fn slot(&mut self, stream: Stream) -> &mut Option<u64> {
         match stream {
             Stream::Transcript => &mut self.transcript,
