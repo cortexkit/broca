@@ -1,5 +1,5 @@
 use super::conversation::Conversation;
-use super::operations::{Budget, OpenBatch, Operations, Run};
+use super::operations::{Budget, OpenBatch, Operations, Run, SetupInForce};
 use super::{Bound, FieldSpec};
 
 /// Every fold state, by name.
@@ -9,11 +9,15 @@ const STATES: &[(&str, &[FieldSpec])] = &[
     ("Run", Run::SCHEMA),
     ("Budget", Budget::SCHEMA),
     ("OpenBatch", OpenBatch::SCHEMA),
+    ("SetupInForce", SetupInForce::SCHEMA),
 ];
 
 /// Each field bounded as `Declared`, with the state struct whose own fields carry the bounds.
-const DECLARED: &[(&str, &str, &str)] =
-    &[("Operations", "run", "Run"), ("Run", "budget", "Budget")];
+const DECLARED: &[(&str, &str, &str)] = &[
+    ("Operations", "run", "Run"),
+    ("Operations", "setup", "SetupInForce"),
+    ("Run", "budget", "Budget"),
+];
 
 #[test]
 fn every_state_field_is_declared_once_with_an_owner_and_a_reset_rule() {

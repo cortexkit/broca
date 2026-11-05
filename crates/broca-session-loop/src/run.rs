@@ -35,6 +35,7 @@ use broca_session_store::record::{
     Assistant, BatchEnd, BatchStart, CallOutcome, Input, PartKind, Placement, Record, RunEnd,
     RunStart, SetupStub, StepEnd, StepStart, ToolIntent, ToolOutcome, ToolReply,
 };
+use broca_session_store::fold::operations::Resolution;
 use broca_session_store::session::SessionError;
 use broca_wal::ComputedTagRules;
 use serde_json::{json, Value};
@@ -124,20 +125,115 @@ where
     P: Provider,
     T: ToolPlane,
 {
-    let prompt_start = writer.conversation().messages.len();
-    admit(writer, parts, &admission).await?;
-    // This run's place in the prompt, a render input. Only the session's first run is
-    // supported yet: a later run also needs every earlier run's place and render config.
-    if prompt_start != 0 {
+    // Only the session's first run is supported yet: a later run also needs every earlier
+    // run's place in the prompt and render config, which requests carry.
+    if !writer.conversation().messages.is_empty() {
         return Err(LoopError::Unsupported("a session's second run"));
     }
-    let episode = EpisodeRenderInput {
-        prompt_start,
-        first_user: admission
-            .input
+    admit(writer, parts, &admission).await?;
+    drive(writer, &admission, seams).await
+}
+
+/// Continues the session's latest run from its last durable record, after a crash or a
+/// restart. What happens next is what the operational fold says the run must do; a call that
+/// may have run is never sent again.
+pub async fn resume<W, P, T>(
+    writer: &mut W,
+    parts: &dyn Parts,
+    seams: &Seams<'_, P, T>,
+) -> Result<Finished, LoopError>
+where
+    W: Writer,
+    P: Provider,
+    T: ToolPlane,
+{
+    let run = writer
+        .operations()
+        .run
+        .as_ref()
+        .ok_or(LoopError::Unsupported("a session with no run to resume"))?;
+    let admission = frozen_admission(run, parts)?;
+    if let Some(reason) = run.finished {
+        return Ok(finished(writer, reason));
+    }
+    match run.resolution() {
+        Resolution::Resume => drive(writer, &admission, seams).await,
+        Resolution::Idle(reason) => finish(writer, seams, &admission.run_id, reason).await,
+        Resolution::Interrupted(_) => {
+            Err(LoopError::Unsupported("closing calls a crash left without results"))
+        }
+        Resolution::ProviderHeld(_) => Err(LoopError::Unsupported("calls a provider holds")),
+        Resolution::Paused(_) => Err(LoopError::Unsupported("a paused run")),
+    }
+}
+
+fn decode<T: serde::de::DeserializeOwned>(value: Option<Value>) -> Result<Option<T>, LoopError> {
+    value
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| LoopError::Parts(e.to_string()))
+}
+
+/// A run's admission as its start record froze it, read back from the fold and the setup
+/// store. Its input is already in the conversation, so it is left empty.
+fn frozen_admission(
+    run: &broca_session_store::fold::operations::Run,
+    parts: &dyn Parts,
+) -> Result<Admission, LoopError> {
+    let start = run
+        .start
+        .as_ref()
+        .ok_or(LoopError::Unsupported("a run whose start isn't in the fold"))?;
+    let part = |kind: PartKind| -> Result<Option<Value>, LoopError> {
+        start
+            .setup
             .iter()
-            .position(|message| message.role == Role::User)
-            .map(|index| prompt_start + index),
+            .find(|part| part.kind == kind)
+            .map(|part| parts.get(part).map_err(LoopError::Parts))
+            .transpose()
+    };
+    let config = start
+        .run_choices
+        .as_ref()
+        .and_then(|choices| choices.get("config"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let member = |key: &str| config.get(key).cloned();
+    Ok(Admission {
+        run_id: start.run_id.clone(),
+        model: start.model.clone(),
+        input: Vec::new(),
+        tools: decode(part(PartKind::Tools)?)?.unwrap_or_default(),
+        tool_choice: decode(member("tool_choice"))?.unwrap_or_default(),
+        generation: decode(member("generation"))?.unwrap_or_default(),
+        response_format: decode(part(PartKind::ResponseFormat)?)?.unwrap_or_default(),
+        provider_options: member("provider_options").unwrap_or(Value::Null),
+        render_config: start.render_config.clone().unwrap_or(Value::Null),
+        renderer_version: start.renderer_version,
+        stop_when: decode(member("stop_when"))?.unwrap_or_default(),
+        ts_ms: start.ts_ms,
+        written_at_ms: start.written_at_ms,
+    })
+}
+
+/// Model steps and tool batches from the run's current state until a decision ends the run.
+async fn drive<W, P, T>(
+    writer: &mut W,
+    admission: &Admission,
+    seams: &Seams<'_, P, T>,
+) -> Result<Finished, LoopError>
+where
+    W: Writer,
+    P: Provider,
+    T: ToolPlane,
+{
+    let episode = EpisodeRenderInput {
+        prompt_start: 0,
+        first_user: writer
+            .conversation()
+            .messages
+            .iter()
+            .position(|message| message.role == Role::User),
         frozen_config: admission.render_config.clone(),
     };
     let tools = Arc::new(admission.tools.clone());
@@ -149,6 +245,25 @@ where
     } else {
         admission.stop_when.clone()
     };
+    // A crash after a step asked for tools but before their batch started: the calls were never
+    // sent, so the batch runs now.
+    if let Some(open) = writer.conversation().open_tool_turn() {
+        if run_state(writer).open_batch.is_none() {
+            let calls: Vec<ToolCall> = open
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    broca_protocol::content::ContentBlock::ToolCall(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect();
+            let step_id = run_state(writer).completed_steps;
+            if batch(writer, seams, &admission.run_id, step_id, &calls, &manifest).await? {
+                return finish(writer, seams, &admission.run_id, RunFinishReason::Interrupted)
+                    .await;
+            }
+        }
+    }
     loop {
         if seams.cancel.is_cancelled() {
             return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await;
@@ -165,7 +280,7 @@ where
                 false,
             )
             .await?;
-        let opts = call_options(writer, &admission, &tools, &episode, seams, step_id)?;
+        let opts = call_options(writer, admission, &tools, &episode, seams, step_id)?;
         let outcome = model_step(seams, step_id, opts).await;
         let step = match outcome {
             Ok(step) => step,

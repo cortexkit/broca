@@ -23,6 +23,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+broca-crash-harness = { path = "../broca-crash-harness" }
 broca-session-convert = { path = "../broca-session-convert" }
 broca-test-support = { path = "../broca-test-support" }
 futures = { workspace = true, features = ["executor"] }

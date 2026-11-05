@@ -24,7 +24,8 @@ use broca_protocol::request::{
     CallOptions, ExecutionMode, ModelHandle, StopCondition, Tool, ToolChoice,
 };
 use broca_protocol::{FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage};
-use broca_session_loop::{run, Admission, MemoryParts, Seams, Writer};
+use broca_crash_harness::wal::LogImage;
+use broca_session_loop::{resume, run, Admission, MemoryParts, Seams, Writer};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::fold::operations::Operations;
@@ -210,14 +211,28 @@ struct Outcome {
 }
 
 async fn today(scenario: &Scenario) -> Outcome {
+    today_from(scenario, None, scenario.steps.clone()).await.0
+}
+
+/// Runs today's loop, starting from the log bytes `start` when given (a crash's cut log, which
+/// today's loop resumes), with the provider serving `steps`. Returns what it did, its whole
+/// log, and the log's file name.
+async fn today_from(
+    scenario: &Scenario,
+    start: Option<(&str, &[u8])>,
+    steps: Vec<Vec<NormalizedEvent>>,
+) -> (Outcome, LogImage, String) {
     let dir = broca_test_support::scratch_root().join(format!(
         "session-loop-differential-{}-{}",
         std::process::id(),
         rand_suffix()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let provider = ScriptedProvider::new(scenario.steps.clone());
+    std::fs::create_dir_all(dir.join("wal")).unwrap();
+    if let Some((name, bytes)) = start {
+        std::fs::write(dir.join("wal").join(name), bytes).unwrap();
+    }
+    let provider = ScriptedProvider::new(steps);
     let plane = scenario.plane();
     let lease = FileLeaseStore::new(dir.join("lease"));
     let wal = FileWalStore::new(dir.join("wal"));
@@ -241,18 +256,24 @@ async fn today(scenario: &Scenario) -> Outcome {
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
         .expect("today's loop wrote a log");
-    let frames = broca_wal::replay_file(&file, u64::MAX).unwrap();
-    let converted = broca_session_convert::convert(&frames, None).expect("the log converts");
+    let image = LogImage::read(&file);
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    let converted =
+        broca_session_convert::convert(&image.framed(), None).expect("the log converts");
     let _ = std::fs::remove_dir_all(&dir);
-    Outcome {
-        records: normalized(&converted.records),
-        requests: sent_requests(&provider),
-        calls: plane
-            .log()
-            .iter()
-            .map(|event| format!("{event:?}"))
-            .collect(),
-    }
+    (
+        Outcome {
+            records: normalized(&converted.records),
+            requests: sent_requests(&provider),
+            calls: plane
+                .log()
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .collect(),
+        },
+        image,
+        name,
+    )
 }
 
 /// A session writer that also keeps every record it appended, for comparison.
@@ -285,6 +306,17 @@ fn bind() -> broca_protocol::BindIdentity {
 }
 
 async fn new_loop(scenario: &Scenario) -> Outcome {
+    new_from(scenario, None, scenario.steps.clone()).await
+}
+
+/// Runs the new loop on a new session. With `start` (a crash's cut log, converted), the session
+/// first holds those records and the loop resumes its run; the outcome's records are only what
+/// the loop appended.
+async fn new_from(
+    scenario: &Scenario,
+    start: Option<broca_session_convert::Converted>,
+    steps: Vec<Vec<NormalizedEvent>>,
+) -> Outcome {
     let bind = bind();
     let backend = MemoryBackend::default();
     let triple = SessionTriple {
@@ -301,13 +333,21 @@ async fn new_loop(scenario: &Scenario) -> Outcome {
     )
     .await
     .unwrap();
-    let provider = ScriptedProvider::new(scenario.steps.clone());
+    let mut parts = MemoryParts::default();
+    let resuming = match start {
+        Some(converted) if converted.records.iter().any(|r| matches!(r, Record::RunStart(_))) => {
+            session.append(&converted.records, true).await.unwrap();
+            parts.parts = converted.parts;
+            true
+        }
+        _ => false,
+    };
+    let provider = ScriptedProvider::new(steps);
     let plane = scenario.plane();
     let mut writer = Recording {
         session: &mut session,
         records: Vec::new(),
     };
-    let mut parts = MemoryParts::default();
     let now = || 0u64;
     let seams = Seams {
         provider: &provider,
@@ -318,13 +358,17 @@ async fn new_loop(scenario: &Scenario) -> Outcome {
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
-    run(
-        &mut writer,
-        &mut parts,
-        scenario.admission(&provider),
-        &seams,
-    )
-    .await
+    if resuming {
+        resume(&mut writer, &parts, &seams).await
+    } else {
+        run(
+            &mut writer,
+            &mut parts,
+            scenario.admission(&provider),
+            &seams,
+        )
+        .await
+    }
     .expect("the new loop runs");
     let records = writer.records.clone();
     Outcome {
@@ -546,6 +590,76 @@ async fn a_call_whose_outcome_is_unknown() {
                 FinishReason::ToolCalls,
             ),
             text_step("a2", "should not be reached"),
+        ],
+    })
+    .await;
+}
+
+/// Cuts today's log of `scenario` after each of its records, as a crash could, and resumes the
+/// cut twice: today's loop resumes the cut log, and the new loop resumes a session holding the
+/// same records converted. Both must send the same requests, run the same tool calls, and
+/// append the same records.
+async fn compare_every_cut(scenario: Scenario) {
+    let (_, full, name) = today_from(&scenario, None, scenario.steps.clone()).await;
+    let records = full.framed().len();
+    assert!(records > 2, "the scenario wrote a log to cut");
+    for cut in 1..records {
+        let bytes = broca_crash_harness::cut_log(&full, cut, false);
+        let frames = LogImage::parse(bytes.clone()).framed();
+        // The provider serves the steps the cut log has no answer for yet.
+        let answered = frames
+            .iter()
+            .filter(|frame| {
+                serde_json::to_value(&frame.record).unwrap()["type"] == "model_step_finished"
+            })
+            .count();
+        let steps = scenario.steps[answered..].to_vec();
+        let converted = broca_session_convert::convert(&frames, None).expect("the cut converts");
+        let before = converted.records.len();
+        let (today, _, _) = today_from(&scenario, Some((&name, &bytes)), steps.clone()).await;
+        let new = new_from(&scenario, Some(converted), steps).await;
+        let today_appended = &today.records[before.min(today.records.len())..];
+        let context = format!("cut after record {cut} of {records}");
+        if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
+            for (index, record) in today_appended.iter().enumerate() {
+                eprintln!("{context} today {index}: {record}");
+            }
+            for (index, record) in new.records.iter().enumerate() {
+                eprintln!("{context} new   {index}: {record}");
+            }
+        }
+        assert_eq!(new.requests.len(), today.requests.len(), "{context}: request count");
+        for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
+            assert_eq!(new, today, "{context}: request {index}");
+        }
+        for (index, (new, today)) in new.records.iter().zip(today_appended).enumerate() {
+            assert_eq!(new, today, "{context}: record {index}");
+        }
+        assert_eq!(new.records.len(), today_appended.len(), "{context}: record count");
+        assert_eq!(new.calls, today.calls, "{context}: tool calls");
+    }
+}
+
+#[tokio::test]
+async fn every_cut_of_a_tool_run_resumes_alike() {
+    compare_every_cut(Scenario {
+        input: vec![user("read two files")],
+        tools: vec![
+            tool("read", ExecutionMode::Sequential),
+            tool("grep", ExecutionMode::Parallel),
+        ],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c2", "grep", json!({"pattern": "b"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            answer("a2", vec![call("c3", "read", json!({"path": "c"}))], FinishReason::ToolCalls),
+            text_step("a3", "done"),
         ],
     })
     .await;

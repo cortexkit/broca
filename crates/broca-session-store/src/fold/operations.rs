@@ -280,6 +280,13 @@ state! {
             reset: "run_start",
             bound: Bound::Fixed,
         },
+        /// The run's start as written: its frozen choices and render config, which a resume
+        /// continues under.
+        22 opt pub start: crate::record::RunStart => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Config("the run's frozen start: its choices, render config and setup parts"),
+        },
     }
 }
 
@@ -323,6 +330,7 @@ impl Run {
             account_limit_pause: None,
             keep_warm: start.keep_warm.clone(),
             on_restart: start.on_restart.clone(),
+            start: Some(start.clone()),
         }
     }
 
