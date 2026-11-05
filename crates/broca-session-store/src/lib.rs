@@ -25,6 +25,7 @@
 //! - `directory`: which sealed segment holds each record sequence number, as a small tree of
 //!   immutable pages.
 //! - `setup`: the setup store, where the parts runs are started with live once per deployment.
+//! - `idindex`: which sealed ledger records name a run id, send id, call key or other id.
 
 pub mod backend;
 pub mod checkpoint;
@@ -34,6 +35,7 @@ pub mod directory;
 pub mod fold;
 pub mod frame;
 pub mod head;
+pub mod idindex;
 pub mod keys;
 pub mod log;
 pub mod prune;

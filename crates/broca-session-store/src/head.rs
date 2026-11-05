@@ -72,6 +72,9 @@ crate::message! {
         2 req unreferenced_at_ms: u64,
         3 rep logs: Id128,
         4 rep objects: String,
+        /// An id-index list of retired runs (see `idindex::Retired`): their data pages and ref
+        /// pages are deleted with the list, so the head doesn't carry every page's name.
+        5 opt retired_index: String,
     }
 }
 
@@ -113,6 +116,8 @@ crate::message! {
         /// Deletions waiting out the grace period. Every change runs due deletions before it
         /// commits, so this holds only the changes of the last grace period.
         15 rep pending: PendingDeletion,
+        /// The id index's root object (see `idindex`). Absent until the first seal.
+        16 opt id_index: String,
     }
 }
 

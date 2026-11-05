@@ -243,6 +243,11 @@ pub struct AppendMeasure {
     /// Messages read back by ordinal (window and sealed), each equal to the message the
     /// conversation placed there.
     pub read_back: u64,
+    /// Distinct ids the written ledger records name, each found after the seals with exactly
+    /// the seqs of the records that name it, and microseconds per lookup (the id index's pages,
+    /// then each record's ledger segment, through the session's `find_id`).
+    pub ids_checked: u64,
+    pub id_lookup_us: Vec<u64>,
     /// Microseconds per setup part stored before the batch that names it. A part the store
     /// already held (from this session or an earlier one) asks the backend nothing and isn't
     /// timed.
@@ -271,7 +276,9 @@ fn named_parts(record: &Record) -> &[PartRef] {
 ///
 /// Then it seals twice: a cut at the newest run input where a cut may fall, which must leave the
 /// window as exactly the messages from there on, and a ledger seal on top. After each, the
-/// session reloads to the state its writer held.
+/// session reloads to the state its writer held. After the reload, every message reads back by
+/// its ordinal, and every id the written ledger records name is found, through the id index,
+/// with exactly the seqs of the records that name it.
 pub fn append_log(
     records: &[Record],
     parts: &std::collections::BTreeMap<Digest, Vec<u8>>,
@@ -301,6 +308,7 @@ pub fn append_log(
         .map_err(|e| format!("create: {e:?}"))?;
         let mut batch_start = 0;
         let mut run_inputs = Vec::new();
+        let mut named: std::collections::BTreeMap<_, Vec<u64>> = std::collections::BTreeMap::new();
         for (index, record) in records.iter().enumerate() {
             if barrier_after(record, records.get(index + 1)) || index + 1 == records.len() {
                 for part in records[batch_start..=index].iter().flat_map(named_parts) {
@@ -329,6 +337,9 @@ pub fn append_log(
                     {
                         run_inputs.push(first + offset as u64);
                     }
+                    for id in broca_session_store::idindex::record_ids(record) {
+                        named.entry(id).or_default().push(first + offset as u64);
+                    }
                 }
                 measure
                     .barrier_us
@@ -340,9 +351,9 @@ pub fn append_log(
         measure.bytes = session.open_log().1;
         let state = (session.conversation.encode(), session.operations.encode());
         session.close().await.map_err(|e| format!("close: {e:?}"))?;
-        Ok::<_, String>((state, run_inputs))
+        Ok::<_, String>((state, run_inputs, named))
     })?;
-    let (written, run_inputs) = written;
+    let (written, run_inputs, named) = written;
     measure.total_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let reopened = LocalBackend::new(root);
@@ -427,6 +438,19 @@ pub fn append_log(
             return Err(format!("message {ordinal} reads back differently"));
         }
         measure.read_back += 1;
+    }
+    for ((kind, id), seqs) in &named {
+        let started = Instant::now();
+        let found = block_on(loaded.find_id(*kind, id))
+            .map_err(|e| format!("find {kind:?} {id}: {e:?}"))?;
+        measure
+            .id_lookup_us
+            .push(started.elapsed().as_micros() as u64);
+        let found: Vec<u64> = found.iter().map(|(seq, _)| *seq).collect();
+        if &found != seqs {
+            return Err(format!("{kind:?} {id} finds seqs {found:?}, not {seqs:?}"));
+        }
+        measure.ids_checked += 1;
     }
     Ok(measure)
 }

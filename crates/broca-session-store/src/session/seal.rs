@@ -19,6 +19,10 @@
 //! every ledger record. A **ledger seal** seals only the ledger records and keeps the whole
 //! transcript open, so a session that runs long without compacting still loads quickly.
 //!
+//! Every seal also files the sealed ledger records' ids in the id index (see `idindex`): a new run
+//! at level 0, and a bounded share of any merge in progress. The new index root commits with the
+//! head, so an id moves from the open log to the index in the same change as its record.
+//!
 //! Records keep their seqs and bytes. The transcript records that stay open are copied into the
 //! new log batch by batch, so a batch is still all-or-nothing there. Opaque reasoning of finished
 //! runs is pruned from sealed transcript records (see `prune`); the current run's isn't. Providers
@@ -34,6 +38,7 @@ use crate::codec::{hex, Id128, Message as _};
 use crate::directory::{DirEntry, Pages, FANOUT};
 use crate::fold::conversation::Conversation;
 use crate::head::{self, LastChange, OpenLog, PendingDeletion};
+use crate::idindex::{self, IndexPages, IndexRoot, Retired};
 use crate::keys::random_id;
 use crate::log::{self, ChainBase, LogEncoder};
 use crate::record::{ChangeAborted, ChangeIntent, ChangeKind, Record, Stream};
@@ -57,6 +62,12 @@ pub struct Sealed {
     pub kept_records: usize,
     pub transcript_bytes: u64,
     pub ledger_bytes: u64,
+    /// Ids the sealed ledger records named, filed at level 0 of the id index.
+    pub index_entries: usize,
+    /// Entries the id index's merges wrote in this change.
+    pub merged_entries: u64,
+    /// Merges that had to finish in this change because their level was full.
+    pub forced_merges: u32,
 }
 
 /// What the create step built, which the commit then names.
@@ -66,6 +77,9 @@ struct Created {
     conversation: Conversation,
     transcript_dir: Option<crate::directory::PageRef>,
     ledger_dir: Option<crate::directory::PageRef>,
+    id_index: String,
+    /// The id-index list of runs merges retired, deleted after the grace period.
+    retired_index: Option<String>,
     replaced: Vec<String>,
 }
 
@@ -239,6 +253,9 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             kept_records: 0,
             transcript_bytes: 0,
             ledger_bytes: 0,
+            index_entries: 0,
+            merged_entries: 0,
+            forced_merges: 0,
         };
         let mut replaced = Vec::new();
         let mut transcript_dir = self.head.transcript_dir.clone();
@@ -309,6 +326,48 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         replaced.extend(appended.replaced);
         let ledger_dir = Some(appended.root);
 
+        // The sealed ledger records' ids, filed in the id index.
+        let index = IndexPages {
+            backend: self.backend,
+            addr: &self.addr,
+            session: self.head.session_id,
+            key: &key,
+        };
+        let root: IndexRoot = match &self.head.id_index {
+            Some(name) => index.read(name).await.map_err(SessionError::Index)?,
+            None => IndexRoot::default(),
+        };
+        let entries = idindex::entries_for(&idindex::hash_key(&self.key), &ledger);
+        sealed.index_entries = entries.len();
+        let updated = index
+            .update(root, entries, &name, self.version)
+            .await
+            .map_err(SessionError::Index)?;
+        sealed.merged_entries = updated.merged_entries;
+        sealed.forced_merges = updated.forced;
+        let id_index = format!("{name}/ix");
+        index
+            .write(&id_index, &updated.root, self.version)
+            .await
+            .map_err(SessionError::Index)?;
+        replaced.extend(self.head.id_index.clone());
+        let retired_index = if updated.retired.is_empty() {
+            None
+        } else {
+            let object = format!("{name}/ixd");
+            index
+                .write(
+                    &object,
+                    &Retired {
+                        refs: updated.retired,
+                    },
+                    self.version,
+                )
+                .await
+                .map_err(SessionError::Index)?;
+            Some(object)
+        };
+
         // The new open log: a checkpoint, then the transcript records that stay open, copied
         // batch by batch with their seqs.
         let transcript_base = transcript
@@ -373,6 +432,8 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             conversation,
             transcript_dir,
             ledger_dir,
+            id_index,
+            retired_index,
             replaced,
         })
     }
@@ -394,12 +455,14 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         head.last_change = Some(LastChange { change, intent_seq });
         head.transcript_dir = created.transcript_dir;
         head.ledger_dir = created.ledger_dir;
+        head.id_index = Some(created.id_index);
         head.next_seq = created.encoder.next_seq();
         head.pending.push(PendingDeletion {
             change,
             unreferenced_at_ms: now_ms,
             logs: vec![self.log],
             objects: created.replaced,
+            retired_index: created.retired_index,
         });
         self.poisoned = true;
         let version = self
@@ -417,6 +480,8 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         self.encoder = created.encoder;
         self.conversation = created.conversation;
         self.operations.open_change = None;
+        // Every ledger record the old log held is sealed, and its ids are in the index now.
+        self.open_ids.clear();
         self.poisoned = false;
         Ok(created.sealed)
     }
@@ -466,7 +531,31 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         if due.is_empty() {
             return Ok(0);
         }
+        let key = self.key.frame_key();
+        let index = IndexPages {
+            backend: self.backend,
+            addr: &self.addr,
+            session: self.head.session_id,
+            key: &key,
+        };
         for pending in &due {
+            // A retired-runs list is read before anything it names is deleted, and deleted
+            // last, so a collection that stops halfway runs again from the list.
+            if let Some(list) = &pending.retired_index {
+                match index.read::<Retired>(list).await {
+                    Ok(retired) => {
+                        index
+                            .delete_retired(&retired.refs, self.version)
+                            .await
+                            .map_err(SessionError::Index)?;
+                        self.backend
+                            .delete_object(&self.addr, list, self.version)
+                            .await?;
+                    }
+                    Err(idindex::IndexError::Missing(_)) => {}
+                    Err(error) => return Err(SessionError::Index(error)),
+                }
+            }
             for log in &pending.logs {
                 self.backend
                     .delete_log(&self.addr, log, self.version)

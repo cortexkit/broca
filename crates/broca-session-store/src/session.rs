@@ -26,6 +26,7 @@ use crate::codec::{ByteBuf, DecodeError, Id128, Message as _};
 use crate::fold::conversation::Conversation;
 use crate::fold::operations::Operations;
 use crate::head::{self, Head, HeadError, OpenLog, Residence, SessionTriple, WrappedKey};
+use crate::idindex::OpenIds;
 use crate::keys::{self, random_id, DataKey, DeploymentKey};
 use crate::log::{self, ChainBase, LogEncoder, LogEnd, LogError, ReadLog};
 use crate::record::{ChangeAborted, Record, Stream, WriterOpened};
@@ -56,6 +57,7 @@ pub enum SessionError {
     BadCut(u64),
     Directory(crate::directory::DirectoryError),
     Segment(crate::segment::SegmentError),
+    Index(crate::idindex::IndexError),
 }
 
 impl From<BackendError> for SessionError {
@@ -105,6 +107,8 @@ pub struct Session<'b, B: SessionBackend> {
     poisoned: bool,
     pub conversation: Conversation,
     pub operations: Operations,
+    /// The open log's ledger records that name ids, so `find_id` finds ids not sealed yet.
+    open_ids: OpenIds,
 }
 
 impl<'b, B: SessionBackend> Session<'b, B> {
@@ -141,6 +145,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             transcript_dir: None,
             ledger_dir: None,
             pending: Vec::new(),
+            id_index: None,
         };
         let version = backend
             .write_head(&addr, &head::seal(&head, &key), None, 1)
@@ -213,6 +218,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             poisoned: false,
             conversation,
             operations,
+            open_ids: OpenIds::default(),
         })
     }
 
@@ -274,9 +280,13 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             .max(last_seq.map_or(0, |seq| seq + 1));
         let mut conversation = checkpoint.conversation;
         let mut operations = checkpoint.operational;
+        let mut open_ids = OpenIds::default();
         for (seq, record) in &read.records {
-            if record.stream() == Stream::Ledger && *seq <= checkpoint.covers_through {
-                continue;
+            if record.stream() == Stream::Ledger {
+                if *seq <= checkpoint.covers_through {
+                    continue;
+                }
+                open_ids.add(*seq, record);
             }
             apply(&mut conversation, &mut operations, record).map_err(SessionError::Fold)?;
         }
@@ -291,6 +301,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             poisoned: false,
             conversation,
             operations,
+            open_ids,
         };
         session.open_writer_over(&key, &read, end).await?;
         Ok(session)
@@ -397,8 +408,14 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         if barrier {
             self.encoder.synced();
         }
+        let first = encoded.first_seq.expect("a batch holds records");
+        for (position, record) in records.iter().enumerate() {
+            if record.stream() == Stream::Ledger {
+                self.open_ids.add(first + position as u64, record);
+            }
+        }
         self.poisoned = false;
-        Ok(encoded.first_seq.expect("a batch holds records"))
+        Ok(first)
     }
 
     /// Appends a claim-only frame, so the log's last barrier counts toward its durable bound.

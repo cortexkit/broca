@@ -33,6 +33,7 @@ fn head(deployment: &DeploymentKey, key: &DataKey) -> Head {
         transcript_dir: None,
         ledger_dir: None,
         pending: Vec::new(),
+        id_index: None,
     }
 }
 

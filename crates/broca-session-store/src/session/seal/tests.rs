@@ -302,9 +302,9 @@ fn the_replaced_log_is_deleted_only_after_the_grace_period() {
 /// log accepts records again.
 #[test]
 fn a_seal_that_fails_before_its_commit_undoes_itself() {
-    // The seal's mutations: the intent, two segments and their directory pages, the new log,
-    // its bytes, the object sync, then the head.
-    for failing in 1..8 {
+    // The seal's mutations: the intent, two segments and their directory pages, the id index's
+    // data page, ref page and root, the new log, its bytes, the object sync, then the head.
+    for failing in 1..11 {
         let backend = MemoryBackend::default();
         block_on(async {
             let (mut session, cut) = history(&backend).await;
@@ -330,8 +330,11 @@ fn a_seal_that_fails_before_its_commit_undoes_itself() {
 /// after it, never between, with nothing left of a change that didn't commit.
 #[test]
 fn a_crash_at_any_point_of_a_seal_loads_to_before_or_after_it() {
+    // The seal's mutations: the intent, two segments and their directory pages, the id index's
+    // data page, ref page and root, the new log, its bytes, the object sync, then the head. So
+    // the last three crash points come after the commit.
     let mut committed = 0;
-    for crash in 0..12 {
+    for crash in 0..15 {
         let backend = MemoryBackend::default();
         let (before, after) = block_on(async {
             let (mut session, cut) = history(&backend).await;
@@ -359,6 +362,5 @@ fn a_crash_at_any_point_of_a_seal_loads_to_before_or_after_it() {
             }
         });
     }
-    // The last crash points come after the commit.
-    assert!((1..12).contains(&committed), "{committed}");
+    assert!((1..15).contains(&committed), "{committed}");
 }

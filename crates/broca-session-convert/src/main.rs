@@ -1080,6 +1080,10 @@ struct AppendReport {
     read_back: u64,
     expanded: u64,
     expand_us: Percentiles,
+    /// Distinct ids found after the seals with exactly the seqs of the records naming them, and
+    /// microseconds per lookup.
+    ids_checked: u64,
+    id_lookup_us: Percentiles,
     /// Setup parts stored across every session of the run, each once, and their bytes on disk
     /// (encrypted).
     setup_parts_stored: u64,
@@ -1128,6 +1132,7 @@ fn run_append(args: &Args) {
     let mut latencies = Vec::new();
     let mut loads = Vec::new();
     let mut seals = Vec::new();
+    let mut id_lookups = Vec::new();
     for (index, file) in chosen.iter().enumerate() {
         let old = match broca_wal::replay_file(file, u64::MAX) {
             Ok(old) => old,
@@ -1171,6 +1176,8 @@ fn run_append(args: &Args) {
                 setup_puts.extend(measured.setup_put_us);
                 report.read_back += measured.read_back;
                 expands.extend(measured.expand_us);
+                report.ids_checked += measured.ids_checked;
+                id_lookups.extend(measured.id_lookup_us);
             }
             Err(e) => report.failures.push(format!("{}: {e}", file.display())),
         }
@@ -1181,6 +1188,7 @@ fn run_append(args: &Args) {
     report.seal_us = percentiles(seals);
     report.expanded = expands.len() as u64;
     report.expand_us = percentiles(expands);
+    report.id_lookup_us = percentiles(id_lookups);
     report.setup_parts_written = setup_puts.len() as u64;
     report.setup_put_us = percentiles(setup_puts);
     if let Ok(entries) = std::fs::read_dir(setup_root.join("setup")) {
