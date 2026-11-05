@@ -1347,11 +1347,7 @@ async fn compare_in(scenario: Scenario) {
     }
     assert_eq!(new.requests.len(), today.requests.len(), "request count");
     for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-        assert_eq!(
-            as_rendered(new),
-            as_rendered(today),
-            "request {index}"
-        );
+        assert_eq!(as_rendered(new), as_rendered(today), "request {index}");
     }
     for (index, (new, today)) in new.records.iter().zip(&today.records).enumerate() {
         assert_eq!(new, today, "record {index}");
@@ -1956,11 +1952,7 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
     }
     assert_eq!(new.requests.len(), today.requests.len(), "request count");
     for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-        assert_eq!(
-            as_rendered(new),
-            as_rendered(today),
-            "request {index}"
-        );
+        assert_eq!(as_rendered(new), as_rendered(today), "request {index}");
     }
     for (index, (new, today)) in new.records.iter().zip(&today.records).enumerate() {
         assert_eq!(new, today, "record {index}");
@@ -2507,11 +2499,7 @@ fn assert_same(today: &Outcome, new: &Outcome) {
     }
     assert_eq!(new.requests.len(), today.requests.len(), "request count");
     for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-        assert_eq!(
-            as_rendered(new),
-            as_rendered(today),
-            "request {index}"
-        );
+        assert_eq!(as_rendered(new), as_rendered(today), "request {index}");
     }
     for (index, (new, today)) in new.records.iter().zip(&today.records).enumerate() {
         assert_eq!(new, today, "record {index}");
@@ -4066,9 +4054,10 @@ async fn a_cut_seals_the_history_before_it_and_requests_stay_the_same() {
         .await;
 }
 
-/// Three runs, then a cut through the second run's answer, so the first two runs leave the
-/// window whole: the new loop keeps the first (the session's first run) and drops the second (same
-/// render settings), and its requests must carry the runs a renderer reads as today's do.
+/// Four runs, with a cut through the second run's answer during the third, so the first two runs
+/// leave the window whole: the new loop keeps the first (the session's first run) and drops the
+/// second (same render settings), and the fourth run's requests must carry the runs a renderer
+/// reads as today's do.
 #[tokio::test]
 async fn a_cut_past_two_runs_keeps_only_the_runs_that_shape_requests() {
     LAYOUT
@@ -4080,15 +4069,25 @@ async fn a_cut_past_two_runs_keeps_only_the_runs_that_shape_requests() {
                     rides: vec![Ride::Cut(4)],
                 })),
                 Box::pin(compare_runs_in(
+                    // The third run calls a tool, so its second request goes out after the seal.
                     compacted_scenario(vec![
                         text_step("a1", "one"),
                         text_step("a2", "two"),
-                        text_step("a3", "three"),
+                        answer(
+                            "a3",
+                            vec![call("c1", "read", json!({"path": "a"}))],
+                            FinishReason::ToolCalls,
+                        ),
+                        text_step("a4", "three"),
+                        text_step("a5", "four"),
                     ]),
+                    // The fourth run starts after the seal, so its requests read the runs the
+                    // sealed conversation kept.
                     &[
                         ("r1", vec![user("first")]),
                         ("r2", vec![user("second")]),
                         ("r3@m2", vec![user("third")]),
+                        ("r4@m2", vec![user("fourth")]),
                     ],
                 )),
             ),

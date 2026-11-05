@@ -1316,11 +1316,12 @@ fn call_options<W: Writer, P, T>(
 ) -> Result<CallOptions, LoopError> {
     let mut prompt = writer.conversation().messages.clone();
     repetition_guidance(&mut prompt, episodes);
-    // Each message keeps its place in the session, which the window may start after.
-    stamp_ordinals_from(
-        &mut prompt,
-        (writer.conversation().window_start() - 1) as usize,
-    );
+    // Each message keeps its place in the session, which the window starts after once history
+    // is sealed: the window's first message has the 0-based position `window_start - 1`.
+    let first = writer.conversation().window_start() - 1;
+    for (index, message) in prompt.iter_mut().enumerate() {
+        message.ordinal = Some(first + index as u64);
+    }
     TagNumbering::for_run(
         &[],
         Some(ComputedRules {
