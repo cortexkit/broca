@@ -321,6 +321,10 @@ impl ToolPlane for Spy {
         guard: &ToolOpenGuard,
     ) -> Result<(), ToolPlaneError> {
         self.note(format!("batch_started_guarded {:?}", ids(calls)));
+        // A batch with a `down` call meets a tool provider that can't be reached.
+        if calls.iter().any(|call| call.tool_name == "down") {
+            return Err(ToolPlaneError::Unavailable("route closed".into()));
+        }
         self.inner
             .batch_started_guarded(ctx, calls, manifest, guard)
             .await
@@ -2603,6 +2607,72 @@ async fn every_cut_of_a_sequential_held_call_resumes_alike() {
                 vec![
                     call("c1", "hold_brief", json!({"job": 1})),
                     call("c2", "read", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_call_to_a_tool_the_run_was_not_given() {
+    compare(Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c2", "delete", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_same_call_id_twice_in_one_message() {
+    compare(Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c1", "read", json!({"path": "b"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_batch_the_tool_plane_refuses() {
+    compare(Scenario {
+        input: vec![user("read a")],
+        tools: vec![
+            tool("read", ExecutionMode::Parallel),
+            tool("down", ExecutionMode::Parallel),
+        ],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c2", "down", json!({})),
                 ],
                 FinishReason::ToolCalls,
             ),

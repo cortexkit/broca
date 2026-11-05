@@ -47,6 +47,7 @@ use broca_session_store::record::{
 };
 use broca_session_store::session::SessionError;
 use broca_wal::ComputedTagRules;
+use broca_wal::NoDispatchReason;
 use futures::channel::oneshot;
 use futures::StreamExt as _;
 use serde_json::{json, Value};
@@ -263,7 +264,7 @@ async fn close_interrupted<W: Writer, P, T>(
                 result,
                 outcome,
                 reason,
-                now,
+                Some(now),
             );
         }
         records.push(Record::BatchEnd(BatchEnd {
@@ -1118,67 +1119,118 @@ where
         media_capture: None,
     };
     // The plane learns of the batch first, so it can say where each call goes; the intents then
-    // record that, with each call's key, before anything is sent.
+    // record that, with each call's key, before anything is sent. A plane that refuses the batch
+    // leaves every call unsent, with a terminal saying why.
     let guard = ToolOpenGuard::new(Some(&seams.cancel), Some(&seams.stop));
-    if seams
+    let refusal = seams
         .tools
         .batch_started_guarded(&ctx, planned, manifest, &guard)
         .await
-        .is_err()
-    {
-        return Err(LoopError::Unsupported("a tool plane refusing a batch"));
-    }
+        .err();
     let sequential = calls.iter().any(|call| {
         manifest
             .get(&call.tool_name)
             .is_some_and(|tool| tool.execution_mode == ExecutionMode::Sequential)
     });
     let known_of = |call: &ToolCall| known.iter().find(|known| known.id == call.tool_call_id);
+    let plans = plan_calls(calls, known, refusal.as_ref(), manifest);
     let session = writer.session_id();
     let now = (seams.now_ms)();
-    let mut intents = Vec::with_capacity(calls.len() + 1);
-    for call in calls.iter().filter(|call| known_of(call).is_none()) {
-        intents.push((
-            call,
-            canonical(&call.input).map_err(LoopError::Parts)?.1,
-            seams.tools.dispatch_target(&ctx, &call.tool_call_id),
-            seams
-                .tools
-                .dispatch_schema_pin(&ctx, &call.tool_call_id, &call.tool_name),
-        ));
+    let mut prepared = Vec::with_capacity(calls.len());
+    for (call, plan) in calls.iter().zip(&plans) {
+        let intent = match plan {
+            CallPlan::Dispatch if known_of(call).is_none() => {
+                // Arguments are stored again only when they differ from the input the message
+                // last gave this call id, as today's converted records hold them.
+                let last = planned
+                    .iter()
+                    .rev()
+                    .find(|other| other.tool_call_id == call.tool_call_id)
+                    .map(|other| &other.input);
+                Some((
+                    canonical(&call.input).map_err(LoopError::Parts)?.1,
+                    (last != Some(&call.input)).then(|| call.input.clone()),
+                    seams.tools.dispatch_target(&ctx, &call.tool_call_id),
+                    seams
+                        .tools
+                        .dispatch_schema_pin(&ctx, &call.tool_call_id, &call.tool_name),
+                ))
+            }
+            _ => None,
+        };
+        prepared.push(intent);
     }
+    let dispatching = plans.iter().any(|plan| matches!(plan, CallPlan::Dispatch));
     let written = writer
         .append_with(
             &mut |_, _, first_seq| {
-                let mut records = Vec::with_capacity(intents.len() + 1);
+                let mut records = Vec::with_capacity(calls.len() + 1);
                 if !started {
                     records.push(Record::BatchStart(BatchStart {
                         run_id: run_id.into(),
                         batch_id: batch_id.clone(),
                         step_id,
-                        planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+                        planned: planned
+                            .iter()
+                            .map(|call| call.tool_call_id.clone())
+                            .collect(),
                     }));
                 }
-                for (call, args, module_id, schema_pin) in &intents {
-                    // The key names the intent record itself, so it never repeats in this
-                    // session and a late result or withdrawal finds exactly this call.
-                    let seq = first_seq + records.len() as u64;
-                    records.push(Record::ToolIntent(ToolIntent {
+                for ((call, plan), intent) in calls.iter().zip(&plans).zip(&prepared) {
+                    match (plan, intent) {
+                        (CallPlan::Dispatch, Some((digest, args, module_id, schema_pin))) => {
+                            // The key names the intent record itself, so it never repeats in
+                            // this session and a late result or withdrawal finds exactly this
+                            // call.
+                            let seq = first_seq + records.len() as u64;
+                            records.push(Record::ToolIntent(ToolIntent {
+                                run_id: run_id.into(),
+                                batch_id: batch_id.clone(),
+                                tool_call_id: call.tool_call_id.clone(),
+                                tool_name: Some(call.tool_name.clone()),
+                                module_id: module_id.clone(),
+                                args_digest: *digest,
+                                args: args.clone(),
+                                call_key: Some(format!("{session}:{seq}")),
+                                approval_digest: None,
+                                dispatched_at_ms: Some(now),
+                                schema_pin: schema_pin.as_ref().map(|pin| {
+                                    serde_json::to_value(pin).expect("a pin serializes")
+                                }),
+                                hooks: None,
+                                key_derived: None,
+                            }));
+                        }
+                        (CallPlan::NoDispatch(reason), _) => {
+                            no_dispatch(
+                                &mut records,
+                                run_id,
+                                &batch_id,
+                                &call.tool_call_id,
+                                reason,
+                                now,
+                            );
+                        }
+                        // A batch that sends nothing records its other terminals in the same
+                        // barrier; one that sends records them with the answers.
+                        (CallPlan::Synthetic { result, reason }, _) if !dispatching => {
+                            terminal_with_reason(
+                                &mut records,
+                                run_id,
+                                &batch_id,
+                                result.clone(),
+                                CallOutcome::Completed,
+                                reason.clone(),
+                                Some(now),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                if !dispatching {
+                    records.push(Record::BatchEnd(BatchEnd {
                         run_id: run_id.into(),
                         batch_id: batch_id.clone(),
-                        tool_call_id: call.tool_call_id.clone(),
-                        tool_name: Some(call.tool_name.clone()),
-                        module_id: module_id.clone(),
-                        args_digest: *args,
-                        args: None,
-                        call_key: Some(format!("{session}:{seq}")),
-                        approval_digest: None,
-                        dispatched_at_ms: Some(now),
-                        schema_pin: schema_pin
-                            .as_ref()
-                            .map(|pin| serde_json::to_value(pin).expect("a pin serializes")),
-                        hooks: None,
-                        key_derived: None,
                     }));
                 }
                 records
@@ -1186,9 +1238,19 @@ where
             true,
         )
         .await?;
-    // Every call's key, in call order: a known call's from its intent, a new call's from the
-    // intent just written.
-    let keys: Vec<(ToolCallId, String)> = calls
+    if !dispatching {
+        let _ = seams.tools.batch_finished(&ctx).await;
+        return Ok(BatchOutcome::Closed { unknown: false });
+    }
+    // The calls that are sent, with their keys: a known call's from its intent, a new call's
+    // from the intent just written.
+    let sending: Vec<ToolCall> = calls
+        .iter()
+        .zip(&plans)
+        .filter(|(_, plan)| matches!(plan, CallPlan::Dispatch))
+        .map(|(call, _)| call.clone())
+        .collect();
+    let keys: Vec<(ToolCallId, String)> = sending
         .iter()
         .filter_map(|call| {
             let key = match known_of(call) {
@@ -1219,13 +1281,13 @@ where
             .map_err(|error| LoopError::Tools(format!("late-results registration: {error}")))?;
     }
 
-    let held: Vec<Option<&ProviderHeldReply>> = calls
+    let held: Vec<Option<&ProviderHeldReply>> = sending
         .iter()
         .map(|call| known_of(call).and_then(|known| known.held.as_ref()))
         .collect();
     let plan = DispatchPlan {
         ctx: &ctx,
-        calls,
+        calls: &sending,
         keys: &keys,
         held: &held,
         guard: &guard,
@@ -1238,21 +1300,40 @@ where
         Dispatched::All { answers, closed } => (answers, false, closed),
         Dispatched::Held(answers) => (answers, true, Vec::new()),
     };
+    // The answers, back in the message's order, with each synthesized terminal in its place.
+    let mut answers = answers.into_iter();
     let mut records = Vec::new();
     let mut unknown = false;
-    for answer in answers.into_iter().flatten() {
-        unknown |= answer.outcome == CallOutcome::Unknown;
-        if !answer.durable {
-            let now = (seams.now_ms)();
-            terminal_with_reason(
+    for plan in &plans {
+        match plan {
+            CallPlan::Dispatch => {
+                let Some(answer) = answers.next().flatten() else {
+                    continue;
+                };
+                unknown |= answer.outcome == CallOutcome::Unknown;
+                if !answer.durable {
+                    let now = (seams.now_ms)();
+                    terminal_with_reason(
+                        &mut records,
+                        run_id,
+                        &batch_id,
+                        answer.result,
+                        answer.outcome,
+                        answer.reason,
+                        Some(now),
+                    );
+                }
+            }
+            CallPlan::Synthetic { result, reason } => terminal_with_reason(
                 &mut records,
                 run_id,
                 &batch_id,
-                answer.result,
-                answer.outcome,
-                answer.reason,
-                now,
-            );
+                result.clone(),
+                CallOutcome::Completed,
+                reason.clone(),
+                Some((seams.now_ms)()),
+            ),
+            CallPlan::NoDispatch(_) => {}
         }
     }
     if paused {
@@ -1279,30 +1360,120 @@ where
     Ok(BatchOutcome::Closed { unknown })
 }
 
-/// A call's reply in the transcript and its outcome in the ledger.
-fn terminal(
-    records: &mut Vec<Record>,
-    run_id: &str,
-    batch_id: &str,
-    result: ToolResult,
-    outcome: CallOutcome,
-    now: u64,
-) {
-    terminal_with_reason(records, run_id, batch_id, result, outcome, None, now);
+/// What a batch does with one call, decided before anything is written.
+enum CallPlan {
+    /// Sent to the tool plane.
+    Dispatch,
+    /// Never sent, durable at once: the plane can't be reached, or the call is invalid.
+    NoDispatch(NoDispatchReason),
+    /// Never sent, answered by the loop with `result`: a repeated call id, or a refusal the
+    /// plane named.
+    Synthetic {
+        result: ToolResult,
+        reason: Option<String>,
+    },
 }
 
-/// `terminal`, with the reason code the outcome records, such as why a held call was closed.
-fn terminal_with_reason(
+/// Decides each call's plan in the message's order, as today's gate does: a call a resume
+/// already knows is sent; a repeated call id gets an error; a refused batch refuses every call;
+/// a call the run's manifest doesn't allow is never sent.
+fn plan_calls(
+    calls: &[ToolCall],
+    known: &[Known],
+    refusal: Option<&broca_core::tool_plane::ToolPlaneError>,
+    manifest: &ToolManifest,
+) -> Vec<CallPlan> {
+    use broca_core::tool_plane::ToolPlaneError;
+    let mut seen = std::collections::HashSet::new();
+    calls
+        .iter()
+        .map(|call| {
+            let first = seen.insert(call.tool_call_id.clone());
+            if known.iter().any(|known| known.id == call.tool_call_id) {
+                return CallPlan::Dispatch;
+            }
+            if !first {
+                return CallPlan::Synthetic {
+                    result: error_result(
+                        &call.tool_call_id,
+                        "duplicate tool_call_id from provider",
+                    ),
+                    reason: None,
+                };
+            }
+            match refusal {
+                None => {}
+                Some(ToolPlaneError::Permanent { code, detail }) => {
+                    return CallPlan::Synthetic {
+                        result: ToolResult {
+                            tool_call_id: call.tool_call_id.clone(),
+                            output: broca_core::tool_plane::permanent_refusal_output(
+                                code,
+                                detail.as_ref(),
+                            ),
+                            is_error: true,
+                        },
+                        reason: Some(code.clone()),
+                    };
+                }
+                Some(ToolPlaneError::Unavailable(_)) => {
+                    // The stable message, which sessions already on disk hold as their reason.
+                    return CallPlan::NoDispatch(NoDispatchReason::Unavailable {
+                        detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                        module: None,
+                        code: None,
+                        refusal_detail: None,
+                    });
+                }
+                Some(ToolPlaneError::ModuleUnavailable {
+                    module,
+                    code,
+                    detail,
+                }) => {
+                    return CallPlan::NoDispatch(NoDispatchReason::Unavailable {
+                        detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                        module: Some(module.clone()),
+                        code: Some(code.clone()),
+                        refusal_detail: (!detail.is_empty()).then(|| detail.clone()),
+                    });
+                }
+                Some(error @ ToolPlaneError::ScopeRefused { .. }) => {
+                    return CallPlan::NoDispatch(NoDispatchReason::Unavailable {
+                        detail: error.to_string(),
+                        module: None,
+                        code: None,
+                        refusal_detail: None,
+                    });
+                }
+                Some(ToolPlaneError::ScopeDrained { reason }) => {
+                    return CallPlan::Synthetic {
+                        result: broca_core::run::route_drained_result(&call.tool_call_id, reason),
+                        reason: Some(reason.clone()),
+                    };
+                }
+            }
+            if let Err(invalid) = manifest.validate_call(call) {
+                return CallPlan::NoDispatch(NoDispatchReason::ValidationFailed {
+                    detail: invalid.to_string(),
+                });
+            }
+            CallPlan::Dispatch
+        })
+        .collect()
+}
+
+/// A call that was never sent: today's no-dispatch result in the transcript and its reason in
+/// the ledger.
+fn no_dispatch(
     records: &mut Vec<Record>,
     run_id: &str,
     batch_id: &str,
-    result: ToolResult,
-    outcome: CallOutcome,
-    reason: Option<String>,
+    id: &ToolCallId,
+    reason: &NoDispatchReason,
     now: u64,
 ) {
+    let result = broca_core::replay::no_dispatch_result(id, reason);
     let digest = Digest(Sha256::digest(result.encode()).into());
-    let tool_call_id = result.tool_call_id.clone();
     let is_error = result.is_error;
     records.push(Record::ToolReply(ToolReply {
         run_id: run_id.into(),
@@ -1314,12 +1485,59 @@ fn terminal_with_reason(
     records.push(Record::ToolOutcome(ToolOutcome {
         run_id: run_id.into(),
         batch_id: batch_id.into(),
+        tool_call_id: id.clone(),
+        outcome: CallOutcome::NotDispatched,
+        result_digest: digest,
+        is_error,
+        reason: None,
+        finished_at_ms: Some(now),
+        detail: serde_json::to_value(reason).ok(),
+        hooks: None,
+    }));
+}
+
+/// A call's reply in the transcript and its outcome in the ledger.
+fn terminal(
+    records: &mut Vec<Record>,
+    run_id: &str,
+    batch_id: &str,
+    result: ToolResult,
+    outcome: CallOutcome,
+    now: u64,
+) {
+    terminal_with_reason(records, run_id, batch_id, result, outcome, None, Some(now));
+}
+
+/// `terminal`, with the reason code the outcome records, such as why a held call was closed.
+/// A terminal today's loop writes without a time, such as a synthesized one, has none here.
+fn terminal_with_reason(
+    records: &mut Vec<Record>,
+    run_id: &str,
+    batch_id: &str,
+    result: ToolResult,
+    outcome: CallOutcome,
+    reason: Option<String>,
+    now: Option<u64>,
+) {
+    let digest = Digest(Sha256::digest(result.encode()).into());
+    let tool_call_id = result.tool_call_id.clone();
+    let is_error = result.is_error;
+    records.push(Record::ToolReply(ToolReply {
+        run_id: run_id.into(),
+        batch_id: Some(batch_id.into()),
+        result,
+        finished_at_ms: now,
+        tags_v1: None,
+    }));
+    records.push(Record::ToolOutcome(ToolOutcome {
+        run_id: run_id.into(),
+        batch_id: batch_id.into(),
         tool_call_id,
         outcome,
         result_digest: digest,
         is_error,
         reason,
-        finished_at_ms: Some(now),
+        finished_at_ms: now,
         detail: None,
         hooks: None,
     }));
@@ -1612,7 +1830,7 @@ async fn dispatch_all<W: Writer, P, T: ToolPlane>(
                     result.clone(),
                     outcome,
                     Some(code.into()),
-                    (seams.now_ms)(),
+                    Some((seams.now_ms)()),
                 );
                 writer.append(&records, true).await?;
                 if let Some(lifecycle) = seams.held {

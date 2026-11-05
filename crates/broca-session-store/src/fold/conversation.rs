@@ -30,7 +30,7 @@ pub enum FoldError {
     LedgerRecord(&'static str),
     /// A reply for a call no held assistant message made.
     ReplyWithoutCall(String),
-    /// A second reply for a call that already has one.
+    /// A reply for a call whose every copy already has one.
     SecondReply(String),
     /// A message other than a run's own input arrived while an assistant message was still
     /// waiting for replies, where it would land between a call and its result.
@@ -316,7 +316,15 @@ impl Conversation {
                 let Some(turn) = self.open.as_mut().filter(|turn| turn.calls.contains(id)) else {
                     return Err(FoldError::ReplyWithoutCall(id.0.clone()));
                 };
-                if turn.replies.iter().any(|known| &known.tool_call_id == id) {
+                // A model can repeat a call id in one message; each copy gets its own reply, in
+                // the order they come, and no copy gets a second one.
+                let replied = turn
+                    .replies
+                    .iter()
+                    .filter(|known| &known.tool_call_id == id)
+                    .count();
+                let asked = turn.calls.iter().filter(|call| *call == id).count();
+                if replied >= asked {
                     return Err(FoldError::SecondReply(id.0.clone()));
                 }
                 turn.replies.push(reply.result.clone());
@@ -331,7 +339,7 @@ impl Conversation {
                                 .iter()
                                 .position(|reply| &reply.tool_call_id == id)
                                 .expect("every call has a reply");
-                            ContentBlock::ToolResult(turn.replies.swap_remove(at))
+                            ContentBlock::ToolResult(turn.replies.remove(at))
                         })
                         .collect();
                     let entry = self.open_entry.take().unwrap_or_default();

@@ -12417,7 +12417,7 @@ fn tool_open_guard(
 
 /// The `route_drained` result for a call a scope drain stopped before it was sent. The text
 /// leads with the name so the model, and anyone reading the transcript, sees why.
-fn route_drained_result(id: &ToolCallId, reason: &str) -> ToolResult {
+pub fn route_drained_result(id: &ToolCallId, reason: &str) -> ToolResult {
     ToolResult {
         tool_call_id: id.clone(),
         output: ToolOutput::error(format!(
