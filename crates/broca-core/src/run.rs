@@ -9441,23 +9441,38 @@ pub fn restore_repetition_guidance_seeded(
     true
 }
 
+/// What [`repetition_checkpoint`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepetitionCheckpointTaken {
+    /// The counters after the steps given.
+    Taken(crate::tool_repetition::RepetitionCheckpoint),
+    /// An assistant's calls among the steps still wait for their results. A checkpoint keeps no
+    /// call text to pair them with, so none can be taken there.
+    CallsWaiting,
+    /// The seed doesn't read as a checkpoint under today's warning rules.
+    SeedRejected,
+}
+
 /// The repetition counters after a run's raw, undecorated steps `prompt`, from its first step,
-/// continuing from `seed` when the run's steps before `prompt` were counted already. `Ok(None)`
-/// while an assistant's calls in `prompt` still wait for their results, since a checkpoint keeps
-/// no call text to pair them with; `Err` when `seed` doesn't read as a checkpoint under today's
-/// rules.
+/// continuing from `seed` when the run's steps before `prompt` were counted already.
 pub fn repetition_checkpoint(
     prompt: &[Message],
     seed: Option<&crate::tool_repetition::RepetitionCheckpoint>,
-) -> Result<Option<crate::tool_repetition::RepetitionCheckpoint>, ()> {
+) -> RepetitionCheckpointTaken {
     let mut fold = match seed {
-        Some(seed) => RepetitionFold::seeded(seed).ok_or(())?,
+        Some(seed) => match RepetitionFold::seeded(seed) {
+            Some(fold) => fold,
+            None => return RepetitionCheckpointTaken::SeedRejected,
+        },
         None => RepetitionFold::default(),
     };
     for message in prompt {
         fold.push(message);
     }
-    Ok(fold.checkpoint())
+    match fold.checkpoint() {
+        Some(checkpoint) => RepetitionCheckpointTaken::Taken(checkpoint),
+        None => RepetitionCheckpointTaken::CallsWaiting,
+    }
 }
 
 fn restore_guidance_with_originals(

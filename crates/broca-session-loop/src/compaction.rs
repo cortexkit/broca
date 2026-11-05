@@ -445,14 +445,15 @@ fn spanning_repetition(
             None => return Ok(None),
         },
     };
+    use broca_core::run::RepetitionCheckpointTaken as Taken;
     match broca_core::run::repetition_checkpoint(steps, seed.as_ref()) {
-        Ok(Some(checkpoint)) => serde_json::to_value(checkpoint)
+        Taken::Taken(checkpoint) => serde_json::to_value(checkpoint)
             .map(Some)
             .map_err(|error| LoopError::Parts(error.to_string())),
-        Ok(None) => Err(LoopError::Unsupported(
+        Taken::CallsWaiting => Err(LoopError::Unsupported(
             "a compaction cut between a tool call and its result",
         )),
-        Err(()) => Err(LoopError::Parts(
+        Taken::SeedRejected => Err(LoopError::Parts(
             "stored repetition counters were taken under other warning rules".into(),
         )),
     }
