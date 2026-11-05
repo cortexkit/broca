@@ -341,6 +341,7 @@ fn first_call_refusal(error: &ItemError, model: &str, pin: &ModelPin) -> Refusal
         errors::AUTH_FAILED => {
             let mut refusal = Refusal::auth_failed();
             refusal.message = error.message.clone();
+            refusal.detail.class = error.class.clone();
             if let Some(credential) = pin.provider.credential_id() {
                 refusal.detail.credential = Some(credential);
             }
@@ -356,6 +357,7 @@ fn first_call_refusal(error: &ItemError, model: &str, pin: &ModelPin) -> Refusal
 /// TypeSafe's errors by status).
 fn map_reply(reply: ProviderReply, pin: &ModelPin) -> Result<(String, Option<Usage>), ItemError> {
     match reply {
+        ProviderReply::ClassifiedError { error, .. } => Err(error),
         ProviderReply::AttributedAnswer { body, .. } => {
             map_reply(ProviderReply::Answered(body), pin)
         }
@@ -433,6 +435,13 @@ fn map_reply(reply: ProviderReply, pin: &ModelPin) -> Result<(String, Option<Usa
 /// mid-request, or a 200 whose body did not decode.
 fn reply_spend(reply: &ProviderReply) -> ItemSpend {
     let code = match reply {
+        ProviderReply::ClassifiedError { may_have_spent, .. } => {
+            return if *may_have_spent {
+                ItemSpend::Unknown
+            } else {
+                ItemSpend::Nothing
+            };
+        }
         ProviderReply::Credential(_) | ProviderReply::Unconnected(_) => return ItemSpend::Nothing,
         ProviderReply::Answered(_)
         | ProviderReply::AttributedAnswer { .. }
@@ -452,6 +461,11 @@ fn reply_spend(reply: &ProviderReply) -> ItemSpend {
 /// allocation (3036) names the account, and waiting cannot clear it.
 fn retry_wait(reply: &ProviderReply, service: &SystemOne) -> Option<std::time::Duration> {
     let wait = match reply {
+        ProviderReply::ClassifiedError { error, .. }
+            if error.class == errors::ErrorClass::Transient =>
+        {
+            error.retry_after_ms?
+        }
         ProviderReply::Status {
             status: 429 | 503 | 529,
             retry_after_ms: Some(wait),
@@ -490,6 +504,11 @@ async fn call_provider(
             pin.provider.call(body.clone()).await
         };
         let code = match &reply {
+            ProviderReply::ClassifiedError {
+                error,
+                provider_code,
+                ..
+            } => Some(provider_code.clone().unwrap_or_else(|| error.code.clone())),
             ProviderReply::Answered(_) | ProviderReply::AttributedAnswer { .. } => None,
             ProviderReply::Status { status, .. } => Some(status.to_string()),
             ProviderReply::WorkersAiError { status, code, .. } => {
