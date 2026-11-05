@@ -1427,3 +1427,167 @@ async fn a_boundary_cancel_with_a_steer_ends_at_the_extra_boundary() {
     )
     .await;
 }
+
+/// A provider step that fails because the credential needs signing in again.
+fn auth_failure() -> Vec<NormalizedEvent> {
+    vec![NormalizedEvent::Control(ProviderControl::Error {
+        error: serde_json::from_value(json!({
+            "class": "auth",
+            "message": "sign in again",
+            "status": 401
+        }))
+        .unwrap(),
+        retries_used: 0,
+    })]
+}
+
+/// Runs `scenario` once through each loop: the run pauses for re-authentication, then resumes
+/// after it, as the session actor would once the credential is refreshed. Compares
+/// everything both did.
+async fn compare_auth_pause(scenario: Scenario) {
+    // Today's loop, pausing and resuming on one writer.
+    let dir = broca_test_support::scratch_root().join(format!(
+        "session-loop-differential-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let wal = FileWalStore::new(dir.join("wal"));
+    let request = scenario.request();
+    let writer = WalHandle::spawn(wal.open(&request.session).unwrap(), 1).unwrap();
+    let provider = ScriptedProvider::new(scenario.steps.clone());
+    let plane = scenario.plane();
+    let (tx, mut rx) = mpsc::channel(512);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let mut summaries = Vec::new();
+    for mode in [StartMode::FreshOrResume, StartMode::ResumeAfterAuth] {
+        let summary = run_loop_on_writer(
+            request.clone(),
+            &writer,
+            mode,
+            &provider,
+            &plane,
+            &AllowAll,
+            &wal,
+            None,
+            RunControl::default(),
+            &tx,
+        )
+        .await
+        .expect("today's loop runs");
+        summaries.push((summary.reason, summary.paused));
+    }
+    drop(tx);
+    drain.await.unwrap();
+    writer.shutdown().await.unwrap();
+    let file = std::fs::read_dir(dir.join("wal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
+        .expect("today's loop wrote a log");
+    let converted = broca_session_convert::convert(&LogImage::read(&file).framed(), None)
+        .expect("the log converts");
+    let _ = std::fs::remove_dir_all(&dir);
+    let today = Outcome {
+        records: normalized(&converted.records),
+        requests: sent_requests(&provider),
+        calls: plane
+            .log()
+            .iter()
+            .map(|event| format!("{event:?}"))
+            .collect(),
+    };
+
+    // The new loop.
+    let backend = MemoryBackend::default();
+    let triple = SessionTriple {
+        project_root: "/project".into(),
+        harness: "differential".into(),
+        session: "s1".into(),
+    };
+    let mut session = Session::create(
+        &backend,
+        SessionAddr("0123456789abcdef".into()),
+        triple,
+        &DeploymentKey::new(1, &[7; 32]),
+        false,
+    )
+    .await
+    .unwrap();
+    let provider = ScriptedProvider::new(scenario.steps.clone());
+    let plane = scenario.plane();
+    let mut writer = Recording {
+        session: &mut session,
+        records: Vec::new(),
+        injected: Default::default(),
+    };
+    let mut parts = MemoryParts::default();
+    let now = || 0u64;
+    let bind = bind();
+    let seams = Seams {
+        provider: &provider,
+        tools: &plane,
+        bind: bind.clone(),
+        out: None,
+        cancel: Default::default(),
+        now_ms: &now,
+        session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+    };
+    let first = run(
+        &mut writer,
+        &mut parts,
+        scenario.admission(&provider),
+        &seams,
+    )
+    .await
+    .expect("the new loop runs");
+    let second = resume(&mut writer, &parts, &seams)
+        .await
+        .expect("the new loop resumes");
+    let new = Outcome {
+        records: normalized(&writer.records),
+        requests: sent_requests(&provider),
+        calls: plane
+            .log()
+            .iter()
+            .map(|event| format!("{event:?}"))
+            .collect(),
+    };
+    assert_eq!(
+        [(first.reason, first.paused), (second.reason, second.paused)].as_slice(),
+        summaries.as_slice(),
+        "how each run reported"
+    );
+    assert_same(&today, &new);
+}
+
+#[tokio::test]
+async fn a_failed_sign_in_pauses_and_resumes_as_the_same_run() {
+    compare_auth_pause(Scenario {
+        input: vec![user("hello")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![auth_failure(), text_step("a1", "hi")],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_failed_sign_in_after_a_tool_step_resumes_with_its_results() {
+    compare_auth_pause(Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            auth_failure(),
+            text_step("a2", "done"),
+        ],
+    })
+    .await;
+}

@@ -18,7 +18,7 @@ use broca_core::provider::{Provider, StepRuntime};
 use broca_core::run::{limiting_stop_satisfied, stop_satisfied, OutputEvent};
 use broca_core::tags::TagNumbering;
 use broca_core::tool_plane::{BatchCtx, DispatchResult, ToolPlane};
-use broca_protocol::caller::RunFinishReason;
+use broca_protocol::caller::{PauseReason, RunFinishReason};
 use broca_protocol::content::{
     stamp_ordinals_from, AssistantMessage, Message, ToolCall, ToolOutput, ToolResult,
 };
@@ -34,7 +34,7 @@ use broca_protocol::{BatchId, BindIdentity, FinishReason, GenerationConfig, RunI
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::operations::{CallState, Operations, Resolution};
 use broca_session_store::record::{
-    Assistant, BatchEnd, BatchStart, CallOutcome, Input, PartKind, Placement, Record, Redo,
+    Assistant, BatchEnd, BatchStart, CallOutcome, Input, PartKind, Pause, Placement, Record, Redo,
     Resumed, RunEnd, RunStart, SetupStub, StepEnd, StepStart, ToolIntent, ToolOutcome, ToolReply,
 };
 use broca_session_store::session::SessionError;
@@ -98,6 +98,9 @@ pub struct Finished {
     pub reason: RunFinishReason,
     pub usage: Option<Usage>,
     pub retries_used: u32,
+    /// Why the run paused, when it paused rather than ended. A paused run reports
+    /// `Interrupted` as its reason, as today's loop does, and resumes as the same run.
+    pub paused: Option<PauseReason>,
 }
 
 #[derive(Debug)]
@@ -160,6 +163,9 @@ where
         Resolution::Idle(reason) => finish(writer, seams, &admission.run_id, reason).await,
         Resolution::Interrupted(_) => close_interrupted(writer, seams, &admission.run_id).await,
         Resolution::ProviderHeld(_) => Err(LoopError::Unsupported("calls a provider holds")),
+        Resolution::Paused(PauseReason::AuthRequired) => {
+            drive(writer, parts, &admission, seams).await
+        }
         Resolution::Paused(_) => Err(LoopError::Unsupported("a paused run")),
     }
 }
@@ -440,8 +446,17 @@ where
                 return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await;
             }
             Err(StepFailure::Error(error)) => {
+                // A failed sign-in pauses the run: after the credential is refreshed, it resumes
+                // as the same run, asking for this step again.
                 if error.class == broca_protocol::ErrorClass::Auth {
-                    return Err(LoopError::Unsupported("a pause for re-authentication"));
+                    return pause(
+                        writer,
+                        seams,
+                        &admission.run_id,
+                        PauseReason::AuthRequired,
+                        Some(*error),
+                    )
+                    .await;
                 }
                 let now = (seams.now_ms)();
                 let mut record = run_end(writer, &admission.run_id, RunFinishReason::Error, now);
@@ -1063,7 +1078,59 @@ fn finished<W: Writer>(writer: &W, reason: RunFinishReason) -> Finished {
         reason,
         usage: (run.completed_steps > 0).then_some(run.usage),
         retries_used: run.retries_used,
+        paused: None,
     }
+}
+
+/// Pauses the run at a boundary, durably, before the run reports it. A caller's cancel wins
+/// until the pause is durable: the run then ends cancelled instead, so nobody is left with a
+/// paused run they already abandoned. Messages steered in stay unplaced, for the resume.
+async fn pause<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+    reason: PauseReason,
+    error: Option<ProviderError>,
+) -> Result<Finished, LoopError> {
+    let error = error
+        .map(|error| serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string())))
+        .transpose()?;
+    let cancelled_now = seams.cancel.is_cancelled();
+    let mut cancelled_end = Some(run_end(
+        writer,
+        run_id,
+        RunFinishReason::Cancelled,
+        (seams.now_ms)(),
+    ));
+    let mut pause = Some(Record::Pause(Pause {
+        run_id: run_id.into(),
+        reason,
+        ts_ms: Some((seams.now_ms)()),
+        error,
+        account_limit: None,
+    }));
+    let owned_run_id = run_id.to_string();
+    let batch = writer
+        .append_with(
+            &mut |_, operations| {
+                let run = operations.run.as_ref().expect("a run is active");
+                if cancelled_now || run.cancel.is_some() {
+                    let mut batch = placed_copies(operations, &owned_run_id);
+                    batch.extend(cancelled_end.take());
+                    batch
+                } else {
+                    pause.take().into_iter().collect()
+                }
+            },
+            true,
+        )
+        .await?;
+    if matches!(batch.last(), Some(Record::RunEnd(_))) {
+        return Ok(finished(writer, RunFinishReason::Cancelled));
+    }
+    let mut paused = finished(writer, RunFinishReason::Interrupted);
+    paused.paused = Some(reason);
+    Ok(paused)
 }
 
 /// Appends the run's end, durable before the run reports it.
