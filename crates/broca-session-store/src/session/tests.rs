@@ -6,7 +6,6 @@ use crate::backend::{LocalBackend, MemoryBackend, SessionAddr, SessionBackend};
 use crate::codec::Message as _;
 use crate::head::SessionTriple;
 use crate::keys::DeploymentKey;
-use crate::log::LogEnd;
 use crate::record::{Event, Input, Placement, Record};
 
 fn triple() -> SessionTriple {
@@ -187,7 +186,8 @@ fn a_torn_tail_is_cut_on_load() {
     assert_eq!(texts(&session.conversation.messages), ["one", "two"]);
 }
 
-/// A flipped byte in a synced batch is damage, and loading refuses without changing anything.
+/// A flipped byte in the last batch is damage. No later frame claims that batch durable, so it is
+/// debris that only a recovery may repair: loading refuses without changing anything.
 #[test]
 fn damage_refuses_and_changes_nothing() {
     let backend = MemoryBackend::default();
@@ -202,7 +202,7 @@ fn damage_refuses_and_changes_nothing() {
     backend.set_log(&addr(), &log, bytes.clone());
     let error = block_on(Session::load(&backend, addr(), &triple(), &deployment())).err();
     assert!(
-        matches!(error, Some(SessionError::Damaged(LogEnd::Damaged { .. }))),
+        matches!(error, Some(SessionError::NeedsRecovery)),
         "{error:?}"
     );
     assert_eq!(

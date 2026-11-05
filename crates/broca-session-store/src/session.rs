@@ -28,7 +28,7 @@ use crate::fold::operations::Operations;
 use crate::head::{self, Head, HeadError, OpenLog, Residence, SessionTriple, WrappedKey};
 use crate::idindex::OpenIds;
 use crate::keys::{self, random_id, DataKey, DeploymentKey};
-use crate::log::{self, ChainBase, LogEncoder, LogEnd, LogError, ReadLog};
+use crate::log::{ChainBase, LogEncoder, LogEnd, LogError, ReadLog};
 use crate::record::{ChangeAborted, Record, Stream, WriterOpened};
 
 /// The id of every session's first data key. The data key never rotates.
@@ -60,6 +60,17 @@ pub enum SessionError {
     Index(crate::idindex::IndexError),
     /// A revert was refused; nothing was written.
     RevertRefused(revert::RevertRefusal),
+    /// The open log holds debris, or a recovery a crash interrupted: run
+    /// [`Session::recover`], then load again.
+    NeedsRecovery,
+    /// Bytes a barrier acknowledged are damaged, from `at`. Nothing was changed; an operator has
+    /// to look.
+    Corrupt {
+        at: u64,
+        durable_bound: u64,
+    },
+    /// The open log's checkpoint is damaged, and rebuilding it isn't built yet.
+    CheckpointLost,
 }
 
 impl From<BackendError> for SessionError {
@@ -72,6 +83,15 @@ impl From<LogError> for SessionError {
     fn from(error: LogError) -> Self {
         Self::Log(error)
     }
+}
+
+/// The chain base a log's checkpoint names: each stream's last record before the log.
+fn chain_base(body: &[u8]) -> Result<ChainBase, String> {
+    let checkpoint = Checkpoint::decode(body).map_err(|e| e.to_string())?;
+    Ok(ChainBase {
+        transcript: checkpoint.transcript_base,
+        ledger: checkpoint.ledger_base,
+    })
 }
 
 /// What frames authenticate together with their header: the session id and the log's name.
@@ -245,6 +265,9 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         if &head.triple != triple {
             return Err(SessionError::TripleMismatch);
         }
+        if let Residence::Recovering(_) = head.residence {
+            return Err(SessionError::NeedsRecovery);
+        }
         if let Residence::Creating(log) = head.residence {
             // Creation crashed before its commit, so the session has no records yet. New
             // sessions keep delivered text apart from tool results.
@@ -263,22 +286,23 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let bytes = backend.read_log(&addr, &open.change, 0..end).await?;
         let bind = log_bind(&head.session_id, &open.change);
         let frame_key = key.frame_key();
-        let mut checkpoint = None;
-        let read = log::read(&bytes, &frame_key, &bind, open.synced_len, |body| {
-            let decoded = Checkpoint::decode(body).map_err(|e| e.to_string())?;
-            let base = ChainBase {
-                transcript: decoded.transcript_base,
-                ledger: decoded.ledger_base,
-            };
-            checkpoint = Some(decoded);
-            Ok(base)
-        })?;
-        let checkpoint = checkpoint.ok_or(SessionError::Damaged(read.end.clone()))?;
-        match read.end {
-            LogEnd::Clean => {}
-            LogEnd::TornTail { at } if at >= read.durable_bound => {}
-            ref end => return Err(SessionError::Damaged(end.clone())),
-        }
+        // A clean log, or one ending in a torn tail (a write cut short, or zero-filled blocks),
+        // opens; debris needs a recovery first, and damage to acknowledged bytes refuses.
+        let read = match crate::damage::analyse(
+            &bytes,
+            &frame_key,
+            &bind,
+            open.synced_len,
+            chain_base,
+            None,
+        )? {
+            crate::damage::Verdict::Opens(read) => read,
+            crate::damage::Verdict::Debris(_) => return Err(SessionError::NeedsRecovery),
+            crate::damage::Verdict::Corrupt { at, durable_bound } => {
+                return Err(SessionError::Corrupt { at, durable_bound })
+            }
+        };
+        let checkpoint = Checkpoint::decode(&read.checkpoint).map_err(SessionError::Checkpoint)?;
 
         let last_seq = read.records.last().map(|(seq, _)| *seq);
         let next_seq = head
@@ -485,6 +509,8 @@ mod read;
 pub use read::StoredEntry;
 mod cold;
 pub use cold::Cold;
+mod recover;
+pub use recover::{Recovered, Recovery, REMOVED_KEEP_MS};
 mod revert;
 pub use revert::{RevertRefusal, Reverted};
 mod seal;

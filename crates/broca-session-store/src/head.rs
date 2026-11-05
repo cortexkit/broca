@@ -89,6 +89,10 @@ crate::oneof! {
         1 Local(()),
         /// Creating the session crashed before its commit; the log it was creating is named.
         2 Creating(Id128),
+        /// A recovery (see `session::recover`) began and hasn't committed; its change is named.
+        /// Only a recovery opens the session in this state: it deletes what that change created
+        /// and recovers again from the unchanged damaged log.
+        3 Recovering(Id128),
     }
 }
 

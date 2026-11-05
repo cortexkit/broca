@@ -96,6 +96,9 @@ values! {
         5 Imported,
         /// A queued send delivered as a turn-scoped system entry (delivery mode `turn_system`).
         6 DeliveredTurnSystem,
+        /// Written by a recovery that may have lost records (see `session::recover`): storage
+        /// damage removed records, and actions near the end may have run unrecorded.
+        7 DamageNotice,
     }
 }
 
@@ -888,6 +891,9 @@ crate::values! {
         /// prunes finished runs' opaque reasoning from the transcript it keeps open (see
         /// `session::cold`).
         4 Cold,
+        /// Repairs a damaged open log (see `session::recover`). Its intent lives in the head, not
+        /// in the damaged log, which nothing writes to again.
+        5 Recover,
     }
 }
 
@@ -920,6 +926,36 @@ message! {
         4 req ordinal: u64,
         /// The session's history version after the revert.
         5 req history_version: u64,
+    }
+}
+
+message! {
+    /// A recovery replaced a damaged open log (see `session::recover`). Only the recovery's own
+    /// ledger segment holds this record.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct RecoveryCut {
+        1 req change: crate::codec::Id128,
+        /// The first damaged byte of the replaced log, and its durable bound.
+        2 req at: u64,
+        3 req durable_bound: u64,
+        /// Seqs from `removed_from` through `removed_through` that the new log doesn't hold are
+        /// removed: they were in the damaged bytes, or were never issued. Records written after
+        /// the recovery take seqs above `removed_through`.
+        4 req removed_from: u64,
+        5 req removed_through: u64,
+        /// Some record may have been lost, so open work was closed and a damage notice written.
+        6 req loss_aware: bool,
+        /// When transcript records may have been lost: the first transcript seq dropped, the
+        /// ordinal from which the compaction provider must read again, and the new history
+        /// version.
+        7 opt transcript_from: u64,
+        8 opt ordinal: u64,
+        9 opt history_version: u64,
+        /// The ledger may have lost records of actions no surviving record identifies: an action
+        /// may have run without any record of it.
+        10 req unattributed_risk: bool,
+        /// The object holding the replaced log's bytes from `at` on, kept for an operator.
+        11 req saved: String,
     }
 }
 
@@ -997,6 +1033,7 @@ records! {
         89 ChangeIntent,
         90 ChangeAborted,
         91 TranscriptReverted,
+        92 RecoveryCut,
     }
 }
 

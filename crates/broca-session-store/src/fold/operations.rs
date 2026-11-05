@@ -486,6 +486,14 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// A recovery couldn't rule out that the ledger lost records of actions no surviving
+        /// record identifies, so an action may have run with no record of it. Only an operator
+        /// clears it.
+        9 req pub unattributed_risk: bool => {
+            owner: "recovery",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -545,6 +553,18 @@ impl Operations {
                     version: view.version,
                     checksum: view.checksum.clone(),
                 });
+            }
+            Record::RecoveryCut(cut) => {
+                if let Some(ordinal) = cut.ordinal {
+                    self.transcript_changed = Some(
+                        self.transcript_changed
+                            .map_or(ordinal, |owed| owed.min(ordinal)),
+                    );
+                }
+                if let Some(version) = cut.history_version {
+                    self.history_version = version;
+                }
+                self.unattributed_risk |= cut.unattributed_risk;
             }
             Record::TranscriptReverted(reverted) => {
                 self.transcript_changed = Some(
