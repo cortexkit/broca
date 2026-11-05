@@ -55,6 +55,19 @@ struct ScriptedProvider {
     /// Whether the run downgraded its strict structured-output schema; the frozen config the
     /// provider reports is downgraded from then on, as a real provider's is.
     downgraded: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this provider has refused the strict schema's grammar.
+    refused: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Whether `script` is the provider refusing the strict schema's grammar.
+fn is_grammar_refusal(script: &[NormalizedEvent]) -> bool {
+    script.iter().any(|event| {
+        matches!(
+            event,
+            NormalizedEvent::Control(ProviderControl::Error { error, .. })
+                if error.provider_code.as_deref() == Some(GRAMMAR_REFUSED)
+        )
+    })
 }
 
 impl ScriptedProvider {
@@ -63,6 +76,7 @@ impl ScriptedProvider {
             scripts: Arc::new(Mutex::new(scripts.into())),
             sent: Arc::new(Mutex::new(Vec::new())),
             downgraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -106,7 +120,31 @@ impl Provider for ScriptedProvider {
 
     async fn step(&self, _step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         self.sent.lock().unwrap().push(opts.clone());
-        let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
+        let script = {
+            let mut scripts = self.scripts.lock().unwrap();
+            let downgraded = self.downgraded.load(std::sync::atomic::Ordering::SeqCst);
+            let strict = structured().is_some_and(|structured| structured["delivery"] == "strict");
+            // A downgraded provider no longer sends the strict schema, so the grammar refusal
+            // scripted for it never comes; one that wasn't downgraded after a refusal still
+            // sends it, and is refused again.
+            if downgraded
+                && scripts
+                    .front()
+                    .is_some_and(|script| is_grammar_refusal(script))
+            {
+                scripts.pop_front();
+            }
+            if strict && !downgraded && self.refused.load(std::sync::atomic::Ordering::SeqCst) {
+                grammar_refused()
+            } else {
+                let script = scripts.pop_front().unwrap_or_default();
+                if is_grammar_refusal(&script) {
+                    self.refused
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                script
+            }
+        };
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             for event in script {
