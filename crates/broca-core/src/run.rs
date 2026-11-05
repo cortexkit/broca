@@ -10940,7 +10940,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
 ) -> Result<BatchOutcome, RunError> {
     let batch_id = tool_batch_id(run_id, step_id);
     let ctx = BatchCtx {
-        media_capture: writer.media_capture(),
+        media_capture: writer.tool_media_capture(),
         batch_id: batch_id.clone(),
         bind: session.clone(),
         run_id: run_id.clone(),
@@ -17787,7 +17787,7 @@ mod approval_gate {
             .await;
         }
         let ctx = BatchCtx {
-            media_capture: writer.media_capture(),
+            media_capture: writer.tool_media_capture(),
             batch_id: tool_batch_id(run_id, step),
             bind: session.clone(),
             run_id: run_id.clone(),
@@ -19254,7 +19254,7 @@ mod approval_gate {
                     &projected.run_id,
                 ) {
                     let ctx = BatchCtx {
-                        media_capture: writer.media_capture(),
+                        media_capture: writer.tool_media_capture(),
                         batch_id: batch_id.clone(),
                         bind: bind.clone(),
                         run_id: run_id.clone(),
@@ -19328,7 +19328,7 @@ mod approval_gate {
                 ) = (&call.elicitation_id, &call.run_id, call.prepared.as_ref())
                 {
                     let ctx = BatchCtx {
-                        media_capture: writer.media_capture(),
+                        media_capture: writer.tool_media_capture(),
                         batch_id: batch_id.clone(),
                         bind: session.clone(),
                         run_id: run_id.clone(),
@@ -19375,7 +19375,7 @@ mod approval_gate {
                 backoff: 50,
             };
             let ctx = BatchCtx {
-                media_capture: writer.media_capture(),
+                media_capture: writer.tool_media_capture(),
                 batch_id: BatchId(format!("late:{key}")),
                 bind: session.clone(),
                 run_id: projected
@@ -19520,7 +19520,7 @@ mod approval_gate {
                 );
                 writer.sync().await?;
                 let ctx = call.ctx(&BatchCtx {
-                    media_capture: writer.media_capture(),
+                    media_capture: writer.tool_media_capture(),
                     batch_id: BatchId(format!("late:{}", call.key)),
                     bind: session.clone(),
                     run_id: projected.run_id.clone().expect("originating run"),
@@ -19564,7 +19564,7 @@ mod approval_gate {
                 })
                 .ok_or_else(|| RunError::Wal("late execution lacks RunStarted".into()))?;
             let ctx = call.ctx(&BatchCtx {
-                media_capture: writer.media_capture(),
+                media_capture: writer.tool_media_capture(),
                 batch_id: BatchId(format!("late:{key}")),
                 bind: session.clone(),
                 run_id: originating.0,
@@ -19967,7 +19967,7 @@ async fn pause_approval(
         _ => return Err(RunError::Wal("approval pause lacks open calls".into())),
     };
     let ctx = BatchCtx {
-        media_capture: writer.media_capture(),
+        media_capture: writer.tool_media_capture(),
         batch_id,
         bind: session.clone(),
         run_id: run.clone(),

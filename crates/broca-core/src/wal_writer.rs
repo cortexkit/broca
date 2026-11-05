@@ -3883,6 +3883,15 @@ impl WalHandle {
         self.media_capture.clone()
     }
 
+    /// The session's media capture, as a batch hands it to the tool plane.
+    pub fn tool_media_capture(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::tool_media::MediaCapture>> {
+        self.media_capture.clone().map(|capture| {
+            std::sync::Arc::new(capture) as std::sync::Arc<dyn crate::tool_media::MediaCapture>
+        })
+    }
+
     pub(crate) fn bind_media_capture(&mut self, store: &impl WalStore, session: &BindIdentity) {
         self.media_capture = store
             .uploads()

@@ -38,8 +38,10 @@ pub struct BatchCtx {
     /// an unscoped run. A plane opens every provider route for this batch under exactly this
     /// scope, and never opens an unscoped route for a scoped run.
     pub scope: Option<SessionScope>,
-    /// Session-owned publication and registration, shared by ordinary and late calls.
-    pub media_capture: Option<crate::tool_media::ToolMediaCapture>,
+    /// Session-owned publication and registration, shared by ordinary and late calls. A plane
+    /// captures a result's media only when this is set; without it media arrives as placeholder
+    /// text.
+    pub media_capture: Option<std::sync::Arc<dyn crate::tool_media::MediaCapture>>,
 }
 
 /// A durable intent's identity, prepared as part of one dispatch barrier.

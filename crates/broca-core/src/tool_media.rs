@@ -136,6 +136,42 @@ impl ToolMediaCapture {
     }
 }
 
+/// Where a tool's media goes when a result arrives, and which references were captured for each
+/// call. The tool plane captures through it, and captures media at all only when a batch carries
+/// one. The run loop checks a completed result against `captured_for` before hooks or the log see
+/// it ([`enforce_provenance`]). [`ToolMediaCapture`] stores into today's session media store;
+/// another store can implement this.
+#[async_trait::async_trait]
+pub trait MediaCapture: Send + Sync + std::fmt::Debug {
+    /// Validates and stores `bytes`, durably, before the reference is returned. A failure
+    /// describes a tool that ran, so the caller shows it as a marker part, never as an unsent call.
+    async fn capture(
+        &self,
+        batch_id: &BatchId,
+        call_id: &ToolCallId,
+        bytes: Vec<u8>,
+        declared_mime: String,
+    ) -> Result<MediaRef, CaptureFailure>;
+    /// The exact references captured for this call, in capture order.
+    fn captured_for(&self, batch_id: &BatchId, call_id: &ToolCallId) -> Vec<MediaRef>;
+}
+
+#[async_trait::async_trait]
+impl MediaCapture for ToolMediaCapture {
+    async fn capture(
+        &self,
+        batch_id: &BatchId,
+        call_id: &ToolCallId,
+        bytes: Vec<u8>,
+        declared_mime: String,
+    ) -> Result<MediaRef, CaptureFailure> {
+        ToolMediaCapture::capture(self, batch_id, call_id, bytes, declared_mime).await
+    }
+    fn captured_for(&self, batch_id: &BatchId, call_id: &ToolCallId) -> Vec<MediaRef> {
+        ToolMediaCapture::captured_for(self, batch_id, call_id)
+    }
+}
+
 /// Only exact references produced for this call may survive into hook metadata
 /// and the WAL. Store existence, or a matching digest with altered metadata, is
 /// not evidence that a tool captured those bytes.
