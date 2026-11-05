@@ -190,7 +190,7 @@ where
                         step_id,
                         provider_message_id: step.message.message_id.clone(),
                         message: assistant,
-                        usage: Some(step.usage.clone()),
+                        usage: Some(step.usage),
                         written_at_ms: Some(now),
                         last_content_at_ms: None,
                         tags_v1: None,
@@ -200,7 +200,7 @@ where
                     Record::StepEnd(StepEnd {
                         run_id: admission.run_id.clone(),
                         step_id,
-                        usage: Some(step.usage.clone()),
+                        usage: Some(step.usage),
                         finish_reason: Some(step.finish_reason),
                         retries_used: step.retries_used,
                         service_tier_used: None,
@@ -675,7 +675,7 @@ fn run_end<W: Writer>(writer: &W, run_id: &str, reason: RunFinishReason, now: u6
     Record::RunEnd(RunEnd {
         run_id: run_id.into(),
         reason,
-        usage: (run.completed_steps > 0).then(|| run.usage.clone()),
+        usage: (run.completed_steps > 0).then(|| run.usage),
         ts_ms: Some(now),
         retries_used: run.retries_used,
         interrupt_reason: None,
@@ -688,7 +688,7 @@ fn finished<W: Writer>(writer: &W, reason: RunFinishReason) -> Finished {
     let run = run_state(writer);
     Finished {
         reason,
-        usage: (run.completed_steps > 0).then(|| run.usage.clone()),
+        usage: (run.completed_steps > 0).then(|| run.usage),
         retries_used: run.retries_used,
     }
 }
