@@ -108,6 +108,9 @@ pub struct Admission {
     /// Whether the run froze part numbers into the model's view. A caller leaves it false: a new
     /// run takes it from its plan. A run read back from its start carries what the start froze.
     pub render_tags: bool,
+    /// The tool-call and input budget the run froze, which the new loop doesn't apply yet, so a
+    /// run carrying one is refused. A caller leaves it `None`.
+    pub budget: Option<broca_protocol::request::BudgetConfig>,
 }
 
 /// The seams a run calls. None of them is owned by the run.
@@ -187,6 +190,7 @@ where
     T: ToolPlane,
 {
     refuse_first_protocol_compaction(writer)?;
+    refuse_unbuilt(&admission)?;
     // A session keeps the layout its first run started under; a new run on it freezes the view
     // library's current plan version, as today's loop does.
     let mut admission = admission;
@@ -271,6 +275,7 @@ where
         .as_ref()
         .ok_or(LoopError::Unsupported("a session with no run to resume"))?;
     let admission = frozen_admission(run, parts)?;
+    refuse_unbuilt(&admission)?;
     if let Some(reason) = run.finished {
         return Ok(finished(writer, reason));
     }
@@ -673,6 +678,8 @@ pub(crate) fn admission_of_start(
         render_tags: member("render_tags")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
+        budget: decode::<broca_protocol::request::BudgetConfig>(member("budget"))?
+            .filter(|budget| *budget != broca_protocol::request::BudgetConfig::default()),
     })
 }
 
@@ -685,6 +692,35 @@ fn refuse_first_protocol_compaction<W: Writer>(writer: &W) -> Result<(), LoopErr
     {
         return Err(LoopError::Unsupported(
             "a session compacted under the first compaction protocol",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses, by name, a run that needs a part of today's run loop the new loop hasn't built yet,
+/// rather than running it without that part: structured output, a tool-call or input budget, and
+/// the client-side refusal fallback. Each is read from what the run froze. A new run's caller
+/// can't ask for a budget here, so only a run read back from its start can carry one.
+fn refuse_unbuilt(admission: &Admission) -> Result<(), LoopError> {
+    let frozen = &admission.render_config;
+    if broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(Some(
+        frozen,
+    ))
+    .is_some()
+    {
+        return Err(LoopError::Unsupported("a run with structured output"));
+    }
+    if frozen
+        .get("refusal_fallback")
+        .is_some_and(|fallback| !fallback.is_null())
+    {
+        return Err(LoopError::Unsupported(
+            "a run with the client-side refusal fallback",
+        ));
+    }
+    if admission.budget.is_some() {
+        return Err(LoopError::Unsupported(
+            "a run with a tool-call or input budget",
         ));
     }
     Ok(())

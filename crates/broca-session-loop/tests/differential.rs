@@ -845,6 +845,7 @@ impl Scenario {
             global_system: Vec::new(),
             compaction_plan_version: layout(),
             render_tags: false,
+            budget: None,
             context_limit: compaction().map(|script| script.context_limit),
         }
     }
@@ -4368,7 +4369,10 @@ async fn two_runs_frozen_with_part_numbers_number_on_from_the_first() {
     scenario.steps.push(text_step("a3", "again"));
     compare_runs(
         scenario,
-        &[("r1", vec![user("read a")]), ("r2", vec![user("once more")])],
+        &[
+            ("r1", vec![user("read a")]),
+            ("r2", vec![user("once more")]),
+        ],
     )
     .await;
 }
