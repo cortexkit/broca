@@ -363,3 +363,73 @@ fn a_crash_at_any_point_of_a_seal_loads_to_before_or_after_it() {
     }
     assert!((1..15).contains(&committed), "{committed}");
 }
+
+/// A seal can carry ledger records into the new open log: they take fresh seqs after every
+/// record the seal read, fold into the state it installs, and a reload finds them in the open
+/// log, which a compaction view's full copy needs after its earlier changes are sealed out.
+#[test]
+fn a_seal_carries_ledger_records_into_the_new_log() {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let (mut session, cut) = history(&backend).await;
+        let applied = Record::ViewApplied(crate::record::ViewApplied {
+            step_id: 7,
+            version: 3,
+            checksum: "c3".into(),
+        });
+        let before = session.next_seq();
+        session
+            .seal_carrying(Some(cut), std::slice::from_ref(&applied), 1_000)
+            .await
+            .unwrap();
+        let carried = session
+            .open_log_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(_, record)| matches!(record, Record::ViewApplied(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(carried.len(), 1);
+        // Above the change's own intent, which took `before`.
+        assert!(carried[0].0 > before);
+        assert_eq!(
+            session
+                .operations
+                .view_applied
+                .as_ref()
+                .map(|slot| slot.view.version),
+            Some(3)
+        );
+        let written = state(&session);
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+            .await
+            .unwrap();
+        assert_eq!(state(&loaded), written);
+        // Only ledger records can be carried: the transcript a seal keeps is the cut's to decide.
+        assert!(matches!(
+            session
+                .seal_carrying(None, &[input("c", "late")], 2_000)
+                .await,
+            Err(super::SessionError::Fold(_))
+        ));
+    });
+}
+
+/// A seal at an entry's ordinal cuts at the record that places it: the third run's input is
+/// entry 5 (after two runs of an input and an answer each).
+#[test]
+fn a_seal_at_an_entry_cuts_where_that_entry_is_placed() {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let (mut session, cut) = history(&backend).await;
+        let sealed = session.seal_at_entry(5, &[], 1_000).await.unwrap();
+        assert_eq!(sealed.transcript_records, 4);
+        assert_eq!(texts(&session.conversation.messages), ["ask c", "c"]);
+        let (records, _, _) = session.read_open_log().await.unwrap();
+        assert_eq!(records[0].0, cut);
+        // An answer starts an entry too; an ordinal past the log places nothing.
+        let other_backend = MemoryBackend::default();
+        let (mut other, _) = history(&other_backend).await;
+        assert!(other.seal_at_entry(99, &[], 1_000).await.is_err());
+    });
+}

@@ -252,17 +252,142 @@ pub fn unavailable_error(message: &str) -> broca_protocol::ProviderError {
     }
 }
 
-/// The session's transcript as `session.entries` serves it, which today's compaction code reads:
-/// the window's messages and the assistant message whose tool calls are still running. Only the
-/// window, which until a seal at a compaction cut is the whole transcript.
-fn entries<W: Writer>(
-    writer: &W,
-) -> Result<Vec<cortexkit_role_compaction::read::Entry>, LoopError> {
-    broca_session_store::session::served_window(writer.conversation())
+/// What today's compaction code reads of the session's transcript: the entries, and the stored
+/// messages they match position by position.
+///
+/// The entries are the window's, in today's terms: the window, and the assistant message whose
+/// tool calls are still running. After a seal at a cut, the history before the window is sealed,
+/// and today's code still expects each view's cut target among the entries, so each target the
+/// views name before the window is read back and put in front, with its message. Every other
+/// edit naming a sealed entry is skipped by the renderer, which changes nothing: those entries
+/// are cut anyway, and the compaction provider never anchors an insert before an entry.
+struct Transcript {
+    entries: Vec<cortexkit_role_compaction::read::Entry>,
+    /// The sealed messages put in front of the window's, for the stored prompt, with ordinals.
+    sealed: Vec<(u64, broca_protocol::Message)>,
+}
+
+async fn transcript<W: Writer>(writer: &W, ctx: &Ctx) -> Result<Transcript, LoopError> {
+    let conversation = writer.conversation();
+    let window = broca_session_store::session::served_window(conversation);
+    let mut stored = Vec::new();
+    if conversation.window_start() > 1 {
+        let mut targets: Vec<String> = {
+            let state = ctx.session.state.lock().await;
+            [state.applied(), state.latest()]
+                .into_iter()
+                .flatten()
+                .flat_map(|view| &view.edits)
+                .filter_map(|edit| match &edit.op {
+                    cortexkit_role_compaction::view::EditOp::Cut { through } => {
+                        Some(through.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        targets.sort();
+        targets.dedup();
+        for mid in targets {
+            let entry = writer.entry_by_mid(&mid).await?.ok_or_else(|| {
+                LoopError::Parts(format!(
+                    "a compaction view cuts through {mid}, which the session doesn't hold"
+                ))
+            })?;
+            if entry.ordinal < conversation.window_start() {
+                stored.push(entry);
+            }
+        }
+        stored.sort_by_key(|entry| entry.ordinal);
+    }
+    let entries = stored
         .iter()
+        .chain(&window)
         .map(crate::entries::project)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(LoopError::Parts)
+        .map_err(LoopError::Parts)?;
+    let sealed = stored
+        .into_iter()
+        .map(|entry| (entry.ordinal, entry.message))
+        .collect();
+    Ok(Transcript { entries, sealed })
+}
+
+/// `opts` with the sealed messages a [`Transcript`] put in front of the window's prepended to its
+/// prompt, each stamped with its own position, so the stored prompt matches the entries.
+fn with_sealed(
+    mut opts: broca_protocol::request::CallOptions,
+    transcript: &Transcript,
+) -> broca_protocol::request::CallOptions {
+    if transcript.sealed.is_empty() {
+        return opts;
+    }
+    let mut prompt: Vec<_> = transcript
+        .sealed
+        .iter()
+        .map(|(ordinal, message)| {
+            let mut message = message.clone();
+            message.ordinal = Some(ordinal - 1);
+            message
+        })
+        .collect();
+    prompt.extend(opts.prompt.iter().cloned());
+    opts.prompt = prompt;
+    opts
+}
+
+/// Seals the session's history before a cut the step just applied, and starts the new open log
+/// with full copies of both view slots: a seal moves the ledger out, and a stored view is a
+/// change against the views before it. The copies go applied view first, then the step that
+/// applied it, then the accepted view, so today's fold rebuilds both slots from them.
+pub async fn seal_at_cut<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    ctx: &Ctx,
+    first_kept_ordinal: u64,
+) -> Result<(), LoopError> {
+    let step = writer
+        .operations()
+        .view_applied
+        .as_ref()
+        .ok_or_else(|| LoopError::Parts("a cut was marked with no view applied".into()))?
+        .step_id;
+    let carry = {
+        let state = ctx.session.state.lock().await;
+        let applied = state
+            .applied_received()
+            .ok_or_else(|| LoopError::Parts("a cut was marked with no view applied".into()))?;
+        let full = |previous: Option<&ReceivedView>, view: &ReceivedView| {
+            serde_json::to_value(v2::storage::encode(previous, view))
+                .map(|edits| {
+                    Record::View(View {
+                        version: view.view().version,
+                        checksum: view.view().checksum.clone(),
+                        edits,
+                    })
+                })
+                .map_err(|error| LoopError::Parts(error.to_string()))
+        };
+        let mut carry = vec![
+            full(None, applied)?,
+            Record::ViewApplied(ViewApplied {
+                step_id: step,
+                version: applied.view().version,
+                checksum: applied.view().checksum.clone(),
+            }),
+        ];
+        if let Some(latest) = state
+            .latest_received()
+            .filter(|latest| latest.view().version != applied.view().version)
+        {
+            carry.push(full(Some(applied), latest)?);
+        }
+        carry
+    };
+    writer
+        .seal_at_entry(first_kept_ordinal, &carry, (seams.now_ms)())
+        .await?;
+    Ok(())
 }
 
 /// The run's frozen choices in the shape today's compaction conditions read. Its model
@@ -328,7 +453,7 @@ pub async fn apply_boundary<W: Writer, P, T>(
     ctx: &Ctx,
     step: u64,
 ) -> Result<Result<(), String>, LoopError> {
-    let entries = entries(writer)?;
+    let entries = transcript(writer, ctx).await?.entries;
     let conditions = match v2::host::conditions_of(&frozen(admission), &entries, false) {
         Ok(conditions) => conditions,
         Err(message) => return Ok(Err(message)),
@@ -362,7 +487,9 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     step: u64,
     opts: broca_protocol::request::CallOptions,
 ) -> Result<Send, LoopError> {
-    let entries = entries(writer)?;
+    let transcript = transcript(writer, ctx).await?;
+    let opts = with_sealed(opts, &transcript);
+    let entries = transcript.entries;
     let chained = seams.provider.history_edit_cost()
         == Some(broca_core::compaction_provider::notice::HistoryEditCost::FullResend);
     let conditions = match v2::host::conditions_of(&frozen(admission), &entries, chained) {
@@ -451,7 +578,7 @@ pub async fn notice<W: Writer, P, T>(
     if admission.context_limit.is_none() {
         return Ok(());
     }
-    let entries = entries(writer)?;
+    let entries = transcript(writer, ctx).await?.entries;
     let conditions =
         v2::host::conditions_of(&frozen(admission), &entries, false).map_err(LoopError::Parts)?;
     let applied = ctx.session.state.lock().await.applied_identity();

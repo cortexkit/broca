@@ -138,6 +138,22 @@ impl<W: Writer> Writer for Placed<'_, W> {
         self.inner.run_start(run_id).await
     }
 
+    async fn seal_at_entry(
+        &mut self,
+        ordinal: u64,
+        carry: &[Record],
+        now_ms: u64,
+    ) -> Result<(), SessionError> {
+        self.inner.seal_at_entry(ordinal, carry, now_ms).await
+    }
+
+    async fn entry_by_mid(
+        &self,
+        mid: &str,
+    ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
+        self.inner.entry_by_mid(mid).await
+    }
+
     fn media(&self) -> Option<std::sync::Arc<dyn broca_core::tool_media::MediaCapture>> {
         self.inner.media()
     }

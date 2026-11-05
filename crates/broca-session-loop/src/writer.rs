@@ -65,6 +65,22 @@ pub trait Writer {
         run_id: &str,
     ) -> Result<Option<broca_session_store::record::RunStart>, SessionError>;
 
+    /// Seals the session's history before the entry with ordinal `ordinal`, starting the new
+    /// open log with `carry` (see `Session::seal_at_entry`).
+    async fn seal_at_entry(
+        &mut self,
+        ordinal: u64,
+        carry: &[Record],
+        now_ms: u64,
+    ) -> Result<(), SessionError>;
+
+    /// The entry whose message id is `mid`, read back from sealed history when it's no longer in
+    /// the window. `None` when no entry of the session has that id.
+    async fn entry_by_mid(
+        &self,
+        mid: &str,
+    ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError>;
+
     /// Where the tool plane captures a result's media. A writer that offers one stores, when it
     /// appends a call's result, the bytes of every media part captured for that call, durable
     /// before the record. Without one nothing is captured, so every media part of a result
@@ -125,6 +141,27 @@ impl<B: SessionBackend> Writer for Session<'_, B> {
 
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
         Session::open_log_records(self).await
+    }
+
+    async fn seal_at_entry(
+        &mut self,
+        ordinal: u64,
+        carry: &[Record],
+        now_ms: u64,
+    ) -> Result<(), SessionError> {
+        Session::seal_at_entry(self, ordinal, carry, now_ms)
+            .await
+            .map(|_| ())
+    }
+
+    async fn entry_by_mid(
+        &self,
+        mid: &str,
+    ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
+        let Some(ordinal) = self.find_message(mid).await? else {
+            return Ok(None);
+        };
+        Ok(self.entries(ordinal, 1).await?.into_iter().next())
     }
 
     async fn run_start(

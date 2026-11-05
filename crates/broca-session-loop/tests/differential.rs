@@ -997,6 +997,22 @@ impl Writer for Recording<'_, '_> {
     ) -> Result<Option<broca_session_store::record::RunStart>, SessionError> {
         Writer::run_start(&*self.session, run_id).await
     }
+
+    async fn seal_at_entry(
+        &mut self,
+        ordinal: u64,
+        carry: &[Record],
+        now_ms: u64,
+    ) -> Result<(), SessionError> {
+        Writer::seal_at_entry(&mut *self.session, ordinal, carry, now_ms).await
+    }
+
+    async fn entry_by_mid(
+        &self,
+        mid: &str,
+    ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
+        Writer::entry_by_mid(&*self.session, mid).await
+    }
     fn media(&self) -> Option<Arc<dyn MediaCapture>> {
         Some(Arc::clone(&self.media) as Arc<dyn MediaCapture>)
     }

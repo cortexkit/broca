@@ -904,11 +904,24 @@ where
             compaction.is_some(),
         )?;
         if let Some(ctx) = compaction {
+            let marked = writer.conversation().marker.clone();
             match crate::compaction::prepare(writer, admission, seams, ctx, step_id, opts).await? {
                 crate::compaction::Send::Ready(ready) => opts = *ready,
                 crate::compaction::Send::Unavailable(message) => {
                     return compaction_unavailable(writer, seams, admission, &message).await;
                 }
+            }
+            // The step applied a view with a new cut: the history before its first kept entry
+            // is sealed now, before the request goes out; the request is already built, so this
+            // changes none of its bytes.
+            if let Some(marker) = writer
+                .conversation()
+                .marker
+                .clone()
+                .filter(|marker| Some(marker) != marked.as_ref())
+            {
+                crate::compaction::seal_at_cut(writer, seams, ctx, marker.first_kept_ordinal)
+                    .await?;
             }
         }
         let outcome = model_step(writer, seams, &admission.run_id, step_id, opts).await?;
@@ -1209,11 +1222,17 @@ async fn admit<W: Writer>(
 async fn shown_high<W: Writer>(writer: &W, parts: &dyn Parts) -> Result<u64, LoopError> {
     let conversation = writer.conversation();
     let start = conversation.window_start();
-    if start > 1 {
-        return Err(LoopError::Unsupported(
-            "a new run after the session's history was sealed",
-        ));
-    }
+    // History before the window was sealed at a compaction cut, whose marker records the highest
+    // number shown through it; numbers never change at a cut.
+    let sealed_high = match (start > 1, &conversation.marker) {
+        (false, _) => 0,
+        (true, Some(marker)) => marker.checkpoint,
+        (true, None) => {
+            return Err(LoopError::Unsupported(
+                "a new run after history was sealed without a compaction cut",
+            ))
+        }
+    };
     // Each window run's frozen choices: whether it rendered numbers (its start's run config), and
     // whether its replies were cleaned (that and its render config).
     let rendered = render_episodes(writer, parts)?;
@@ -1229,10 +1248,11 @@ async fn shown_high<W: Writer>(writer: &W, parts: &dyn Parts) -> Result<u64, Loo
         let render = choices["config"]["render_tags"].as_bool().unwrap_or(false);
         let clean =
             broca_core::compaction_v2::metadata::clean_replies(render, &render_input.frozen_config);
-        runs.push(((episode.start - start) as usize, render, clean));
+        runs.push(((episode.start - 1) as usize, render, clean));
     }
-    let mut high = 0;
+    let mut high = sealed_high;
     for (index, message) in conversation.messages.iter().enumerate() {
+        let index = index + (start - 1) as usize;
         // The run that placed this message is the last one starting at or before it.
         let (render, clean) = runs
             .iter()
@@ -1257,12 +1277,13 @@ fn render_episodes<W: Writer>(
     parts: &dyn Parts,
 ) -> Result<Vec<EpisodeRenderInput>, LoopError> {
     let conversation = writer.conversation();
-    let start = conversation.window_start();
     conversation
         .episodes
         .iter()
         .map(|episode| {
-            let index = |ordinal: u64| (ordinal - start) as usize;
+            // Positions count from the session's first message, as today's: once history is
+            // sealed at a cut, the window's first message keeps its place.
+            let index = |ordinal: u64| (ordinal - 1) as usize;
             Ok(EpisodeRenderInput {
                 prompt_start: index(episode.start),
                 first_user: episode.first_user.map(index),
@@ -1289,7 +1310,11 @@ fn call_options<W: Writer, P, T>(
 ) -> Result<CallOptions, LoopError> {
     let mut prompt = writer.conversation().messages.clone();
     repetition_guidance(&mut prompt, episodes);
-    stamp_ordinals_from(&mut prompt, 0);
+    // Each message keeps its place in the session, which the window may start after.
+    stamp_ordinals_from(
+        &mut prompt,
+        (writer.conversation().window_start() - 1) as usize,
+    );
     TagNumbering::for_run(
         &[],
         Some(ComputedRules {

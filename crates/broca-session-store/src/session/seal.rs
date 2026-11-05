@@ -115,11 +115,30 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     /// the transcript records before it are sealed too; it must start an entry (a user input or
     /// an assistant message) with no assistant message waiting for replies before it.
     pub async fn seal(&mut self, cut: Option<u64>, now_ms: u64) -> Result<Sealed, SessionError> {
+        self.seal_carrying(cut, &[], now_ms).await
+    }
+
+    /// [`Session::seal`], starting the new open log with `carry` after its checkpoint: ledger
+    /// records the caller needs whole in the open log and that the seal would otherwise move
+    /// out, such as full copies of compaction views whose stored edits are changes against
+    /// earlier views. They take fresh seqs, and they're part of the change, so the log never
+    /// exists without them.
+    pub async fn seal_carrying(
+        &mut self,
+        cut: Option<u64>,
+        carry: &[Record],
+        now_ms: u64,
+    ) -> Result<Sealed, SessionError> {
         if self.poisoned {
             return Err(SessionError::Poisoned);
         }
         if self.operations.open_change.is_some() {
             return Err(SessionError::ChangeOpen);
+        }
+        if carry.iter().any(|record| record.stream() != Stream::Ledger) {
+            return Err(SessionError::Fold(
+                "a seal carries only ledger records into the new log".into(),
+            ));
         }
         let open = self.read_open_log().await?;
         if let Some(cut) = cut {
@@ -130,7 +149,23 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         } else {
             ChangeKind::LedgerSeal
         };
-        self.seal_read(kind, cut, false, open, now_ms).await
+        self.seal_read(kind, cut, false, carry, open, now_ms).await
+    }
+
+    /// [`Session::seal_carrying`] at or before the open-log entry with ordinal `ordinal`: the
+    /// transcript records before it are sealed. A compaction cut names its first kept entry this
+    /// way. A log can only start at an input or an assistant message with no tool turn open
+    /// before it, so when that entry is a tool turn's results, the seal falls at the nearest
+    /// earlier entry that can start one: it may keep more than the cut keeps, never less.
+    pub async fn seal_at_entry(
+        &mut self,
+        ordinal: u64,
+        carry: &[Record],
+        now_ms: u64,
+    ) -> Result<Sealed, SessionError> {
+        let (records, _, checkpoint) = self.read_open_log().await?;
+        let cut = placing_seq(&checkpoint, &records, ordinal)?;
+        self.seal_carrying(Some(cut), carry, now_ms).await
     }
 
     /// Runs a seal over an open log already read. `prune_window` also prunes finished runs'
@@ -141,6 +176,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         kind: ChangeKind,
         cut: Option<u64>,
         prune_window: bool,
+        carry: &[Record],
         open: OpenLogRead,
         now_ms: u64,
     ) -> Result<Sealed, SessionError> {
@@ -156,6 +192,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 change,
                 cut,
                 prune_window,
+                carry,
                 intent_seq,
                 &records,
                 &batches,
@@ -230,6 +267,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         change: Id128,
         cut: Option<u64>,
         prune_window: bool,
+        carry: &[Record],
         intent_seq: u64,
         records: &[(u64, Record)],
         batches: &[std::ops::Range<usize>],
@@ -412,6 +450,21 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             sealed.kept_records += kept.len();
             bytes.extend(encoder.copy_batch(&kept)?.into_written(&mut encoder));
         }
+        // The carried ledger records follow as one batch with fresh seqs, above every record the
+        // seal read, and fold into the state the change installs.
+        let mut settled_after = settled_after;
+        let mut open_ids = OpenIds::default();
+        if !carry.is_empty() {
+            let first = encoder.next_seq();
+            bytes.extend(encoder.batch(carry)?.into_written(&mut encoder));
+            for (offset, record) in carry.iter().enumerate() {
+                let seq = first + offset as u64;
+                window.note(seq, record);
+                open_ids.add(seq, record);
+                super::apply(&mut conversation, &mut settled_after, seq, record)
+                    .map_err(SessionError::Fold)?;
+            }
+        }
         self.backend
             .append_log(&self.addr, &change, &bytes, 0, self.version, true)
             .await?;
@@ -425,7 +478,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             conversation,
             operations: settled_after,
             window,
-            open_ids: OpenIds::default(),
+            open_ids,
             transcript_dir,
             ledger_dir: ledger_sealed.ledger_dir,
             id_index: ledger_sealed.id_index,
@@ -710,6 +763,51 @@ impl<'b, B: SessionBackend> Session<'b, B> {
 }
 
 /// The checkpoint's conversation state folded over the log's transcript records before `cut`.
+/// The seq of the latest open-log record a log can start at that places an entry with ordinal at
+/// most `ordinal`: an input or an assistant message, with no tool turn open before it. Every
+/// entry the log knows counts: those it placed, and an assistant message waiting for its results.
+fn placing_seq(
+    checkpoint: &Checkpoint,
+    records: &[(u64, Record)],
+    ordinal: u64,
+) -> Result<u64, SessionError> {
+    let known = |conversation: &Conversation| {
+        conversation.placed + u64::from(conversation.open_tool_turn().is_some())
+    };
+    let mut conversation = checkpoint.conversation.clone();
+    let mut start = None;
+    let mut reached = false;
+    for (seq, record) in records {
+        if record.stream() != Stream::Transcript {
+            continue;
+        }
+        let before = known(&conversation);
+        let open_before = conversation.open_tool_turn().is_some();
+        conversation
+            .apply(record)
+            .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
+        let after = known(&conversation);
+        if after > before && before < ordinal {
+            if matches!(record, Record::Input(_) | Record::Assistant(_)) && !open_before {
+                start = Some(*seq);
+            }
+            reached |= after >= ordinal;
+        }
+        if reached {
+            break;
+        }
+    }
+    match (reached, start) {
+        (true, Some(seq)) => Ok(seq),
+        (true, None) => Err(SessionError::Fold(format!(
+            "no entry the open log holds up to {ordinal} can start a log"
+        ))),
+        (false, _) => Err(SessionError::Fold(format!(
+            "the open log places no entry {ordinal}"
+        ))),
+    }
+}
+
 fn conversation_at(
     checkpoint: &Checkpoint,
     records: &[(u64, Record)],
