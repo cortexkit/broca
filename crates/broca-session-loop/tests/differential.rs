@@ -2965,6 +2965,17 @@ impl broca_core::hooks::HookPlane for HarnessHooks {
         use cortexkit_role_step_transform_provider::answer::HookAnswer;
         use cortexkit_role_step_transform_provider::hook::Subject;
         use cortexkit_role_step_transform_provider::subscription::Phase;
+        if let Subject::PostTool { tool, .. } = &call.subject {
+            return match tool.as_str() {
+                "post_down" => Err(broca_core::hooks::HookUnavailable),
+                _ => Ok(HookAnswer::Ops {
+                    ops: vec![serde_json::from_value(
+                        json!({"op": "append", "block": 0, "text": " [checked by the harness hook]"}),
+                    )
+                    .unwrap()],
+                }),
+            };
+        }
         let Subject::PreTool { tool, phase, .. } = &call.subject else {
             return Ok(HookAnswer::Pass);
         };
@@ -2987,11 +2998,14 @@ fn harness_hooks() -> Arc<dyn broca_core::hooks::HookPlane> {
 }
 
 /// A planned manifest whose one hook provider subscribes to the pre-tool mutate phase (passing
-/// when unavailable) and validate phase (refusing when unavailable).
+/// when unavailable) and validate phase (refusing when unavailable), and to post-tool hooks for
+/// `read` (passing when unavailable) and `post_down` (refusing when unavailable).
 fn hooked_manifest(tools: &[Tool]) -> Arc<broca_wal::PlanManifest> {
     let subscriptions = json!([
         {"hook": "pre_tool", "phase": "mutate", "ops": [], "on_unavailable": "pass", "budget_ms": 500},
         {"hook": "pre_tool", "phase": "validate", "ops": [], "on_unavailable": "refuse", "budget_ms": 500},
+        {"hook": "post_tool", "tools": ["read"], "ops": ["append", "prepend", "replace"], "on_unavailable": "pass", "budget_ms": 500},
+        {"hook": "post_tool", "tools": ["post_down"], "ops": ["append", "prepend", "replace"], "on_unavailable": "refuse", "budget_ms": 500},
     ]);
     let mut manifest = (*planned_manifest(tools)).clone();
     manifest.plan = broca_wal::OpaqueJson::from_json_text(
@@ -3050,4 +3064,46 @@ async fn pre_tool_hooks_mutate_deny_and_refuse_when_unavailable() {
 #[tokio::test]
 async fn every_cut_of_a_run_with_pre_tool_hooks_resumes_alike() {
     compare_every_cut(hooked_scenario()).await;
+}
+
+fn post_tool_scenario(mode: ExecutionMode) -> Scenario {
+    let tools = vec![tool("read", mode), tool("post_down", mode)];
+    Scenario {
+        input: vec![user("read a")],
+        manifest: Some(hooked_manifest(&tools)),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c2", "post_down", json!({"path": "b"})),
+                    call("c3", "read", json!({"path": "c"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn post_tool_hooks_append_and_withhold_when_unavailable() {
+    compare(post_tool_scenario(ExecutionMode::Parallel)).await;
+}
+
+#[tokio::test]
+async fn sequential_post_tool_hooks_run_before_the_next_call() {
+    compare(post_tool_scenario(ExecutionMode::Sequential)).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_run_with_post_tool_hooks_resumes_alike() {
+    compare_every_cut(post_tool_scenario(ExecutionMode::Parallel)).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_sequential_run_with_post_tool_hooks_resumes_alike() {
+    compare_every_cut(post_tool_scenario(ExecutionMode::Sequential)).await;
 }

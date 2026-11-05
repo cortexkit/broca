@@ -112,7 +112,10 @@ pub fn pre_tool_refusal(
     (error_result(call, &message), reason)
 }
 
-fn transformed_tool_result(
+/// A tool result after its post-tool hooks: the edited text in the original output's form, or
+/// a withheld result when a hook the plan requires was unavailable. Also returns the outcome's
+/// reason code and the hook trace.
+pub fn transformed_tool_result(
     original: &ToolResult,
     output: &crate::hooks::ChainOutput,
 ) -> (ToolResult, Option<String>, Option<Box<broca_wal::Hooks>>) {
@@ -169,32 +172,7 @@ pub(super) async fn resolve_hooked<T: ToolPlane>(
     }
     let runtime = hooks.expect("subscribed implies an installed runtime");
     let original = Arc::clone(&resolution.result);
-    let text = match &original.output {
-        // Media provenance permits only captured references; legacy text hooks receive markers.
-        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
-            parts,
-            broca_protocol::MediaMarkerReason::Carrier,
-        ),
-        ToolOutput::Text { text } => text.clone(),
-        ToolOutput::Error {
-            message,
-            module,
-            code,
-            detail,
-            nothing_sent,
-            retry,
-            ..
-        } => ToolOutput::error_model_text(
-            message,
-            module.as_deref(),
-            code.as_deref(),
-            detail.as_deref(),
-            *nothing_sent,
-            retry.as_deref(),
-        ),
-        ToolOutput::Denied { reason } => format!("denied: {reason}"),
-        ToolOutput::Json { .. } => unreachable!(),
-    };
+    let text = post_tool_text(&original);
     let stage = crate::shutdown_seal::HookStage::PostTool {
         source_index,
         tool_call_id: original.tool_call_id.0.clone(),
@@ -249,5 +227,36 @@ pub(super) async fn record_hook_stage(
 ) {
     if !seal.record_hook(stage, writer, record) {
         std::future::pending::<()>().await;
+    }
+}
+
+/// The text a post-tool hook sees for a result: the model's text for it, with media as markers
+/// (provenance permits only captured references). Never called for a JSON result, which stays
+/// hookless.
+pub fn post_tool_text(result: &ToolResult) -> String {
+    match &result.output {
+        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
+            parts,
+            broca_protocol::MediaMarkerReason::Carrier,
+        ),
+        ToolOutput::Text { text } => text.clone(),
+        ToolOutput::Error {
+            message,
+            module,
+            code,
+            detail,
+            nothing_sent,
+            retry,
+            ..
+        } => ToolOutput::error_model_text(
+            message,
+            module.as_deref(),
+            code.as_deref(),
+            detail.as_deref(),
+            *nothing_sent,
+            retry.as_deref(),
+        ),
+        ToolOutput::Denied { reason } => format!("denied: {reason}"),
+        ToolOutput::Json { .. } => unreachable!("a JSON result has no post-tool hooks"),
     }
 }

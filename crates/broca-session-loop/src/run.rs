@@ -1460,6 +1460,8 @@ where
         batch_id: &batch_id,
         run_id,
         sequential,
+        hooks,
+        step_id,
     };
     let dispatched = dispatch_all(writer, seams, &plan).await?;
     let (answers, paused, closed) = match dispatched {
@@ -1488,6 +1490,9 @@ where
                         answer.reason,
                         Some(now),
                     );
+                    if let Some(Record::ToolOutcome(outcome)) = records.last_mut() {
+                        outcome.hooks = answer.hooks;
+                    }
                 }
             }
             CallPlan::Synthetic { result, reason } => terminal_with_reason(
@@ -2113,14 +2118,39 @@ struct DispatchPlan<'p> {
     batch_id: &'p str,
     run_id: &'p str,
     sequential: bool,
+    hooks: Option<&'p broca_core::hooks::HookRuntime<'p>>,
+    step_id: u64,
+}
+
+/// What a call resolved to, before the batch takes it: the result and outcome, the code the
+/// outcome records, and what its post-tool hooks did.
+struct Resolved {
+    result: ToolResult,
+    outcome: CallOutcome,
+    reason: Option<String>,
+    hooks: Option<Value>,
+}
+
+impl From<(ToolResult, CallOutcome)> for Resolved {
+    fn from((result, outcome): (ToolResult, CallOutcome)) -> Self {
+        Self {
+            result,
+            outcome,
+            reason: None,
+            hooks: None,
+        }
+    }
 }
 
 /// One call's answer.
 struct Answer {
     result: ToolResult,
     outcome: CallOutcome,
-    /// The code its outcome records, for a held call a cancel closed.
+    /// The code its outcome records: a held call a cancel closed, or a result a post-tool hook
+    /// withheld.
     reason: Option<String>,
+    /// What its post-tool hooks did, recorded on its outcome.
+    hooks: Option<Value>,
     /// Already appended: a held call's answer is durable as soon as it arrives.
     durable: bool,
 }
@@ -2204,6 +2234,7 @@ async fn dispatch_all<W: Writer, P, T: ToolPlane>(
                     result,
                     outcome,
                     reason: Some(code.into()),
+                    hooks: None,
                     durable: true,
                 });
             }
@@ -2216,20 +2247,21 @@ async fn dispatch_all<W: Writer, P, T: ToolPlane>(
             let interrupted = tripped && held.is_none();
             let key = key_of(call);
             jobs.push(async move {
-                let answer = if interrupted {
+                let answer: Resolved = if interrupted {
                     (
                         interrupted_result(&call.tool_call_id),
                         CallOutcome::Interrupted,
                     )
+                        .into()
                 } else if let Some(reply) = held {
                     match seams.held {
                         Some(lifecycle) => {
-                            resolve(call, lifecycle.wait(plan.ctx, call, reply).await)
+                            resolve(call, lifecycle.wait(plan.ctx, call, reply).await).into()
                         }
                         None => std::future::pending().await,
                     }
                 } else {
-                    dispatch_one(seams.tools, plan.ctx, call, key, recorder, plan.guard).await
+                    dispatch_one(seams.tools, plan, call, key, recorder).await
                 };
                 (index, answer)
             });
@@ -2337,8 +2369,14 @@ async fn settle<W: Writer, P, T: ToolPlane>(
     answers: &mut [Option<Answer>],
     tripped: &mut bool,
     index: usize,
-    (result, outcome): (ToolResult, CallOutcome),
+    resolved: Resolved,
 ) -> Result<(), LoopError> {
+    let Resolved {
+        result,
+        outcome,
+        reason,
+        hooks,
+    } = resolved;
     *tripped |= outcome == CallOutcome::Unknown;
     let id = plan.calls[index].tool_call_id.clone();
     let durable = open_held.contains(&id);
@@ -2361,7 +2399,8 @@ async fn settle<W: Writer, P, T: ToolPlane>(
     answers[index] = Some(Answer {
         result,
         outcome,
-        reason: None,
+        reason,
+        hooks,
         durable,
     });
     Ok(())
@@ -2426,23 +2465,67 @@ fn interrupted_result(id: &ToolCallId) -> ToolResult {
     }
 }
 
-/// Sends one call with its key and the batch's held-reply recorder, and resolves the answer.
+/// Sends one call with its key and the batch's held-reply recorder, and resolves the answer. A
+/// result the provider returned goes through the post-tool hooks the plan subscribes for its
+/// tool, before the batch takes it.
 async fn dispatch_one<T: ToolPlane>(
     tools: &T,
-    ctx: &BatchCtx,
+    plan: &DispatchPlan<'_>,
     call: &ToolCall,
     call_key: &str,
     recorder: &HeldChannel,
-    guard: &ToolOpenGuard,
-) -> (ToolResult, CallOutcome) {
+) -> Resolved {
     let key = DispatchKey {
         call_key,
         held_recorder: Some(recorder),
     };
-    resolve(
-        call,
-        tools.dispatch_guarded(ctx, call, Some(key), guard).await,
-    )
+    match tools
+        .dispatch_guarded(plan.ctx, call, Some(key), plan.guard)
+        .await
+    {
+        DispatchResult::Completed(result) => {
+            post_tool(plan.hooks, plan.step_id, call, call_key, result).await
+        }
+        other => resolve(call, other).into(),
+    }
+}
+
+/// A provider's result through the post-tool hooks subscribed for its tool, as today's loop
+/// runs them: a JSON result stays hookless, and a hook may edit the text or, when it was
+/// required and unavailable, withhold the result.
+async fn post_tool(
+    hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
+    step_id: u64,
+    call: &ToolCall,
+    call_key: &str,
+    result: ToolResult,
+) -> Resolved {
+    let subscribed = !matches!(result.output, ToolOutput::Json { .. })
+        && hooks.is_some_and(|runtime| runtime.plan.post_tool(&call.tool_name));
+    let Some(runtime) = hooks.filter(|_| subscribed) else {
+        return (result, CallOutcome::Completed).into();
+    };
+    let output = runtime
+        .chain(
+            broca_core::hooks::Subject::PostTool {
+                step_id: step_id.to_string(),
+                tool: call.tool_name.clone(),
+                tool_call_id: result.tool_call_id.0.clone(),
+                call_key: Some(call_key.to_owned()),
+                blocks: vec![broca_core::run::post_tool_text(&result)],
+                is_error: result.is_error,
+            },
+            broca_core::hooks::Trace::default(),
+            |_| true,
+        )
+        .await;
+    let (result, reason, hooks) = broca_core::run::transformed_tool_result(&result, &output);
+    Resolved {
+        result,
+        outcome: CallOutcome::Completed,
+        reason,
+        hooks: hooks.map(|hooks| serde_json::to_value(hooks).expect("hook metadata serializes")),
+    }
 }
 
 /// A call's result and outcome from what the tool plane said:
