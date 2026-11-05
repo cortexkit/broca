@@ -14,10 +14,15 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use broca_core::{provider::Provider, run_loop, AllowAll, FileLeaseStore, FileWalStore, RunRequest, StubReply, StubToolPlane};
+use broca_core::{
+    provider::Provider, run_loop, AllowAll, FileLeaseStore, FileWalStore, RunRequest, StubReply,
+    StubToolPlane,
+};
 use broca_protocol::content::{AssistantMessage, ContentBlock, Message, Role, ToolCall};
 use broca_protocol::provider::{NormalizedEvent, ProviderControl};
-use broca_protocol::request::{CallOptions, ExecutionMode, ModelHandle, StopCondition, Tool, ToolChoice};
+use broca_protocol::request::{
+    CallOptions, ExecutionMode, ModelHandle, StopCondition, Tool, ToolChoice,
+};
 use broca_protocol::{FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage};
 use broca_session_loop::{run, Admission, MemoryParts, Seams, Writer};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
@@ -91,7 +96,11 @@ fn answer(id: &str, content: Vec<ContentBlock>, reason: FinishReason) -> Vec<Nor
 }
 
 fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
-    answer(id, vec![ContentBlock::Text { text: text.into() }], FinishReason::Stop)
+    answer(
+        id,
+        vec![ContentBlock::Text { text: text.into() }],
+        FinishReason::Stop,
+    )
 }
 
 fn call(id: &str, name: &str, input: Value) -> ContentBlock {
@@ -127,6 +136,12 @@ impl Scenario {
         StubToolPlane::new()
             .with_canned_text("read", "file contents")
             .with_tool("grep", |_| StubReply::ExecError("no match".into()))
+            .with_tool("fetch", |_| {
+                StubReply::PlaneUnavailable("route closed".into())
+            })
+            .with_tool("write", |_| {
+                StubReply::OutcomeUnknown("connection reset".into())
+            })
     }
 
     fn request(&self) -> RunRequest {
@@ -208,9 +223,17 @@ async fn today(scenario: &Scenario) -> Outcome {
     let wal = FileWalStore::new(dir.join("wal"));
     let (tx, mut rx) = mpsc::channel(512);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    run_loop(scenario.request(), &provider, &plane, &lease, &AllowAll, &wal, &tx)
-        .await
-        .expect("today's loop runs");
+    run_loop(
+        scenario.request(),
+        &provider,
+        &plane,
+        &lease,
+        &AllowAll,
+        &wal,
+        &tx,
+    )
+    .await
+    .expect("today's loop runs");
     drop(tx);
     drain.await.unwrap();
     let file = std::fs::read_dir(dir.join("wal"))
@@ -224,7 +247,11 @@ async fn today(scenario: &Scenario) -> Outcome {
     Outcome {
         records: normalized(&converted.records),
         requests: sent_requests(&provider),
-        calls: plane.log().iter().map(|event| format!("{event:?}")).collect(),
+        calls: plane
+            .log()
+            .iter()
+            .map(|event| format!("{event:?}"))
+            .collect(),
     }
 }
 
@@ -291,14 +318,23 @@ async fn new_loop(scenario: &Scenario) -> Outcome {
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
-    run(&mut writer, &mut parts, scenario.admission(&provider), &seams)
-        .await
-        .expect("the new loop runs");
+    run(
+        &mut writer,
+        &mut parts,
+        scenario.admission(&provider),
+        &seams,
+    )
+    .await
+    .expect("the new loop runs");
     let records = writer.records.clone();
     Outcome {
         records: normalized(&records),
         requests: sent_requests(&provider),
-        calls: plane.log().iter().map(|event| format!("{event:?}")).collect(),
+        calls: plane
+            .log()
+            .iter()
+            .map(|event| format!("{event:?}"))
+            .collect(),
     }
 }
 
@@ -347,11 +383,14 @@ fn scrub(value: &mut Value) {
 
 async fn compare(scenario: Scenario) {
     let today = today(&scenario).await;
-    let new = new_loop(&scenario).await;
-    if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
+    let dump = std::env::var_os("DIFFERENTIAL_DUMP").is_some();
+    if dump {
         for (index, record) in today.records.iter().enumerate() {
             eprintln!("today {index}: {record}");
         }
+    }
+    let new = new_loop(&scenario).await;
+    if dump {
         for (index, record) in new.records.iter().enumerate() {
             eprintln!("new   {index}: {record}");
         }
@@ -393,7 +432,11 @@ async fn a_tool_call_then_an_answer() {
         tools: vec![tool("read", ExecutionMode::Sequential)],
         stop_when: vec![StopCondition::StepCount { n: 8 }],
         steps: vec![
-            answer("a1", vec![call("c1", "read", json!({"path": "a"}))], FinishReason::ToolCalls),
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
             text_step("a2", "done"),
         ],
     })
@@ -413,7 +456,9 @@ async fn parallel_calls_one_failing() {
             answer(
                 "a1",
                 vec![
-                    ContentBlock::Text { text: "checking".into() },
+                    ContentBlock::Text {
+                        text: "checking".into(),
+                    },
                     call("c1", "read", json!({"path": "a"})),
                     call("c2", "grep", json!({"pattern": "x"})),
                 ],
@@ -444,8 +489,63 @@ async fn sequential_calls_keep_their_order() {
                 ],
                 FinishReason::ToolCalls,
             ),
-            answer("a2", vec![call("c4", "read", json!({"path": "d"}))], FinishReason::ToolCalls),
+            answer(
+                "a2",
+                vec![call("c4", "read", json!({"path": "d"}))],
+                FinishReason::ToolCalls,
+            ),
             text_step("a3", "done"),
+        ],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_step_limit_with_calls_pending() {
+    compare(Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        stop_when: vec![StopCondition::StepCount { n: 1 }],
+        steps: vec![answer(
+            "a1",
+            vec![call("c1", "read", json!({"path": "a"}))],
+            FinishReason::ToolCalls,
+        )],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_call_that_was_never_sent() {
+    compare(Scenario {
+        input: vec![user("fetch a")],
+        tools: vec![tool("fetch", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "fetch", json!({"url": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "it failed"),
+        ],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_call_whose_outcome_is_unknown() {
+    compare(Scenario {
+        input: vec![user("write a")],
+        tools: vec![tool("write", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "write", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "should not be reached"),
         ],
     })
     .await;

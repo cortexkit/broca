@@ -15,22 +15,20 @@ use std::sync::Arc;
 
 use broca_core::capability::ToolManifest;
 use broca_core::provider::{Provider, StepRuntime};
-use broca_core::run::{stop_satisfied, OutputEvent};
+use broca_core::run::{limiting_stop_satisfied, stop_satisfied, OutputEvent};
+use broca_core::tags::TagNumbering;
 use broca_core::tool_plane::{BatchCtx, DispatchResult, ToolPlane};
 use broca_protocol::caller::RunFinishReason;
-use broca_core::tags::TagNumbering;
 use broca_protocol::content::{
-    stamp_ordinals_from, AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput,
-    ToolResult,
+    stamp_ordinals_from, AssistantMessage, Message, Role, ToolCall, ToolOutput, ToolResult,
 };
-use broca_protocol::request::EpisodeRenderInput;
-use broca_protocol::tags::{clean_computed_into, ComputedRules};
-use broca_wal::ComputedTagRules;
 use broca_protocol::provider::{NormalizedEvent, ProviderControl};
+use broca_protocol::request::EpisodeRenderInput;
 use broca_protocol::request::{
     CallOptions, ExecutionMode, ModelHandle, ResponseFormat, StepContext, StopCondition, Tool,
     ToolChoice,
 };
+use broca_protocol::tags::{clean_computed_into, ComputedRules};
 use broca_protocol::{BatchId, BindIdentity, FinishReason, GenerationConfig, RunId, StepId, Usage};
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::record::{
@@ -38,6 +36,7 @@ use broca_session_store::record::{
     RunStart, SetupStub, StepEnd, StepStart, ToolIntent, ToolOutcome, ToolReply,
 };
 use broca_session_store::session::SessionError;
+use broca_wal::ComputedTagRules;
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
@@ -179,8 +178,10 @@ where
         };
         let calls: Vec<ToolCall> = step.message.tool_calls().cloned().collect();
         let stop = stop_satisfied(&stop_when, completed_steps + 1, &step.message).cloned();
+        let limiting = limiting_stop_satisfied(&stop_when, completed_steps + 1, &step.message);
         let now = (seams.now_ms)();
-        let assistant = Message::assistant_from(step.message.content.clone(), admission.model.clone());
+        let assistant =
+            Message::assistant_from(step.message.content.clone(), admission.model.clone());
         writer
             .append(
                 &[
@@ -210,7 +211,7 @@ where
                         budget_finalize: None,
                         total_usage: None,
                         stop_met: stop.is_some().then_some(true),
-                        limiting_stop_met: None,
+                        limiting_stop_met: limiting.then_some(true),
                     }),
                 ],
                 calls.is_empty(),
@@ -219,10 +220,18 @@ where
         if calls.is_empty() {
             return finish(writer, seams, &admission.run_id, RunFinishReason::Completed).await;
         }
-        if stop.is_some() {
-            return Err(LoopError::Unsupported("a stop condition with tool calls pending"));
+        if let Some(stop) = stop {
+            return hard_stop(writer, seams, &admission.run_id, step_id, &calls, &stop).await;
         }
-        batch(writer, seams, &admission.run_id, step_id, &calls, &manifest).await?;
+        if batch(writer, seams, &admission.run_id, step_id, &calls, &manifest).await? {
+            return finish(
+                writer,
+                seams,
+                &admission.run_id,
+                RunFinishReason::Interrupted,
+            )
+            .await;
+        }
     }
 }
 
@@ -243,12 +252,19 @@ async fn admit<W: Writer>(
         let value = value.map_err(|e| LoopError::Parts(e.to_string()))?;
         setup.push(parts.put(kind, &value).map_err(LoopError::Parts)?);
     }
-    let tool_names = admission.tools.iter().map(|tool| tool.name.clone()).collect();
+    let tool_names = admission
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
     let mut config = serde_json::Map::new();
     config.insert("tool_choice".into(), json!(admission.tool_choice));
     config.insert("generation".into(), json!(admission.generation));
     if !admission.provider_options.is_null() {
-        config.insert("provider_options".into(), admission.provider_options.clone());
+        config.insert(
+            "provider_options".into(),
+            admission.provider_options.clone(),
+        );
     }
     // Today's computed tag rules, starting after the transcript's highest tag (none yet in a
     // new session).
@@ -282,7 +298,8 @@ async fn admit<W: Writer>(
         service_tier: None,
         route_decision_id: None,
         compaction_plan_version: None,
-        render_config: (!admission.render_config.is_null()).then(|| admission.render_config.clone()),
+        render_config: (!admission.render_config.is_null())
+            .then(|| admission.render_config.clone()),
         auth_selection: None,
         run_choices: Some(json!({
             "config": config,
@@ -426,7 +443,9 @@ async fn model_step<P: Provider, T>(
     }
 }
 
-/// Dispatches one assistant message's tool calls and records every result.
+/// Dispatches one assistant message's tool calls and records every result. Returns whether a
+/// call may have run without its result coming back: the run must then stop, because feeding
+/// that call's failure to the model would invite it to run the call again.
 async fn batch<W, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
@@ -434,7 +453,7 @@ async fn batch<W, P, T>(
     step_id: u64,
     calls: &[ToolCall],
     manifest: &ToolManifest,
-) -> Result<(), LoopError>
+) -> Result<bool, LoopError>
 where
     W: Writer,
     T: ToolPlane,
@@ -477,31 +496,18 @@ where
         Err(_) => return Err(LoopError::Unsupported("a tool plane refusing a batch")),
     };
     let _ = seams.tools.batch_finished(&ctx).await;
+    let unknown = results
+        .iter()
+        .any(|(_, outcome)| *outcome == CallOutcome::Unknown);
     let mut records = Vec::new();
-    for result in results {
-        let finished = Some((seams.now_ms)());
-        let digest = Digest(Sha256::digest(result.encode()).into());
-        records.push(Record::ToolOutcome(ToolOutcome {
-            run_id: run_id.into(),
-            batch_id: batch_id.clone(),
-            tool_call_id: result.tool_call_id.clone(),
-            outcome: CallOutcome::Completed,
-            result_digest: digest,
-            is_error: result.is_error,
-            reason: None,
-            finished_at_ms: finished,
-            detail: None,
-            hooks: None,
-        }));
-        records.insert(
-            records.len() - 1,
-            Record::ToolReply(ToolReply {
-                run_id: run_id.into(),
-                batch_id: Some(batch_id.clone()),
-                result,
-                finished_at_ms: finished,
-                tags_v1: None,
-            }),
+    for (result, outcome) in results {
+        terminal(
+            &mut records,
+            run_id,
+            &batch_id,
+            result,
+            outcome,
+            (seams.now_ms)(),
         );
     }
     records.push(Record::BatchEnd(BatchEnd {
@@ -509,7 +515,88 @@ where
         batch_id,
     }));
     writer.append(&records, true).await?;
-    Ok(())
+    Ok(unknown)
+}
+
+/// A call's reply in the transcript and its outcome in the ledger.
+fn terminal(
+    records: &mut Vec<Record>,
+    run_id: &str,
+    batch_id: &str,
+    result: ToolResult,
+    outcome: CallOutcome,
+    now: u64,
+) {
+    let digest = Digest(Sha256::digest(result.encode()).into());
+    let tool_call_id = result.tool_call_id.clone();
+    let is_error = result.is_error;
+    records.push(Record::ToolReply(ToolReply {
+        run_id: run_id.into(),
+        batch_id: Some(batch_id.into()),
+        result,
+        finished_at_ms: Some(now),
+        tags_v1: None,
+    }));
+    records.push(Record::ToolOutcome(ToolOutcome {
+        run_id: run_id.into(),
+        batch_id: batch_id.into(),
+        tool_call_id,
+        outcome,
+        result_digest: digest,
+        is_error,
+        reason: None,
+        finished_at_ms: Some(now),
+        detail: None,
+        hooks: None,
+    }));
+}
+
+/// A stop condition held on a step that asked for tools. The calls are never dispatched: each
+/// gets a result saying so, and the batch and the run's end are durable together, so a crash
+/// either loses both (the resumed run takes the step again) or keeps both (the run is over).
+async fn hard_stop<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+    step_id: u64,
+    calls: &[ToolCall],
+    stop: &StopCondition,
+) -> Result<Finished, LoopError> {
+    let (outcome, message, reason) = match stop {
+        StopCondition::StepCount { .. } => (
+            CallOutcome::MaxSteps,
+            "tool not run: max steps reached before dispatch",
+            RunFinishReason::MaxSteps,
+        ),
+        _ => (
+            CallOutcome::Interrupted,
+            "tool not run: interrupted before dispatch",
+            RunFinishReason::Completed,
+        ),
+    };
+    let batch_id = format!("{run_id}-b{step_id}");
+    let mut records = vec![Record::BatchStart(BatchStart {
+        run_id: run_id.into(),
+        batch_id: batch_id.clone(),
+        step_id,
+        planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+    })];
+    let now = (seams.now_ms)();
+    for call in calls {
+        let result = ToolResult {
+            tool_call_id: call.tool_call_id.clone(),
+            output: ToolOutput::error(message.to_string()),
+            is_error: true,
+        };
+        terminal(&mut records, run_id, &batch_id, result, outcome, now);
+    }
+    records.push(Record::BatchEnd(BatchEnd {
+        run_id: run_id.into(),
+        batch_id,
+    }));
+    records.push(run_end(writer, run_id, reason, now));
+    writer.append(&records, true).await?;
+    Ok(finished(writer, reason))
 }
 
 /// Dispatches every call, in parallel unless one of them must run alone, and returns the
@@ -519,7 +606,7 @@ async fn dispatch_all<P, T: ToolPlane>(
     ctx: &BatchCtx,
     calls: &[ToolCall],
     manifest: &ToolManifest,
-) -> Vec<ToolResult> {
+) -> Vec<(ToolResult, CallOutcome)> {
     let sequential = calls.iter().any(|call| {
         manifest
             .get(&call.tool_name)
@@ -531,24 +618,44 @@ async fn dispatch_all<P, T: ToolPlane>(
             results.push(resolve(call, seams.tools.dispatch(ctx, call).await));
         }
     } else {
-        let all = calls.iter().map(|call| async move {
-            resolve(call, seams.tools.dispatch(ctx, call).await)
-        });
+        let all = calls
+            .iter()
+            .map(|call| async move { resolve(call, seams.tools.dispatch(ctx, call).await) });
         results = futures::future::join_all(all).await;
     }
     results
 }
 
-fn resolve(call: &ToolCall, result: DispatchResult) -> ToolResult {
+/// A call's result and outcome from what the tool plane said:
+/// - a result is the tool's own answer;
+/// - never sent is safe: the model gets an error result and may try again;
+/// - sent with no result may have had its effect: the model gets an error result, the outcome
+///   is unknown, and the run stops.
+fn resolve(call: &ToolCall, result: DispatchResult) -> (ToolResult, CallOutcome) {
+    let error = |message: String| ToolResult {
+        tool_call_id: call.tool_call_id.clone(),
+        output: ToolOutput::error(message),
+        is_error: true,
+    };
     match result {
-        DispatchResult::Completed(result) => result,
-        DispatchResult::NotSent { reason }
-        | DispatchResult::SentButOutcomeUnknown { reason }
-        | DispatchResult::ScopeDrained { reason, .. } => ToolResult {
-            tool_call_id: call.tool_call_id.clone(),
-            output: ToolOutput::error(reason),
-            is_error: true,
-        },
+        DispatchResult::Completed(result) => (result, CallOutcome::Completed),
+        DispatchResult::NotSent { reason } => (
+            error(format!("tool not dispatched: {reason}")),
+            CallOutcome::Completed,
+        ),
+        DispatchResult::SentButOutcomeUnknown { reason } => (
+            error(format!(
+                "tool outcome unknown (interrupted for review): {reason}"
+            )),
+            CallOutcome::Unknown,
+        ),
+        // A drained scope route ends the run differently; not handled by this build.
+        DispatchResult::ScopeDrained { reason, .. } => (
+            error(format!(
+                "tool outcome unknown (interrupted for review): {reason}"
+            )),
+            CallOutcome::Unknown,
+        ),
     }
 }
 
@@ -562,45 +669,38 @@ fn run_state<W: Writer>(writer: &W) -> &broca_session_store::fold::operations::R
         .expect("the run's start is appended before any step")
 }
 
-/// Appends the run's end. Its usage is the run's total, present once a step completed.
+/// The run's end record. Its usage is the run's total, present once a step completed.
+fn run_end<W: Writer>(writer: &W, run_id: &str, reason: RunFinishReason, now: u64) -> Record {
+    let run = run_state(writer);
+    Record::RunEnd(RunEnd {
+        run_id: run_id.into(),
+        reason,
+        usage: (run.completed_steps > 0).then(|| run.usage.clone()),
+        ts_ms: Some(now),
+        retries_used: run.retries_used,
+        interrupt_reason: None,
+        error: None,
+    })
+}
+
+/// How the run ended, as its end record states it.
+fn finished<W: Writer>(writer: &W, reason: RunFinishReason) -> Finished {
+    let run = run_state(writer);
+    Finished {
+        reason,
+        usage: (run.completed_steps > 0).then(|| run.usage.clone()),
+        retries_used: run.retries_used,
+    }
+}
+
+/// Appends the run's end, durable before the run reports it.
 async fn finish<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
     run_id: &str,
     reason: RunFinishReason,
 ) -> Result<Finished, LoopError> {
-    let run = run_state(writer);
-    let usage = (run.completed_steps > 0).then(|| run.usage.clone());
-    let retries_used = run.retries_used;
-    writer
-        .append(
-            &[Record::RunEnd(RunEnd {
-                run_id: run_id.into(),
-                reason,
-                usage: usage.clone(),
-                ts_ms: Some((seams.now_ms)()),
-                retries_used,
-                interrupt_reason: None,
-                error: None,
-            })],
-            true,
-        )
-        .await?;
-    Ok(Finished {
-        reason,
-        usage,
-        retries_used,
-    })
-}
-
-#[allow(dead_code)]
-fn text_of(message: &Message) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
+    let record = run_end(writer, run_id, reason, (seams.now_ms)());
+    writer.append(&[record], true).await?;
+    Ok(finished(writer, reason))
 }
