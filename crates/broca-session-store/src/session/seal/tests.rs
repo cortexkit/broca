@@ -408,7 +408,7 @@ fn a_seal_carries_ledger_records_into_the_new_log() {
             Some(3)
         );
         let written = state(&session);
-        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+        let mut loaded = Session::load(&backend, addr(), &triple(), &deployment())
             .await
             .unwrap();
         assert_eq!(state(&loaded), written);
@@ -426,6 +426,45 @@ fn a_seal_carries_ledger_records_into_the_new_log() {
                 .await,
             Err(super::SessionError::Fold(_))
         ));
+        // The reloaded session holds the writer now, and names an applied view, so a seal must
+        // carry a copy of it and a `ViewApplied` naming it. Without them it refuses, and writes
+        // nothing.
+        let before = loaded.next_seq();
+        assert!(matches!(
+            loaded.seal_carrying(None, &Carry::default(), 2_000).await,
+            Err(super::SessionError::ViewNotCarried)
+        ));
+        assert!(matches!(
+            loaded
+                .seal_carrying(
+                    None,
+                    &Carry {
+                        records: std::slice::from_ref(&applied),
+                        ..Default::default()
+                    },
+                    2_000,
+                )
+                .await,
+            Err(super::SessionError::ViewNotCarried)
+        ));
+        assert_eq!(loaded.next_seq(), before);
+        // With both carried, the seal goes ahead.
+        let view = Record::View(crate::record::View {
+            version: 3,
+            checksum: "c3".into(),
+            edits: serde_json::json!([]),
+        });
+        loaded
+            .seal_carrying(
+                None,
+                &Carry {
+                    records: &[view, applied.clone()],
+                    ..Default::default()
+                },
+                2_000,
+            )
+            .await
+            .unwrap();
     });
 }
 

@@ -67,9 +67,9 @@ pub async fn earlier_context<W: Writer>(
 /// `Session::open_log_records`) by today's fold: each accepted view rebuilt from its stored
 /// edits and checked against its checksum, the views steps applied, and the latest marker.
 ///
-/// The operational fold names the accepted and applied views; a view it names that the open
-/// log no longer holds was sealed out with the ledger, and rebuilding it needs the view bases a
-/// seal will write (not built yet), so that refuses by name.
+/// The operational fold names the accepted and applied views. Every seal carries whole copies of
+/// them into the new log (`carried_views`), and the store refuses a seal that doesn't, so a view
+/// the fold names but the open log doesn't hold means the log is damaged.
 pub fn restore(
     records: &[(u64, Record)],
     bind: &BindIdentity,
@@ -129,8 +129,8 @@ pub fn restore(
     }
     if accepted != identity(state.latest()) || applied != identity(state.applied()) {
         return Err(
-            "a compaction view the session names is no longer in its open log, and rebuilding it \
-             needs a view base, which isn't built yet"
+            "a compaction view the session names is missing from its open log, which every seal \
+             carries it into"
                 .into(),
         );
     }
