@@ -19,6 +19,7 @@
 use broca_protocol::content::{ContentBlock, Message, Role, ToolResult};
 use broca_protocol::ids::ToolCallId;
 
+use crate::codec::Digest;
 use crate::fold::Bound;
 use crate::record::{EntryFacts, Marker, Notice, PartKind, PartRef, Placement, Record, Stream};
 
@@ -39,6 +40,8 @@ pub enum FoldError {
     AssistantInsideToolTurn,
     /// Entry facts for an ordinal the conversation hasn't placed or reserved.
     FactsWithoutEntry(u64),
+    /// A seal would keep more runs past the window than their declared cap.
+    Bound(&'static str),
 }
 
 crate::message! {
@@ -76,6 +79,8 @@ crate::message! {
         3 opt first_user: u64,
         /// The render config part in force when the run started.
         4 opt render_config: PartRef,
+        /// What renderers read from that config when rendering other runs' messages.
+        5 opt render_key: Digest,
     }
 }
 
@@ -161,14 +166,34 @@ state! {
             reset: "setup_stub",
             bound: Bound::Fixed,
         },
-        /// One per run whose input is in the window, in run order.
+        /// One per run whose input is in the window, in run order. After a cut, the first is
+        /// the run whose input the cut split, when its later messages are in the window.
         10 rep pub episodes: Episode => {
             owner: "run loop",
             reset: "never",
             bound: Bound::Window,
         },
+        /// The render key the latest setup marker named.
+        11 opt pub render_key: Digest => {
+            owner: "admission",
+            reset: "setup_stub",
+            bound: Bound::Fixed,
+        },
+        /// The runs before the window whose settings still shape a request: the session's first
+        /// run, and every later one whose render key differs from the run before it. A request
+        /// carries them ahead of the window's runs, as it carried every run before history was
+        /// sealed. The key changes rarely (at most 6 times in any stored session), so a seal
+        /// that would keep more than the cap refuses.
+        12 rep pub sealed_episodes: Episode => {
+            owner: "seal",
+            reset: "never",
+            bound: Bound::Capped(SEALED_EPISODES_CAP),
+        },
     }
 }
+
+/// The most change points [`Conversation::sealed_episodes`] keeps besides the session's first run.
+pub const SEALED_EPISODES_CAP: usize = 64;
 
 impl Conversation {
     pub fn new(appends_in_conversation: bool) -> Self {
@@ -183,6 +208,8 @@ impl Conversation {
             window_pending: false,
             render_config: None,
             episodes: Vec::new(),
+            render_key: None,
+            sealed_episodes: Vec::new(),
         }
     }
 
@@ -201,6 +228,8 @@ impl Conversation {
             window_pending: self.window_pending,
             render_config: self.render_config.clone(),
             episodes: Vec::new(),
+            render_key: self.render_key,
+            sealed_episodes: self.sealed_episodes.clone(),
         }
     }
 
@@ -210,6 +239,44 @@ impl Conversation {
         self.messages.clear();
         self.entries.clear();
         self.episodes.clear();
+    }
+
+    /// Empties the window for a log that starts at a cut, keeping what of the window's runs still
+    /// shapes a request: the run whose input the cut split stays a window run (its later messages
+    /// are above the cut), and the runs wholly below the cut join the sealed ones where their
+    /// render key changes. `first_kept` is the ordinal of the first entry above the cut.
+    pub fn seal_window(&mut self, first_kept: u64) -> Result<(), FoldError> {
+        self.messages.clear();
+        self.entries.clear();
+        let episodes = std::mem::take(&mut self.episodes);
+        // The run in force at the cut: the last one starting before it, unless the next run
+        // starts exactly at the cut.
+        let spanning = episodes
+            .iter()
+            .rposition(|episode| episode.start < first_kept)
+            .filter(|at| {
+                episodes
+                    .get(at + 1)
+                    .is_none_or(|next| next.start > first_kept)
+            });
+        for (at, episode) in episodes.into_iter().enumerate() {
+            if episode.start >= first_kept || Some(at) == spanning {
+                self.episodes.push(episode);
+                continue;
+            }
+            let changes = match self.sealed_episodes.last() {
+                None => true,
+                Some(last) => last.render_key != episode.render_key || last.render_key.is_none(),
+            };
+            if changes {
+                // The session's first run, then at most the cap of change points.
+                if self.sealed_episodes.len() > SEALED_EPISODES_CAP {
+                    return Err(FoldError::Bound("sealed_episodes"));
+                }
+                self.sealed_episodes.push(episode);
+            }
+        }
+        Ok(())
     }
 
     /// The window message with `ordinal` and its entry state.
@@ -262,6 +329,7 @@ impl Conversation {
                 start: ordinal,
                 first_user: None,
                 render_config: self.render_config.clone(),
+                render_key: self.render_key,
             });
         }
         let episode = self.episodes.last_mut().expect("pushed above");
@@ -393,6 +461,7 @@ impl Conversation {
                     .iter()
                     .find(|part| part.kind == PartKind::RenderConfig)
                     .cloned();
+                self.render_key = stub.render_key;
             }
             Record::Compaction(_) => {}
             _ => unreachable!("every transcript kind is matched above"),

@@ -13,6 +13,7 @@ async-trait.workspace = true
 futures.workspace = true
 broca-core = { path = "../broca-core" }
 broca-protocol = { path = "../broca-protocol" }
+broca-provider = { path = "../broca-provider" }
 broca-session-store = { path = "../broca-session-store" }
 broca-wal = { path = "../broca-wal" }
 cortexkit-compaction-view.workspace = true

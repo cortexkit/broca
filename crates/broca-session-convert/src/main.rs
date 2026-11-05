@@ -247,8 +247,136 @@ fn main() {
         "split" => run_split(&args),
         "seal" => run_seal(&args),
         "entries" => run_entries(&args),
+        "episodes" => run_episodes(&args),
         _ => usage(),
     }
+}
+
+/// How many times sessions change their runs' render settings: a run whose render config differs
+/// from the run before it is a change point. The fold keeps the first run and every change point
+/// once they leave the window, so this sets that list's cap.
+#[derive(Default, Serialize)]
+struct EpisodesReport {
+    logs: u64,
+    runs: u64,
+    /// Sessions by their number of change points.
+    change_points: BTreeMap<u64, u64>,
+    max_change_points: u64,
+    max_change_points_log: String,
+    /// The same counted on only what renderers read across runs (family, wire model, reasoning
+    /// effort and whether effort updates are on), the key the fold would keep change points of.
+    key_change_points: BTreeMap<u64, u64>,
+    max_key_change_points: u64,
+    max_key_change_points_log: String,
+    failures: BTreeMap<String, u64>,
+}
+
+/// What request renderers read from a run's render config when that run's messages aren't the
+/// ones being rendered: the ChatGPT effort plan's inputs.
+fn render_key(config: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!([
+        config["family_id"],
+        config["wire_model_id"],
+        config["reasoning_effort"],
+        config["reasoning"]["effort"],
+        config["chatgpt_effort_updates"],
+    ])
+}
+
+fn run_episodes(args: &Args) {
+    let mut report = EpisodesReport::default();
+    each_log(args, |item| {
+        let Item::Log {
+            name, old: Ok(old), ..
+        } = item
+        else {
+            return;
+        };
+        let converted = match convert_log(&old) {
+            Ok(converted) => converted,
+            Err(e) => {
+                *report
+                    .failures
+                    .entry(e.0.chars().take(100).collect())
+                    .or_default() += 1;
+                return;
+            }
+        };
+        report.logs += 1;
+        let mut previous = None;
+        let mut changes = 0u64;
+        let mut previous_key: Option<serde_json::Value> = None;
+        let mut key_changes = 0u64;
+        for record in &converted.records {
+            let Record::RunStart(start) = record else {
+                continue;
+            };
+            report.runs += 1;
+            let config = start
+                .setup
+                .iter()
+                .find(|part| part.kind == broca_session_store::record::PartKind::RenderConfig)
+                .map(|part| part.digest);
+            if let Some(Some(previous)) = previous.filter(|previous| *previous != config) {
+                changes += 1;
+                // With EPISODES_DIFF set, print which members of the render config changed.
+                if std::env::var_os("EPISODES_DIFF").is_some() {
+                    let value = |digest: &broca_session_store::codec::Digest| {
+                        converted
+                            .parts
+                            .get(digest)
+                            .and_then(|bytes| {
+                                serde_json::from_slice::<serde_json::Value>(bytes).ok()
+                            })
+                            .unwrap_or_default()
+                    };
+                    let (before, after) = (
+                        value(&previous),
+                        config.as_ref().map(value).unwrap_or_default(),
+                    );
+                    let keys: std::collections::BTreeSet<&String> = before
+                        .as_object()
+                        .into_iter()
+                        .chain(after.as_object())
+                        .flat_map(|object| object.keys())
+                        .collect();
+                    let changed: Vec<&String> = keys
+                        .into_iter()
+                        .filter(|key| before.get(key.as_str()) != after.get(key.as_str()))
+                        .collect();
+                    eprintln!("{name}: {changed:?}");
+                }
+            } else if previous.is_some_and(|previous| previous != config) {
+                changes += 1;
+            }
+            let key = render_key(
+                &config
+                    .as_ref()
+                    .and_then(|digest| converted.parts.get(digest))
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                    .unwrap_or_default(),
+            );
+            if previous_key
+                .as_ref()
+                .is_some_and(|previous| *previous != key)
+            {
+                key_changes += 1;
+            }
+            previous_key = Some(key);
+            previous = Some(config);
+        }
+        *report.key_change_points.entry(key_changes).or_default() += 1;
+        if key_changes > report.max_key_change_points {
+            report.max_key_change_points = key_changes;
+            report.max_key_change_points_log = name.clone();
+        }
+        *report.change_points.entry(changes).or_default() += 1;
+        if changes > report.max_change_points {
+            report.max_change_points = changes;
+            report.max_change_points_log = name.clone();
+        }
+    });
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
 
 #[derive(Default, Serialize)]

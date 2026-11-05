@@ -1161,6 +1161,9 @@ async fn admit<W: Writer>(
             parts: setup.clone(),
             model: admission.model.clone(),
             tool_names,
+            render_key: Some(
+                crate::parts::render_key(&admission.render_config).map_err(LoopError::Parts)?,
+            ),
         }));
     }
     records.push(Record::RunStart(Box::new(RunStart {
@@ -1277,9 +1280,12 @@ fn render_episodes<W: Writer>(
     parts: &dyn Parts,
 ) -> Result<Vec<EpisodeRenderInput>, LoopError> {
     let conversation = writer.conversation();
+    // The runs past the window whose settings still shape a request come first, in run order,
+    // then the window's own.
     conversation
-        .episodes
+        .sealed_episodes
         .iter()
+        .chain(&conversation.episodes)
         .map(|episode| {
             // Positions count from the session's first message, as today's: once history is
             // sealed at a cut, the window's first message keeps its place.

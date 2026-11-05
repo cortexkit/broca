@@ -312,7 +312,11 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             Some(cut) => {
                 let mut at =
                     conversation_at(checkpoint, records, cut).map_err(SessionError::Fold)?;
-                at.clear_window();
+                // The runs whose settings still shape a request after the cut stay with the
+                // conversation the new log starts from.
+                let first_kept = at.placed + 1;
+                at.seal_window(first_kept)
+                    .map_err(|error| SessionError::Fold(format!("conversation: {error:?}")))?;
                 at
             }
             None => checkpoint.conversation.clone(),

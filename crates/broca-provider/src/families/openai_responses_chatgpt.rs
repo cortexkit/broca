@@ -55,6 +55,32 @@ thread_local! {
     pub(crate) static EFFORT_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// What any renderer reads from the render config of a run other than the ones whose messages
+/// it renders: [`effort_plan`]'s inputs, the family, the wire model, the reasoning effort and
+/// whether effort updates are on.
+///
+/// A store that no longer holds every earlier run keeps only the first run and the runs where
+/// this key changes, so a renderer that starts reading another member of an earlier run's config
+/// must add it here, or those requests change bytes once history is sealed. A config that doesn't
+/// read as a render config has its own key, which [`effort_plan`] treats the same way.
+pub fn episode_render_key(frozen_config: &serde_json::Value) -> serde_json::Value {
+    let Ok(config) = serde_json::from_value::<FrozenRenderConfig>(frozen_config.clone()) else {
+        return serde_json::json!({ "unreadable": true });
+    };
+    let effort = config.reasoning_effort.clone().or(match &config.reasoning {
+        crate::policy::ReasoningPolicy::OpenAiResponsesReasoning { effort, .. } => {
+            Some(effort.clone())
+        }
+        _ => None,
+    });
+    serde_json::json!({
+        "family_id": config.family_id,
+        "wire_model_id": config.wire_model_id,
+        "effort": effort,
+        "chatgpt_effort_updates": config.chatgpt_effort_updates,
+    })
+}
+
 pub(crate) fn effort_plan(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,

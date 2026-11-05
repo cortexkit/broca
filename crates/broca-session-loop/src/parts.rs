@@ -34,6 +34,16 @@ pub fn canonical(value: &Value) -> Result<(Vec<u8>, Digest), String> {
     Ok((bytes, digest))
 }
 
+/// The digest of what renderers read from a run's render config when rendering other runs'
+/// messages (`broca_provider`'s `episode_render_key`), which a setup marker records so the
+/// conversation keeps runs past the window only where it changes.
+pub fn render_key(render_config: &Value) -> Result<Digest, String> {
+    canonical(
+        &broca_provider::families::openai_responses_chatgpt::episode_render_key(render_config),
+    )
+    .map(|(_, digest)| digest)
+}
+
 impl Parts for MemoryParts {
     fn put(&mut self, kind: PartKind, value: &Value) -> Result<PartRef, String> {
         let (bytes, digest) = canonical(value)?;

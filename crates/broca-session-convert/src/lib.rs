@@ -872,10 +872,19 @@ fn run_started(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
     let mut sorted = parts.clone();
     sorted.sort();
     if sorted != state.setup || state.model.as_ref() != Some(&model) {
+        let render_key = parts
+            .iter()
+            .find(|part| part.kind == PartKind::RenderConfig)
+            .and_then(|part| out.parts.get(&part.digest))
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .map(|config| broca_session_loop::parts::render_key(&config))
+            .transpose()
+            .map_err(err)?;
         out.records.push(Record::SetupStub(SetupStub {
             parts: parts.clone(),
             model: model.clone(),
             tool_names: tool_names(&parts, out),
+            render_key,
         }));
         state.setup = sorted;
     }

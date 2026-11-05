@@ -544,6 +544,12 @@ fn lineage(image: &LogImage) -> Option<String> {
     image.lineage_id().map(|lineage| lineage.to_string())
 }
 
+/// The model a run of the comparison uses: `m`, or the one a run id names after an `@`
+/// (`r2@m2`), so a scenario can change the model between runs.
+fn run_model(run_id: &str) -> &str {
+    run_id.split_once('@').map_or("m", |(_, model)| model)
+}
+
 tokio::task_local! {
     /// The compaction provider a comparison's plan names, scripted: what it answers each ride
     /// and the window the run freezes. `None` runs without one.
@@ -565,6 +571,9 @@ struct CompactionScript {
 enum Ride {
     /// A view that drops the whole entry at this ordinal.
     Drop(u64),
+    /// A view that cuts through the entry at this ordinal: it and everything before it no
+    /// longer render.
+    Cut(u64),
 }
 
 /// A compaction provider that answers from a script and records every call, so both loops must
@@ -681,16 +690,18 @@ impl broca_core::CompactionPlane for CompactionSpy {
             "compaction.notice" => json!({"answer": "received"}),
             "compaction.ride" => match self.rides.lock().unwrap().pop_front() {
                 None => json!({"answer": "nothing"}),
-                Some(Ride::Drop(ordinal)) => {
+                Some(ride) => {
                     use cortexkit_role_compaction::view::{Edit, EditOp, View};
+                    let (Ride::Drop(ordinal) | Ride::Cut(ordinal)) = ride;
                     let mid = self.mids.lock().unwrap()[&ordinal].clone();
                     let version = 1 + self
                         .version
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let view = View::seal(
-                        version,
-                        vec![Edit::new(version, EditOp::Drop { mid, part: None })],
-                    );
+                    let op = match ride {
+                        Ride::Drop(_) => EditOp::Drop { mid, part: None },
+                        Ride::Cut(_) => EditOp::Cut { through: mid },
+                    };
+                    let view = View::seal(version, vec![Edit::new(version, op)]);
                     json!({"answer": "view", "view": view})
                 }
             },
@@ -763,7 +774,7 @@ impl Scenario {
             principal: None,
             run_id: RunId(run_id.into()),
             session: bind(),
-            model: ModelHandle::new("stub", "m"),
+            model: ModelHandle::new("stub", run_model(run_id)),
             input: input.to_vec(),
             tools: self.tools.clone(),
             policy_allowed: self.tools.iter().map(|t| t.name.clone()).collect(),
@@ -795,7 +806,7 @@ impl Scenario {
     ) -> Admission {
         Admission {
             run_id: run_id.into(),
-            model: ModelHandle::new("stub", "m"),
+            model: ModelHandle::new("stub", run_model(run_id)),
             input: input.to_vec(),
             tools: self.tools.clone(),
             tool_choice: ToolChoice::Auto,
@@ -1176,7 +1187,7 @@ fn rename_ids(value: &mut Value, names: &mut std::collections::HashMap<String, u
         Value::Object(members) => {
             for (key, member) in members.iter_mut() {
                 match (key.as_str(), member.as_str()) {
-                    ("mid" | "first_kept_mid", Some(text)) => {
+                    ("mid" | "first_kept_mid" | "through", Some(text)) => {
                         let next = names.len();
                         *member = json!(format!(
                             "mid#{}",
@@ -1197,6 +1208,44 @@ fn rename_ids(value: &mut Value, names: &mut std::collections::HashMap<String, u
         Value::Array(items) => items.iter_mut().for_each(|item| rename_ids(item, names)),
         _ => {}
     }
+}
+
+/// A scenario whose provider cuts: the new loop sealed the history before the cut, so the window
+/// no longer starts at the first message, and a fresh load of the session holds exactly the
+/// state the writer holds and rebuilds both compaction view slots from the new open log alone.
+async fn sealed_at_the_cut(
+    session: &Session<'_, MemoryBackend>,
+    triple: &SessionTriple,
+    bind: &broca_protocol::BindIdentity,
+) {
+    use broca_session_store::codec::Message as _;
+    assert!(
+        Writer::conversation(session).window_start() > 1,
+        "the new loop sealed nothing at the cut"
+    );
+    let loaded = Session::load(
+        session.backend(),
+        SessionAddr("0123456789abcdef".into()),
+        triple,
+        &DeploymentKey::new(1, &[7; 32]),
+    )
+    .await
+    .expect("the sealed session loads");
+    assert_eq!(
+        Writer::conversation(&loaded).encode(),
+        Writer::conversation(session).encode()
+    );
+    assert_eq!(
+        Writer::operations(&loaded).encode(),
+        Writer::operations(session).encode()
+    );
+    let records = Writer::open_log_records(&loaded)
+        .await
+        .expect("the open log reads");
+    let state =
+        broca_session_loop::compaction::restore(&records, bind, Writer::operations(&loaded))
+            .expect("the carried views rebuild the compaction state");
+    assert!(state.applied().is_some(), "the applied view was carried");
 }
 
 /// Every call the new loop sent carried a key that finds, through the session's own id lookup,
@@ -1808,7 +1857,7 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
     let mut session = Session::create(
         &backend,
         SessionAddr("0123456789abcdef".into()),
-        triple,
+        triple.clone(),
         &DeploymentKey::new(1, &[7; 32]),
         false,
     )
@@ -1856,6 +1905,11 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         .expect("the new loop runs");
     }
     keys_match(writer.session, &plane).await;
+    if compaction()
+        .is_some_and(|script| script.rides.iter().any(|ride| matches!(ride, Ride::Cut(_))))
+    {
+        sealed_at_the_cut(writer.session, &triple, &bind).await;
+    }
     let new = Outcome {
         records: normalized(&writer.records),
         requests: sent_requests(&provider),
@@ -3947,6 +4001,32 @@ async fn a_second_compacted_run_compares_with_the_first_runs_request() {
                         text_step("a2", "hello again"),
                     ]),
                     &[("r1", vec![user("first")]), ("r2", vec![user("second")])],
+                )),
+            ),
+        )
+        .await;
+}
+
+/// A model change between two runs makes the second run's first step ride, and the provider
+/// answers with a view that cuts through the first run. Today's loop keeps its whole log; the
+/// new loop seals the first run's history before sending, and must still send the same requests,
+/// write the same records and make the same calls.
+#[tokio::test]
+async fn a_cut_seals_the_history_before_it_and_requests_stay_the_same() {
+    LAYOUT
+        .scope(
+            Some(cortexkit_compaction_view::PLAN_VERSION),
+            COMPACTION.scope(
+                Some(Arc::new(CompactionScript {
+                    context_limit: 100_000,
+                    rides: vec![Ride::Cut(2)],
+                })),
+                Box::pin(compare_runs_in(
+                    compacted_scenario(vec![
+                        text_step("a1", "hello"),
+                        text_step("a2", "hello again"),
+                    ]),
+                    &[("r1", vec![user("first")]), ("r2@m2", vec![user("second")])],
                 )),
             ),
         )

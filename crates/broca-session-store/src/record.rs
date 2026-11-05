@@ -304,6 +304,11 @@ message! {
         1 rep parts: PartRef,
         2 req model: ModelHandle,
         3 rep tool_names: String,
+        /// A digest of what renderers read from this setup's render config when rendering
+        /// another run's messages (`broca_provider`'s `episode_render_key`). The conversation
+        /// keeps runs past the window only where it changes. Absent on setups converted before
+        /// it was recorded.
+        4 opt render_key: Digest,
     }
 }
 

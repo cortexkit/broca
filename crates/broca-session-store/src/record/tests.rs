@@ -80,6 +80,7 @@ fn one_of_each() -> Vec<Record> {
             parts: vec![part.clone()],
             model: model(),
             tool_names: vec!["read".into(), "bash".into()],
+            render_key: Some(Digest([4; 32])),
         }),
         Record::Compaction(Compaction {
             version: 2,

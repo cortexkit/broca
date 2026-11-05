@@ -516,6 +516,11 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         Ok(())
     }
 
+    /// The backend the session reads and writes through.
+    pub fn backend(&self) -> &'b B {
+        self.backend
+    }
+
     pub fn head(&self) -> &Head {
         &self.head
     }
