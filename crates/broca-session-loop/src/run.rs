@@ -896,7 +896,7 @@ where
         )?;
         if let Some(ctx) = compaction {
             match crate::compaction::prepare(writer, admission, seams, ctx, step_id, opts).await? {
-                crate::compaction::Send::Ready(ready) => opts = ready,
+                crate::compaction::Send::Ready(ready) => opts = *ready,
                 crate::compaction::Send::Unavailable(message) => {
                     return compaction_unavailable(writer, seams, admission, &message).await;
                 }

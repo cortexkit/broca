@@ -195,7 +195,7 @@ impl<W: Writer> Journal for StoreJournal<'_, W> {
 /// How a step's request came out of compaction.
 pub enum Send {
     /// The request to send: the prompt the applied view renders, with the run's settings.
-    Ready(broca_protocol::request::CallOptions),
+    Ready(Box<broca_protocol::request::CallOptions>),
     /// The provider can't serve the run (Setup failed with no view to fall back on, or the run
     /// froze no window to state conditions from), so the run ends `compaction_unavailable`.
     Unavailable(String),
@@ -391,9 +391,9 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             seams
                 .provider
                 .set_cache_evidence_view(applied.map(|view| view.version));
-            Ok(Send::Ready(
+            Ok(Send::Ready(Box::new(
                 finish(&opts, prompt, admission).map_err(LoopError::Parts)?,
-            ))
+            )))
         }
         v2::request::Prepared::CompactionUnavailable => Ok(Send::Unavailable(
             "compaction provider Setup is unavailable".into(),

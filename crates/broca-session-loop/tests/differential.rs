@@ -563,7 +563,6 @@ struct CompactionScript {
 
 #[derive(Clone, Copy)]
 enum Ride {
-    Nothing,
     /// A view that drops the whole entry at this ordinal.
     Drop(u64),
 }
@@ -681,7 +680,7 @@ impl broca_core::CompactionPlane for CompactionSpy {
             "compaction.setup" => json!({"answer": "ready"}),
             "compaction.notice" => json!({"answer": "received"}),
             "compaction.ride" => match self.rides.lock().unwrap().pop_front() {
-                None | Some(Ride::Nothing) => json!({"answer": "nothing"}),
+                None => json!({"answer": "nothing"}),
                 Some(Ride::Drop(ordinal)) => {
                     use cortexkit_role_compaction::view::{Edit, EditOp, View};
                     let mid = self.mids.lock().unwrap()[&ordinal].clone();
@@ -3772,6 +3771,22 @@ async fn compare_compacted(scenario: Scenario, script: CompactionScript) {
         .await;
 }
 
+/// [`compare_compacted`] for every cut of today's log: both loops resume from each prefix, each
+/// with a fresh provider following the same script, and must make the same calls and write the
+/// same records. Resuming rebuilds the compaction state from the cut log, so this covers a
+/// crash between a view being accepted and a step applying it.
+async fn compare_compacted_every_cut(scenario: Scenario, script: CompactionScript) {
+    LAYOUT
+        .scope(
+            Some(cortexkit_compaction_view::PLAN_VERSION),
+            COMPACTION.scope(
+                Some(Arc::new(script)),
+                Box::pin(compare_every_cut_in(scenario)),
+            ),
+        )
+        .await;
+}
+
 /// A fetch plan's manifest that also names a compaction provider (`compactor`, preset `head`),
 /// with part numbers rendered into requests.
 fn compacted_manifest(tools: &[Tool]) -> Arc<broca_wal::PlanManifest> {
@@ -3839,6 +3854,25 @@ async fn a_compacted_tool_call_then_an_answer() {
 #[tokio::test]
 async fn an_over_limit_step_rides_and_renders_from_the_view_it_gets() {
     compare_compacted(
+        compacted_scenario(vec![
+            answer(
+                "a1",
+                vec![call("c1", "big", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ]),
+        CompactionScript {
+            context_limit: 1_200,
+            rides: vec![Ride::Drop(2)],
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn every_cut_of_an_over_limit_ride_resumes_alike() {
+    compare_compacted_every_cut(
         compacted_scenario(vec![
             answer(
                 "a1",
