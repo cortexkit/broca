@@ -22,6 +22,7 @@ use broca_protocol::caller::RunFinishReason;
 use broca_protocol::content::{
     stamp_ordinals_from, AssistantMessage, Message, Role, ToolCall, ToolOutput, ToolResult,
 };
+use broca_protocol::error::ProviderError;
 use broca_protocol::provider::{NormalizedEvent, ProviderControl};
 use broca_protocol::request::EpisodeRenderInput;
 use broca_protocol::request::{
@@ -31,11 +32,11 @@ use broca_protocol::request::{
 use broca_protocol::tags::{clean_computed_into, ComputedRules};
 use broca_protocol::{BatchId, BindIdentity, FinishReason, GenerationConfig, RunId, StepId, Usage};
 use broca_session_store::codec::{Digest, Message as _};
+use broca_session_store::fold::operations::{CallState, Resolution};
 use broca_session_store::record::{
-    Assistant, BatchEnd, BatchStart, CallOutcome, Input, PartKind, Placement, Record, RunEnd,
-    RunStart, SetupStub, StepEnd, StepStart, ToolIntent, ToolOutcome, ToolReply,
+    Assistant, BatchEnd, BatchStart, CallOutcome, Input, PartKind, Placement, Record, Redo,
+    Resumed, RunEnd, RunStart, SetupStub, StepEnd, StepStart, ToolIntent, ToolOutcome, ToolReply,
 };
-use broca_session_store::fold::operations::Resolution;
 use broca_session_store::session::SessionError;
 use broca_wal::ComputedTagRules;
 use serde_json::{json, Value};
@@ -156,14 +157,136 @@ where
     if let Some(reason) = run.finished {
         return Ok(finished(writer, reason));
     }
-    match run.resolution() {
+    let resolution = run.resolution();
+    let resumed = resumed_record(writer, &resolution);
+    writer.append(&[Record::Resumed(resumed)], false).await?;
+    match resolution {
         Resolution::Resume => drive(writer, &admission, seams).await,
         Resolution::Idle(reason) => finish(writer, seams, &admission.run_id, reason).await,
-        Resolution::Interrupted(_) => {
-            Err(LoopError::Unsupported("closing calls a crash left without results"))
-        }
+        Resolution::Interrupted(_) => close_interrupted(writer, seams, &admission.run_id).await,
         Resolution::ProviderHeld(_) => Err(LoopError::Unsupported("calls a provider holds")),
         Resolution::Paused(_) => Err(LoopError::Unsupported("a paused run")),
+    }
+}
+
+/// The result a resume records for a call that was sent with no result recorded.
+const OUTCOME_UNKNOWN: &str = "outcome_unknown: this tool call was sent, but no result was \
+recorded before the run stopped, so it may or may not have run. It will not be sent again.";
+
+/// The result a resume records for a planned call the crash stopped before it was sent.
+const NOT_RUN_INTERRUPTED: &str =
+    "tool not run: the run was interrupted before this call was dispatched";
+
+/// Ends a run a crash left with calls that may have run: every call of the open batch gets a
+/// result (unknown outcome if it was sent, not run if it wasn't), and the batch and the run's
+/// end are durable together. No call is sent.
+async fn close_interrupted<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+) -> Result<Finished, LoopError> {
+    let now = (seams.now_ms)();
+    let mut records = Vec::new();
+    if let Some(batch) = run_state(writer).open_batch.as_ref() {
+        // The calls still waiting for a result, in the order the model asked for them. With
+        // every call answered the turn is no longer open, and only the batch needs closing.
+        let open = writer.conversation().open_tool_turn();
+        for block in open.iter().flat_map(|open| open.content.iter()) {
+            let broca_protocol::content::ContentBlock::ToolCall(call) = block else {
+                continue;
+            };
+            let (message, outcome) = match batch.state_of(&call.tool_call_id) {
+                Some(CallState::Dispatched) => (OUTCOME_UNKNOWN, CallOutcome::Unknown),
+                Some(CallState::NotSent) => (NOT_RUN_INTERRUPTED, CallOutcome::Interrupted),
+                Some(CallState::Terminated) | None => continue,
+                Some(CallState::ProviderHeld | CallState::HeldSuccessor) => {
+                    return Err(LoopError::Unsupported("calls a provider holds"))
+                }
+            };
+            let result = ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::error(message.to_string()),
+                is_error: true,
+            };
+            terminal(&mut records, run_id, &batch.batch_id, result, outcome, now);
+        }
+        records.push(Record::BatchEnd(BatchEnd {
+            run_id: run_id.into(),
+            batch_id: batch.batch_id.clone(),
+        }));
+    }
+    records.push(run_end(writer, run_id, RunFinishReason::Interrupted, now));
+    writer.append(&records, true).await?;
+    Ok(finished(writer, RunFinishReason::Interrupted))
+}
+
+/// The calls of the run's open tool turn that were never sent: all of them when the step's
+/// batch never started, else those with no intent and no outcome. `None` without an open turn.
+///
+/// A call with an intent and no outcome never reaches this: the fold resolves such a run as
+/// interrupted, and the resume closes it without sending anything. Leaving such calls out here
+/// keeps this filter right on its own.
+fn unsent_calls<W: Writer>(writer: &W) -> Option<Vec<ToolCall>> {
+    let open = writer.conversation().open_tool_turn()?;
+    let batch = run_state(writer).open_batch.as_ref();
+    Some(
+        open.content
+            .iter()
+            .filter_map(|block| match block {
+                broca_protocol::content::ContentBlock::ToolCall(call) => Some(call.clone()),
+                _ => None,
+            })
+            .filter(|call| {
+                batch.is_none_or(|batch| {
+                    batch.state_of(&call.tool_call_id) == Some(CallState::NotSent)
+                })
+            })
+            .collect(),
+    )
+}
+
+/// What a resume rebuilt, what it does again, and which calls it will never send again.
+/// What a resume rebuilt, what it does again, and which calls it will never send again.
+///
+/// While a tool batch is open, its step's tool turn isn't complete: the counted messages stop
+/// before the step's assistant message, and only the batch's unsent calls are done again; the
+/// next model step follows the batch and isn't counted as done again.
+fn resumed_record<W: Writer>(writer: &W, resolution: &Resolution) -> Resumed {
+    let run = run_state(writer);
+    let conversation = writer.conversation();
+    let tool_results = run.open_batch.as_ref().map_or(0, |batch| {
+        (0..batch.calls.len())
+            .filter(|position| batch.state(*position) == CallState::Terminated)
+            .count()
+    });
+    let mut messages = conversation.messages.len();
+    if run.open_batch.is_some() && conversation.open_tool_turn().is_none() {
+        // Every call answered: the turn's assistant message and its results are placed.
+        messages = messages.saturating_sub(2);
+    }
+    let mut redone = Vec::new();
+    if *resolution == Resolution::Resume {
+        let unsent = unsent_calls(writer).unwrap_or_default();
+        redone.extend(unsent.into_iter().map(|call| Redo {
+            step_id: None,
+            tool_call_id: Some(call.tool_call_id),
+        }));
+        if run.open_batch.is_none() && conversation.open_tool_turn().is_none() {
+            // The next model step has no durable answer: it is asked for again.
+            redone.push(Redo {
+                step_id: Some(run.completed_steps + 1),
+                tool_call_id: None,
+            });
+        }
+    }
+    Resumed {
+        run_id: run.run_id.clone(),
+        resumed_from_seq: writer.next_seq().saturating_sub(1),
+        messages: messages as u64,
+        model_steps: run.completed_steps,
+        tool_results: tool_results as u64,
+        redone,
+        indeterminate: run.indeterminate(),
     }
 }
 
@@ -180,10 +303,9 @@ fn frozen_admission(
     run: &broca_session_store::fold::operations::Run,
     parts: &dyn Parts,
 ) -> Result<Admission, LoopError> {
-    let start = run
-        .start
-        .as_ref()
-        .ok_or(LoopError::Unsupported("a run whose start isn't in the fold"))?;
+    let start = run.start.as_ref().ok_or(LoopError::Unsupported(
+        "a run whose start isn't in the fold",
+    ))?;
     let part = |kind: PartKind| -> Result<Option<Value>, LoopError> {
         start
             .setup
@@ -245,23 +367,42 @@ where
     } else {
         admission.stop_when.clone()
     };
-    // A crash after a step asked for tools but before their batch started: the calls were never
-    // sent, so the batch runs now.
-    if let Some(open) = writer.conversation().open_tool_turn() {
-        if run_state(writer).open_batch.is_none() {
-            let calls: Vec<ToolCall> = open
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    broca_protocol::content::ContentBlock::ToolCall(call) => Some(call.clone()),
-                    _ => None,
-                })
-                .collect();
-            let step_id = run_state(writer).completed_steps;
-            if batch(writer, seams, &admission.run_id, step_id, &calls, &manifest).await? {
-                return finish(writer, seams, &admission.run_id, RunFinishReason::Interrupted)
-                    .await;
-            }
+    // A crash after every call of a batch had its result but before the batch closed: it
+    // closes now.
+    if let Some(batch) = run_state(writer).open_batch.as_ref() {
+        let ended =
+            (0..batch.calls.len()).all(|position| batch.state(position) == CallState::Terminated);
+        if ended {
+            let record = Record::BatchEnd(BatchEnd {
+                run_id: admission.run_id.clone(),
+                batch_id: batch.batch_id.clone(),
+            });
+            writer.append(&[record], true).await?;
+        }
+    }
+    // A crash after a step asked for tools and before every call was sent: the calls with no
+    // durable intent never left, so they are dispatched now, in the step's batch.
+    if let Some(unsent) = unsent_calls(writer).filter(|unsent| !unsent.is_empty()) {
+        let step_id = run_state(writer).completed_steps;
+        let started = run_state(writer).open_batch.is_some();
+        if batch(
+            writer,
+            seams,
+            &admission.run_id,
+            step_id,
+            &unsent,
+            &manifest,
+            started,
+        )
+        .await?
+        {
+            return finish(
+                writer,
+                seams,
+                &admission.run_id,
+                RunFinishReason::Interrupted,
+            )
+            .await;
         }
     }
     loop {
@@ -287,8 +428,20 @@ where
             Err(StepFailure::Cancelled) => {
                 return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await;
             }
-            Err(StepFailure::Error) => {
-                return finish(writer, seams, &admission.run_id, RunFinishReason::Error).await;
+            Err(StepFailure::Error(error)) => {
+                if error.class == broca_protocol::ErrorClass::Auth {
+                    return Err(LoopError::Unsupported("a pause for re-authentication"));
+                }
+                let now = (seams.now_ms)();
+                let mut record = run_end(writer, &admission.run_id, RunFinishReason::Error, now);
+                if let Record::RunEnd(end) = &mut record {
+                    end.error = Some(
+                        serde_json::to_value(&*error)
+                            .map_err(|e| LoopError::Parts(e.to_string()))?,
+                    );
+                }
+                writer.append(&[record], true).await?;
+                return Ok(finished(writer, RunFinishReason::Error));
             }
         };
         let calls: Vec<ToolCall> = step.message.tool_calls().cloned().collect();
@@ -338,7 +491,17 @@ where
         if let Some(stop) = stop {
             return hard_stop(writer, seams, &admission.run_id, step_id, &calls, &stop).await;
         }
-        if batch(writer, seams, &admission.run_id, step_id, &calls, &manifest).await? {
+        if batch(
+            writer,
+            seams,
+            &admission.run_id,
+            step_id,
+            &calls,
+            &manifest,
+            false,
+        )
+        .await?
+        {
             return finish(
                 writer,
                 seams,
@@ -497,9 +660,32 @@ struct Step {
     retries_used: u32,
 }
 
+/// The error a step fails with when the provider's stream ends without an answer and its final
+/// `Finished`, as today's loop records it.
+fn incomplete_stream() -> ProviderError {
+    ProviderError {
+        provider_details: None,
+        provider_subcode: None,
+        refusal: None,
+        class: broca_protocol::ErrorClass::ProviderUnavailable,
+        message:
+            "provider stream ended without an assembled assistant message and Finished control"
+                .into(),
+        status: None,
+        retry_after_secs: None,
+        provider_code: None,
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+    }
+}
+
 enum StepFailure {
     Cancelled,
-    Error,
+    Error(Box<ProviderError>),
 }
 
 /// Runs one model call and assembles its answer. Display events go straight to the listener.
@@ -541,7 +727,7 @@ async fn model_step<P: Provider, T>(
                 retries_used,
             })) => {
                 let Some(message) = message.take() else {
-                    return Err(StepFailure::Error);
+                    return Err(StepFailure::Error(Box::new(incomplete_stream())));
                 };
                 return Ok(Step {
                     message,
@@ -550,9 +736,10 @@ async fn model_step<P: Provider, T>(
                     retries_used,
                 });
             }
-            Some(NormalizedEvent::Control(ProviderControl::Error { .. })) | None => {
-                return Err(StepFailure::Error)
+            Some(NormalizedEvent::Control(ProviderControl::Error { error, .. })) => {
+                return Err(StepFailure::Error(Box::new(error)))
             }
+            None => return Err(StepFailure::Error(Box::new(incomplete_stream()))),
             Some(NormalizedEvent::Control(_)) => {}
         }
     }
@@ -568,6 +755,7 @@ async fn batch<W, P, T>(
     step_id: u64,
     calls: &[ToolCall],
     manifest: &ToolManifest,
+    started: bool,
 ) -> Result<bool, LoopError>
 where
     W: Writer,
@@ -581,12 +769,15 @@ where
         scope: None,
         media_capture: None,
     };
-    let mut records = vec![Record::BatchStart(BatchStart {
-        run_id: run_id.into(),
-        batch_id: batch_id.clone(),
-        step_id,
-        planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
-    })];
+    let mut records = Vec::new();
+    if !started {
+        records.push(Record::BatchStart(BatchStart {
+            run_id: run_id.into(),
+            batch_id: batch_id.clone(),
+            step_id,
+            planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+        }));
+    }
     for call in calls {
         let args = canonical(&call.input).map_err(LoopError::Parts)?.1;
         records.push(Record::ToolIntent(ToolIntent {
@@ -790,7 +981,7 @@ fn run_end<W: Writer>(writer: &W, run_id: &str, reason: RunFinishReason, now: u6
     Record::RunEnd(RunEnd {
         run_id: run_id.into(),
         reason,
-        usage: (run.completed_steps > 0).then(|| run.usage),
+        usage: (run.completed_steps > 0).then_some(run.usage),
         ts_ms: Some(now),
         retries_used: run.retries_used,
         interrupt_reason: None,
@@ -803,7 +994,7 @@ fn finished<W: Writer>(writer: &W, reason: RunFinishReason) -> Finished {
     let run = run_state(writer);
     Finished {
         reason,
-        usage: (run.completed_steps > 0).then(|| run.usage),
+        usage: (run.completed_steps > 0).then_some(run.usage),
         retries_used: run.retries_used,
     }
 }

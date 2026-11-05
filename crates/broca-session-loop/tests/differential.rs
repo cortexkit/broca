@@ -18,13 +18,13 @@ use broca_core::{
     provider::Provider, run_loop, AllowAll, FileLeaseStore, FileWalStore, RunRequest, StubReply,
     StubToolPlane,
 };
+use broca_crash_harness::wal::LogImage;
 use broca_protocol::content::{AssistantMessage, ContentBlock, Message, Role, ToolCall};
 use broca_protocol::provider::{NormalizedEvent, ProviderControl};
 use broca_protocol::request::{
     CallOptions, ExecutionMode, ModelHandle, StopCondition, Tool, ToolChoice,
 };
 use broca_protocol::{FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage};
-use broca_crash_harness::wal::LogImage;
 use broca_session_loop::{resume, run, Admission, MemoryParts, Seams, Writer};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::fold::conversation::Conversation;
@@ -297,6 +297,9 @@ impl Writer for Recording<'_, '_> {
     fn session_id(&self) -> String {
         Writer::session_id(&*self.session)
     }
+    fn next_seq(&self) -> u64 {
+        self.session.next_seq()
+    }
 }
 
 /// Both loops route tool calls under one bind, so their requests carry the same session
@@ -335,7 +338,12 @@ async fn new_from(
     .unwrap();
     let mut parts = MemoryParts::default();
     let resuming = match start {
-        Some(converted) if converted.records.iter().any(|r| matches!(r, Record::RunStart(_))) => {
+        Some(converted)
+            if converted
+                .records
+                .iter()
+                .any(|r| matches!(r, Record::RunStart(_))) =>
+        {
             session.append(&converted.records, true).await.unwrap();
             parts.parts = converted.parts;
             true
@@ -396,6 +404,8 @@ const NORMALIZED: &[&str] = &[
     "dispatched_at_ms",
     "last_content_at_ms",
     "call_key",
+    // A log position: each format numbers its own records.
+    "resumed_from_seq",
 ];
 
 fn normalized(records: &[Record]) -> Vec<Value> {
@@ -615,8 +625,10 @@ async fn compare_every_cut(scenario: Scenario) {
             .count();
         let steps = scenario.steps[answered..].to_vec();
         let converted = broca_session_convert::convert(&frames, None).expect("the cut converts");
+        let cut_records = converted.records.clone();
         let before = converted.records.len();
         let (today, _, _) = today_from(&scenario, Some((&name, &bytes)), steps.clone()).await;
+        eprintln!("cut after record {cut} of {records}");
         let new = new_from(&scenario, Some(converted), steps).await;
         let today_appended = &today.records[before.min(today.records.len())..];
         let context = format!("cut after record {cut} of {records}");
@@ -628,15 +640,64 @@ async fn compare_every_cut(scenario: Scenario) {
                 eprintln!("{context} new   {index}: {record}");
             }
         }
-        assert_eq!(new.requests.len(), today.requests.len(), "{context}: request count");
+        assert_eq!(
+            new.requests.len(),
+            today.requests.len(),
+            "{context}: request count"
+        );
         for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
             assert_eq!(new, today, "{context}: request {index}");
         }
         for (index, (new, today)) in new.records.iter().zip(today_appended).enumerate() {
             assert_eq!(new, today, "{context}: record {index}");
         }
-        assert_eq!(new.records.len(), today_appended.len(), "{context}: record count");
-        assert_eq!(new.calls, today.calls, "{context}: tool calls");
+        assert_eq!(
+            new.records.len(),
+            today_appended.len(),
+            "{context}: record count"
+        );
+        let expected_calls = if resumes_an_answered_batch(&cut_records) {
+            without_empty_resumed_batch(&today.calls)
+        } else {
+            today.calls.clone()
+        };
+        assert_eq!(new.calls, expected_calls, "{context}: tool calls");
+    }
+}
+
+/// Whether a crash left the run's open tool batch with every call answered and the batch not
+/// yet closed, read from the operational fold over the cut's records.
+fn resumes_an_answered_batch(records: &[Record]) -> bool {
+    let mut operations = Operations::default();
+    for record in records {
+        if record.stream() == broca_session_store::record::Stream::Ledger {
+            operations.apply(record).expect("the cut folds");
+        }
+    }
+    operations
+        .run
+        .as_ref()
+        .and_then(|run| run.open_batch.as_ref())
+        .is_some_and(|batch| {
+            (0..batch.calls.len()).all(|position| {
+                batch.state(position)
+                    == broca_session_store::fold::operations::CallState::Terminated
+            })
+        })
+}
+
+/// Today's tool-plane calls without the one difference the new loop makes on purpose: on
+/// resume, today's loop opens and closes a batch whose calls all have recorded results, sending
+/// nothing; the new loop records the batch's end without calling the plane, since a plane can
+/// open routes for a batch it never sends on. Only that pair, opening the resume, is left out.
+fn without_empty_resumed_batch(calls: &[String]) -> Vec<String> {
+    match calls {
+        [started, finished, rest @ ..]
+            if started.starts_with("BatchStarted") && finished == "BatchFinished" =>
+        {
+            rest.to_vec()
+        }
+        _ => calls.to_vec(),
     }
 }
 
@@ -658,8 +719,104 @@ async fn every_cut_of_a_tool_run_resumes_alike() {
                 ],
                 FinishReason::ToolCalls,
             ),
-            answer("a2", vec![call("c3", "read", json!({"path": "c"}))], FinishReason::ToolCalls),
+            answer(
+                "a2",
+                vec![call("c3", "read", json!({"path": "c"}))],
+                FinishReason::ToolCalls,
+            ),
             text_step("a3", "done"),
+        ],
+    })
+    .await;
+}
+
+fn tool_run() -> Scenario {
+    Scenario {
+        input: vec![user("look around")],
+        tools: vec![
+            tool("read", ExecutionMode::Parallel),
+            tool("grep", ExecutionMode::Parallel),
+        ],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    ContentBlock::Text {
+                        text: "checking".into(),
+                    },
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c2", "grep", json!({"pattern": "x"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn every_cut_of_parallel_calls_resumes_alike() {
+    compare_every_cut(tool_run()).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_text_answer_resumes_alike() {
+    compare_every_cut(Scenario {
+        input: vec![system("Be brief."), user("hello")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![text_step("a1", "hi")],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_step_limit_resumes_alike() {
+    compare_every_cut(Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        stop_when: vec![StopCondition::StepCount { n: 1 }],
+        steps: vec![answer(
+            "a1",
+            vec![call("c1", "read", json!({"path": "a"}))],
+            FinishReason::ToolCalls,
+        )],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn every_cut_of_an_unknown_outcome_resumes_alike() {
+    compare_every_cut(Scenario {
+        input: vec![user("write a")],
+        tools: vec![tool("write", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "write", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "should not be reached"),
+        ],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn every_cut_of_an_unsent_call_resumes_alike() {
+    compare_every_cut(Scenario {
+        input: vec![user("fetch a")],
+        tools: vec![tool("fetch", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "fetch", json!({"url": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "it failed"),
         ],
     })
     .await;

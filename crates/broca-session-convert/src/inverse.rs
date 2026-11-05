@@ -697,6 +697,22 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         "run_id": result.run_id,
                         "result": result.result,
                     }),
+                    Record::Resumed(resumed) => serde_json::json!({
+                        "type": "resume_started",
+                        "episode": resumed.run_id,
+                        "resumed_from_seq": resumed.resumed_from_seq,
+                        "replayed": {
+                            "messages": resumed.messages,
+                            "model_steps": resumed.model_steps,
+                            "tool_results": resumed.tool_results,
+                        },
+                        "redone": resumed.redone.iter().map(|redo| match (&redo.step_id, &redo.tool_call_id) {
+                            (Some(step_id), _) => serde_json::json!({"kind": "model_step", "step_id": step_id}),
+                            (None, Some(call)) => serde_json::json!({"kind": "tool_dispatch", "tool_call_id": call.0}),
+                            (None, None) => serde_json::json!({}),
+                        }).collect::<Vec<_>>(),
+                        "indeterminate": resumed.indeterminate,
+                    }),
                     Record::Pause(pause) => {
                         let mut object = Map::new();
                         object.insert("type".into(), json("run_paused"));

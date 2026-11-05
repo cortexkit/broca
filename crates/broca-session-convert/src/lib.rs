@@ -24,9 +24,9 @@ use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::record::{
     Assistant, Attempt, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome, CancelPoint,
     CancelRequest, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker, Notice, PartKind,
-    PartRef, Pause, Placement, QueuedSend, Record, ResultAppend, Retraction, RunEnd, RunStart,
-    SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepStart, Stream, StructuredResult,
-    ToolHeld, ToolIntent, ToolOutcome, ToolReply, View, ViewApplied,
+    PartRef, Pause, Placement, QueuedSend, Record, Redo, ResultAppend, Resumed, Retraction, RunEnd,
+    RunStart, SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepStart, Stream,
+    StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, View, ViewApplied,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -511,6 +511,34 @@ fn convert_one(
                     pruned: Vec::new(),
                 }));
             }
+        }
+        "resume_started" => {
+            let mut replayed = f
+                .object("replayed")
+                .ok_or_else(|| err("resume_started without replayed"))?;
+            let resumed = Resumed {
+                run_id: f.req_string("episode"),
+                resumed_from_seq: f.req_u64("resumed_from_seq"),
+                messages: replayed.u64("messages").unwrap_or_default(),
+                model_steps: replayed.u64("model_steps").unwrap_or_default(),
+                tool_results: replayed.u64("tool_results").unwrap_or_default(),
+                redone: match f.take("redone") {
+                    Some(Value::Array(redone)) => redone
+                        .into_iter()
+                        .map(|redo| Redo {
+                            step_id: redo.get("step_id").and_then(Value::as_u64),
+                            tool_call_id: redo
+                                .get("tool_call_id")
+                                .and_then(Value::as_str)
+                                .map(|id| ToolCallId(id.into())),
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                },
+                indeterminate: f.parse("indeterminate")?.unwrap_or_default(),
+            };
+            replayed.finish(out);
+            out.records.push(Record::Resumed(resumed));
         }
         "run_paused" => {
             let reason = f

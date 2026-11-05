@@ -27,6 +27,9 @@ pub trait Writer {
 
     /// The session's id, which names the call keys of this session's tool calls.
     fn session_id(&self) -> String;
+
+    /// The seq the next appended record will take.
+    fn next_seq(&self) -> u64;
 }
 
 #[async_trait(?Send)]
@@ -45,5 +48,9 @@ impl<B: SessionBackend> Writer for Session<'_, B> {
 
     fn session_id(&self) -> String {
         broca_session_store::codec::hex(&self.head().session_id.0)
+    }
+
+    fn next_seq(&self) -> u64 {
+        Session::next_seq(self)
     }
 }

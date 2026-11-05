@@ -628,6 +628,36 @@ impl Value for PauseReason {
 }
 
 message! {
+    /// A run continued after a crash or a restart: what it rebuilt from its records without
+    /// calling anyone, what it does again because no durable record of it survived, and which
+    /// calls may have run without a recorded result. Those calls are never sent again.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Resumed {
+        1 req run_id: String,
+        /// The seq of the last durable record the resume read.
+        2 req resumed_from_seq: u64,
+        /// Messages of the rebuilt conversation, every earlier run included.
+        3 req messages: u64,
+        /// The run's model steps whose answer is durable and isn't asked for again.
+        4 req model_steps: u64,
+        /// Durable results of the run's open tool batch, used as recorded.
+        5 req tool_results: u64,
+        6 rep redone: Redo,
+        7 rep indeterminate: ToolCallId,
+    }
+}
+
+message! {
+    /// One thing a resume does again: a model step asked for again (`step_id`), or a planned
+    /// call dispatched because it has no durable intent (`tool_call_id`). Exactly one is set.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct Redo {
+        1 opt step_id: u64,
+        2 opt tool_call_id: ToolCallId,
+    }
+}
+
+message! {
     /// A run paused without ending: it waits for re-authentication, a restart, an account
     /// limit's reset, or a held tool call's late result, and resumes as the same run.
     #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1034,6 +1064,7 @@ records! {
         90 ChangeAborted,
         91 TranscriptReverted,
         92 RecoveryCut,
+        93 Resumed,
     }
 }
 

@@ -105,6 +105,7 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
             push(IdKind::SendId, start.send_id.as_deref());
         }
         Record::RunEnd(end) => push(IdKind::RunId, Some(&end.run_id)),
+        Record::Resumed(resumed) => push(IdKind::RunId, Some(&resumed.run_id)),
         Record::StructuredResult(result) => push(IdKind::RunId, Some(&result.run_id)),
         // Records inside a run are found through the run, never by an id of their own.
         Record::StepStart(_)

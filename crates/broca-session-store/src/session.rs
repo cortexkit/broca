@@ -486,6 +486,11 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         &self.head
     }
 
+    /// The seq the next appended record will take.
+    pub fn next_seq(&self) -> u64 {
+        self.encoder.next_seq()
+    }
+
     /// The open log's change id and its current length.
     pub fn open_log(&self) -> (Id128, u64) {
         (self.log, self.encoder.offset())

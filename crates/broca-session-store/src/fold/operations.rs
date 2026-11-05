@@ -109,6 +109,12 @@ impl OpenBatch {
             .any(|call| call.id == self.calls[position].id)
     }
 
+    /// The state of the planned call `id`, if the batch plans it.
+    pub fn state_of(&self, id: &ToolCallId) -> Option<CallState> {
+        let position = self.calls.iter().position(|call| &call.id == id)?;
+        Some(self.state(position))
+    }
+
     pub fn state(&self, position: usize) -> CallState {
         let call = &self.calls[position];
         if call.terminal.is_some() {
