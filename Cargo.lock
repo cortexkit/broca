@@ -629,6 +629,7 @@ dependencies = [
  "broca-core",
  "broca-crash-harness",
  "broca-protocol",
+ "broca-provider",
  "broca-session-convert",
  "broca-session-store",
  "broca-test-support",

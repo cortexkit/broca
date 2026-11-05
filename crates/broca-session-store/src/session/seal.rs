@@ -315,7 +315,11 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 // The runs whose settings still shape a request after the cut stay with the
                 // conversation the new log starts from.
                 let first_kept = at.placed + 1;
-                at.seal_window(first_kept)
+                let starts_run = records.iter().find_map(|(seq, record)| match record {
+                    Record::Input(input) if *seq == cut => Some(input.run_id.as_str()),
+                    _ => None,
+                });
+                at.seal_window(first_kept, starts_run)
                     .map_err(|error| SessionError::Fold(format!("conversation: {error:?}")))?;
                 at
             }

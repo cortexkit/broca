@@ -244,20 +244,28 @@ impl Conversation {
     /// Empties the window for a log that starts at a cut, keeping what of the window's runs still
     /// shapes a request: the run whose input the cut split stays a window run (its later messages
     /// are above the cut), and the runs wholly below the cut join the sealed ones where their
-    /// render key changes. `first_kept` is the ordinal of the first entry above the cut.
-    pub fn seal_window(&mut self, first_kept: u64) -> Result<(), FoldError> {
+    /// render key changes. `first_kept` is the ordinal of the first entry above the cut, and
+    /// `starts_run` the run whose input that entry is, if it's a run's input: a run other than
+    /// the last one before the cut starts exactly at the cut, and no earlier run spans it.
+    pub fn seal_window(
+        &mut self,
+        first_kept: u64,
+        starts_run: Option<&str>,
+    ) -> Result<(), FoldError> {
         self.messages.clear();
         self.entries.clear();
         let episodes = std::mem::take(&mut self.episodes);
         // The run in force at the cut: the last one starting before it, unless the next run
-        // starts exactly at the cut.
+        // starts at the cut.
         let spanning = episodes
             .iter()
             .rposition(|episode| episode.start < first_kept)
             .filter(|at| {
-                episodes
-                    .get(at + 1)
-                    .is_none_or(|next| next.start > first_kept)
+                let next_at_cut = match episodes.get(at + 1) {
+                    Some(next) => next.start <= first_kept,
+                    None => starts_run.is_some_and(|run| run != episodes[*at].run_id),
+                };
+                !next_at_cut
             });
         for (at, episode) in episodes.into_iter().enumerate() {
             if episode.start >= first_kept || Some(at) == spanning {

@@ -1248,6 +1248,27 @@ async fn sealed_at_the_cut(
     assert!(state.applied().is_some(), "the applied view was carried");
 }
 
+/// A request as every renderer reads it. A store that seals history keeps only the runs whose
+/// settings still shape a request, so each side's runs are reduced the way the provider crate
+/// proves renders the same bytes (`reduce_episodes`, from the first message the request still
+/// renders); everything else compares as sent.
+fn as_rendered(opts: &CallOptions) -> CallOptions {
+    let first_kept = opts
+        .prompt
+        .iter()
+        .filter_map(|message| message.ordinal)
+        .min()
+        .unwrap_or(0) as usize;
+    let mut opts = opts.clone();
+    opts.render_episodes = Arc::new(
+        broca_provider::families::openai_responses_chatgpt::reduce_episodes(
+            &opts.render_episodes,
+            first_kept,
+        ),
+    );
+    opts
+}
+
 /// Every call the new loop sent carried a key that finds, through the session's own id lookup,
 /// exactly one intent, that call's. A key the new loop minted names the intent's position:
 /// `<session id>:<seq>`.
@@ -1326,7 +1347,11 @@ async fn compare_in(scenario: Scenario) {
     }
     assert_eq!(new.requests.len(), today.requests.len(), "request count");
     for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-        assert_eq!(new, today, "request {index}");
+        assert_eq!(
+            as_rendered(new),
+            as_rendered(today),
+            "request {index}"
+        );
     }
     for (index, (new, today)) in new.records.iter().zip(&today.records).enumerate() {
         assert_eq!(new, today, "record {index}");
@@ -1931,7 +1956,11 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
     }
     assert_eq!(new.requests.len(), today.requests.len(), "request count");
     for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-        assert_eq!(new, today, "request {index}");
+        assert_eq!(
+            as_rendered(new),
+            as_rendered(today),
+            "request {index}"
+        );
     }
     for (index, (new, today)) in new.records.iter().zip(&today.records).enumerate() {
         assert_eq!(new, today, "record {index}");
@@ -2478,7 +2507,11 @@ fn assert_same(today: &Outcome, new: &Outcome) {
     }
     assert_eq!(new.requests.len(), today.requests.len(), "request count");
     for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
-        assert_eq!(new, today, "request {index}");
+        assert_eq!(
+            as_rendered(new),
+            as_rendered(today),
+            "request {index}"
+        );
     }
     for (index, (new, today)) in new.records.iter().zip(&today.records).enumerate() {
         assert_eq!(new, today, "record {index}");
@@ -4027,6 +4060,36 @@ async fn a_cut_seals_the_history_before_it_and_requests_stay_the_same() {
                         text_step("a2", "hello again"),
                     ]),
                     &[("r1", vec![user("first")]), ("r2@m2", vec![user("second")])],
+                )),
+            ),
+        )
+        .await;
+}
+
+/// Three runs, then a cut through the second run's answer, so the first two runs leave the
+/// window whole: the new loop keeps the first (the session's first run) and drops the second (same
+/// render settings), and its requests must carry the runs a renderer reads as today's do.
+#[tokio::test]
+async fn a_cut_past_two_runs_keeps_only_the_runs_that_shape_requests() {
+    LAYOUT
+        .scope(
+            Some(cortexkit_compaction_view::PLAN_VERSION),
+            COMPACTION.scope(
+                Some(Arc::new(CompactionScript {
+                    context_limit: 100_000,
+                    rides: vec![Ride::Cut(4)],
+                })),
+                Box::pin(compare_runs_in(
+                    compacted_scenario(vec![
+                        text_step("a1", "one"),
+                        text_step("a2", "two"),
+                        text_step("a3", "three"),
+                    ]),
+                    &[
+                        ("r1", vec![user("first")]),
+                        ("r2", vec![user("second")]),
+                        ("r3@m2", vec![user("third")]),
+                    ],
                 )),
             ),
         )
