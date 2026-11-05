@@ -81,6 +81,34 @@ pub fn episode_render_key(frozen_config: &serde_json::Value) -> serde_json::Valu
     })
 }
 
+/// The runs of `history` a request must carry when the messages before prompt position
+/// `first_kept` no longer render (a compaction view cut them): the first run, every later run
+/// whose [`episode_render_key`] differs from the run before it, and every run starting at or after
+/// `first_kept`. Every renderer gives the same bytes for the reduced list as for the whole one,
+/// which is what lets a store that seals history keep only these runs.
+pub fn reduce_episodes(
+    history: &broca_protocol::request::RenderHistory,
+    first_kept: usize,
+) -> broca_protocol::request::RenderHistory {
+    let mut reduced = history.clone();
+    let mut previous_key = None;
+    reduced.episodes = history
+        .episodes
+        .iter()
+        .enumerate()
+        .filter(|(index, episode)| {
+            let key = episode_render_key(&episode.frozen_config);
+            let keep = *index == 0
+                || previous_key.as_ref() != Some(&key)
+                || episode.prompt_start >= first_kept;
+            previous_key = Some(key);
+            keep
+        })
+        .map(|(_, episode)| episode.clone())
+        .collect();
+    reduced
+}
+
 pub(crate) fn effort_plan(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,

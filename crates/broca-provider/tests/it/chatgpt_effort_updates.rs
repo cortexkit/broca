@@ -420,3 +420,62 @@ fn changed_or_unknown_checkpoint_effort_history_cannot_seed_the_fast_path() {
         assert!(prior.render_episodes.is_none());
     }
 }
+
+/// Rendering with the runs `reduce_episodes` keeps gives the same bytes as rendering with every
+/// run, over generated sessions: each run's effort and whether it admitted updates vary, and a
+/// compaction view cuts a varying number of leading messages (the request renders only messages
+/// at or after the cut, with native ordinals). A store that seals history relies on this.
+#[test]
+fn reduced_episodes_render_the_same_bytes_as_every_episode() {
+    let efforts = ["low", "medium", "high", "xhigh"];
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |bound: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % bound
+    };
+    let mut reduced_any = 0;
+    for _ in 0..300 {
+        let runs = 1 + next(12) as usize;
+        let mut rows = Vec::new();
+        let mut effort = efforts[next(4) as usize];
+        for run in 0..runs {
+            if run > 0 {
+                rows.push(finish());
+                // Mostly the same effort as the run before, as real sessions are.
+                if next(4) == 0 {
+                    effort = efforts[next(4) as usize];
+                }
+            }
+            let admitted = next(10) != 0;
+            rows.push(start("gpt-6.1-sol", effort, admitted, (next(5) != 0).then_some(Role::User)));
+        }
+        let prior = broca_core::replay::replay(&rows).unwrap();
+        let frozen: FrozenRenderConfig =
+            serde_json::from_value(prior.run_config.unwrap().frozen_render_config).unwrap();
+        let mut history: broca_protocol::request::RenderHistory =
+            prior.render_episodes.unwrap().into();
+        history.raw_ordinals = true;
+        let mut prompt = prior.prompt.clone();
+        for (index, message) in prompt.iter_mut().enumerate() {
+            message.ordinal = Some(index as u64);
+        }
+        let first_kept = next(prompt.len() as u64 + 1) as usize;
+        let kept: Vec<Message> = prompt[first_kept..].to_vec();
+        let mut whole = CallOptions::new(kept.clone());
+        whole.render_episodes = Arc::new(history.clone());
+        let reduced_history =
+            broca_provider::families::openai_responses_chatgpt::reduce_episodes(&history, first_kept);
+        reduced_any += usize::from(reduced_history.episodes.len() < history.episodes.len());
+        let mut reduced = CallOptions::new(kept);
+        reduced.render_episodes = Arc::new(reduced_history);
+        assert_eq!(
+            OpenAiResponsesChatgpt.render(&frozen, &reduced),
+            OpenAiResponsesChatgpt.render(&frozen, &whole),
+            "{runs} runs, cut before {first_kept}"
+        );
+    }
+    // The generated sessions do drop runs, so the check isn't passing on unreduced lists alone.
+    assert!(reduced_any > 50, "only {reduced_any} sessions dropped a run");
+}
