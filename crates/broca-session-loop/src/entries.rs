@@ -31,9 +31,15 @@ pub struct Placed<'w, W> {
     pub inner: &'w mut W,
     /// The run's tag rules, for a session that records entry facts.
     pub facts: Option<Tags>,
-    /// The compaction view the current step renders with, which a model-written message
-    /// records.
-    pub view: Option<ViewRef>,
+}
+
+/// The view a model-written message was written under, as today's projection decides it: the
+/// newest view a step applied, which the step that writes the message applied or kept.
+fn written_under(operations: &Operations) -> Option<ViewRef> {
+    operations.view_applied.as_ref().map(|applied| ViewRef {
+        version: applied.view.version,
+        checksum: applied.view.checksum.clone(),
+    })
 }
 
 #[async_trait(?Send)]
@@ -50,7 +56,7 @@ impl<W: Writer> Writer for Placed<'_, W> {
                 first_seq: self.inner.next_seq(),
                 prefix: &prefix,
                 tags,
-                view: self.view.clone(),
+                view: written_under(self.inner.operations()),
             },
         )
         .map_err(SessionError::Fold)?;
@@ -71,7 +77,6 @@ impl<W: Writer> Writer for Placed<'_, W> {
             return self.inner.append_with(build, barrier).await;
         };
         let prefix = self.inner.message_id_prefix();
-        let view = self.view.clone();
         let mut failure = None;
         let records = self
             .inner
@@ -83,7 +88,7 @@ impl<W: Writer> Writer for Placed<'_, W> {
                         first_seq,
                         prefix: &prefix,
                         tags,
-                        view: view.clone(),
+                        view: written_under(operations),
                     };
                     match with_facts(batch, &placing) {
                         Ok(batch) => batch,
@@ -122,6 +127,10 @@ impl<W: Writer> Writer for Placed<'_, W> {
         self.inner.message_id_prefix()
     }
 
+    async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
+        self.inner.open_log_records().await
+    }
+
     fn media(&self) -> Option<std::sync::Arc<dyn broca_core::tool_media::MediaCapture>> {
         self.inner.media()
     }
@@ -138,13 +147,16 @@ pub struct Tags {
 
 impl Tags {
     /// Today's rules for a run on the current compaction contract: numbers render when the plan
-    /// names a compaction item, and replies are cleaned when they render, except a
-    /// structured-output run's final text.
+    /// asks for them or names a compaction item, and replies are cleaned when they render, except
+    /// a structured-output run's final text.
     pub fn for_run(
         manifest: Option<&broca_wal::PlanManifest>,
         render_config: &serde_json::Value,
     ) -> Self {
-        let render = manifest.is_some_and(broca_core::compaction::has_compaction);
+        let render = manifest.is_some_and(|manifest| {
+            broca_core::tags::plan_renders_tags(manifest)
+                || broca_core::compaction::has_compaction(manifest)
+        });
         Self {
             render,
             clean_replies: broca_core::compaction_v2::metadata::clean_replies(

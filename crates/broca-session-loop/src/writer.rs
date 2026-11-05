@@ -54,6 +54,10 @@ pub trait Writer {
     /// `EntryFacts` record takes seq `s` is `<prefix>.<s>`.
     fn message_id_prefix(&self) -> String;
 
+    /// Every record of the open log after its checkpoint, with its seq: what a reader needs
+    /// whole when the folds keep only a summary of it, such as the compaction views.
+    async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError>;
+
     /// Where the tool plane captures a result's media. A writer that offers one stores, when it
     /// appends a call's result, the bytes of every media part captured for that call, durable
     /// before the record. Without one nothing is captured, so every media part of a result
@@ -110,6 +114,10 @@ impl<B: SessionBackend> Writer for Session<'_, B> {
 
     fn message_id_prefix(&self) -> String {
         Session::message_id_prefix(self)
+    }
+
+    async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
+        Session::open_log_records(self).await
     }
 }
 

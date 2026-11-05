@@ -425,6 +425,16 @@ impl ToolPlane for Spy {
         if call.tool_name == "photo" {
             return photo(ctx, call).await;
         }
+        // A result big enough that the next request goes over a small window.
+        if call.tool_name == "big" {
+            return DispatchResult::Completed(ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::Text {
+                    text: "x".repeat(8_000),
+                },
+                is_error: false,
+            });
+        }
         self.inner.dispatch_guarded(ctx, call, key, guard).await
     }
 
@@ -535,6 +545,163 @@ fn lineage(image: &LogImage) -> Option<String> {
 }
 
 tokio::task_local! {
+    /// The compaction provider a comparison's plan names, scripted: what it answers each ride
+    /// and the window the run freezes. `None` runs without one.
+    static COMPACTION: Option<Arc<CompactionScript>>;
+}
+
+/// The compaction script the comparison running in this task uses.
+fn compaction() -> Option<Arc<CompactionScript>> {
+    COMPACTION.try_with(Clone::clone).ok().flatten()
+}
+
+struct CompactionScript {
+    context_limit: u64,
+    /// What each ride is answered, in order; once they run out, `nothing`.
+    rides: Vec<Ride>,
+}
+
+#[derive(Clone, Copy)]
+enum Ride {
+    Nothing,
+    /// A view that drops the whole entry at this ordinal.
+    Drop(u64),
+}
+
+/// A compaction provider that answers from a script and records every call, so both loops must
+/// make the same calls. Message ids differ between the loops by design, so the provider learns
+/// them from the entries it's told about, and a view names entries by those ids.
+struct CompactionSpy {
+    rides: Mutex<VecDeque<Ride>>,
+    mids: Mutex<std::collections::BTreeMap<u64, String>>,
+    version: std::sync::atomic::AtomicU64,
+    calls: Mutex<Vec<(String, Value)>>,
+}
+
+impl CompactionSpy {
+    fn new(script: &CompactionScript) -> Self {
+        Self {
+            rides: Mutex::new(script.rides.iter().copied().collect()),
+            mids: Mutex::default(),
+            version: Default::default(),
+            calls: Mutex::default(),
+        }
+    }
+
+    /// The calls made, in order, each with message ids, digests and checksums renamed by order of
+    /// first appearance and times blanked, so two loops' calls compare equal exactly when they
+    /// say the same thing.
+    fn calls(&self) -> Vec<String> {
+        let mut names = std::collections::HashMap::new();
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(method, params)| {
+                let mut params = params.clone();
+                rename(&mut params, &mut names);
+                format!("{method} {params}")
+            })
+            .collect()
+    }
+}
+
+/// Renames, in `value`, every message id, digest and checksum by its order of first appearance,
+/// and blanks every time.
+fn rename(value: &mut Value, names: &mut std::collections::HashMap<String, usize>) {
+    match value {
+        Value::Object(members) => {
+            for (key, member) in members.iter_mut() {
+                match (key.as_str(), &member) {
+                    ("now" | "at_ms" | "written_at" | "completed_at", _) => {
+                        *member = json!("<time>");
+                    }
+                    (
+                        "mid" | "through" | "first_kept_mid" | "digest" | "checksum",
+                        Value::String(text),
+                    ) => {
+                        let next = names.len();
+                        let name = *names.entry(text.clone()).or_insert(next);
+                        *member = json!(format!("<{key}#{name}>"));
+                    }
+                    _ => rename(member, names),
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| rename(item, names)),
+        _ => {}
+    }
+}
+
+/// Every `(ordinal, mid)` pair an entry in `value` names.
+fn entry_mids(value: &Value, out: &mut std::collections::BTreeMap<u64, String>) {
+    match value {
+        Value::Object(members) => {
+            if let (Some(ordinal), Some(mid)) = (
+                members.get("ordinal").and_then(Value::as_u64),
+                members.get("mid").and_then(Value::as_str),
+            ) {
+                out.insert(ordinal, mid.to_owned());
+            }
+            members.values().for_each(|member| entry_mids(member, out));
+        }
+        Value::Array(items) => items.iter().for_each(|item| entry_mids(item, out)),
+        _ => {}
+    }
+}
+
+#[async_trait::async_trait]
+impl broca_core::CompactionPlane for CompactionSpy {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        _: broca_core::compaction_provider::setup::SetupRequest,
+    ) -> Result<
+        broca_core::compaction_provider::setup::SetupAnswer,
+        broca_core::CompactionUnavailable,
+    > {
+        panic!("a session on the current compaction contract never calls the first protocol")
+    }
+
+    async fn call_v2(
+        &self,
+        _: &str,
+        _: &broca_protocol::BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        method: &str,
+        params: Value,
+        _: u64,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
+    {
+        entry_mids(&params, &mut self.mids.lock().unwrap());
+        self.calls.lock().unwrap().push((method.into(), params));
+        let answer = match method {
+            "compaction.setup" => json!({"answer": "ready"}),
+            "compaction.notice" => json!({"answer": "received"}),
+            "compaction.ride" => match self.rides.lock().unwrap().pop_front() {
+                None | Some(Ride::Nothing) => json!({"answer": "nothing"}),
+                Some(Ride::Drop(ordinal)) => {
+                    use cortexkit_role_compaction::view::{Edit, EditOp, View};
+                    let mid = self.mids.lock().unwrap()[&ordinal].clone();
+                    let version = 1 + self
+                        .version
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let view = View::seal(
+                        version,
+                        vec![Edit::new(version, EditOp::Drop { mid, part: None })],
+                    );
+                    json!({"answer": "view", "view": view})
+                }
+            },
+            other => panic!("unexpected compaction method {other}"),
+        };
+        Ok(serde_json::value::to_raw_value(&answer).expect("an answer serializes"))
+    }
+}
+
+tokio::task_local! {
     /// The layout a comparison's session starts under: the current compaction contract (a plan
     /// version), or the established layout (`None`). Every comparison runs once in each.
     static LAYOUT: Option<u32>;
@@ -607,7 +774,7 @@ impl Scenario {
             stop_when: self.stop_when.clone(),
             submission_id: None,
             budget: None,
-            context_limit: None,
+            context_limit: compaction().map(|script| script.context_limit),
             work_class: None,
             context_management: None,
             variant: None,
@@ -645,6 +812,7 @@ impl Scenario {
             manifest: self.manifest.clone(),
             global_system: Vec::new(),
             compaction_plan_version: layout(),
+            context_limit: compaction().map(|script| script.context_limit),
         }
     }
 }
@@ -682,6 +850,7 @@ async fn today_from(
     }
     let provider = ScriptedProvider::new(steps);
     let plane = scenario.plane();
+    let spy = compaction().map(|script| Arc::new(CompactionSpy::new(&script)));
     let lease = FileLeaseStore::new(dir.join("lease"));
     let wal = FileWalStore::new(dir.join("wal"));
     let (tx, mut rx) = mpsc::channel(512);
@@ -701,6 +870,10 @@ async fn today_from(
             cancel: Some(cancel.clone()),
             hook_plane: Some(harness_hooks_cancelling(cancel)),
             new_log_compaction_plan_version: layout(),
+            compaction_plane: spy
+                .clone()
+                .map(|spy| spy as Arc<dyn broca_core::CompactionPlane>),
+            admitted_context_limit: compaction().map(|script| script.context_limit),
             ..Default::default()
         },
         &tx,
@@ -727,6 +900,7 @@ async fn today_from(
                 .log()
                 .iter()
                 .map(|event| format!("{event:?}"))
+                .chain(spy.map_or_else(Vec::new, |spy| spy.calls()))
                 .collect(),
         },
         image,
@@ -813,6 +987,10 @@ impl Writer for Recording<'_, '_> {
     fn message_id_prefix(&self) -> String {
         self.session.message_id_prefix()
     }
+
+    async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
+        self.session.open_log_records().await
+    }
     fn media(&self) -> Option<Arc<dyn MediaCapture>> {
         Some(Arc::clone(&self.media) as Arc<dyn MediaCapture>)
     }
@@ -870,6 +1048,7 @@ async fn new_from(
         }
         _ => false,
     };
+    let spy = compaction().map(|script| Arc::new(CompactionSpy::new(&script)));
     let provider = ScriptedProvider::new(steps);
     let plane = scenario.plane();
     let lifecycle = plane.lifecycle();
@@ -894,6 +1073,10 @@ async fn new_from(
         hook_plane: Some(harness_hooks_cancelling(cancel)),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        compaction_plane: spy
+            .as_deref()
+            .map(|spy| spy as &dyn broca_core::CompactionPlane),
+        compaction_session: None,
     };
     if resuming {
         resume(&mut writer, &parts, &seams).await
@@ -920,6 +1103,7 @@ async fn new_from(
             .log()
             .iter()
             .map(|event| format!("{event:?}"))
+            .chain(spy.map_or_else(Vec::new, |spy| spy.calls()))
             .collect(),
     }
 }
@@ -946,33 +1130,51 @@ const NORMALIZED: &[&str] = &[
 ];
 
 /// Records as the comparison reads them. Message ids differ by design: today's are
-/// `m<lineage prefix>.<position>`, the new loop's `g<generation>.<seq>`. So each id becomes its
-/// order of first appearance, and the same id always maps to the same number; two outcomes
-/// compare equal only if their ids line up one to one.
+/// `m<lineage prefix>.<position>`, the new loop's `g<generation>.<seq>`, and a compaction view's
+/// checksum covers the ids its edits name. So each id, anywhere in a record, becomes its order of
+/// first appearance, and each view checksum likewise; two outcomes compare equal only if their
+/// ids and views line up one to one.
 fn normalized(records: &[Record]) -> Vec<Value> {
-    let mut ids: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut id = |mid: &mut Value| {
-        if let Some(text) = mid.as_str() {
-            let next = ids.len();
-            *mid = json!(format!(
-                "mid#{}",
-                *ids.entry(text.to_owned()).or_insert(next)
-            ));
-        }
-    };
+    let mut names: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     records
         .iter()
         .map(|record| {
             let mut value = serde_json::to_value(record).expect("records serialize");
             scrub(&mut value);
-            for key in ["mid", "first_kept_mid"] {
-                if let Some(mid) = value.get_mut(key) {
-                    id(mid);
-                }
-            }
+            rename_ids(&mut value, &mut names);
             json!({ record.name(): value })
         })
         .collect()
+}
+
+/// Renames, anywhere in `value`, every message id and view checksum by its order of first
+/// appearance across the records.
+fn rename_ids(value: &mut Value, names: &mut std::collections::HashMap<String, usize>) {
+    match value {
+        Value::Object(members) => {
+            for (key, member) in members.iter_mut() {
+                match (key.as_str(), member.as_str()) {
+                    ("mid" | "first_kept_mid", Some(text)) => {
+                        let next = names.len();
+                        *member = json!(format!(
+                            "mid#{}",
+                            *names.entry(text.to_owned()).or_insert(next)
+                        ));
+                    }
+                    ("checksum", Some(text)) => {
+                        let next = names.len();
+                        *member = json!(format!(
+                            "checksum#{}",
+                            *names.entry(text.to_owned()).or_insert(next)
+                        ));
+                    }
+                    _ => rename_ids(member, names),
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| rename_ids(item, names)),
+        _ => {}
+    }
 }
 
 /// Every call the new loop sent carried a key that finds, through the session's own id lookup,
@@ -1602,6 +1804,8 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         hook_plane: Some(harness_hooks()),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        compaction_plane: None,
+        compaction_session: None,
     };
     for (run_id, input) in runs {
         run(
@@ -2114,6 +2318,8 @@ async fn compare_actions_in(
         hook_plane: Some(harness_hooks()),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        compaction_plane: None,
+        compaction_session: None,
     };
     let mut admission = scenario.admission(&provider.inner);
     admission.on_restart = on_restart;
@@ -2440,6 +2646,8 @@ async fn compare_auth_pause_in(scenario: Scenario) {
         hook_plane: Some(harness_hooks()),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        compaction_plane: None,
+        compaction_session: None,
     };
     let first = run(
         &mut writer,
@@ -3551,4 +3759,98 @@ fn cancel_before_batch_with_a_repeated_id_scenario() -> Scenario {
 #[tokio::test]
 async fn a_refused_batch_still_answers_a_repeated_call_id_as_a_duplicate() {
     compare(cancel_before_batch_with_a_repeated_id_scenario()).await;
+}
+
+/// Runs [`compare_in`] once, on the current compaction contract, with a compaction provider
+/// scripted by `script` that both loops call.
+async fn compare_compacted(scenario: Scenario, script: CompactionScript) {
+    LAYOUT
+        .scope(
+            Some(cortexkit_compaction_view::PLAN_VERSION),
+            COMPACTION.scope(Some(Arc::new(script)), Box::pin(compare_in(scenario))),
+        )
+        .await;
+}
+
+/// A fetch plan's manifest that also names a compaction provider (`compactor`, preset `head`),
+/// with part numbers rendered into requests.
+fn compacted_manifest(tools: &[Tool]) -> Arc<broca_wal::PlanManifest> {
+    let mut manifest = planned_manifest(tools).as_ref().clone();
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+        json!({
+            "tool_items": [{"provider": "provider"}],
+            "compaction_item": {"provider": "compactor", "preset": "head", "params": {}},
+            "composition": {},
+            "render_tags": true,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    Arc::new(manifest)
+}
+
+fn compacted_scenario(steps: Vec<Vec<NormalizedEvent>>) -> Scenario {
+    let tools = vec![
+        tool("read", ExecutionMode::Parallel),
+        tool("big", ExecutionMode::Parallel),
+    ];
+    Scenario {
+        input: vec![user("read a")],
+        manifest: Some(compacted_manifest(&tools)),
+        tools,
+        stop_when: Vec::new(),
+        steps,
+    }
+}
+
+#[tokio::test]
+async fn a_compacted_text_answer() {
+    compare_compacted(
+        compacted_scenario(vec![text_step("a1", "hello")]),
+        CompactionScript {
+            context_limit: 100_000,
+            rides: Vec::new(),
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_compacted_tool_call_then_an_answer() {
+    compare_compacted(
+        compacted_scenario(vec![
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ]),
+        CompactionScript {
+            context_limit: 100_000,
+            rides: Vec::new(),
+        },
+    )
+    .await;
+}
+
+/// A tool result pushes the next request over the window; the step rides, the provider answers
+/// with a view that drops the call's entry, and the step renders from that view.
+#[tokio::test]
+async fn an_over_limit_step_rides_and_renders_from_the_view_it_gets() {
+    compare_compacted(
+        compacted_scenario(vec![
+            answer(
+                "a1",
+                vec![call("c1", "big", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ]),
+        CompactionScript {
+            context_limit: 1_200,
+            rides: vec![Ride::Drop(2)],
+        },
+    )
+    .await;
 }

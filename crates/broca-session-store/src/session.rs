@@ -345,6 +345,37 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         Ok(session)
     }
 
+    /// Every record of the open log after its checkpoint, with its seq, read again from the
+    /// backend: one read of the open log. For a reader that needs whole records the folds keep only
+    /// a summary of, such as the compaction views (the fold keeps their version and checksum, the
+    /// records their edits). The writer appended every one of them, so a log that no longer reads
+    /// clean means something else wrote it, and the read refuses.
+    pub async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
+        let open =
+            self.head
+                .open_log
+                .clone()
+                .ok_or(SessionError::Backend(BackendError::Corrupt(
+                    "local head without a log",
+                )))?;
+        let end = self.backend.log_end(&self.addr, &self.log).await?;
+        let bytes = self.backend.read_log(&self.addr, &self.log, 0..end).await?;
+        let bind = log_bind(&self.head.session_id, &self.log);
+        match crate::damage::analyse(
+            &bytes,
+            &self.key.frame_key(),
+            &bind,
+            open.synced_len,
+            chain_base,
+            None,
+        )? {
+            crate::damage::Verdict::Opens(read) => Ok(read.records),
+            _ => Err(SessionError::Fold(
+                "the open log no longer reads clean under its writer".into(),
+            )),
+        }
+    }
+
     /// Opens the writer on a log nothing but its checkpoint was written to.
     async fn open_writer(&mut self, key: &DataKey) -> Result<(), SessionError> {
         let end = self.encoder.offset();
@@ -525,7 +556,7 @@ use media::OpenLogIndex;
 pub use media::{MediaError, NewMedia};
 
 mod read;
-pub use read::{window_entries, StoredEntry};
+pub use read::{served_window, window_entries, StoredEntry};
 mod cold;
 pub use cold::Cold;
 mod recover;

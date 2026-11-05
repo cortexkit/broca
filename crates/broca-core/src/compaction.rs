@@ -553,7 +553,7 @@ impl CompactionHistory {
 /// absent cache splits as included in fresh input; only absent fresh input makes fill unknown.
 /// A display estimate may fall back to byte conversion, but unknown measured input never
 /// authorizes sending at a wait cap after a completed model step.
-pub(crate) fn request_estimate(bytes: usize, history: &CompactionHistory) -> (u64, Option<u64>) {
+pub fn request_estimate(bytes: usize, history: &CompactionHistory) -> (u64, Option<u64>) {
     let measured = history.usage().and_then(|usage| usage.fill_tokens());
     // Without the old body length, the whole current body bounds bytes added since it.
     let previous = measured.map(|input| (input, history.previous_request_bytes.unwrap_or(0)));

@@ -51,6 +51,22 @@ fn canonical_u64(digits: &str) -> Option<u64> {
     canonical.then(|| digits.parse().ok()).flatten()
 }
 
+/// The window's entries as `session.entries` serves them: the placed messages, then the
+/// assistant message whose tool calls are still running, at the ordinal reserved for it.
+pub fn served_window(conversation: &Conversation) -> Vec<StoredEntry> {
+    let mut entries = window_entries(conversation, 1, usize::MAX);
+    if let Some((ordinal, message, state)) = conversation.open_entry() {
+        entries.push(StoredEntry {
+            ordinal,
+            message: message.clone(),
+            next: None,
+            state: state.clone(),
+            open: true,
+        });
+    }
+    entries
+}
+
 /// The entries of `conversation`'s window from `from` on, at most `limit` of them: one per
 /// window message, so a request's prompt and its entries line up.
 pub fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> Vec<StoredEntry> {

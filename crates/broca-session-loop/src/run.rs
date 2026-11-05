@@ -99,6 +99,9 @@ pub struct Admission {
     /// a planned run, otherwise the system messages the caller sent, or the previous run's when
     /// it sent none. [`run`] takes it out of `input`; a caller leaves it empty.
     pub global_system: Vec<Message>,
+    /// The window the run's model may use, in tokens; compaction states its conditions from it,
+    /// and a run on a plan with a compaction provider needs one.
+    pub context_limit: Option<u64>,
     /// For a session's first run: the compaction plan version the session starts under, so it
     /// records and renders under the current compaction contract; `None` keeps the established
     /// layout. Today's actor asks for it when the plan names a compaction provider. A later run
@@ -132,6 +135,12 @@ pub struct Seams<'a, P, T> {
     pub now_ms: &'a (dyn Fn() -> u64 + Sync),
     /// The session's address, given to the provider for its diagnostics only.
     pub session_address: Option<String>,
+    /// The compaction provider's calls, for a run whose plan names one. Without it every call
+    /// fails as unavailable, as today's loop's do without a plane.
+    pub compaction_plane: Option<&'a dyn broca_core::CompactionPlane>,
+    /// The session's compaction state, kept for the session's life by whoever owns the session
+    /// (today's actor keeps it per session). Without it a run starts from the session's log.
+    pub compaction_session: Option<Arc<broca_core::compaction_v2::session::Session>>,
 }
 
 /// How a run ended.
@@ -198,10 +207,10 @@ where
         facts: contract
             .then(|| Tags::for_run(admission.manifest.as_deref(), &admission.render_config)),
         inner: writer,
-        view: None,
     };
     admit(&mut placed, parts, &admission).await?;
-    drive(&mut placed, parts, &admission, seams).await
+    let compaction = compaction_ctx(&placed, &admission, seams, true).await?;
+    drive(&mut placed, parts, &admission, seams, compaction.as_ref()).await
 }
 
 /// Takes the system messages out of a run's input and decides the system text its requests
@@ -268,20 +277,22 @@ where
             .compaction_plan_version
             .map(|_| Tags::for_run(admission.manifest.as_deref(), &admission.render_config)),
         inner: writer,
-        view: None,
     };
     let writer = &mut placed;
     let resumed = resumed_record(writer, &resolution);
     writer.append(&[Record::Resumed(resumed)], false).await?;
+    let compaction = compaction_ctx(writer, &admission, seams, false).await?;
     match resolution {
-        Resolution::Resume => drive(writer, parts, &admission, seams).await,
+        Resolution::Resume => drive(writer, parts, &admission, seams, compaction.as_ref()).await,
         Resolution::Idle(reason) => finish(writer, seams, &admission.run_id, reason).await,
         Resolution::Interrupted(_) => close_interrupted(writer, seams, &admission.run_id).await,
         // A held call's late result arrived: the run goes on from its open batch, waiting on
         // each held call again rather than sending it.
-        Resolution::ProviderHeld(_) => drive(writer, parts, &admission, seams).await,
+        Resolution::ProviderHeld(_) => {
+            drive(writer, parts, &admission, seams, compaction.as_ref()).await
+        }
         Resolution::Paused(PauseReason::AuthRequired | PauseReason::Restart) => {
-            drive(writer, parts, &admission, seams).await
+            drive(writer, parts, &admission, seams, compaction.as_ref()).await
         }
         Resolution::Paused(_) => Err(LoopError::Unsupported("a paused run")),
     }
@@ -645,6 +656,7 @@ fn frozen_admission(
             (Some(_), None) => decode(part(PartKind::GlobalSystem)?)?.unwrap_or_default(),
         },
         compaction_plan_version: start.compaction_plan_version,
+        context_limit: start.context_limit,
         manifest: frozen_manifest(start, parts)?,
     })
 }
@@ -655,6 +667,7 @@ async fn drive<W, P, T>(
     parts: &dyn Parts,
     admission: &Admission,
     seams: &Seams<'_, P, T>,
+    compaction: Option<&crate::compaction::Ctx>,
 ) -> Result<Finished, LoopError>
 where
     W: Writer,
@@ -767,6 +780,22 @@ where
             account_limit: None,
         }));
         let resumes = admission.on_restart == Some(OnRestart::Resume);
+        // A view the compaction provider handed over applies here, before the step starts, as
+        // in today's loop; a boundary that ends the run applies none.
+        let ending = cancelled_now
+            || stopping
+            || writer
+                .operations()
+                .run
+                .as_ref()
+                .is_some_and(|run| run.cancel.is_some());
+        if let (Some(ctx), false) = (compaction, ending) {
+            if let Err(message) =
+                crate::compaction::apply_boundary(writer, admission, seams, ctx, step_id).await?
+            {
+                return compaction_unavailable(writer, seams, admission, &message).await;
+            }
+        }
         // Queued sends with a delivery order are read before the batch is built, since their
         // records may be sealed. One queued after this read waits for the next boundary.
         let ordered = ordered_sends(writer).await?;
@@ -856,7 +885,23 @@ where
             }
             _ => {}
         }
-        let opts = call_options(writer, admission, &tools, &episodes, seams, step_id)?;
+        let mut opts = call_options(
+            writer,
+            admission,
+            &tools,
+            &episodes,
+            seams,
+            step_id,
+            compaction.is_some(),
+        )?;
+        if let Some(ctx) = compaction {
+            match crate::compaction::prepare(writer, admission, seams, ctx, step_id, opts).await? {
+                crate::compaction::Send::Ready(ready) => opts = ready,
+                crate::compaction::Send::Unavailable(message) => {
+                    return compaction_unavailable(writer, seams, admission, &message).await;
+                }
+            }
+        }
         let outcome = model_step(writer, seams, &admission.run_id, step_id, opts).await?;
         let step = match outcome {
             Ok(step) => step,
@@ -936,6 +981,9 @@ where
                 calls.is_empty(),
             )
             .await?;
+        if let Some(ctx) = compaction {
+            crate::compaction::notice(writer, admission, seams, ctx).await?;
+        }
         if calls.is_empty() {
             // A message steered in during the step makes the run take one more step, unless a
             // stop condition that limits the run was met. Otherwise the run ends here.
@@ -1061,6 +1109,14 @@ async fn admit<W: Writer>(
             admission.provider_options.clone(),
         );
     }
+    // A plan that asks for part numbers in the model's view freezes that on the run, as today.
+    if admission
+        .manifest
+        .as_deref()
+        .is_some_and(broca_core::tags::plan_renders_tags)
+    {
+        config.insert("render_tags".into(), json!(true));
+    }
     // Today's computed tag rules, starting after the transcript's highest tag (none yet in a
     // new session).
     config.insert("computed_tags".into(), json!({ "checkpoint": 0 }));
@@ -1098,7 +1154,7 @@ async fn admit<W: Writer>(
         session_class: None,
         retention_secs: None,
         title: None,
-        context_limit: None,
+        context_limit: admission.context_limit,
         service_tier: None,
         route_decision_id: None,
         compaction_plan_version: admission.compaction_plan_version,
@@ -1169,6 +1225,7 @@ fn call_options<W: Writer, P, T>(
     episodes: &[EpisodeRenderInput],
     seams: &Seams<'_, P, T>,
     step_id: u64,
+    compacted: bool,
 ) -> Result<CallOptions, LoopError> {
     let mut prompt = writer.conversation().messages.clone();
     repetition_guidance(&mut prompt, episodes);
@@ -1206,7 +1263,9 @@ fn call_options<W: Writer, P, T>(
         account_ref: None,
         max_output_tokens: None,
     });
-    if !contract {
+    // A run with a compaction provider renders its prompt from the provider's view
+    // (`compaction::prepare`), which starts from these options.
+    if !contract || compacted {
         return Ok(opts);
     }
     // On the current compaction contract a request renders from the entries, as today's loop
@@ -2805,6 +2864,73 @@ fn resolve(call: &ToolCall, result: DispatchResult) -> (ToolResult, CallOutcome)
 
 /// The run's state as the operational fold holds it. Admission appended its start, so it
 /// exists for the whole run.
+/// Ends the run as today's loop does when its compaction provider can't serve it: an error
+/// with code `compaction_unavailable`, before any model call of the step.
+async fn compaction_unavailable<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    message: &str,
+) -> Result<Finished, LoopError> {
+    let mut record = run_end(
+        writer,
+        &admission.run_id,
+        RunFinishReason::Error,
+        (seams.now_ms)(),
+    );
+    if let Record::RunEnd(end) = &mut record {
+        end.error = Some(
+            serde_json::to_value(crate::compaction::unavailable_error(message))
+                .map_err(|e| LoopError::Parts(e.to_string()))?,
+        );
+    }
+    append_end(writer, &admission.run_id, vec![record]).await?;
+    Ok(finished(writer, RunFinishReason::Error))
+}
+
+/// The compaction state and plane a run uses, when its session is on the current compaction
+/// contract and its plan names a compaction provider. The state is rebuilt from the open log
+/// the first time a session uses it, then kept by whoever owns the session, as today's actor
+/// keeps it; a fresh run starts its step history again.
+async fn compaction_ctx<W: Writer, P, T>(
+    writer: &W,
+    admission: &Admission,
+    seams: &Seams<'_, P, T>,
+    fresh: bool,
+) -> Result<Option<crate::compaction::Ctx>, LoopError> {
+    if admission.compaction_plan_version.is_none() {
+        return Ok(None);
+    }
+    let Some(manifest) = admission.manifest.as_deref() else {
+        return Ok(None);
+    };
+    let Some((provider, preset, _, _)) =
+        broca_core::compaction::item(manifest).map_err(LoopError::Parts)?
+    else {
+        return Ok(None);
+    };
+    let preset =
+        preset.ok_or_else(|| LoopError::Parts("a compaction preset must be a string".into()))?;
+    let session = seams.compaction_session.clone().unwrap_or_default();
+    if !session.is_initialized() {
+        let records = writer.open_log_records().await?;
+        let state = crate::compaction::restore(&records, &seams.bind, writer.operations())
+            .map_err(LoopError::Parts)?;
+        session.restore(state).await;
+    }
+    session.claim_serving_start();
+    if fresh {
+        session.state.lock().await.begin_run();
+    }
+    let has_view = session.state.lock().await.applied().is_some();
+    session.runtime.begin_send(has_view).await;
+    Ok(Some(crate::compaction::Ctx {
+        session,
+        provider,
+        preset,
+    }))
+}
+
 /// A batch's last record apart from the entry facts after it: what a boundary batch decided,
 /// whether the run's end, a pause or the step's start.
 fn decision(records: &[Record]) -> Option<&Record> {
