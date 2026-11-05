@@ -144,6 +144,9 @@ struct Spy {
     log: Arc<Mutex<Vec<String>>>,
     keys: Mutex<Vec<(ToolCallId, String)>>,
     held: Arc<HeldScript>,
+    /// The caller's cancel, which the `hold_cancel` tool's call triggers once its provider holds
+    /// it: a caller who gives up on a run waiting on a held call.
+    cancel_on_hold: Mutex<Option<CancellationToken>>,
 }
 
 /// A provider that holds calls: the `hold` tool's provider answers with a held marker and
@@ -154,6 +157,8 @@ struct HeldScript {
     log: Arc<Mutex<Vec<String>>>,
     replies: Mutex<Vec<ProviderHeldReply>>,
     deposits: Mutex<Vec<ToolResult>>,
+    /// Whether the run's end is durable yet, for the withdrawal's log entry.
+    ended: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
 }
 
 impl HeldScript {
@@ -217,10 +222,16 @@ impl ProviderHeldLifecycle for HeldScript {
     }
 
     async fn withdraw_held(&self, call: &ProviderHeldReply) -> Result<(), String> {
-        self.log
+        let ended = self
+            .ended
             .lock()
             .unwrap()
-            .push(format!("withdraw {}", call.tool_call_id.0));
+            .as_ref()
+            .is_some_and(|ended| ended());
+        self.log.lock().unwrap().push(format!(
+            "withdraw {} after_run_end={ended}",
+            call.tool_call_id.0
+        ));
         Ok(())
     }
 }
@@ -234,10 +245,17 @@ impl Spy {
                 log: Arc::clone(&log),
                 replies: Default::default(),
                 deposits: Default::default(),
+                ended: Mutex::new(None),
             }),
             log,
             keys: Mutex::new(Vec::new()),
+            cancel_on_hold: Mutex::new(None),
         }
+    }
+
+    /// Makes `hold_cancel` cancel the run through `cancel` once its call is held.
+    fn cancel_on_hold(&self, cancel: CancellationToken) {
+        *self.cancel_on_hold.lock().unwrap() = Some(cancel);
     }
 
     /// The held calls' lifecycle, as the runtime installs it for a run.
@@ -363,7 +381,7 @@ impl ToolPlane for Spy {
             keyed.as_deref().unwrap_or("unkeyed")
         ));
         if let (
-            "hold" | "hold_brief",
+            "hold" | "hold_brief" | "hold_cancel",
             Some(DispatchKey {
                 call_key,
                 held_recorder: Some(recorder),
@@ -385,6 +403,11 @@ impl ToolPlane for Spy {
             self.held.replies.lock().unwrap().push(reply.clone());
             if call.tool_name == "hold_brief" {
                 self.held.deposit(&call.tool_call_id);
+            }
+            if call.tool_name == "hold_cancel" {
+                if let Some(cancel) = self.cancel_on_hold.lock().unwrap().as_ref() {
+                    cancel.cancel();
+                }
             }
             return self.held.wait(ctx, call, &reply).await;
         }
@@ -590,6 +613,9 @@ struct Recording<'s, 'b> {
     /// Records another appender (the session actor, in production) added while the loop was
     /// waiting on a seam. They're appended, durably, before the loop's next batch.
     injected: Arc<Mutex<Vec<Record>>>,
+    /// Set once a run's end is appended durably, so a provider can tell whether it was asked to
+    /// withdraw a call before or after the run's end.
+    ended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Recording<'_, '_> {
@@ -608,7 +634,15 @@ impl Writer for Recording<'_, '_> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         self.flush().await?;
         self.records.extend_from_slice(records);
-        self.session.append(records, barrier).await
+        let seq = self.session.append(records, barrier).await?;
+        if barrier
+            && records
+                .iter()
+                .any(|record| matches!(record, Record::RunEnd(_)))
+        {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(seq)
     }
     fn conversation(&self) -> &Conversation {
         &self.session.conversation
@@ -701,6 +735,7 @@ async fn new_from(
         session: &mut session,
         records: Vec::new(),
         injected: Default::default(),
+        ended: Default::default(),
     };
     let now = || 0u64;
     let seams = Seams {
@@ -1286,6 +1321,7 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         session: &mut session,
         records: Vec::new(),
         injected: Default::default(),
+        ended: Default::default(),
     };
     let mut parts = MemoryParts::default();
     let now = || 0u64;
@@ -1646,10 +1682,25 @@ async fn compare_actions(
     let plane = scenario.plane();
     let (tx, mut rx) = mpsc::channel(512);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let cancel = CancellationToken::new();
+    plane.cancel_on_hold(cancel.clone());
+    let wal_dir = dir.join("wal");
+    *plane.held.ended.lock().unwrap() = Some(Arc::new(move || {
+        std::fs::read_dir(&wal_dir).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                std::fs::read(entry.path()).is_ok_and(|bytes| {
+                    bytes
+                        .windows(br#""type":"run_finished""#.len())
+                        .any(|window| window == br#""type":"run_finished""#)
+                })
+            })
+        })
+    }));
     let control = RunControl {
         steer: Some(Arc::clone(&inbox)),
         stop_requested: Some(stop),
         provider_held_lifecycle: Some(plane.lifecycle()),
+        cancel: Some(cancel),
         ..Default::default()
     };
     let first = run_loop_on_writer(
@@ -1756,6 +1807,7 @@ async fn compare_actions(
         session: &mut session,
         records: Vec::new(),
         injected,
+        ended: Default::default(),
     };
     let mut parts = MemoryParts::default();
     let now = || 0u64;
@@ -1774,8 +1826,15 @@ async fn compare_actions(
     let mut admission = scenario.admission(&provider.inner);
     admission.on_restart = on_restart;
     let lifecycle = plane.lifecycle();
+    let ended = Arc::clone(&writer.ended);
+    *plane.held.ended.lock().unwrap() = Some(Arc::new(move || {
+        ended.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    let cancel = CancellationToken::new();
+    plane.cancel_on_hold(cancel.clone());
     let seams = Seams {
         held: Some(&*lifecycle),
+        cancel,
         ..seams
     };
     let first = finishes(run(&mut writer, &mut parts, admission, &seams))
@@ -2052,6 +2111,7 @@ async fn compare_auth_pause(scenario: Scenario) {
         session: &mut session,
         records: Vec::new(),
         injected: Default::default(),
+        ended: Default::default(),
     };
     let mut parts = MemoryParts::default();
     let now = || 0u64;
@@ -2458,6 +2518,30 @@ async fn a_sequential_held_call_keeps_its_successor_unsent_until_resume() {
                 ),
                 text_step("a2", "done"),
             ],
+        },
+        Vec::new(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_cancel_while_a_provider_holds_a_call_closes_it_and_withdraws_after_the_end() {
+    compare_steered(
+        Scenario {
+            input: vec![user("run both")],
+            tools: vec![
+                tool("hold_cancel", ExecutionMode::Parallel),
+                tool("read", ExecutionMode::Parallel),
+            ],
+            stop_when: Vec::new(),
+            steps: vec![answer(
+                "a1",
+                vec![
+                    call("c1", "hold_cancel", json!({"job": 1})),
+                    call("c2", "read", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            )],
         },
         Vec::new(),
     )
