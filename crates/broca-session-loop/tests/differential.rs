@@ -1734,3 +1734,77 @@ async fn a_cancel_wins_over_a_stop_at_a_boundary() {
     )
     .await;
 }
+
+/// One HTTP attempt's evidence, as a provider reports it when the attempt ends.
+fn attempt(number: u32, status: u16, outcome: &str) -> NormalizedEvent {
+    NormalizedEvent::Control(ProviderControl::AttemptFinished {
+        attempt: serde_json::from_value(json!({
+            "attempt": number,
+            "request_body_len": 1200 + number,
+            "request_body_sha256": format!("{:064x}", number),
+            "http_status": status,
+            "content_type": "text/event-stream",
+            "response_body_len": 340,
+            "response_body_sha256": format!("{:064x}", 1000 + number),
+            "outcome": outcome,
+            "ts_ms": 50,
+            "first_content_at_ms": 20,
+            "last_content_at_ms": 45,
+            "max_content_gap_ms": 9,
+            "content_bytes": 310,
+            "sent_at_ms": 10,
+            "transport": "https",
+            "cache_evidence": {"read": 80, "written": 0},
+        }))
+        .unwrap(),
+    })
+}
+
+/// `step` with these attempts reported before its terminal event.
+fn attempted(
+    mut step: Vec<NormalizedEvent>,
+    attempts: Vec<NormalizedEvent>,
+) -> Vec<NormalizedEvent> {
+    let terminal = step.pop().expect("a step ends with its terminal");
+    step.extend(attempts);
+    step.push(terminal);
+    step
+}
+
+#[tokio::test]
+async fn each_attempt_is_recorded_as_it_ends() {
+    compare(Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![
+            attempted(
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                vec![
+                    attempt(1, 529, "eof_before_completion"),
+                    attempt(2, 200, "complete"),
+                ],
+            ),
+            attempted(text_step("a2", "done"), vec![attempt(1, 200, "complete")]),
+        ],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_failed_steps_attempts_are_recorded_before_the_pause() {
+    compare_auth_pause(Scenario {
+        input: vec![user("hello")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![
+            attempted(auth_failure(), vec![attempt(1, 401, "complete")]),
+            attempted(text_step("a1", "hi"), vec![attempt(1, 200, "complete")]),
+        ],
+    })
+    .await;
+}
