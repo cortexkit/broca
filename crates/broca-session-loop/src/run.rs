@@ -121,6 +121,10 @@ pub struct Seams<'a, P, T> {
     pub now_ms: &'a (dyn Fn() -> u64 + Sync),
     /// The session's address, given to the provider for its diagnostics only.
     pub session_address: Option<String>,
+    /// Where a tool's media is stored as its result arrives. A result keeps only the media
+    /// captured here for that exact call; any other media part becomes a provenance marker, as in
+    /// today's loop. Without it no media is captured, so every media part becomes a marker.
+    pub media: Option<Arc<dyn broca_core::tool_media::MediaCapture>>,
 }
 
 /// How a run ended.
@@ -1271,7 +1275,7 @@ where
         bind: seams.bind.clone(),
         run_id: RunId(run_id.into()),
         scope: None,
-        media_capture: None,
+        media_capture: seams.media.clone(),
     };
     // The plane learns of the batch first, so it can say where each call goes; the intents then
     // record that, with each call's key, before anything is sent. A plane that refuses the batch
@@ -2307,9 +2311,11 @@ async fn dispatch_all<W: Writer, P, T: ToolPlane>(
                         .into()
                 } else if let Some(reply) = held {
                     match seams.held {
-                        Some(lifecycle) => {
-                            resolve(call, lifecycle.wait(plan.ctx, call, reply).await).into()
-                        }
+                        Some(lifecycle) => resolve(
+                            call,
+                            checked(plan.ctx, lifecycle.wait(plan.ctx, call, reply).await),
+                        )
+                        .into(),
                         None => std::future::pending().await,
                     }
                 } else {
@@ -2531,15 +2537,33 @@ async fn dispatch_one<T: ToolPlane>(
         call_key,
         held_recorder: Some(recorder),
     };
-    match tools
-        .dispatch_guarded(plan.ctx, call, Some(key), plan.guard)
-        .await
-    {
+    match checked(
+        plan.ctx,
+        tools
+            .dispatch_guarded(plan.ctx, call, Some(key), plan.guard)
+            .await,
+    ) {
         DispatchResult::Completed(result) => {
             post_tool(plan.hooks, plan.step_id, call, call_key, result).await
         }
         other => resolve(call, other).into(),
     }
+}
+
+/// A completed result keeps only the media the batch's capture holds for that exact call; every
+/// other media part becomes a provenance marker, before hooks or the record see the result. A
+/// reference to stored bytes, or one with the right digest and other metadata, isn't evidence
+/// that this call produced them. Today's loop does the same in `resolve`.
+fn checked(ctx: &BatchCtx, mut answer: DispatchResult) -> DispatchResult {
+    if let DispatchResult::Completed(result) = &mut answer {
+        let captured = ctx
+            .media_capture
+            .as_ref()
+            .map(|capture| capture.captured_for(&ctx.batch_id, &result.tool_call_id))
+            .unwrap_or_default();
+        broca_core::tool_media::enforce_provenance(result, &captured);
+    }
+    answer
 }
 
 /// A model answer's text through the post-assistant hooks: each accepted edit is applied to the

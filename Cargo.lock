@@ -632,6 +632,7 @@ dependencies = [
  "broca-session-store",
  "broca-test-support",
  "broca-wal",
+ "cortexkit-role-step-transform-provider",
  "futures",
  "serde",
  "serde_jcs",
