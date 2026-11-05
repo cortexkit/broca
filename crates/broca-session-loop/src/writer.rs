@@ -58,6 +58,13 @@ pub trait Writer {
     /// whole when the folds keep only a summary of it, such as the compaction views.
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError>;
 
+    /// The start record of the session's run `run_id`, sealed or in the open log, found through
+    /// the session's id lookup. `None` when the session has no such run.
+    async fn run_start(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<broca_session_store::record::RunStart>, SessionError>;
+
     /// Where the tool plane captures a result's media. A writer that offers one stores, when it
     /// appends a call's result, the bytes of every media part captured for that call, durable
     /// before the record. Without one nothing is captured, so every media part of a result
@@ -118,6 +125,20 @@ impl<B: SessionBackend> Writer for Session<'_, B> {
 
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
         Session::open_log_records(self).await
+    }
+
+    async fn run_start(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<broca_session_store::record::RunStart>, SessionError> {
+        Ok(self
+            .find_id(broca_session_store::idindex::IdKind::RunId, run_id)
+            .await?
+            .into_iter()
+            .find_map(|(_, record)| match record {
+                Record::RunStart(start) => Some(*start),
+                _ => None,
+            }))
     }
 }
 

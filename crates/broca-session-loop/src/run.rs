@@ -209,7 +209,7 @@ where
         inner: writer,
     };
     admit(&mut placed, parts, &admission).await?;
-    let compaction = compaction_ctx(&placed, &admission, seams, true).await?;
+    let compaction = compaction_ctx(&placed, parts, &admission, seams, true).await?;
     drive(&mut placed, parts, &admission, seams, compaction.as_ref()).await
 }
 
@@ -281,7 +281,7 @@ where
     let writer = &mut placed;
     let resumed = resumed_record(writer, &resolution);
     writer.append(&[Record::Resumed(resumed)], false).await?;
-    let compaction = compaction_ctx(writer, &admission, seams, false).await?;
+    let compaction = compaction_ctx(writer, parts, &admission, seams, false).await?;
     match resolution {
         Resolution::Resume => drive(writer, parts, &admission, seams, compaction.as_ref()).await,
         Resolution::Idle(reason) => finish(writer, seams, &admission.run_id, reason).await,
@@ -615,6 +615,15 @@ fn frozen_admission(
         broca_core::compaction_v2::conditions::check_plan_version(version)
             .map_err(LoopError::Parts)?;
     }
+    admission_of_start(start, parts)
+}
+
+/// The admission a run's start froze: its model, settings, tools and system text, read back from
+/// the setup parts the start names.
+pub(crate) fn admission_of_start(
+    start: &broca_session_store::record::RunStart,
+    parts: &dyn Parts,
+) -> Result<Admission, LoopError> {
     let part = |kind: PartKind| -> Result<Option<Value>, LoopError> {
         start
             .setup
@@ -1117,9 +1126,9 @@ async fn admit<W: Writer>(
     {
         config.insert("render_tags".into(), json!(true));
     }
-    // Today's computed tag rules, starting after the transcript's highest tag (none yet in a
-    // new session).
-    config.insert("computed_tags".into(), json!({ "checkpoint": 0 }));
+    // Today's computed tag rules, starting after the highest number the session has shown.
+    let checkpoint = shown_high(writer, parts).await?;
+    config.insert("computed_tags".into(), json!({ "checkpoint": checkpoint }));
     config.insert("context_epoch".into(), json!(0));
     if !admission.stop_when.is_empty() {
         config.insert("stop_when".into(), json!(admission.stop_when));
@@ -1188,6 +1197,57 @@ async fn admit<W: Writer>(
     }
     writer.append(&records, true).await?;
     Ok(())
+}
+
+/// The highest part number the session's requests have shown, which a new run's numbering
+/// continues after: today's `high_after` over the prompt, each message numbered under the rules
+/// of the run that placed it. Only a run that renders numbers counts anything, so a session
+/// that has never rendered stays at 0.
+///
+/// Counted over the window. A window that doesn't start at the session's first message has had
+/// numbers sealed out with the history before it, which isn't modelled yet.
+async fn shown_high<W: Writer>(writer: &W, parts: &dyn Parts) -> Result<u64, LoopError> {
+    let conversation = writer.conversation();
+    let start = conversation.window_start();
+    if start > 1 {
+        return Err(LoopError::Unsupported(
+            "a new run after the session's history was sealed",
+        ));
+    }
+    // Each window run's frozen choices: whether it rendered numbers (its start's run config), and
+    // whether its replies were cleaned (that and its render config).
+    let rendered = render_episodes(writer, parts)?;
+    let mut runs = Vec::new();
+    for (episode, render_input) in conversation.episodes.iter().zip(&rendered) {
+        let start_record = writer.run_start(&episode.run_id).await?.ok_or_else(|| {
+            LoopError::Parts(format!(
+                "the window names run {} but the session holds no start for it",
+                episode.run_id
+            ))
+        })?;
+        let choices = start_record.run_choices.unwrap_or(Value::Null);
+        let render = choices["config"]["render_tags"].as_bool().unwrap_or(false);
+        let clean =
+            broca_core::compaction_v2::metadata::clean_replies(render, &render_input.frozen_config);
+        runs.push(((episode.start - start) as usize, render, clean));
+    }
+    let mut high = 0;
+    for (index, message) in conversation.messages.iter().enumerate() {
+        // The run that placed this message is the last one starting at or before it.
+        let (render, clean) = runs
+            .iter()
+            .rev()
+            .find(|(first, _, _)| *first <= index)
+            .map_or((false, false), |(_, render, clean)| (*render, *clean));
+        let mut numbered = message.clone();
+        broca_protocol::tags::number_message(
+            &mut numbered,
+            ComputedRules { render, clean },
+            &mut high,
+        )
+        .map_err(|_| LoopError::Unsupported("part numbers past the numbering limit"))?;
+    }
+    Ok(high)
 }
 
 /// Every window run's place in the prompt (its first message's index, and its first user
@@ -2894,6 +2954,7 @@ async fn compaction_unavailable<W: Writer, P, T>(
 /// keeps it; a fresh run starts its step history again.
 async fn compaction_ctx<W: Writer, P, T>(
     writer: &W,
+    parts: &dyn Parts,
     admission: &Admission,
     seams: &Seams<'_, P, T>,
     fresh: bool,
@@ -2925,6 +2986,7 @@ async fn compaction_ctx<W: Writer, P, T>(
     let has_view = session.state.lock().await.applied().is_some();
     session.runtime.begin_send(has_view).await;
     Ok(Some(crate::compaction::Ctx {
+        earlier: crate::compaction::earlier_context(writer, admission, parts).await?,
         session,
         provider,
         preset,

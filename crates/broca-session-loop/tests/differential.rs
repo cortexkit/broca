@@ -990,6 +990,13 @@ impl Writer for Recording<'_, '_> {
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
         self.session.open_log_records().await
     }
+
+    async fn run_start(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<broca_session_store::record::RunStart>, SessionError> {
+        Writer::run_start(&*self.session, run_id).await
+    }
     fn media(&self) -> Option<Arc<dyn MediaCapture>> {
         Some(Arc::clone(&self.media) as Arc<dyn MediaCapture>)
     }
@@ -1702,6 +1709,19 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
     std::fs::create_dir_all(&dir).unwrap();
     let provider = ScriptedProvider::new(scenario.steps.clone());
     let plane = scenario.plane();
+    let spy = compaction().map(|script| Arc::new(CompactionSpy::new(&script)));
+    // One compaction session state for the session's life, as the actor keeps it across runs.
+    let compaction_session: Arc<broca_core::compaction_v2::session::Session> = Arc::default();
+    let control = || RunControl {
+        manifest: scenario.manifest.clone(),
+        compaction_session: Some(Arc::clone(&compaction_session)),
+        new_log_compaction_plan_version: layout(),
+        compaction_plane: spy
+            .clone()
+            .map(|spy| spy as Arc<dyn broca_core::CompactionPlane>),
+        admitted_context_limit: compaction().map(|script| script.context_limit),
+        ..Default::default()
+    };
     let lease = FileLeaseStore::new(dir.join("lease"));
     let wal = FileWalStore::new(dir.join("wal"));
     for (index, (run_id, input)) in runs.iter().enumerate() {
@@ -1717,16 +1737,13 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
                 &HarnessPolicy,
                 &wal,
                 None,
-                RunControl {
-                    new_log_compaction_plan_version: layout(),
-                    ..Default::default()
-                },
+                control(),
                 &tx,
             )
             .await
             .expect("today's first run");
         } else {
-            broca_core::run_loop_append_episode(
+            broca_core::run_loop_append_episode_with_control(
                 request,
                 &provider,
                 &plane,
@@ -1734,6 +1751,7 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
                 &HarnessPolicy,
                 &wal,
                 None,
+                control(),
                 &tx,
             )
             .await
@@ -1760,6 +1778,7 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
             .log()
             .iter()
             .map(|event| format!("{event:?}"))
+            .chain(spy.map_or_else(Vec::new, |spy| spy.calls()))
             .collect(),
     };
 
@@ -1781,6 +1800,7 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
     .unwrap();
     let provider = ScriptedProvider::new(scenario.steps.clone());
     let plane = scenario.plane();
+    let spy = compaction().map(|script| Arc::new(CompactionSpy::new(&script)));
     let mut writer = Recording {
         session: &mut session,
         records: Vec::new(),
@@ -1803,8 +1823,11 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         hook_plane: Some(harness_hooks()),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
-        compaction_plane: None,
-        compaction_session: None,
+        compaction_plane: spy
+            .as_deref()
+            .map(|spy| spy as &dyn broca_core::CompactionPlane),
+        // One session state for the session's life, as the actor keeps it across runs.
+        compaction_session: Some(Arc::default()),
     };
     for (run_id, input) in runs {
         run(
@@ -1824,6 +1847,7 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
             .log()
             .iter()
             .map(|event| format!("{event:?}"))
+            .chain(spy.map_or_else(Vec::new, |spy| spy.calls()))
             .collect(),
     };
 
@@ -3887,4 +3911,28 @@ async fn every_cut_of_an_over_limit_ride_resumes_alike() {
         },
     )
     .await;
+}
+
+/// Two runs on one compacted session: the second run's first send compares the first run's
+/// last accepted request with its own, which the new loop rebuilds from the first run's start.
+#[tokio::test]
+async fn a_second_compacted_run_compares_with_the_first_runs_request() {
+    LAYOUT
+        .scope(
+            Some(cortexkit_compaction_view::PLAN_VERSION),
+            COMPACTION.scope(
+                Some(Arc::new(CompactionScript {
+                    context_limit: 100_000,
+                    rides: Vec::new(),
+                })),
+                Box::pin(compare_runs_in(
+                    compacted_scenario(vec![
+                        text_step("a1", "hello"),
+                        text_step("a2", "hello again"),
+                    ]),
+                    &[("r1", vec![user("first")]), ("r2", vec![user("second")])],
+                )),
+            ),
+        )
+        .await;
 }

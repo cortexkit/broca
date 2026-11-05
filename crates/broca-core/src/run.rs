@@ -1439,6 +1439,43 @@ where
     .await
 }
 
+/// [`run_loop_append_episode`] under `control`, as the session actor drives a later run with
+/// its planes (compaction, hooks) and the session's layout.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_loop_append_episode_with_control<P, T, L, A, W>(
+    req: RunRequest,
+    provider: &P,
+    tool_plane: &T,
+    lease_store: &L,
+    approval: &A,
+    wal_store: &W,
+    store: Option<Arc<dyn SessionStore>>,
+    control: RunControl,
+    out: &mpsc::Sender<OutputEvent>,
+) -> Result<RunSummary, RunError>
+where
+    P: Provider,
+    T: ToolPlane,
+    L: LeaseStore,
+    A: ApprovalPolicy,
+    W: WalStore,
+{
+    run_loop_inner(
+        req,
+        provider,
+        tool_plane,
+        lease_store,
+        approval,
+        wal_store,
+        store,
+        true,
+        false,
+        control,
+        out,
+    )
+    .await
+}
+
 /// Resume a run that PAUSED awaiting (re-)authentication, after the credential has been
 /// refreshed. Continues the SAME run_id from the last durable boundary (no new episode,
 /// no new `RunStarted`) — the prompt is the paused run's reconstructed prefix and the

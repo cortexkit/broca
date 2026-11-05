@@ -131,6 +131,13 @@ impl<W: Writer> Writer for Placed<'_, W> {
         self.inner.open_log_records().await
     }
 
+    async fn run_start(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<broca_session_store::record::RunStart>, SessionError> {
+        self.inner.run_start(run_id).await
+    }
+
     fn media(&self) -> Option<std::sync::Arc<dyn broca_core::tool_media::MediaCapture>> {
         self.inner.media()
     }

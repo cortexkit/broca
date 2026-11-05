@@ -31,6 +31,36 @@ pub struct Ctx {
     /// The compaction provider's module and the preset the plan asks for.
     pub provider: String,
     pub preset: String,
+    /// The send context of the newest accepted request, when an earlier run made it: what this
+    /// run's first ride compares with. Once this run's own request is accepted, its own context
+    /// is the previous one.
+    pub earlier: Option<(String, v2::conditions::SendContext)>,
+}
+
+/// The send context of the session's newest accepted request when an earlier run than
+/// `admission`'s made it, rebuilt from that run's start, which the session's id lookup finds
+/// sealed or open. A run the fold names but the session can't find is damage.
+pub async fn earlier_context<W: Writer>(
+    writer: &W,
+    admission: &Admission,
+    parts: &dyn crate::parts::Parts,
+) -> Result<Option<(String, v2::conditions::SendContext)>, LoopError> {
+    let Some(run) = writer
+        .operations()
+        .last_send_run
+        .clone()
+        .filter(|run| *run != admission.run_id)
+    else {
+        return Ok(None);
+    };
+    let start = writer.run_start(&run).await?.ok_or_else(|| {
+        LoopError::Parts(format!(
+            "the session names run {run} as its newest request's, but holds no start for it"
+        ))
+    })?;
+    let earlier = crate::run::admission_of_start(&start, parts)?;
+    let context = v2::host::context_of(&frozen(&earlier), earlier.manifest.as_deref());
+    Ok(Some((run, context)))
 }
 
 /// Today's compaction state, rebuilt from the open log's records (see
@@ -256,10 +286,11 @@ fn frozen(admission: &Admission) -> v2::host::Frozen<'_> {
 }
 
 /// The context of the newest request the provider accepted, which a ride compares with the
-/// current run's. `None` before any; a request of an earlier run isn't modelled yet.
+/// current run's. `None` before any.
 fn previous<W: Writer>(
     writer: &W,
     admission: &Admission,
+    ctx: &Ctx,
 ) -> Result<Option<v2::conditions::SendContext>, LoopError> {
     match writer.operations().last_send_run.as_deref() {
         None => Ok(None),
@@ -267,9 +298,12 @@ fn previous<W: Writer>(
             &frozen(admission),
             admission.manifest.as_deref(),
         ))),
-        Some(_) => Err(LoopError::Unsupported(
-            "a compaction ride after a request of an earlier run",
-        )),
+        Some(run) => match &ctx.earlier {
+            Some((earlier, context)) if earlier == run => Ok(Some(context.clone())),
+            _ => Err(LoopError::Parts(format!(
+                "the newest request's run {run} has no context loaded"
+            ))),
+        },
     }
 }
 
@@ -336,7 +370,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         Err(message) => return Ok(Send::Unavailable(message)),
     };
     let current = v2::host::context_of(&frozen(admission), admission.manifest.as_deref());
-    let previous = previous(writer, admission)?;
+    let previous = previous(writer, admission, ctx)?;
     let history = writer
         .operations()
         .estimate
