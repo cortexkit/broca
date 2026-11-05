@@ -4326,6 +4326,11 @@ where
             return Err(error);
         }
     };
+    if is_resume && !append_episode {
+        if let Some(config) = &prior.run_config {
+            writer.note_step_event_run_config(&resolved_run_id, config);
+        }
+    }
     // Whether this run shows runner tags to the model, and under which rules: both frozen in
     // the run's own config on a resume, so a run started under the stored-ledger rules
     // (`runner-tags/v1`) finishes under them with its exact bytes. A new episode is admitted
