@@ -454,6 +454,8 @@ struct Scenario {
     input: Vec<Message>,
     tools: Vec<Tool>,
     stop_when: Vec<StopCondition>,
+    /// The session's plan manifest, for a scenario admitted with a fetch plan.
+    manifest: Option<Arc<broca_wal::PlanManifest>>,
     steps: Vec<Vec<NormalizedEvent>>,
 }
 
@@ -538,6 +540,7 @@ impl Scenario {
             on_restart: None,
             ts_ms: Some(0),
             written_at_ms: Some(0),
+            manifest: self.manifest.clone(),
         }
     }
 }
@@ -589,6 +592,7 @@ async fn today_from(
         None,
         RunControl {
             provider_held_lifecycle: Some(plane.lifecycle()),
+            manifest: scenario.manifest.clone(),
             ..Default::default()
         },
         &tx,
@@ -915,6 +919,7 @@ async fn a_text_answer() {
     compare(Scenario {
         input: vec![system("Be brief."), user("hello")],
         tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![text_step("a1", "hi")],
     })
@@ -926,6 +931,7 @@ async fn a_tool_call_then_an_answer() {
     compare(Scenario {
         input: vec![user("read a")],
         tools: vec![tool("read", ExecutionMode::Sequential)],
+        manifest: None,
         stop_when: vec![StopCondition::StepCount { n: 8 }],
         steps: vec![
             answer(
@@ -947,6 +953,7 @@ async fn parallel_calls_one_failing() {
             tool("read", ExecutionMode::Parallel),
             tool("grep", ExecutionMode::Parallel),
         ],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -974,6 +981,7 @@ async fn sequential_calls_keep_their_order() {
             tool("read", ExecutionMode::Sequential),
             tool("grep", ExecutionMode::Parallel),
         ],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -1001,6 +1009,7 @@ async fn a_step_limit_with_calls_pending() {
     compare(Scenario {
         input: vec![user("read a")],
         tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: vec![StopCondition::StepCount { n: 1 }],
         steps: vec![answer(
             "a1",
@@ -1016,6 +1025,7 @@ async fn a_call_that_was_never_sent() {
     compare(Scenario {
         input: vec![user("fetch a")],
         tools: vec![tool("fetch", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -1034,6 +1044,7 @@ async fn a_call_whose_outcome_is_unknown() {
     compare(Scenario {
         input: vec![user("write a")],
         tools: vec![tool("write", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -1154,6 +1165,7 @@ async fn every_cut_of_a_tool_run_resumes_alike() {
             tool("read", ExecutionMode::Sequential),
             tool("grep", ExecutionMode::Parallel),
         ],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -1182,6 +1194,7 @@ fn tool_run() -> Scenario {
             tool("read", ExecutionMode::Parallel),
             tool("grep", ExecutionMode::Parallel),
         ],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -1210,6 +1223,7 @@ async fn every_cut_of_a_text_answer_resumes_alike() {
     compare_every_cut(Scenario {
         input: vec![system("Be brief."), user("hello")],
         tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![text_step("a1", "hi")],
     })
@@ -1221,6 +1235,7 @@ async fn every_cut_of_a_step_limit_resumes_alike() {
     compare_every_cut(Scenario {
         input: vec![user("read a")],
         tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: vec![StopCondition::StepCount { n: 1 }],
         steps: vec![answer(
             "a1",
@@ -1236,6 +1251,7 @@ async fn every_cut_of_an_unknown_outcome_resumes_alike() {
     compare_every_cut(Scenario {
         input: vec![user("write a")],
         tools: vec![tool("write", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -1254,6 +1270,7 @@ async fn every_cut_of_an_unsent_call_resumes_alike() {
     compare_every_cut(Scenario {
         input: vec![user("fetch a")],
         tools: vec![tool("fetch", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -1422,6 +1439,7 @@ async fn a_second_run_on_the_same_session() {
         Scenario {
             input: Vec::new(),
             tools: vec![tool("read", ExecutionMode::Sequential)],
+            manifest: None,
             stop_when: vec![StopCondition::StepCount { n: 8 }],
             steps: vec![
                 answer(
@@ -1942,6 +1960,7 @@ async fn a_steer_during_a_tool_step_enters_at_the_next_boundary() {
         Scenario {
             input: vec![user("read a")],
             tools: vec![tool("read", ExecutionMode::Sequential)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![
                 answer(
@@ -1963,6 +1982,7 @@ async fn a_steer_during_the_last_answer_takes_one_more_step() {
         Scenario {
             input: vec![user("hello")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![text_step("a1", "hi"), text_step("a2", "and again")],
         },
@@ -1977,6 +1997,7 @@ async fn a_steer_after_a_limiting_stop_ends_with_the_run() {
         Scenario {
             input: vec![user("hello")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: vec![StopCondition::StepCount { n: 1 }],
             steps: vec![text_step("a1", "hi")],
         },
@@ -1991,6 +2012,7 @@ async fn a_steer_during_a_step_that_hits_the_step_limit_ends_with_the_run() {
         Scenario {
             input: vec![user("read a")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: vec![StopCondition::StepCount { n: 1 }],
             steps: vec![answer(
                 "a1",
@@ -2009,6 +2031,7 @@ async fn a_boundary_cancel_during_a_tool_step_ends_after_its_batch() {
         Scenario {
             input: vec![user("read a")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![
                 answer(
@@ -2030,6 +2053,7 @@ async fn a_boundary_cancel_during_the_last_answer_lets_it_complete() {
         Scenario {
             input: vec![user("hello")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![text_step("a1", "hi")],
         },
@@ -2044,6 +2068,7 @@ async fn a_boundary_cancel_with_a_steer_ends_at_the_extra_boundary() {
         Scenario {
             input: vec![user("hello")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![text_step("a1", "hi"), text_step("a2", "never asked for")],
         },
@@ -2202,6 +2227,7 @@ async fn a_failed_sign_in_pauses_and_resumes_as_the_same_run() {
     compare_auth_pause(Scenario {
         input: vec![user("hello")],
         tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![auth_failure(), text_step("a1", "hi")],
     })
@@ -2213,6 +2239,7 @@ async fn a_failed_sign_in_after_a_tool_step_resumes_with_its_results() {
     compare_auth_pause(Scenario {
         input: vec![user("read a")],
         tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -2233,6 +2260,7 @@ async fn a_stop_before_a_batch_refuses_it_and_ends_the_run() {
         Scenario {
             input: vec![user("read a")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![
                 answer(
@@ -2255,6 +2283,7 @@ async fn a_stop_at_a_boundary_pauses_and_the_resume_places_the_steer() {
         Scenario {
             input: vec![user("hello")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![text_step("a1", "hi"), text_step("a2", "and again")],
         },
@@ -2273,6 +2302,7 @@ async fn a_stop_at_a_boundary_without_a_resume_policy_ends_the_run() {
         Scenario {
             input: vec![user("hello")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![text_step("a1", "hi"), text_step("a2", "never asked for")],
         },
@@ -2291,6 +2321,7 @@ async fn a_cancel_wins_over_a_stop_at_a_boundary() {
         Scenario {
             input: vec![user("hello")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![text_step("a1", "hi"), text_step("a2", "never asked for")],
         },
@@ -2345,6 +2376,7 @@ async fn each_attempt_is_recorded_as_it_ends() {
     compare(Scenario {
         input: vec![user("read a")],
         tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             attempted(
@@ -2369,6 +2401,7 @@ async fn a_failed_steps_attempts_are_recorded_before_the_pause() {
     compare_auth_pause(Scenario {
         input: vec![user("hello")],
         tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             attempted(auth_failure(), vec![attempt(1, 401, "complete")]),
@@ -2384,6 +2417,7 @@ async fn an_ordered_steer_enters_at_the_next_boundary() {
         Scenario {
             input: vec![user("read a")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![
                 answer(
@@ -2408,6 +2442,7 @@ async fn an_expired_ordered_send_ends_at_the_boundary() {
         Scenario {
             input: vec![user("read a")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![
                 answer(
@@ -2429,6 +2464,7 @@ async fn an_idle_start_send_waits_for_the_run_to_end() {
         Scenario {
             input: vec![user("read a")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![
                 answer(
@@ -2450,6 +2486,7 @@ async fn an_ordered_steer_during_the_last_answer() {
         Scenario {
             input: vec![user("hello")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![text_step("a1", "hi"), text_step("a2", "and again")],
         },
@@ -2464,6 +2501,7 @@ async fn ordered_sends_deliver_in_queue_order_after_steers() {
         Scenario {
             input: vec![user("read a")],
             tools: vec![tool("read", ExecutionMode::Parallel)],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![
                 answer(
@@ -2493,6 +2531,7 @@ async fn a_held_call_answered_while_its_batch_runs() {
                 tool("hold_brief", ExecutionMode::Parallel),
                 tool("read", ExecutionMode::Parallel),
             ],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![
                 answer(
@@ -2520,6 +2559,7 @@ async fn a_run_pauses_on_a_held_call_and_resumes_with_its_late_result() {
                 tool("hold", ExecutionMode::Parallel),
                 tool("read", ExecutionMode::Parallel),
             ],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![
                 answer(
@@ -2547,6 +2587,7 @@ async fn a_sequential_held_call_keeps_its_successor_unsent_until_resume() {
                 tool("hold", ExecutionMode::Sequential),
                 tool("read", ExecutionMode::Sequential),
             ],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![
                 answer(
@@ -2574,6 +2615,7 @@ async fn a_cancel_while_a_provider_holds_a_call_closes_it_and_withdraws_after_th
                 tool("hold_cancel", ExecutionMode::Parallel),
                 tool("read", ExecutionMode::Parallel),
             ],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![answer(
                 "a1",
@@ -2597,6 +2639,7 @@ async fn every_cut_of_a_held_call_resumes_alike() {
             tool("hold_brief", ExecutionMode::Parallel),
             tool("read", ExecutionMode::Parallel),
         ],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -2621,6 +2664,7 @@ async fn every_cut_of_a_sequential_held_call_resumes_alike() {
             tool("hold_brief", ExecutionMode::Sequential),
             tool("read", ExecutionMode::Sequential),
         ],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -2642,6 +2686,7 @@ async fn a_call_to_a_tool_the_run_was_not_given() {
     compare(Scenario {
         input: vec![user("read a")],
         tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -2663,6 +2708,7 @@ async fn the_same_call_id_twice_in_one_message() {
     compare(Scenario {
         input: vec![user("read a")],
         tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -2687,6 +2733,7 @@ async fn a_batch_the_tool_plane_refuses() {
             tool("read", ExecutionMode::Parallel),
             tool("down", ExecutionMode::Parallel),
         ],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -2736,6 +2783,7 @@ async fn the_approval_policy_denies_and_narrows() {
             tool("forbidden", ExecutionMode::Parallel),
             tool("narrow", ExecutionMode::Parallel),
         ],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -2761,6 +2809,7 @@ async fn every_cut_of_a_narrowed_call_resumes_alike() {
             tool("narrow", ExecutionMode::Sequential),
             tool("forbidden", ExecutionMode::Sequential),
         ],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -2786,6 +2835,7 @@ async fn a_narrowed_call_queued_behind_a_held_call_goes_out_narrowed() {
                 tool("hold", ExecutionMode::Sequential),
                 tool("narrow", ExecutionMode::Sequential),
             ],
+            manifest: None,
             stop_when: Vec::new(),
             steps: vec![
                 answer(
@@ -2812,6 +2862,7 @@ async fn every_cut_of_a_narrowed_call_behind_a_held_call_resumes_alike() {
             tool("hold_brief", ExecutionMode::Sequential),
             tool("narrow", ExecutionMode::Sequential),
         ],
+        manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
@@ -2826,4 +2877,65 @@ async fn every_cut_of_a_narrowed_call_behind_a_held_call_resumes_alike() {
         ],
     })
     .await;
+}
+
+/// A plan manifest as a fetch plan freezes it: one tool provider that answered with `tools`,
+/// and a system text.
+fn planned_manifest(tools: &[Tool]) -> Arc<broca_wal::PlanManifest> {
+    let tools = Arc::new(tools.to_vec());
+    Arc::new(broca_wal::PlanManifest {
+        rich_ui: None,
+        plan: broca_wal::OpaqueJson::from_json_text(
+            json!({"tool_items": [{"provider": "provider"}]}).to_string(),
+        )
+        .unwrap(),
+        plan_identity: "plan-1".into(),
+        composition_digest: "composition-1".into(),
+        fetches: vec![broca_wal::ProviderFetch {
+            provider: "provider".into(),
+            outcome: broca_wal::FetchOutcome::Answered {
+                catalog_digest: "catalog-1".into(),
+                tools: Arc::clone(&tools),
+                text: None,
+                result_ops: None,
+                reply: None,
+                declarations_frozen: None,
+                reference_slots: None,
+            },
+        }],
+        tools,
+        system_text: "You work in a planned session.".into(),
+        system_digest: "system-1".into(),
+        join_version: 1,
+        role_versions: [("tool-provider".to_string(), "v1".to_string())].into(),
+        declarations: Vec::new(),
+    })
+}
+
+fn planned_scenario() -> Scenario {
+    let tools = vec![tool("read", ExecutionMode::Parallel)];
+    Scenario {
+        input: vec![user("read a")],
+        manifest: Some(planned_manifest(&tools)),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn a_run_admitted_with_a_fetch_plan() {
+    compare(planned_scenario()).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_run_admitted_with_a_fetch_plan_resumes_alike() {
+    compare_every_cut(planned_scenario()).await;
 }

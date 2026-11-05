@@ -90,6 +90,9 @@ pub struct Admission {
     /// When the run was admitted and when its input was written.
     pub ts_ms: Option<u64>,
     pub written_at_ms: Option<u64>,
+    /// The session's frozen plan manifest, for a session admitted with a fetch plan: the tools
+    /// its providers answered with, its system text and the hooks it declares.
+    pub manifest: Option<std::sync::Arc<broca_wal::PlanManifest>>,
 }
 
 /// The seams a run calls. None of them is owned by the run.
@@ -418,6 +421,90 @@ fn decode<T: serde::de::DeserializeOwned>(value: Option<Value>) -> Result<Option
         .map_err(|e| LoopError::Parts(e.to_string()))
 }
 
+/// Stores a plan manifest's shared members as setup parts, in a fixed order: the plan, each
+/// provider's answer, the manifest's tools, its system text and its hook declarations. Returns
+/// what remains of the manifest, or `None` when nothing does.
+fn manifest_parts(
+    manifest: &broca_wal::PlanManifest,
+    parts: &mut dyn Parts,
+    setup: &mut Vec<broca_session_store::record::PartRef>,
+) -> Result<Option<Value>, LoopError> {
+    let Value::Object(mut members) =
+        serde_json::to_value(manifest).map_err(|e| LoopError::Parts(e.to_string()))?
+    else {
+        return Err(LoopError::Parts("a manifest isn't an object".into()));
+    };
+    let mut put = |kind: PartKind, value: &Value| -> Result<(), LoopError> {
+        setup.push(parts.put(kind, value).map_err(LoopError::Parts)?);
+        Ok(())
+    };
+    if let Some(plan) = members.remove("plan") {
+        put(PartKind::Plan, &plan)?;
+    }
+    if let Some(Value::Array(fetches)) = members.remove("fetches") {
+        for fetch in &fetches {
+            put(PartKind::ProviderAnswer, fetch)?;
+        }
+    }
+    for (key, kind) in [
+        ("tools", PartKind::Tools),
+        ("system_text", PartKind::SystemText),
+        ("declarations", PartKind::Declarations),
+    ] {
+        if let Some(value) = members.remove(key) {
+            put(kind, &value)?;
+        }
+    }
+    Ok((!members.is_empty()).then_some(Value::Object(members)))
+}
+
+/// The plan manifest a run's start froze, rebuilt from the setup parts from its plan on and the
+/// remainder its choices keep. `None` for a run admitted without a plan.
+fn frozen_manifest(
+    start: &broca_session_store::record::RunStart,
+    parts: &dyn Parts,
+) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, LoopError> {
+    let Some(first) = start
+        .setup
+        .iter()
+        .position(|part| part.kind == PartKind::Plan)
+    else {
+        return Ok(None);
+    };
+    let mut members = match start
+        .run_choices
+        .as_ref()
+        .and_then(|choices| choices.get("manifest"))
+    {
+        Some(Value::Object(rest)) => rest.clone(),
+        _ => serde_json::Map::new(),
+    };
+    let mut fetches = Vec::new();
+    for part in &start.setup[first..] {
+        let value = parts.get(part).map_err(LoopError::Parts)?;
+        match part.kind {
+            PartKind::Plan => {
+                members.insert("plan".into(), value);
+            }
+            PartKind::ProviderAnswer => fetches.push(value),
+            PartKind::Tools => {
+                members.insert("tools".into(), value);
+            }
+            PartKind::SystemText => {
+                members.insert("system_text".into(), value);
+            }
+            PartKind::Declarations => {
+                members.insert("declarations".into(), value);
+            }
+            _ => {}
+        }
+    }
+    members.insert("fetches".into(), Value::Array(fetches));
+    serde_json::from_value(Value::Object(members))
+        .map(|manifest| Some(std::sync::Arc::new(manifest)))
+        .map_err(|e| LoopError::Parts(format!("the frozen manifest: {e}")))
+}
+
 /// A run's admission as its start record froze it, read back from the fold and the setup
 /// store. Its input is already in the conversation, so it is left empty.
 fn frozen_admission(
@@ -457,6 +544,7 @@ fn frozen_admission(
         on_restart: decode(start.on_restart.clone())?,
         ts_ms: start.ts_ms,
         written_at_ms: start.written_at_ms,
+        manifest: frozen_manifest(start, parts)?,
     })
 }
 
@@ -820,6 +908,12 @@ async fn admit<W: Writer>(
         }
         setup.push(parts.put(kind, &value).map_err(LoopError::Parts)?);
     }
+    // A manifest's shared members are setup parts after the run config's, in the order the
+    // resume reads them back; what remains of it stays with the run's choices.
+    let manifest_rest = match &admission.manifest {
+        Some(manifest) => manifest_parts(manifest, parts, &mut setup)?,
+        None => None,
+    };
     let tool_names = admission
         .tools
         .iter()
@@ -841,6 +935,15 @@ async fn admit<W: Writer>(
     if !admission.stop_when.is_empty() {
         config.insert("stop_when".into(), json!(admission.stop_when));
     }
+    let mut choices = serde_json::Map::new();
+    choices.insert("config".into(), Value::Object(config));
+    if let Some(rest) = manifest_rest {
+        choices.insert("manifest".into(), rest);
+    }
+    choices.insert(
+        "record".into(),
+        json!({ "marker_order_version": MARKER_ORDER_VERSION }),
+    );
     let mut records = Vec::new();
     if writer.operations().setup_changed(&setup, &admission.model) {
         records.push(Record::SetupStub(SetupStub {
@@ -867,10 +970,7 @@ async fn admit<W: Writer>(
         route_decision_id: None,
         compaction_plan_version: None,
         auth_selection: None,
-        run_choices: Some(json!({
-            "config": config,
-            "record": { "marker_order_version": MARKER_ORDER_VERSION },
-        })),
+        run_choices: Some(Value::Object(choices)),
         origin: Some(json!({ "kind": "fresh" })),
         principal: None,
         scope: None,
