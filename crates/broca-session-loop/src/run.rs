@@ -1246,7 +1246,7 @@ where
     let mut calls = calls.to_vec();
     for call in &mut calls {
         if let Some(args) = known_of(call).and_then(|known| known.args.clone()) {
-            call.input = args.into();
+            call.input = args;
         }
     }
     let plans = plan_calls(
@@ -1518,7 +1518,7 @@ async fn plan_calls(
             None => match approval.decide(call).await {
                 ApprovalResponse::Allow { .. } => CallPlan::Dispatch,
                 ApprovalResponse::AllowNarrowed { input, .. } => {
-                    call.input = input.into();
+                    call.input = input;
                     CallPlan::Dispatch
                 }
                 ApprovalResponse::Deny { reason, .. } => {
