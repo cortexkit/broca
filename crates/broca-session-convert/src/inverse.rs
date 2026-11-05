@@ -771,6 +771,13 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         set(&mut object, "failure", retraction.failure.as_ref());
                         Value::Object(object)
                     }
+                    Record::OutputCapLowered(lowered) => serde_json::json!({
+                        "type": "output_reservation_clamped",
+                        "step_id": lowered.step_id,
+                        "max_output_tokens": lowered.max_output_tokens,
+                        "estimated_input_tokens": lowered.estimated_input_tokens,
+                        "context_limit": lowered.context_limit,
+                    }),
                     Record::CeilingDecided(decided) => {
                         let mut object = Map::new();
                         object.insert("type".into(), json("context_ceiling_decided"));

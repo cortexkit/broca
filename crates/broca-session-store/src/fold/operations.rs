@@ -358,6 +358,33 @@ state! {
             reset: "run_start",
             bound: Bound::Fixed,
         },
+        /// The lowered output cap a step of this run recorded, until that step ends: a resume
+        /// that sends the step again sends it with this cap.
+        24 opt pub output_cap: OutputCap => {
+            owner: "run loop",
+            reset: "a step's end",
+            bound: Bound::Fixed,
+        },
+    }
+}
+
+crate::message! {
+    /// A step's lowered output cap.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OutputCap {
+        1 req step_id: u64,
+        2 req max_output_tokens: u32,
+    }
+}
+
+crate::message! {
+    /// A step's measured input: what the provider reported as its full input, the body length of
+    /// the attempt that produced it, and the model that measured it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OutputMeasure {
+        1 req input_tokens: u64,
+        2 req request_bytes: u64,
+        3 req model: broca_protocol::request::ModelHandle,
     }
 }
 
@@ -400,6 +427,7 @@ impl Run {
             provider_call_started: false,
             account_limit_pause: None,
             context_ceiling: None,
+            output_cap: None,
             keep_warm: start.keep_warm.clone(),
             on_restart: start.on_restart.clone(),
             start: Some(start.clone()),
@@ -630,6 +658,22 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The newest step whose input the provider measured, which the run loop estimates the
+        /// next request's input from when it decides whether a step's output cap must be
+        /// lowered. A step without a measurement leaves the older one in place. Session-scoped:
+        /// an earlier run's step still measures this run's model.
+        16 opt pub output_measure: OutputMeasure => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// The body length of the newest attempt no step's end has closed yet, which the next
+        /// step's end measures against.
+        17 opt pub output_attempt_bytes: u64 => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -744,8 +788,10 @@ impl Operations {
                 self.estimate
                     .get_or_insert_with(Estimate::default)
                     .run_model = Some(start.model.clone());
+                self.output_attempt_bytes = None;
             }
             Record::Attempt(attempt) => {
+                self.output_attempt_bytes = Some(attempt.request_body_len);
                 self.estimate
                     .get_or_insert_with(Estimate::default)
                     .current_request_bytes = Some(attempt.request_body_len);
@@ -766,6 +812,7 @@ impl Operations {
                 }
             }
             Record::StepEnd(step) => {
+                self.measure_step(step);
                 let estimate = self.estimate.get_or_insert_with(Estimate::default);
                 estimate.step_model = estimate.run_model.clone();
                 estimate.step_usage = step.usage;
@@ -775,6 +822,53 @@ impl Operations {
                 self.last_send_run = Some(step.run_id.clone());
             }
             _ => {}
+        }
+    }
+
+    /// A step's end measures its input when the provider reported it, an attempt's body length
+    /// is known and the model that served the measured call is: the model the step was routed
+    /// to, else the run's, with a server-side handoff measured on the last model that served it.
+    /// Today's `OutputReservationHistory::note_served_step` decides the same.
+    fn measure_step(&mut self, step: &crate::record::StepEnd) {
+        let bytes = self.output_attempt_bytes.take();
+        let fallback = step.fallback.as_ref();
+        let routed: Option<broca_protocol::request::ModelHandle> = fallback
+            .and_then(|fallback| fallback.get("route"))
+            .and_then(|route| route.get("model"))
+            .and_then(|model| serde_json::from_value(model.clone()).ok());
+        let Some(requested) = routed.or_else(|| {
+            self.estimate
+                .as_ref()
+                .and_then(|estimate| estimate.run_model.clone())
+        }) else {
+            return;
+        };
+        let served = fallback
+            .and_then(|fallback| fallback.get("served_model"))
+            .and_then(|model| model.as_str());
+        let iterations: Option<Vec<broca_protocol::usage::UsageIteration>> = fallback
+            .and_then(|fallback| fallback.get("usage_iterations"))
+            .and_then(|iterations| serde_json::from_value(iterations.clone()).ok());
+        let measured = broca_protocol::usage::model_usage(
+            served.unwrap_or(&requested.model_id),
+            step.usage.unwrap_or_default(),
+            iterations.as_deref(),
+        )
+        .last()
+        .map(|(model, usage)| {
+            (
+                *usage,
+                broca_protocol::request::ModelHandle::new(&requested.provider_module_id, *model),
+            )
+        });
+        if let (Some((usage, model)), Some(request_bytes)) = (measured, bytes) {
+            if let Some(input_tokens) = usage.fill_tokens() {
+                self.output_measure = Some(OutputMeasure {
+                    input_tokens,
+                    request_bytes,
+                    model,
+                });
+            }
         }
     }
 
@@ -875,6 +969,7 @@ impl Operations {
                 run.pending_steers.clear();
             }
             Record::StepEnd(step) => {
+                run.output_cap = None;
                 let usage = step.total_usage.or(step.usage).unwrap_or_default();
                 run.usage.accumulate(&usage);
                 run.last_step_usage = Some(usage);
@@ -980,6 +1075,12 @@ impl Operations {
             // Today's replay keeps the latest decision of the run still going.
             Record::CeilingDecided(decided) if run.finished.is_none() => {
                 run.context_ceiling = decided.detail.clone();
+            }
+            Record::OutputCapLowered(lowered) => {
+                run.output_cap = Some(OutputCap {
+                    step_id: lowered.step_id,
+                    max_output_tokens: lowered.max_output_tokens,
+                });
             }
             Record::CancelRequest(cancel) => {
                 if cancel.run_id == run.run_id

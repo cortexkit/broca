@@ -32,6 +32,7 @@
 pub mod compaction;
 pub mod entries;
 pub mod media;
+pub mod output;
 pub mod parts;
 pub mod run;
 pub mod writer;

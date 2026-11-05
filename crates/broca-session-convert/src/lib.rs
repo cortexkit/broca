@@ -23,7 +23,7 @@ use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::record::{
     Assistant, Attempt, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome, CancelPoint,
-    CancelRequest, CeilingDecided, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker,
+    CancelRequest, CeilingDecided, OutputCapLowered, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker,
     Notice, PartKind, PartRef, Pause, Placement, QueuedSend, Record, Redo, ResultAppend, Resumed,
     Retraction, RunEnd, RunStart, SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepStart,
     Stream, StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, View, ViewApplied,
@@ -599,6 +599,14 @@ fn convert_one(
             step_id: f.req_u64("step_id"),
             detail: f.take("detail"),
         })),
+        "output_reservation_clamped" => {
+            out.records.push(Record::OutputCapLowered(OutputCapLowered {
+                step_id: f.req_u64("step_id"),
+                max_output_tokens: f.req_u64("max_output_tokens") as u32,
+                estimated_input_tokens: f.req_u64("estimated_input_tokens"),
+                context_limit: f.req_u64("context_limit"),
+            }))
+        }
         "run_cancel_requested" => {
             let at = match f.req_string("at").as_str() {
                 "now" => CancelPoint::Now,

@@ -1211,6 +1211,7 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         .into_iter()
         .map(|pending| pending.submission_id.0)
         .collect();
+    let output_reservation = broca_session_loop::output::history(&operations);
     let Some(run) = operations.run else {
         // Nothing to compare only when today's replay has no run either.
         return if today.run_id.is_none() {
@@ -1248,6 +1249,10 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
             differs.push(field.to_owned());
         }
     };
+    check(
+        "output_reservation",
+        today.output_reservation == output_reservation,
+    );
     check(
         "run_id",
         today.run_id.as_ref().map(|id| id.0.as_str()) == Some(run.run_id.as_str()),

@@ -842,6 +842,23 @@ message! {
 }
 
 message! {
+    /// A step's output-token cap, lowered below the run's frozen cap before the step's request
+    /// was sent, so the estimated input plus the output reservation stays inside the context
+    /// limit. Written only for a step whose cap was lowered, and durable before the request goes
+    /// out, so a resume renders the cap the provider saw.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct OutputCapLowered {
+        1 req step_id: u64,
+        /// The cap the step's request carries.
+        2 req max_output_tokens: u32,
+        /// The input-token estimate the cap was derived from, kept for diagnosis only.
+        3 req estimated_input_tokens: u64,
+        /// The run's frozen context limit the estimate was checked against.
+        4 req context_limit: u64,
+    }
+}
+
+message! {
     /// A caller asked to cancel a run.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct CancelRequest {
@@ -1113,6 +1130,7 @@ records! {
         92 RecoveryCut,
         93 Resumed,
         94 CeilingDecided,
+        95 OutputCapLowered,
     }
 }
 
