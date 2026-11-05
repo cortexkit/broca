@@ -4297,3 +4297,34 @@ async fn a_ledger_seal_between_runs_keeps_the_compaction_views() {
         )
         .await;
 }
+
+/// A tool result pushes the next request over the window, and the provider answers with no view,
+/// so the request still doesn't fit: the run ends at the context ceiling without sending it, with
+/// the ceiling's decision recorded as today's loop records it.
+fn ceiling_scenario() -> Scenario {
+    compacted_scenario(vec![
+        answer(
+            "a1",
+            vec![call("c1", "big", json!({}))],
+            FinishReason::ToolCalls,
+        ),
+        text_step("a2", "never sent"),
+    ])
+}
+
+fn no_view() -> CompactionScript {
+    CompactionScript {
+        context_limit: 1_200,
+        rides: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn a_request_over_the_window_after_the_ride_ends_at_the_ceiling() {
+    compare_compacted(ceiling_scenario(), no_view()).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_run_ending_at_the_ceiling_resumes_alike() {
+    compare_compacted_every_cut(ceiling_scenario(), no_view()).await;
+}

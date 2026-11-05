@@ -23,10 +23,10 @@ use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::record::{
     Assistant, Attempt, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome, CancelPoint,
-    CancelRequest, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker, Notice, PartKind,
-    PartRef, Pause, Placement, QueuedSend, Record, Redo, ResultAppend, Resumed, Retraction, RunEnd,
-    RunStart, SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepStart, Stream,
-    StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, View, ViewApplied,
+    CancelRequest, CeilingDecided, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker,
+    Notice, PartKind, PartRef, Pause, Placement, QueuedSend, Record, Redo, ResultAppend, Resumed,
+    Retraction, RunEnd, RunStart, SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepStart,
+    Stream, StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, View, ViewApplied,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -594,6 +594,10 @@ fn convert_one(
         "retracted" => out.records.push(Record::Retraction(Retraction {
             submission_id: f.req_string("submission_id"),
             failure: f.take("failure"),
+        })),
+        "context_ceiling_decided" => out.records.push(Record::CeilingDecided(CeilingDecided {
+            step_id: f.req_u64("step_id"),
+            detail: f.take("detail"),
         })),
         "run_cancel_requested" => {
             let at = match f.req_string("at").as_str() {

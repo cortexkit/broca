@@ -830,6 +830,18 @@ message! {
 }
 
 message! {
+    /// The context-ceiling check before a step's request: the request doesn't fit the model's
+    /// window even after the compaction provider's answer, so the run ends without sending it.
+    /// `detail` is the protocol's `ContextCeilingDetail` (the usable window, the request's tokens
+    /// and why), kept as the caller reads it; absent when the check let the step send.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct CeilingDecided {
+        1 req step_id: u64,
+        2 opt detail: serde_json::Value,
+    }
+}
+
+message! {
     /// A caller asked to cancel a run.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct CancelRequest {
@@ -1100,6 +1112,7 @@ records! {
         91 TranscriptReverted,
         92 RecoveryCut,
         93 Resumed,
+        94 CeilingDecided,
     }
 }
 

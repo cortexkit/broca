@@ -41,9 +41,9 @@ use broca_protocol::{DeliveryMode, DeliveryOrder};
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::operations::{CallState, Operations, Resolution};
 use broca_session_store::record::{
-    Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, Delivery, Input, PartKind, Pause,
-    Placement, Record, Redo, Resumed, RunEnd, RunStart, SendEnded, SetupStub, StepEnd, StepStart,
-    ToolHeld, ToolIntent, ToolOutcome, ToolReply,
+    Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, CeilingDecided, Delivery, Input,
+    PartKind, Pause, Placement, Record, Redo, Resumed, RunEnd, RunStart, SendEnded, SetupStub,
+    StepEnd, StepStart, ToolHeld, ToolIntent, ToolOutcome, ToolReply,
 };
 use broca_session_store::session::SessionError;
 use broca_wal::ComputedTagRules;
@@ -907,6 +907,25 @@ where
                 crate::compaction::Send::Ready(ready) => opts = *ready,
                 crate::compaction::Send::Unavailable(message) => {
                     return compaction_unavailable(writer, seams, admission, &message).await;
+                }
+                crate::compaction::Send::Ceiling(detail) => {
+                    // Written with the run's end, which is durable, as today's loop writes it.
+                    writer
+                        .append(
+                            &[Record::CeilingDecided(CeilingDecided {
+                                step_id,
+                                detail: Some(detail),
+                            })],
+                            false,
+                        )
+                        .await?;
+                    return finish(
+                        writer,
+                        seams,
+                        &admission.run_id,
+                        RunFinishReason::ContextCeiling,
+                    )
+                    .await;
                 }
             }
             // The step applied a view with a new cut: the history before its first kept entry

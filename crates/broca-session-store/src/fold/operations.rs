@@ -352,6 +352,12 @@ state! {
             reset: "run_start",
             bound: Bound::Config("the run's frozen start: its choices, render config and setup parts"),
         },
+        /// The context-ceiling detail the run ended on, which `run.status` reports.
+        23 opt pub context_ceiling: serde_json::Value => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -393,6 +399,7 @@ impl Run {
             last_step_usage: None,
             provider_call_started: false,
             account_limit_pause: None,
+            context_ceiling: None,
             keep_warm: start.keep_warm.clone(),
             on_restart: start.on_restart.clone(),
             start: Some(start.clone()),
@@ -960,6 +967,10 @@ impl Operations {
                     }
                     run.open_batch = None;
                 }
+            }
+            // Today's replay keeps the latest decision of the run still going.
+            Record::CeilingDecided(decided) if run.finished.is_none() => {
+                run.context_ceiling = decided.detail.clone();
             }
             Record::CancelRequest(cancel) => {
                 if cancel.run_id == run.run_id

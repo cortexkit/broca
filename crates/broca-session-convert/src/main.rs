@@ -1022,10 +1022,19 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         broca_wal::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
     });
     check("cancel", today_cancel == run.cancel);
+    // The ceiling detail `run.status` reports comes from today's reconciled run state, which
+    // the replay above doesn't carry.
+    let today_ceiling = broca_core::replay::reconcile_run_state(&records, &run.run_id)
+        .and_then(|state| state.context_ceiling);
+    check(
+        "context_ceiling",
+        json_of(&today_ceiling) == run.context_ceiling,
+    );
     check("queue", today_queue == folded_queue);
     differs.extend(sends);
     let mut set = Vec::new();
     for (field, value) in [
+        ("context_ceiling", json_of(&today_ceiling)),
         ("account_limit_pause", json_of(&today.account_limit_pause)),
         ("keep_warm", json_of(&today.keep_warm)),
         ("on_restart", json_of(&today.on_restart)),

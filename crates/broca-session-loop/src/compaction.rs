@@ -229,6 +229,10 @@ pub enum Send {
     /// The provider can't serve the run (Setup failed with no view to fall back on, or the run
     /// froze no window to state conditions from), so the run ends `compaction_unavailable`.
     Unavailable(String),
+    /// The request still doesn't fit the model's window after the provider's answer, so the run
+    /// ends at the context ceiling without sending it. Carries the protocol's
+    /// `ContextCeilingDetail`, as `run.status` reports it.
+    Ceiling(serde_json::Value),
 }
 
 /// The error a run ends with when its compaction provider can't serve it: permanent, with code
@@ -659,9 +663,16 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         v2::request::Prepared::CompactionUnavailable => Ok(Send::Unavailable(
             "compaction provider Setup is unavailable".into(),
         )),
-        v2::request::Prepared::ContextCeiling { .. } => Err(LoopError::Unsupported(
-            "a request over the window after the compaction provider's answer",
-        )),
+        v2::request::Prepared::ContextCeiling {
+            request_tokens,
+            usable_window,
+        } => serde_json::to_value(broca_protocol::ContextCeilingDetail::new(
+            usable_window,
+            request_tokens,
+            "over_window",
+        ))
+        .map(Send::Ceiling)
+        .map_err(|error| LoopError::Parts(error.to_string())),
     }
 }
 

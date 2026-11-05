@@ -771,6 +771,13 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         set(&mut object, "failure", retraction.failure.as_ref());
                         Value::Object(object)
                     }
+                    Record::CeilingDecided(decided) => {
+                        let mut object = Map::new();
+                        object.insert("type".into(), json("context_ceiling_decided"));
+                        object.insert("step_id".into(), json(decided.step_id));
+                        set(&mut object, "detail", decided.detail.as_ref());
+                        Value::Object(object)
+                    }
                     Record::CancelRequest(cancel) => serde_json::json!({
                         "type": "run_cancel_requested",
                         "run_id": cancel.run_id,
