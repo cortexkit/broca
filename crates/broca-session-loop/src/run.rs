@@ -19,8 +19,8 @@ use broca_core::provider::{Provider, StepRuntime};
 use broca_core::run::{limiting_stop_satisfied, stop_satisfied, OutputEvent};
 use broca_core::tags::TagNumbering;
 use broca_core::tool_plane::{
-    BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ProviderHeldRecorder,
-    ProviderHeldReply, ToolOpenGuard, ToolPlane,
+    BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ProviderHeldLifecycle,
+    ProviderHeldRecorder, ProviderHeldReply, ToolOpenGuard, ToolPlane,
 };
 use broca_protocol::caller::{PauseReason, RunFinishReason};
 use broca_protocol::content::{
@@ -103,6 +103,9 @@ pub struct Seams<'a, P, T> {
     /// `cancel`, it cuts nothing in flight: the run stops at its next step boundary, where it
     /// pauses or ends interrupted as its restart policy says.
     pub stop: CancellationToken,
+    /// The late-result runtime's waiting slots for calls a provider holds. Without it a held
+    /// call is never answered, as in today's loop, and its run pauses.
+    pub held: Option<&'a dyn ProviderHeldLifecycle>,
     /// Milliseconds since the epoch, for the times records carry.
     pub now_ms: &'a (dyn Fn() -> u64 + Sync),
     /// The session's address, given to the provider for its diagnostics only.
@@ -182,7 +185,9 @@ where
         Resolution::Resume => drive(writer, parts, &admission, seams).await,
         Resolution::Idle(reason) => finish(writer, seams, &admission.run_id, reason).await,
         Resolution::Interrupted(_) => close_interrupted(writer, seams, &admission.run_id).await,
-        Resolution::ProviderHeld(_) => Err(LoopError::Unsupported("calls a provider holds")),
+        // A held call's late result arrived: the run goes on from its open batch, waiting on
+        // each held call again rather than sending it.
+        Resolution::ProviderHeld(_) => drive(writer, parts, &admission, seams).await,
         Resolution::Paused(PauseReason::AuthRequired | PauseReason::Restart) => {
             drive(writer, parts, &admission, seams).await
         }
@@ -259,11 +264,60 @@ fn unsent_calls<W: Writer>(writer: &W) -> Option<Vec<ToolCall>> {
             })
             .filter(|call| {
                 batch.is_none_or(|batch| {
-                    batch.state_of(&call.tool_call_id) == Some(CallState::NotSent)
+                    matches!(
+                        batch.state_of(&call.tool_call_id),
+                        Some(
+                            CallState::NotSent | CallState::ProviderHeld | CallState::HeldSuccessor
+                        )
+                    )
                 })
             })
             .collect(),
     )
+}
+
+/// Every call the open tool turn's assistant message asked for.
+fn planned_calls<W: Writer>(writer: &W) -> Vec<ToolCall> {
+    writer
+        .conversation()
+        .open_tool_turn()
+        .map(|open| {
+            open.content
+                .iter()
+                .filter_map(|block| match block {
+                    broca_protocol::content::ContentBlock::ToolCall(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The open batch's calls that already have intents and are still to be answered: a call a
+/// provider holds, with its held reply, and a call queued behind one, never sent.
+fn known_calls<W: Writer>(writer: &W) -> Vec<Known> {
+    let Some(batch) = run_state(writer).open_batch.as_ref() else {
+        return Vec::new();
+    };
+    (0..batch.calls.len())
+        .filter(|position| {
+            matches!(
+                batch.state(*position),
+                CallState::ProviderHeld | CallState::HeldSuccessor
+            )
+        })
+        .map(|position| Known {
+            id: batch.id(position).clone(),
+            key: batch.key(position).map(str::to_owned),
+            held: batch.held_reply(position).map(|held| ProviderHeldReply {
+                tool_call_id: held.tool_call_id.clone(),
+                call_key: held.call_key.clone(),
+                module: held.module.clone(),
+                reason: held.reason.clone(),
+                detail_digest: held.detail_digest.clone(),
+            }),
+        })
+        .collect()
 }
 
 /// What a resume rebuilt, what it does again, and which calls it will never send again.
@@ -402,24 +456,32 @@ where
     if let Some(unsent) = unsent_calls(writer).filter(|unsent| !unsent.is_empty()) {
         let step_id = run_state(writer).completed_steps;
         let started = run_state(writer).open_batch.is_some();
-        if batch(
+        let known = known_calls(writer);
+        let planned = planned_calls(writer);
+        match batch(
             writer,
             seams,
             &admission.run_id,
             step_id,
+            &planned,
             &unsent,
+            &known,
             &manifest,
             started,
         )
         .await?
         {
-            return finish(
-                writer,
-                seams,
-                &admission.run_id,
-                RunFinishReason::Interrupted,
-            )
-            .await;
+            BatchOutcome::Closed { unknown: false } => {}
+            BatchOutcome::Closed { unknown: true } => {
+                return finish(
+                    writer,
+                    seams,
+                    &admission.run_id,
+                    RunFinishReason::Interrupted,
+                )
+                .await;
+            }
+            BatchOutcome::Held(finished) => return Ok(finished),
         }
     }
     loop {
@@ -651,24 +713,30 @@ where
         if seams.stop.is_cancelled() {
             return stopped_batch(writer, seams, &admission.run_id, step_id, &calls).await;
         }
-        if batch(
+        match batch(
             writer,
             seams,
             &admission.run_id,
             step_id,
             &calls,
+            &calls,
+            &[],
             &manifest,
             false,
         )
         .await?
         {
-            return finish(
-                writer,
-                seams,
-                &admission.run_id,
-                RunFinishReason::Interrupted,
-            )
-            .await;
+            BatchOutcome::Closed { unknown: false } => {}
+            BatchOutcome::Closed { unknown: true } => {
+                return finish(
+                    writer,
+                    seams,
+                    &admission.run_id,
+                    RunFinishReason::Interrupted,
+                )
+                .await;
+            }
+            BatchOutcome::Held(finished) => return Ok(finished),
         }
     }
 }
@@ -946,18 +1014,42 @@ async fn model_step<W: Writer, P: Provider, T>(
     }
 }
 
-/// Dispatches one assistant message's tool calls and records every result. Returns whether a
-/// call may have run without its result coming back: the run must then stop, because feeding
-/// that call's failure to the model would invite it to run the call again.
+/// A call of a batch that already has an intent, from before the run paused or crashed: it is
+/// sent with the key its intent recorded, and a call a provider holds is waited on again, never
+/// sent again.
+pub(crate) struct Known {
+    pub id: ToolCallId,
+    pub key: Option<String>,
+    pub held: Option<ProviderHeldReply>,
+}
+
+/// How a tool batch ended.
+enum BatchOutcome {
+    /// Every call has its outcome; `unknown` when one may have run without its result coming
+    /// back, which stops the run, because feeding that call's failure to the model would invite
+    /// it to run the call again.
+    Closed { unknown: bool },
+    /// Only calls a provider holds were still waiting, so the run paused for their late
+    /// results.
+    Held(Finished),
+}
+
+/// Dispatches one assistant message's tool calls and records every result. `planned` is every
+/// call the message asked for, which the plane is told of; `calls` are the ones still to be
+/// answered, all of them unless the batch is resumed. `known` names those that already have
+/// intents; every other call gets its intent here.
+#[allow(clippy::too_many_arguments)]
 async fn batch<W, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
     run_id: &str,
     step_id: u64,
+    planned: &[ToolCall],
     calls: &[ToolCall],
+    known: &[Known],
     manifest: &ToolManifest,
     started: bool,
-) -> Result<bool, LoopError>
+) -> Result<BatchOutcome, LoopError>
 where
     W: Writer,
     T: ToolPlane,
@@ -975,7 +1067,7 @@ where
     let guard = ToolOpenGuard::new(Some(&seams.cancel), Some(&seams.stop));
     if seams
         .tools
-        .batch_started_guarded(&ctx, calls, manifest, &guard)
+        .batch_started_guarded(&ctx, planned, manifest, &guard)
         .await
         .is_err()
     {
@@ -986,10 +1078,11 @@ where
             .get(&call.tool_name)
             .is_some_and(|tool| tool.execution_mode == ExecutionMode::Sequential)
     });
+    let known_of = |call: &ToolCall| known.iter().find(|known| known.id == call.tool_call_id);
     let session = writer.session_id();
     let now = (seams.now_ms)();
     let mut intents = Vec::with_capacity(calls.len() + 1);
-    for call in calls {
+    for call in calls.iter().filter(|call| known_of(call).is_none()) {
         intents.push((
             call,
             canonical(&call.input).map_err(LoopError::Parts)?.1,
@@ -1038,14 +1131,21 @@ where
             true,
         )
         .await?;
-    let keys: Vec<(ToolCallId, String)> = written
+    // Every call's key, in call order: a known call's from its intent, a new call's from the
+    // intent just written.
+    let keys: Vec<(ToolCallId, String)> = calls
         .iter()
-        .filter_map(|record| match record {
-            Record::ToolIntent(intent) => intent
-                .call_key
-                .clone()
-                .map(|key| (intent.tool_call_id.clone(), key)),
-            _ => None,
+        .filter_map(|call| {
+            let key = match known_of(call) {
+                Some(known) => known.key.clone(),
+                None => written.iter().find_map(|record| match record {
+                    Record::ToolIntent(intent) if intent.tool_call_id == call.tool_call_id => {
+                        intent.call_key.clone()
+                    }
+                    _ => None,
+                }),
+            };
+            key.map(|key| (call.tool_call_id.clone(), key))
         })
         .collect();
     let registrations: Vec<DispatchRegistration> = keys
@@ -1064,31 +1164,56 @@ where
             .map_err(|error| LoopError::Tools(format!("late-results registration: {error}")))?;
     }
 
-    let results = dispatch_all(
-        writer, seams, &ctx, calls, &keys, &guard, run_id, &batch_id, sequential,
-    )
-    .await?;
-    let _ = seams.tools.batch_finished(&ctx).await;
-    let unknown = results
+    let held: Vec<Option<&ProviderHeldReply>> = calls
         .iter()
-        .any(|(_, outcome)| *outcome == CallOutcome::Unknown);
+        .map(|call| known_of(call).and_then(|known| known.held.as_ref()))
+        .collect();
+    let plan = DispatchPlan {
+        ctx: &ctx,
+        calls,
+        keys: &keys,
+        held: &held,
+        guard: &guard,
+        batch_id: &batch_id,
+        run_id,
+        sequential,
+    };
+    let dispatched = dispatch_all(writer, seams, &plan).await?;
+    let (answers, paused) = match dispatched {
+        Dispatched::All(answers) => (answers, false),
+        Dispatched::Held(answers) => (answers, true),
+    };
     let mut records = Vec::new();
-    for (result, outcome) in results {
-        terminal(
-            &mut records,
-            run_id,
-            &batch_id,
-            result,
-            outcome,
-            (seams.now_ms)(),
-        );
+    let mut unknown = false;
+    for answer in answers.into_iter().flatten() {
+        unknown |= answer.outcome == CallOutcome::Unknown;
+        if !answer.durable {
+            let now = (seams.now_ms)();
+            terminal(
+                &mut records,
+                run_id,
+                &batch_id,
+                answer.result,
+                answer.outcome,
+                now,
+            );
+        }
     }
+    if paused {
+        // The answers that came in are durable before the run pauses; the batch stays open.
+        if !records.is_empty() {
+            writer.append(&records, true).await?;
+        }
+        let finished = pause(writer, seams, run_id, PauseReason::ToolHeld, None).await?;
+        return Ok(BatchOutcome::Held(finished));
+    }
+    let _ = seams.tools.batch_finished(&ctx).await;
     records.push(Record::BatchEnd(BatchEnd {
         run_id: run_id.into(),
         batch_id,
     }));
     writer.append(&records, true).await?;
-    Ok(unknown)
+    Ok(BatchOutcome::Closed { unknown })
 }
 
 /// A call's reply in the transcript and its outcome in the ledger.
@@ -1319,75 +1444,213 @@ impl ProviderHeldRecorder for HeldChannel {
     }
 }
 
-/// Dispatches every call, in parallel unless one of them must run alone, and returns the
-/// results in the calls' order. Each call carries its key and the batch's held-reply
-/// recorder; a held reply is appended, durably, while the other calls keep running.
-#[allow(clippy::too_many_arguments)]
+/// What a batch's dispatch works from.
+struct DispatchPlan<'p> {
+    ctx: &'p BatchCtx,
+    calls: &'p [ToolCall],
+    keys: &'p [(ToolCallId, String)],
+    /// Per call, in order: the provider's held reply when the call was held before the run
+    /// paused; that call waits for its late result again instead of being sent.
+    held: &'p [Option<&'p ProviderHeldReply>],
+    guard: &'p ToolOpenGuard,
+    batch_id: &'p str,
+    run_id: &'p str,
+    sequential: bool,
+}
+
+/// One call's answer.
+struct Answer {
+    result: ToolResult,
+    outcome: CallOutcome,
+    /// Already appended: a held call's answer is durable as soon as it arrives.
+    durable: bool,
+}
+
+/// How a batch's dispatch ended. Answers are in call order; `None` for a call still waiting.
+enum Dispatched {
+    /// Every call answered.
+    All(Vec<Option<Answer>>),
+    /// Only calls a provider holds were still waiting.
+    Held(Vec<Option<Answer>>),
+}
+
+/// Dispatches every call, in parallel unless one of them must run alone, and collects their
+/// answers, matching today's held-batch scheduling:
+/// - each call carries its key and the batch's held-reply recorder; a held reply is appended,
+///   durably, while the other calls keep running;
+/// - a held call's answer is appended, durably, as soon as it arrives, before any call queued
+///   behind it is sent, and the plane is then told it's durable;
+/// - after a call whose outcome is unknown, no later call is sent: each gets the interrupted
+///   result;
+/// - when every call still running is held, the dispatch stops and the run pauses.
 async fn dispatch_all<W: Writer, P, T: ToolPlane>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
-    ctx: &BatchCtx,
-    calls: &[ToolCall],
-    keys: &[(ToolCallId, String)],
-    guard: &ToolOpenGuard,
-    run_id: &str,
-    batch_id: &str,
-    sequential: bool,
-) -> Result<Vec<(ToolResult, CallOutcome)>, LoopError> {
-    let (requests, mut held) = futures::channel::mpsc::unbounded::<HeldRequest>();
+    plan: &DispatchPlan<'_>,
+) -> Result<Dispatched, LoopError> {
+    use futures::stream::FuturesUnordered;
+    let calls = plan.calls;
+    let (requests, mut held_requests) = futures::channel::mpsc::unbounded::<HeldRequest>();
     let recorder = HeldChannel { requests };
+    let recorder = &recorder;
     let key_of = |call: &ToolCall| {
-        keys.iter()
+        plan.keys
+            .iter()
             .find(|(id, _)| *id == call.tool_call_id)
             .map(|(_, key)| key.as_str())
             .expect("every dispatched call has an intent with a key")
     };
-    let recorder = &recorder;
-    let work =
-        async {
-            if sequential {
-                let mut results = Vec::with_capacity(calls.len());
-                for call in calls {
-                    results.push(
-                        dispatch_one(seams.tools, ctx, call, key_of(call), recorder, guard).await,
-                    );
-                }
-                results
-            } else {
-                futures::future::join_all(calls.iter().map(|call| {
-                    dispatch_one(seams.tools, ctx, call, key_of(call), recorder, guard)
-                }))
-                .await
-            }
-        };
-    let mut work = std::pin::pin!(work);
+    let mut open_held: Vec<ToolCallId> = calls
+        .iter()
+        .zip(plan.held)
+        .filter(|(_, held)| held.is_some())
+        .map(|(call, _)| call.tool_call_id.clone())
+        .collect();
+    let mut answers: Vec<Option<Answer>> = calls.iter().map(|_| None).collect();
+    let mut jobs = FuturesUnordered::new();
+    let mut next = 0;
+    let mut tripped = false;
     loop {
-        let next = futures::future::select(work.as_mut(), held.next());
-        match next.await {
-            futures::future::Either::Left((results, _)) => return Ok(results),
-            futures::future::Either::Right((Some((reply, answer)), _)) => {
+        while next < calls.len() && (!plan.sequential || jobs.is_empty()) {
+            let index = next;
+            next += 1;
+            let call = &calls[index];
+            let held = plan.held[index];
+            let interrupted = tripped && held.is_none();
+            let key = key_of(call);
+            jobs.push(async move {
+                let answer = if interrupted {
+                    (
+                        interrupted_result(&call.tool_call_id),
+                        CallOutcome::Interrupted,
+                    )
+                } else if let Some(reply) = held {
+                    match seams.held {
+                        Some(lifecycle) => {
+                            resolve(call, lifecycle.wait(plan.ctx, call, reply).await)
+                        }
+                        None => std::future::pending().await,
+                    }
+                } else {
+                    dispatch_one(seams.tools, plan.ctx, call, key, recorder, plan.guard).await
+                };
+                (index, answer)
+            });
+        }
+        if answers.iter().all(Option::is_some) {
+            return Ok(Dispatched::All(answers));
+        }
+        if !tripped && !open_held.is_empty() && jobs.len() == open_held.len() {
+            // Only held calls wait. Anything already answered is taken first, as today's
+            // loop does, then the run pauses.
+            if let Some(Some((index, answer))) = futures::FutureExt::now_or_never(jobs.next()) {
+                settle(
+                    writer,
+                    seams,
+                    plan,
+                    &mut open_held,
+                    &mut answers,
+                    &mut tripped,
+                    index,
+                    answer,
+                )
+                .await?;
+                continue;
+            }
+            return Ok(Dispatched::Held(answers));
+        }
+        match futures::future::select(jobs.next(), held_requests.next()).await {
+            futures::future::Either::Left((Some((index, answer)), _)) => {
+                settle(
+                    writer,
+                    seams,
+                    plan,
+                    &mut open_held,
+                    &mut answers,
+                    &mut tripped,
+                    index,
+                    answer,
+                )
+                .await?;
+            }
+            futures::future::Either::Left((None, _)) => {
+                unreachable!("jobs run until every call has an answer")
+            }
+            futures::future::Either::Right((Some((reply, answered)), _)) => {
                 let record = Record::ToolHeld(ToolHeld {
-                    batch_id: batch_id.into(),
+                    batch_id: plan.batch_id.into(),
                     tool_call_id: reply.tool_call_id.clone(),
                     call_key: reply.call_key.clone(),
                     module: reply.module.clone(),
                     reason: reply.reason.clone(),
                     detail_digest: reply.detail_digest.clone(),
                     held_at_ms: (seams.now_ms)(),
-                    sequential,
+                    sequential: plan.sequential,
                 });
-                let _ = run_id;
                 let durable = writer
                     .append(&[record], true)
                     .await
                     .map(|_| ())
                     .map_err(|error| format!("{error:?}"));
-                let _ = answer.send(durable);
+                if durable.is_ok() {
+                    open_held.push(reply.tool_call_id.clone());
+                }
+                let _ = answered.send(durable);
             }
             futures::future::Either::Right((None, _)) => {
                 unreachable!("the recorder lives as long as the dispatches")
             }
         }
+    }
+}
+
+/// Takes call `index`'s answer. A held call's answer is appended durably at once, and the plane
+/// told so, before any call behind it is sent.
+#[allow(clippy::too_many_arguments)]
+async fn settle<W: Writer, P, T: ToolPlane>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    plan: &DispatchPlan<'_>,
+    open_held: &mut Vec<ToolCallId>,
+    answers: &mut [Option<Answer>],
+    tripped: &mut bool,
+    index: usize,
+    (result, outcome): (ToolResult, CallOutcome),
+) -> Result<(), LoopError> {
+    *tripped |= outcome == CallOutcome::Unknown;
+    let id = plan.calls[index].tool_call_id.clone();
+    let durable = open_held.contains(&id);
+    if durable {
+        let mut records = Vec::new();
+        terminal(
+            &mut records,
+            plan.run_id,
+            plan.batch_id,
+            result.clone(),
+            outcome,
+            (seams.now_ms)(),
+        );
+        writer.append(&records, true).await?;
+        open_held.retain(|held| *held != id);
+        if let Some(lifecycle) = seams.held {
+            lifecycle.terminal_synced(plan.ctx, &id).await;
+        }
+    }
+    answers[index] = Some(Answer {
+        result,
+        outcome,
+        durable,
+    });
+    Ok(())
+}
+
+/// The result a call gets when an earlier call of its batch may have run without an answer,
+/// so it was never sent.
+fn interrupted_result(id: &ToolCallId) -> ToolResult {
+    ToolResult {
+        tool_call_id: id.clone(),
+        output: ToolOutput::error("tool not run: batch interrupted"),
+        is_error: true,
     }
 }
 

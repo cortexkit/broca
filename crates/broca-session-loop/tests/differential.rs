@@ -16,15 +16,18 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use broca_core::capability::ToolManifest;
 use broca_core::tool_plane::{
-    BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ToolOpenGuard, ToolPlane,
-    ToolPlaneError,
+    BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ProviderHeldLifecycle,
+    ProviderHeldReply, ToolOpenGuard, ToolPlane, ToolPlaneError,
 };
 use broca_core::{
     provider::Provider, run_loop, run_loop_on_writer, AllowAll, FileLeaseStore, FileWalStore,
     RunControl, RunRequest, StartMode, SteerInbox, StubReply, StubToolPlane, WalHandle, WalStore,
 };
 use broca_crash_harness::wal::LogImage;
-use broca_protocol::content::{AssistantMessage, ContentBlock, Message, Role, ToolCall};
+use broca_protocol::caller::PauseReason;
+use broca_protocol::content::{
+    AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult,
+};
 use broca_protocol::provider::{NormalizedEvent, ProviderControl};
 use broca_protocol::request::{
     CallOptions, ExecutionMode, ModelHandle, OnRestart, StopCondition, Tool, ToolChoice,
@@ -138,17 +141,108 @@ fn tool(name: &str, mode: ExecutionMode) -> Tool {
 /// its own; `keys` keeps the real one per call, so a run can check it against the call's intent.
 struct Spy {
     inner: StubToolPlane,
-    log: Mutex<Vec<String>>,
+    log: Arc<Mutex<Vec<String>>>,
     keys: Mutex<Vec<(ToolCallId, String)>>,
+    held: Arc<HeldScript>,
+}
+
+/// A provider that holds calls: the `hold` tool's provider answers with a held marker and
+/// delivers its late result only once the scenario deposits it; `hold_brief`'s result is
+/// deposited as soon as it's held, so it arrives while the batch is still running. Both log
+/// to the spy's log, in order with the plane's calls.
+struct HeldScript {
+    log: Arc<Mutex<Vec<String>>>,
+    replies: Mutex<Vec<ProviderHeldReply>>,
+    deposits: Mutex<Vec<ToolResult>>,
+}
+
+impl HeldScript {
+    fn deposited(&self, id: &ToolCallId) -> Option<ToolResult> {
+        self.deposits
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|result| result.tool_call_id == *id)
+            .cloned()
+    }
+
+    fn deposit(&self, id: &ToolCallId) {
+        self.deposits.lock().unwrap().push(ToolResult {
+            tool_call_id: id.clone(),
+            output: ToolOutput::Text {
+                text: format!("late result for {}", id.0),
+            },
+            is_error: false,
+        });
+    }
+
+    /// Deposits the late result of every call still held, as a provider's feed would.
+    fn deposit_all(&self) {
+        let replies = self.replies.lock().unwrap().clone();
+        for reply in replies {
+            if self.deposited(&reply.tool_call_id).is_none() {
+                self.deposit(&reply.tool_call_id);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderHeldLifecycle for HeldScript {
+    fn deposited_result(&self, _ctx: &BatchCtx, reply: &ProviderHeldReply) -> Option<ToolResult> {
+        self.deposited(&reply.tool_call_id)
+    }
+
+    async fn wait(
+        &self,
+        _ctx: &BatchCtx,
+        call: &ToolCall,
+        _reply: &ProviderHeldReply,
+    ) -> DispatchResult {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("held_wait {}", call.tool_call_id.0));
+        match self.deposited(&call.tool_call_id) {
+            Some(result) => DispatchResult::Completed(result),
+            None => std::future::pending().await,
+        }
+    }
+
+    async fn terminal_synced(&self, _ctx: &BatchCtx, id: &ToolCallId) {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("terminal_synced {}", id.0));
+    }
+
+    async fn withdraw_held(&self, call: &ProviderHeldReply) -> Result<(), String> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("withdraw {}", call.tool_call_id.0));
+        Ok(())
+    }
 }
 
 impl Spy {
     fn new(inner: StubToolPlane) -> Self {
+        let log: Arc<Mutex<Vec<String>>> = Default::default();
         Self {
             inner,
-            log: Mutex::new(Vec::new()),
+            held: Arc::new(HeldScript {
+                log: Arc::clone(&log),
+                replies: Default::default(),
+                deposits: Default::default(),
+            }),
+            log,
             keys: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The held calls' lifecycle, as the runtime installs it for a run.
+    fn lifecycle(&self) -> Arc<dyn ProviderHeldLifecycle> {
+        Arc::clone(&self.held) as Arc<dyn ProviderHeldLifecycle>
     }
 
     fn log(&self) -> Vec<String> {
@@ -268,6 +362,32 @@ impl ToolPlane for Spy {
             call.tool_call_id.0,
             keyed.as_deref().unwrap_or("unkeyed")
         ));
+        if let (
+            "hold" | "hold_brief",
+            Some(DispatchKey {
+                call_key,
+                held_recorder: Some(recorder),
+            }),
+        ) = (call.tool_name.as_str(), key)
+        {
+            // The provider answers with a held marker, which the run records durably before the
+            // provider's late result is awaited.
+            let reply = ProviderHeldReply {
+                tool_call_id: call.tool_call_id.clone(),
+                call_key: call_key.to_owned(),
+                module: "provider".into(),
+                reason: "running".into(),
+                detail_digest: None,
+            };
+            if let Err(error) = recorder.sync_held(&reply).await {
+                return DispatchResult::SentButOutcomeUnknown { reason: error };
+            }
+            self.held.replies.lock().unwrap().push(reply.clone());
+            if call.tool_name == "hold_brief" {
+                self.held.deposit(&call.tool_call_id);
+            }
+            return self.held.wait(ctx, call, &reply).await;
+        }
         self.inner.dispatch_guarded(ctx, call, key, guard).await
     }
 
@@ -590,6 +710,7 @@ async fn new_from(
         out: None,
         cancel: Default::default(),
         stop: Default::default(),
+        held: None,
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -631,6 +752,7 @@ const NORMALIZED: &[&str] = &[
     "finished_at_ms",
     "dispatched_at_ms",
     "last_content_at_ms",
+    "held_at_ms",
     "call_key",
     // A log position: each format numbers its own records.
     "resumed_from_seq",
@@ -650,7 +772,7 @@ fn normalized(records: &[Record]) -> Vec<Value> {
 }
 
 /// Every call the new loop sent carried a key that finds, through the session's own id lookup,
-/// exactly that call's intent, and names the intent's position: `<session id>:<seq>`.
+/// exactly one intent, that call's, and names the intent's position: `<session id>:<seq>`.
 async fn keys_match(session: &Session<'_, MemoryBackend>, plane: &Spy) {
     let id = broca_session_store::codec::hex(&session.head().session_id.0);
     for (call, key) in plane.keys() {
@@ -658,7 +780,16 @@ async fn keys_match(session: &Session<'_, MemoryBackend>, plane: &Spy) {
             .find_id(broca_session_store::idindex::IdKind::CallKey, &key)
             .await
             .expect("the id lookup reads");
-        let [(seq, Record::ToolIntent(intent))] = found.as_slice() else {
+        // Other records may name the key too, such as a provider's held reply; exactly one
+        // intent does.
+        let intents: Vec<(u64, &broca_session_store::record::ToolIntent)> = found
+            .iter()
+            .filter_map(|(seq, record)| match record {
+                Record::ToolIntent(intent) => Some((*seq, intent)),
+                _ => None,
+            })
+            .collect();
+        let [(seq, intent)] = intents.as_slice() else {
             panic!("key {key} of call {} finds {found:?}", call.0);
         };
         assert_eq!(intent.tool_call_id, call, "key {key} names another call");
@@ -1166,6 +1297,7 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         out: None,
         cancel: Default::default(),
         stop: Default::default(),
+        held: None,
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -1517,6 +1649,7 @@ async fn compare_actions(
     let control = RunControl {
         steer: Some(Arc::clone(&inbox)),
         stop_requested: Some(stop),
+        provider_held_lifecycle: Some(plane.lifecycle()),
         ..Default::default()
     };
     let first = run_loop_on_writer(
@@ -1535,7 +1668,11 @@ async fn compare_actions(
     .expect("today's loop runs");
     let mut summaries = vec![(first.reason, first.paused)];
     if first.paused.is_some() {
-        // The runner started again: the paused run resumes as the same run.
+        // A run paused on held calls resumes when their late results arrive; any other pause
+        // resumes when the runner starts again. Either way it's the same run.
+        if first.paused == Some(PauseReason::ToolHeld) {
+            plane.held.deposit_all();
+        }
         let second = run_loop_on_writer(
             request,
             &writer,
@@ -1545,7 +1682,10 @@ async fn compare_actions(
             &AllowAll,
             &wal,
             None,
-            RunControl::default(),
+            RunControl {
+                provider_held_lifecycle: Some(plane.lifecycle()),
+                ..Default::default()
+            },
             &tx,
         )
         .await
@@ -1627,21 +1767,30 @@ async fn compare_actions(
         out: None,
         cancel: Default::default(),
         stop: stop.clone(),
+        held: None,
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
     let mut admission = scenario.admission(&provider.inner);
     admission.on_restart = on_restart;
-    let first = run(&mut writer, &mut parts, admission, &seams)
+    let lifecycle = plane.lifecycle();
+    let seams = Seams {
+        held: Some(&*lifecycle),
+        ..seams
+    };
+    let first = finishes(run(&mut writer, &mut parts, admission, &seams))
         .await
         .expect("the new loop runs");
     let mut reports = vec![(first.reason, first.paused)];
     if first.paused.is_some() {
+        if first.paused == Some(PauseReason::ToolHeld) {
+            plane.held.deposit_all();
+        }
         let restarted = Seams {
             stop: Default::default(),
             ..seams
         };
-        let second = resume(&mut writer, &parts, &restarted)
+        let second = finishes(resume(&mut writer, &parts, &restarted))
             .await
             .expect("the new loop resumes");
         reports.push((second.reason, second.paused));
@@ -1658,6 +1807,14 @@ async fn compare_actions(
             .collect(),
     };
     assert_same(&today, &new);
+}
+
+/// A loop run that doesn't finish within ten seconds fails the comparison rather than hanging
+/// it, such as a run left waiting on a held call it should have paused for.
+async fn finishes<F: std::future::Future>(run: F) -> F::Output {
+    tokio::time::timeout(std::time::Duration::from_secs(10), run)
+        .await
+        .expect("the loop finished")
 }
 
 fn assert_same(today: &Outcome, new: &Outcome) {
@@ -1906,6 +2063,7 @@ async fn compare_auth_pause(scenario: Scenario) {
         out: None,
         cancel: Default::default(),
         stop: Default::default(),
+        held: None,
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -2221,6 +2379,87 @@ async fn ordered_sends_deliver_in_queue_order_after_steers() {
             (1, ordered("q2", &["idle_start"], "waits", None)),
             (1, ordered("q3", &["steer"], "second queued", None)),
         ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_held_call_answered_while_its_batch_runs() {
+    compare_steered(
+        Scenario {
+            input: vec![user("run both")],
+            tools: vec![
+                tool("hold_brief", ExecutionMode::Parallel),
+                tool("read", ExecutionMode::Parallel),
+            ],
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![
+                        call("c1", "hold_brief", json!({"job": 1})),
+                        call("c2", "read", json!({"path": "a"})),
+                    ],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        },
+        Vec::new(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_run_pauses_on_a_held_call_and_resumes_with_its_late_result() {
+    compare_steered(
+        Scenario {
+            input: vec![user("run both")],
+            tools: vec![
+                tool("hold", ExecutionMode::Parallel),
+                tool("read", ExecutionMode::Parallel),
+            ],
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![
+                        call("c1", "hold", json!({"job": 1})),
+                        call("c2", "read", json!({"path": "a"})),
+                    ],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        },
+        Vec::new(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_sequential_held_call_keeps_its_successor_unsent_until_resume() {
+    compare_steered(
+        Scenario {
+            input: vec![user("run in order")],
+            tools: vec![
+                tool("hold", ExecutionMode::Sequential),
+                tool("read", ExecutionMode::Sequential),
+            ],
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![
+                        call("c1", "hold", json!({"job": 1})),
+                        call("c2", "read", json!({"path": "a"})),
+                    ],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        },
+        Vec::new(),
     )
     .await;
 }

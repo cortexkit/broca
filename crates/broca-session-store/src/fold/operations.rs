@@ -56,6 +56,10 @@ crate::message! {
         /// A provider took the call to answer later; `Some(true)` when later calls wait for it.
         3 opt held: bool,
         4 opt terminal: CallOutcome,
+        /// The key its intent recorded, which a resume sends it again with.
+        5 opt key: String,
+        /// The provider's held reply, which a resume rejoins the call's wait with.
+        6 opt held_reply: crate::record::ToolHeld,
     }
 }
 
@@ -107,6 +111,21 @@ impl OpenBatch {
         !self.calls[..position]
             .iter()
             .any(|call| call.id == self.calls[position].id)
+    }
+
+    /// The id of the planned call at `position`.
+    pub fn id(&self, position: usize) -> &ToolCallId {
+        &self.calls[position].id
+    }
+
+    /// The key the intent of the planned call at `position` recorded, if it has one.
+    pub fn key(&self, position: usize) -> Option<&str> {
+        self.calls[position].key.as_deref()
+    }
+
+    /// The provider's held reply for the planned call at `position`, if a provider holds it.
+    pub fn held_reply(&self, position: usize) -> Option<&crate::record::ToolHeld> {
+        self.calls[position].held_reply.as_ref()
     }
 
     /// The state of the planned call `id`, if the batch plans it.
@@ -786,6 +805,8 @@ impl Operations {
                             id: id.clone(),
                             intent: false,
                             held: None,
+                            key: None,
+                            held_reply: None,
                             terminal: None,
                         })
                         .collect(),
@@ -799,6 +820,7 @@ impl Operations {
                         .filter(|c| c.id == intent.tool_call_id)
                     {
                         call.intent = true;
+                        call.key = intent.call_key.clone();
                     }
                 }
             }
@@ -806,6 +828,7 @@ impl Operations {
                 if let Some(batch) = run.open_batch.as_mut() {
                     for call in batch.calls.iter_mut().filter(|c| c.id == held.tool_call_id) {
                         call.held = Some(held.sequential);
+                        call.held_reply = Some(held.clone());
                     }
                 }
             }
