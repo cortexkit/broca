@@ -26,8 +26,8 @@ use broca_protocol::error::ProviderError;
 use broca_protocol::provider::{NormalizedEvent, ProviderControl};
 use broca_protocol::request::EpisodeRenderInput;
 use broca_protocol::request::{
-    CallOptions, ExecutionMode, ModelHandle, ResponseFormat, StepContext, StopCondition, Tool,
-    ToolChoice,
+    CallOptions, ExecutionMode, ModelHandle, OnRestart, ResponseFormat, StepContext, StopCondition,
+    Tool, ToolChoice,
 };
 use broca_protocol::tags::{clean_computed_into, ComputedRules};
 use broca_protocol::{BatchId, BindIdentity, FinishReason, GenerationConfig, RunId, StepId, Usage};
@@ -71,6 +71,9 @@ pub struct Admission {
     pub renderer_version: u32,
     /// Termination predicates, OR'd. Empty means a [`DEFAULT_MAX_STEPS`] step limit.
     pub stop_when: Vec<StopCondition>,
+    /// What the run does when the runner stops while it runs: end interrupted (the default),
+    /// or pause and continue as the same run after the runner starts again.
+    pub on_restart: Option<OnRestart>,
     /// When the run was admitted and when its input was written.
     pub ts_ms: Option<u64>,
     pub written_at_ms: Option<u64>,
@@ -86,6 +89,10 @@ pub struct Seams<'a, P, T> {
     pub out: Option<&'a mpsc::Sender<OutputEvent>>,
     /// Cancels the run now: a model step in flight stops and no further call is sent.
     pub cancel: CancellationToken,
+    /// Asks the run to stop starting work because the runner is shutting down. Unlike
+    /// `cancel`, it cuts nothing in flight: the run stops at its next step boundary, where it
+    /// pauses or ends interrupted as its restart policy says.
+    pub stop: CancellationToken,
     /// Milliseconds since the epoch, for the times records carry.
     pub now_ms: &'a (dyn Fn() -> u64 + Sync),
     /// The session's address, given to the provider for its diagnostics only.
@@ -163,7 +170,7 @@ where
         Resolution::Idle(reason) => finish(writer, seams, &admission.run_id, reason).await,
         Resolution::Interrupted(_) => close_interrupted(writer, seams, &admission.run_id).await,
         Resolution::ProviderHeld(_) => Err(LoopError::Unsupported("calls a provider holds")),
-        Resolution::Paused(PauseReason::AuthRequired) => {
+        Resolution::Paused(PauseReason::AuthRequired | PauseReason::Restart) => {
             drive(writer, parts, &admission, seams).await
         }
         Resolution::Paused(_) => Err(LoopError::Unsupported("a paused run")),
@@ -334,6 +341,7 @@ fn frozen_admission(
         render_config: decode::<Value>(part(PartKind::RenderConfig)?)?.unwrap_or(Value::Null),
         renderer_version: start.renderer_version,
         stop_when: decode(member("stop_when"))?.unwrap_or_default(),
+        on_restart: decode(start.on_restart.clone())?,
         ts_ms: start.ts_ms,
         written_at_ms: start.written_at_ms,
     })
@@ -409,21 +417,39 @@ where
         // here, in the same batch as either the step's start or, when a caller cancelled the run
         // now or at this boundary, the run's end. The run's state is read as the batch is built,
         // so a cancel recorded while the last step ran ends the run here.
+        //
+        // A stop request (the runner is shutting down) is checked after the cancel: the run
+        // pauses here if its restart policy says to resume, with the steered messages left for
+        // the resume; otherwise it ends interrupted.
         let run_id = admission.run_id.clone();
         let cancelled_now = seams.cancel.is_cancelled();
-        let mut cancelled_end = Some(run_end(
-            writer,
-            &run_id,
-            RunFinishReason::Cancelled,
-            (seams.now_ms)(),
-        ));
+        let stopping = seams.stop.is_cancelled();
+        let now = (seams.now_ms)();
+        let mut cancelled_end = Some(run_end(writer, &run_id, RunFinishReason::Cancelled, now));
+        let mut stopped_end = Some(run_end(writer, &run_id, RunFinishReason::Interrupted, now));
+        if let Some(Record::RunEnd(end)) = stopped_end.as_mut() {
+            end.interrupt_reason = Some("runner_shutdown".into());
+        }
+        let mut restart_pause = Some(Record::Pause(Pause {
+            run_id: run_id.clone(),
+            reason: PauseReason::Restart,
+            ts_ms: Some(now),
+            error: None,
+            account_limit: None,
+        }));
+        let resumes = admission.on_restart == Some(OnRestart::Resume);
         let boundary = writer
             .append_with(
                 &mut |_, operations| {
                     let run = operations.run.as_ref().expect("a run is active");
+                    if !(cancelled_now || run.cancel.is_some()) && stopping && resumes {
+                        return restart_pause.take().into_iter().collect();
+                    }
                     let mut batch = placed_copies(operations, &run_id);
                     if cancelled_now || run.cancel.is_some() {
                         batch.extend(cancelled_end.take());
+                    } else if stopping {
+                        batch.extend(stopped_end.take());
                     } else {
                         batch.push(Record::StepStart(StepStart {
                             run_id: run_id.clone(),
@@ -435,8 +461,14 @@ where
                 false,
             )
             .await?;
-        if matches!(boundary.last(), Some(Record::RunEnd(_))) {
-            return Ok(finished(writer, RunFinishReason::Cancelled));
+        match boundary.last() {
+            Some(Record::RunEnd(end)) => return Ok(finished(writer, end.reason)),
+            Some(Record::Pause(_)) => {
+                let mut paused = finished(writer, RunFinishReason::Interrupted);
+                paused.paused = Some(PauseReason::Restart);
+                return Ok(paused);
+            }
+            _ => {}
         }
         let opts = call_options(writer, admission, &tools, &episodes, seams, step_id)?;
         let outcome = model_step(seams, step_id, opts).await;
@@ -546,6 +578,9 @@ where
         if let Some(stop) = stop {
             return hard_stop(writer, seams, &admission.run_id, step_id, &calls, &stop).await;
         }
+        if seams.stop.is_cancelled() {
+            return stopped_batch(writer, seams, &admission.run_id, step_id, &calls).await;
+        }
         if batch(
             writer,
             seams,
@@ -645,7 +680,11 @@ async fn admit<W: Writer>(
         scope: None,
         hooks: None,
         keep_warm: None,
-        on_restart: None,
+        on_restart: admission
+            .on_restart
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| LoopError::Parts(e.to_string()))?,
         seeded: None,
         refusal_schedule: None,
     })));
@@ -986,6 +1025,57 @@ async fn hard_stop<W: Writer, P, T>(
     append_end(writer, run_id, records).await?;
     Ok(finished(writer, reason))
 }
+
+/// The runner asked the run to stop before its batch was dispatched. No call is sent: each
+/// gets a result saying so, the tool plane is never told the batch started, and the run ends
+/// interrupted whatever its restart policy, as today's loop does. The batch and the run's end
+/// are two barriers, as there.
+async fn stopped_batch<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+    step_id: u64,
+    calls: &[ToolCall],
+) -> Result<Finished, LoopError> {
+    let batch_id = format!("{run_id}-b{step_id}");
+    let now = (seams.now_ms)();
+    let mut records = vec![Record::BatchStart(BatchStart {
+        run_id: run_id.into(),
+        batch_id: batch_id.clone(),
+        step_id,
+        planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+    })];
+    for call in calls {
+        let result = ToolResult {
+            tool_call_id: call.tool_call_id.clone(),
+            output: ToolOutput::error(NOT_DISPATCHED.to_string()),
+            is_error: true,
+        };
+        terminal(
+            &mut records,
+            run_id,
+            &batch_id,
+            result,
+            CallOutcome::Interrupted,
+            now,
+        );
+    }
+    records.push(Record::BatchEnd(BatchEnd {
+        run_id: run_id.into(),
+        batch_id,
+    }));
+    writer.append(&records, true).await?;
+    let mut end = run_end(writer, run_id, RunFinishReason::Interrupted, now);
+    if let Record::RunEnd(end) = &mut end {
+        end.interrupt_reason = Some("runner_shutdown".into());
+    }
+    append_end(writer, run_id, vec![end]).await?;
+    Ok(finished(writer, RunFinishReason::Interrupted))
+}
+
+/// The result a call gets when the run stopped before the call was dispatched.
+const NOT_DISPATCHED: &str =
+    "tool not run: the run was interrupted before this call was dispatched";
 
 /// Dispatches every call, in parallel unless one of them must run alone, and returns the
 /// results in the calls' order.

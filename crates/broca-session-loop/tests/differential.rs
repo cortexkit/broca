@@ -22,7 +22,7 @@ use broca_crash_harness::wal::LogImage;
 use broca_protocol::content::{AssistantMessage, ContentBlock, Message, Role, ToolCall};
 use broca_protocol::provider::{NormalizedEvent, ProviderControl};
 use broca_protocol::request::{
-    CallOptions, ExecutionMode, ModelHandle, StopCondition, Tool, ToolChoice,
+    CallOptions, ExecutionMode, ModelHandle, OnRestart, StopCondition, Tool, ToolChoice,
 };
 use broca_protocol::{FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage};
 use broca_session_loop::{resume, run, Admission, MemoryParts, Seams, Writer};
@@ -36,6 +36,7 @@ use broca_session_store::session::{Session, SessionError};
 use broca_wal::WalRecord;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Serves scripted steps in order and records every request it was asked to send.
 #[derive(Clone)]
@@ -209,6 +210,7 @@ impl Scenario {
             render_config: provider.render_config_blob(),
             renderer_version: provider.renderer_version(),
             stop_when: self.stop_when.clone(),
+            on_restart: None,
             ts_ms: Some(0),
             written_at_ms: Some(0),
         }
@@ -406,6 +408,7 @@ async fn new_from(
         bind: bind.clone(),
         out: None,
         cancel: Default::default(),
+        stop: Default::default(),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -951,6 +954,7 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         bind: bind.clone(),
         out: None,
         cancel: Default::default(),
+        stop: Default::default(),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -1030,6 +1034,8 @@ enum Action {
     Steer(Vec<Message>),
     /// Cancels the run at its next step boundary.
     CancelAtBoundary,
+    /// Asks the run to stop, as the runner does when it shuts down.
+    Stop,
 }
 
 /// Where a scripted provider sends what the session actor does while a step is answered.
@@ -1039,12 +1045,15 @@ trait SteerSink: Send + Sync {
     async fn steer(&self, record: WalRecord);
     /// Records the caller's cancel at the run's next step boundary, as the actor would.
     async fn cancel_at_boundary(&self);
+    /// Asks the run to stop, as the runner does when it shuts down.
+    fn stop(&self);
 }
 
 /// Today's actor: the record is written under the run's steer inbox lock and synced.
 struct TodaySink {
     inbox: Arc<SteerInbox>,
     writer: Arc<WalHandle>,
+    stop: CancellationToken,
 }
 
 #[async_trait]
@@ -1068,12 +1077,17 @@ impl SteerSink for TodaySink {
             .await
             .expect("the cancel is durable");
     }
+
+    fn stop(&self) {
+        self.stop.cancel();
+    }
 }
 
 /// The new store's actor: the same steer as the converter writes it, appended before the
 /// loop's next batch.
 struct NewSink {
     injected: Arc<Mutex<Vec<Record>>>,
+    stop: CancellationToken,
 }
 
 #[async_trait]
@@ -1105,6 +1119,10 @@ impl SteerSink for NewSink {
             },
         ));
     }
+
+    fn stop(&self) {
+        self.stop.cancel();
+    }
 }
 
 /// A scripted provider that steers messages in while answering given calls.
@@ -1130,6 +1148,7 @@ impl Provider for SteeringProvider {
             match action {
                 Action::Steer(messages) => self.sink.steer(steered(call, index, messages)).await,
                 Action::CancelAtBoundary => self.sink.cancel_at_boundary().await,
+                Action::Stop => self.sink.stop(),
             }
         }
         self.inner.step(step_id, opts).await
@@ -1155,6 +1174,17 @@ fn steered(call: usize, index: usize, messages: Vec<Message>) -> WalRecord {
 /// Runs `scenario` once through each loop, steering `steers` in while the provider answers,
 /// and compares everything both did.
 async fn compare_steered(scenario: Scenario, steers: Vec<(usize, Action)>) {
+    compare_actions(scenario, steers, None).await;
+}
+
+/// Like `compare_steered`, with the run's restart policy set to `on_restart`. A run that pauses
+/// for a restart is resumed once, as the runner does after it starts again, and both loops'
+/// reports for each run are compared too.
+async fn compare_actions(
+    scenario: Scenario,
+    steers: Vec<(usize, Action)>,
+    on_restart: Option<OnRestart>,
+) {
     // Today's loop, on a writer this test owns so its actor side can write steers.
     let dir = broca_test_support::scratch_root().join(format!(
         "session-loop-differential-{}-{}",
@@ -1164,9 +1194,11 @@ async fn compare_steered(scenario: Scenario, steers: Vec<(usize, Action)>) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let wal = FileWalStore::new(dir.join("wal"));
-    let request = scenario.request();
+    let mut request = scenario.request();
+    request.on_restart = on_restart;
     let writer = Arc::new(WalHandle::spawn(wal.open(&request.session).unwrap(), 1).unwrap());
     let inbox = SteerInbox::new();
+    let stop = CancellationToken::new();
     let provider = SteeringProvider {
         inner: ScriptedProvider::new(scenario.steps.clone()),
         calls: Default::default(),
@@ -1174,6 +1206,7 @@ async fn compare_steered(scenario: Scenario, steers: Vec<(usize, Action)>) {
         sink: Arc::new(TodaySink {
             inbox: Arc::clone(&inbox),
             writer: Arc::clone(&writer),
+            stop: stop.clone(),
         }),
     };
     let plane = scenario.plane();
@@ -1181,10 +1214,11 @@ async fn compare_steered(scenario: Scenario, steers: Vec<(usize, Action)>) {
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let control = RunControl {
         steer: Some(Arc::clone(&inbox)),
+        stop_requested: Some(stop),
         ..Default::default()
     };
-    run_loop_on_writer(
-        request,
+    let first = run_loop_on_writer(
+        request.clone(),
         &writer,
         StartMode::FreshOrResume,
         &provider,
@@ -1197,6 +1231,25 @@ async fn compare_steered(scenario: Scenario, steers: Vec<(usize, Action)>) {
     )
     .await
     .expect("today's loop runs");
+    let mut summaries = vec![(first.reason, first.paused)];
+    if first.paused.is_some() {
+        // The runner started again: the paused run resumes as the same run.
+        let second = run_loop_on_writer(
+            request,
+            &writer,
+            StartMode::FreshOrResume,
+            &provider,
+            &plane,
+            &AllowAll,
+            &wal,
+            None,
+            RunControl::default(),
+            &tx,
+        )
+        .await
+        .expect("today's loop resumes");
+        summaries.push((second.reason, second.paused));
+    }
     drop(tx);
     drain.await.unwrap();
     // The provider's sink holds the writer too; keep only what the comparison reads.
@@ -1243,12 +1296,14 @@ async fn compare_steered(scenario: Scenario, steers: Vec<(usize, Action)>) {
     .await
     .unwrap();
     let injected: Arc<Mutex<Vec<Record>>> = Default::default();
+    let stop = CancellationToken::new();
     let provider = SteeringProvider {
         inner: ScriptedProvider::new(scenario.steps.clone()),
         calls: Default::default(),
         steers: Mutex::new(steers),
         sink: Arc::new(NewSink {
             injected: Arc::clone(&injected),
+            stop: stop.clone(),
         }),
     };
     let plane = scenario.plane();
@@ -1266,17 +1321,27 @@ async fn compare_steered(scenario: Scenario, steers: Vec<(usize, Action)>) {
         bind: bind.clone(),
         out: None,
         cancel: Default::default(),
+        stop: stop.clone(),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
-    run(
-        &mut writer,
-        &mut parts,
-        scenario.admission(&provider.inner),
-        &seams,
-    )
-    .await
-    .expect("the new loop runs");
+    let mut admission = scenario.admission(&provider.inner);
+    admission.on_restart = on_restart;
+    let first = run(&mut writer, &mut parts, admission, &seams)
+        .await
+        .expect("the new loop runs");
+    let mut reports = vec![(first.reason, first.paused)];
+    if first.paused.is_some() {
+        let restarted = Seams {
+            stop: Default::default(),
+            ..seams
+        };
+        let second = resume(&mut writer, &parts, &restarted)
+            .await
+            .expect("the new loop resumes");
+        reports.push((second.reason, second.paused));
+    }
+    assert_eq!(reports, summaries, "how each run reported");
     let new = Outcome {
         records: normalized(&writer.records),
         requests: sent_requests(&provider.inner),
@@ -1531,6 +1596,7 @@ async fn compare_auth_pause(scenario: Scenario) {
         bind: bind.clone(),
         out: None,
         cancel: Default::default(),
+        stop: Default::default(),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -1589,5 +1655,82 @@ async fn a_failed_sign_in_after_a_tool_step_resumes_with_its_results() {
             text_step("a2", "done"),
         ],
     })
+    .await;
+}
+
+#[tokio::test]
+async fn a_stop_before_a_batch_refuses_it_and_ends_the_run() {
+    compare_actions(
+        Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "never asked for"),
+            ],
+        },
+        vec![(1, Action::Steer(vec![user("also b")])), (1, Action::Stop)],
+        Some(OnRestart::Resume),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_stop_at_a_boundary_pauses_and_the_resume_places_the_steer() {
+    compare_actions(
+        Scenario {
+            input: vec![user("hello")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![text_step("a1", "hi"), text_step("a2", "and again")],
+        },
+        vec![
+            (1, Action::Steer(vec![user("one more")])),
+            (1, Action::Stop),
+        ],
+        Some(OnRestart::Resume),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_stop_at_a_boundary_without_a_resume_policy_ends_the_run() {
+    compare_actions(
+        Scenario {
+            input: vec![user("hello")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![text_step("a1", "hi"), text_step("a2", "never asked for")],
+        },
+        vec![
+            (1, Action::Steer(vec![user("one more")])),
+            (1, Action::Stop),
+        ],
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_cancel_wins_over_a_stop_at_a_boundary() {
+    compare_actions(
+        Scenario {
+            input: vec![user("hello")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![text_step("a1", "hi"), text_step("a2", "never asked for")],
+        },
+        vec![
+            (1, Action::Steer(vec![user("one more")])),
+            (1, Action::Stop),
+            (1, Action::CancelAtBoundary),
+        ],
+        Some(OnRestart::Resume),
+    )
     .await;
 }
