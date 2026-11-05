@@ -17,6 +17,8 @@
 //! shape, kept separate so the wire contract and the internal command enums can evolve
 //! independently.
 
+pub mod admission_refusal;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 

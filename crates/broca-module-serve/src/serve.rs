@@ -4882,17 +4882,8 @@ fn log_refused_send(
 }
 
 fn upload_error_body(error: &broca_core::media_uploads::UploadError, for_send: bool) -> ErrorBody {
-    let mut detail = serde_json::json!({});
-    if let Some(field) = error.field {
-        detail["field"] = field.into();
-    }
-    if let Some(received) = error.received {
-        detail["received"] = received.into();
-    }
-    if for_send || error.error_class() == broca_protocol::ErrorClass::Transient {
-        detail["class"] = shared_class_name(error.error_class()).into();
-    }
-    ErrorBody::new(error.code, error.to_string()).with_detail(detail)
+    let body = broca_module::serve::admission_refusal::upload_refusal(error, for_send);
+    ErrorBody::new(body.code, body.message).with_detail(body.detail.expect("upload detail"))
 }
 
 async fn send_serve_error(
@@ -4903,6 +4894,10 @@ async fn send_serve_error(
     corr: u64,
     err: &ServeError,
 ) -> Result<(), ServeIoError> {
+    if let Some(refusal) = broca_module::serve::admission_refusal::admission_refusal(err) {
+        let body = serde_json::to_vec(&refusal).map_err(|error| ServeIoError(error.to_string()))?;
+        return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
+    }
     if let ServeError::ReplyTooLarge(detail) = err {
         #[derive(serde::Serialize)]
         struct ReplyTooLargeErrorBody<'a> {
@@ -4927,10 +4922,20 @@ async fn send_serve_error(
             );
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
-        ServeError::Upload(error) => {
-            let body = upload_error_body(error, false);
-            return send_error_body(writer, ver, channel, epoch, corr, body).await;
-        }
+        ServeError::Upload(_)
+        | ServeError::SessionTooLarge { .. }
+        | ServeError::RetainedSessionTooLarge { .. }
+        | ServeError::Open(_, _)
+        | ServeError::WalNewerWriter { .. }
+        | ServeError::VariantUnsupported(_)
+        | ServeError::ToolAliasInvalid(_)
+        | ServeError::DeliveryRefused { .. }
+        | ServeError::MediaTooLarge(_)
+        | ServeError::SendIdReuse { .. }
+        | ServeError::Transient(_)
+        | ServeError::InvalidParams { .. }
+        | ServeError::AccountSelectionRefused(_)
+        | ServeError::RoutingUnavailable(_) => unreachable!("admission refusal returned above"),
         ServeError::ReplyTooLarge(_) => unreachable!("reply_too_large returned above"),
         ServeError::SessionMoving { cut_id } => {
             let body = ErrorBody::new("session_moving", err.to_string())
@@ -4940,16 +4945,6 @@ async fn send_serve_error(
         ServeError::SessionMoved { holder } => {
             let body = ErrorBody::new("session_moved", err.to_string())
                 .with_detail(serde_json::json!({"holder":holder}));
-            return send_error_body(writer, ver, channel, epoch, corr, body).await;
-        }
-        ServeError::SessionTooLarge { max_bytes } => {
-            let body = ErrorBody::new("session_too_large", err.to_string())
-                .with_detail(serde_json::json!({"class": "permanent", "max_bytes": max_bytes}));
-            return send_error_body(writer, ver, channel, epoch, corr, body).await;
-        }
-        ServeError::RetainedSessionTooLarge { max_bytes } => {
-            let body = ErrorBody::new("retained_session_too_large", err.to_string())
-                .with_detail(serde_json::json!({"class": "permanent", "max_bytes": max_bytes}));
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::HistoryUnreachable { session_ref, .. } => {
@@ -4977,10 +4972,6 @@ async fn send_serve_error(
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::SessionHeld(_) => "session_held",
-        ServeError::Open(_, _) => "open_failed",
-        ServeError::WalNewerWriter { .. } => broca_wire::WAL_NEWER_WRITER,
-        ServeError::VariantUnsupported(_) => "variant_unsupported",
-        ServeError::ToolAliasInvalid(_) => "tool_alias_invalid",
         ServeError::ServiceTierInvalid { .. } => "invalid_params",
         ServeError::SendRetracted { .. } => "send_retracted",
         ServeError::SendEnded {
@@ -4990,21 +4981,6 @@ async fn send_serve_error(
             let reply = broca_wire::ordered_send_ended_reply(submission_id, outcome);
             return send_json_response(writer, ver, channel, epoch, corr, &reply).await;
         }
-        ServeError::DeliveryRefused { code, .. } => {
-            let body = ErrorBody::new(*code, err.to_string())
-                .with_detail(serde_json::json!({"field": "delivery"}));
-            return send_error_body(writer, ver, channel, epoch, corr, body).await;
-        }
-        ServeError::MediaTooLarge(detail) => {
-            let body = ErrorBody::new(
-                cortexkit_role_llm_runner::errors::MEDIA_TOO_LARGE,
-                err.to_string(),
-            )
-            .with_detail(
-                serde_json::to_value(detail).map_err(|error| ServeIoError(error.to_string()))?,
-            );
-            return send_error_body(writer, ver, channel, epoch, corr, body).await;
-        }
         ServeError::TemplatePartGone { slot } => {
             let body = ErrorBody::new(
                 cortexkit_role_llm_runner::errors::TEMPLATE_PART_GONE,
@@ -5013,8 +4989,7 @@ async fn send_serve_error(
             .with_detail(serde_json::json!({ "slot": slot }));
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
-        ServeError::SendIdReuse { .. } => "send_id_reuse",
-        ServeError::Transient(_) | ServeError::TagsAwaitSetup => "transient",
+        ServeError::TagsAwaitSetup => "transient",
         ServeError::ContextCeiling(detail) => {
             let body = ErrorBody::new(
                 cortexkit_role_llm_runner::errors::CONTEXT_CEILING,
@@ -5026,7 +5001,6 @@ async fn send_serve_error(
         ServeError::Import(_) => "import_rejected",
         ServeError::ImportIdReuse => "import_id_reuse",
         ServeError::ImportBusy => "import_busy",
-        ServeError::InvalidParams { .. } => broca_wire::INVALID_PARAMS,
         ServeError::HistoryRewriting => broca_core::served_history::HISTORY_REWRITING,
         ServeError::HistoryChanged => broca_wire::HISTORY_CHANGED,
         ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID,
@@ -5048,29 +5022,6 @@ async fn send_serve_error(
                 .with_detail(serde_json::json!({"provider": provider}));
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
-        ServeError::AccountSelectionRefused(refusal) => {
-            // Sent exactly as the broca-wire type serializes: the bytes its golden files pin.
-            let body = serde_json::to_vec(
-                &broca_wire::AccountSelectionRefused::new(
-                    refusal.routing_code.clone(),
-                    refusal.class,
-                    refusal.retry_after_s,
-                    refusal.decision_id.clone(),
-                )
-                .with_routing_detail(refusal.routing_detail.clone(), refusal.resets_at_ms),
-            )
-            .map_err(|e| ServeIoError(e.to_string()))?;
-            return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
-        }
-        ServeError::RoutingUnavailable(unavailable) => {
-            // Sent exactly as the broca-wire type serializes: the bytes its golden files pin.
-            let body = serde_json::to_vec(&broca_wire::RoutingUnavailable::new(
-                unavailable.reason.as_str(),
-                unavailable.budget_ms,
-            ))
-            .map_err(|e| ServeIoError(e.to_string()))?;
-            return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
-        }
         ServeError::WarmRefused(refusal) => {
             // Sent exactly as the broca-wire type serializes: the bytes its golden files pin.
             let body = serde_json::to_vec(refusal).map_err(|e| ServeIoError(e.to_string()))?;
@@ -5090,42 +5041,8 @@ async fn send_serve_error(
     if matches!(err, ServeError::HistoryRewriting) {
         body = body.with_detail(serde_json::json!({"class":"transient"}));
     }
-    if let ServeError::Open(_, Some(class)) = err {
-        body = body.with_detail(serde_json::json!({"class": class.shared_class()}));
-    }
-    let field = match err {
-        ServeError::InvalidParams { field, .. } => Some(field.clone()),
-        ServeError::SendIdReuse { differing } => send_field_of(differing).map(String::from),
-        _ => None,
-    };
-    if let Some(field) = field {
-        body = body.with_detail(
-            serde_json::to_value(broca_wire::FieldDetail { field })
-                .map_err(|e| ServeIoError(e.to_string()))?,
-        );
-    }
-    if let ServeError::VariantUnsupported(refusal) = err {
-        body = body.with_detail(serde_json::json!({
-            "model": refusal.model,
-            "variant": refusal.variant,
-            "defined": refusal.defined,
-        }));
-    }
-    if let ServeError::ToolAliasInvalid(refusal) = err {
-        body = body.with_detail(serde_json::json!({"tool": refusal.tool, "class": "permanent"}));
-    }
     if let ServeError::ServiceTierInvalid { reason, .. } = err {
         body = body.with_detail(serde_json::json!({"field":"service_tier", "reason":reason}));
-    }
-    if let ServeError::WalNewerWriter { missing, .. } = err {
-        // Serialized from `broca_wire::WalNewerWriterDetail`, whose bytes the golden file
-        // `broca-wire/tests/golden/wal_newer_writer.json` pins, so a change to the detail's
-        // wire shape fails that test instead of reaching callers unannounced.
-        let detail = broca_wire::WalNewerWriterDetail::NewerWriter {
-            missing: missing.clone(),
-        };
-        body = body
-            .with_detail(serde_json::to_value(&detail).map_err(|e| ServeIoError(e.to_string()))?);
     }
     send_error_body(writer, ver, channel, epoch, corr, body).await
 }
@@ -5323,31 +5240,6 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
             })
         }
     }
-}
-
-/// The `session.send` member a send-identity difference is about, as a caller spells it: the
-/// identity compares the converted request, whose `input` is the send's `prompt`, and whose
-/// `policy_allowed` is derived from `tools`. `None` when the difference names no single member.
-fn send_field_of(differing: &str) -> Option<&'static str> {
-    Some(match differing {
-        "input" => "prompt",
-        "policy_allowed" | "tools" => "tools",
-        "delivery" => "delivery",
-        "conversation_key" => "conversation_key",
-        "model" => "model",
-        "variant" => "model.variant",
-        "tool_choice" => "tool_choice",
-        "generation" => "generation",
-        "cache" => "cache",
-        "budget" => "budget",
-        "auth" => "auth",
-        "context_limit" => "context_limit",
-        "service_tier" => "service_tier",
-        "stop_when" => "stop_when",
-        "context_management" => "context_management",
-        "client_message_id" => "client_message_id",
-        _ => return None,
-    })
 }
 
 /// The bind refusal for an unsupported role version or multiple supported roles on one route.
@@ -6129,6 +6021,10 @@ impl std::fmt::Display for ServeIoError {
 }
 
 impl std::error::Error for ServeIoError {}
+
+#[cfg(test)]
+#[path = "queued_admission_tests.rs"]
+mod queued_admission_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1759,7 +1759,7 @@ async fn reopened_actor_resolves_permanent_queue_failure_and_serves_commands() {
                         }
                         ControlUnit::Error { error } if saw_failed_start => {
                             saw_failed_error =
-                                error.provider_code.as_deref() == Some("queued_admission_failed");
+                                error.provider_code.as_deref() == Some("open_failed");
                         }
                         ControlUnit::RunFinished {
                             reason: broca_protocol::caller::RunFinishReason::Error,
@@ -1898,17 +1898,17 @@ async fn permanent_poison_head_is_consumed_before_younger_queue_work() {
 }
 
 #[tokio::test]
-async fn transient_queued_admission_retries_without_consuming_the_head() {
+async fn transient_queued_admission_ends_failed_before_younger_work() {
     let exec = FakeExecutor::scripted(vec![
         RunScript::AdmissionTransient,
         RunScript::FreshCompleted,
     ]);
     let rig = Rig::new("reopen-transient-queue", exec.clone(), LONG_TTL);
     let key = rig.key("s1");
-    seed_completed_run_with_queue(&rig, &key, &["b"]);
+    seed_completed_run_with_queue(&rig, &key, &["b", "c"]);
 
     broca_test_support::event_timeout(
-        "transient_queued_admission_retries_without_consuming_the_head",
+        "transient_queued_admission_ends_failed_before_younger_work",
         async {
             rig.registry.actor_for(&key).await?;
             rig.registry.route_status(&key).await
@@ -1922,9 +1922,10 @@ async fn transient_queued_admission_retries_without_consuming_the_head() {
         },
     )
     .await
-    .expect("transient startup retry must recover")
+    .expect("a refused admission must not hold startup recovery")
     .unwrap();
-    wait_for_resolved_state(&rig, &key, "b", RunIndexState::Completed).await;
+    wait_for_resolved_state(&rig, &key, "b", RunIndexState::Error).await;
+    wait_for_resolved_state(&rig, &key, "c", RunIndexState::Completed).await;
 
     let store = broca_core::FileWalStore::new(rig.dir.join("wal"));
     let records: Vec<_> = store
@@ -1933,26 +1934,83 @@ async fn transient_queued_admission_retries_without_consuming_the_head() {
         .into_iter()
         .map(|record| record.record)
         .collect();
-    assert!(!records.iter().any(|record| {
-        matches!(
-            record,
-            broca_wal::WalRecord::Retracted {
-                failure: Some(_),
-                ..
-            }
-        )
+    assert!(records.iter().any(|record| {
+        matches!(record, broca_wal::WalRecord::Retracted { failure: Some(failure), .. }
+            if failure.run_id.0 == "b"
+                && failure.error.class == broca_protocol::ErrorClass::Transient
+                && failure.error.provider_code.as_deref() == Some("transient"))
     }));
     assert!(records.iter().any(|record| {
-        matches!(
-            record,
-            broca_wal::WalRecord::RunStarted {
-                run_id,
-                submission_id: Some(submission_id),
-                ..
-            } if run_id.0 == "b" && submission_id.0 == "sub-b"
-        )
+        matches!(record, broca_wal::WalRecord::RunStarted {
+            run_id, submission_id: Some(submission_id), ..
+        } if run_id.0 == "c" && submission_id.0 == "sub-c")
     }));
-    assert_eq!(exec.started_count(), 2, "one retry, then one admission");
+    assert_eq!(
+        exec.started_count(),
+        2,
+        "one refusal, then the younger admission"
+    );
+}
+
+#[tokio::test]
+async fn live_routing_refusal_ends_failed_and_drains_the_send_behind_it() {
+    let (exec, gate) = FakeExecutor::scripted_gated(vec![
+        RunScript::FreshCompletedAfterGate,
+        RunScript::AdmissionRoutingUnavailable,
+        RunScript::FreshCompleted,
+    ]);
+    let rig = Rig::new("live-routing-refusal", exec.clone(), LONG_TTL);
+    let key = rig.key("s1");
+    rig.registry
+        .route_send(&key, req(&key, "a"), RunKind::FreshOrResume)
+        .await
+        .unwrap();
+    for run in ["b", "c"] {
+        assert!(matches!(
+            rig.registry
+                .route_send(&key, req(&key, run), RunKind::FreshOrResume)
+                .await
+                .unwrap(),
+            SendOutcome::Pending { .. }
+        ));
+    }
+    gate.release().await;
+    wait_for_resolved_state(&rig, &key, "b", RunIndexState::Error).await;
+    wait_for_resolved_state(&rig, &key, "c", RunIndexState::Completed).await;
+    let store = broca_core::FileWalStore::new(rig.dir.join("wal"));
+    let records = store.read_records(&key).unwrap();
+    let failed_at = records
+        .iter()
+        .position(|frame| {
+            matches!(
+                &frame.record, broca_wal::WalRecord::Retracted { failure: Some(failure), .. }
+                if failure.run_id.0 == "b"
+                    && failure.error.class == broca_protocol::ErrorClass::Transient
+                    && failure.error.provider_code.as_deref() == Some("routing_unavailable")
+            )
+        })
+        .expect("routing refusal has a durable transient terminal");
+    let started_at = records
+        .iter()
+        .position(|frame| {
+            matches!(
+                &frame.record, broca_wal::WalRecord::RunStarted { run_id, .. } if run_id.0 == "c"
+            )
+        })
+        .expect("younger queued send starts without a further send");
+    assert!(failed_at < started_at);
+    assert!(matches!(
+        rig.registry
+            .route_send(&key, req(&key, "b"), RunKind::FreshOrResume)
+            .await
+            .unwrap(),
+        SendOutcome::Finished {
+            reason: broca_protocol::caller::RunFinishReason::Error,
+            ..
+        }
+    ));
+    assert_eq!(exec.started_count(), 3, "no refusal retry");
+    assert!(rig.registry.stop_and_seal().await);
 }
 
 #[tokio::test]
