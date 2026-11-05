@@ -204,8 +204,9 @@ const NOT_RUN_INTERRUPTED: &str =
     "tool not run: the run was interrupted before this call was dispatched";
 
 /// Ends a run a crash left with calls that may have run: every call of the open batch gets a
-/// result (unknown outcome if it was sent, not run if it wasn't), and the batch and the run's
-/// end are durable together. No call is sent.
+/// result (unknown outcome if it was sent, not run if it wasn't, the provider-held close result
+/// if a provider holds it), and the batch and the run's end are durable together. No call is
+/// sent. Each provider still holding a call is asked to withdraw it once the end is durable.
 async fn close_interrupted<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
@@ -213,6 +214,7 @@ async fn close_interrupted<W: Writer, P, T>(
 ) -> Result<Finished, LoopError> {
     let now = (seams.now_ms)();
     let mut records = Vec::new();
+    let mut withdrawn = Vec::new();
     if let Some(batch) = run_state(writer).open_batch.as_ref() {
         // The calls still waiting for a result, in the order the model asked for them. With
         // every call answered the turn is no longer open, and only the batch needs closing.
@@ -221,20 +223,48 @@ async fn close_interrupted<W: Writer, P, T>(
             let broca_protocol::content::ContentBlock::ToolCall(call) = block else {
                 continue;
             };
-            let (message, outcome) = match batch.state_of(&call.tool_call_id) {
-                Some(CallState::Dispatched) => (OUTCOME_UNKNOWN, CallOutcome::Unknown),
-                Some(CallState::NotSent) => (NOT_RUN_INTERRUPTED, CallOutcome::Interrupted),
-                Some(CallState::Terminated) | None => continue,
-                Some(CallState::ProviderHeld | CallState::HeldSuccessor) => {
-                    return Err(LoopError::Unsupported("calls a provider holds"))
+            let id = &call.tool_call_id;
+            let (result, outcome, reason) = match batch.state_of(id) {
+                Some(CallState::Dispatched) => (
+                    error_result(id, OUTCOME_UNKNOWN),
+                    CallOutcome::Unknown,
+                    None,
+                ),
+                Some(CallState::NotSent | CallState::HeldSuccessor) => (
+                    error_result(id, NOT_RUN_INTERRUPTED),
+                    CallOutcome::Interrupted,
+                    None,
+                ),
+                Some(CallState::ProviderHeld) => {
+                    let (result, _, code) = broca_core::resume::provider_held_close_result(
+                        id,
+                        RunFinishReason::Interrupted,
+                    );
+                    let position = (0..batch.calls.len())
+                        .find(|position| batch.id(*position) == id)
+                        .expect("a held call is planned");
+                    if let Some(held) = batch.held_reply(position) {
+                        withdrawn.push(ProviderHeldReply {
+                            tool_call_id: held.tool_call_id.clone(),
+                            call_key: held.call_key.clone(),
+                            module: held.module.clone(),
+                            reason: held.reason.clone(),
+                            detail_digest: held.detail_digest.clone(),
+                        });
+                    }
+                    (result, CallOutcome::Interrupted, Some(code.to_string()))
                 }
+                Some(CallState::Terminated) | None => continue,
             };
-            let result = ToolResult {
-                tool_call_id: call.tool_call_id.clone(),
-                output: ToolOutput::error(message.to_string()),
-                is_error: true,
-            };
-            terminal(&mut records, run_id, &batch.batch_id, result, outcome, now);
+            terminal_with_reason(
+                &mut records,
+                run_id,
+                &batch.batch_id,
+                result,
+                outcome,
+                reason,
+                now,
+            );
         }
         records.push(Record::BatchEnd(BatchEnd {
             run_id: run_id.into(),
@@ -243,7 +273,17 @@ async fn close_interrupted<W: Writer, P, T>(
     }
     records.push(run_end(writer, run_id, RunFinishReason::Interrupted, now));
     append_end(writer, run_id, records).await?;
+    withdraw(seams, &withdrawn).await;
     Ok(finished(writer, RunFinishReason::Interrupted))
+}
+
+/// An error result for call `id` saying `message`.
+fn error_result(id: &ToolCallId, message: &str) -> ToolResult {
+    ToolResult {
+        tool_call_id: id.clone(),
+        output: ToolOutput::error(message.to_string()),
+        is_error: true,
+    }
 }
 
 /// The calls of the run's open tool turn that were never sent: all of them when the step's

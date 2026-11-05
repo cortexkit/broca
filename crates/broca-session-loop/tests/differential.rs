@@ -20,8 +20,9 @@ use broca_core::tool_plane::{
     ProviderHeldReply, ToolOpenGuard, ToolPlane, ToolPlaneError,
 };
 use broca_core::{
-    provider::Provider, run_loop, run_loop_on_writer, AllowAll, FileLeaseStore, FileWalStore,
-    RunControl, RunRequest, StartMode, SteerInbox, StubReply, StubToolPlane, WalHandle, WalStore,
+    provider::Provider, run_loop, run_loop_on_writer, run_loop_with_control, AllowAll,
+    FileLeaseStore, FileWalStore, RunControl, RunRequest, StartMode, SteerInbox, StubReply,
+    StubToolPlane, WalHandle, WalStore,
 };
 use broca_crash_harness::wal::LogImage;
 use broca_protocol::caller::PauseReason;
@@ -208,6 +209,10 @@ impl ProviderHeldLifecycle for HeldScript {
             .lock()
             .unwrap()
             .push(format!("held_wait {}", call.tool_call_id.0));
+        // `hold_brief`'s provider answers promptly, also when a resumed run waits for it again.
+        if call.tool_name == "hold_brief" && self.deposited(&call.tool_call_id).is_none() {
+            self.deposit(&call.tool_call_id);
+        }
         match self.deposited(&call.tool_call_id) {
             Some(result) => DispatchResult::Completed(result),
             None => std::future::pending().await,
@@ -568,13 +573,18 @@ async fn today_from(
     let wal = FileWalStore::new(dir.join("wal"));
     let (tx, mut rx) = mpsc::channel(512);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    run_loop(
+    run_loop_with_control(
         scenario.request(),
         &provider,
         &plane,
         &lease,
         &AllowAll,
         &wal,
+        None,
+        RunControl {
+            provider_held_lifecycle: Some(plane.lifecycle()),
+            ..Default::default()
+        },
         &tx,
     )
     .await
@@ -731,6 +741,7 @@ async fn new_from(
     };
     let provider = ScriptedProvider::new(steps);
     let plane = scenario.plane();
+    let lifecycle = plane.lifecycle();
     let mut writer = Recording {
         session: &mut session,
         records: Vec::new(),
@@ -745,7 +756,7 @@ async fn new_from(
         out: None,
         cancel: Default::default(),
         stop: Default::default(),
-        held: None,
+        held: Some(&*lifecycle),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -807,7 +818,8 @@ fn normalized(records: &[Record]) -> Vec<Value> {
 }
 
 /// Every call the new loop sent carried a key that finds, through the session's own id lookup,
-/// exactly one intent, that call's, and names the intent's position: `<session id>:<seq>`.
+/// exactly one intent, that call's. A key the new loop minted names the intent's position:
+/// `<session id>:<seq>`.
 async fn keys_match(session: &Session<'_, MemoryBackend>, plane: &Spy) {
     let id = broca_session_store::codec::hex(&session.head().session_id.0);
     for (call, key) in plane.keys() {
@@ -828,7 +840,11 @@ async fn keys_match(session: &Session<'_, MemoryBackend>, plane: &Spy) {
             panic!("key {key} of call {} finds {found:?}", call.0);
         };
         assert_eq!(intent.tool_call_id, call, "key {key} names another call");
-        assert_eq!(key, format!("{id}:{seq}"), "key of call {}", call.0);
+        // A converted intent keeps the key today's runner sent, made from today's log; only a
+        // key the new loop minted names the new log's position.
+        if intent.key_derived != Some(true) {
+            assert_eq!(key, format!("{id}:{seq}"), "key of call {}", call.0);
+        }
     }
 }
 
@@ -2545,5 +2561,53 @@ async fn a_cancel_while_a_provider_holds_a_call_closes_it_and_withdraws_after_th
         },
         Vec::new(),
     )
+    .await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_held_call_resumes_alike() {
+    compare_every_cut(Scenario {
+        input: vec![user("run both")],
+        tools: vec![
+            tool("hold_brief", ExecutionMode::Parallel),
+            tool("read", ExecutionMode::Parallel),
+        ],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "hold_brief", json!({"job": 1})),
+                    call("c2", "read", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_sequential_held_call_resumes_alike() {
+    compare_every_cut(Scenario {
+        input: vec![user("run in order")],
+        tools: vec![
+            tool("hold_brief", ExecutionMode::Sequential),
+            tool("read", ExecutionMode::Sequential),
+        ],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "hold_brief", json!({"job": 1})),
+                    call("c2", "read", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    })
     .await;
 }
