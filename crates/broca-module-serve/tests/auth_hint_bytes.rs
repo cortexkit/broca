@@ -52,6 +52,8 @@ fn pin_values() -> [(&'static str, Vec<u8>, &'static str); 4] {
     };
     let account_for = broca_module_serve::account_routing::account_for_params(
         &broca_module_serve::account_routing::AccountForRequest {
+            pool: None,
+            credential_id: None,
             decision_id: None,
             service_tier: None,
             provider: "anthropic",

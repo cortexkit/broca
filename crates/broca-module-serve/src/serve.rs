@@ -3078,6 +3078,22 @@ where
                     .await;
                 }
             };
+            if params
+                .auth
+                .as_ref()
+                .is_some_and(crate::wire::auth_pin_hint_conflict)
+            {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("auth.account".into()),
+                    crate::wire::AUTH_PIN_HINT_CONFLICT,
+                )
+                .await;
+            }
             if params.template.is_some()
                 && (req.params.get("prompt").is_some() || req.params.get("prompt_blocks").is_some())
             {

@@ -9,7 +9,7 @@ struct TierServeRig {
     wal: Arc<FileWalStore>,
     session: BindIdentity,
     corr: u64,
-    subc: tokio::task::JoinHandle<()>,
+    subc: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TierServeRig {
@@ -22,12 +22,22 @@ impl TierServeRig {
         url: &str,
         plane: Option<Arc<TierCompaction>>,
     ) -> Self {
+        let (live, subc) = stand_in_executor(root).await;
+        Self::start_with_executor(root, Some(url), plane, live, Some(subc)).await
+    }
+
+    async fn start_with_executor(
+        root: &std::path::Path,
+        url: Option<&str>,
+        plane: Option<Arc<TierCompaction>>,
+        mut live: LiveLoopExecutor,
+        subc: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
         use broca_module::{DefaultOpener, LineageRegistry};
         use subc_protocol::{
             Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTOCOL_VERSION,
         };
-        let (mut live, subc) = stand_in_executor(root).await;
-        live.provider_base_url = Some(url.to_owned());
+        live.provider_base_url = url.map(str::to_owned);
         let wal = live.wal_store.clone();
         let store = live.session_store.clone().expect("legacy fixture materializer");
         broca_store::session_refs::migrate(
@@ -224,8 +234,10 @@ impl TierServeRig {
         drop(self.writer);
         drop(self.reader);
         self.serve.await.unwrap();
-        self.subc.abort();
-        let _ = self.subc.await;
+        if let Some(subc) = self.subc {
+            subc.abort();
+            let _ = subc.await;
+        }
     }
 }
 

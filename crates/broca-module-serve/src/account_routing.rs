@@ -752,6 +752,8 @@ pub fn conversation_key(session: &BindIdentity) -> String {
 pub struct AccountForRequest<'a> {
     pub decision_id: Option<&'a str>,
     pub service_tier: Option<&'a str>,
+    pub pool: Option<&'a str>,
+    pub credential_id: Option<&'a str>,
     pub provider: &'a str,
     pub model: &'a str,
     pub conversation_key: &'a str,
@@ -887,6 +889,12 @@ pub fn account_for_params(request: &AccountForRequest<'_>) -> Value {
     }
     if let Some(tier) = request.service_tier {
         params["service_tier"] = tier.into();
+    }
+    if let Some(pool) = request.pool {
+        params["pool"] = pool.into();
+    }
+    if let Some(credential_id) = request.credential_id {
+        params["requested_account"] = json!({"credential_id":credential_id});
     }
     params
 }
@@ -1091,6 +1099,8 @@ impl AccountChoice {
 pub struct ChoiceInputs<'a> {
     pub decision_id: Option<&'a str>,
     pub service_tier: Option<&'a str>,
+    pub pool: Option<&'a str>,
+    pub credential_id: Option<&'a str>,
     /// Caller affinity for this admission; an explicit key always wins.
     pub conversation_key: Option<&'a str>,
     /// Affinity frozen by the latest episode in the durable admission snapshot.
@@ -1192,7 +1202,18 @@ where
         return Ok(AccountChoice::NotApplicable);
     }
     let admission = admission_id(inputs.run_id);
-    if inputs.caller_named_account && inputs.decision_id.is_none() {
+    let hinted = inputs.pool.is_some() || inputs.credential_id.is_some();
+    if inputs.caller_named_account && hinted {
+        return Err(ChoiceRefusal::Refused(AccountSelectionRefusal {
+            routing_code: "invalid_request".into(),
+            retry_after_s: None,
+            resets_at_ms: None,
+            routing_detail: Some(Box::new(json!({"field":"auth.account"}))),
+            decision_id: None,
+            class: classify_refusal("invalid_request"),
+        }));
+    }
+    if inputs.caller_named_account && inputs.decision_id.is_none() && !hinted {
         client.counters.bump("pinned");
         return Ok(AccountChoice::Static(decision(
             broca_wal::ACCOUNT_DECISION_PINNED,
@@ -1201,7 +1222,7 @@ where
         )));
     }
     let Ok(Some(listing)) = tokio::time::timeout_at(deadline, listing).await else {
-        if inputs.decision_id.is_some() {
+        if inputs.decision_id.is_some() || hinted {
             return Err(ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable()));
         }
         client.counters.bump("candidates_unknown");
@@ -1218,7 +1239,7 @@ where
         )));
     };
     let candidates = Candidates::from_listing(&listing, method, provider);
-    if candidates.distinct_accounts() <= 1 && inputs.decision_id.is_none() {
+    if candidates.distinct_accounts() <= 1 && inputs.decision_id.is_none() && !hinted {
         client.counters.bump("single_candidate");
         return Ok(AccountChoice::Static(decision(
             broca_wal::ACCOUNT_DECISION_SINGLE_CANDIDATE,
@@ -1229,6 +1250,8 @@ where
     let params = account_for_params(&AccountForRequest {
         decision_id: inputs.decision_id,
         service_tier: inputs.service_tier,
+        pool: inputs.pool,
+        credential_id: inputs.credential_id,
         provider,
         model: inputs.model,
         conversation_key: conversation,
@@ -1318,6 +1341,16 @@ where
             )))
         }
         AccountForOutcome::SelectionDisabled { decision_id } => {
+            if hinted {
+                return Err(ChoiceRefusal::Refused(AccountSelectionRefusal {
+                    routing_code: SELECTION_DISABLED.into(),
+                    retry_after_s: None,
+                    resets_at_ms: None,
+                    routing_detail: None,
+                    decision_id,
+                    class: classify_refusal(SELECTION_DISABLED),
+                }));
+            }
             client.counters.bump("disabled");
             tracing::info!(
                 target: "routing",

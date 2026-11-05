@@ -603,8 +603,20 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
 `routed_accounts` capability. These are the subscription sign-ins for which broca chooses
 an account through `route.account_for` and reports its run through `route.account_observe`.
 `apikey` and `antigravity` are not listed: their existing caller/configured credential
-selection is unchanged. A caller-named account, a single candidate, and resumed runs retain
-their existing account-selection rules.
+selection is unchanged. Without new hints, an `auth.account` pin bypasses routing. If broca
+cannot list credentials or finds at most one account, it also uses the configured credential
+without asking routing. Resumed runs retain their frozen choice.
+
+For a listed method, `auth.pool` is sent as `route.account_for.pool`, and optional
+`auth.credential_id` is sent only as `requested_account.credential_id`, a preference the router
+may overrule. Either hint requires routing even with a single candidate. If the vault cannot
+provide its candidate credential list, or routing answers `account_selection_disabled`, broca
+refuses rather than using the configured default credential without honoring the hints.
+Both hints are ignored for unlisted methods before request storage and identity comparison.
+A strict `auth.account` pin cannot be combined with either hint for a listed method:
+`invalid_params` names `auth.account` before storage or any routing request. A pin without
+either hint bypasses routing. Queued requests retain their original hints across
+restart; a resumed run keeps its frozen credential/decision and accepts no fresh auth pin.
 
 Broca sends the effective `service_tier` on `route.account_for` only when the router's
 `role.describe` declares `service_tier`. A tier-aware answer's `service_tier_chosen` must be a

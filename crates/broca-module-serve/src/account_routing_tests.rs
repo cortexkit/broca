@@ -263,6 +263,8 @@ async fn choose(
     choose_account(
         client,
         ChoiceInputs {
+            pool: None,
+            credential_id: None,
             service_tier: None,
             decision_id: None,
             hold_cap: Default::default(),
@@ -381,6 +383,8 @@ fn account_for_hold_cap_params_preserve_legacy_members_and_bound_the_previous_ac
             "{name}"
         );
         let mut params = account_for_params(&AccountForRequest {
+            pool: None,
+            credential_id: None,
             service_tier: None,
             decision_id: None,
             provider: "anthropic",
@@ -415,6 +419,8 @@ async fn account_for_counts_only_sent_unknown_hold_caps_not_real_zero_or_static_
         choose_account(
             &client,
             ChoiceInputs {
+                pool: None,
+                credential_id: None,
                 service_tier: None,
                 decision_id: None,
                 hold_cap: AccountHoldCap {
@@ -535,6 +541,8 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
     let (choice, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
+            pool: None,
+            credential_id: None,
             service_tier: None,
             decision_id: None,
             hold_cap: Default::default(),
@@ -590,6 +598,8 @@ async fn a_slow_listing_shares_the_admission_budget() {
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            pool: None,
+            credential_id: None,
             service_tier: None,
             decision_id: None,
             hold_cap: Default::default(),
@@ -718,6 +728,8 @@ async fn caller_affinity_changes_only_the_conversation_key_in_the_routing_body()
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            pool: None,
+            credential_id: None,
             service_tier: None,
             decision_id: None,
             hold_cap: Default::default(),
@@ -1048,6 +1060,8 @@ async fn refusal_log_names_send_and_routing_decision() {
     let (result, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
+            pool: None,
+            credential_id: None,
             service_tier: None,
             decision_id: None,
             hold_cap: Default::default(),
@@ -1945,6 +1959,8 @@ async fn a_caller_decision_is_forwarded_even_with_a_pin_and_is_not_runner_report
     let choice = choose_account(
         &client,
         ChoiceInputs {
+            pool: None,
+            credential_id: None,
             service_tier: None,
             decision_id: Some("caller-decision"),
             hold_cap: Default::default(),
@@ -1984,6 +2000,8 @@ async fn an_unknown_caller_decision_never_falls_back_to_a_static_account() {
     let result = choose_account(
         &client,
         ChoiceInputs {
+            pool: None,
+            credential_id: None,
             service_tier: None,
             decision_id: Some("expired"),
             hold_cap: Default::default(),
@@ -2005,4 +2023,89 @@ async fn an_unknown_caller_decision_never_falls_back_to_a_static_account() {
         matches!(result, Err(ChoiceRefusal::Refused(refusal)) if refusal.routing_code == "unknown_decision")
     );
     assert_eq!(routing.methods(), vec!["route.account_for"]);
+}
+
+async fn choose_with_auth_hints(
+    client: &RoutingClient,
+    credential: &str,
+    view: Option<Arc<ScopedList>>,
+) -> Result<AccountChoice, ChoiceRefusal> {
+    let credential = CredentialId::parse(credential).unwrap();
+    choose_account(
+        client,
+        ChoiceInputs {
+            decision_id: None,
+            service_tier: None,
+            pool: Some("selected-pool"),
+            credential_id: Some("preferred"),
+            conversation_key: None,
+            inherited_conversation_key: None,
+            static_credential: &credential,
+            caller_named_account: false,
+            model: "fixture",
+            session: &session(),
+            send_id: None,
+            run_id: "run-hints",
+            initial_input_bytes: 1,
+            hold_cap: Default::default(),
+        },
+        async { view },
+        tokio::time::Instant::now() + ADMISSION_BUDGET,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn auth_routing_hints_consult_routing_even_for_one_candidate() {
+    let routing = FakeRouting::choosing("acct-a", "oauth:anthropic");
+    let choice = choose_with_auth_hints(
+        &client(&routing),
+        "oauth:anthropic",
+        Some(listing(vec![anthropic("oauth:anthropic", "acct-a")])),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(choice, AccountChoice::Routed {credential_id, ..} if credential_id == "oauth:anthropic")
+    );
+    let requests = routing.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["params"]["pool"], "selected-pool");
+    assert_eq!(
+        requests[0]["params"]["requested_account"]["credential_id"],
+        "preferred"
+    );
+}
+
+#[tokio::test]
+async fn auth_routing_hints_refuse_an_unknown_candidate_view() {
+    let routing = FakeRouting::choosing("acct-a", "oauth:anthropic");
+    assert!(matches!(
+        choose_with_auth_hints(&client(&routing), "oauth:anthropic", None).await,
+        Err(ChoiceRefusal::Unavailable(_))
+    ));
+    assert!(routing.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn auth_routing_hints_cannot_fall_back_when_selection_is_disabled() {
+    let routing = FakeRouting::refusing(SELECTION_DISABLED, json!({}));
+    assert!(
+        matches!(choose_with_auth_hints(&client(&routing), "oauth:anthropic", Some(two_accounts())).await,
+        Err(ChoiceRefusal::Refused(refusal)) if refusal.routing_code == SELECTION_DISABLED)
+    );
+}
+
+#[tokio::test]
+async fn auth_routing_hints_are_ignored_for_unlisted_methods() {
+    for method in ["apikey:anthropic", "antigravity:google"] {
+        let routing = FakeRouting::choosing("acct-a", "oauth:anthropic");
+        assert_eq!(
+            choose_with_auth_hints(&client(&routing), method, None)
+                .await
+                .unwrap(),
+            AccountChoice::NotApplicable
+        );
+        assert!(routing.requests.lock().unwrap().is_empty());
+    }
 }

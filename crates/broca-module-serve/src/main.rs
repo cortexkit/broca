@@ -2987,6 +2987,12 @@ mod executor {
         }
     }
 
+    struct EpisodeAccountPreference<'a> {
+        pin: (Option<AuthMethod>, Option<&'a str>),
+        pool: Option<&'a str>,
+        credential_id: Option<&'a str>,
+    }
+
     /// Drives the real agentic loop for each run: resolves the provider from the catalog
     /// (or a base_url override), dispatches tools through the shared `SubcToolPlane`, and
     /// threads the admission ack so the coordinator admits a run only once it's durable.
@@ -3374,7 +3380,7 @@ mod executor {
             &self,
             req: &broca_core::RunRequest,
             fresh_episode: bool,
-            pinned: (Option<AuthMethod>, Option<&str>),
+            preference: EpisodeAccountPreference<'_>,
             conversation: (Option<&str>, Option<&str>),
             hold_cap: broca_module_serve::account_routing::AccountHoldCap,
             service_tier: Option<&str>,
@@ -3385,7 +3391,7 @@ mod executor {
             let (Some(vault), Some(routing)) = (self.vault.as_ref(), self.routing.as_ref()) else {
                 return Ok(AccountChoice::NotApplicable);
             };
-            let (pinned_method, pinned_account) = pinned;
+            let (pinned_method, pinned_account) = preference.pin;
             let (conversation_key, inherited_conversation_key) = conversation;
             let static_credential = broca_module_serve::auth_routing::resolve_credential_id(
                 req.model.provider_module_id.as_str(),
@@ -3404,6 +3410,8 @@ mod executor {
                 broca_module_serve::account_routing::ChoiceInputs {
                     decision_id: req.route_decision_id.as_deref(),
                     service_tier,
+                    pool: preference.pool,
+                    credential_id: preference.credential_id,
                     conversation_key,
                     inherited_conversation_key,
                     static_credential: &static_credential,
@@ -4424,7 +4432,14 @@ mod executor {
                 .choose_account_for_episode(
                     &job.req,
                     fresh_episode,
-                    (pinned_method, pinned_account),
+                    EpisodeAccountPreference {
+                        pin: (pinned_method, pinned_account),
+                        pool: job.auth.as_ref().and_then(|auth| auth.pool.as_deref()),
+                        credential_id: job
+                            .auth
+                            .as_ref()
+                            .and_then(|auth| auth.credential_id.as_deref()),
+                    },
                     (job.conversation_key.as_deref(), inherited_key),
                     broca_module_serve::account_routing::account_hold_cap(
                         self.max_same_account_wait,
@@ -5269,6 +5284,7 @@ mod executor {
         include!("queued_service_tier_tests.rs");
         include!("service_tier_writer_tests.rs");
         include!("step_event_writer_tests.rs");
+        include!("auth_hint_writer_tests.rs");
         include!("vault_request_tests.rs");
         include!("role_plane_tests.rs");
         include!("admission_wal_read_budget_tests.rs");
@@ -5804,6 +5820,8 @@ mod executor {
         fn caller_auth_pin_wins_over_provider_config_at_admission() {
             let methods = load_method_config("caller-pin", r#"{"openai":"oauth"}"#);
             let auth = AuthRequest {
+                pool: None,
+                credential_id: None,
                 method: "apikey".into(),
                 account: None,
             };
@@ -5825,6 +5843,8 @@ mod executor {
         fn caller_auth_account_rides_through_to_credential_id() {
             let methods = load_method_config("caller-account", r#"{"openai":"oauth"}"#);
             let auth = AuthRequest {
+                pool: None,
+                credential_id: None,
                 method: "apikey".into(),
                 account: Some("astro".into()),
             };
@@ -5845,6 +5865,8 @@ mod executor {
         #[test]
         fn caller_auth_pin_is_refused_on_a_genuine_resume() {
             let auth = AuthRequest {
+                pool: None,
+                credential_id: None,
                 method: "apikey".into(),
                 account: None,
             };
@@ -5863,6 +5885,8 @@ mod executor {
         fn caller_auth_pin_is_honoured_for_a_new_episode_with_session_history() {
             let methods = load_method_config("new-episode-pin", r#"{"openai":"oauth"}"#);
             let auth = AuthRequest {
+                pool: None,
+                credential_id: None,
                 method: "apikey".into(),
                 account: Some("astro".into()),
             };
@@ -5884,6 +5908,8 @@ mod executor {
         #[test]
         fn unknown_caller_auth_method_is_a_typed_config_refusal() {
             let auth = AuthRequest {
+                pool: None,
+                credential_id: None,
                 method: "api-key".into(),
                 account: None,
             };

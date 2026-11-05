@@ -1660,7 +1660,7 @@ async fn routed_chatgpt_choice() -> AccountChoice {
         credentials: candidates, grants: 1, grant_tuples: Vec::new(), view: "chatgpt-view".into(),
     });
     let credential = broca_module_serve::CredentialId::parse("chatgpt:openai").unwrap();
-    let choice = choose_account(&client, ChoiceInputs { decision_id: None, service_tier: None,
+    let choice = choose_account(&client, ChoiceInputs { decision_id: None, service_tier: None, pool: None, credential_id: None,
     hold_cap: Default::default(),
     conversation_key: None, inherited_conversation_key: None,
     static_credential: &credential, caller_named_account: false,

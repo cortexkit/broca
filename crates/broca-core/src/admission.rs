@@ -6737,6 +6737,8 @@ mod tests {
 
         let mut pinned = unpinned.clone();
         pinned.auth = Some(broca_protocol::AuthRequest {
+            pool: None,
+            credential_id: None,
             method: "apikey".into(),
             account: Some("astro".into()),
         });
