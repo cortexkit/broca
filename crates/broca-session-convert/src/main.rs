@@ -1571,6 +1571,7 @@ fn run_seal(args: &Args) {
             prefixes: Vec::new(),
             leading: None,
             trailer: None,
+            log_start: None,
             placed_before: Vec::new(),
         };
         report.logs += 1;

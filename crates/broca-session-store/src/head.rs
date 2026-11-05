@@ -128,6 +128,9 @@ crate::message! {
         /// Set by the cold step (see `session::cold`) and cleared when a writer opens the session
         /// again, so a catalog rebuilt from heads knows which sessions are cold.
         17 opt cold_since_ms: u64,
+        /// The setting the session's first log was created with (see `Conversation::new`).
+        /// Absent means false. A damaged checkpoint of that first log is rebuilt from it.
+        18 opt appends_in_conversation: bool,
     }
 }
 

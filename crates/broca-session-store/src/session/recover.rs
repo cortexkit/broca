@@ -30,8 +30,13 @@
 //!    closing records. The damaged bytes are saved for an operator for a week. Then one
 //!    compare-and-swap makes the new log the session's open log.
 //!
-//! Not built yet: rebuilding a damaged checkpoint (recovery refuses as `CheckpointLost`), entry
-//! facts for the records a recovery writes, steers pending inside an interrupted run, withdrawals
+//! **A damaged checkpoint** is rebuilt, not cut: cutting at the log's first batch would cut the
+//! whole log. Every change that creates an open log keeps a copy of that log's checkpoint in the
+//! ledger segment it seals, so the newest ledger segment holds it. A session's first log, which
+//! no ledger segment precedes, started from empty state. With the rebuilt checkpoint, the records
+//! after it chain to its bases, so a damaged checkpoint alone loses nothing.
+//!
+//! Not built yet: entry facts for the records a recovery writes, steers pending inside an interrupted run, withdrawals
 //! owed for provider-held calls, the crash-loop limit, and showing the damage notice at system
 //! authority and keeping it in view until a model step has seen it (the run loop's part).
 
@@ -59,6 +64,8 @@ use crate::record::{
 
 use super::seal::{Created, Sealed, GRACE_MS};
 use super::{chain_base, log_bind, Session, SessionError};
+use crate::directory::{Pages, FANOUT};
+use crate::segment::Segment;
 
 /// How long the damaged bytes a recovery removed are kept for an operator.
 pub const REMOVED_KEEP_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -187,10 +194,31 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 return Err(SessionError::Corrupt { at, durable_bound })
             }
         };
-        let Some(body) = &debris.checkpoint else {
-            return Err(SessionError::CheckpointLost);
+        let (debris, body) = match debris.checkpoint.clone() {
+            Some(body) => (debris, body),
+            None => {
+                let body = rebuild_checkpoint(backend, &addr, &head, &key, &open.change).await?;
+                // Analyse again from the rebuilt checkpoint's chain bases, so a damaged
+                // checkpoint alone reads as losing nothing.
+                let base = chain_base(&body).map_err(SessionError::Fold)?;
+                let verdict = damage::analyse(
+                    &bytes,
+                    &frame_key,
+                    &bind,
+                    open.synced_len,
+                    chain_base,
+                    Some(base),
+                )?;
+                match verdict {
+                    Verdict::Debris(debris) => (debris, body),
+                    Verdict::Corrupt { at, durable_bound } => {
+                        return Err(SessionError::Corrupt { at, durable_bound })
+                    }
+                    Verdict::Opens(_) => return Err(SessionError::CheckpointLost),
+                }
+            }
         };
-        let checkpoint = Checkpoint::decode(body).map_err(SessionError::Checkpoint)?;
+        let checkpoint = Checkpoint::decode(&body).map_err(SessionError::Checkpoint)?;
         let first_damage = debris.at();
 
         // The intent, in the head: nothing writes to the damaged log again.
@@ -472,9 +500,18 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             open_ids: OpenIds::default(),
             window_facts: BTreeMap::new(),
         };
+        let checkpoint_body = Checkpoint {
+            covers_through: intent_seq,
+            next_seq: intent_seq + 1,
+            conversation: checkpoint.conversation.clone(),
+            operational: settled.clone(),
+            transcript_base: checkpoint.transcript_base,
+            ledger_base: Some(intent_seq),
+        }
+        .encode();
         let created = async {
             let ledger_sealed = session
-                .seal_ledger(&name, &ledger, &settled, now_ms)
+                .seal_ledger(&name, &ledger, &settled, &checkpoint_body, now_ms)
                 .await?;
             backend
                 .put_object(&addr, &saved, &bytes[first_damage as usize..], version)
@@ -493,17 +530,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             );
             backend.create_log(&addr, &change, version).await?;
             let mut out = encoder
-                .checkpoint(
-                    &Checkpoint {
-                        covers_through: intent_seq,
-                        next_seq: intent_seq + 1,
-                        conversation: checkpoint.conversation.clone(),
-                        operational: settled.clone(),
-                        transcript_base: checkpoint.transcript_base,
-                        ledger_base: Some(intent_seq),
-                    }
-                    .encode(),
-                )?
+                .checkpoint(&checkpoint_body)?
                 .into_written(&mut encoder);
             let mut conversation = checkpoint.conversation.clone();
             let mut window_facts = BTreeMap::new();
@@ -593,6 +620,56 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         session.commit(change, intent_seq, created, now_ms).await?;
         Ok(Recovery::Recovered(recovered))
     }
+}
+
+/// Rebuilds the checkpoint of open log `log`: the copy in the newest ledger segment, which the
+/// change that created the log sealed, or empty state for the session's first log. Refuses as
+/// `CheckpointLost` when the newest segment belongs to another change or holds no copy.
+async fn rebuild_checkpoint<B: SessionBackend>(
+    backend: &B,
+    addr: &SessionAddr,
+    head: &head::Head,
+    key: &crate::keys::DataKey,
+    log: &Id128,
+) -> Result<Vec<u8>, SessionError> {
+    let frame_key = key.frame_key();
+    let pages = Pages {
+        backend,
+        addr,
+        session: head.session_id,
+        key: &frame_key,
+        fanout: FANOUT,
+    };
+    let newest = pages
+        .find_before(head.ledger_dir.as_ref(), u64::MAX)
+        .await
+        .map_err(SessionError::Directory)?;
+    let Some(entry) = newest else {
+        // The session's first log, which creation started from empty state.
+        return Ok(Checkpoint {
+            covers_through: 0,
+            next_seq: 1,
+            conversation: Conversation::new(head.appends_in_conversation.unwrap_or(false)),
+            operational: Default::default(),
+            transcript_base: None,
+            ledger_base: None,
+        }
+        .encode());
+    };
+    if entry.object != format!("{}/l", hex(&log.0)) {
+        return Err(SessionError::CheckpointLost);
+    }
+    let bytes = backend
+        .get_object(addr, &entry.object)
+        .await?
+        .ok_or(SessionError::CheckpointLost)?;
+    let segment = Segment::open(&bytes, &frame_key, entry.object.as_bytes())
+        .map_err(SessionError::Segment)?;
+    segment
+        .index
+        .log_start
+        .map(|body| body.0)
+        .ok_or(SessionError::CheckpointLost)
 }
 
 /// The closing result of a call whose outcome was lost.

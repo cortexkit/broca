@@ -172,6 +172,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             pending: Vec::new(),
             id_index: None,
             cold_since_ms: None,
+            appends_in_conversation: appends_in_conversation.then_some(true),
         };
         let version = backend
             .write_head(&addr, &head::seal(&head, &key), None, 1)
@@ -269,10 +270,10 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             return Err(SessionError::NeedsRecovery);
         }
         if let Residence::Creating(log) = head.residence {
-            // Creation crashed before its commit, so the session has no records yet. New
-            // sessions keep delivered text apart from tool results.
+            // Creation crashed before its commit, so the session has no records yet.
+            let appends = head.appends_in_conversation.unwrap_or(false);
             let mut session =
-                Self::create_log(backend, addr, head, version, &key, log, false).await?;
+                Self::create_log(backend, addr, head, version, &key, log, appends).await?;
             session.open_writer(&key).await?;
             return Ok(session);
         }

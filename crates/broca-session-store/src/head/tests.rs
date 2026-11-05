@@ -35,6 +35,7 @@ fn head(deployment: &DeploymentKey, key: &DataKey) -> Head {
         pending: Vec::new(),
         id_index: None,
         cold_since_ms: None,
+        appends_in_conversation: None,
     }
 }
 

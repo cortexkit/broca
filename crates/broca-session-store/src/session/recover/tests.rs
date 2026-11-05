@@ -525,3 +525,117 @@ trait Blocking: std::future::Future + Sized {
 }
 
 impl<F: std::future::Future> Blocking for F {}
+
+/// Two finished runs, all synced. `seal` adds a ledger seal after the first, so the open log is
+/// one a change created rather than the session's first.
+fn finished_runs(backend: &MemoryBackend, seal: bool) -> (Vec<String>, Option<RunFinishReason>) {
+    block_on(async {
+        let mut session = Session::create(backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        session.append(&[start("a")], true).await.unwrap();
+        session
+            .append(
+                &[
+                    input("a", "ask a"),
+                    assistant("a", 1, vec![text("answer a")]),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        session.append(&[end("a")], true).await.unwrap();
+        if seal {
+            session.seal(None, 1_000).await.unwrap();
+        }
+        session.append(&[start("b")], true).await.unwrap();
+        session
+            .append(
+                &[
+                    input("b", "ask b"),
+                    assistant("b", 1, vec![text("answer b")]),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        session.append(&[end("b")], true).await.unwrap();
+        (
+            texts(&session.conversation.messages),
+            session.operations.run.as_ref().unwrap().finished,
+        )
+    })
+}
+
+/// A damaged checkpoint is rebuilt, never cut: from empty state for the session's first log, and
+/// from the copy the creating change sealed for a later log. Nothing else was damaged, so the
+/// recovery closes nothing and the session loads with the conversation and run state it had.
+#[test]
+fn a_damaged_checkpoint_is_rebuilt_and_loses_nothing() {
+    for seal in [false, true] {
+        let backend = MemoryBackend::default();
+        let expected = finished_runs(&backend, seal);
+        damage(&backend, 60);
+        assert!(
+            matches!(load(&backend), Err(SessionError::NeedsRecovery)),
+            "seal {seal}"
+        );
+        let Recovery::Recovered(recovered) = recover(&backend, 1_000).unwrap() else {
+            panic!("seal {seal}: nothing recovered");
+        };
+        assert!(!recovered.loss_aware, "seal {seal}");
+        assert!(recovered.interrupted_runs.is_empty(), "seal {seal}");
+        assert_eq!(recovered.history_version, None, "seal {seal}");
+        let session = load(&backend).unwrap();
+        let got = (
+            texts(&session.conversation.messages),
+            session.operations.run.as_ref().unwrap().finished,
+        );
+        assert_eq!(got, expected, "seal {seal}");
+        assert!(!session.operations.unattributed_risk, "seal {seal}");
+    }
+}
+
+/// A ledger segment whose copy names another log can't stand in for this log's checkpoint:
+/// recovery refuses and writes nothing.
+#[test]
+fn a_damaged_checkpoint_without_its_copy_refuses() {
+    let backend = MemoryBackend::default();
+    finished_runs(&backend, true);
+    // Seal again: the newest ledger segment now belongs to the change that created the current
+    // log. Then point the head back at the log the first seal created.
+    let (first_log, logs) = block_on(async {
+        let (stored, _) = backend.read_head(&addr()).await.unwrap().unwrap();
+        let (head, _) = crate::head::open(&stored, &deployment()).unwrap();
+        (head.open_log.unwrap().change, backend.log_names(&addr()))
+    });
+    let mut session = load(&backend).unwrap();
+    block_on(session.seal(None, 2_000)).unwrap();
+    drop(session);
+    block_on(async {
+        let (stored, version) = backend.read_head(&addr()).await.unwrap().unwrap();
+        let (mut head, key) = crate::head::open(&stored, &deployment()).unwrap();
+        let mut open = head.open_log.clone().unwrap();
+        open.change = first_log;
+        let len = backend.log_end(&addr(), &first_log).await.unwrap();
+        open.synced_len = len;
+        head.open_log = Some(open);
+        backend
+            .write_head(
+                &addr(),
+                &crate::head::seal(&head, &key),
+                Some(version),
+                version + 1,
+            )
+            .await
+            .unwrap();
+    });
+    assert!(logs.contains(&first_log));
+    damage(&backend, 60);
+    let objects = backend.object_names(&addr());
+    assert!(matches!(
+        recover(&backend, 3_000),
+        Err(SessionError::CheckpointLost)
+    ));
+    assert_eq!(backend.object_names(&addr()), objects);
+}

@@ -338,9 +338,6 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         settled
             .apply(&reverted)
             .map_err(|e| SessionError::Fold(format!("operations: {e:?}")))?;
-        let ledger_sealed = self.seal_ledger(&name, &ledger, &settled, now_ms).await?;
-        let replaced = ledger_sealed.replaced;
-
         // The transcript: cut the directory at the message if it's sealed; otherwise keep the
         // open log's records before it.
         let pages = Pages {
@@ -391,6 +388,19 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 checkpoint.transcript_base,
             )
         };
+        let checkpoint_body = Checkpoint {
+            covers_through: reverted_seq,
+            next_seq: reverted_seq + 1,
+            conversation: conversation.clone(),
+            operational: settled.clone(),
+            transcript_base: base,
+            ledger_base: Some(reverted_seq),
+        }
+        .encode();
+        let ledger_sealed = self
+            .seal_ledger(&name, &ledger, &settled, &checkpoint_body, now_ms)
+            .await?;
+        let replaced = ledger_sealed.replaced;
 
         let mut encoder = LogEncoder::new(
             key.clone(),
@@ -405,17 +415,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             .create_log(&self.addr, &change, self.version)
             .await?;
         let mut bytes = encoder
-            .checkpoint(
-                &Checkpoint {
-                    covers_through: reverted_seq,
-                    next_seq: reverted_seq + 1,
-                    conversation: conversation.clone(),
-                    operational: settled.clone(),
-                    transcript_base: base,
-                    ledger_base: Some(reverted_seq),
-                }
-                .encode(),
-            )?
+            .checkpoint(&checkpoint_body)?
             .into_written(&mut encoder);
         let mut window_facts = BTreeMap::new();
         let mut kept_records = 0;

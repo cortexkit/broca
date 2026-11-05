@@ -92,6 +92,9 @@ crate::message! {
         2 opt leading: ByteBuf,
         /// A ledger segment's trailing state: the operational state at its last record.
         3 opt trailer: ByteBuf,
+        /// For the ledger segment a change sealed when it created a new open log: that log's
+        /// checkpoint, exactly as written. A damaged checkpoint is rebuilt from it.
+        4 opt log_start: ByteBuf,
     }
 }
 
@@ -132,6 +135,8 @@ pub struct SegmentMeta {
     pub prefixes: Vec<Id128>,
     pub leading: Option<Vec<u8>>,
     pub trailer: Option<Vec<u8>>,
+    /// See [`SegmentIndex::log_start`].
+    pub log_start: Option<Vec<u8>>,
     /// For a transcript segment, one entry per record: how many messages the conversation had
     /// placed before it. Blocks record the ordinal their first message gets from it. Empty when
     /// the caller doesn't track ordinals.
@@ -271,6 +276,7 @@ pub fn build(
         blocks: entries,
         leading: meta.leading.map(ByteBuf),
         trailer: meta.trailer.map(ByteBuf),
+        log_start: meta.log_start.map(ByteBuf),
     }
     .encode();
     let index_offset = out.len() as u64;

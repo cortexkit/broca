@@ -318,6 +318,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                     prefixes: Vec::new(),
                     leading: Some(checkpoint.conversation.encode()),
                     trailer: None,
+                    log_start: None,
                     placed_before,
                 },
             )
@@ -338,19 +339,32 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             replaced.extend(appended.replaced);
             transcript_dir = Some(appended.root);
         }
-        let ledger_sealed = self.seal_ledger(&name, &ledger, &settled, now_ms).await?;
+        // The new open log starts with this checkpoint. The ledger segment keeps a copy, so a
+        // damaged checkpoint can be rebuilt.
+        let transcript_base = transcript
+            .last()
+            .map(|(seq, _)| *seq)
+            .or(checkpoint.transcript_base);
+        let checkpoint_body = Checkpoint {
+            covers_through: intent_seq,
+            next_seq: self.encoder.next_seq(),
+            conversation: at_cut.clone(),
+            operational: settled.clone(),
+            transcript_base,
+            ledger_base: Some(intent_seq),
+        }
+        .encode();
+        let ledger_sealed = self
+            .seal_ledger(&name, &ledger, &settled, &checkpoint_body, now_ms)
+            .await?;
         sealed.ledger_bytes = ledger_sealed.bytes;
         sealed.index_entries = ledger_sealed.index_entries;
         sealed.merged_entries = ledger_sealed.merged_entries;
         sealed.forced_merges = ledger_sealed.forced_merges;
         replaced.extend(ledger_sealed.replaced);
 
-        // The new open log: a checkpoint, then the transcript records that stay open, copied
+        // The new open log: the checkpoint, then the transcript records that stay open, copied
         // batch by batch with their seqs.
-        let transcript_base = transcript
-            .last()
-            .map(|(seq, _)| *seq)
-            .or(checkpoint.transcript_base);
         let mut encoder = LogEncoder::new(
             key.clone(),
             log_bind(&self.head.session_id, &change),
@@ -364,17 +378,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             .create_log(&self.addr, &change, self.version)
             .await?;
         let mut bytes = encoder
-            .checkpoint(
-                &Checkpoint {
-                    covers_through: intent_seq,
-                    next_seq: self.encoder.next_seq(),
-                    conversation: at_cut.clone(),
-                    operational: settled.clone(),
-                    transcript_base,
-                    ledger_base: Some(intent_seq),
-                }
-                .encode(),
-            )?
+            .checkpoint(&checkpoint_body)?
             .into_written(&mut encoder);
         let settled_after = settled;
         let mut conversation = at_cut;
@@ -441,6 +445,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         name: &str,
         ledger: &[(u64, Record)],
         settled: &Operations,
+        log_start: &[u8],
         now_ms: u64,
     ) -> Result<LedgerSealed, SessionError> {
         let key = self.key.frame_key();
@@ -463,6 +468,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 prefixes: Vec::new(),
                 leading: None,
                 trailer: Some(settled.encode()),
+                log_start: Some(log_start.to_vec()),
                 placed_before: Vec::new(),
             },
         )
