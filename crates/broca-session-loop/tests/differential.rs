@@ -328,13 +328,23 @@ impl Writer for Recording<'_, '_> {
     fn session_id(&self) -> String {
         Writer::session_id(&*self.session)
     }
+    async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
+        self.flush().await?;
+        Writer::send_records(&mut *self.session, submission_id).await
+    }
+
     async fn append_with(
         &mut self,
-        build: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations) -> Vec<Record> + Send),
+        build: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations, u64) -> Vec<Record>
+                  + Send),
         barrier: bool,
     ) -> Result<Vec<Record>, SessionError> {
         self.flush().await?;
-        let records = build(&self.session.conversation, &self.session.operations);
+        let records = build(
+            &self.session.conversation,
+            &self.session.operations,
+            self.session.next_seq(),
+        );
         if !records.is_empty() {
             let barrier = barrier || broca_session_loop::writer::ends_run(&records);
             self.append(&records, barrier).await?;
@@ -1036,6 +1046,52 @@ enum Action {
     CancelAtBoundary,
     /// Asks the run to stop, as the runner does when it shuts down.
     Stop,
+    /// Queues a send with a delivery order, as the actor does for a running run: its
+    /// `delivery_ordered` and `queued` records, in today's format.
+    Ordered {
+        send: Box<broca_core::delivery_order::OrderedSend>,
+        records: Box<[WalRecord; 2]>,
+    },
+}
+
+/// A send queued with delivery `modes`, expiring at `expires_at_ms` when given.
+fn ordered(id: &str, modes: &[&str], text: &str, expires_at_ms: Option<u64>) -> Action {
+    let mut order = json!({"modes": modes});
+    if let Some(expires) = expires_at_ms {
+        order["expires_at_ms"] = json!(expires);
+    }
+    let input = vec![user(text)];
+    let send = broca_core::delivery_order::OrderedSend {
+        admitted_at_ms: Some(0),
+        submission_id: broca_protocol::SubmissionId(id.into()),
+        order: serde_json::from_value(order.clone()).unwrap(),
+        principal: None,
+        input: input.clone(),
+    };
+    let records = [
+        serde_json::from_value(json!({
+            "type": "delivery_ordered", "submission_id": id, "order": order,
+        }))
+        .unwrap(),
+        serde_json::from_value(json!({
+            "type": "queued",
+            "submission_id": id,
+            "request": {
+                "model": {"provider_module_id": "stub", "model_id": "m"},
+                "input": input,
+                "policy_allowed": [],
+                "tool_choice": {"type": "auto"},
+                "generation": {},
+                "stop_when": [],
+            },
+            "written_at_ms": 0,
+        }))
+        .unwrap(),
+    ];
+    Action::Ordered {
+        send: Box::new(send),
+        records: Box::new(records),
+    }
 }
 
 /// Where a scripted provider sends what the session actor does while a step is answered.
@@ -1047,6 +1103,8 @@ trait SteerSink: Send + Sync {
     async fn cancel_at_boundary(&self);
     /// Asks the run to stop, as the runner does when it shuts down.
     fn stop(&self);
+    /// Queues an ordered send into the running run, as the actor does.
+    async fn ordered(&self, send: broca_core::delivery_order::OrderedSend, records: [WalRecord; 2]);
 }
 
 /// Today's actor: the record is written under the run's steer inbox lock and synced.
@@ -1080,6 +1138,28 @@ impl SteerSink for TodaySink {
 
     fn stop(&self) {
         self.stop.cancel();
+    }
+
+    async fn ordered(
+        &self,
+        send: broca_core::delivery_order::OrderedSend,
+        records: [WalRecord; 2],
+    ) {
+        let writer = Arc::clone(&self.writer);
+        let accepted = self.inbox.accept_ordered(send, move |superseded| {
+            assert!(superseded.is_none(), "no send is replaced");
+            for record in records {
+                writer.record(record);
+            }
+        });
+        assert!(
+            matches!(
+                accepted,
+                broca_core::steer::OrderedAcceptance::Queued { .. }
+            ),
+            "the running turn takes the send"
+        );
+        self.writer.sync().await.expect("the send is durable");
     }
 }
 
@@ -1123,6 +1203,25 @@ impl SteerSink for NewSink {
     fn stop(&self) {
         self.stop.cancel();
     }
+
+    async fn ordered(
+        &self,
+        _send: broca_core::delivery_order::OrderedSend,
+        records: [WalRecord; 2],
+    ) {
+        let framed: Vec<broca_wal::FramedRecord> = records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| broca_wal::FramedRecord {
+                seq: index as u64 + 1,
+                fence: 0,
+                record,
+            })
+            .collect();
+        let converted =
+            broca_session_convert::convert(&framed, None).expect("the send's records convert");
+        self.injected.lock().unwrap().extend(converted.records);
+    }
 }
 
 /// A scripted provider that steers messages in while answering given calls.
@@ -1149,6 +1248,7 @@ impl Provider for SteeringProvider {
                 Action::Steer(messages) => self.sink.steer(steered(call, index, messages)).await,
                 Action::CancelAtBoundary => self.sink.cancel_at_boundary().await,
                 Action::Stop => self.sink.stop(),
+                Action::Ordered { send, records } => self.sink.ordered(*send, *records).await,
             }
         }
         self.inner.step(step_id, opts).await
@@ -1806,5 +1906,111 @@ async fn a_failed_steps_attempts_are_recorded_before_the_pause() {
             attempted(text_step("a1", "hi"), vec![attempt(1, 200, "complete")]),
         ],
     })
+    .await;
+}
+
+#[tokio::test]
+async fn an_ordered_steer_enters_at_the_next_boundary() {
+    compare_steered(
+        Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        },
+        vec![(
+            1,
+            ordered("q1", &["steer", "idle_start"], "also read b", None),
+        )],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_expired_ordered_send_ends_at_the_boundary() {
+    compare_steered(
+        Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        },
+        vec![(1, ordered("q1", &["steer"], "too late", Some(0)))],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_idle_start_send_waits_for_the_run_to_end() {
+    compare_steered(
+        Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        },
+        vec![(1, ordered("q1", &["idle_start"], "later", None))],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_ordered_steer_during_the_last_answer() {
+    compare_steered(
+        Scenario {
+            input: vec![user("hello")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![text_step("a1", "hi"), text_step("a2", "and again")],
+        },
+        vec![(1, ordered("q1", &["steer"], "one more", None))],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ordered_sends_deliver_in_queue_order_after_steers() {
+    compare_steered(
+        Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        },
+        vec![
+            (1, ordered("q1", &["steer"], "first queued", None)),
+            (1, Action::Steer(vec![user("a plain steer")])),
+            (1, ordered("q2", &["idle_start"], "waits", None)),
+            (1, ordered("q3", &["steer"], "second queued", None)),
+        ],
+    )
     .await;
 }

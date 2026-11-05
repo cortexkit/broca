@@ -14,13 +14,14 @@
 use std::sync::Arc;
 
 use broca_core::capability::ToolManifest;
+use broca_core::delivery_order::{appended_text, choose_mode, Boundary};
 use broca_core::provider::{Provider, StepRuntime};
 use broca_core::run::{limiting_stop_satisfied, stop_satisfied, OutputEvent};
 use broca_core::tags::TagNumbering;
 use broca_core::tool_plane::{BatchCtx, DispatchResult, ToolPlane};
 use broca_protocol::caller::{PauseReason, RunFinishReason};
 use broca_protocol::content::{
-    stamp_ordinals_from, AssistantMessage, Message, ToolCall, ToolOutput, ToolResult,
+    stamp_ordinals_from, AssistantMessage, Message, Role, ToolCall, ToolOutput, ToolResult,
 };
 use broca_protocol::error::ProviderError;
 use broca_protocol::provider::{ModelAttempt, NormalizedEvent, ProviderControl};
@@ -31,12 +32,13 @@ use broca_protocol::request::{
 };
 use broca_protocol::tags::{clean_computed_into, ComputedRules};
 use broca_protocol::{BatchId, BindIdentity, FinishReason, GenerationConfig, RunId, StepId, Usage};
+use broca_protocol::{DeliveryMode, DeliveryOrder};
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::operations::{CallState, Operations, Resolution};
 use broca_session_store::record::{
-    Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, Input, PartKind, Pause, Placement,
-    Record, Redo, Resumed, RunEnd, RunStart, SetupStub, StepEnd, StepStart, ToolIntent,
-    ToolOutcome, ToolReply,
+    Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, Delivery, Input, PartKind, Pause,
+    Placement, Record, Redo, Resumed, RunEnd, RunStart, SendEnded, SetupStub, StepEnd, StepStart,
+    ToolIntent, ToolOutcome, ToolReply,
 };
 use broca_session_store::session::SessionError;
 use broca_wal::ComputedTagRules;
@@ -439,24 +441,81 @@ where
             account_limit: None,
         }));
         let resumes = admission.on_restart == Some(OnRestart::Resume);
+        // Queued sends with a delivery order are read before the batch is built, since their
+        // records may be sealed. One queued after this read waits for the next boundary.
+        let ordered = ordered_sends(writer).await?;
         let boundary = writer
             .append_with(
-                &mut |_, operations| {
+                &mut |_, operations, first_seq| {
                     let run = operations.run.as_ref().expect("a run is active");
                     if !(cancelled_now || run.cancel.is_some()) && stopping && resumes {
                         return restart_pause.take().into_iter().collect();
                     }
-                    let mut batch = placed_copies(operations, &run_id);
                     if cancelled_now || run.cancel.is_some() {
+                        let mut batch = placed_copies(operations, &run_id);
                         batch.extend(cancelled_end.take());
-                    } else if stopping {
+                        return batch;
+                    }
+                    if stopping {
+                        let mut batch = placed_copies(operations, &run_id);
                         batch.extend(stopped_end.take());
-                    } else {
-                        batch.push(Record::StepStart(StepStart {
+                        return batch;
+                    }
+                    // A step starts: ordered sends whose first possible mode here is `steer`
+                    // are delivered, and expired ones end, in queue order. Their records come
+                    // first, then every waiting message's copy (steers before deliveries), then
+                    // the step's start.
+                    let mut batch = Vec::new();
+                    let mut delivered = Vec::new();
+                    for pending in operations.queue.iter().filter(|pending| pending.ordered) {
+                        let Some(send) = ordered.get(&pending.submission_id) else {
+                            continue;
+                        };
+                        if send.order.expired_at(now) {
+                            batch.push(Record::SendEnded(SendEnded {
+                                submission_id: pending.submission_id.clone(),
+                                reason: Some(json!({"kind": "expired"})),
+                            }));
+                            continue;
+                        }
+                        let has_text = appended_text(&send.input).is_some();
+                        if choose_mode(&send.order, Boundary::STEP, has_text)
+                            != Some(DeliveryMode::Steer)
+                        {
+                            continue;
+                        }
+                        let seq = first_seq + batch.len() as u64;
+                        delivered.extend(send.input.iter().map(|message| {
+                            Record::Input(Input {
+                                run_id: run_id.clone(),
+                                placement: Placement::Delivered,
+                                message: message.clone(),
+                                written_at_ms: send.written_at_ms,
+                                submission_id: Some(pending.submission_id.clone()),
+                                notice: None,
+                                tags_v1: None,
+                                receipt_seq: Some(seq),
+                                pruned: Vec::new(),
+                            })
+                        }));
+                        batch.push(Record::Delivery(Delivery {
+                            submission_id: pending.submission_id.clone(),
                             run_id: run_id.clone(),
-                            step_id,
+                            mode: "steer".into(),
+                            input: send.input.clone(),
+                            tool_call_id: None,
+                            appended_text: None,
+                            written_at_ms: send.written_at_ms,
+                            tags_v1: None,
+                            input_listed: Some(true),
                         }));
                     }
+                    batch.extend(placed_copies(operations, &run_id));
+                    batch.extend(delivered);
+                    batch.push(Record::StepStart(StepStart {
+                        run_id: run_id.clone(),
+                        step_id,
+                    }));
                     batch
                 },
                 false,
@@ -557,7 +616,7 @@ where
             let mut end = Some(end);
             let appended = writer
                 .append_with(
-                    &mut |_, operations| {
+                    &mut |_, operations, _| {
                         let run = operations.run.as_ref().expect("a run is active");
                         let extends = run.natural_end.is_some_and(|end| end.extendable)
                             && run.pending_messages() > 0;
@@ -1084,6 +1143,79 @@ async fn stopped_batch<W: Writer, P, T>(
     Ok(finished(writer, RunFinishReason::Interrupted))
 }
 
+/// A queued send with a delivery order, as a boundary delivers it.
+struct OrderedSend {
+    order: DeliveryOrder,
+    /// The user messages a `steer` delivery places: the input after the send's `pre_user`
+    /// hooks, without system messages, as today's queue holds it.
+    input: Vec<Message>,
+    written_at_ms: Option<u64>,
+}
+
+/// The queue's sends that carry a delivery order, read from their records. Only `steer` and
+/// `idle_start` orders are delivered by this loop yet: an order naming `tool_result` or
+/// `turn_system` refuses by name rather than delivering it differently from today.
+async fn ordered_sends<W: Writer>(
+    writer: &mut W,
+) -> Result<std::collections::BTreeMap<String, OrderedSend>, LoopError> {
+    let ids: Vec<String> = writer
+        .operations()
+        .queue
+        .iter()
+        .filter(|pending| pending.ordered)
+        .map(|pending| pending.submission_id.clone())
+        .collect();
+    let mut sends = std::collections::BTreeMap::new();
+    for id in ids {
+        let records = writer.send_records(&id).await?;
+        let order = records.iter().find_map(|record| match record {
+            Record::DeliveryOrdered(ordered) => Some(ordered.order.clone()),
+            _ => None,
+        });
+        let queued = records.iter().find_map(|record| match record {
+            Record::QueuedSend(queued) => Some(queued),
+            _ => None,
+        });
+        let (Some(order), Some(queued)) = (order, queued) else {
+            return Err(LoopError::Parts(format!(
+                "queued send {id} is missing its order or its request"
+            )));
+        };
+        let order: DeliveryOrder =
+            serde_json::from_value(order).map_err(|e| LoopError::Parts(e.to_string()))?;
+        if order
+            .modes
+            .iter()
+            .any(|mode| matches!(mode, DeliveryMode::ToolResult | DeliveryMode::TurnSystem))
+        {
+            return Err(LoopError::Unsupported(
+                "a queued send delivered as a tool result or turn-scoped system message",
+            ));
+        }
+        let hooked = queued
+            .receipt
+            .as_ref()
+            .and_then(|receipt| receipt.get("hooks"))
+            .and_then(|hooks| hooks.get("final_value"))
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Vec<Message>>(value).ok());
+        let input = hooked
+            .unwrap_or_else(|| queued.input.clone())
+            .into_iter()
+            .filter(|message| message.role != Role::System)
+            .collect();
+        sends.insert(
+            id,
+            OrderedSend {
+                order,
+                input,
+                written_at_ms: queued.written_at_ms,
+            },
+        );
+    }
+    Ok(sends)
+}
+
 /// The result a call gets when the run stopped before the call was dispatched.
 const NOT_DISPATCHED: &str =
     "tool not run: the run was interrupted before this call was dispatched";
@@ -1213,7 +1345,7 @@ async fn pause<W: Writer, P, T>(
     let owned_run_id = run_id.to_string();
     let batch = writer
         .append_with(
-            &mut |_, operations| {
+            &mut |_, operations, _| {
                 let run = operations.run.as_ref().expect("a run is active");
                 if cancelled_now || run.cancel.is_some() {
                     let mut batch = placed_copies(operations, &owned_run_id);
@@ -1258,7 +1390,7 @@ async fn append_end<W: Writer>(
     let mut records = Some(records);
     writer
         .append_with(
-            &mut |_, operations| {
+            &mut |_, operations, _| {
                 let mut batch = records.take().expect("one batch");
                 let end = batch.pop().expect("the batch ends with the run's end");
                 batch.extend(placed_copies(operations, &run_id));

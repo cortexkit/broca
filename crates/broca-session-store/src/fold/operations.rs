@@ -477,6 +477,9 @@ crate::message! {
         1 req submission_id: String,
         /// Queued by an interrupting send: it drains ahead of every plain send.
         2 req interrupt: bool,
+        /// Queued with a delivery order (its `DeliveryOrdered` record): a running run may
+        /// deliver it at a boundary, by the first mode in its order possible there.
+        3 req ordered: bool,
     }
 }
 
@@ -554,6 +557,13 @@ state! {
             reset: "run_start",
             bound: Bound::Declared,
         },
+        /// The send a `DeliveryOrdered` record just named. Its `QueuedSend` follows in the same
+        /// batch and takes the mark.
+        11 opt pub ordered_next: String => {
+            owner: "queue",
+            reset: "queued_send",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -579,10 +589,17 @@ impl Operations {
     /// delivery into a running run removes it.
     fn apply_queue(&mut self, record: &Record) {
         let removed = match record {
+            Record::DeliveryOrdered(ordered) => {
+                self.ordered_next = Some(ordered.submission_id.clone());
+                return;
+            }
             Record::QueuedSend(send) => {
+                let ordered =
+                    self.ordered_next.take().as_deref() == Some(send.submission_id.as_str());
                 let pending = Pending {
                     submission_id: send.submission_id.clone(),
                     interrupt: send.delivery.as_deref() == Some("interrupt"),
+                    ordered,
                 };
                 let at = if pending.interrupt {
                     self.queue

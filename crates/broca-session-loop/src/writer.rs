@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::fold::operations::Operations;
+use broca_session_store::idindex::IdKind;
 use broca_session_store::record::Record;
 use broca_session_store::session::{Session, SessionError};
 
@@ -19,15 +20,21 @@ pub trait Writer {
     /// `barrier`, it returns only once the batch is durable.
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError>;
 
+    /// Every ledger record that names the queued send `submission_id`, oldest first, from the
+    /// open log or sealed history: what the loop reads to deliver the send at a boundary.
+    async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError>;
+
     /// Appends the batch `build` makes from the folds as they stand at that moment, and returns
     /// it. A writer shared with other appenders (the session actor appends steers and queued
     /// sends during a run) calls `build` and appends its batch with nothing in between, so the
-    /// batch can't miss a record another appender added. An empty batch appends nothing. A
+    /// batch can't miss a record another appender added. `build` also gets the seq the batch's
+    /// first record will take, so a record in it can name another. An empty batch appends nothing. A
     /// batch that ends or pauses the run is appended with a barrier whatever `barrier` says: a
     /// run's end is durable before anyone learns of it.
     async fn append_with(
         &mut self,
-        build: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations) -> Vec<Record> + Send),
+        build: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations, u64) -> Vec<Record>
+                  + Send),
         barrier: bool,
     ) -> Result<Vec<Record>, SessionError>;
 
@@ -50,12 +57,22 @@ impl<B: SessionBackend> Writer for Session<'_, B> {
         Session::append(self, records, barrier).await
     }
 
+    async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
+        Ok(self
+            .find_id(IdKind::SubmissionId, submission_id)
+            .await?
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect())
+    }
+
     async fn append_with(
         &mut self,
-        build: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations) -> Vec<Record> + Send),
+        build: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations, u64) -> Vec<Record>
+                  + Send),
         barrier: bool,
     ) -> Result<Vec<Record>, SessionError> {
-        let records = build(&self.conversation, &self.operations);
+        let records = build(&self.conversation, &self.operations, self.next_seq());
         if !records.is_empty() {
             let barrier = barrier || ends_run(&records);
             Session::append(self, &records, barrier).await?;
