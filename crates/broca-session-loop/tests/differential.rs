@@ -593,6 +593,7 @@ async fn today_from(
         RunControl {
             provider_held_lifecycle: Some(plane.lifecycle()),
             manifest: scenario.manifest.clone(),
+            hook_plane: Some(harness_hooks()),
             ..Default::default()
         },
         &tx,
@@ -768,6 +769,7 @@ async fn new_from(
         stop: Default::default(),
         held: Some(&*lifecycle),
         approval: &HarnessPolicy,
+        hook_plane: Some(harness_hooks()),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -1390,6 +1392,7 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         stop: Default::default(),
         held: None,
         approval: &HarnessPolicy,
+        hook_plane: Some(harness_hooks()),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -1878,6 +1881,7 @@ async fn compare_actions(
         stop: stop.clone(),
         held: None,
         approval: &HarnessPolicy,
+        hook_plane: Some(harness_hooks()),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -2190,6 +2194,7 @@ async fn compare_auth_pause(scenario: Scenario) {
         stop: Default::default(),
         held: None,
         approval: &HarnessPolicy,
+        hook_plane: Some(harness_hooks()),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
     };
@@ -2938,4 +2943,111 @@ async fn a_run_admitted_with_a_fetch_plan() {
 #[tokio::test]
 async fn every_cut_of_a_run_admitted_with_a_fetch_plan_resumes_alike() {
     compare_every_cut(planned_scenario()).await;
+}
+
+/// The hook provider both loops call, keyed by the tool a call names: the mutate hook rewrites
+/// a `mutated` call's input to `{"path":"mutated"}`, the validate hook denies a `vetoed` call,
+/// the provider is unavailable for a `hook_down` call, and every other call passes.
+struct HarnessHooks;
+
+#[async_trait::async_trait]
+impl broca_core::hooks::HookPlane for HarnessHooks {
+    async fn hook(
+        &self,
+        _provider: &str,
+        _bind: &broca_protocol::BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
+        call: cortexkit_role_step_transform_provider::hook::HookCall,
+    ) -> Result<
+        cortexkit_role_step_transform_provider::answer::HookAnswer,
+        broca_core::hooks::HookUnavailable,
+    > {
+        use cortexkit_role_step_transform_provider::answer::HookAnswer;
+        use cortexkit_role_step_transform_provider::hook::Subject;
+        use cortexkit_role_step_transform_provider::subscription::Phase;
+        let Subject::PreTool { tool, phase, .. } = &call.subject else {
+            return Ok(HookAnswer::Pass);
+        };
+        match (tool.as_str(), phase) {
+            ("hook_down", _) => Err(broca_core::hooks::HookUnavailable),
+            ("mutated", Phase::Mutate) => Ok(HookAnswer::Mutate {
+                input: json!({"path": "mutated"}),
+                note: Some("rewritten by the harness hook".into()),
+            }),
+            ("vetoed", Phase::Validate) => Ok(HookAnswer::Deny {
+                text: "vetoed by the harness hook".into(),
+            }),
+            _ => Ok(HookAnswer::Pass),
+        }
+    }
+}
+
+fn harness_hooks() -> Arc<dyn broca_core::hooks::HookPlane> {
+    Arc::new(HarnessHooks)
+}
+
+/// A planned manifest whose one hook provider subscribes to the pre-tool mutate phase (passing
+/// when unavailable) and validate phase (refusing when unavailable).
+fn hooked_manifest(tools: &[Tool]) -> Arc<broca_wal::PlanManifest> {
+    let subscriptions = json!([
+        {"hook": "pre_tool", "phase": "mutate", "ops": [], "on_unavailable": "pass", "budget_ms": 500},
+        {"hook": "pre_tool", "phase": "validate", "ops": [], "on_unavailable": "refuse", "budget_ms": 500},
+    ]);
+    let mut manifest = (*planned_manifest(tools)).clone();
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+        json!({
+            "tool_items": [{"provider": "provider"}],
+            "step_transform_items": [
+                {"provider": "p0", "preset": "default", "params": {}, "subscriptions": subscriptions}
+            ],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    manifest.declarations = vec![broca_wal::FrozenDeclaration {
+        provider: "p0".into(),
+        answer: broca_wal::OpaqueJson::from_json_text(
+            json!({"subscriptions": subscriptions}).to_string(),
+        )
+        .unwrap(),
+    }];
+    Arc::new(manifest)
+}
+
+fn hooked_scenario() -> Scenario {
+    let tools = vec![
+        tool("read", ExecutionMode::Parallel),
+        tool("mutated", ExecutionMode::Parallel),
+        tool("vetoed", ExecutionMode::Parallel),
+        tool("hook_down", ExecutionMode::Parallel),
+    ];
+    Scenario {
+        input: vec![user("read a")],
+        manifest: Some(hooked_manifest(&tools)),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c2", "mutated", json!({"path": "b"})),
+                    call("c3", "vetoed", json!({"path": "c"})),
+                    call("c4", "hook_down", json!({"path": "d"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn pre_tool_hooks_mutate_deny_and_refuse_when_unavailable() {
+    compare(hooked_scenario()).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_run_with_pre_tool_hooks_resumes_alike() {
+    compare_every_cut(hooked_scenario()).await;
 }

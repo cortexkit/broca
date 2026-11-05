@@ -59,7 +59,8 @@ pub(super) async fn restream_message(
     }
 }
 
-pub(super) fn pre_tool_subject(
+/// The subject a pre-tool hook sees for `call` in `phase`.
+pub fn pre_tool_subject(
     step_id: StepId,
     call: &ToolCall,
     phase: cortexkit_role_step_transform_provider::subscription::Phase,
@@ -81,6 +82,23 @@ pub(super) fn pre_tool_terminal(
     text: &str,
     unavailable: bool,
 ) -> CallPlan {
+    let (result, reason) = pre_tool_refusal(call, provider, text, unavailable);
+    CallPlan::HookTerminal {
+        result: Arc::new(result),
+        reason: reason.into(),
+        hooks: trace.metadata(original.clone(), call.input.clone(), true),
+    }
+}
+
+/// The result a call gets when a pre-tool hook refuses it, and the outcome's reason code. A
+/// provider that denied the call gives the model its own text; one that was unavailable gives
+/// a fixed message naming it.
+pub fn pre_tool_refusal(
+    call: &ToolCall,
+    provider: &str,
+    text: &str,
+    unavailable: bool,
+) -> (ToolResult, &'static str) {
     let reason = if unavailable {
         "pre_tool_unavailable"
     } else {
@@ -91,11 +109,7 @@ pub(super) fn pre_tool_terminal(
     } else {
         text.into()
     };
-    CallPlan::HookTerminal {
-        result: Arc::new(error_result(call, &message)),
-        reason: reason.into(),
-        hooks: trace.metadata(original.clone(), call.input.clone(), true),
-    }
+    (error_result(call, &message), reason)
 }
 
 fn transformed_tool_result(

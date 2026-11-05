@@ -12949,9 +12949,9 @@ mod delivery_order_tests;
 mod display_text;
 #[path = "run/hook_dispatch.rs"]
 mod hook_dispatch;
+pub use hook_dispatch::{pre_tool_refusal, pre_tool_subject};
 use hook_dispatch::{
-    pre_tool_subject, pre_tool_terminal, record_hook_stage, record_model_hook, resolve_hooked,
-    restream_message,
+    pre_tool_terminal, record_hook_stage, record_model_hook, resolve_hooked, restream_message,
 };
 
 #[cfg(test)]

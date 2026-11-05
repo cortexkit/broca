@@ -114,6 +114,9 @@ pub struct Seams<'a, P, T> {
     pub held: Option<&'a dyn ProviderHeldLifecycle>,
     /// Decides each valid call before it is sent: allow it, narrow its input, or deny it.
     pub approval: &'a dyn ApprovalPolicy,
+    /// Calls the hooks a frozen plan declares. A run whose plan declares hooks refuses to start
+    /// or resume without it, as today's loop does.
+    pub hook_plane: Option<Arc<dyn broca_core::hooks::HookPlane>>,
     /// Milliseconds since the epoch, for the times records carry.
     pub now_ms: &'a (dyn Fn() -> u64 + Sync),
     /// The session's address, given to the provider for its diagnostics only.
@@ -565,6 +568,18 @@ where
     let episodes = render_episodes(writer, parts)?;
     let tools = Arc::new(admission.tools.clone());
     let manifest = ToolManifest::from_tools(admission.tools.clone());
+    let hook_plan = hook_plan(admission, seams)?;
+    let hooks = hook_plan
+        .as_ref()
+        .map(|plan| broca_core::hooks::HookRuntime {
+            plan,
+            plane: seams.hook_plane.as_ref().expect("checked with the plan"),
+            bind: &seams.bind,
+            scope: None,
+            cancel: Some(&seams.cancel),
+            stop: Some(&seams.stop),
+            seal: None,
+        });
     let stop_when = if admission.stop_when.is_empty() {
         vec![StopCondition::StepCount {
             n: DEFAULT_MAX_STEPS,
@@ -601,6 +616,7 @@ where
             &unsent,
             &known,
             &manifest,
+            hooks.as_ref(),
             started,
         )
         .await?
@@ -862,6 +878,7 @@ where
             &calls,
             &[],
             &manifest,
+            hooks.as_ref(),
             false,
         )
         .await?
@@ -1212,6 +1229,7 @@ async fn batch<W, P, T>(
     calls: &[ToolCall],
     known: &[Known],
     manifest: &ToolManifest,
+    hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
     started: bool,
 ) -> Result<BatchOutcome, LoopError>
 where
@@ -1255,15 +1273,17 @@ where
         refusal.as_ref(),
         manifest,
         seams.approval,
+        hooks,
+        step_id,
     )
-    .await;
+    .await?;
     let calls = &calls[..];
     let session = writer.session_id();
     let now = (seams.now_ms)();
     let mut prepared = Vec::with_capacity(calls.len());
     for (call, plan) in calls.iter().zip(&plans) {
         let intent = match plan {
-            CallPlan::Dispatch if known_of(call).is_none() => {
+            CallPlan::Dispatch(_) if known_of(call).is_none() => {
                 // Arguments are stored again only when they differ from the input the message
                 // last gave this call id, as today's converted records hold them.
                 let last = planned
@@ -1284,7 +1304,9 @@ where
         };
         prepared.push(intent);
     }
-    let dispatching = plans.iter().any(|plan| matches!(plan, CallPlan::Dispatch));
+    let dispatching = plans
+        .iter()
+        .any(|plan| matches!(plan, CallPlan::Dispatch(_)));
     let written = writer
         .append_with(
             &mut |_, _, first_seq| {
@@ -1302,7 +1324,10 @@ where
                 }
                 for ((call, plan), intent) in calls.iter().zip(&plans).zip(&prepared) {
                     match (plan, intent) {
-                        (CallPlan::Dispatch, Some((digest, args, module_id, schema_pin))) => {
+                        (
+                            CallPlan::Dispatch(hooks),
+                            Some((digest, args, module_id, schema_pin)),
+                        ) => {
                             // The key names the intent record itself, so it never repeats in
                             // this session and a late result or withdrawal finds exactly this
                             // call.
@@ -1321,20 +1346,37 @@ where
                                 schema_pin: schema_pin.as_ref().map(|pin| {
                                     serde_json::to_value(pin).expect("a pin serializes")
                                 }),
-                                hooks: None,
+                                hooks: hooks.clone(),
                                 key_derived: None,
                             }));
                         }
-                        (CallPlan::NoDispatch(reason), _) => {
+                        (CallPlan::NoDispatch(reason, hooks), _) => {
                             no_dispatch(
                                 &mut records,
                                 run_id,
                                 &batch_id,
                                 &call.tool_call_id,
                                 reason,
+                                hooks.clone(),
                                 now,
                             );
                         }
+                        (
+                            CallPlan::HookTerminal {
+                                result,
+                                reason,
+                                hooks,
+                            },
+                            _,
+                        ) => hook_terminal(
+                            &mut records,
+                            run_id,
+                            &batch_id,
+                            result.clone(),
+                            reason.clone(),
+                            hooks.clone(),
+                            now,
+                        ),
                         // A batch that sends nothing records its other terminals in the same
                         // barrier; one that sends records them with the answers.
                         (CallPlan::Synthetic { result, reason }, _) if !dispatching => {
@@ -1371,7 +1413,7 @@ where
     let sending: Vec<ToolCall> = calls
         .iter()
         .zip(&plans)
-        .filter(|(_, plan)| matches!(plan, CallPlan::Dispatch))
+        .filter(|(_, plan)| matches!(plan, CallPlan::Dispatch(_)))
         .map(|(call, _)| call.clone())
         .collect();
     let keys: Vec<(ToolCallId, String)> = sending
@@ -1430,7 +1472,7 @@ where
     let mut unknown = false;
     for plan in &plans {
         match plan {
-            CallPlan::Dispatch => {
+            CallPlan::Dispatch(_) => {
                 let Some(answer) = answers.next().flatten() else {
                     continue;
                 };
@@ -1457,7 +1499,7 @@ where
                 reason.clone(),
                 Some((seams.now_ms)()),
             ),
-            CallPlan::NoDispatch(_) => {}
+            CallPlan::NoDispatch(..) | CallPlan::HookTerminal { .. } => {}
         }
     }
     if paused {
@@ -1486,10 +1528,18 @@ where
 
 /// What a batch does with one call, decided before anything is written.
 enum CallPlan {
-    /// Sent to the tool plane.
-    Dispatch,
-    /// Never sent, durable at once: the plane can't be reached, or the call is invalid.
-    NoDispatch(NoDispatchReason),
+    /// Sent to the tool plane; its intent records what the pre-tool hooks did, if any.
+    Dispatch(Option<Value>),
+    /// Never sent, durable at once: the plane can't be reached, the call is invalid, or the
+    /// approval policy denied it. The outcome records what the pre-tool hooks did, if any.
+    NoDispatch(NoDispatchReason, Option<Value>),
+    /// Never sent because a pre-tool hook refused it, durable at once with the refusal's result
+    /// and reason code, and what the hooks did.
+    HookTerminal {
+        result: ToolResult,
+        reason: String,
+        hooks: Option<Value>,
+    },
     /// Never sent, answered by the loop with `result`: a repeated call id, or a refusal the
     /// plane named.
     Synthetic {
@@ -1499,36 +1549,167 @@ enum CallPlan {
 }
 
 /// Decides each call's plan in the message's order, as today's gate does: a call a resume
-/// already knows is sent; a repeated call id gets an error; a refused batch refuses every call;
-/// a call the run's manifest doesn't allow is never sent; the approval policy then allows a
-/// call, narrows its input (in `calls`, so the intent records what is sent), or denies it.
+/// already knows is sent as recorded; a repeated call id gets an error; a refused batch refuses
+/// every call; a call the run's manifest doesn't allow is never sent. A valid call then goes
+/// through the pre-tool mutate hooks, a second manifest check, the approval policy and the
+/// validate hooks; its input in `calls` becomes what those left, so its intent records it.
+#[allow(clippy::too_many_arguments)]
 async fn plan_calls(
     calls: &mut [ToolCall],
     known: &[Known],
     refusal: Option<&broca_core::tool_plane::ToolPlaneError>,
     manifest: &ToolManifest,
     approval: &dyn ApprovalPolicy,
-) -> Vec<CallPlan> {
+    hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
+    step_id: u64,
+) -> Result<Vec<CallPlan>, LoopError> {
     let mut seen = std::collections::HashSet::new();
     let mut plans = Vec::with_capacity(calls.len());
     for call in calls.iter_mut() {
         let first = seen.insert(call.tool_call_id.clone());
         let plan = match gate_call(call, first, known, refusal, manifest) {
             Some(plan) => plan,
-            None => match approval.decide(call).await {
-                ApprovalResponse::Allow { .. } => CallPlan::Dispatch,
-                ApprovalResponse::AllowNarrowed { input, .. } => {
-                    call.input = input;
-                    CallPlan::Dispatch
-                }
-                ApprovalResponse::Deny { reason, .. } => {
-                    CallPlan::NoDispatch(NoDispatchReason::Denied { reason })
-                }
-            },
+            None => gate_hooked(call, manifest, approval, hooks, step_id).await?,
         };
         plans.push(plan);
     }
-    plans
+    Ok(plans)
+}
+
+/// A valid call through the pre-tool hooks and the approval policy.
+async fn gate_hooked(
+    call: &mut ToolCall,
+    manifest: &ToolManifest,
+    approval: &dyn ApprovalPolicy,
+    hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
+    step_id: u64,
+) -> Result<CallPlan, LoopError> {
+    use broca_core::hooks::{Subject, Trace};
+    use cortexkit_role_step_transform_provider::subscription::Phase;
+    let original = call.input.clone();
+    let mut trace = Trace::default();
+    let metadata = |trace: &Trace, input: &Value, intentless: bool| {
+        trace
+            .metadata(original.clone(), input.clone(), intentless)
+            .map(|hooks| serde_json::to_value(hooks).expect("hook metadata serializes"))
+    };
+    if let Some(runtime) = hooks {
+        let output = runtime
+            .chain(
+                broca_core::run::pre_tool_subject(StepId(step_id), call, Phase::Mutate),
+                trace,
+                |_| true,
+            )
+            .await;
+        trace = output.trace;
+        if output.cancellation.is_some() {
+            return Err(LoopError::Unsupported(
+                "a pre-tool hook cut short by a stop",
+            ));
+        }
+        if let Subject::PreTool { input, .. } = output.subject {
+            call.input = input;
+        }
+        if let Some((provider, text, unavailable)) = output.refusal {
+            return Ok(hook_refused(
+                call,
+                &trace,
+                &provider,
+                &text,
+                unavailable,
+                &metadata,
+            ));
+        }
+    }
+    if let Err(invalid) = manifest.validate_call(call) {
+        return Ok(CallPlan::NoDispatch(
+            NoDispatchReason::ValidationFailed {
+                detail: invalid.to_string(),
+            },
+            metadata(&trace, &call.input, true),
+        ));
+    }
+    match approval.decide(call).await {
+        ApprovalResponse::Allow { .. } => {}
+        ApprovalResponse::AllowNarrowed { input, .. } => call.input = input,
+        ApprovalResponse::Deny { reason, .. } => {
+            return Ok(CallPlan::NoDispatch(
+                NoDispatchReason::Denied { reason },
+                metadata(&trace, &call.input, true),
+            ));
+        }
+    }
+    if let Some(runtime) = hooks {
+        let output = runtime
+            .chain(
+                broca_core::run::pre_tool_subject(StepId(step_id), call, Phase::Validate),
+                trace,
+                |_| true,
+            )
+            .await;
+        trace = output.trace;
+        if output.cancellation.is_some() {
+            return Err(LoopError::Unsupported(
+                "a pre-tool hook cut short by a stop",
+            ));
+        }
+        if let Some((provider, text, unavailable)) = output.refusal {
+            return Ok(hook_refused(
+                call,
+                &trace,
+                &provider,
+                &text,
+                unavailable,
+                &metadata,
+            ));
+        }
+    }
+    Ok(CallPlan::Dispatch(metadata(&trace, &call.input, false)))
+}
+
+/// The plan for a call a pre-tool hook refused: today's refusal result and reason code.
+fn hook_refused(
+    call: &ToolCall,
+    trace: &broca_core::hooks::Trace,
+    provider: &str,
+    text: &str,
+    unavailable: bool,
+    metadata: &dyn Fn(&broca_core::hooks::Trace, &Value, bool) -> Option<Value>,
+) -> CallPlan {
+    let (result, reason) = broca_core::run::pre_tool_refusal(call, provider, text, unavailable);
+    CallPlan::HookTerminal {
+        result,
+        reason: reason.into(),
+        hooks: metadata(trace, &call.input, true),
+    }
+}
+
+/// The run's hook plan, from its frozen manifest. A plan that declares hooks without a plane to
+/// call them refuses the run, as today's loop does; one whose hooks ask a person to approve a
+/// call isn't supported yet.
+fn hook_plan<P, T>(
+    admission: &Admission,
+    seams: &Seams<'_, P, T>,
+) -> Result<Option<broca_core::hooks::HookPlan>, LoopError> {
+    let Some(manifest) = admission
+        .manifest
+        .as_deref()
+        .filter(|manifest| broca_core::hooks::has_transforms(manifest))
+    else {
+        return Ok(None);
+    };
+    let plan = broca_core::hooks::HookPlan::from_manifest(manifest).map_err(LoopError::Parts)?;
+    if seams.hook_plane.is_none() {
+        return Err(LoopError::Unsupported(
+            "a plan that declares hooks, without a hook plane",
+        ));
+    }
+    if plan.approves() {
+        return Err(LoopError::Unsupported(
+            "hooks that ask a person to approve a call",
+        ));
+    }
+    Ok(Some(plan))
 }
 
 /// The checks that come before the approval policy. `None` means the call reaches the policy. A
@@ -1542,7 +1723,7 @@ fn gate_call(
 ) -> Option<CallPlan> {
     use broca_core::tool_plane::ToolPlaneError;
     if known.iter().any(|known| known.id == call.tool_call_id) {
-        return Some(CallPlan::Dispatch);
+        return Some(CallPlan::Dispatch(None));
     }
     if !first {
         return Some(CallPlan::Synthetic {
@@ -1564,32 +1745,41 @@ fn gate_call(
         }
         Some(ToolPlaneError::Unavailable(_)) => {
             // The stable message, which sessions already on disk hold as their reason.
-            return Some(CallPlan::NoDispatch(NoDispatchReason::Unavailable {
-                detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
-                module: None,
-                code: None,
-                refusal_detail: None,
-            }));
+            return Some(CallPlan::NoDispatch(
+                NoDispatchReason::Unavailable {
+                    detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                    module: None,
+                    code: None,
+                    refusal_detail: None,
+                },
+                None,
+            ));
         }
         Some(ToolPlaneError::ModuleUnavailable {
             module,
             code,
             detail,
         }) => {
-            return Some(CallPlan::NoDispatch(NoDispatchReason::Unavailable {
-                detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
-                module: Some(module.clone()),
-                code: Some(code.clone()),
-                refusal_detail: (!detail.is_empty()).then(|| detail.clone()),
-            }));
+            return Some(CallPlan::NoDispatch(
+                NoDispatchReason::Unavailable {
+                    detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
+                    module: Some(module.clone()),
+                    code: Some(code.clone()),
+                    refusal_detail: (!detail.is_empty()).then(|| detail.clone()),
+                },
+                None,
+            ));
         }
         Some(error @ ToolPlaneError::ScopeRefused { .. }) => {
-            return Some(CallPlan::NoDispatch(NoDispatchReason::Unavailable {
-                detail: error.to_string(),
-                module: None,
-                code: None,
-                refusal_detail: None,
-            }));
+            return Some(CallPlan::NoDispatch(
+                NoDispatchReason::Unavailable {
+                    detail: error.to_string(),
+                    module: None,
+                    code: None,
+                    refusal_detail: None,
+                },
+                None,
+            ));
         }
         Some(ToolPlaneError::ScopeDrained { reason }) => {
             return Some(CallPlan::Synthetic {
@@ -1599,9 +1789,12 @@ fn gate_call(
         }
     }
     if let Err(invalid) = manifest.validate_call(call) {
-        return Some(CallPlan::NoDispatch(NoDispatchReason::ValidationFailed {
-            detail: invalid.to_string(),
-        }));
+        return Some(CallPlan::NoDispatch(
+            NoDispatchReason::ValidationFailed {
+                detail: invalid.to_string(),
+            },
+            None,
+        ));
     }
     None
 }
@@ -1614,6 +1807,7 @@ fn no_dispatch(
     batch_id: &str,
     id: &ToolCallId,
     reason: &NoDispatchReason,
+    hooks: Option<Value>,
     now: u64,
 ) {
     let result = broca_core::replay::no_dispatch_result(id, reason);
@@ -1636,8 +1830,33 @@ fn no_dispatch(
         reason: None,
         finished_at_ms: Some(now),
         detail: serde_json::to_value(reason).ok(),
-        hooks: None,
+        hooks,
     }));
+}
+
+/// A call a pre-tool hook refused: its result in the transcript and its outcome, completed with
+/// the refusal's reason code, in the ledger.
+fn hook_terminal(
+    records: &mut Vec<Record>,
+    run_id: &str,
+    batch_id: &str,
+    result: ToolResult,
+    reason: String,
+    hooks: Option<Value>,
+    now: u64,
+) {
+    terminal_with_reason(
+        records,
+        run_id,
+        batch_id,
+        result,
+        CallOutcome::Completed,
+        Some(reason),
+        Some(now),
+    );
+    if let Some(Record::ToolOutcome(outcome)) = records.last_mut() {
+        outcome.hooks = hooks;
+    }
 }
 
 /// A call's reply in the transcript and its outcome in the ledger.
