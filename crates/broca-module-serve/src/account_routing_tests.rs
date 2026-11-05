@@ -9,6 +9,36 @@ use broca_protocol::{AttemptAccountLimit, AttemptAccountObservation, AttemptOutc
 use broca_subc::vault::ScopedCredential;
 use std::sync::atomic::AtomicUsize;
 
+#[test]
+fn routed_accounts_discovery_lists_only_self_routed_sign_in_methods() {
+    for describe in [
+        broca_wire::broca_role_describe("test"),
+        broca_wire::broca_role_describe_with_writers("test", true, true, true),
+    ] {
+        let value = serde_json::to_value(&describe).unwrap();
+        let checked = cortexkit_role_llm_runner::describe::check_describe(&value).unwrap();
+        assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ROUTED_ACCOUNTS));
+        assert_eq!(value["routed_accounts"], json!(["oauth", "chatgpt"]));
+        for method in [
+            AuthMethod::ApiKey,
+            AuthMethod::Oauth,
+            AuthMethod::Antigravity,
+            AuthMethod::Chatgpt,
+        ] {
+            assert_eq!(
+                selects_accounts(method),
+                checked
+                    .routed_accounts
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|listed| listed == method.as_token()),
+                "{method:?}"
+            );
+        }
+    }
+}
+
 /// Routing's test clock, used in its pinned bodies.
 const NOW: i64 = 1_790_683_200_000;
 

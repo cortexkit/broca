@@ -599,6 +599,13 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   possible. A stored system entry switched to an unsupported route renders as user text
   without changing the stored role, text or delivery mode.
 
+`role.describe` declares `routed_accounts: ["oauth", "chatgpt"]` with the matching
+`routed_accounts` capability. These are the subscription sign-ins for which broca chooses
+an account through `route.account_for` and reports its run through `route.account_observe`.
+`apikey` and `antigravity` are not listed: their existing caller/configured credential
+selection is unchanged. A caller-named account, a single candidate, and resumed runs retain
+their existing account-selection rules.
+
 Broca sends the effective `service_tier` on `route.account_for` only when the router's
 `role.describe` declares `service_tier`. A tier-aware answer's `service_tier_chosen` must be a
 known level, must be present for an explicit request, and cannot upgrade it. An unbound

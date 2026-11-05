@@ -409,6 +409,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::SESSION_USAGE,
         cortexkit_role_llm_runner::capabilities::HEAD_SENDER,
         cortexkit_role_llm_runner::capabilities::HEAD_SELECTION,
+        cortexkit_role_llm_runner::capabilities::ROUTED_ACCOUNTS,
         cortexkit_role_llm_runner::capabilities::RUN_CANCEL,
         cortexkit_role_llm_runner::capabilities::RUN_CANCEL_BY_INTERRUPT,
         cortexkit_role_llm_runner::capabilities::RETRACT,
@@ -476,7 +477,8 @@ pub fn broca_role_describe_with_writers(
     // `delivered` receipt is either absent (not rendered yet) or final, never `pending` or
     // `unknown`.
     .with_steer_receipt(steer_receipt::GUARANTEED)
-    .with_run_cancel(vec!["now".into(), "step_boundary".into()]);
+    .with_run_cancel(vec!["now".into(), "step_boundary".into()])
+    .with_routed_accounts(vec!["oauth".into(), "chatgpt".into()]);
     if hook_writer {
         // Once a hook plane is installed the run loop calls every hook the role names:
         // `pre_user` on each user message before it is written, `pre_tool` and `post_tool`
@@ -1263,7 +1265,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "a58fd6980deec9cc2a9ed4bcd2f76ad6a5a58ab71406cab4bae9332ddd9faae8",
+            "b486cf74a3d49f3800ba840c021a2f8a698f4bcbb3cc3b79823f715693881501",
         );
     }
 
@@ -1445,7 +1447,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "4f2bae8f94c58e811dc7d5ea7a56545019d48f423914f2de1f2328533ed61dab";
+        "b41ce8b9b81b073e20002b7e0e559234ec42d9b1730de1adb78de8d6a7ea22f2";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =
