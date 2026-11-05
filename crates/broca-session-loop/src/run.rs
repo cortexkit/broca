@@ -636,7 +636,15 @@ fn frozen_admission(
         broca_core::compaction_v2::conditions::check_plan_version(version)
             .map_err(LoopError::Parts)?;
     }
-    admission_of_start(start, parts)
+    let mut admission = admission_of_start(start, parts)?;
+    // A run whose strict schema was downgraded renders downgraded from then on, as today's
+    // resume rebuilds its provider from the downgraded config.
+    if run.structured_downgraded {
+        broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(
+            &mut admission.render_config,
+        );
+    }
+    Ok(admission)
 }
 
 /// The admission a run's start froze: its model, settings, tools and system text, read back from
@@ -711,27 +719,11 @@ fn refuse_first_protocol_compaction<W: Writer>(writer: &W) -> Result<(), LoopErr
 }
 
 /// Refuses, by name, a run that needs a part of today's run loop the new loop hasn't built yet,
-/// rather than running it without that part: structured output delivered strictly, a tool-call
-/// or input budget, and the client-side refusal fallback. Each is read from what the run froze.
-/// A new run's caller can't ask for a budget here, so only a run read back from its start can
-/// carry one.
-///
-/// Strict delivery is refused because the provider may reject a strict schema's grammar, and
-/// today's loop then records a downgrade and sends the step again without the strict flag
-/// (`StructuredOutputDowngraded`), which the new loop doesn't do yet. A run whose schema goes
-/// out non-strict or unconstrained never downgrades.
+/// rather than running it without that part: a tool-call or input budget, and the client-side
+/// refusal fallback. Each is read from what the run froze. A new run's caller can't ask for a
+/// budget here, so only a run read back from its start can carry one.
 fn refuse_unbuilt(admission: &Admission) -> Result<(), LoopError> {
     let frozen = &admission.render_config;
-    if broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(Some(
-        frozen,
-    ))
-    .is_some_and(|structured| {
-        structured.delivery == broca_protocol::structured_output::SchemaDelivery::Strict
-    }) {
-        return Err(LoopError::Unsupported(
-            "a run whose structured output is delivered strictly",
-        ));
-    }
     if frozen
         .get("refusal_fallback")
         .is_some_and(|fallback| !fallback.is_null())
@@ -857,7 +849,7 @@ where
     let episodes = render_episodes(writer, parts)?;
     let tools = Arc::new(admission.tools.clone());
     let manifest = ToolManifest::from_tools(admission.tools.clone());
-    let structured = structured_of(admission);
+    let mut structured = structured_of(admission);
     let hook_plan = hook_plan(admission, seams)?;
     let hooks = hook_plan
         .as_ref()
@@ -1132,13 +1124,55 @@ where
                 return Ok(finished(writer, RunFinishReason::Error));
             }
         };
-        let outcome = model_step(writer, seams, &admission.run_id, step_id, opts).await?;
+        // A strict structured-output schema the provider refuses as too large a grammar is
+        // downgraded once: the downgrade is durable, the provider renders without the strict
+        // flag, and the same step is sent again, its retries counting the refused attempt's, as
+        // today's loop does.
+        let mut downgraded_now = false;
+        let mut prior_retries = 0;
+        let outcome = loop {
+            let outcome =
+                model_step(writer, seams, &admission.run_id, step_id, opts.clone()).await?;
+            if let Err(StepFailure::Error(error, retries_used)) = &outcome {
+                // The provider decides: it answers yes only for its own strict schema's refusal.
+                if !downgraded_now && seams.provider.structured_output_grammar_rejection(error) {
+                    writer
+                        .append(
+                            &[Record::StructuredDowngraded(
+                                broca_session_store::record::StructuredDowngraded {
+                                    run_id: admission.run_id.clone(),
+                                },
+                            )],
+                            true,
+                        )
+                        .await?;
+                    seams.provider.downgrade_structured_output();
+                    if let Some(frozen) = structured.as_mut() {
+                        frozen.downgrade_grammar();
+                    }
+                    downgraded_now = true;
+                    prior_retries = *retries_used;
+                    continue;
+                }
+            }
+            break match outcome {
+                Ok(mut step) => {
+                    step.retries_used = step.retries_used.saturating_add(prior_retries);
+                    Ok(step)
+                }
+                Err(StepFailure::Error(error, retries)) => Err(StepFailure::Error(
+                    error,
+                    retries.saturating_add(prior_retries),
+                )),
+                Err(failure) => Err(failure),
+            };
+        };
         let step = match outcome {
             Ok(step) => step,
             Err(StepFailure::Cancelled) => {
                 return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await;
             }
-            Err(StepFailure::Error(error)) => {
+            Err(StepFailure::Error(error, retries)) => {
                 // A failed sign-in pauses the run: after the credential is refreshed, it resumes
                 // as the same run, asking for this step again.
                 if error.class == broca_protocol::ErrorClass::Auth {
@@ -1158,6 +1192,8 @@ where
                         serde_json::to_value(&*error)
                             .map_err(|e| LoopError::Parts(e.to_string()))?,
                     );
+                    // The failed step wrote no end of its own, so its retries count here.
+                    end.retries_used = end.retries_used.saturating_add(retries);
                 }
                 append_end(writer, &admission.run_id, vec![record]).await?;
                 return Ok(finished(writer, RunFinishReason::Error));
@@ -1729,7 +1765,8 @@ fn incomplete_stream() -> ProviderError {
 
 enum StepFailure {
     Cancelled,
-    Error(Box<ProviderError>),
+    /// The step failed, after this many retries.
+    Error(Box<ProviderError>, u32),
 }
 
 /// Runs one model call and assembles its answer. Display events go straight to the listener.
@@ -1776,7 +1813,7 @@ async fn model_step<W: Writer, P: Provider, T>(
                 retries_used,
             })) => {
                 let Some(message) = message.take() else {
-                    return Ok(Err(StepFailure::Error(Box::new(incomplete_stream()))));
+                    return Ok(Err(StepFailure::Error(Box::new(incomplete_stream()), retries_used)));
                 };
                 return Ok(Ok(Step {
                     message,
@@ -1785,15 +1822,16 @@ async fn model_step<W: Writer, P: Provider, T>(
                     retries_used,
                 }));
             }
-            Some(NormalizedEvent::Control(ProviderControl::Error { error, .. })) => {
-                return Ok(Err(StepFailure::Error(Box::new(error))))
-            }
+            Some(NormalizedEvent::Control(ProviderControl::Error {
+                error,
+                retries_used,
+            })) => return Ok(Err(StepFailure::Error(Box::new(error), retries_used))),
             Some(NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt })) => {
                 writer
                     .append(&[attempt_record(run_id, step_id, attempt)?], false)
                     .await?;
             }
-            None => return Ok(Err(StepFailure::Error(Box::new(incomplete_stream())))),
+            None => return Ok(Err(StepFailure::Error(Box::new(incomplete_stream()), 0))),
             Some(NormalizedEvent::Control(_)) => {}
         }
     }

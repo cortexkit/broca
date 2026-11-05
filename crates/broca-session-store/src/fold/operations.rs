@@ -365,6 +365,13 @@ state! {
             reset: "a step's end",
             bound: Bound::Fixed,
         },
+        /// The run's strict structured-output schema was downgraded after the provider refused
+        /// its grammar: every later request renders it without the strict flag.
+        25 req pub structured_downgraded: bool => {
+            owner: "run loop",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -428,6 +435,7 @@ impl Run {
             account_limit_pause: None,
             context_ceiling: None,
             output_cap: None,
+            structured_downgraded: false,
             keep_warm: start.keep_warm.clone(),
             on_restart: start.on_restart.clone(),
             start: Some(start.clone()),
@@ -1075,6 +1083,9 @@ impl Operations {
             // Today's replay keeps the latest decision of the run still going.
             Record::CeilingDecided(decided) if run.finished.is_none() => {
                 run.context_ceiling = decided.detail.clone();
+            }
+            Record::StructuredDowngraded(downgraded) if downgraded.run_id == run.run_id => {
+                run.structured_downgraded = true;
             }
             Record::OutputCapLowered(lowered) => {
                 run.output_cap = Some(OutputCap {

@@ -771,6 +771,10 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         set(&mut object, "failure", retraction.failure.as_ref());
                         Value::Object(object)
                     }
+                    Record::StructuredDowngraded(downgraded) => serde_json::json!({
+                        "type": "structured_output_downgraded",
+                        "run_id": downgraded.run_id,
+                    }),
                     Record::OutputCapLowered(lowered) => serde_json::json!({
                         "type": "output_reservation_clamped",
                         "step_id": lowered.step_id,

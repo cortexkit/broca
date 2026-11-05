@@ -26,7 +26,7 @@ use broca_session_store::record::{
     CancelRequest, CeilingDecided, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker,
     Notice, OutputCapLowered, PartKind, PartRef, Pause, Placement, QueuedSend, Record, Redo,
     ResultAppend, Resumed, Retraction, RunEnd, RunStart, SendEnded, SessionRefresh, SetupStub,
-    Steer, StepEnd, StepStart, Stream, StructuredResult, ToolHeld, ToolIntent, ToolOutcome,
+    Steer, StepEnd, StepStart, Stream, StructuredDowngraded, StructuredResult, ToolHeld, ToolIntent, ToolOutcome,
     ToolReply, View, ViewApplied,
 };
 use broca_wal::{FramedRecord, WalRecord};
@@ -600,6 +600,12 @@ fn convert_one(
             step_id: f.req_u64("step_id"),
             detail: f.take("detail"),
         })),
+        "structured_output_downgraded" => {
+            out.records
+                .push(Record::StructuredDowngraded(StructuredDowngraded {
+                    run_id: f.req_string("run_id"),
+                }))
+        }
         "output_reservation_clamped" => {
             out.records.push(Record::OutputCapLowered(OutputCapLowered {
                 step_id: f.req_u64("step_id"),

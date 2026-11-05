@@ -52,6 +52,9 @@ use tokio_util::sync::CancellationToken;
 struct ScriptedProvider {
     scripts: Arc<Mutex<VecDeque<Vec<NormalizedEvent>>>>,
     sent: Arc<Mutex<Vec<CallOptions>>>,
+    /// Whether the run downgraded its strict structured-output schema; the frozen config the
+    /// provider reports is downgraded from then on, as a real provider's is.
+    downgraded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ScriptedProvider {
@@ -59,9 +62,13 @@ impl ScriptedProvider {
         Self {
             scripts: Arc::new(Mutex::new(scripts.into())),
             sent: Arc::new(Mutex::new(Vec::new())),
+            downgraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
+
+/// The provider code a scripted grammar refusal carries.
+const GRAMMAR_REFUSED: &str = "scripted_grammar_too_large";
 
 #[async_trait]
 impl Provider for ScriptedProvider {
@@ -76,7 +83,25 @@ impl Provider for ScriptedProvider {
         if let Some(structured) = structured() {
             blob["structured_output"] = structured;
         }
+        if self.downgraded.load(std::sync::atomic::Ordering::SeqCst) {
+            broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(
+                &mut blob,
+            );
+        }
         blob
+    }
+
+    /// As a real provider decides: only a refusal of the run's own strict schema, before it
+    /// was downgraded.
+    fn structured_output_grammar_rejection(&self, error: &broca_protocol::ProviderError) -> bool {
+        error.provider_code.as_deref() == Some(GRAMMAR_REFUSED)
+            && !self.downgraded.load(std::sync::atomic::Ordering::SeqCst)
+            && structured().is_some_and(|structured| structured["delivery"] == "strict")
+    }
+
+    fn downgrade_structured_output(&self) {
+        self.downgraded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn step(&self, _step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
@@ -4630,4 +4655,90 @@ async fn a_submit_tool_run_that_never_submits_records_no_value() {
             compare(single(vec![text_step("a1", "done")])),
         )
         .await;
+}
+
+/// Structured output in `mode` delivered strictly, which a provider may refuse as too large a
+/// grammar.
+fn strict(mode: &str) -> Value {
+    let mut structured = unconstrained(mode);
+    structured["enforcement"] = json!("enforced");
+    structured.as_object_mut().unwrap().remove("reason");
+    structured["delivery"] = json!("strict");
+    structured
+}
+
+/// The provider refuses the run's strict schema as too large a grammar, after one retry.
+fn grammar_refused() -> Vec<NormalizedEvent> {
+    vec![NormalizedEvent::Control(ProviderControl::Error {
+        error: serde_json::from_value(json!({
+            "class": "permanent",
+            "message": "schema grammar too large",
+            "status": 400,
+            "provider_code": GRAMMAR_REFUSED,
+        }))
+        .unwrap(),
+        retries_used: 1,
+    })]
+}
+
+#[tokio::test]
+async fn a_refused_strict_final_text_schema_is_downgraded_and_the_step_sent_again() {
+    STRUCTURED
+        .scope(
+            Some(strict("final_text")),
+            compare(single(vec![
+                grammar_refused(),
+                text_step("a1", r#"{"answer":5}"#),
+            ])),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_refused_strict_submit_schema_is_downgraded_and_the_submit_counted() {
+    STRUCTURED
+        .scope(
+            Some(strict("submit_tool")),
+            compare(single(vec![
+                grammar_refused(),
+                answer(
+                    "a1",
+                    vec![submit_call("c1", json!({"answer": 6}))],
+                    FinishReason::ToolCalls,
+                ),
+            ])),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_strict_schema_refused_twice_ends_the_run() {
+    STRUCTURED
+        .scope(
+            Some(strict("final_text")),
+            compare(single(vec![grammar_refused(), grammar_refused()])),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_failed_sign_in_after_retries_keeps_its_retry_count() {
+    let mut failure = auth_failure();
+    if let Some(NormalizedEvent::Control(ProviderControl::Error { retries_used, .. })) =
+        failure.last_mut()
+    {
+        *retries_used = 2;
+    }
+    compare_auth_pause(single(vec![failure, text_step("a1", "hi")])).await;
+}
+
+#[tokio::test]
+async fn a_failed_step_after_retries_counts_them_in_the_run_end() {
+    let mut failure = grammar_refused();
+    if let Some(NormalizedEvent::Control(ProviderControl::Error { retries_used, .. })) =
+        failure.last_mut()
+    {
+        *retries_used = 3;
+    }
+    compare(single(vec![failure])).await;
 }

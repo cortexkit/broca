@@ -859,6 +859,16 @@ message! {
 }
 
 message! {
+    /// The provider refused a run's strict structured-output schema as too large a grammar, so
+    /// the run's schema goes out without the strict flag from here on: its step is sent again,
+    /// and a resume renders the run downgraded. Durable before the step is sent again.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct StructuredDowngraded {
+        1 req run_id: String,
+    }
+}
+
+message! {
     /// A caller asked to cancel a run.
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct CancelRequest {
@@ -1131,6 +1141,7 @@ records! {
         93 Resumed,
         94 CeilingDecided,
         95 OutputCapLowered,
+        96 StructuredDowngraded,
     }
 }
 
