@@ -137,6 +137,15 @@ impl BrocaSubject {
             output.push_str(event);
             output.push('\n');
         }
+        output.push_str("--- routed HTTP model requests (no credential payloads) ---\n");
+        {
+            let observations = self.shared.routed_http_requests.lock().unwrap();
+            let mut sessions: Vec<_> = observations.iter().collect();
+            sessions.sort_by_key(|(session, _)| *session);
+            for (session, requests) in sessions {
+                output.push_str(&format!("{session}: {requests:?}\n"));
+            }
+        }
         let polls = self.shared.run_polls.lock().unwrap();
         let mut runs: Vec<_> = polls.iter().filter(|(_, (count, _))| *count > 0).collect();
         runs.sort_by(|left, right| left.0.cmp(right.0));

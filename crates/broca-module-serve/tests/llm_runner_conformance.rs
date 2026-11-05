@@ -382,6 +382,7 @@ struct Armed {
 struct Shared {
     routed_account_peers:
         Mutex<HashMap<String, cortexkit_role_llm_runner_conformance::RecordingRoutingPeer>>,
+    routed_http_requests: Mutex<HashMap<String, Vec<routed_accounts::HttpRequestEvidence>>>,
     service_tier_sessions: Mutex<BTreeSet<String>>,
     head_selection_sessions: Mutex<BTreeSet<String>>,
     service_tier_keys: Mutex<HashMap<String, String>>,
@@ -833,6 +834,21 @@ async fn serve_model_request(
             .and_then(|script| script.turns.get(turn_index).cloned())
     });
     if let Some(session) = &session {
+        if shared
+            .routed_account_peers
+            .lock()
+            .unwrap()
+            .contains_key(session)
+        {
+            let evidence = routed_accounts::http_request_evidence(&headers);
+            shared
+                .routed_http_requests
+                .lock()
+                .unwrap()
+                .entry(session.clone())
+                .or_default()
+                .push(evidence);
+        }
         shared
             .raw_bodies
             .lock()
@@ -943,8 +959,29 @@ async fn serve_model_request(
 
     *shared.last_session.lock().unwrap() = Some(session.clone());
     let id = format!("chatcmpl-{session}-{turn_index}");
-    if model.ends_with(output_refs::MODEL) {
-        let body = output_refs::stream(&id, &turn);
+    // A local endpoint override does not change the provider's native stream grammar.
+    let messages_endpoint = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .is_some_and(|target| {
+            target
+                .split('?')
+                .next()
+                .is_some_and(|path| path.ends_with("/messages"))
+        });
+    let native_messages = messages_endpoint
+        && shared
+            .routed_account_peers
+            .lock()
+            .unwrap()
+            .contains_key(&session);
+    if model.ends_with(output_refs::MODEL) || native_messages {
+        let body = if native_messages {
+            output_refs::stream_for_model(&id, model, &turn)
+        } else {
+            output_refs::stream(&id, &turn)
+        };
         let headers = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
         stream.write_all(headers.as_bytes()).await?;
         stream.write_all(body.as_bytes()).await?;

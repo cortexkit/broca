@@ -262,6 +262,44 @@ fn credentials() -> Vec<Value> {
 
 struct Vault;
 
+fn credential_payload(id: &str) -> Vec<u8> {
+    format!("synthetic-fixture-token-{id}").into_bytes()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HttpRequestEvidence {
+    pub authority: String,
+    pub target: String,
+    pub credential_id: Option<String>,
+}
+
+pub(super) fn http_request_evidence(headers: &str) -> HttpRequestEvidence {
+    let authorization = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("authorization:"))
+        .map(str::trim);
+    let credential_id = credentials().into_iter().find_map(|row| {
+        let id = row["id"].as_str()?;
+        let expected = format!("bearer {}", String::from_utf8(credential_payload(id)).ok()?);
+        (authorization == Some(expected.as_str())).then(|| id.to_owned())
+    });
+    HttpRequestEvidence {
+        authority: headers
+            .lines()
+            .find_map(|line| line.strip_prefix("host:"))
+            .map(str::trim)
+            .unwrap_or_default()
+            .into(),
+        target: headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .into(),
+        credential_id,
+    }
+}
+
 impl Vault {
     fn request(request: &Value) -> Result<Value, HarnessError> {
         match request["method"].as_str() {
@@ -273,7 +311,7 @@ impl Vault {
                     .find(|row| row["id"] == request["params"]["credential_id"])
                     .ok_or_else(|| HarnessError::new("fixture credential not found"))?;
                 Ok(
-                    json!({"result":{"payload":format!("synthetic-{}-token",row["auth_method"].as_str().unwrap()).into_bytes(),
+                    json!({"result":{"payload":credential_payload(row["id"].as_str().unwrap()),
                     "expires_at_ms":null,"record_version":1,"credential_id":row["id"],"account_id":row["account_id"]}}),
                 )
             }
@@ -498,6 +536,276 @@ fn text_bytes(value: &Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PeerTransport(RecordingRoutingPeer);
+
+    #[async_trait]
+    impl broca_module_serve::account_routing::RoutingTransport for PeerTransport {
+        async fn request(
+            &self,
+            body: Vec<u8>,
+        ) -> broca_module_serve::account_routing::RoutingReply {
+            let request: Value =
+                serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+            let answer = self
+                .0
+                .request(
+                    "broca",
+                    request["method"].as_str().unwrap(),
+                    request["params"].clone(),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(Ok(serde_json::to_vec(&answer).unwrap()))
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_accounts_oauth_fixture_completes_catalog_resolved_messages_request() {
+        const CHILD: &str = "BROCA_ROUTED_MESSAGES_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "routed_accounts::tests::routed_accounts_oauth_fixture_completes_catalog_resolved_messages_request", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use broca_catalog::live::{AuthMethod, AuthMode, EpisodeRenderConfig, ResolveOptions};
+        use broca_module_serve::account_routing::{
+            AccountChoice, AccountSelectionConfig, ChoiceInputs, RoutingClient,
+        };
+        let shared = Arc::new(Shared::default());
+        let session = "cf-routed-account-portable-oauth";
+        shared.scripts.lock().unwrap().insert(
+            session.into(),
+            Script {
+                turns: vec![cortexkit_role_llm_runner_conformance::ScriptedTurn::new(
+                    vec![ScriptedPart::Text("routed account accepted".into())],
+                )],
+            },
+        );
+        let ids = fixture("oauth").unwrap();
+        let peer = RecordingRoutingPeer::new("oauth", ids.clone()).unwrap();
+        shared
+            .routed_account_peers
+            .lock()
+            .unwrap()
+            .insert(session.into(), peer.clone());
+        let model_url = start_model(shared.clone()).await;
+        let root = broca_test_support::scratch_root()
+            .join(format!("routed-native-messages-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        seed_structured_output_catalog(&root).unwrap();
+        seed_catalog(&root, &model_url, session).unwrap();
+        let response =
+            serde_json::from_slice(&std::fs::read(root.join("catalog/fusiform-lkg.json")).unwrap())
+                .unwrap();
+        let cache = Arc::new(broca_catalog::CatalogCache::empty());
+        cache
+            .install_for_test(response, broca_catalog::CatalogSource::Fusiform)
+            .unwrap();
+        broca_catalog::install_global_catalog_cache(cache);
+        let fields = send_fields(session, true, &peer);
+        let model = fields["model"]["model"].as_str().unwrap();
+        let binding = broca_protocol::BindIdentity::new("/fixture", "broca", session);
+        let static_credential = broca_module_serve::auth_routing::CredentialId::new(
+            AuthMethod::Oauth,
+            "anthropic",
+            None,
+        );
+        let listing = serde_json::from_value(
+            Vault::request(&json!({"method":"credential.list_scoped"})).unwrap()["result"].clone(),
+        )
+        .unwrap();
+        let client = RoutingClient::new(
+            Arc::new(PeerTransport(peer.clone())),
+            AccountSelectionConfig::default(),
+        );
+        let chosen = broca_module_serve::account_routing::choose_account(
+            &client,
+            ChoiceInputs {
+                decision_id: None,
+                service_tier: None,
+                pool: None,
+                credential_id: None,
+                conversation_key: None,
+                inherited_conversation_key: None,
+                static_credential: &static_credential,
+                caller_named_account: false,
+                model,
+                session: &binding,
+                send_id: Some("fixture-send"),
+                run_id: "fixture-run",
+                initial_input_bytes: 14,
+                hold_cap: Default::default(),
+            },
+            async { Some(Arc::new(listing)) },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let AccountChoice::Routed {
+            credential_id,
+            account_id,
+            method,
+            ..
+        } = chosen
+        else {
+            panic!("fixture did not route its account");
+        };
+        assert_eq!(credential_id, ids["credential_id"]);
+        assert_eq!(account_id, ids["account_id"]);
+        assert_eq!(method, AuthMethod::Oauth);
+        let vault = Vault::request(
+            &json!({"method":"credential.get_scoped","params":{"credential_id":credential_id}}),
+        )
+        .unwrap();
+        let token =
+            String::from_utf8(serde_json::from_value(vault["result"]["payload"].clone()).unwrap())
+                .unwrap();
+        let mut daemon = json!({"modules":{"broca":{"env":{}}}});
+        let mut settings = json!({});
+        configure(&root, &model_url, &mut daemon, &mut settings).unwrap();
+        let overrides =
+            broca_module_serve::provider_overrides::ProviderOverrides::parse(&settings.to_string())
+                .unwrap();
+        let base_url = overrides.base_url("anthropic").unwrap();
+        let persona = broca_module_serve::claude_code_identity::fresh_persona(
+            "00000000-0000-4000-8000-000000000001",
+            Some(&account_id),
+            &credential_id,
+            &binding,
+            None,
+            1,
+        )
+        .unwrap();
+        let resolved = broca_catalog::live::resolve_catalog_episode_with_client(
+            &format!("anthropic/{model}"),
+            Some(2048),
+            &AuthMode::Secret(token),
+            &ResolveOptions {
+                auth_method: Some(method),
+                account_id: Some(&account_id),
+                frozen_account_ref: Some(&account_id),
+                session_id: Some(session),
+                claude_code_persona: Some(&persona),
+                ..Default::default()
+            },
+            broca_provider::build_provider_http_client(),
+            EpisodeRenderConfig {
+                base_url: Some(base_url),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.auth_method, Some(AuthMethod::Oauth));
+        assert_eq!(
+            resolved.family_id,
+            broca_provider::spec::WireFamilyId::AnthropicMessages
+        );
+        assert_eq!(resolved.base_url, model_url.trim_end_matches("/v1"));
+        let frozen = resolved.provider.render_config_blob();
+        assert_eq!(frozen["base_url"], resolved.base_url);
+        assert_eq!(frozen["family_id"], "anthropic_messages");
+        resolved.provider.bind_run_transport(&binding);
+        let options =
+            broca_protocol::request::CallOptions::new(vec![broca_protocol::Message::new(
+                broca_protocol::Role::User,
+                vec![broca_protocol::ContentBlock::Text {
+                    text: "answer briefly".into(),
+                }],
+            )]);
+        let mut events = resolved
+            .provider
+            .step(broca_protocol::StepId(1), &options)
+            .await;
+        let mut completed = false;
+        let mut attempts = 0;
+        let mut answered = false;
+        while let Some(event) = broca_test_support::wait_for(
+            "catalog-selected routed Messages event",
+            events.recv(),
+            || format!("completed={completed} attempts={attempts}"),
+        )
+        .await
+        {
+            match event {
+                broca_protocol::NormalizedEvent::Control(
+                    broca_protocol::ProviderControl::StepFinished { .. },
+                ) => completed = true,
+                broca_protocol::NormalizedEvent::Control(
+                    broca_protocol::ProviderControl::AssistantMessage { message },
+                ) => {
+                    let text: String = message
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            broca_protocol::ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(text, "routed account accepted");
+                    answered = true;
+                }
+                broca_protocol::NormalizedEvent::Control(
+                    broca_protocol::ProviderControl::AttemptFinished { attempt },
+                ) => {
+                    attempts += 1;
+                    assert_eq!(attempt.transport.as_deref(), Some("https"));
+                    assert_eq!(
+                        attempt.outcome,
+                        broca_protocol::AttemptOutcome::Complete,
+                        "native Messages endpoint did not complete: {:?}; received requests={:?}",
+                        attempt.outcome,
+                        shared.routed_http_requests.lock().unwrap().get(session)
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(completed);
+        assert!(answered);
+        assert_eq!(
+            attempts, 1,
+            "the scripted success must not rely on provider retries"
+        );
+        assert_eq!(
+            shared.routed_http_requests.lock().unwrap()[session],
+            vec![HttpRequestEvidence {
+                authority: model_url
+                    .strip_prefix("http://")
+                    .unwrap()
+                    .trim_end_matches("/v1")
+                    .into(),
+                target: "/v1/messages?beta=true".into(),
+                credential_id: Some(credential_id),
+            }]
+        );
+        assert_eq!(shared.requests.lock().unwrap()[session].len(), 1);
+        assert_eq!(
+            peer.calls()
+                .iter()
+                .filter(|call| call.method == "route.account_for")
+                .count(),
+            1
+        );
+        if let Some(path) = std::env::var_os("BROCA_ROUTED_MESSAGES_EVIDENCE") {
+            let requests = shared.routed_http_requests.lock().unwrap();
+            let request = &requests[session][0];
+            let evidence = json!({"provider":"anthropic","model":model,"auth_method":"oauth",
+                "family":frozen["family_id"],"frozen_base_url":frozen["base_url"],
+                "account_id":account_id,"credential_id":ids["credential_id"],
+                "received_authority":request.authority,"received_target":request.target,
+                "received_credential_id":request.credential_id,"attempts":attempts,
+                "completed":completed,"answered":answered});
+            std::fs::write(path, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn routed_account_catalog_resolves_models_for_actual_native_provider_families() {
