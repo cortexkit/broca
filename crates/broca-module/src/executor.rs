@@ -125,6 +125,28 @@ impl RunJob {
 /// fake.
 #[async_trait]
 pub trait RunExecutor: Send + Sync + 'static {
+    /// Resolve a selectable model without admitting a run or changing routing state.
+    fn head_selection_wire(
+        &self,
+        _model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+    ) -> Option<String> {
+        None
+    }
+
+    async fn check_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> Result<
+        Option<cortexkit_role_llm_runner::head_selection::PlanModel>,
+        cortexkit_role_llm_runner::head_selection::PlanModelProblem,
+    > {
+        cortexkit_role_llm_runner::head_selection::check_plan(
+            plan,
+            &broca_wire::broca_role_describe(env!("CARGO_PKG_VERSION")).role,
+            |model| self.head_selection_wire(model),
+        )
+    }
+
     /// Validate the abstract level before a send can enter the durable queue.
     fn check_service_tier(
         &self,

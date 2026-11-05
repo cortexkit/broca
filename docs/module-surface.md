@@ -310,8 +310,28 @@ across rollback. Existing records are not rewritten: reads expose only recorded 
 successful-attempt times, and tool results' recorded `tool-times/v1` finish times. Unknown times
 stay absent, never zero. The same placement rules attach these facts before and after projection.
 
-`session.head.model` is the latest recorded next-send selection, not a model guessed from plan
-JSON. `usage`, behind the `session_usage` group, is incremental durable session spend with
+`session.head.model` is the latest recorded next-send selection. Broca declares the
+`head_selection` capability group in `role.describe`; it lets an admitted creating plan or
+durably accepted refresh select
+`plan.model: {provider, model, variant?, service_tier?}`. A changed choice appears on head
+immediately, regardless of when the refresh applies its text or tools. An absent model member
+leaves the selection alone; a present model's omitted tier means standard. Top-level
+`session.head.service_tier` reports the non-standard default; absence means standard.
+
+A run-starting send's own model wins over that recorded selection. Its tier is its explicit
+`service_tier`, otherwise the latest recorded selection's default, otherwise standard. A send's
+own model or tier applies only to its run and does not change the recorded next-run choice.
+Broca has no separate host model picker or host-switch path. Joining sends retain the running
+run's model and fixed tier. Sessions with no plan selection keep the legacy joining-only
+model omission rule. Unsupported plan models (including unavailable provider sign-in)
+refuse `invalid_params` with `{field:"plan.model", reason:"unsupported_model"}`; unsupported
+plan tiers name `plan.model.service_tier` with reason `unsupported_tier`. These checks are
+read-only and precede acceptance and writes. The selection is recovered from the creating
+`RunStarted.manifest` and later `session_refresh_accepted` manifests, not from a run's applied
+tier or a refetch of the original plan. Bounded authenticated source references keep these
+facts independent of transcript length.
+
+`usage`, behind the `session_usage` group, is incremental durable session spend with
 `since` naming the first counted run. Its selection keys, first-use ordering and lower-bound
 totals are exactly run usage's: a field no counted step reported is absent; unreported steps
 are counted, not silently treated as measured zeros. Projection commits totals with its WAL
@@ -584,8 +604,32 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   possible. A stored system entry switched to an unsupported route renders as user text
   without changing the stored role, text or delivery mode.
 
-Broca does not send `service_tier` to account routing; a tier chosen by a router reaches broca
-only through the caller's send. Broca does not report `service_tier_applied` or
+`role.describe` declares `routed_accounts: ["oauth", "chatgpt"]` with the matching
+`routed_accounts` capability. These are the subscription sign-ins for which broca chooses
+an account through `route.account_for` and reports its run through `route.account_observe`.
+`apikey` and `antigravity` are not listed: their existing caller/configured credential
+selection is unchanged. Without new hints, an `auth.account` pin bypasses routing. If broca
+cannot list credentials or finds at most one account, it also uses the configured credential
+without asking routing. Resumed runs retain their frozen choice.
+
+For a listed method, `auth.pool` is sent as `route.account_for.pool`, and optional
+`auth.credential_id` is sent only as `requested_account.credential_id`, a preference the router
+may overrule. Either hint requires routing even with a single candidate. If the vault cannot
+provide its candidate credential list, or routing answers `account_selection_disabled`, broca
+refuses rather than using the configured default credential without honoring the hints.
+Both hints are ignored for unlisted methods before request storage and identity comparison.
+A strict `auth.account` pin cannot be combined with either hint for a listed method:
+`invalid_params` names `auth.account` before storage or any routing request. A pin without
+either hint bypasses routing. Queued requests retain their original hints across
+restart; a resumed run keeps its frozen credential/decision and accepts no fresh auth pin.
+
+Broca sends the effective `service_tier` on `route.account_for` only when the router's
+`role.describe` declares `service_tier`. A tier-aware answer's `service_tier_chosen` must be a
+known level, must be present for an explicit request, and cannot upgrade it. An unbound
+admission may step down; broca applies that chosen level. A decision-bound non-standard request
+must receive exactly its fixed level, not a second choice at a lower level. Legacy routers
+receive no tier member and their absent chosen tier is not treated as confirmation of a
+non-standard level. Broca does not report `service_tier_applied` or
 `service_tier_served` to account routing.
 
 #### Service-tier writer switch
@@ -603,7 +647,8 @@ even when the writer switch is off.
 
 On declares `service_tier` and `role.describe.service_tiers`, and accepts only the abstract
 `standard`, `fast` and `ultrafast` levels on `session.send`. A new run without the member
-starts at standard; a send into an unfinished run inherits its fixed tier when absent.
+takes the latest recorded plan default, or standard when none was selected; a send into an
+unfinished run inherits its fixed tier when absent.
 Explicitly changing that tier, including explicitly asking for standard, refuses
 `invalid_params` with detail `{field: "service_tier", reason: "run_tier_fixed"}`.
 Unknown levels and unsupported routes refuse before a model call with reason
@@ -629,8 +674,8 @@ carries the change event and non-standard condition. Unchanged tiers do not ride
 
 The service-tier switch does not depend on role-routing's route-selection and reporting
 contract. Broca uses its own `route.account_for` / `route.account_observe` protocol instead.
-Those calls still carry neither the applied nor served tier.
-The switch adopts llm-runner service tiers, not a second account-routing path.
+Account requests carry the requested level only to tier-aware routers as described above;
+observations still carry neither applied nor served tier. There is no second account-routing path.
 
 #### Tool-name aliases
 

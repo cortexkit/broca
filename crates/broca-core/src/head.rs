@@ -84,6 +84,9 @@ pub struct HeadProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_rich_ui: Option<broca_protocol::RichUiStamp>,
     pub model: Option<HeadModel>,
+    /// The next-run choice; the episode model above remains the source of usage attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<cortexkit_role_llm_runner::head_selection::PlanModel>,
     pub usage: Option<SessionUsage>,
     run_id: Option<RunId>,
     ownership: crate::SessionOwnershipV1,
@@ -105,6 +108,7 @@ impl Default for HeadProjection {
             creation_times: None,
             last_run_rich_ui: None,
             model: None,
+            selection: None,
             usage: None,
             run_id: None,
             ownership: crate::SessionOwnershipV1::default().for_owner_access(),
@@ -117,6 +121,23 @@ impl Default for HeadProjection {
 }
 
 impl HeadProjection {
+    pub fn selected_model(&self) -> Option<HeadModel> {
+        self.selection.as_ref().map_or_else(
+            || self.model.clone(),
+            |selection| {
+                let mut model = HeadModel::new(&selection.provider, &selection.model);
+                model.variant = selection.variant.clone();
+                Some(model)
+            },
+        )
+    }
+
+    fn select_manifest(&mut self, manifest: &broca_wal::PlanManifest) {
+        if let Some(selection) = manifest_selection(manifest) {
+            self.selection = Some(selection);
+        }
+    }
+
     /// Cached heads written before sender-policy folding ignored accepted refreshes.
     pub fn sender_admission_current(&self, session_change_recorded: bool) -> bool {
         !session_change_recorded
@@ -195,6 +216,9 @@ impl HeadProjection {
             } => {
                 if self.run_id.is_none() {
                     self.mode3 = Some(crate::is_mode3_log(std::iter::once(record)));
+                    if let Some(manifest) = manifest {
+                        self.select_manifest(manifest);
+                    }
                 }
                 if let Some(id) = submission_id {
                     self.queued_times.remove(&id.0);
@@ -260,6 +284,7 @@ impl HeadProjection {
                 self.queued_times.remove(&submission_id.0);
             }
             WalRecord::SessionRefreshAccepted { manifest, .. } => {
+                self.select_manifest(manifest);
                 self.set_senders(manifest);
                 self.ownership.session_change_recorded = true;
                 // The head keeps template-free grants above; only presence is needed here.
@@ -334,6 +359,14 @@ impl HeadProjection {
         .is_ok();
         Some(HeadSender::new(granted, interrupt))
     }
+}
+
+/// Only admission interprets untrusted plan choices. Replay reads an already admitted manifest.
+pub fn manifest_selection(
+    manifest: &broca_wal::PlanManifest,
+) -> Option<cortexkit_role_llm_runner::head_selection::PlanModel> {
+    let plan: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).ok()?;
+    serde_json::from_value(plan.get("model")?.clone()).ok()
 }
 
 /// A display-only continuation: identifiers and numeric counters, never a billing source.
@@ -671,5 +704,38 @@ mod tests {
             .unwrap()
             .get("last_run_rich_ui")
             .is_none());
+    }
+
+    #[test]
+    fn head_selection_is_independent_of_episode_model_and_spend() {
+        let manifest = |model: serde_json::Value| {
+            json!({
+                "plan":json!({"model":model}).to_string(), "plan_identity":"plan", "composition_digest":"composition",
+                "fetches":[], "tools":[], "system_text":"", "system_digest":"system",
+                "join_version":1, "role_versions":{}
+            })
+        };
+        let mut first = serde_json::to_value(start("first", None)).unwrap();
+        first["manifest"] =
+            manifest(json!({"provider":"chosen","model":"next","service_tier":"fast"}));
+        let mut head = HeadProjection::default();
+        head.observe(&serde_json::from_value(first.clone()).unwrap());
+        head.observe(&step(json!({"input_tokens":3})));
+        assert_eq!(head.selected_model().unwrap().model, "next");
+        assert_eq!(head.model.as_ref().unwrap().model, "m");
+        assert_eq!(
+            serde_json::to_value(head.usage.as_ref().unwrap()).unwrap()["by_model"][0]["model"],
+            "m"
+        );
+        let refresh: WalRecord = serde_json::from_value(json!({"type":"session_refresh_accepted",
+            "generation":1,"policy":"immediately","manifest":manifest(json!({"provider":"changed","model":"latest"})),
+            "run_in_progress":false,"applies_from_next_run":true})).unwrap();
+        head.observe(&refresh);
+        head.observe(&serde_json::from_value(first).unwrap());
+        assert_eq!(head.selected_model().unwrap().model, "latest");
+        assert!(head.selection.as_ref().unwrap().service_tier.is_none());
+        let restored: HeadProjection =
+            serde_json::from_slice(&serde_json::to_vec(&head).unwrap()).unwrap();
+        assert_eq!(restored.selected_model(), head.selected_model());
     }
 }

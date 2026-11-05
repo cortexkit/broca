@@ -1370,7 +1370,7 @@ async fn an_unreadable_prompt_history_is_refused_through_the_admission_ack() {
         media_profile: None,
         conversation_key: None,
         req,
-        auth: Some(broca_protocol::AuthRequest { method: "oauth".into(), account: None }),
+        auth: Some(broca_protocol::AuthRequest { pool: None, credential_id: None, method: "oauth".into(), account: None }),
         writer: Arc::new(broca_core::WalHandle::spawn(wal, 1).unwrap()),
         kind: RunKind::AppendEpisode,
         skip_materialization: true,

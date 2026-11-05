@@ -9,7 +9,7 @@ struct TierServeRig {
     wal: Arc<FileWalStore>,
     session: BindIdentity,
     corr: u64,
-    subc: tokio::task::JoinHandle<()>,
+    subc: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TierServeRig {
@@ -22,12 +22,22 @@ impl TierServeRig {
         url: &str,
         plane: Option<Arc<TierCompaction>>,
     ) -> Self {
+        let (live, subc) = stand_in_executor(root).await;
+        Self::start_with_executor(root, Some(url), plane, live, Some(subc)).await
+    }
+
+    async fn start_with_executor(
+        root: &std::path::Path,
+        url: Option<&str>,
+        plane: Option<Arc<TierCompaction>>,
+        mut live: LiveLoopExecutor,
+        subc: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
         use broca_module::{DefaultOpener, LineageRegistry};
         use subc_protocol::{
             Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTOCOL_VERSION,
         };
-        let (mut live, subc) = stand_in_executor(root).await;
-        live.provider_base_url = Some(url.to_owned());
+        live.provider_base_url = url.map(str::to_owned);
         let wal = live.wal_store.clone();
         let store = live.session_store.clone().expect("legacy fixture materializer");
         broca_store::session_refs::migrate(
@@ -224,8 +234,10 @@ impl TierServeRig {
         drop(self.writer);
         drop(self.reader);
         self.serve.await.unwrap();
-        self.subc.abort();
-        let _ = self.subc.await;
+        if let Some(subc) = self.subc {
+            subc.abort();
+            let _ = subc.await;
+        }
     }
 }
 
@@ -273,6 +285,12 @@ struct TierFixtureExecutor {
 
 #[async_trait::async_trait]
 impl RunExecutor for TierFixtureExecutor {
+    fn head_selection_wire(&self, model: &cortexkit_role_llm_runner::head_selection::PlanModel) -> Option<String> {
+        self.live.head_selection_wire(model)
+    }
+    async fn check_plan_selection(&self, plan: &serde_json::Value) -> Result<Option<cortexkit_role_llm_runner::head_selection::PlanModel>, cortexkit_role_llm_runner::head_selection::PlanModelProblem> {
+        self.live.check_plan_selection(plan).await
+    }
     fn check_service_tier(
         &self,
         request: &broca_protocol::SubmissionRequest,
@@ -310,6 +328,29 @@ fn tier_sample(name: &str, bytes: &[u8]) {
     }
 }
 
+#[tokio::test]
+async fn head_selection_reader_samples() {
+    if !run_catalog_drift_child("head_selection_reader_samples") {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+    let root = fresh_vault_root("head-selection-readers");
+    let http = resume_http_fixture().await;
+    let mut rig = TierServeRig::start(&root, &http.url).await;
+    let describe = rig.call("role.describe", serde_json::json!({})).await;
+    tier_sample("role.describe.json", &describe.body);
+    let unwritten = rig.call("session.head", serde_json::json!({})).await;
+    tier_sample("session.head-unwritten.json", &unwritten.body);
+    let run = tier_run(&rig.send("first", Some("fast")).await);
+    rig.ended(&run).await;
+    let head = rig.call("session.head", serde_json::json!({})).await;
+    assert_eq!(tier_reply(&head)["result"]["model"]["model"], "test-ultrafast");
+    tier_sample("session.head.json", &head.body);
+    rig.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn tier_reply(frame: &subc_protocol::Frame) -> serde_json::Value {
     serde_json::from_slice(&frame.body).unwrap()
 }
@@ -331,6 +372,328 @@ fn tier_run(frame: &subc_protocol::Frame) -> String {
         })
         .unwrap_or_else(|| panic!("admitted run identity: {value}"))
         .to_owned()
+}
+
+struct HeadSelectionAdmitter;
+
+#[async_trait::async_trait]
+impl broca_fetch_plan::PlanAdmitter for HeadSelectionAdmitter {
+    async fn admit(
+        &self,
+        plan: &broca_fetch_plan::Plan,
+        _: &BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+    ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
+        Ok(broca_fetch_plan::Admitted {
+            manifest: broca_wal::PlanManifest {
+                rich_ui: None,
+                plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+                plan_identity: plan.identity.clone(),
+                composition_digest: cortexkit_role_tool_provider::catalog::composition_digest(
+                    &serde_json::json!({"providers":[],"step_transform_items":[]}),
+                )
+                .unwrap(),
+                fetches: vec![],
+                tools: Arc::new(vec![]),
+                system_text: String::new(),
+                system_digest: String::new(),
+                join_version: 1,
+                role_versions: Default::default(),
+                declarations: vec![],
+            },
+        })
+    }
+}
+
+fn selection_plan(model: Option<serde_json::Value>) -> serde_json::Value {
+    let composition = serde_json::json!({"providers":[],"step_transform_items":[]});
+    let mut plan = serde_json::json!({"tool_items":[],"system_text_items":[],
+        "step_transform_items":[],"composition":composition,
+        "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap()});
+    if let Some(model) = model {
+        plan["model"] = model;
+    }
+    plan
+}
+
+fn fast_selection() -> serde_json::Value {
+    serde_json::json!({"provider":"openai","model":"test-ultrafast","service_tier":"fast"})
+}
+
+async fn selection_first(rig: &mut TierServeRig, plan: serde_json::Value) -> String {
+    rig.registry.set_plan_admitter(Arc::new(HeadSelectionAdmitter));
+    let sent = rig.call("session.send", serde_json::json!({"send_id":"first","prompt":"hello",
+        "model":{"provider":"openai","model":"test-standard-only"},"service_tier":"standard","plan":plan})).await;
+    let run = tier_run(&sent);
+    selection_completed(rig, &run).await;
+    run
+}
+
+async fn selection_completed(rig: &mut TierServeRig, run: &str) {
+    let (_, result) = rig.ended(run).await;
+    assert_eq!(tier_reply(&result)["result"]["state"], "completed", "{result:?}");
+}
+
+#[tokio::test]
+async fn head_selection_creating_send_plan_drives_first_run() {
+    if !run_catalog_drift_child("head_selection_creating_send_plan_drives_first_run") {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+    let root = fresh_vault_root("selection-create");
+    let http = resume_http_fixture().await;
+    let mut rig = TierServeRig::start(&root, &http.url).await;
+    rig.registry.set_plan_admitter(Arc::new(HeadSelectionAdmitter));
+    let sent = rig.call("session.send", serde_json::json!({"send_id":"first","prompt":"hello",
+        "plan":selection_plan(Some(fast_selection()))})).await;
+    let run = tier_run(&sent);
+    selection_completed(&mut rig, &run).await;
+    let body: serde_json::Value = serde_json::from_slice(&http.requests.lock().unwrap()[0].body).unwrap();
+    assert_eq!(body["model"], "test-ultrafast");
+    assert_eq!(body["service_tier"], "priority");
+    let head = tier_reply(&rig.call("session.head", serde_json::json!({})).await);
+    assert_eq!(head["result"]["model"]["model"], "test-ultrafast");
+    assert_eq!(head["result"]["service_tier"], "fast");
+    rig.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn head_selection_refreshed_model_is_used_by_next_run() {
+    if !run_catalog_drift_child("head_selection_refreshed_model_is_used_by_next_run") {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+    let root = fresh_vault_root("selection-refresh-run");
+    let http = resume_http_fixture().await;
+    let mut rig = TierServeRig::start(&root, &http.url).await;
+    selection_first(&mut rig, selection_plan(None)).await;
+    let refresh = rig.call("session.refresh", serde_json::json!({"plan":selection_plan(Some(fast_selection())),
+        "generation":1,"policy":"on_prefix_rebuild"})).await;
+    assert_eq!(refresh.header.ty, subc_protocol::FrameType::Response, "{refresh:?}");
+    let head = rig.call("session.head", serde_json::json!({})).await;
+    assert_eq!(tier_reply(&head)["result"]["model"]["model"], "test-ultrafast");
+    assert_eq!(tier_reply(&head)["result"]["service_tier"], "fast");
+    tier_sample("session.head-refreshed.json", &head.body);
+    {
+        use broca_core::WalStore as _;
+        let accepted = rig.wal.read_records(&rig.session).unwrap().into_iter().find_map(|frame| {
+            matches!(frame.record, broca_wal::WalRecord::SessionRefreshAccepted { .. }).then_some(frame.record)
+        }).unwrap();
+        let bytes = serde_json::to_vec(&accepted).unwrap();
+        let decoded: broca_wal::WalRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, accepted);
+        let mut without_selection = accepted.clone();
+        if let broca_wal::WalRecord::SessionRefreshAccepted { manifest, .. } = &mut without_selection {
+            let mut plan: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+            plan.as_object_mut().unwrap().remove("model");
+            manifest.plan = broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+        }
+        assert_eq!(accepted.required_features(), without_selection.required_features());
+        tier_sample("session_refresh_accepted.json", &bytes);
+    }
+    let absent = rig.call("session.refresh", serde_json::json!({"plan":selection_plan(None),
+        "generation":2,"policy":"on_prefix_rebuild"})).await;
+    assert_eq!(absent.header.ty, subc_protocol::FrameType::Response, "{absent:?}");
+    assert_eq!(tier_reply(&rig.call("session.head", serde_json::json!({})).await)["result"]["service_tier"], "fast");
+    rig.close().await;
+    let mut reopened = TierServeRig::start(&root, &http.url).await;
+    let sent = reopened.call("session.send", serde_json::json!({"send_id":"after-restart","prompt":"hello"})).await;
+    let run = tier_run(&sent);
+    selection_completed(&mut reopened, &run).await;
+    let body: serde_json::Value = serde_json::from_slice(&http.requests.lock().unwrap().last().unwrap().body).unwrap();
+    assert_eq!(body["model"], "test-ultrafast");
+    assert_eq!(body["service_tier"], "priority");
+    reopened.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn head_selection_send_model_overrides_plan_model() {
+    if !run_catalog_drift_child("head_selection_send_model_overrides_plan_model") {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+    let root = fresh_vault_root("selection-send-model");
+    let http = resume_http_fixture().await;
+    let mut rig = TierServeRig::start(&root, &http.url).await;
+    selection_first(&mut rig, selection_plan(Some(fast_selection()))).await;
+    let body: serde_json::Value = serde_json::from_slice(&http.requests.lock().unwrap()[0].body).unwrap();
+    assert_eq!(body["model"], "test-standard-only");
+    assert_eq!(body["service_tier"], "default");
+    let head = tier_reply(&rig.call("session.head", serde_json::json!({})).await);
+    assert_eq!(head["result"]["model"]["model"], "test-ultrafast");
+    assert_eq!(head["result"]["service_tier"], "fast");
+    let sent = rig.call("session.send", serde_json::json!({"send_id":"own-model-default-tier","prompt":"hello",
+        "model":{"provider":"openai","model":"test-other-fast"}})).await;
+    selection_completed(&mut rig, &tier_run(&sent)).await;
+    let body: serde_json::Value = serde_json::from_slice(&http.requests.lock().unwrap().last().unwrap().body).unwrap();
+    assert_eq!(body["model"], "test-other-fast");
+    assert_eq!(body["service_tier"], "priority");
+    let head = tier_reply(&rig.call("session.head", serde_json::json!({})).await);
+    assert_eq!(head["result"]["model"]["model"], "test-ultrafast");
+    assert_eq!(head["result"]["service_tier"], "fast");
+    let sent = rig.call("session.send", serde_json::json!({"send_id":"inherit-override","prompt":"hello"})).await;
+    selection_completed(&mut rig, &tier_run(&sent)).await;
+    let body: serde_json::Value = serde_json::from_slice(&http.requests.lock().unwrap().last().unwrap().body).unwrap();
+    assert_eq!(body["model"], "test-ultrafast");
+    assert_eq!(body["service_tier"], "priority");
+    rig.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn head_selection_refresh_does_not_change_running_tier() {
+    if !run_catalog_drift_child("head_selection_refresh_does_not_change_running_tier") {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+    let root = fresh_vault_root("selection-running-tier");
+    let release = Arc::new(tokio::sync::Notify::new());
+    let http = tier_http_fixture(vec![None, None], false, Some(release.clone()), None).await;
+    let mut rig = TierServeRig::start(&root, &http.url).await;
+    rig.registry.set_plan_admitter(Arc::new(HeadSelectionAdmitter));
+    let sent = rig.call("session.send", serde_json::json!({"send_id":"first","prompt":"hello",
+        "plan":selection_plan(Some(fast_selection()))})).await;
+    let run = tier_run(&sent);
+    broca_test_support::wait_until("held selection request", || std::future::ready(
+        if http.requests.lock().unwrap().is_empty() { Err("not requested".to_owned()) } else { Ok(()) }
+    )).await;
+    let standard = selection_plan(Some(serde_json::json!({"provider":"openai","model":"test-ultrafast"})));
+    let refreshed = rig.call("session.refresh", serde_json::json!({"plan":standard,"generation":1,"policy":"immediately"})).await;
+    assert_eq!(refreshed.header.ty, subc_protocol::FrameType::Response, "{refreshed:?}");
+    let refused = rig.call("session.send", serde_json::json!({"send_id":"change-tier","prompt":"hello",
+        "delivery":"steer","service_tier":"standard"})).await;
+    assert_eq!(tier_reply(&refused)["detail"], serde_json::json!({"field":"service_tier","reason":"run_tier_fixed"}));
+    let steer = rig.call("session.send", serde_json::json!({"send_id":"join-tier","prompt":"hello","delivery":"steer"})).await;
+    assert_eq!(steer.header.ty, subc_protocol::FrameType::Response, "{steer:?}");
+    release.notify_one();
+    let (_, result) = rig.ended(&run).await;
+    assert_eq!(tier_reply(&result)["result"]["state"], "completed");
+    assert_eq!(tier_reply(&result)["result"]["usage"]["service_tier_applied"], "fast");
+    {
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["service_tier"], "priority");
+        }
+    }
+    assert!(tier_reply(&rig.call("session.head", serde_json::json!({})).await)["result"].get("service_tier").is_none());
+    rig.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+async fn selection_refusal(model: serde_json::Value, detail: serde_json::Value) {
+    use broca_core::WalStore as _;
+    let root = fresh_vault_root("selection-refusal");
+    let http = resume_http_fixture().await;
+    let mut rig = TierServeRig::start(&root, &http.url).await;
+    selection_first(&mut rig, selection_plan(None)).await;
+    let before = rig.wal.read_records(&rig.session).unwrap();
+    let head = rig.call("session.head", serde_json::json!({})).await;
+    let response = rig.call("session.refresh", serde_json::json!({"plan":selection_plan(Some(model)),
+        "generation":1,"policy":"immediately"})).await;
+    assert_eq!(response.header.ty, subc_protocol::FrameType::Error, "{response:?}");
+    let error = tier_reply(&response);
+    assert_eq!(error["code"], "invalid_params");
+    assert_eq!(error["detail"], detail);
+    assert_eq!(rig.wal.read_records(&rig.session).unwrap(), before);
+    assert_eq!(rig.call("session.head", serde_json::json!({})).await.body, head.body);
+    assert_eq!(http.requests.lock().unwrap().len(), 1);
+    rig.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn head_selection_refuses_malformed_model_without_write() {
+    if !run_catalog_drift_child("head_selection_refuses_malformed_model_without_write") {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+    selection_refusal(serde_json::json!({"provider":"openai","model":"test-ultrafast","unknown":true}),
+        serde_json::json!({"field":"plan.model"})).await;
+}
+
+#[tokio::test]
+async fn head_selection_refuses_unsupported_model_without_write() {
+    if !run_catalog_drift_child("head_selection_refuses_unsupported_model_without_write") {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+    selection_refusal(serde_json::json!({"provider":"openai","model":"missing-model"}),
+        serde_json::json!({"field":"plan.model","reason":"unsupported_model"})).await;
+}
+
+#[tokio::test]
+async fn head_selection_missing_sign_in_is_unsupported_model_without_write() {
+    if !run_catalog_drift_child("head_selection_missing_sign_in_is_unsupported_model_without_write") {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+    let root = fresh_vault_root("selection-no-sign-in");
+    let (mut live, subc) = stand_in_executor(&root).await;
+    live.provider_base_url = None;
+    live.vault = None;
+    let result = live.check_plan_selection(&selection_plan(Some(fast_selection()))).await;
+    assert_eq!(result, Err(cortexkit_role_llm_runner::head_selection::PlanModelProblem::UnsupportedModel));
+    let session = BindIdentity::new(&root, "tier-test", "session");
+    assert_eq!(broca_core::WalStore::live_wal_bytes(live.wal_store.as_ref(), &session).unwrap(), None);
+    assert!(matches!(broca_core::WalStore::read_records(live.wal_store.as_ref(), &session),
+        Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound));
+    subc.abort();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn head_selection_refuses_unsupported_tier_without_write() {
+    if !run_catalog_drift_child("head_selection_refuses_unsupported_tier_without_write") {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+    for tier in ["unknown-tier", "fast"] {
+        selection_refusal(serde_json::json!({"provider":"openai","model":"test-standard-only","service_tier":tier}),
+            serde_json::json!({"field":"plan.model.service_tier","reason":"unsupported_tier"})).await;
+    }
+}
+
+#[tokio::test]
+async fn head_selection_creating_refusals_do_not_create_a_wal() {
+    use broca_core::WalStore as _;
+    if !run_catalog_drift_child("head_selection_creating_refusals_do_not_create_a_wal") {
+        return;
+    }
+    broca_protocol::configure_service_tier(true).unwrap();
+    install_queued_ultrafast_catalog();
+    for (model, detail) in [
+        (serde_json::json!({"provider":"openai"}), serde_json::json!({"field":"plan.model"})),
+        (serde_json::json!({"provider":"openai","model":"missing-model"}), serde_json::json!({"field":"plan.model","reason":"unsupported_model"})),
+        (serde_json::json!({"provider":"openai","model":"test-standard-only","service_tier":"fast"}), serde_json::json!({"field":"plan.model.service_tier","reason":"unsupported_tier"})),
+    ] {
+        let root = fresh_vault_root("selection-create-refusal");
+        let http = resume_http_fixture().await;
+        let mut rig = TierServeRig::start(&root, &http.url).await;
+        rig.registry.set_plan_admitter(Arc::new(HeadSelectionAdmitter));
+        let before = rig.wal.live_wal_bytes(&rig.session).unwrap();
+        let response = rig.call("session.send", serde_json::json!({"send_id":"refused","prompt":"hello",
+            "model":{"provider":"openai","model":"test-ultrafast"},"plan":selection_plan(Some(model))})).await;
+        assert_eq!(response.header.ty, subc_protocol::FrameType::Error, "{response:?}");
+        assert_eq!(tier_reply(&response)["detail"], detail);
+        assert_eq!(rig.wal.live_wal_bytes(&rig.session).unwrap(), before);
+        assert!(matches!(rig.wal.read_records(&rig.session),
+            Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound));
+        assert!(http.requests.lock().unwrap().is_empty());
+        rig.close().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// The queue record a tiered send leaves behind when it waits for a run already in flight: the

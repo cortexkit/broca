@@ -3078,6 +3078,22 @@ where
                     .await;
                 }
             };
+            if params
+                .auth
+                .as_ref()
+                .is_some_and(crate::wire::auth_pin_hint_conflict)
+            {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("auth.account".into()),
+                    crate::wire::AUTH_PIN_HINT_CONFLICT,
+                )
+                .await;
+            }
             if params.template.is_some()
                 && (req.params.get("prompt").is_some() || req.params.get("prompt_blocks").is_some())
             {
@@ -3189,11 +3205,50 @@ where
                 )
                 .await;
             }
+            let plan_selection =
+                if let Some(plan) = req.params.get("plan").filter(|plan| !plan.is_null()) {
+                    if matches!(
+                        handler.plan_state(session).await,
+                        broca_module::serve::PlanState::NotAdmitted
+                    ) {
+                        match handler.check_plan_selection(plan).await {
+                            Ok(selection) => selection,
+                            Err(problem) => {
+                                return send_error_body(
+                                    writer,
+                                    ver,
+                                    channel,
+                                    epoch,
+                                    corr,
+                                    ErrorBody::new(
+                                        "invalid_params",
+                                        "plan.model is not a supported model and tier selection",
+                                    )
+                                    .with_detail(problem.detail()),
+                                )
+                                .await
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            if params.model.is_none() {
+                if let Some(selection) = &plan_selection {
+                    params.model = Some(crate::wire::ModelParams {
+                        provider: selection.provider.clone(),
+                        model: selection.model.clone(),
+                        variant: selection.variant.clone(),
+                    });
+                }
+            }
             // Deliveries that can join an episode take omitted runner parameters from its
             // frozen config, so they render the session's own request prefix. Admission resolves
             // them against its history snapshot; this preflight only classifies WAL presence.
             // Deliveries that can only start a new run take defaults and must name a model.
-            let inherit_frozen: std::collections::BTreeSet<
+            let mut inherit_frozen: std::collections::BTreeSet<
                 broca_protocol::request::InheritedParam,
             > = if match params.delivery.as_ref() {
                 Some(broca_wire::SendDelivery::Mode(_)) => matches!(
@@ -3224,7 +3279,7 @@ where
             } else {
                 Default::default()
             };
-            let session_written = if inherit_frozen.is_empty() {
+            let session_written = if inherit_frozen.is_empty() && params.model.is_some() {
                 false
             } else {
                 // The presence probe can stat the live WAL and read archive containers, so it
@@ -3249,12 +3304,13 @@ where
                     }
                 }
             };
-            // Captured before the placeholder below replaces the absent model.
-            let model_inherited = params.model.is_none();
+            // Keep caller omission distinct from the value resolved from the creating plan.
+            let model_inherited = req
+                .params
+                .get("model")
+                .is_none_or(serde_json::Value::is_null);
             if params.model.is_none() {
-                let may_inherit = inherit_frozen
-                    .contains(&broca_protocol::request::InheritedParam::Model)
-                    && session_written;
+                let may_inherit = session_written;
                 if !may_inherit {
                     return send_invalid_params(
                         writer,
@@ -3263,7 +3319,7 @@ where
                         epoch,
                         corr,
                         Some("model".into()),
-                        "model is required unless a joining delivery can inherit it from an existing episode",
+                        "model is required unless plan.model selects it or the session has a recorded selection",
                     )
                     .await;
                 }
@@ -3275,11 +3331,18 @@ where
                     model: String::new(),
                     variant: None,
                 });
+                inherit_frozen.insert(broca_protocol::request::InheritedParam::Model);
             }
             // A session never written has no frozen values, so its first send keeps the
             // defaults for everything it omits.
             let inherit_frozen = if !session_written {
-                Default::default()
+                if model_inherited && plan_selection.is_some() {
+                    std::collections::BTreeSet::from([
+                        broca_protocol::request::InheritedParam::Model,
+                    ])
+                } else {
+                    Default::default()
+                }
             } else {
                 inherit_frozen
             };
@@ -3335,7 +3398,7 @@ where
                         scope,
                         // An inherited model is known only to the session's actor, which checks
                         // the plan's models against it; the placeholder must never be compared.
-                        if model_inherited {
+                        if model_inherited && plan_selection.is_none() {
                             None
                         } else {
                             params.model.as_ref()

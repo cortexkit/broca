@@ -3017,6 +3017,12 @@ mod executor {
         }
     }
 
+    struct EpisodeAccountPreference<'a> {
+        pin: (Option<AuthMethod>, Option<&'a str>),
+        pool: Option<&'a str>,
+        credential_id: Option<&'a str>,
+    }
+
     /// Drives the real agentic loop for each run: resolves the provider from the catalog
     /// (or a base_url override), dispatches tools through the shared `SubcToolPlane`, and
     /// threads the admission ack so the coordinator admits a run only once it's durable.
@@ -3404,10 +3410,10 @@ mod executor {
             &self,
             req: &broca_core::RunRequest,
             fresh_episode: bool,
-            pinned: (Option<AuthMethod>, Option<&str>),
-            conversation_key: Option<&str>,
-            inherited_conversation_key: Option<&str>,
+            preference: EpisodeAccountPreference<'_>,
+            conversation: (Option<&str>, Option<&str>),
             hold_cap: broca_module_serve::account_routing::AccountHoldCap,
+            service_tier: Option<&str>,
         ) -> Result<AccountChoice, broca_module_serve::account_routing::ChoiceRefusal> {
             if !fresh_episode || self.provider_base_url.is_some() {
                 return Ok(AccountChoice::NotApplicable);
@@ -3415,7 +3421,8 @@ mod executor {
             let (Some(vault), Some(routing)) = (self.vault.as_ref(), self.routing.as_ref()) else {
                 return Ok(AccountChoice::NotApplicable);
             };
-            let (pinned_method, pinned_account) = pinned;
+            let (pinned_method, pinned_account) = preference.pin;
+            let (conversation_key, inherited_conversation_key) = conversation;
             let static_credential = broca_module_serve::auth_routing::resolve_credential_id(
                 req.model.provider_module_id.as_str(),
                 pinned_method,
@@ -3432,6 +3439,9 @@ mod executor {
                 routing,
                 broca_module_serve::account_routing::ChoiceInputs {
                     decision_id: req.route_decision_id.as_deref(),
+                    service_tier,
+                    pool: preference.pool,
+                    credential_id: preference.credential_id,
                     conversation_key,
                     inherited_conversation_key,
                     static_credential: &static_credential,
@@ -3644,6 +3654,7 @@ mod executor {
                     method,
                     decision,
                     view_digest,
+                    ..
                 } => Some((credential_id, account_id, decision, view_digest, *method)),
                 _ => None,
             };
@@ -3863,8 +3874,166 @@ mod executor {
         }
     }
 
+    impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
+        fn selection_family(
+            &self,
+            selection: &cortexkit_role_llm_runner::head_selection::PlanModel,
+        ) -> Option<WireFamilyId> {
+            let catalog = broca_catalog::catalog().ok()?;
+            let (provider, model) =
+                catalog.model_for_serving(&selection.provider, &selection.model)?;
+            let method = self
+                .vault
+                .as_ref()
+                .filter(|_| self.provider_base_url.is_none())
+                .map(|vault| {
+                    broca_module_serve::auth_routing::resolve_credential_id(
+                        &selection.provider,
+                        None,
+                        None,
+                        &vault.methods,
+                        FALLBACK_METHOD,
+                    )
+                    .method
+                });
+            let family = if let Some(family) = method.and_then(family_for_method) {
+                family
+            } else if catalog
+                .routing_facts(&selection.provider, &selection.model)
+                .is_some()
+            {
+                catalog
+                    .resolve_route(&selection.provider, &selection.model)
+                    .ok()?
+                    .0
+            } else {
+                provider.wire_family
+            };
+            if let Some(variant) = &selection.variant {
+                let resolved = broca_provider::variant::resolve_variant(
+                    family,
+                    &format!("{}/{}", selection.provider, selection.model),
+                    &model.id,
+                    &model.reasoning_options,
+                    model.limits.max_output,
+                    variant,
+                )
+                .ok()?;
+                if family == WireFamilyId::GoogleCodeAssist {
+                    catalog
+                        .routing_facts(&selection.provider, &selection.model)?
+                        .reasoning_wire_ids
+                        .as_ref()?
+                        .get(&resolved.name)
+                        .filter(|id| !id.is_empty())?;
+                }
+            }
+            Some(family)
+        }
+    }
+
     #[async_trait]
     impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
+        fn head_selection_wire(
+            &self,
+            model: &cortexkit_role_llm_runner::head_selection::PlanModel,
+        ) -> Option<String> {
+            Some(
+                match self.selection_family(model)? {
+                    WireFamilyId::OpenAiChat => "openai.chat_completions",
+                    WireFamilyId::OpenAiResponses => "openai.responses",
+                    WireFamilyId::OpenAiResponsesChatgpt => "openai.chatgpt_responses",
+                    WireFamilyId::AnthropicMessages => "anthropic.messages",
+                    WireFamilyId::Gemini | WireFamilyId::GoogleCodeAssist => {
+                        "google.generate_content"
+                    }
+                    WireFamilyId::BedrockConverse => "aws.bedrock_converse",
+                }
+                .into(),
+            )
+        }
+
+        async fn check_plan_selection(
+            &self,
+            plan: &serde_json::Value,
+        ) -> Result<
+            Option<cortexkit_role_llm_runner::head_selection::PlanModel>,
+            cortexkit_role_llm_runner::head_selection::PlanModelProblem,
+        > {
+            use cortexkit_role_llm_runner::head_selection::{self, PlanModelProblem};
+            let listing = if plan.get("model").is_some() && self.provider_base_url.is_none() {
+                match &self.vault {
+                    Some(vault) => vault.client.list_scoped().await.ok(),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let selection = head_selection::check_plan(
+                plan,
+                &broca_wire::broca_role_describe(env!("CARGO_PKG_VERSION")).role,
+                |model| {
+                    if self.provider_base_url.is_none() {
+                        let vault = self.vault.as_ref()?;
+                        let key = broca_module_serve::auth_routing::resolve_credential_id(
+                            &model.provider,
+                            None,
+                            None,
+                            &vault.methods,
+                            FALLBACK_METHOD,
+                        );
+                        let id = vault.addressing.vault_id_for(&key);
+                        let listing = listing.as_ref()?;
+                        let routed = self.routing.is_some()
+                            && broca_module_serve::account_routing::selects_accounts(key.method)
+                            && broca_module_serve::account_routing::Candidates::from_listing(
+                                listing,
+                                key.method,
+                                &model.provider,
+                            )
+                            .distinct_accounts()
+                                > 1;
+                        let available = listing.credentials.iter().any(|row| {
+                            row.state == "active"
+                                && row.operations.iter().any(|op| op == "read")
+                                && ((row.id == id
+                                    && row
+                                        .auth_method
+                                        .as_deref()
+                                        .is_none_or(|method| method == key.method.as_token())
+                                    && (row.provider_ids.is_empty()
+                                        || row.provider_ids.contains(&model.provider)))
+                                    || (routed
+                                        && row.account_id.is_some()
+                                        && row.provider_ids.contains(&model.provider)
+                                        && row.auth_method.as_deref()
+                                            == Some(key.method.as_token())))
+                        });
+                        if !available {
+                            return None;
+                        }
+                    }
+                    self.head_selection_wire(model)
+                },
+            )?;
+            if let Some(model) = &selection {
+                if let Some(tier) = model.service_tier.filter(|tier| !tier.is_standard()) {
+                    let catalog =
+                        broca_catalog::catalog().map_err(|_| PlanModelProblem::UnsupportedModel)?;
+                    broca_catalog::live::check_service_tier_level(
+                        self.selection_family(model)
+                            .ok_or(PlanModelProblem::UnsupportedModel)?,
+                        tier.as_str(),
+                        &model.provider,
+                        &format!("{}/{}", model.provider, model.model),
+                        &catalog.priced_modes(&model.provider, &model.model),
+                    )
+                    .map_err(|_| PlanModelProblem::UnsupportedTier)?;
+                }
+            }
+            Ok(selection)
+        }
+
         fn check_service_tier(
             &self,
             request: &broca_protocol::request::SubmissionRequest,
@@ -4293,9 +4462,15 @@ mod executor {
                 .choose_account_for_episode(
                     &job.req,
                     fresh_episode,
-                    (pinned_method, pinned_account),
-                    job.conversation_key.as_deref(),
-                    inherited_key,
+                    EpisodeAccountPreference {
+                        pin: (pinned_method, pinned_account),
+                        pool: job.auth.as_ref().and_then(|auth| auth.pool.as_deref()),
+                        credential_id: job
+                            .auth
+                            .as_ref()
+                            .and_then(|auth| auth.credential_id.as_deref()),
+                    },
+                    (job.conversation_key.as_deref(), inherited_key),
                     broca_module_serve::account_routing::account_hold_cap(
                         self.max_same_account_wait,
                         prior_snapshot
@@ -4312,6 +4487,7 @@ mod executor {
                                 .session_last_accepted_at_ms(&job.req.session, account)
                         },
                     ),
+                    job.queued_service_tier.as_deref(),
                 )
                 .await
             {
@@ -4335,6 +4511,16 @@ mod executor {
                     return Err(error);
                 }
             };
+            if let (
+                AccountChoice::Routed {
+                    service_tier_chosen: Some(tier),
+                    ..
+                },
+                Some(level),
+            ) = (&account_choice, job.queued_service_tier.as_mut())
+            {
+                level.clone_from(tier);
+            }
             let frozen_decision = if fresh_episode {
                 None
             } else {
@@ -5127,6 +5313,8 @@ mod executor {
         include!("tool_name_alias_tests.rs");
         include!("queued_service_tier_tests.rs");
         include!("service_tier_writer_tests.rs");
+        include!("step_event_writer_tests.rs");
+        include!("auth_hint_writer_tests.rs");
         include!("vault_request_tests.rs");
         include!("role_plane_tests.rs");
         include!("admission_wal_read_budget_tests.rs");
@@ -5662,6 +5850,8 @@ mod executor {
         fn caller_auth_pin_wins_over_provider_config_at_admission() {
             let methods = load_method_config("caller-pin", r#"{"openai":"oauth"}"#);
             let auth = AuthRequest {
+                pool: None,
+                credential_id: None,
                 method: "apikey".into(),
                 account: None,
             };
@@ -5683,6 +5873,8 @@ mod executor {
         fn caller_auth_account_rides_through_to_credential_id() {
             let methods = load_method_config("caller-account", r#"{"openai":"oauth"}"#);
             let auth = AuthRequest {
+                pool: None,
+                credential_id: None,
                 method: "apikey".into(),
                 account: Some("astro".into()),
             };
@@ -5703,6 +5895,8 @@ mod executor {
         #[test]
         fn caller_auth_pin_is_refused_on_a_genuine_resume() {
             let auth = AuthRequest {
+                pool: None,
+                credential_id: None,
                 method: "apikey".into(),
                 account: None,
             };
@@ -5721,6 +5915,8 @@ mod executor {
         fn caller_auth_pin_is_honoured_for_a_new_episode_with_session_history() {
             let methods = load_method_config("new-episode-pin", r#"{"openai":"oauth"}"#);
             let auth = AuthRequest {
+                pool: None,
+                credential_id: None,
                 method: "apikey".into(),
                 account: Some("astro".into()),
             };
@@ -5742,6 +5938,8 @@ mod executor {
         #[test]
         fn unknown_caller_auth_method_is_a_typed_config_refusal() {
             let auth = AuthRequest {
+                pool: None,
+                credential_id: None,
                 method: "api-key".into(),
                 account: None,
             };

@@ -846,6 +846,12 @@ pub struct AuthParams {
     /// Selects one credential when a provider holds several under one method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// Pool from which routing must select a subscription sign-in account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    /// Credential record id to prefer; unlike `account`, routing may choose another credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

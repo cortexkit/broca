@@ -1778,6 +1778,19 @@ impl std::error::Error for ServeError {}
 /// real outcome or a typed `ServeError`.
 #[async_trait]
 pub trait ServeHandler: Send + Sync {
+    async fn check_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> Result<
+        Option<cortexkit_role_llm_runner::head_selection::PlanModel>,
+        cortexkit_role_llm_runner::head_selection::PlanModelProblem,
+    > {
+        cortexkit_role_llm_runner::head_selection::check_plan(
+            plan,
+            &broca_wire::broca_role_describe(env!("CARGO_PKG_VERSION")).role,
+            |_| None,
+        )
+    }
     async fn media_read(
         &self,
         _session: &LineageKey,
@@ -2400,6 +2413,15 @@ impl crate::LineageRegistry {
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
+    async fn check_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> Result<
+        Option<cortexkit_role_llm_runner::head_selection::PlanModel>,
+        cortexkit_role_llm_runner::head_selection::PlanModelProblem,
+    > {
+        crate::LineageRegistry::check_plan_selection(self, plan).await
+    }
     fn cached_session_owner(
         &self,
         session: &LineageKey,
@@ -3456,6 +3478,13 @@ impl ServeHandler for crate::LineageRegistry {
                 .find_map(|framed| broca_core::record_time_ms(&framed.record))
                 .unwrap_or(0),
         };
+        let selected_model = head_facts.selected_model();
+        let service_tier = head_facts.selection.as_ref().and_then(|selection| {
+            selection
+                .service_tier
+                .filter(|tier| !tier.is_standard())
+                .map(|tier| tier.as_str().into())
+        });
         let media_facts = if let Some(lineage_id) = page.lineage_id {
             Some(
                 self.media_facts_for_head(
@@ -3465,7 +3494,7 @@ impl ServeHandler for crate::LineageRegistry {
                         at_seq,
                         run_id: page.lineage_state.last_run_id.as_ref(),
                         state: page.lineage_state.state.as_str(),
-                        model: head_facts.model.as_ref(),
+                        model: selected_model.as_ref(),
                         stored: head_media.as_ref(),
                     },
                 )
@@ -3522,7 +3551,8 @@ impl ServeHandler for crate::LineageRegistry {
             mode3,
             last_run_rich_ui: head_facts.last_run_rich_ui,
             last_run_error,
-            model: head_facts.model,
+            model: selected_model,
+            service_tier,
             usage: head_facts.usage.filter(|usage| usage.consistent()),
             sender,
             incarnation: snapshot.incarnation,
@@ -4251,6 +4281,13 @@ impl ServeHandler for crate::LineageRegistry {
             }
             session_change::RefreshOrder::New => {}
         }
+        self.check_plan_selection(&plan_value)
+            .await
+            .map_err(|problem| {
+                SessionChangeError::FetchRefused(broca_fetch_plan::Refusal::InvalidParams {
+                    detail: problem.detail(),
+                })
+            })?;
         broca_fetch_plan::session_change::check_compaction_item(
             change.current_manifest.as_deref(),
             &plan_value,

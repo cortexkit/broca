@@ -4274,44 +4274,132 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if let Some(fixed) = fixed_route_decision {
             request.route_decision_id = fixed;
         }
-        if broca_protocol::service_tier_enabled() && !resume_indexed_run {
-            let checkpoint = match self.load_checkpoint_at_head().await {
-                Ok(checkpoint) => checkpoint,
-                Err(error) => return SendOutcome::Transient(error),
-            };
-            let running = match &self.state {
-                RunState::Active { run_id, .. } => self.durable_finish_of_active(run_id).is_none(),
-                RunState::Idle => checkpoint
+        let selection = checkpoint
+            .head
+            .as_ref()
+            .and_then(|head| head.selection.clone())
+            .or_else(|| {
+                checkpoint
                     .last_episode
-                    .as_ref()
-                    .is_some_and(|episode| episode.disposition == EpisodeDisposition::Paused),
+                    .is_none()
+                    .then(|| {
+                        self.admitting_manifest
+                            .as_deref()
+                            .and_then(broca_core::head::manifest_selection)
+                    })
+                    .flatten()
+            });
+        let legacy_model_inheritance = self.admitting_order.as_ref().map_or_else(
+            || {
+                matches!(
+                    delivery,
+                    broca_protocol::Delivery::Steer | broca_protocol::Delivery::Interrupt
+                )
+            },
+            |order| {
+                order.modes.iter().any(|mode| {
+                    matches!(
+                        mode,
+                        broca_protocol::DeliveryMode::Steer
+                            | broca_protocol::DeliveryMode::ToolResult
+                            | broca_protocol::DeliveryMode::TurnSystem
+                    )
+                })
+            },
+        );
+        // Without a plan selection, legacy sessions keep their joining-only model omission rule.
+        if !resume_indexed_run
+            && selection.is_none()
+            && !legacy_model_inheritance
+            && request
+                .inherit_frozen
+                .contains(&broca_protocol::request::InheritedParam::Model)
+        {
+            return SendOutcome::DeliveryRefused {
+                code: "invalid_params",
+                field: "model",
+                message:
+                    "model is required unless plan.model selected the session's next-run model"
+                        .into(),
             };
-            if running {
-                if let Some(episode) = &checkpoint.last_episode {
-                    let fixed =
-                        broca_protocol::frozen_service_tier(&episode.config.frozen_render_config);
-                    if request
-                        .service_tier_level
-                        .as_deref()
-                        .is_some_and(|requested| requested != fixed)
-                    {
-                        return SendOutcome::ServiceTierInvalid {
-                            reason: "run_tier_fixed",
-                            message: format!(
-                                "service_tier is fixed at {fixed:?} for run {}",
-                                episode.run_id.0
-                            ),
-                        };
-                    }
-                    request.service_tier_level = (fixed != "standard"
-                        || request.service_tier_level.is_some())
-                    .then(|| fixed.to_owned());
+        }
+        // Broca has no model picker and records no host switches: a send's own model selects
+        // that run only, so the host-switch default-tier fallback never applies here.
+        if !resume_indexed_run && !running {
+            if let Some(selection) = &selection {
+                if request
+                    .inherit_frozen
+                    .remove(&broca_protocol::request::InheritedParam::Model)
+                {
+                    request.model =
+                        broca_protocol::ModelHandle::new(&selection.provider, &selection.model);
+                    request.variant = selection.variant.clone();
                 }
+            }
+        }
+        if (broca_protocol::service_tier_enabled() || selection.is_some()) && !resume_indexed_run {
+            use cortexkit_role_llm_runner::{head_selection, service_tier::ServiceTier};
+            if request
+                .service_tier_level
+                .as_deref()
+                .is_some_and(|tier| ServiceTier::parse(tier).is_none())
+            {
+                return SendOutcome::ServiceTierInvalid {
+                    reason: "unsupported_tier",
+                    message: format!("unknown service_tier {:?}", request.service_tier_level),
+                };
             }
             let mut effective = request.clone();
             if let Some(episode) = &checkpoint.last_episode {
                 inherit_frozen_parameters(&mut effective, &episode.config);
             }
+            let fixed = checkpoint
+                .last_episode
+                .as_ref()
+                .filter(|_| running)
+                .and_then(|episode| {
+                    ServiceTier::parse(broca_protocol::frozen_service_tier(
+                        &episode.config.frozen_render_config,
+                    ))
+                });
+            let model = head_selection::PlanModel::new(
+                &effective.model.provider_module_id,
+                &effective.model.model_id,
+            );
+            let wire = self
+                .executor
+                .head_selection_wire(&model)
+                .unwrap_or_default();
+            let applied = match head_selection::check_send_tier(
+                request
+                    .service_tier_level
+                    .as_deref()
+                    .and_then(ServiceTier::parse),
+                fixed,
+                selection.as_ref(),
+                &wire,
+                &broca_wire::broca_role_describe(env!("CARGO_PKG_VERSION")).role,
+            ) {
+                Ok(applied) => applied,
+                Err(problem) => {
+                    return SendOutcome::ServiceTierInvalid {
+                        reason: problem.reason(),
+                        message: format!(
+                            "service_tier {:?} cannot be applied to {}/{}: {}",
+                            request.service_tier_level,
+                            effective.model.provider_module_id,
+                            effective.model.model_id,
+                            problem.reason()
+                        ),
+                    }
+                }
+            };
+            request.service_tier_level = (!applied.is_standard()
+                || request.service_tier_level.is_some())
+            .then(|| applied.as_str().to_owned());
+            effective
+                .service_tier_level
+                .clone_from(&request.service_tier_level);
             if let Err(message) = self.executor.check_service_tier(&effective) {
                 return SendOutcome::ServiceTierInvalid {
                     reason: "unsupported_tier",
@@ -4320,10 +4408,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
 
-        // A send that left its model to the session is checked against the plan's model-bearing
-        // items here, with the model it inherits: the latest episode's frozen model, which
-        // `record_frozen_model` and run start also take. It runs after the same-key receipts
-        // above, so a retry of an admitted send keeps its answer even if a later episode
+        // A send that left its model to the session checks the plan's model-bearing items
+        // against its resolved next-run selection, or the frozen model of a run it joins.
+        // The check runs after the earlier submission-retry checks,
+        // so a retry of an admitted send keeps its answer even if a later episode
         // changed the session's model.
         if let Some(plan) = deferred_model_check {
             let checkpoint = match self.load_checkpoint_at_head().await {
@@ -4333,11 +4421,26 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // With no episode there is no model to inherit; admission refuses the send for its
             // missing model further on.
             if let Some(episode) = &checkpoint.last_episode {
+                let model = if request
+                    .inherit_frozen
+                    .contains(&broca_protocol::request::InheritedParam::Model)
+                {
+                    &episode.config.model
+                } else {
+                    &request.model
+                };
                 if let Err(refusal) = broca_fetch_plan::admit::check_plan_model(
                     &plan,
-                    episode.config.model.provider_module_id.as_str(),
-                    &episode.config.model.model_id,
-                    episode.config.variant.as_deref(),
+                    model.provider_module_id.as_str(),
+                    &model.model_id,
+                    if request
+                        .inherit_frozen
+                        .contains(&broca_protocol::request::InheritedParam::Model)
+                    {
+                        episode.config.variant.as_deref()
+                    } else {
+                        request.variant.as_deref()
+                    },
                 ) {
                     return SendOutcome::PlanRefused(refusal);
                 }
@@ -5259,6 +5362,23 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // An episode admitted on a history with none is the session's first.
         let admits_the_session = ownership.episodes == 0;
         let mut resolved_request = request;
+        if kind == RunKind::AppendEpisode {
+            if let Some(selection) = prior_snapshot
+                .checkpoint_at_head
+                .head
+                .as_ref()
+                .and_then(|head| head.selection.as_ref())
+            {
+                if resolved_request
+                    .inherit_frozen
+                    .remove(&broca_protocol::request::InheritedParam::Model)
+                {
+                    resolved_request.model =
+                        broca_protocol::ModelHandle::new(&selection.provider, &selection.model);
+                    resolved_request.variant = selection.variant.clone();
+                }
+            }
+        }
         if tools_were_omitted {
             // A fresh lineage has no prior config, so omission resolves to a tool-less run.
             let inherited_tools = prior_snapshot

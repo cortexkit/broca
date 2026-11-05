@@ -4647,6 +4647,7 @@ fn abstract_served_tier(tier: &str) -> String {
 }
 
 mod generation;
+pub use generation::content_timing_intervals;
 
 pub(crate) fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::usage::StepUsage {
     let mut step = cortexkit_role_llm_runner::usage::StepUsage::unreported();
