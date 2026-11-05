@@ -757,7 +757,8 @@ impl serde::Serialize for Id128 {
     }
 }
 
-pub(crate) fn hex(bytes: &[u8]) -> String {
+/// Lowercase hex of `bytes`, as object names and ids are spelled.
+pub fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

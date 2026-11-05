@@ -621,6 +621,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "broca-session-loop"
+version = "0.3.315"
+dependencies = [
+ "async-trait",
+ "broca-core",
+ "broca-protocol",
+ "broca-session-convert",
+ "broca-session-store",
+ "broca-test-support",
+ "broca-wal",
+ "futures",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "broca-session-store"
 version = "0.3.315"
 dependencies = [

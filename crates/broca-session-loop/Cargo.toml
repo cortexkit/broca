@@ -1,0 +1,29 @@
+[package]
+name = "broca-session-loop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The run loop for sessions on broca's new session storage: model steps and tool batches driven from the store's fold state."
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+broca-core = { path = "../broca-core" }
+broca-protocol = { path = "../broca-protocol" }
+broca-session-store = { path = "../broca-session-store" }
+broca-wal = { path = "../broca-wal" }
+serde.workspace = true
+serde_json.workspace = true
+serde_jcs.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+broca-session-convert = { path = "../broca-session-convert" }
+broca-test-support = { path = "../broca-test-support" }
+futures = { workspace = true, features = ["executor"] }
+tokio = { workspace = true, features = ["test-util"] }

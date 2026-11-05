@@ -494,6 +494,30 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The setup the latest run started with. A run whose setup equals it starts without a
+        /// new `SetupStub`.
+        10 opt pub setup: SetupInForce => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Declared,
+        },
+    }
+}
+
+state! {
+    /// A run's setup as a run start names it: its parts, sorted, and its model.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct SetupInForce {
+        1 rep pub parts: crate::record::PartRef => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Config("the run's setup parts: its tool lists, formats, system text and plan answers"),
+        },
+        2 opt pub model: broca_protocol::request::ModelHandle => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -526,6 +550,21 @@ impl Operations {
         };
         if let Some(id) = removed {
             self.queue.retain(|pending| pending.submission_id != id);
+        }
+    }
+
+    /// Whether a run starting with `parts` and `model` changes the setup in force, and so
+    /// starts with a `SetupStub`.
+    pub fn setup_changed(
+        &self,
+        parts: &[crate::record::PartRef],
+        model: &broca_protocol::request::ModelHandle,
+    ) -> bool {
+        let mut sorted = parts.to_vec();
+        sorted.sort();
+        match &self.setup {
+            Some(setup) => setup.parts != sorted || setup.model.as_ref() != Some(model),
+            None => true,
         }
     }
 
@@ -587,6 +626,12 @@ impl Operations {
         if let Record::RunStart(start) = record {
             self.run = Some(Run::new(start));
             self.refusal_schedule = start.refusal_schedule.clone();
+            let mut parts = start.setup.clone();
+            parts.sort();
+            self.setup = Some(SetupInForce {
+                parts,
+                model: Some(start.model.clone()),
+            });
             return Ok(());
         }
         if let Record::StepEnd(step) = record {

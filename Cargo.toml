@@ -28,6 +28,7 @@ members = [
     "crates/broca-memory-relief",
     "crates/broca-session-store",
     "crates/broca-session-convert",
+    "crates/broca-session-loop",
 ]
 
 # broca workspace.
