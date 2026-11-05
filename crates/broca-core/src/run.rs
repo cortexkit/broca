@@ -9418,6 +9418,48 @@ pub fn restore_repetition_guidance(prompt: &mut [Message]) {
     restore_guidance_with_originals(prompt, 0, None);
 }
 
+/// [`restore_repetition_guidance`] for a run whose earlier steps aren't in `prompt`: counting
+/// starts from `seed`, the run's [`repetition_checkpoint`] just before `prompt`'s first message,
+/// so the warnings are the ones the whole run would get. False, with nothing changed, when the
+/// checkpoint was taken under other warning rules or doesn't read as one.
+pub fn restore_repetition_guidance_seeded(
+    prompt: &mut [Message],
+    seed: &crate::tool_repetition::RepetitionCheckpoint,
+) -> bool {
+    let Some(mut fold) = RepetitionFold::seeded(seed) else {
+        return false;
+    };
+    for message in prompt.iter_mut() {
+        for (index, verdict) in fold.push(message) {
+            if let Some(guidance) = verdict.guidance() {
+                if let ContentBlock::ToolResult(result) = &mut message.content[index] {
+                    append_repetition_guidance(result, &guidance);
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The repetition counters after a run's raw, undecorated steps `prompt`, from its first step,
+/// continuing from `seed` when the run's steps before `prompt` were counted already. `Ok(None)`
+/// while an assistant's calls in `prompt` still wait for their results, since a checkpoint keeps
+/// no call text to pair them with; `Err` when `seed` doesn't read as a checkpoint under today's
+/// rules.
+pub fn repetition_checkpoint(
+    prompt: &[Message],
+    seed: Option<&crate::tool_repetition::RepetitionCheckpoint>,
+) -> Result<Option<crate::tool_repetition::RepetitionCheckpoint>, ()> {
+    let mut fold = match seed {
+        Some(seed) => RepetitionFold::seeded(seed).ok_or(())?,
+        None => RepetitionFold::default(),
+    };
+    for message in prompt {
+        fold.push(message);
+    }
+    Ok(fold.checkpoint())
+}
+
 fn restore_guidance_with_originals(
     prompt: &mut [Message],
     base: usize,

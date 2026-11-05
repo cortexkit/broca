@@ -70,7 +70,7 @@ pub trait Writer {
     async fn seal_at_entry(
         &mut self,
         ordinal: u64,
-        carry: &[Record],
+        carry: &broca_session_store::session::Carry<'_>,
         now_ms: u64,
     ) -> Result<(), SessionError>;
 
@@ -146,7 +146,7 @@ impl<B: SessionBackend> Writer for Session<'_, B> {
     async fn seal_at_entry(
         &mut self,
         ordinal: u64,
-        carry: &[Record],
+        carry: &broca_session_store::session::Carry<'_>,
         now_ms: u64,
     ) -> Result<(), SessionError> {
         Session::seal_at_entry(self, ordinal, carry, now_ms)

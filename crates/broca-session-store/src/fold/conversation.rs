@@ -189,6 +189,15 @@ state! {
             reset: "never",
             bound: Bound::Capped(SEALED_EPISODES_CAP),
         },
+        /// When the latest cut split a run whose steps continue above it, that run's
+        /// repetition-warning counters over its sealed steps (call signatures, result digests and
+        /// counts, never call text), so a request's warnings still count them. The run loop
+        /// computes and reads them; the store only keeps them.
+        13 opt pub window_repetition: serde_json::Value => {
+            owner: "seal",
+            reset: "a cut",
+            bound: Bound::PerRun("one count per distinct failing call"),
+        },
     }
 }
 
@@ -210,6 +219,7 @@ impl Conversation {
             episodes: Vec::new(),
             render_key: None,
             sealed_episodes: Vec::new(),
+            window_repetition: None,
         }
     }
 
@@ -230,6 +240,7 @@ impl Conversation {
             episodes: Vec::new(),
             render_key: self.render_key,
             sealed_episodes: self.sealed_episodes.clone(),
+            window_repetition: self.window_repetition.clone(),
         }
     }
 
@@ -254,6 +265,7 @@ impl Conversation {
     ) -> Result<(), FoldError> {
         self.messages.clear();
         self.entries.clear();
+        self.window_repetition = None;
         let episodes = std::mem::take(&mut self.episodes);
         // The run in force at the cut: the last one starting before it, unless the next run
         // starts at the cut.

@@ -569,7 +569,7 @@ pub use recover::{Recovered, Recovery, REMOVED_KEEP_MS};
 mod revert;
 pub use revert::{RevertRefusal, Reverted};
 mod seal;
-pub use seal::{Sealed, GRACE_MS};
+pub use seal::{Carry, Sealed, GRACE_MS};
 
 #[cfg(test)]
 mod tests;

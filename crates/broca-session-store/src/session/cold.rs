@@ -63,7 +63,14 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             .is_none_or(|run| matches!(run.resolution(), Resolution::Idle(_)));
         let pruned = run_idle && self.conversation.open_tool_turn().is_none();
         let sealed = self
-            .seal_read(ChangeKind::Cold, None, pruned, &[], open, now_ms)
+            .seal_read(
+                ChangeKind::Cold,
+                None,
+                pruned,
+                &super::seal::Carry::default(),
+                open,
+                now_ms,
+            )
             .await?;
         Ok(Cold::Applied { sealed, pruned })
     }

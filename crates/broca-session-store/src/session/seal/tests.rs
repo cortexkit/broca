@@ -4,7 +4,7 @@ use broca_protocol::ids::MessageId;
 use broca_protocol::request::ModelHandle;
 use futures::executor::block_on;
 
-use super::GRACE_MS;
+use super::{Carry, GRACE_MS};
 use crate::backend::{MemoryBackend, SessionAddr, SessionBackend};
 use crate::codec::{hex, Message as _};
 use crate::head::SessionTriple;
@@ -379,7 +379,14 @@ fn a_seal_carries_ledger_records_into_the_new_log() {
         });
         let before = session.next_seq();
         session
-            .seal_carrying(Some(cut), std::slice::from_ref(&applied), 1_000)
+            .seal_carrying(
+                Some(cut),
+                &Carry {
+                    records: std::slice::from_ref(&applied),
+                    ..Default::default()
+                },
+                1_000,
+            )
             .await
             .unwrap();
         let carried = session
@@ -408,7 +415,14 @@ fn a_seal_carries_ledger_records_into_the_new_log() {
         // Only ledger records can be carried: the transcript a seal keeps is the cut's to decide.
         assert!(matches!(
             session
-                .seal_carrying(None, &[input("c", "late")], 2_000)
+                .seal_carrying(
+                    None,
+                    &Carry {
+                        records: &[input("c", "late")],
+                        ..Default::default()
+                    },
+                    2_000,
+                )
                 .await,
             Err(super::SessionError::Fold(_))
         ));
@@ -422,7 +436,10 @@ fn a_seal_at_an_entry_cuts_where_that_entry_is_placed() {
     let backend = MemoryBackend::default();
     block_on(async {
         let (mut session, cut) = history(&backend).await;
-        let sealed = session.seal_at_entry(5, &[], 1_000).await.unwrap();
+        let sealed = session
+            .seal_at_entry(5, &Carry::default(), 1_000)
+            .await
+            .unwrap();
         assert_eq!(sealed.transcript_records, 4);
         assert_eq!(texts(&session.conversation.messages), ["ask c", "c"]);
         let (records, _, _) = session.read_open_log().await.unwrap();
@@ -430,6 +447,9 @@ fn a_seal_at_an_entry_cuts_where_that_entry_is_placed() {
         // An answer starts an entry too; an ordinal past the log places nothing.
         let other_backend = MemoryBackend::default();
         let (mut other, _) = history(&other_backend).await;
-        assert!(other.seal_at_entry(99, &[], 1_000).await.is_err());
+        assert!(other
+            .seal_at_entry(99, &Carry::default(), 1_000)
+            .await
+            .is_err());
     });
 }

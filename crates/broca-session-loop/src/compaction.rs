@@ -384,10 +384,78 @@ pub async fn seal_at_cut<W: Writer, P, T>(
         }
         carry
     };
+    let window_repetition = spanning_repetition(writer.conversation(), first_kept_ordinal)?;
     writer
-        .seal_at_entry(first_kept_ordinal, &carry, (seams.now_ms)())
+        .seal_at_entry(
+            first_kept_ordinal,
+            &broca_session_store::session::Carry {
+                records: &carry,
+                window_repetition,
+            },
+            (seams.now_ms)(),
+        )
         .await?;
     Ok(())
+}
+
+/// The repetition counters a cut before ordinal `first_kept` must keep: when the cut splits a
+/// run that already took steps below it, that run's counters over those steps, continuing from
+/// the counters the window already kept for it when it spanned the previous cut too. `None`
+/// when no run's steps are split.
+fn spanning_repetition(
+    conversation: &broca_session_store::fold::conversation::Conversation,
+    first_kept: u64,
+) -> Result<Option<serde_json::Value>, LoopError> {
+    let window_start = conversation.window_start();
+    let episodes = &conversation.episodes;
+    let Some(at) = episodes
+        .iter()
+        .rposition(|episode| episode.start < first_kept)
+    else {
+        return Ok(None);
+    };
+    if episodes
+        .get(at + 1)
+        .is_some_and(|next| next.start <= first_kept)
+    {
+        return Ok(None);
+    }
+    let run = &episodes[at];
+    // The run's window messages below the cut. When the run started before the window, its
+    // earlier steps are counted in the counters the window kept.
+    let from = run.start.max(window_start);
+    let below: Vec<_> = (from..first_kept)
+        .filter_map(|ordinal| conversation.window_message(ordinal).cloned())
+        .collect();
+    let seed =
+        match (run.start < window_start, &conversation.window_repetition) {
+            (true, Some(seed)) => Some(serde_json::from_value(seed.clone()).map_err(|error| {
+                LoopError::Parts(format!("stored repetition counters: {error}"))
+            })?),
+            _ => None,
+        };
+    // Counting starts at the run's first step; its input before that has nothing to count.
+    let steps = match &seed {
+        Some(_) => &below[..],
+        None => match below
+            .iter()
+            .position(|message| message.role == broca_protocol::content::Role::Assistant)
+        {
+            Some(first_step) => &below[first_step..],
+            None => return Ok(None),
+        },
+    };
+    match broca_core::run::repetition_checkpoint(steps, seed.as_ref()) {
+        Ok(Some(checkpoint)) => serde_json::to_value(checkpoint)
+            .map(Some)
+            .map_err(|error| LoopError::Parts(error.to_string())),
+        Ok(None) => Err(LoopError::Unsupported(
+            "a compaction cut between a tool call and its result",
+        )),
+        Err(()) => Err(LoopError::Parts(
+            "stored repetition counters were taken under other warning rules".into(),
+        )),
+    }
 }
 
 /// The run's frozen choices in the shape today's compaction conditions read. Its model

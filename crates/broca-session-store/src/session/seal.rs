@@ -110,23 +110,33 @@ pub(super) struct LedgerSealed {
     pub(super) forced_merges: u32,
 }
 
+/// What a seal starts the new open log with besides its checkpoint.
+#[derive(Debug, Default)]
+pub struct Carry<'a> {
+    /// Ledger records the caller needs whole in the open log and that the seal would otherwise
+    /// move out, such as full copies of compaction views whose stored edits are changes against
+    /// earlier views. They take fresh seqs after the checkpoint, and they're part of the change,
+    /// so the log never exists without them.
+    pub records: &'a [Record],
+    /// For a cut through a run: that run's repetition-warning counters at the cut, as the loop
+    /// computes them (the store doesn't read them). The new log's conversation keeps them, so a
+    /// request still counts the run's sealed steps. See `Conversation::window_repetition`.
+    pub window_repetition: Option<serde_json::Value>,
+}
+
 impl<'b, B: SessionBackend> Session<'b, B> {
     /// Seals the open log. With `cut`, the seq of the first record a compaction view keeps,
     /// the transcript records before it are sealed too; it must start an entry (a user input or
     /// an assistant message) with no assistant message waiting for replies before it.
     pub async fn seal(&mut self, cut: Option<u64>, now_ms: u64) -> Result<Sealed, SessionError> {
-        self.seal_carrying(cut, &[], now_ms).await
+        self.seal_carrying(cut, &Carry::default(), now_ms).await
     }
 
-    /// [`Session::seal`], starting the new open log with `carry` after its checkpoint: ledger
-    /// records the caller needs whole in the open log and that the seal would otherwise move
-    /// out, such as full copies of compaction views whose stored edits are changes against
-    /// earlier views. They take fresh seqs, and they're part of the change, so the log never
-    /// exists without them.
+    /// [`Session::seal`], starting the new open log with what `carry` names.
     pub async fn seal_carrying(
         &mut self,
         cut: Option<u64>,
-        carry: &[Record],
+        carry: &Carry<'_>,
         now_ms: u64,
     ) -> Result<Sealed, SessionError> {
         if self.poisoned {
@@ -135,7 +145,11 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         if self.operations.open_change.is_some() {
             return Err(SessionError::ChangeOpen);
         }
-        if carry.iter().any(|record| record.stream() != Stream::Ledger) {
+        if carry
+            .records
+            .iter()
+            .any(|record| record.stream() != Stream::Ledger)
+        {
             return Err(SessionError::Fold(
                 "a seal carries only ledger records into the new log".into(),
             ));
@@ -160,7 +174,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     pub async fn seal_at_entry(
         &mut self,
         ordinal: u64,
-        carry: &[Record],
+        carry: &Carry<'_>,
         now_ms: u64,
     ) -> Result<Sealed, SessionError> {
         let (records, _, checkpoint) = self.read_open_log().await?;
@@ -176,7 +190,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         kind: ChangeKind,
         cut: Option<u64>,
         prune_window: bool,
-        carry: &[Record],
+        carry: &Carry<'_>,
         open: OpenLogRead,
         now_ms: u64,
     ) -> Result<Sealed, SessionError> {
@@ -267,7 +281,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         change: Id128,
         cut: Option<u64>,
         prune_window: bool,
-        carry: &[Record],
+        carry: &Carry<'_>,
         intent_seq: u64,
         records: &[(u64, Record)],
         batches: &[std::ops::Range<usize>],
@@ -321,6 +335,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 });
                 at.seal_window(first_kept, starts_run)
                     .map_err(|error| SessionError::Fold(format!("conversation: {error:?}")))?;
+                at.window_repetition = carry.window_repetition.clone();
                 at
             }
             None => checkpoint.conversation.clone(),
@@ -462,10 +477,11 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         // seal read, and fold into the state the change installs.
         let mut settled_after = settled_after;
         let mut open_ids = OpenIds::default();
-        if !carry.is_empty() {
+        let carried = carry.records;
+        if !carried.is_empty() {
             let first = encoder.next_seq();
-            bytes.extend(encoder.batch(carry)?.into_written(&mut encoder));
-            for (offset, record) in carry.iter().enumerate() {
+            bytes.extend(encoder.batch(carried)?.into_written(&mut encoder));
+            for (offset, record) in carried.iter().enumerate() {
                 let seq = first + offset as u64;
                 window.note(seq, record);
                 open_ids.add(seq, record);

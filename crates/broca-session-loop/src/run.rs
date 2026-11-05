@@ -25,9 +25,7 @@ use broca_core::tool_plane::{
 };
 use broca_protocol::approval::ApprovalResponse;
 use broca_protocol::caller::{PauseReason, RunFinishReason};
-use broca_protocol::content::{
-    stamp_ordinals_from, AssistantMessage, Message, Role, ToolCall, ToolOutput, ToolResult,
-};
+use broca_protocol::content::{AssistantMessage, Message, Role, ToolCall, ToolOutput, ToolResult};
 use broca_protocol::error::ProviderError;
 use broca_protocol::provider::{ModelAttempt, NormalizedEvent, ProviderControl};
 use broca_protocol::request::EpisodeRenderInput;
@@ -1315,7 +1313,12 @@ fn call_options<W: Writer, P, T>(
     compacted: bool,
 ) -> Result<CallOptions, LoopError> {
     let mut prompt = writer.conversation().messages.clone();
-    repetition_guidance(&mut prompt, episodes);
+    repetition_guidance(
+        &mut prompt,
+        episodes,
+        writer.conversation().window_start() - 1,
+        writer.conversation().window_repetition.as_ref(),
+    )?;
     // Each message keeps its place in the session, which the window starts after once history
     // is sealed: the window's first message has the 0-based position `window_start - 1`.
     let first = writer.conversation().window_start() - 1;
@@ -1382,18 +1385,51 @@ fn call_options<W: Writer, P, T>(
 /// Adds today's repetition guidance to the copies of tool results the request sends, never to
 /// what's stored: each run's model steps (from its first answer up to the next run's input) are
 /// folded with fresh counters, as today's loop counts within one run.
-fn repetition_guidance(prompt: &mut [Message], episodes: &[EpisodeRenderInput]) {
-    for (index, episode) in episodes.iter().enumerate() {
-        let end = episodes
-            .get(index + 1)
-            .map_or(prompt.len(), |next| next.prompt_start)
-            .min(prompt.len());
-        let first_step = (episode.prompt_start..end)
+/// Adds each run's repetition warnings to its window messages. `prompt` holds the window, whose
+/// first message has session position `first`, while each run's place is a session position. A
+/// run that started before the window counts on from `spanning`, the counters the latest cut kept
+/// for its sealed steps; without them none of its steps were sealed.
+fn repetition_guidance(
+    prompt: &mut [Message],
+    episodes: &[EpisodeRenderInput],
+    first: u64,
+    spanning: Option<&serde_json::Value>,
+) -> Result<(), LoopError> {
+    let len = prompt.len();
+    let index = |position: usize| position.saturating_sub(first as usize).min(len);
+    for (at, episode) in episodes.iter().enumerate() {
+        let start = index(episode.prompt_start);
+        let end = index(
+            episodes
+                .get(at + 1)
+                .map_or(usize::MAX, |next| next.prompt_start),
+        );
+        if start >= end {
+            continue;
+        }
+        if episode.prompt_start < first as usize {
+            if let Some(seed) = spanning {
+                let seed = serde_json::from_value(seed.clone()).map_err(|error| {
+                    LoopError::Parts(format!("stored repetition counters: {error}"))
+                })?;
+                if !broca_core::run::restore_repetition_guidance_seeded(
+                    &mut prompt[start..end],
+                    &seed,
+                ) {
+                    return Err(LoopError::Parts(
+                        "stored repetition counters were taken under other warning rules".into(),
+                    ));
+                }
+                continue;
+            }
+        }
+        let first_step = (start..end)
             .find(|position| prompt[*position].role == broca_protocol::content::Role::Assistant);
         if let Some(first_step) = first_step {
             broca_core::run::restore_repetition_guidance(&mut prompt[first_step..end]);
         }
     }
+    Ok(())
 }
 
 struct Step {

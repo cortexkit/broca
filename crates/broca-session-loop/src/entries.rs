@@ -141,7 +141,7 @@ impl<W: Writer> Writer for Placed<'_, W> {
     async fn seal_at_entry(
         &mut self,
         ordinal: u64,
-        carry: &[Record],
+        carry: &broca_session_store::session::Carry<'_>,
         now_ms: u64,
     ) -> Result<(), SessionError> {
         self.inner.seal_at_entry(ordinal, carry, now_ms).await

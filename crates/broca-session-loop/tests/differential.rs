@@ -574,6 +574,9 @@ enum Ride {
     /// A view that cuts through the entry at this ordinal: it and everything before it no
     /// longer render.
     Cut(u64),
+    /// A view that cuts through the entry at the first ordinal and drops the whole entry at the
+    /// second.
+    CutAndDrop(u64, u64),
 }
 
 /// A compaction provider that answers from a script and records every call, so both loops must
@@ -692,16 +695,30 @@ impl broca_core::CompactionPlane for CompactionSpy {
                 None => json!({"answer": "nothing"}),
                 Some(ride) => {
                     use cortexkit_role_compaction::view::{Edit, EditOp, View};
-                    let (Ride::Drop(ordinal) | Ride::Cut(ordinal)) = ride;
-                    let mid = self.mids.lock().unwrap()[&ordinal].clone();
+                    let mid = |ordinal: u64| self.mids.lock().unwrap()[&ordinal].clone();
                     let version = 1 + self
                         .version
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let op = match ride {
-                        Ride::Drop(_) => EditOp::Drop { mid, part: None },
-                        Ride::Cut(_) => EditOp::Cut { through: mid },
+                    let ops = match ride {
+                        Ride::Drop(ordinal) => vec![EditOp::Drop {
+                            mid: mid(ordinal),
+                            part: None,
+                        }],
+                        Ride::Cut(ordinal) => vec![EditOp::Cut {
+                            through: mid(ordinal),
+                        }],
+                        Ride::CutAndDrop(cut, drop) => vec![
+                            EditOp::Cut { through: mid(cut) },
+                            EditOp::Drop {
+                                mid: mid(drop),
+                                part: None,
+                            },
+                        ],
                     };
-                    let view = View::seal(version, vec![Edit::new(version, op)]);
+                    let view = View::seal(
+                        version,
+                        ops.into_iter().map(|op| Edit::new(version, op)).collect(),
+                    );
                     json!({"answer": "view", "view": view})
                 }
             },
@@ -1012,7 +1029,7 @@ impl Writer for Recording<'_, '_> {
     async fn seal_at_entry(
         &mut self,
         ordinal: u64,
-        carry: &[Record],
+        carry: &broca_session_store::session::Carry<'_>,
         now_ms: u64,
     ) -> Result<(), SessionError> {
         Writer::seal_at_entry(&mut *self.session, ordinal, carry, now_ms).await
@@ -1926,9 +1943,12 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         .expect("the new loop runs");
     }
     keys_match(writer.session, &plane).await;
-    if compaction()
-        .is_some_and(|script| script.rides.iter().any(|ride| matches!(ride, Ride::Cut(_))))
-    {
+    if compaction().is_some_and(|script| {
+        script
+            .rides
+            .iter()
+            .any(|ride| matches!(ride, Ride::Cut(_) | Ride::CutAndDrop(..)))
+    }) {
         sealed_at_the_cut(writer.session, &triple, &bind).await;
     }
     let new = Outcome {
@@ -4093,4 +4113,63 @@ async fn a_cut_past_two_runs_keeps_only_the_runs_that_shape_requests() {
             ),
         )
         .await;
+}
+
+/// A run whose repeated failing call spans a cut: two failures, then a big result pushes the next
+/// request over the window, and the provider cuts through the first failure and drops the big
+/// call. The new loop seals that history mid-run, so the third failure's warning must still count
+/// the sealed first one, from the counters the seal kept.
+fn repetition_across_a_cut_scenario() -> Scenario {
+    let tools = vec![
+        tool("grep", ExecutionMode::Parallel),
+        tool("big", ExecutionMode::Parallel),
+    ];
+    Scenario {
+        input: vec![user("find x")],
+        manifest: Some(compacted_manifest(&tools)),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "grep", json!({"pattern": "x"}))],
+                FinishReason::ToolCalls,
+            ),
+            answer(
+                "a2",
+                vec![call("c2", "grep", json!({"pattern": "x"}))],
+                FinishReason::ToolCalls,
+            ),
+            answer(
+                "a3",
+                vec![call("c3", "big", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            answer(
+                "a4",
+                vec![call("c4", "grep", json!({"pattern": "x"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a5", "giving up"),
+        ],
+    }
+}
+
+fn repetition_cut() -> CompactionScript {
+    CompactionScript {
+        context_limit: 1_200,
+        // Entries: the input (1), each call with its result, then its empty results entry
+        // (2-3 and 4-5 the failures, 6-7 the big call).
+        rides: vec![Ride::CutAndDrop(3, 6)],
+    }
+}
+
+#[tokio::test]
+async fn a_cut_through_a_run_keeps_its_repetition_counts() {
+    compare_compacted(repetition_across_a_cut_scenario(), repetition_cut()).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_run_split_by_a_compaction_cut_resumes_alike() {
+    compare_compacted_every_cut(repetition_across_a_cut_scenario(), repetition_cut()).await;
 }
