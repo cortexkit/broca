@@ -4329,3 +4329,46 @@ async fn a_request_over_the_window_after_the_ride_ends_at_the_ceiling() {
 async fn every_cut_of_a_run_ending_at_the_ceiling_resumes_alike() {
     compare_compacted_every_cut(ceiling_scenario(), no_view()).await;
 }
+
+/// A plan with no compaction provider that asks for part numbers in the model's view: on the
+/// established layout each run's user and tool-result text goes out with its numbers in front,
+/// numbered by that run's own frozen rules, as today's loop numbers it. The real-data request
+/// check found the new loop sending these without their numbers.
+fn tagged_scenario() -> Scenario {
+    let tools = vec![tool("read", ExecutionMode::Parallel)];
+    let mut manifest = planned_manifest(&tools).as_ref().clone();
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+        json!({"tool_items": [{"provider": "provider"}], "render_tags": true}).to_string(),
+    )
+    .unwrap();
+    Scenario {
+        input: vec![user("read a")],
+        manifest: Some(Arc::new(manifest)),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn a_run_frozen_with_part_numbers_sends_them() {
+    compare(tagged_scenario()).await;
+}
+
+#[tokio::test]
+async fn two_runs_frozen_with_part_numbers_number_on_from_the_first() {
+    let mut scenario = tagged_scenario();
+    scenario.steps.push(text_step("a3", "again"));
+    compare_runs(
+        scenario,
+        &[("r1", vec![user("read a")]), ("r2", vec![user("once more")])],
+    )
+    .await;
+}
