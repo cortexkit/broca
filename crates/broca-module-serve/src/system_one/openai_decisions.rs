@@ -112,9 +112,18 @@ fn request_body(request: &Request) -> Result<Value, String> {
                 question["type"] = json!("choice");
                 let criteria: BTreeMap<String, Value> = serde_json::from_str(required_criteria(q)?)
                     .map_err(|e| format!("question {name} choice criteria: {e}"))?;
-                question["choices"] = criteria.into_iter().map(|(value, description)| {
-                    json!({"value":value, "description":text(&description)})
-                }).collect();
+                // A null description means the option has none, so it's left out rather than
+                // sent as the text "null".
+                question["choices"] = criteria
+                    .into_iter()
+                    .map(|(value, description)| {
+                        if description.is_null() {
+                            json!({"value":value})
+                        } else {
+                            json!({"value":value, "description":text(&description)})
+                        }
+                    })
+                    .collect();
             }
             "score" => {
                 question["type"] = json!("score");
@@ -305,10 +314,15 @@ fn mapping_error(message: String) -> ProviderReply {
 fn http_error(status: u16, retry_after_ms: Option<u64>, body: &[u8]) -> ProviderReply {
     let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let provider_code = value["error"]["code"].as_str().map(str::to_owned);
-    let code = match status {
-        401 => errors::AUTH_FAILED,
-        429 => errors::RATE_LIMITED,
-        400..=499 => errors::INVALID_ITEM,
+    let code = match (status, provider_code.as_deref()) {
+        (401, _) => errors::AUTH_FAILED,
+        // Out of credit, or over a billing hard limit: it ends only when someone pays, so it is
+        // the permanent account refusal, not a rate limit that a retry outlasts.
+        (429, Some("credit_balance_exhausted" | "insufficient_quota")) => {
+            errors::ACCOUNT_NOT_ENTITLED
+        }
+        (429, _) => errors::RATE_LIMITED,
+        (400..=499, _) => errors::INVALID_ITEM,
         _ => errors::PROVIDER_ERROR,
     };
     let mut error = ItemError::for_code(
@@ -319,6 +333,7 @@ fn http_error(status: u16, retry_after_ms: Option<u64>, body: &[u8]) -> Provider
         ),
     );
     error.class = match status {
+        _ if code == errors::ACCOUNT_NOT_ENTITLED => ErrorClass::Permanent,
         401 => ErrorClass::Other("auth_required".into()),
         429 | 500..=599 => ErrorClass::Transient,
         _ => ErrorClass::Permanent,

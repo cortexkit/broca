@@ -205,7 +205,7 @@ async fn golden_request_and_answers_keep_all_three_kinds_and_numeric_text() {
             "input":[{"role":"user","content":[{"type":"input_text","text":"{\"ticket\":\"broken\"}"},{"type":"input_image","image_url":PIXEL}]}],
             "questions":[
                 {"name":"a_predicate","type":"predicate","instructions":[{"type":"input_text","text":"{\"ask\":\"urgent\"}"},{"type":"input_text","text":"Answer true when: It is urgent.\nAnswer false when: It can wait."}]},
-                {"name":"b_choice","type":"choice","instructions":"Pick a team", "choices":[{"value":"a","description":"null"},{"value":"b","description":"{\"team\":\"engineering\"}"}]},
+                {"name":"b_choice","type":"choice","instructions":"Pick a team", "choices":[{"value":"a"},{"value":"b","description":"{\"team\":\"engineering\"}"}]},
                 {"name":"c_score","type":"score","instructions":"[\"Rate severity\"]", "levels":[{"label":"0","description":"Low"},{"label":"1","description":"High"}]}
             ]
         })
@@ -307,6 +307,38 @@ async fn missing_fields_refusals_and_incomplete_distributions_are_named_errors()
     for body in [r#"{"answers":[]}"#.to_owned(), r#"{"answers":[{"name":"q","type":"predicate","probability":0.5},{"name":"q","type":"predicate","probability":0.5}]}"#.to_owned()] {
         let (_, client) = start(vec![(200, body, None)]).await;
         assert_eq!(failed(client.call(simple().to_string()).await).code, "openai_decisions_unmappable_answer");
+    }
+}
+
+/// An account out of credit (OpenAI's 429 `credit_balance_exhausted`, as a live call returned
+/// it) or over its billing limit (`insufficient_quota`) refuses the call as the permanent
+/// `account_not_entitled`, so nothing retries an account that can't pay.
+#[tokio::test]
+async fn out_of_credit_is_the_permanent_account_refusal() {
+    for openai_code in ["credit_balance_exhausted", "insufficient_quota"] {
+        let body = format!(r#"{{"error":{{"code":"{openai_code}","type":"insufficient_quota"}}}}"#);
+        let (_, client) = start(vec![(429, body.clone(), None)]).await;
+        let reply = client.call(simple().to_string()).await;
+        let ProviderReply::ClassifiedError {
+            error,
+            provider_code,
+            may_have_spent,
+        } = reply
+        else {
+            panic!("not a classified error: {reply:?}");
+        };
+        assert_eq!(provider_code.as_deref(), Some(openai_code));
+        assert!(!may_have_spent);
+        let error = serde_json::to_value(error).unwrap();
+        assert_eq!(error["code"], "account_not_entitled", "{openai_code}");
+        assert_eq!(error["class"], "permanent", "{openai_code}");
+
+        // Met on the call's first provider call, it refuses the whole call at admission.
+        let (_, client) = start(vec![(429, body, None)]).await;
+        let service = service(client, Some("decision"));
+        let refusal = service.spawn_call(params(), scope()).await.unwrap_err();
+        let refusal: Value = serde_json::from_slice(&refusal).unwrap();
+        assert_eq!(refusal["code"], "account_not_entitled", "{openai_code}");
     }
 }
 
