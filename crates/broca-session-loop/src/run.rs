@@ -287,8 +287,21 @@ where
         inner: writer,
     };
     let writer = &mut placed;
-    let resumed = resumed_record(writer, &resolution);
+    // A durable step that called `submit_result` may survive a crash before the barrier that
+    // ends its run. Its calls are never sent on recovery: the run ends here exactly as the live
+    // path would have ended it, and the resume redoes nothing.
+    let submit = match (&resolution, structured_of(&admission)) {
+        (Resolution::Resume, Some(frozen)) => pending_submit(writer, &frozen).map(|s| (frozen, s)),
+        _ => None,
+    };
+    let mut resumed = resumed_record(writer, &resolution);
+    if submit.is_some() {
+        resumed.redone.clear();
+    }
     writer.append(&[Record::Resumed(resumed)], false).await?;
+    if let Some((frozen, pending)) = submit {
+        return submitted(writer, seams, &admission.run_id, &frozen, &pending).await;
+    }
     let compaction = compaction_ctx(writer, parts, &admission, seams, false).await?;
     match resolution {
         Resolution::Resume => drive(writer, parts, &admission, seams, compaction.as_ref()).await,
@@ -698,17 +711,26 @@ fn refuse_first_protocol_compaction<W: Writer>(writer: &W) -> Result<(), LoopErr
 }
 
 /// Refuses, by name, a run that needs a part of today's run loop the new loop hasn't built yet,
-/// rather than running it without that part: structured output, a tool-call or input budget, and
-/// the client-side refusal fallback. Each is read from what the run froze. A new run's caller
-/// can't ask for a budget here, so only a run read back from its start can carry one.
+/// rather than running it without that part: structured output delivered strictly, a tool-call
+/// or input budget, and the client-side refusal fallback. Each is read from what the run froze.
+/// A new run's caller can't ask for a budget here, so only a run read back from its start can
+/// carry one.
+///
+/// Strict delivery is refused because the provider may reject a strict schema's grammar, and
+/// today's loop then records a downgrade and sends the step again without the strict flag
+/// (`StructuredOutputDowngraded`), which the new loop doesn't do yet. A run whose schema goes
+/// out non-strict or unconstrained never downgrades.
 fn refuse_unbuilt(admission: &Admission) -> Result<(), LoopError> {
     let frozen = &admission.render_config;
     if broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(Some(
         frozen,
     ))
-    .is_some()
-    {
-        return Err(LoopError::Unsupported("a run with structured output"));
+    .is_some_and(|structured| {
+        structured.delivery == broca_protocol::structured_output::SchemaDelivery::Strict
+    }) {
+        return Err(LoopError::Unsupported(
+            "a run whose structured output is delivered strictly",
+        ));
     }
     if frozen
         .get("refusal_fallback")
@@ -835,6 +857,7 @@ where
     let episodes = render_episodes(writer, parts)?;
     let tools = Arc::new(admission.tools.clone());
     let manifest = ToolManifest::from_tools(admission.tools.clone());
+    let structured = structured_of(admission);
     let hook_plan = hook_plan(admission, seams)?;
     let hooks = hook_plan
         .as_ref()
@@ -1202,6 +1225,23 @@ where
             );
             let run_id = admission.run_id.clone();
             let mut end = Some(end);
+            // A completed run admitted with structured output records what it produced with its
+            // end: a `final_text` run its answer's text, a `submit_tool` run that never called
+            // `submit_result` nothing.
+            let mut produced = structured.as_ref().map(|frozen| {
+                let text = (frozen.mode == broca_protocol::structured_output::Mode::FinalText)
+                    .then(|| broca_core::run::joined_text(&step.message));
+                structured_result(
+                    &run_id,
+                    broca_protocol::structured_output::result(
+                        frozen,
+                        true,
+                        None,
+                        text.as_deref(),
+                        Vec::new(),
+                    ),
+                )
+            });
             let appended = writer
                 .append_with(
                     &mut |_, operations, _| {
@@ -1212,6 +1252,7 @@ where
                             return Vec::new();
                         }
                         let mut batch = placed_copies(operations, &run_id);
+                        batch.extend(produced.take());
                         batch.extend(end.take());
                         batch
                     },
@@ -1222,6 +1263,20 @@ where
                 continue;
             }
             return Ok(finished(writer, RunFinishReason::Completed));
+        }
+        // A `submit_tool` run ends at the step that calls `submit_result`, before anything is
+        // dispatched or a stop condition is weighed, as today's loop ends it.
+        if let Some(frozen) = structured.as_ref() {
+            if let Some(submit) = broca_core::run::counted_submit(frozen, &step.message, &[]) {
+                let pending = PendingSubmit {
+                    step_id,
+                    calls: calls.clone(),
+                    submit,
+                    started: false,
+                    answered: Vec::new(),
+                };
+                return submitted(writer, seams, &admission.run_id, frozen, &pending).await;
+            }
         }
         if let Some(stop) = stop {
             return hard_stop(writer, seams, &admission.run_id, step_id, &calls, &stop).await;
@@ -2472,6 +2527,150 @@ fn terminal_with_reason(
 /// A stop condition held on a step that asked for tools. The calls are never dispatched: each
 /// gets a result saying so, and the batch and the run's end are durable together, so a crash
 /// either loses both (the resumed run takes the step again) or keeps both (the run is over).
+/// The structured output a run froze, read from its frozen render config.
+fn structured_of(
+    admission: &Admission,
+) -> Option<broca_protocol::structured_output::FrozenStructuredOutput> {
+    broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(Some(
+        &admission.render_config,
+    ))
+}
+
+/// What a resume finds of a submit the crash stopped before the run's end: the open turn's
+/// step, its calls, the counted `submit_result` call, and whether the turn's batch already
+/// started with the calls already answered. Today's loop writes a submit's result, batch and
+/// end in one barrier, so a started batch here is a torn write of that barrier; its answered
+/// calls keep their results, and a call that has one isn't counted as the submit.
+struct PendingSubmit {
+    step_id: u64,
+    calls: Vec<ToolCall>,
+    submit: ToolCall,
+    started: bool,
+    answered: Vec<ToolCallId>,
+}
+
+fn pending_submit<W: Writer>(
+    writer: &W,
+    frozen: &broca_protocol::structured_output::FrozenStructuredOutput,
+) -> Option<PendingSubmit> {
+    let run = run_state(writer);
+    let open = writer.conversation().open_tool_turn()?;
+    let message = broca_protocol::content::AssistantMessage {
+        message_id: broca_protocol::MessageId(String::new()),
+        content: open.content.clone(),
+    };
+    let calls: Vec<ToolCall> = message.tool_calls().cloned().collect();
+    let answered: Vec<ToolCallId> = run.open_batch.as_ref().map_or_else(Vec::new, |batch| {
+        calls
+            .iter()
+            .filter(|call| batch.state_of(&call.tool_call_id) == Some(CallState::Terminated))
+            .map(|call| call.tool_call_id.clone())
+            .collect()
+    });
+    let existing: Vec<ToolResult> = answered.iter().map(|id| error_result(id, "")).collect();
+    let submit = broca_core::run::counted_submit(frozen, &message, &existing)?;
+    Some(PendingSubmit {
+        step_id: run.completed_steps,
+        calls,
+        submit,
+        started: run.open_batch.is_some(),
+        answered,
+    })
+}
+
+/// A structured-output result record for run `run_id`.
+fn structured_result(
+    run_id: &str,
+    result: broca_protocol::structured_output::StructuredOutputResult,
+) -> Record {
+    Record::StructuredResult(broca_session_store::record::StructuredResult {
+        run_id: run_id.into(),
+        result: serde_json::to_value(result).expect("a structured result encodes"),
+    })
+}
+
+/// A `submit_tool` run's step called `submit_result`. None of the step's calls is dispatched:
+/// the counted submit gets the runner's own result, each other call a never-run
+/// `skipped_after_submit` result, and the run's structured result is written with them and the
+/// run's end, in one barrier, as today's loop writes them.
+async fn submitted<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+    frozen: &broca_protocol::structured_output::FrozenStructuredOutput,
+    pending: &PendingSubmit,
+) -> Result<Finished, LoopError> {
+    let PendingSubmit {
+        step_id,
+        calls,
+        submit,
+        started,
+        answered,
+    } = pending;
+    let step_id = *step_id;
+    use broca_protocol::structured_output::{
+        SkippedSibling, SKIPPED_AFTER_SUBMIT, SKIPPED_AFTER_SUBMIT_MESSAGE, SUBMIT_RESULT_RECORDED,
+    };
+    let skipped = calls
+        .iter()
+        .filter(|call| call.tool_call_id != submit.tool_call_id)
+        .map(|call| SkippedSibling::new(call.tool_call_id.0.clone(), call.tool_name.clone()))
+        .collect();
+    let batch_id = format!("{run_id}-b{step_id}");
+    let now = (seams.now_ms)();
+    let mut records = vec![structured_result(
+        run_id,
+        broca_protocol::structured_output::result(frozen, true, Some(&submit.input), None, skipped),
+    )];
+    if !started {
+        records.push(Record::BatchStart(BatchStart {
+            run_id: run_id.into(),
+            batch_id: batch_id.clone(),
+            step_id,
+            planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+        }));
+    }
+    for call in calls {
+        if answered.contains(&call.tool_call_id) {
+            continue;
+        }
+        if call.tool_call_id == submit.tool_call_id {
+            let result = ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::Text {
+                    text: SUBMIT_RESULT_RECORDED.into(),
+                },
+                is_error: false,
+            };
+            terminal(
+                &mut records,
+                run_id,
+                &batch_id,
+                result,
+                CallOutcome::Completed,
+                now,
+            );
+        } else {
+            terminal_with_reason(
+                &mut records,
+                run_id,
+                &batch_id,
+                error_result(&call.tool_call_id, SKIPPED_AFTER_SUBMIT_MESSAGE),
+                CallOutcome::MaxSteps,
+                Some(SKIPPED_AFTER_SUBMIT.into()),
+                Some(now),
+            );
+        }
+    }
+    records.push(Record::BatchEnd(BatchEnd {
+        run_id: run_id.into(),
+        batch_id,
+    }));
+    records.push(run_end(writer, run_id, RunFinishReason::Completed, now));
+    append_end(writer, run_id, records).await?;
+    Ok(finished(writer, RunFinishReason::Completed))
+}
+
 async fn hard_stop<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,

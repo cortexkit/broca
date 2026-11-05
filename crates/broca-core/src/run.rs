@@ -12917,7 +12917,8 @@ async fn finalize_hard_stop(
 
 /// The text parts of `message` joined exactly as `run.result` joins them: in order, with
 /// nothing inserted.
-fn joined_text(message: &AssistantMessage) -> String {
+/// A message's text parts joined as one answer: what a `final_text` run validates.
+pub fn joined_text(message: &AssistantMessage) -> String {
     message
         .content
         .iter()
@@ -12933,7 +12934,9 @@ fn joined_text(message: &AssistantMessage) -> String {
 
 /// The `submit_result` call that ends a `submit_tool` run at this step: the first one the
 /// model emitted whose arguments parsed. `None` for a `final_text` run or a step without one.
-fn counted_submit(
+/// The `submit_result` call that ends a `submit_tool` run: the step's first one that wasn't
+/// refused for unparseable arguments. `None` in any other mode.
+pub fn counted_submit(
     frozen: &FrozenStructuredOutput,
     message: &AssistantMessage,
     rejected: &[ToolResult],

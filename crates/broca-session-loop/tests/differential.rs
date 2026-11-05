@@ -69,6 +69,16 @@ impl Provider for ScriptedProvider {
         output().map(|script| script.limits)
     }
 
+    /// The default stateless config, carrying the run's structured output when the comparison
+    /// freezes one: both loops read it from here.
+    fn render_config_blob(&self) -> Value {
+        let mut blob = json!({ "render_config": "stateless" });
+        if let Some(structured) = structured() {
+            blob["structured_output"] = structured;
+        }
+        blob
+    }
+
     async fn step(&self, _step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         self.sent.lock().unwrap().push(opts.clone());
         let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
@@ -575,6 +585,30 @@ tokio::task_local! {
 struct OutputScript {
     limits: broca_core::output_reservation::OutputLimits,
     context_limit: u64,
+}
+
+tokio::task_local! {
+    /// The structured output the provider's frozen render config carries, as a
+    /// `FrozenStructuredOutput` value. `None` runs without structured output.
+    static STRUCTURED: Option<Value>;
+}
+
+/// The structured output the comparison running in this task freezes.
+fn structured() -> Option<Value> {
+    STRUCTURED.try_with(Clone::clone).ok().flatten()
+}
+
+/// Structured output in `mode`, delivered without provider enforcement, so its schema never
+/// needs the strict-grammar downgrade.
+fn unconstrained(mode: &str) -> Value {
+    json!({
+        "mode": mode,
+        "name": "result",
+        "schema_jcs": r#"{"properties":{"answer":{"type":"integer"}},"required":["answer"],"type":"object"}"#,
+        "enforcement": "best_effort",
+        "reason": "route_unsupported",
+        "delivery": "unconstrained",
+    })
 }
 
 /// The output script the comparison running in this task uses.
@@ -4485,6 +4519,115 @@ async fn a_compacted_step_whose_cap_would_pass_the_context_limit_is_lowered() {
         .scope(
             Some(lowering()),
             compare_compacted(measured_scenario(), script),
+        )
+        .await;
+}
+
+fn submit_call(id: &str, answer: Value) -> ContentBlock {
+    call(
+        id,
+        broca_protocol::structured_output::SUBMIT_RESULT_TOOL,
+        answer,
+    )
+}
+
+fn single(steps: Vec<Vec<NormalizedEvent>>) -> Scenario {
+    Scenario {
+        input: vec![user("answer as JSON")],
+        manifest: None,
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps,
+    }
+}
+
+#[tokio::test]
+async fn a_final_text_run_records_its_valid_answer() {
+    STRUCTURED
+        .scope(
+            Some(unconstrained("final_text")),
+            compare(single(vec![text_step("a1", r#"{"answer":1}"#)])),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_final_text_run_records_an_answer_that_is_not_json() {
+    STRUCTURED
+        .scope(
+            Some(unconstrained("final_text")),
+            compare(single(vec![text_step("a1", "one")])),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_final_text_run_records_only_its_last_answer() {
+    STRUCTURED
+        .scope(
+            Some(unconstrained("final_text")),
+            compare(single(vec![
+                answer(
+                    "a1",
+                    vec![
+                        ContentBlock::Text {
+                            text: "reading".into(),
+                        },
+                        call("c1", "read", json!({"path": "a"})),
+                    ],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", r#"{"answer":2}"#),
+            ])),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_submit_ends_the_run_before_its_siblings_run() {
+    STRUCTURED
+        .scope(
+            Some(unconstrained("submit_tool")),
+            compare(single(vec![answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    submit_call("c2", json!({"answer": 3})),
+                    submit_call("c3", json!({"answer": 4})),
+                ],
+                FinishReason::ToolCalls,
+            )])),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_submit_survives_every_crash_cut() {
+    STRUCTURED
+        .scope(
+            Some(unconstrained("submit_tool")),
+            compare_every_cut(single(vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                answer(
+                    "a2",
+                    vec![submit_call("c2", json!({"answer": "wrong type"}))],
+                    FinishReason::ToolCalls,
+                ),
+            ])),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_submit_tool_run_that_never_submits_records_no_value() {
+    STRUCTURED
+        .scope(
+            Some(unconstrained("submit_tool")),
+            compare(single(vec![text_step("a1", "done")])),
         )
         .await;
 }
