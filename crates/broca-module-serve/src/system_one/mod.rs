@@ -28,6 +28,7 @@ mod images;
 pub use images::ImageResolver;
 pub(crate) use images::PreparedImages;
 pub mod credential;
+pub mod openai_decisions;
 pub mod typesafe;
 pub mod workers_ai;
 
@@ -65,6 +66,8 @@ pub const JEV_1_13_0: &str = cortexkit_role_classifier::provider::catalog_ids::J
 pub const CLEF: &str = cortexkit_role_classifier::provider::catalog_ids::CLEF;
 /// The catalog id of Cloudflare Workers AI's Clef-flash.
 pub const CLEF_FLASH: &str = cortexkit_role_classifier::provider::catalog_ids::CLEF_FLASH;
+/// The catalog row for OpenAI's Decisions endpoint, distinct from a chat model row.
+pub const OPENAI_DECISIONS: &str = "openai/gpt-6-luna-decisions";
 
 /// The code a call is answered with when serving it failed inside broca (a panic, or the
 /// batch store refusing a write). Transient: the caller re-sends, and the stored outcomes
@@ -153,6 +156,13 @@ pub enum ProviderReply {
         code: Option<u64>,
         retry_after_ms: Option<u64>,
     },
+    /// An adapter-classified error. Provider codes remain diagnostic, separate from the
+    /// role's error code; billing distinguishes rejected requests from possibly paid ones.
+    ClassifiedError {
+        error: cortexkit_role_classifier::errors::ItemError,
+        provider_code: Option<String>,
+        may_have_spent: bool,
+    },
     /// No reply: the attempt ran out of time, or the connection failed in a way that may
     /// have come after the request was sent, so the provider may have billed it.
     Transport(String),
@@ -220,6 +230,17 @@ pub(crate) fn consent_model_labels(row: &ModelBatchRow) -> Option<(&str, &str)> 
 }
 
 impl ModelPin {
+    /// OpenAI Decisions, with a module image bound and OpenAI's 400-question limit.
+    pub fn openai_decisions(provider: Arc<dyn ClassifierProvider>) -> Self {
+        Self {
+            catalog_id: OPENAI_DECISIONS.to_owned(),
+            provider_model: openai_decisions::MODEL.to_owned(),
+            max_questions: openai_decisions::MAX_QUESTIONS,
+            images_max: Some(openai_decisions::MAX_IMAGES),
+            provider,
+        }
+    }
+
     /// TypeSafe's Jev 1.13.0, text only. Its question limit is the role's own question-id
     /// space at the clef bound, since TypeSafe states none.
     pub fn jev(provider: Arc<dyn ClassifierProvider>) -> Self {
@@ -871,6 +892,9 @@ mod tests;
 #[cfg(test)]
 #[path = "workers_ai_tests.rs"]
 mod workers_ai_tests;
+
+#[cfg(test)]
+mod openai_decisions_tests;
 
 #[cfg(test)]
 mod tool_admission_tests {

@@ -26,10 +26,19 @@ pub(crate) fn json_dump_text_bytes<'a>(
     if text.len() < 200 {
         return None;
     }
-    let whole_json = matches!(text.as_bytes().first(), Some(b'{' | b'['))
-        && serde_json::from_str::<serde_json::Value>(text).is_ok();
-    let escaped_json = || text.contains(r#"{\""#) && text.matches(r#"\""#).take(10).count() == 10;
-    (whole_json || escaped_json()).then_some(text.len())
+    // The whole text is a JSON object or array, or a JSON string whose content is one (JSON
+    // encoded twice). JSON quoted inside other text, such as a code excerpt with an escaped JSON
+    // literal, doesn't count: search, grep and outline results quote source files, and source
+    // is full of it.
+    let object_or_array = |text: &str| {
+        matches!(text.as_bytes().first(), Some(b'{' | b'['))
+            && serde_json::from_str::<serde_json::Value>(text).is_ok()
+    };
+    let double_encoded = || {
+        text.starts_with('"')
+            && serde_json::from_str::<String>(text).is_ok_and(|inner| object_or_array(inner.trim()))
+    };
+    (object_or_array(text) || double_encoded()).then_some(text.len())
 }
 
 fn json_dump_exempt(tool_name: &str) -> bool {
@@ -203,25 +212,31 @@ pub(crate) mod tests {
         );
     }
 
+    /// A code excerpt quoting an escaped JSON literal is not a dump, however many escaped quotes
+    /// it holds: search, grep and outline results quote source files, which hold such literals.
     #[test]
-    fn tool_result_json_dump_escaped_quote_boundary_9_and_10() {
-        for quotes in [9, 10] {
-            let text = format!(
-                r#"prefix {{\"{}{}"#,
-                "x".repeat(200),
-                r#"\""#.repeat(quotes - 1)
-            );
-            assert_eq!(text.matches(r#"\""#).count(), quotes);
-            assert_eq!(
-                json_dump_text_bytes("search", std::iter::once(text.as_str())),
-                (quotes == 10).then_some(text.len())
-            );
-        }
-        let no_brace = format!(r#"prefix {}{}"#, "x".repeat(200), r#"\""#.repeat(10));
+    fn tool_result_json_dump_ignores_json_quoted_inside_text() {
+        let excerpt = format!(
+            "crates/x/src/lib.rs:12 [lexical match]\n    let body = \"{{\\\"op\\\":\\\"store\\\",{}}}\";\n",
+            r#"\"k\":\"v\","#.repeat(20)
+        );
+        assert!(excerpt.matches(r#"\""#).count() >= 10 && excerpt.len() >= 200);
         assert_eq!(
-            json_dump_text_bytes("search", std::iter::once(no_brace.as_str())),
+            json_dump_text_bytes("search", std::iter::once(excerpt.as_str())),
             None
         );
+    }
+
+    /// JSON encoded twice, as a JSON string whose content is an object or array, is a dump.
+    #[test]
+    fn tool_result_json_dump_counts_double_encoded_json() {
+        for inner in [json_object(200), format!(r#"["{}"]"#, "x".repeat(196))] {
+            let text = serde_json::to_string(&inner).unwrap();
+            assert_eq!(
+                json_dump_text_bytes("search", std::iter::once(text.as_str())),
+                Some(text.len())
+            );
+        }
     }
 
     #[test]

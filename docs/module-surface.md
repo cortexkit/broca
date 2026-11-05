@@ -190,6 +190,11 @@ A consumer can be both. The surface is **session-centric**: consumers address
   the inbound connection. Scoped outgoing tool/catalog routes select the frozen scope;
   unscoped routes carry no folder. Compaction, hook and vault module-level routes are
   unscoped. Neither storage roots nor the namespace are sent as wire bind projects.
+  Tool routes to the plan's compaction or step-transform providers bind the session's own
+  harness and session; other tool modules bind `runner` with the unchanged session string.
+  Keeping one `(harness, session)` bind pair per session at a provider relies on the session
+  string being unique per consumer and provider, which every caller today satisfies
+  (Core names each session with its own task id).
 - **Run = one turn's loop execution** — a user message in → the agent loops until its
   response → a terminal. Each run begins with a `RunStarted` **episode marker** (input +
   frozen config + `origin` + `submission_id`). Runs **accumulate** in the lineage WAL:
@@ -1119,8 +1124,9 @@ variants select the corresponding native tier ids. Argon tiers use uppercase `th
 
 broca also serves the `classifier/v1` role (`cortexkit-role-classifier`, with the
 batch rules of `cortexkit-model-batch`) from the same management surface, for the
-decision models it routes: TypeSafe's `typesafe/jev-1.13.0`, and Cloudflare Workers
-AI's `cloudflare-workers-ai/@cf/cloudflare/clef` and `.../clef-flash` in this build.
+decision models it routes: TypeSafe's `typesafe/jev-1.13.0`, Cloudflare Workers
+AI's `cloudflare-workers-ai/@cf/cloudflare/clef` and `.../clef-flash`, and OpenAI's
+`openai/gpt-6-luna-decisions` in this build.
 The manifest lists `classifier/v1` in `capabilities.provides`.
 
 - **One route, one role.** A `route.open` declaring `role_versions
@@ -1167,8 +1173,18 @@ The manifest lists `classifier/v1` in `capabilities.provides`.
   https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/cloudflare/{model}`
   with `apikey:cloudflare-workers-ai`, whose vault record carries the account id
   beside the token; their answers are read from the `result` member of Cloudflare's
-  reply envelope. `providers.<id>.base_url` (`typesafe`, `cloudflare-workers-ai`)
-  replaces either base. Workers AI errors map by their `errors[].code` first: a
+  reply envelope. OpenAI Decisions uses `POST https://api.openai.com/v1/decisions`
+  with `gpt-6-luna` and the vault credential `apikey:openai`, resolved through
+  `vault.credential_ids` aliases like the other System One credentials.
+  `providers.<id>.base_url` (`typesafe`, `cloudflare-workers-ai`, `openai`)
+  replaces the corresponding base. The OpenAI override also applies to chat calls
+  using that provider id. Decisions requests disable prompt caching with explicit
+  mode and no marked boundaries, so frozen input-only billing remains correct.
+  Unexpected nonzero cache usage warns without discarding answers; cache counts
+  never enter the classifier reply. OpenAI 429/5xx are transient, 401 is
+  `auth_required`, and other 4xx are permanent; its diagnostic error code stays
+  in the message and provider health metric, and `Retry-After` is preserved.
+  Workers AI errors map by their `errors[].code` first: a
   daily allocation used up (3036) or an account not entitled (5035, 5016, 3023)
   ends the whole batch, is never recorded for an item, and is refused at admission
   when the call's first provider call meets it.

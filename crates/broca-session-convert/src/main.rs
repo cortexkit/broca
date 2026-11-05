@@ -19,6 +19,11 @@
 //! checkpoint gives the state folding the whole log gives: at every split point of a short log,
 //! and at its ends and 8 points between them for a longer one.
 //!
+//! `session-convert entries <path>...`: for every session log on the current compaction
+//! contract, compares today's `session.entries` projection with the entries the new format serves
+//! from the converted records, from the open log and again after sealing at the newest possible
+//! cut. Every entry must be equal, digests included.
+//!
 //! Point it only at a copy of a state root (an APFS clone, `cp -c`), never at live files: it opens
 //! each log read-only, but a measurement run should never share a disk path with the daemon.
 
@@ -30,11 +35,15 @@ use broca_session_convert::inverse::{comparable, first_difference, invert, witho
 use broca_session_convert::measure::{append_log, measure};
 use broca_session_convert::split::{check_splits, split_points};
 use broca_session_convert::{convert, Tally};
+use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::codec::Digest;
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::frame::{FrameKey, FRAME_OVERHEAD};
-use broca_session_store::record::{CancelPoint, Stream};
+use broca_session_store::keys::DeploymentKey;
+use broca_session_store::record::{CancelPoint, Record, Stream};
+use broca_session_store::session::Session;
 use broca_wal::FramedRecord;
+use futures::executor::block_on;
 use serde::Serialize;
 
 /// Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
@@ -139,7 +148,8 @@ fn usage() -> ! {
         "usage: session-convert measure [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert check [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
          session-convert append --dir SCRATCH [--sample N] [--out FILE] PATH...\n       \
-         session-convert split [--dir SCRATCH] [--out FILE] [--limit N] PATH..."
+         session-convert split [--dir SCRATCH] [--out FILE] [--limit N] PATH...\n       \
+         session-convert entries [--dir SCRATCH] [--out FILE] [--limit N] PATH..."
     );
     std::process::exit(64);
 }
@@ -235,7 +245,204 @@ fn main() {
         "measure" => run_measure(&args),
         "append" => run_append(&args),
         "split" => run_split(&args),
+        "seal" => run_seal(&args),
+        "entries" => run_entries(&args),
         _ => usage(),
+    }
+}
+
+#[derive(Default, Serialize)]
+struct EntriesReport {
+    logs: u64,
+    mode3_logs: u64,
+    /// Today's entries for those logs.
+    entries: u64,
+    /// Entries the new format serves equal to today's, from the open log...
+    equal_open: u64,
+    /// ...and again from a session written to memory and sealed at its newest possible cut, so
+    /// most entries are read back from sealed segments.
+    equal_sealed: u64,
+    sealed_logs: u64,
+    /// Entries whose id resolves back to their ordinal through `find_message` after sealing.
+    ids_resolved: u64,
+    /// Of today's entries, how many carry each fact, so an equal count above is known to
+    /// cover them.
+    with_notice: u64,
+    with_usage: u64,
+    with_generated_under: u64,
+    with_completed_at: u64,
+    with_delivered: u64,
+    tagged: u64,
+    /// The first difference of each mismatching log, by path.
+    mismatches: BTreeMap<String, u64>,
+    failures: BTreeMap<String, u64>,
+}
+
+/// For every mode-3 session: today's `session.entries` projection against the entries the new
+/// format serves from the converted records, first from the open log, then after sealing.
+/// Every entry must be equal, digests included.
+fn run_entries(args: &Args) {
+    use broca_session_convert::entry_facts;
+    let mut report = EntriesReport::default();
+    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    each_log(args, |item| {
+        let Item::Log {
+            name, old: Ok(old), ..
+        } = item
+        else {
+            return;
+        };
+        report.logs += 1;
+        let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
+        if !broca_core::is_mode3_log(&records) {
+            return;
+        }
+        report.mode3_logs += 1;
+        let mut fail = |what: &str, e: String| {
+            let key: String = format!("{what}: {e}").chars().take(100).collect();
+            *report.failures.entry(key).or_default() += 1;
+        };
+        let Some(lineage) = old.lineage.clone() else {
+            return fail("lineage", "a mode-3 log has no lineage frame".into());
+        };
+        let today = match broca_core::compaction_v2::transcript::project(&old, &lineage) {
+            Ok(transcript) => transcript.entries,
+            Err(e) => return fail("today's projection", e),
+        };
+        let today: Vec<serde_json::Value> = today
+            .iter()
+            .map(|entry| serde_json::to_value(entry).expect("entries serialize"))
+            .collect();
+        let converted = match convert_log(&old) {
+            Ok(converted) => converted,
+            Err(e) => return fail("convert", e.0),
+        };
+        report.entries += today.len() as u64;
+        for entry in &today {
+            report.with_notice += u64::from(!entry["notice"].is_null());
+            report.with_usage += u64::from(!entry["usage"].is_null());
+            report.with_generated_under += u64::from(!entry["generated_under"].is_null());
+            report.with_completed_at += u64::from(!entry["completed_at"].is_null());
+            let parts = entry["parts"].as_array().cloned().unwrap_or_default();
+            report.with_delivered += u64::from(
+                parts
+                    .iter()
+                    .any(|p| p["delivered"].as_array().is_some_and(|d| !d.is_empty())),
+            );
+            report.tagged += u64::from(parts.iter().any(|p| !p["tag"].is_null()));
+        }
+        let compare = |served: &[broca_session_store::session::StoredEntry],
+                       mismatches: &mut BTreeMap<String, u64>|
+         -> u64 {
+            if served.len() != today.len() {
+                *mismatches
+                    .entry(format!(
+                        "{} entries served, {} today",
+                        served.len(),
+                        today.len()
+                    ))
+                    .or_default() += 1;
+                return 0;
+            }
+            let mut equal = 0;
+            for (stored, expected) in served.iter().zip(&today) {
+                let got = match entry_facts::project(stored) {
+                    Ok(entry) => serde_json::to_value(entry).expect("entries serialize"),
+                    Err(e) => {
+                        *mismatches.entry(format!("project: {e}")).or_default() += 1;
+                        return equal;
+                    }
+                };
+                if &got == expected {
+                    equal += 1;
+                } else {
+                    let path = broca_session_convert::inverse::first_difference(&got, expected, "")
+                        .unwrap_or_else(|| "?".into());
+                    *mismatches.entry(path).or_default() += 1;
+                    return equal;
+                }
+            }
+            equal
+        };
+        // From the records alone, folded in memory as the open log would be.
+        let served = block_on(async {
+            let backend = MemoryBackend::default();
+            let addr = SessionAddr(name.clone());
+            let triple = triple(&name);
+            let mut session =
+                Session::create(&backend, addr.clone(), triple.clone(), &deployment, false)
+                    .await
+                    .map_err(|e| format!("create: {e:?}"))?;
+            let mut run_inputs = Vec::new();
+            for record in &converted.records {
+                let seq = session
+                    .append(std::slice::from_ref(record), false)
+                    .await
+                    .map_err(|e| format!("append {}: {e:?}", record.name()))?;
+                if matches!(record, Record::Input(input) if input.placement == broca_session_store::record::Placement::RunInput)
+                {
+                    run_inputs.push(seq);
+                }
+            }
+            let open = session
+                .entries(1, usize::MAX)
+                .await
+                .map_err(|e| format!("entries: {e:?}"))?;
+            let mut sealed = false;
+            for cut in run_inputs.iter().rev() {
+                match session.seal(Some(*cut), 0).await {
+                    Ok(_) => {
+                        sealed = true;
+                        break;
+                    }
+                    Err(broca_session_store::session::SessionError::BadCut(_)) => continue,
+                    Err(e) => return Err(format!("seal: {e:?}")),
+                }
+            }
+            session.close().await.map_err(|e| format!("close: {e:?}"))?;
+            let loaded = Session::load(&backend, addr, &triple, &deployment)
+                .await
+                .map_err(|e| format!("load: {e:?}"))?;
+            let after = loaded
+                .entries(1, usize::MAX)
+                .await
+                .map_err(|e| format!("entries after seal: {e:?}"))?;
+            let mut resolved = 0;
+            for entry in &after {
+                let Some(facts) = &entry.state.facts else {
+                    continue;
+                };
+                let found = loaded
+                    .find_message(&facts.mid)
+                    .await
+                    .map_err(|e| format!("find {}: {e:?}", facts.mid))?;
+                if found != Some(entry.ordinal) {
+                    return Err(format!(
+                        "{} resolves to {found:?}, not {}",
+                        facts.mid, entry.ordinal
+                    ));
+                }
+                resolved += 1;
+            }
+            Ok::<_, String>((open, sealed, after, resolved))
+        });
+        let (open, sealed, after, resolved) = match served {
+            Ok(served) => served,
+            Err(e) => return fail("session", e),
+        };
+        report.equal_open += compare(&open, &mut report.mismatches);
+        report.sealed_logs += u64::from(sealed);
+        report.ids_resolved += resolved;
+        report.equal_sealed += compare(&after, &mut report.mismatches);
+    });
+    write_report(&report, args.out_file.as_deref());
+}
+
+fn triple(name: &str) -> broca_session_store::head::SessionTriple {
+    broca_session_store::head::SessionTriple {
+        project_root: "/entries".into(),
+        harness: "entries".into(),
+        session: name.into(),
     }
 }
 
@@ -268,7 +475,7 @@ fn run_check(args: &Args) {
                 return;
             }
         };
-        let converted = match convert(&old) {
+        let converted = match convert_log(&old) {
             Ok(converted) => converted,
             Err(e) => {
                 *report.failures.entry(format!("convert: {e}")).or_default() += 1;
@@ -384,7 +591,7 @@ fn run_prompt(args: &Args) {
                 return;
             }
         };
-        let Ok(converted) = convert(&old) else {
+        let Ok(converted) = convert_log(&old) else {
             *report.fold_refused.entry("convert".into()).or_default() += 1;
             return;
         };
@@ -432,7 +639,7 @@ fn run_trace(args: &Args) {
             return;
         };
         println!("== {name}");
-        for framed in &old {
+        for framed in old.iter() {
             let kind = serde_json::to_value(&framed.record)
                 .ok()
                 .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
@@ -444,7 +651,7 @@ fn run_trace(args: &Args) {
             .map(|s| s.prompt)
             .unwrap_or_default();
         let mut conversation = Conversation::new(!broca_core::is_mode3_log(&records));
-        if let Ok(converted) = convert(&old) {
+        if let Ok(converted) = convert_log(&old) {
             for record in converted
                 .records
                 .iter()
@@ -532,14 +739,14 @@ enum OpsOutcome {
 
 /// Folds one log's converted ledger with the new operational fold, and compares the latest
 /// run's state with what today's replay derives from the same records.
-fn compare_ops(old: &[FramedRecord]) -> OpsOutcome {
+fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
     use broca_session_store::fold::operations::{CallState, Operations, Resolution};
     let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
     let today = match broca_core::replay::replay(&records) {
         Ok(state) => state,
         Err(e) => return OpsOutcome::ReplayRefused(e.to_string().chars().take(80).collect()),
     };
-    let Ok(converted) = convert(old) else {
+    let Ok(converted) = convert(old, lineage) else {
         return OpsOutcome::FoldRefused("convert".into());
     };
     let mut operations = Operations::default();
@@ -750,7 +957,7 @@ fn run_ops(args: &Args) {
         let mut log_equal = true;
         for end in ends {
             report.compared += 1;
-            match compare_ops(&old[..end]) {
+            match compare_ops(&old[..end], old.lineage.as_deref()) {
                 OpsOutcome::ReplayRefused(reason) => {
                     *report.replay_refused.entry(reason).or_default() += 1;
                 }
@@ -814,9 +1021,9 @@ impl Measuring {
     /// Converts and measures one old log. `name` identifies it in errors, and its frames are
     /// encrypted with `name` as their authenticated data, the way a real log's frames are bound
     /// to that log. `size` is its size as stored today.
-    fn log(&mut self, name: &str, size: u64, old: &[FramedRecord]) {
+    fn log(&mut self, name: &str, size: u64, old: &OldLog) {
         let report = &mut self.report;
-        for framed in old {
+        for framed in old.iter() {
             let bytes = serde_json::to_vec(&framed.record).map_or(0, |v| v.len());
             let kind = serde_json::to_value(&framed.record)
                 .ok()
@@ -828,7 +1035,7 @@ impl Measuring {
         }
 
         let started = Instant::now();
-        let converted = match convert(old) {
+        let converted = match convert_log(old) {
             Ok(converted) => converted,
             Err(e) => return self.fail(name, format!("convert: {e}")),
         };
@@ -931,10 +1138,46 @@ enum Item {
         name: String,
         /// Its size as stored today.
         size: u64,
-        old: Result<Vec<FramedRecord>, String>,
+        old: Result<OldLog, String>,
         read_ms: u128,
     },
     Note(String, String),
+}
+
+/// One of today's logs: its records, and its lineage id, which today's message ids carry.
+struct OldLog {
+    records: Vec<FramedRecord>,
+    lineage: Option<String>,
+}
+
+impl std::ops::Deref for OldLog {
+    type Target = [FramedRecord];
+    fn deref(&self) -> &[FramedRecord] {
+        &self.records
+    }
+}
+
+/// Converts a log with its own lineage, so converted messages keep today's ids.
+fn convert_log(
+    old: &OldLog,
+) -> Result<broca_session_convert::Converted, broca_session_convert::ConvertError> {
+    convert(old, old.lineage.as_deref())
+}
+
+/// The lineage id a log's lineage frames name, or `None` for a log written before they existed.
+fn read_lineage(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut rest = bytes.as_slice();
+    while !rest.is_empty() {
+        rest = match broca_wal::framing::decode_next(rest) {
+            broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => {
+                return Some(lineage_id.to_string())
+            }
+            broca_wal::framing::DecodeStep::Record { consumed, .. } => &rest[consumed..],
+            _ => return None,
+        };
+    }
+    None
 }
 
 /// Visits every session log under the given paths: `.wal` files directly, and the members of
@@ -949,7 +1192,12 @@ fn each_log(args: &Args, mut visit: impl FnMut(Item)) {
     let mut addresses = std::collections::BTreeSet::new();
     let read = |path: &Path| {
         let started = Instant::now();
-        let old = broca_wal::replay_file(path, u64::MAX).map_err(|e| format!("read: {e}"));
+        let old = broca_wal::replay_file(path, u64::MAX)
+            .map(|records| OldLog {
+                records,
+                lineage: read_lineage(path),
+            })
+            .map_err(|e| format!("read: {e}"));
         (old, started.elapsed().as_millis())
     };
     for (index, file) in args.files.iter().enumerate() {
@@ -1068,6 +1316,33 @@ struct AppendReport {
     /// Loading a written log, in microseconds: read the file, read and decrypt every frame, and
     /// fold both streams.
     load_us: Percentiles,
+    /// Microseconds per seal (a cut, then a ledger seal), each followed by a reload that must give
+    /// the writer's state.
+    seal_us: Percentiles,
+    /// Logs where a cut was sealed; the rest had no run input where a cut may fall.
+    cuts: u64,
+    /// Messages read back by ordinal after the seals, every one equal to what was placed, and
+    /// of those, the sealed ones and microseconds per sealed read.
+    read_back: u64,
+    expanded: u64,
+    expand_us: Percentiles,
+    /// Distinct ids found after the seals with exactly the seqs of the records naming them, and
+    /// microseconds per lookup.
+    ids_checked: u64,
+    id_lookup_us: Percentiles,
+    /// Setup parts stored across every session of the run, each once, and their bytes on disk
+    /// (encrypted).
+    setup_parts_stored: u64,
+    setup_bytes_stored: u64,
+    /// Parts written, and microseconds per write (encrypt, write, sync, rename, sync the folder).
+    /// A part an earlier session already stored writes nothing and isn't counted.
+    setup_parts_written: u64,
+    setup_put_us: Percentiles,
+    /// The cold step after the seals: logs whose kept transcript it pruned (no run unfinished),
+    /// and the open logs' total size before and after it.
+    cold_pruned: u64,
+    open_before_cold: u64,
+    open_after_cold: u64,
     /// Per log: the size of the session's log in today's format, records, barriers, total append time in milliseconds, the
     /// written log's size, and its load time in microseconds.
     per_log: Vec<(u64, u64, u64, f64, u64, u64)>,
@@ -1094,24 +1369,46 @@ fn run_append(args: &Args) {
     chosen.extend(by_size.iter().rev().take(5).map(|(_, f)| *f));
     chosen.dedup();
 
-    let key = measurement_key();
+    // Measurements encrypt with a fixed throwaway key: only the cost matters, not secrecy.
+    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let setup_key = deployment.setup_key();
+    // One setup store for the whole run, as a deployment has: later sessions reuse parts that
+    // earlier ones stored.
+    let setup_root = dir.join("append-setup");
+    let setup_backend = broca_session_store::backend::LocalBackend::new(&setup_root);
+    let setup = broca_session_store::setup::SetupStore::new(&setup_backend, &setup_key);
     let mut report = AppendReport::default();
+    let mut setup_puts = Vec::new();
+    let mut expands = Vec::new();
     let mut latencies = Vec::new();
     let mut loads = Vec::new();
+    let mut seals = Vec::new();
+    let mut id_lookups = Vec::new();
     for (index, file) in chosen.iter().enumerate() {
         let old = match broca_wal::replay_file(file, u64::MAX) {
-            Ok(old) => old,
+            Ok(records) => OldLog {
+                records,
+                lineage: read_lineage(file),
+            },
             Err(e) => {
                 eprintln!("{}: {e}", file.display());
                 continue;
             }
         };
-        let Ok(converted) = convert(&old) else {
+        let Ok(converted) = convert_log(&old) else {
             continue;
         };
-        let target = dir.join(format!("append-{index}.log"));
-        let bind = format!("{index}");
-        match append_log(&converted.records, &key, bind.as_bytes(), &target) {
+        let target = dir.join(format!("append-{index}"));
+        let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
+        let appends_in_conversation = !broca_core::is_mode3_log(&records);
+        match append_log(
+            &converted.records,
+            &converted.parts,
+            &setup,
+            appends_in_conversation,
+            &deployment,
+            &target,
+        ) {
             Ok(measured) => {
                 let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
                 report.logs += 1;
@@ -1128,13 +1425,36 @@ fn run_append(args: &Args) {
                 ));
                 latencies.extend(measured.barrier_us);
                 loads.push(measured.load_us);
+                seals.extend(measured.seal_us);
+                report.cuts += u64::from(measured.cut);
+                setup_puts.extend(measured.setup_put_us);
+                report.read_back += measured.read_back;
+                expands.extend(measured.expand_us);
+                report.ids_checked += measured.ids_checked;
+                id_lookups.extend(measured.id_lookup_us);
+                report.cold_pruned += u64::from(measured.cold_pruned);
+                report.open_before_cold += measured.open_before_cold;
+                report.open_after_cold += measured.open_after_cold;
             }
             Err(e) => report.failures.push(format!("{}: {e}", file.display())),
         }
-        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir_all(&target);
     }
     report.barrier_us = percentiles(latencies);
     report.load_us = percentiles(loads);
+    report.seal_us = percentiles(seals);
+    report.expanded = expands.len() as u64;
+    report.expand_us = percentiles(expands);
+    report.id_lookup_us = percentiles(id_lookups);
+    report.setup_parts_written = setup_puts.len() as u64;
+    report.setup_put_us = percentiles(setup_puts);
+    if let Ok(entries) = std::fs::read_dir(setup_root.join("setup")) {
+        for entry in entries.flatten() {
+            report.setup_parts_stored += 1;
+            report.setup_bytes_stored += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&setup_root);
     write_report(&report, args.out_file.as_deref());
 }
 
@@ -1161,7 +1481,7 @@ fn run_split(args: &Args) {
         };
         let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
         let appends_in_conversation = !broca_core::is_mode3_log(&records);
-        let Ok(converted) = convert(&old) else {
+        let Ok(converted) = convert_log(&old) else {
             *report.refused.entry("convert".into()).or_default() += 1;
             return;
         };
@@ -1184,5 +1504,158 @@ fn run_split(args: &Args) {
             }
         }
     });
+    write_report(&report, args.out_file.as_deref());
+}
+
+#[derive(Default, Serialize)]
+struct SealReport {
+    logs: u64,
+    records: u64,
+    /// Today's log bytes for the logs sealed.
+    today_bytes: u64,
+    transcript_segment_bytes: u64,
+    /// The transcript segments again, with finished runs' opaque reasoning pruned, as a real seal
+    /// writes them.
+    pruned_transcript_segment_bytes: u64,
+    /// Opaque payloads pruned, and their bytes.
+    pruned_payloads: u64,
+    pruned_payload_bytes: u64,
+    ledger_segment_bytes: u64,
+    blocks: u64,
+    /// Microseconds to build both segments of one log (encode, compress, encrypt).
+    build_us: Percentiles,
+    /// Microseconds to read one record by seq from a sealed segment held in memory: open the
+    /// segment (decrypt its index), then decrypt, decompress and decode one block.
+    expand_us: Percentiles,
+    /// Records that read back different from what was sealed. Must be zero.
+    mismatches: u64,
+    failures: Vec<String>,
+}
+
+/// Seals every log: builds its transcript segment and its ledger segment with the real segment
+/// format, as if every record had left the open log, and reads a sample of records back by seq.
+/// It also seals each transcript again with finished runs' opaque reasoning pruned (a run is
+/// finished when the log holds its end), which is what a real seal writes.
+fn run_seal(args: &Args) {
+    let key = broca_session_store::frame::FrameKey::new(1, &[0x5a; 32]);
+    let mut report = SealReport::default();
+    let mut builds = Vec::new();
+    let mut expands = Vec::new();
+    each_log(args, |item| {
+        let Item::Log {
+            name,
+            size,
+            old: Ok(old),
+            ..
+        } = item
+        else {
+            return;
+        };
+        let Ok(converted) = convert_log(&old) else {
+            report.failures.push(format!("{name}: convert"));
+            return;
+        };
+        let numbered: Vec<(u64, Record)> = converted
+            .records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| (index as u64 + 1, record))
+            .collect();
+        let (transcript, ledger): (Vec<_>, Vec<_>) =
+            numbered.into_iter().partition(|(_, record)| {
+                record.stream() == broca_session_store::record::Stream::Transcript
+            });
+        let meta = || broca_session_store::segment::SegmentMeta {
+            session_id: broca_session_store::codec::Id128([0; 16]),
+            created_at_ms: 0,
+            prefixes: Vec::new(),
+            leading: None,
+            trailer: None,
+            placed_before: Vec::new(),
+        };
+        report.logs += 1;
+        report.today_bytes += size;
+        let finished: std::collections::BTreeSet<&str> = ledger
+            .iter()
+            .filter_map(|(_, record)| match record {
+                Record::RunEnd(end) => Some(end.run_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let pruned: Vec<(u64, Record)> = transcript
+            .iter()
+            .map(|(seq, record)| {
+                let mut record = record.clone();
+                let run = match &record {
+                    Record::Assistant(assistant) => Some(assistant.run_id.clone()),
+                    Record::Input(input) => Some(input.run_id.clone()),
+                    _ => None,
+                };
+                if run.is_some_and(|run| finished.contains(run.as_str())) {
+                    broca_session_store::prune::prune_record(&mut record, &[0x11; 32]);
+                }
+                (*seq, record)
+            })
+            .collect();
+        for (_, record) in &pruned {
+            let stubs = match record {
+                Record::Assistant(assistant) => &assistant.pruned,
+                Record::Input(input) => &input.pruned,
+                _ => continue,
+            };
+            report.pruned_payloads += stubs.len() as u64;
+            report.pruned_payload_bytes += stubs.iter().map(|stub| stub.size).sum::<u64>();
+        }
+        if !pruned.is_empty() {
+            let object = format!("{name}/p");
+            match broca_session_store::segment::build(&key, object.as_bytes(), &pruned, meta()) {
+                Ok(bytes) => report.pruned_transcript_segment_bytes += bytes.len() as u64,
+                Err(e) => report.failures.push(format!("{name}: build pruned {e:?}")),
+            }
+        }
+        for (records, stream_name) in [(&transcript, "t"), (&ledger, "l")] {
+            if records.is_empty() {
+                continue;
+            }
+            report.records += records.len() as u64;
+            let object = format!("{name}/{stream_name}");
+            let started = Instant::now();
+            let bytes =
+                match broca_session_store::segment::build(&key, object.as_bytes(), records, meta())
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        report.failures.push(format!("{name}: build {e:?}"));
+                        continue;
+                    }
+                };
+            builds.push(started.elapsed().as_micros() as u64);
+            if stream_name == "t" {
+                report.transcript_segment_bytes += bytes.len() as u64;
+            } else {
+                report.ledger_segment_bytes += bytes.len() as u64;
+            }
+            // Up to 8 records spread over the segment, each read cold: open, then find.
+            let step = (records.len() / 8).max(1);
+            for (seq, record) in records.iter().step_by(step).take(8) {
+                let started = Instant::now();
+                let found =
+                    broca_session_store::segment::Segment::open(&bytes, &key, object.as_bytes())
+                        .and_then(|segment| segment.find(*seq));
+                expands.push(started.elapsed().as_micros() as u64);
+                match found {
+                    Ok(Some(found)) if &found == record => {}
+                    _ => report.mismatches += 1,
+                }
+            }
+            if let Ok(segment) =
+                broca_session_store::segment::Segment::open(&bytes, &key, object.as_bytes())
+            {
+                report.blocks += segment.index.blocks.len() as u64;
+            }
+        }
+    });
+    report.build_us = percentiles(builds);
+    report.expand_us = percentiles(expands);
     write_report(&report, args.out_file.as_deref());
 }

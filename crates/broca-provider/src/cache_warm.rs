@@ -43,6 +43,34 @@ pub struct CacheDeclaration {
     /// lifetime, `provider_default` when the markers carry none and the provider's default
     /// applies.
     pub basis: Option<&'static str>,
+    /// The cache lifetime the session's requests ask the provider for, when they ask for one
+    /// the provider honours: a first-party Anthropic marker's `ttl` (or the 5 minutes its API
+    /// defines for a marker without one), or first-party OpenAI's 24-hour retention. `None`
+    /// where the request names no lifetime, such as ChatGPT's backend, where `ttl_ms` is broca's
+    /// own estimate. Only this lifetime can prove a cache expired; `ttl_ms` only schedules warms.
+    pub requested_ttl_ms: Option<u64>,
+}
+
+/// See [`CacheDeclaration::requested_ttl_ms`].
+fn requested_ttl_ms(provider_id: &str, frozen: &FrozenRenderConfig) -> Option<u64> {
+    match (&frozen.cache.as_ref()?.class, frozen.family_id) {
+        (
+            CacheClass::Markers {
+                syntax: MarkerSyntax::AnthropicCacheControl,
+                ttl,
+                ..
+            },
+            WireFamilyId::AnthropicMessages,
+        ) if provider_id == FIRST_PARTY_ANTHROPIC => Some(ttl_ms(*ttl)),
+        (
+            CacheClass::Hints {
+                retention: Some(retention),
+                ..
+            },
+            WireFamilyId::OpenAiResponses,
+        ) if provider_id == "openai" && retention == "24h" => Some(86_400_000),
+        _ => None,
+    }
 }
 
 /// The marker lifetime a frozen cache policy schedules by, in milliseconds. `None` for a policy
@@ -69,12 +97,14 @@ pub fn cache_declaration(
     tool_choice: &ToolChoice,
     response_format: &ResponseFormat,
 ) -> CacheDeclaration {
+    let requested = requested_ttl_ms(provider_id, frozen);
     let unsupported = |reason: String| CacheDeclaration {
         ttl_ms: None,
         ttl_options_ms: Vec::new(),
         read_refreshes_ttl: None,
         warm: Err(reason),
         basis: None,
+        requested_ttl_ms: requested,
     };
     // These Responses backends render prompt_cache_key even without frozen.cache. The
     // request therefore carries a cache-affinity hint regardless of the optional policy;
@@ -89,6 +119,7 @@ pub fn cache_declaration(
             read_refreshes_ttl: None,
             warm: Ok(()),
             basis: None,
+            requested_ttl_ms: requested,
         };
     }
     let Some(policy) = &frozen.cache else {
@@ -131,6 +162,7 @@ pub fn cache_declaration(
                 } else {
                     "requested"
                 }),
+                requested_ttl_ms: requested,
             }
         }
         (CacheClass::Markers { ttl, omit_ttl, .. }, _) => CacheDeclaration {
@@ -146,6 +178,7 @@ pub fn cache_declaration(
             } else {
                 "requested"
             }),
+            requested_ttl_ms: requested,
         },
         (CacheClass::Hints { .. }, WireFamilyId::OpenAiResponsesChatgpt)
         | (CacheClass::Hints { .. }, WireFamilyId::OpenAiResponses)
@@ -160,6 +193,7 @@ pub fn cache_declaration(
                 read_refreshes_ttl: None,
                 warm: Ok(()),
                 basis: None,
+                requested_ttl_ms: requested,
             }
         }
         (CacheClass::Hints { .. }, _) => unsupported(format!(
@@ -380,8 +414,68 @@ mod tests {
                 read_refreshes_ttl: Some(true),
                 warm: Ok(()),
                 basis: Some("requested"),
+                requested_ttl_ms: Some(3_600_000),
             }
         );
+    }
+
+    /// Only a lifetime the request asks the provider for, and the provider honours, counts:
+    /// first-party Anthropic markers (the API defines 5 minutes for a marker without `ttl`) and
+    /// first-party OpenAI's 24-hour retention. ChatGPT's backend takes no lifetime, so its
+    /// 30-minute `ttl_ms` is broca's estimate and proves nothing.
+    #[test]
+    fn only_a_lifetime_the_request_asks_for_is_requested() {
+        let anthropic = |provider: &str, ttl, omit_ttl| {
+            let frozen = anthropic_with(Some(markers(ttl, omit_ttl)));
+            cache_declaration(provider, &frozen, &ToolChoice::Auto, &ResponseFormat::Text)
+                .requested_ttl_ms
+        };
+        assert_eq!(
+            anthropic("anthropic", CacheTtl::OneHour, false),
+            Some(3_600_000)
+        );
+        assert_eq!(
+            anthropic("anthropic", CacheTtl::FiveMinutes, true),
+            Some(300_000)
+        );
+        assert_eq!(anthropic("minimax", CacheTtl::FiveMinutes, false), None);
+
+        let responses = |family, provider: &str, retention: Option<&str>, key: bool| {
+            let mut frozen = crate::families::frozen_config_for_family(family, "model");
+            if key {
+                frozen.prompt_cache_key = Some("scope".into());
+            }
+            frozen.cache = retention.map(|retention| CachePolicy {
+                version: 1,
+                class: CacheClass::Hints {
+                    cache_key: "k".into(),
+                    retention: Some(retention.into()),
+                },
+            });
+            let declared =
+                cache_declaration(provider, &frozen, &ToolChoice::Auto, &ResponseFormat::Text);
+            (declared.ttl_ms, declared.requested_ttl_ms)
+        };
+        let chatgpt = WireFamilyId::OpenAiResponsesChatgpt;
+        let platform = WireFamilyId::OpenAiResponses;
+        assert_eq!(
+            responses(chatgpt, "openai", None, true),
+            (Some(1_800_000), None)
+        );
+        assert_eq!(
+            responses(chatgpt, "openai", Some("24h"), true),
+            (Some(1_800_000), None)
+        );
+        assert_eq!(
+            responses(platform, "openai", Some("24h"), true),
+            (Some(1_800_000), Some(86_400_000))
+        );
+        assert_eq!(
+            responses(platform, "openai", Some("in-memory"), false).1,
+            None
+        );
+        assert_eq!(responses(platform, "openai", None, true).1, None);
+        assert_eq!(responses(platform, "gateway", Some("24h"), false).1, None);
     }
 
     #[test]

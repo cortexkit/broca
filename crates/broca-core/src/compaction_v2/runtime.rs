@@ -91,6 +91,10 @@ struct Lane {
     seq: u64,
     ready: bool,
     setup_due: bool,
+    /// Whether the Setup the provider accepted listed `cache_expired` in its `detects`. A ride
+    /// claims the cause only then, so the provider never hears a cause it was told broca can't
+    /// detect.
+    detects_cache_expired: bool,
 }
 
 impl Default for Lane {
@@ -99,6 +103,7 @@ impl Default for Lane {
             seq: 0,
             ready: false,
             setup_due: true,
+            detects_cache_expired: false,
         }
     }
 }
@@ -218,6 +223,12 @@ impl Runtime {
         let mut lane = self.lane.lock().await;
         lane.ready = false;
         lane.setup_due = true;
+    }
+
+    /// Whether the provider's accepted Setup listed `cache_expired` as a cause broca detects.
+    pub async fn detects_cache_expired(&self) -> bool {
+        let lane = self.lane.lock().await;
+        lane.ready && lane.detects_cache_expired
     }
 
     pub async fn ensure_setup(&self, plane: &dyn Plane, request: &SetupRequest) -> bool {
@@ -374,6 +385,7 @@ async fn setup(lane: &mut Lane, plane: &dyn Plane, request: &SetupRequest) -> bo
         }
         Err(_) => false,
     };
+    lane.detects_cache_expired = lane.ready && request.detects.contains(&RideCause::CacheExpired);
     lane.setup_due = false;
     lane.ready
 }
@@ -395,8 +407,12 @@ async fn call<Q: Serialize, A: DeserializeOwned>(
     serde_json::from_str(value.get()).map_err(|_| CallError::Unavailable)
 }
 
-pub fn detects() -> Vec<RideCause> {
-    vec![
+/// The ride causes broca can detect. `cache_expired` is listed only when the session's requests
+/// ask the provider for a cache lifetime it honours, the only lifetime that can prove expiry;
+/// elsewhere (ChatGPT's backend, gateways) broca can't tell, and an unlisted cause tells the
+/// provider so.
+pub fn detects(cache_expired: bool) -> Vec<RideCause> {
+    let mut causes = vec![
         RideCause::CacheExpired,
         RideCause::ChainReset,
         RideCause::ModelChange,
@@ -404,7 +420,11 @@ pub fn detects() -> Vec<RideCause> {
         RideCause::AccountChange,
         RideCause::SurfaceChange,
         RideCause::OverLimit,
-    ]
+    ];
+    if !cache_expired {
+        causes.retain(|cause| *cause != RideCause::CacheExpired);
+    }
+    causes
 }
 
 #[cfg(test)]

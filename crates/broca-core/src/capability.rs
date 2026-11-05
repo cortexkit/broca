@@ -51,6 +51,14 @@ pub struct ToolManifest {
     /// Empty for a session admitted without one, and never filled from a live catalog: a
     /// resumed run must read replies by what its session actually admitted.
     provider_declarations: HashMap<String, broca_wal::FrozenProviderDeclarations>,
+    /// The providers whose catalog the plan fetch answered at admission. Each was fetched over
+    /// a route declaring `tool-provider: v1`, so its dispatch route declares the same role.
+    fetched_providers: HashSet<String>,
+    /// The session's compaction provider, from the plan's compaction item. Its tool route binds
+    /// the session's own identity, so it sees the calls and the compaction as one session.
+    compaction_provider: Option<String>,
+    /// Hook routes bind the session's own identity; tools at those same modules must agree.
+    hook_providers: HashSet<String>,
 }
 
 impl ToolManifest {
@@ -85,6 +93,9 @@ impl ToolManifest {
             provider_presets: HashMap::new(),
             provider_replies: HashMap::new(),
             provider_declarations: HashMap::new(),
+            fetched_providers: HashSet::new(),
+            compaction_provider: None,
+            hook_providers: HashSet::new(),
         }
     }
 
@@ -94,6 +105,15 @@ impl ToolManifest {
         manifest: &broca_wal::PlanManifest,
     ) -> Result<Self, serde_json::Error> {
         let plan: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text())?;
+        self.compaction_provider = plan["compaction_item"]["provider"]
+            .as_str()
+            .map(str::to_owned);
+        self.hook_providers = plan["step_transform_items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["provider"].as_str().map(str::to_owned))
+            .collect();
         if let Some(items) = plan["tool_items"].as_array() {
             for item in items {
                 if let (Some(provider), Some(preset)) =
@@ -105,6 +125,9 @@ impl ToolManifest {
             }
         }
         for fetch in &manifest.fetches {
+            if matches!(fetch.outcome, broca_wal::FetchOutcome::Answered { .. }) {
+                self.fetched_providers.insert(fetch.provider.clone());
+            }
             if let broca_wal::FetchOutcome::Answered {
                 declarations_frozen: Some(declarations),
                 ..
@@ -144,6 +167,23 @@ impl ToolManifest {
         provider: &str,
     ) -> Option<&broca_wal::FrozenProviderDeclarations> {
         self.provider_declarations.get(provider)
+    }
+
+    /// Whether `provider` is the session's compaction provider, named by the plan's compaction
+    /// item.
+    pub fn is_compaction_provider(&self, provider: &str) -> bool {
+        self.compaction_provider.as_deref() == Some(provider)
+    }
+
+    /// Whether another role at this provider already binds the session's own identity.
+    pub fn uses_session_identity(&self, provider: &str) -> bool {
+        self.is_compaction_provider(provider) || self.hook_providers.contains(provider)
+    }
+
+    /// Whether the session's plan fetch answered `provider`'s catalog at admission. False for a
+    /// session admitted without a plan manifest.
+    pub fn provider_fetched(&self, provider: &str) -> bool {
+        self.fetched_providers.contains(provider)
     }
 
     /// The frozen tool item's preset for the provider a call actually routes to.

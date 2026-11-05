@@ -17,8 +17,13 @@ broca-core = { path = "../broca-core" }
 broca-protocol = { path = "../broca-protocol" }
 broca-session-store = { path = "../broca-session-store" }
 broca-wal = { path = "../broca-wal" }
+cortexkit-role-compaction.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true
 sha2.workspace = true
 zstd = "0.14"
+futures = { workspace = true, features = ["executor"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

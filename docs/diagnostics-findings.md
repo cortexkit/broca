@@ -81,9 +81,10 @@ A tool result is a raw JSON dump when all three hold:
    return the caller's own data or JSON on purpose.
 2. Its model-visible text (the text parts joined, images excluded), trimmed of
    surrounding whitespace, is at least 200 bytes.
-3. Either the whole trimmed text parses as a JSON object or array, or it contains
-   the 3-byte sequence `{\"` and at least 10 occurrences of the 2-byte sequence
-   `\"`, which is JSON escaped inside text.
+3. The whole trimmed text parses as a JSON object or array, or as a JSON string
+   whose content is one (JSON encoded twice). JSON quoted inside other text, such
+   as an escaped literal in a code excerpt, doesn't count: search, grep and
+   outline results quote source files.
 
 The tool allowlist and byte floor are checked before attempting a JSON parse.
 Each finding's key is a compact JSON pair `[module_id,tool_name]`; samples name

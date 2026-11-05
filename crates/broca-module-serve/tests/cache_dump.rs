@@ -242,6 +242,71 @@ fn sse(events: Vec<Value>) -> Vec<u8> {
         .collect::<String>()
         .into_bytes()
 }
+
+fn mode3_manifest() -> Arc<broca_wal::PlanManifest> {
+    Arc::new(broca_wal::PlanManifest {
+        rich_ui: None,
+        plan: broca_wal::OpaqueJson::from_json_text(
+            json!({
+                "compaction_item":{"provider":"compactor","preset":"head","params":{}},
+                "composition":{},"render_tags":true
+            })
+            .to_string(),
+        )
+        .unwrap(),
+        plan_identity: "mode3".into(),
+        composition_digest: "digest".into(),
+        tools: Arc::new(vec![]),
+        system_text: "Frozen plan system".into(),
+        system_digest: "system".into(),
+        join_version: 1,
+        role_versions: Default::default(),
+        fetches: vec![],
+        declarations: vec![],
+    })
+}
+
+struct DumpCompactionPlane(Arc<broca_core::wal_writer::WalHandle>);
+
+#[async_trait::async_trait]
+impl broca_core::compaction::CompactionPlane for DumpCompactionPlane {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        _: broca_core::compaction_provider::setup::SetupRequest,
+    ) -> Result<
+        broca_core::compaction_provider::setup::SetupAnswer,
+        broca_core::compaction::CompactionUnavailable,
+    > {
+        panic!("mode-3 must not call the retired compaction protocol")
+    }
+
+    async fn call_v2(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+        method: &str,
+        _: Value,
+        _: u64,
+    ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
+    {
+        use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+        let answer = match method {
+            "compaction.setup" => json!({"answer":"ready"}),
+            "compaction.notice" => json!({"answer":"received"}),
+            "compaction.ride" => {
+                let lineage = self.0.lineage_id().unwrap().to_string();
+                let through = broca_core::message_mid(true, Some(&lineage), 0).unwrap();
+                json!({"answer":"view","view":View::seal(1, vec![Edit::new(1, EditOp::Cut { through })])})
+            }
+            _ => panic!("unexpected compaction method {method}"),
+        };
+        Ok(serde_json::value::to_raw_value(&answer).unwrap())
+    }
+}
 fn anthropic(tool: bool) -> Vec<u8> {
     let mut events = vec![
         json!({"type":"message_start", "message":{"id":"msg", "type":"message", "role":"assistant", "model":"m", "content":[], "usage":{"input_tokens":11,"cache_read_input_tokens":23,"cache_creation_input_tokens":7,"output_tokens":0}}}),
@@ -301,9 +366,27 @@ async fn read_body(socket: &mut TcpStream) -> Vec<u8> {
 async fn fixture<F: WireFamily + 'static>(
     tag: &str,
     family: F,
+    frozen: FrozenRenderConfig,
+    replies: Vec<Vec<u8>>,
+    tool: bool,
+) -> (PathBuf, Vec<WalRecord>, Vec<Vec<u8>>) {
+    fixture_with_mode(tag, family, frozen, replies, tool, FixtureMode::Legacy).await
+}
+
+#[derive(Clone, Copy)]
+enum FixtureMode {
+    Legacy,
+    Compaction,
+    GlobalSystem,
+}
+
+async fn fixture_with_mode<F: WireFamily + 'static>(
+    tag: &str,
+    family: F,
     mut frozen: FrozenRenderConfig,
     replies: Vec<Vec<u8>>,
     tool: bool,
+    mode: FixtureMode,
 ) -> (PathBuf, Vec<WalRecord>, Vec<Vec<u8>>) {
     let root = scratch(tag);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -333,7 +416,7 @@ async fn fixture<F: WireFamily + 'static>(
     } else {
         vec![]
     };
-    let request = RunRequest {
+    let mut request = RunRequest {
         route_decision_id: None,
         input_written_at_ms: None,
         directives: None,
@@ -381,21 +464,81 @@ async fn fixture<F: WireFamily + 'static>(
     let (tx, mut rx) = mpsc::channel(4096);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let provider = LiveProvider::new(family, frozen, AuthHandle::Bearer("fixture".into()));
-    tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        run_loop(
-            request,
-            &provider,
-            &StubToolPlane::new(),
-            &FileLeaseStore::new(root.join("leases")),
-            &AllowAll,
-            &wal,
-            &tx,
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let run = async {
+        if !matches!(mode, FixtureMode::Legacy) {
+            request.context_limit = Some(4000);
+            if matches!(mode, FixtureMode::Compaction) {
+                request.input.insert(
+                    0,
+                    Message::new(
+                        Role::User,
+                        vec![ContentBlock::Text {
+                            text: "old context ".repeat(10_000),
+                        }],
+                    ),
+                );
+            } else {
+                request.input.insert(
+                    0,
+                    Message::new(
+                        Role::System,
+                        vec![ContentBlock::Text {
+                            text: "Frozen unplanned system".into(),
+                        }],
+                    ),
+                );
+            }
+            let writer = Arc::new(
+                broca_core::wal_writer::WalHandle::spawn(wal.open(&session).unwrap(), 1).unwrap(),
+            );
+            let control = broca_core::RunControl {
+                new_log_compaction_plan_version: Some(broca_core::compaction_v2::PLAN_VERSION),
+                admitted_context_limit: request.context_limit,
+                manifest: matches!(mode, FixtureMode::Compaction).then(mode3_manifest),
+                compaction_plane: if matches!(mode, FixtureMode::Compaction) {
+                    Some(Arc::new(DumpCompactionPlane(writer.clone())))
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+            let result = broca_core::run_loop_on_writer(
+                request,
+                &writer,
+                broca_core::StartMode::FreshOrResume,
+                &provider,
+                &StubToolPlane::new(),
+                &AllowAll,
+                &wal,
+                None,
+                control,
+                &tx,
+            )
+            .await;
+            Arc::try_unwrap(writer)
+                .ok()
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+            result
+        } else {
+            run_loop(
+                request,
+                &provider,
+                &StubToolPlane::new(),
+                &FileLeaseStore::new(root.join("leases")),
+                &AllowAll,
+                &wal,
+                &tx,
+            )
+            .await
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(20), run)
+        .await
+        .unwrap()
+        .unwrap();
     drop(tx);
     drain.await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), server)
@@ -439,6 +582,242 @@ fn check_bodies(out: &Path, captured: &[Vec<u8>]) {
             "export must equal independently captured request bytes"
         );
     }
+}
+
+#[tokio::test]
+async fn mode3_offline_rebuild_matches_every_received_step_after_a_ride() {
+    let (root, mut records, bodies) = fixture_with_mode(
+        "mode3-rebuild",
+        AnthropicMessages,
+        anthropic_frozen_config("m"),
+        vec![anthropic(true), anthropic(false)],
+        true,
+        FixtureMode::Compaction,
+    )
+    .await;
+    assert_eq!(bodies.len(), 2);
+    assert!(records
+        .iter()
+        .any(|r| matches!(r, WalRecord::CompactionViewAppliedV2 { .. })));
+    // An accepted replacement is not the view the request sent until an application is recorded.
+    let at = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::ModelAttemptFinished { .. }))
+        .unwrap();
+    let newer = broca_core::compaction_v2::protocol::view::View::seal(2, vec![]);
+    records.insert(
+        at,
+        WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
+            version: 2,
+            checksum: newer.checksum.clone(),
+            edits: broca_core::compaction_v2::storage::encode(None, &newer.into()),
+        }),
+    );
+    let (run_id, config) = records
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::RunStarted { run_id, config, .. } => Some((run_id, config)),
+            _ => None,
+        })
+        .unwrap();
+    let bind = BindIdentity::new(root.join("proj"), "test", "mode3-rebuild");
+    let lineage = FileWalStore::new(root.join("wal"))
+        .read_records_range(&bind, 0, None, None)
+        .unwrap()
+        .lineage_id
+        .unwrap()
+        .to_string();
+    for (index, record) in records.iter().enumerate() {
+        if let WalRecord::ModelAttemptFinished { step_id, .. } = record {
+            let (_, _, rebuilt) = broca_module_serve::wal_render::render_step_with_lineage(
+                Some(&lineage),
+                &records[..index],
+                config,
+                &run_id.0,
+                step_id.0,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                rebuilt == bodies[step_id.0 as usize - 1],
+                "step {} body differs",
+                step_id.0
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mode3_global_system_next_request_matches_cache_dump_rebuild() {
+    let (root, records, bodies) = fixture_with_mode(
+        "mode3-global-system",
+        AnthropicMessages,
+        anthropic_frozen_config("m"),
+        vec![anthropic(true), anthropic(false)],
+        true,
+        FixtureMode::GlobalSystem,
+    )
+    .await;
+    assert_eq!(bodies.len(), 2);
+    let (run_id, config, bind) = records
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::RunStarted {
+                run_id,
+                config,
+                session,
+                input,
+                manifest,
+                ..
+            } => {
+                assert!(manifest.is_none());
+                assert!(config.global_system.is_some());
+                assert!(input.iter().all(|message| message.role != Role::System));
+                Some((run_id, config, session))
+            }
+            _ => None,
+        })
+        .unwrap();
+    let next = records
+        .iter()
+        .position(|record| {
+            matches!(record,
+                WalRecord::ModelAttemptFinished { step_id, .. } if step_id.0 == 2
+            )
+        })
+        .unwrap();
+    let lineage = FileWalStore::new(root.join("wal"))
+        .read_records_range(bind, 0, None, None)
+        .unwrap()
+        .lineage_id
+        .unwrap()
+        .to_string();
+    let (_, _, rebuilt) = broca_module_serve::wal_render::render_step_with_lineage(
+        Some(&lineage),
+        &records[..next],
+        config,
+        &run_id.0,
+        2,
+        None,
+        None,
+    )
+    .unwrap();
+    let live: Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert!(live["system"].as_array().unwrap().iter().any(|part| {
+        part["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Frozen unplanned system"))
+    }));
+    assert!(
+        rebuilt == bodies[1],
+        "the next request must include the same frozen system bytes"
+    );
+}
+
+#[tokio::test]
+async fn legacy_view_applied_after_step_started_exports_the_first_request() {
+    use broca_core::compaction_provider::{
+        lineage::MessageRef,
+        view::{CompactionView, ViewRange},
+    };
+    let (root, mut records, _) = fixture(
+        "legacy-applied",
+        AnthropicMessages,
+        anthropic_frozen_config("m"),
+        vec![anthropic(false)],
+        false,
+    )
+    .await;
+    let boundary = records
+        .iter()
+        .position(|r| matches!(r, WalRecord::StepStarted { .. }))
+        .unwrap();
+    let replacement = vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "summary".into(),
+        }],
+    )];
+    let view = CompactionView::new(
+        "session",
+        1,
+        "lineage",
+        MessageRef {
+            ordinal: 0,
+            mid: "m0".into(),
+        },
+        vec![ViewRange::replace(
+            0,
+            1,
+            serde_json::to_string(&replacement).unwrap(),
+        )],
+    );
+    records.insert(
+        boundary,
+        serde_json::from_value(json!({
+            "type":"compaction_message", "provider":"compactor", "kind":"setup",
+            "compaction_id":"initial", "version":1, "range":{"from":0,"to":0},
+            "sha256":"fixture", "replacement":[]
+        }))
+        .unwrap(),
+    );
+    records.insert(
+        boundary + 2,
+        WalRecord::CompactionViewApplied {
+            provider: "compactor".into(),
+            view_version: 1,
+            view: broca_wal::OpaqueJson::from_json_text(serde_json::to_string(&view).unwrap())
+                .unwrap(),
+            choice: broca_wal::CompactionViewChoice::Applied,
+        },
+    );
+    let expected = AnthropicMessages.render(
+        &anthropic_frozen_config("m"),
+        &broca_protocol::CallOptions::new(replacement),
+    );
+    for record in &mut records {
+        if let WalRecord::ModelAttemptFinished {
+            request_body_sha256,
+            ..
+        } = record
+        {
+            *request_body_sha256 = format!("{:x}", Sha256::digest(&expected));
+        }
+    }
+    let out = root.join("legacy-out");
+    std::fs::create_dir(&out).unwrap();
+    let mut summary = Summary::default();
+    export_records("legacy", &records, &out, &mut summary).unwrap();
+    assert_eq!(summary.calls_verified, 1);
+    assert_eq!(summary.calls_exported, 1);
+    assert!(summary.calls_skipped.is_empty());
+    check_bodies(&out, &[expected]);
+}
+
+#[tokio::test]
+async fn mode3_cache_dump_exports_every_call_verified_without_skips() {
+    let (root, _, bodies) = fixture_with_mode(
+        "mode3-export",
+        AnthropicMessages,
+        anthropic_frozen_config("m"),
+        vec![anthropic(true), anthropic(false)],
+        true,
+        FixtureMode::Compaction,
+    )
+    .await;
+    let out = root.join("out");
+    let summary = export(&root, &["mode3-export".into()], None, &out).unwrap();
+    assert_eq!(summary.calls_examined, 2);
+    assert_eq!(summary.calls_verified, 2);
+    assert_eq!(summary.calls_exported, 2);
+    assert_eq!(summary.digest_mismatches, 0);
+    assert!(
+        summary.calls_skipped.is_empty(),
+        "{:?}",
+        summary.calls_skipped
+    );
+    check_bodies(&out, &bodies);
 }
 
 #[tokio::test]

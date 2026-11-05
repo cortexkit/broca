@@ -19,7 +19,7 @@ fn log(lines: &[&str]) -> Vec<FramedRecord> {
 const RUN: &str = r#"{"type":"run_started","run_id":"RUN","session":{"project_root":"/project","harness":"runner","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[{"name":"bash","description":"run","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"}}"#;
 
 fn assert_round_trip(old: &[FramedRecord]) {
-    let converted = convert(old).unwrap();
+    let converted = convert(old, None).unwrap();
     assert!(converted.lost.is_empty(), "{:?}", converted.lost);
     let rebuilt: Vec<_> = invert(&converted.records, &converted.parts)
         .unwrap()
@@ -73,7 +73,7 @@ fn a_steer_is_recorded_where_it_is_placed_and_round_trips() {
         STEP,
         r#"{"type":"step_started","step_id":2}"#,
     ]);
-    let converted = convert(&old).unwrap();
+    let converted = convert(&old, None).unwrap();
     let names: Vec<_> = converted.records.iter().map(|r| r.name()).collect();
     assert_eq!(
         names,
@@ -105,7 +105,7 @@ fn a_steer_is_recorded_where_it_is_placed_and_round_trips() {
 #[test]
 fn an_unplaced_steer_gets_no_copy_and_round_trips() {
     let old = log(&[&RUN.replace("RUN", "r"), STEER]);
-    let converted = convert(&old).unwrap();
+    let converted = convert(&old, None).unwrap();
     assert!(!converted.records.iter().any(
         |r| matches!(r, broca_session_store::record::Record::Input(i) if i.receipt_seq.is_some())
     ));
@@ -122,7 +122,7 @@ fn a_placed_copy_that_differs_from_its_record_refuses() {
         STEER,
         r#"{"type":"step_started","step_id":1}"#,
     ]);
-    let mut converted = convert(&old).unwrap();
+    let mut converted = convert(&old, None).unwrap();
     let Some(Record::Input(copy)) = converted
         .records
         .iter_mut()
@@ -148,10 +148,13 @@ fn a_changed_value_is_named_by_path_only() {
 
 #[test]
 fn an_unclaimed_transcript_record_refuses() {
-    let converted = convert(&log(&[
-        &RUN.replace("RUN", "r"),
-        r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[]},"usage":{},"retries_used":0}"#,
-    ]))
+    let converted = convert(
+        &log(&[
+            &RUN.replace("RUN", "r"),
+            r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[]},"usage":{},"retries_used":0}"#,
+        ]),
+        None,
+    )
     .unwrap();
     // Without its step end, the assistant message has no anchor to claim it.
     let records: Vec<_> = converted
@@ -176,7 +179,7 @@ fn current_compaction_records_round_trip() {
         r#"{"type":"compaction_marker","harness":"h","session":"s","view_version":3,"first_kept_mid":"m2","first_kept_ordinal":2,"checkpoint":7}"#,
         STEP,
     ]);
-    let converted = convert(&old).unwrap();
+    let converted = convert(&old, None).unwrap();
     let kinds: Vec<_> = converted
         .records
         .iter()

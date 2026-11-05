@@ -292,7 +292,8 @@ impl LateResultsIntake {
         format!("reserved:{}", self.consumer_module)
     }
 
-    /// The one bind every feed route is opened under.
+    /// The dedicated maintenance bind for the custodian's global feeds, never a conversation
+    /// identity: each provider's cursor and ack cover all of this custodian's sessions.
     pub fn feed_identity(state_root: &Path) -> BindIdentity {
         BindIdentity::new(
             state_root.to_string_lossy().to_string(),
@@ -2385,6 +2386,7 @@ mod tests {
         async fn withdraw(
             &self,
             _: &LateResultRegistration,
+            _: bool,
         ) -> (
             cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
             Value,
@@ -3398,6 +3400,7 @@ mod tests {
         async fn withdraw(
             &self,
             _: &LateResultRegistration,
+            _: bool,
         ) -> (
             cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
             Value,
@@ -3646,6 +3649,7 @@ mod tests {
         async fn withdraw(
             &self,
             call: &LateResultRegistration,
+            _: bool,
         ) -> (
             cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
             Value,
@@ -3760,6 +3764,74 @@ mod tests {
         service.recover().await.unwrap();
         assert_eq!(*route.seen.lock().unwrap(), ["lineage:4"]);
         assert_eq!(service.health()["failed"], 0);
+    }
+
+    #[test]
+    fn withdrawal_identity_comes_from_the_originating_frozen_plan() {
+        for (owner, hook) in [
+            (None, false),
+            (Some("tools"), false),
+            (Some("another-compactor"), false),
+            (Some("another-compactor"), true),
+        ] {
+            let bind = session("withdraw-identity");
+            let mut records = held_records("lineage:4", "tools", &bind);
+            let manifest = broca_wal::PlanManifest {
+                rich_ui: None,
+                declarations: Vec::new(),
+                plan: broca_wal::OpaqueJson::from_json_text(
+                    json!({
+                        "compaction_item": owner.map(|provider| json!({"provider":provider})),
+                        "step_transform_items": if hook { vec![json!({"provider":"tools"})] } else { vec![] }
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+                plan_identity: String::new(),
+                composition_digest: String::new(),
+                fetches: Vec::new(),
+                tools: Vec::new().into(),
+                system_text: String::new(),
+                system_digest: String::new(),
+                join_version: 1,
+                role_versions: Default::default(),
+            };
+            let WalRecord::RunStarted {
+                manifest: frozen, ..
+            } = &mut records[0]
+            else {
+                panic!("missing run")
+            };
+            *frozen = Some(Box::new(manifest.clone()));
+            let registration = held_registrations(&framed(records.clone()), &bind)
+                .pop()
+                .unwrap();
+            // Accepting a refresh does not change the identity of an already-dispatched call.
+            records.insert(
+                3,
+                WalRecord::SessionRefreshAccepted {
+                    generation: 2,
+                    policy: "next-run".into(),
+                    run_in_progress: true,
+                    applies_from_next_run: true,
+                    manifest: Box::new(broca_wal::PlanManifest {
+                        plan: broca_wal::OpaqueJson::from_json_text(
+                            json!({"compaction_item":{"provider":"future"}}).to_string(),
+                        )
+                        .unwrap(),
+                        ..manifest
+                    }),
+                },
+            );
+            assert_eq!(
+                crate::held_withdrawals::withdrawal_uses_session_identity(
+                    &framed(records),
+                    &registration
+                )
+                .unwrap(),
+                owner == Some("tools") || hook
+            );
+        }
     }
 
     #[tokio::test]

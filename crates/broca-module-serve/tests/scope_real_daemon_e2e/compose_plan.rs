@@ -81,9 +81,14 @@ async fn compose_plan_direct_carrier_fetches_catalog_on_scoped_bind() {
             emits_push: false,
             sub_supervises: false,
         }])
-        // Like the real AFT: the daemon omits scope.workdir unless the recipient opts in.
+        // Like the real AFT: the daemon omits scope.workdir unless the recipient opts in, and
+        // broca declares the tool-provider role on its routes only to a module that advertises
+        // `tool-provider/v1`.
         .capabilities(Some(CapabilityDeclarations {
-            provides: vec![subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_owned()],
+            provides: vec![
+                subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_owned(),
+                "tool-provider/v1".to_owned(),
+            ],
             requires: vec![],
             must_never_reach: vec![],
         }))

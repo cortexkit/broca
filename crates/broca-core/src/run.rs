@@ -680,6 +680,11 @@ pub struct RunControl {
     /// record prefixes at each simulated crash point. Production cannot enable it.
     #[cfg(test)]
     pub(crate) legacy_compaction_fixture: bool,
+    /// Tests of what a compaction ride delivers need a ride on a fresh step. In production, a
+    /// fresh session's first step has no proven cause to ride for, so these tests stand in for
+    /// the cache clock with this flag: it makes the step's cache count as proven expired.
+    #[cfg(test)]
+    pub(crate) compaction_cache_proven_expired: bool,
     /// Session-owned v2 state shared with compaction-runner pushed-view calls.
     pub compaction_session: Option<Arc<crate::compaction_v2::session::Session>>,
     /// Receives durable entry changes without putting v2 notices in the WAL.
@@ -912,6 +917,8 @@ impl Default for RunControl {
         Self {
             #[cfg(test)]
             legacy_compaction_fixture: false,
+            #[cfg(test)]
+            compaction_cache_proven_expired: false,
             compaction_session: None,
             compaction_changes: None,
             new_log_compaction_plan_version: None,
@@ -6423,12 +6430,28 @@ where
             let previous = crate::compaction_v2::host::previous(&frames);
             let now = control.now_ms().unwrap_or_else(crate::compaction::now);
             let raw: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
-            let cache_warm = control
-                .keep_warm
-                .as_ref()
-                .and_then(|driver| driver.timing(&config).ok())
-                .zip(crate::cache_warm::last_cache_send_at_ms(&raw))
-                .is_some_and(|(timing, sent)| now < sent.saturating_add(timing.ttl_ms));
+            // Expiry counts from the last request that reached the cache, by the lifetime that
+            // request asked the provider for, which a refresh may have changed since.
+            let last_send = crate::cache_warm::last_cache_send(&raw);
+            let requested_ttl = |config: &RunConfig| {
+                control
+                    .keep_warm
+                    .as_ref()
+                    .and_then(|driver| driver.requested_ttl_ms(config))
+            };
+            let cache_expired = crate::compaction_v2::conditions::cache_proven_expired(
+                last_send
+                    .as_ref()
+                    .and_then(|(_, sent_under)| requested_ttl(sent_under)),
+                last_send.as_ref().map(|(sent_at_ms, _)| *sent_at_ms),
+                now,
+            );
+            let detects_cache_expired = requested_ttl(&config).is_some();
+            #[cfg(test)]
+            let cache_expired = cache_expired || control.compaction_cache_proven_expired;
+            #[cfg(test)]
+            let detects_cache_expired =
+                detects_cache_expired || control.compaction_cache_proven_expired;
             let next_mid =
                 crate::message_mid(true, Some(&lineage), transcript.entries.len() as u64)
                     .map_err(RunError::Wal)?;
@@ -6454,17 +6477,22 @@ where
                     conditions: &conditions,
                     previous: previous.as_ref(),
                     current: &current,
-                    cache_warm,
+                    cache_expired,
+                    detects_cache_expired,
                     chain_reset: chained && provider.prepare_chain_reset(),
                     now,
                     next_mid: &next_mid,
                 },
                 |image| crate::compaction_v2::host::image(writer, image),
                 |prompt| {
-                    let view = crate::compaction_v2::render::options(&opts, prompt.to_vec());
-                    let globals = crate::compaction_v2::systems::view(&view, &v2_globals)?;
+                    let view = crate::compaction_v2::render::finish(
+                        &opts,
+                        prompt.to_vec(),
+                        &config,
+                        manifest,
+                    )?;
                     provider
-                        .try_render_request(globals.as_ref().unwrap_or(&view))
+                        .try_render_request(&view)
                         .map(|bytes| {
                             crate::compaction::request_estimate(bytes.len(), &compaction_history).0
                         })
@@ -6501,9 +6529,10 @@ where
                     prompt, applied, ..
                 } => {
                     provider.set_cache_evidence_view(applied.map(|view| view.version));
-                    model_opts = Some(Arc::new(crate::compaction_v2::render::options(
-                        &opts, prompt,
-                    )));
+                    model_opts = Some(Arc::new(
+                        crate::compaction_v2::render::finish(&opts, prompt, &config, manifest)
+                            .map_err(RunError::Wal)?,
+                    ));
                 }
             }
         }
@@ -6519,12 +6548,15 @@ where
                 .to_string();
             let transcript = crate::compaction_v2::transcript::project(&frames, &lineage)
                 .map_err(RunError::Wal)?;
+            let (config, manifest) =
+                crate::compaction_v2::host::frozen(&frames).map_err(RunError::Wal)?;
             let prompt =
                 crate::compaction_v2::render::deliveries_only(&opts.prompt, &transcript.entries)
                     .map_err(RunError::Wal)?;
-            model_opts = Some(Arc::new(crate::compaction_v2::render::options(
-                &opts, prompt,
-            )));
+            model_opts = Some(Arc::new(
+                crate::compaction_v2::render::finish(&opts, prompt, &config, manifest)
+                    .map_err(RunError::Wal)?,
+            ));
         }
         if let Some(runtime) = compaction_runtime
             .as_ref()
@@ -6862,14 +6894,6 @@ where
             .and_then(|text| crate::plan_system::view(sent_opts, &opts.prompt, text))
             .map(Arc::new);
         let sent_opts = system_view.as_ref().unwrap_or(sent_opts);
-        let v2_system_view = if mode3 {
-            crate::compaction_v2::systems::view(sent_opts, &v2_globals)
-                .map_err(RunError::Wal)?
-                .map(Arc::new)
-        } else {
-            None
-        };
-        let sent_opts = v2_system_view.as_ref().unwrap_or(sent_opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
             break RunFinishReason::Cancelled;
         }
@@ -7841,6 +7865,7 @@ where
                         &req.session,
                         req.scope.as_ref(),
                         control.compaction_plane.as_deref(),
+                        control.keep_warm.as_deref(),
                     )
                     .await
                     .map_err(RunError::Wal)?;
@@ -8434,6 +8459,7 @@ where
             &req.session,
             req.scope.as_ref(),
             control.compaction_plane.as_deref(),
+            control.keep_warm.as_deref(),
         )
         .await
         .map_err(RunError::Wal)?;
@@ -10957,6 +10983,10 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     // are planned: `None` dispatches them; otherwise each gets a durable terminal record and is
     // never sent to the tool plane.
     enum BatchRefusal {
+        Permanent {
+            code: String,
+            detail: Option<serde_json::Value>,
+        },
         /// The tool plane is unavailable or refused the route: each call gets a durable
         /// `tool_no_dispatch`. `detail` is the stable matchable message; a refusal the
         /// plane attributed to a module outage additionally names the module, the daemon's
@@ -10988,6 +11018,9 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
             .await
         {
             Ok(()) => None,
+            Err(ToolPlaneError::Permanent { code, detail }) => {
+                Some(BatchRefusal::Permanent { code, detail })
+            }
             // An ordinary tool-plane failure keeps the exact detail text it always had: sessions
             // already on disk hold it as their durable no-dispatch reason.
             Err(ToolPlaneError::Unavailable(_)) => Some(BatchRefusal::Unavailable {
@@ -11083,6 +11116,17 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         }
         match &batch_refusal {
             None => {}
+            Some(BatchRefusal::Permanent { code, detail }) => {
+                plan.push(CallPlan::Synthetic {
+                    result: Arc::new(ToolResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        output: crate::tool_plane::permanent_refusal_output(code, detail.as_ref()),
+                        is_error: true,
+                    }),
+                    reason: Some(code.clone()),
+                });
+                continue;
+            }
             Some(BatchRefusal::Unavailable {
                 detail,
                 module,
@@ -17434,12 +17478,25 @@ mod approval_gate {
             .await
         {
             Ok(()) => None,
+            Err(ToolPlaneError::Permanent { code, detail }) => {
+                let mut resolution = CallResolution::plain(
+                    ToolResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        output: crate::tool_plane::permanent_refusal_output(&code, detail.as_ref()),
+                        is_error: true,
+                    },
+                    Some(DispatchOutcome::Completed),
+                );
+                resolution.reason = Some(code);
+                Some(resolution)
+            }
             Err(error) => {
                 let reason = match error {
                     ToolPlaneError::ScopeDrained { reason } => reason,
                     ToolPlaneError::ScopeRefused { code, .. } => code,
                     ToolPlaneError::Unavailable(reason) => reason,
                     ToolPlaneError::ModuleUnavailable { module, .. } => module,
+                    ToolPlaneError::Permanent { .. } => unreachable!("handled above"),
                 };
                 let mut result = CallResolution::plain(
                     route_drained_result(&call.tool_call_id, &reason),

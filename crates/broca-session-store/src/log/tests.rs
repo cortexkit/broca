@@ -20,6 +20,7 @@ fn input(text: &str) -> Record {
         notice: None,
         tags_v1: None,
         receipt_seq: None,
+        pruned: Vec::new(),
     })
 }
 
@@ -53,8 +54,12 @@ fn sample() -> (Vec<u8>, Vec<u64>) {
     (writer.into_file(), starts)
 }
 
+fn no_base(_: &[u8]) -> Result<ChainBase, String> {
+    Ok(ChainBase::default())
+}
+
 fn read_all(bytes: &[u8]) -> super::ReadLog {
-    read(bytes, &key(), BIND, 0, ChainBase::default()).unwrap()
+    read(bytes, &key(), BIND, 0, no_base).unwrap()
 }
 
 #[test]
@@ -142,7 +147,7 @@ fn a_removed_batch_is_an_index_gap() {
 #[test]
 fn a_log_read_under_another_name_fails_authentication() {
     let (bytes, _) = sample();
-    let log = read(&bytes, &key(), b"session-1/log-2", 0, ChainBase::default()).unwrap();
+    let log = read(&bytes, &key(), b"session-1/log-2", 0, no_base).unwrap();
     assert_eq!(
         log.end,
         LogEnd::Damaged {
@@ -160,7 +165,7 @@ fn the_durable_bound_follows_barriers_and_claim_only_frames() {
     // The barrier after the first batch covers it; later frames claim that much.
     assert_eq!(read_all(&bytes).durable_bound, starts[1]);
     // The length synced when the log was created counts too.
-    let created = read(&bytes, &key(), BIND, starts[0], ChainBase::default()).unwrap();
+    let created = read(&bytes, &key(), BIND, starts[0], no_base).unwrap();
     assert_eq!(created.durable_bound, starts[1]);
 
     let mut writer = LogWriter::create(
@@ -208,4 +213,83 @@ fn a_file_backed_log_reads_back() {
     assert_eq!(log.end, LogEnd::Clean);
     let seqs: Vec<u64> = log.records.iter().map(|(seq, _)| *seq).collect();
     assert_eq!(seqs, [5, 6]);
+}
+
+/// A batch copied into a new log keeps its records' seqs, which may skip, and reads back as one
+/// batch. A frame cut out of it still reads as damage, and copied seqs that go backwards refuse.
+#[test]
+fn a_copied_batch_keeps_its_seqs_and_stays_all_or_nothing() {
+    use super::{LogEncoder, LogError};
+    let mut encoder = LogEncoder::new(
+        key(),
+        BIND.to_vec(),
+        20,
+        ChainBase {
+            transcript: Some(3),
+            ledger: Some(19),
+        },
+    );
+    let mut bytes = encoder
+        .checkpoint(b"checkpoint")
+        .unwrap()
+        .into_written(&mut encoder);
+    let (one, three) = (input("one"), input("three"));
+    // Seqs 5 and 8: the ledger records between them stayed in the old log.
+    bytes.extend(
+        encoder
+            .copy_batch(&[(5, &one), (8, &three)])
+            .unwrap()
+            .into_written(&mut encoder),
+    );
+    let after_copy = bytes.len();
+    // New records follow at the encoder's next seq.
+    bytes.extend(
+        encoder
+            .batch(&[step(1)])
+            .unwrap()
+            .into_written(&mut encoder),
+    );
+    let base = |_: &[u8]| {
+        Ok(ChainBase {
+            transcript: Some(3),
+            ledger: Some(19),
+        })
+    };
+    let log = read(&bytes, &key(), BIND, 0, base).unwrap();
+    assert_eq!(log.end, LogEnd::Clean);
+    let seqs: Vec<u64> = log.records.iter().map(|(seq, _)| *seq).collect();
+    assert_eq!(seqs, [5, 8, 20]);
+    assert_eq!(log.batches, [0..2, 2..3]);
+
+    // Cutting the copied batch's second frame out leaves a frame-index gap. Every frame of
+    // `one` has the same length, so the first frame ends where a one-record copy would.
+    let first_frame_end = {
+        let mut only = LogEncoder::new(key(), BIND.to_vec(), 20, ChainBase::default());
+        let checkpoint = only
+            .checkpoint(b"checkpoint")
+            .unwrap()
+            .into_written(&mut only);
+        checkpoint.len() + only.copy_batch(&[(5, &one)]).unwrap().bytes.len()
+    };
+    let mut gap = bytes[..first_frame_end].to_vec();
+    gap.extend_from_slice(&bytes[after_copy..]);
+    let log = read(&gap, &key(), BIND, 0, base).unwrap();
+    assert!(matches!(log.end, LogEnd::Damaged { .. }), "{:?}", log.end);
+    assert!(log.records.is_empty());
+
+    // Copied seqs must increase and follow what the log already holds.
+    assert!(matches!(
+        encoder.copy_batch(&[(9, &one)]),
+        Err(LogError::CopiedSeqs)
+    ));
+    let mut fresh = LogEncoder::new(key(), BIND.to_vec(), 20, ChainBase::default());
+    fresh.checkpoint(b"c").unwrap().into_written(&mut fresh);
+    assert!(matches!(
+        fresh.copy_batch(&[(8, &one), (5, &three)]),
+        Err(LogError::CopiedSeqs)
+    ));
+    assert!(matches!(
+        fresh.copy_batch(&[(20, &one)]),
+        Err(LogError::CopiedSeqs)
+    ));
 }

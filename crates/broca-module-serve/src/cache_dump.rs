@@ -303,24 +303,32 @@ fn export_legacy_with_bind(
     let selected = addresses
         .into_iter()
         .map(|(address, key)| {
-            exportable_records(&store, &key, clock.now_ms()).map(|records| (address, records))
+            exportable_frames(&store, &key, clock.now_ms()).map(|(lineage, frames)| {
+                (
+                    address,
+                    lineage,
+                    frames
+                        .into_iter()
+                        .map(|frame| frame.record)
+                        .collect::<Vec<_>>(),
+                )
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     private_directory(out)?;
-    for (address, records) in selected {
+    for (address, lineage, records) in selected {
         summary.sessions_read += 1;
-        export_records_since(&address, &records, out, &mut summary, since)?;
+        let lineage = lineage.map(|lineage| lineage.to_string());
+        export_records_since(
+            &address,
+            lineage.as_deref(),
+            &records,
+            out,
+            &mut summary,
+            since,
+        )?;
     }
     Ok(summary)
-}
-
-fn exportable_records(
-    store: &FileWalStore,
-    key: &BindIdentity,
-    now_ms: u64,
-) -> Result<Vec<WalRecord>, String> {
-    exportable_frames(store, key, now_ms)
-        .map(|(_, frames)| frames.into_iter().map(|frame| frame.record).collect())
 }
 
 pub(crate) fn exportable_frames(
@@ -396,11 +404,12 @@ pub fn export_records(
     out: &Path,
     summary: &mut Summary,
 ) -> Result<(), String> {
-    export_records_since(address, records, out, summary, None)
+    export_records_since(address, None, records, out, summary, None)
 }
 
 fn export_records_since(
     _address: &str,
+    lineage: Option<&str>,
     records: &[WalRecord],
     out: &Path,
     summary: &mut Summary,
@@ -445,9 +454,9 @@ fn export_records_since(
                     outcome,
                     ..
                 } if *response_body_len > 0 => {
-                    attempts.insert(step_id.0, record);
+                    attempts.insert(step_id.0, (start + index, record));
                     if *outcome == AttemptOutcome::Complete {
-                        completed.insert(step_id.0, record);
+                        completed.insert(step_id.0, (start + index, record));
                     }
                 }
                 WalRecord::ModelStepFinished { step_id, usage, .. } => {
@@ -458,7 +467,7 @@ fn export_records_since(
         }
         for (step, last_response) in attempts {
             let usage = usages.get(&step).copied();
-            let selected = if usage.is_some() {
+            let (attempt_at, selected) = if usage.is_some() {
                 completed.get(&step).copied().unwrap_or(last_response)
             } else {
                 last_response
@@ -498,15 +507,17 @@ fn export_records_since(
             ) {
                 meta["input_transformations"] = report;
             }
-            let rendered = boundaries.get(&step).and_then(|boundary| {
-                // The prefix ends at the step's `step_started`; a cap the step lowered before
-                // sending follows it, so it is passed in.
-                crate::wal_render::render_step_with_output_cap(
-                    &records[..=*boundary],
+            let rendered = boundaries.get(&step).and_then(|_| {
+                // The runner can apply a compaction provider's view after StepStarted. Rebuild
+                // through this attempt, not a later acceptance or the earlier prompt boundary.
+                crate::wal_render::render_step_with_lineage(
+                    lineage,
+                    &records[..attempt_at],
                     config,
                     &run_id.0,
                     step,
                     output_caps.get(&step).copied(),
+                    None,
                 )
                 .ok()
             });

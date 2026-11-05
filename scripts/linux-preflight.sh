@@ -4,6 +4,7 @@ set -euo pipefail
 [[ "$(uname -s)" == Linux ]] || { echo 'linux-preflight: requires Linux; refusing local fallback' >&2; exit 2; }
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
+source scripts/lib/exit-guard.sh
 dirty="$(git status --porcelain)" || { echo 'linux-preflight: cannot read snapshot status' >&2; exit 2; }
 [[ -z "$dirty" ]] || { echo 'linux-preflight: snapshot must be committed and clean' >&2; exit 2; }
 : "${CARGO_TARGET_DIR:?motor must supply its persistent target cache}"
@@ -32,7 +33,7 @@ unset SUBC_CORE_BIN FAKE_AFT_STUB_BIN CK_CLAUSTRUM_BIN CK_AUTH_BIN CK_CLAUSTRUM_
 export BROCA_REQUIRE_SUBC=1 BROCA_REQUIRE_VAULT=1 BROCA_REQUIRE_AIMOCK=1
 export NEXTEST_TEST_THREADS="${NEXTEST_TEST_THREADS:-num-cpus}"
 scratch="$(mktemp -d)"
-trap 'rm -rf "$scratch"' EXIT
+trap 'broca_exit_guard rm -rf "$scratch"' EXIT
 unit_skips=()
 for name in "${portable_unit_exclusions[@]}"; do unit_skips+=(--skip "$name"); done
 list_rc=0
@@ -53,3 +54,4 @@ python3 scripts/preflight-test-report.py integrations "$scratch/integrations" "$
 dirty="$(git status --porcelain)" || { echo 'linux-preflight: cannot read snapshot status' >&2; exit 2; }
 [[ -z "$dirty" ]] || { git status --short; echo 'linux-preflight: checks changed the snapshot' >&2; exit 2; }
 echo 'linux-preflight: all fixture-independent lanes passed; full fixtures/doctests/scripts/Postgres remain in CI/Mac gates'
+BROCA_EXIT_GUARD_FINISHED=1

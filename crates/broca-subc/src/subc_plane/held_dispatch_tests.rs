@@ -16,6 +16,7 @@ mod dropped_media_tests;
 struct Rig {
     identity: bool,
     declared_route: bool,
+    provides_role: AtomicBool,
     reply: Mutex<serde_json::Value>,
     sent: Mutex<Vec<(Option<String>, Option<String>)>>,
     groups: Mutex<Vec<Vec<LateResultRegistration>>>,
@@ -29,6 +30,10 @@ struct Rig {
     /// Whether each tool route this rig opened was asked to declare the held-reply capabilities.
     opened_declaring: Mutex<Vec<bool>>,
     opened_result: Mutex<Vec<bool>>,
+    /// Whether each tool route this rig opened declared `tool-provider: v1`.
+    opened_role: Mutex<Vec<bool>>,
+    /// Whether each tool route this rig opened bound the session's own harness.
+    opened_session_identity: Mutex<Vec<bool>>,
 }
 
 impl Rig {
@@ -38,6 +43,7 @@ impl Rig {
         Arc::new(Self {
             identity,
             declared_route,
+            provides_role: AtomicBool::new(true),
             reply: Mutex::new(json!({"content":[{"type":"text","text":"terminal"}]})),
             sent: Mutex::new(Vec::new()),
             groups: Mutex::new(Vec::new()),
@@ -49,6 +55,8 @@ impl Rig {
             registering: tokio::sync::Notify::new(),
             opened_declaring: Mutex::new(Vec::new()),
             opened_result: Mutex::new(Vec::new()),
+            opened_role: Mutex::new(Vec::new()),
+            opened_session_identity: Mutex::new(Vec::new()),
             release_registration: tokio::sync::Notify::new(),
         })
     }
@@ -71,7 +79,16 @@ impl ToolPlaneConnection for Rig {
         self.identity.then_some("broca")
     }
     async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
-        Ok(Vec::new())
+        let mut entry = CatalogEntry::new("provider", Vec::new(), Vec::new()).with_ready(true);
+        if self.provides_role.load(Ordering::SeqCst) {
+            entry.capabilities = Some(
+                serde_json::from_value(json!({
+                    "provides": ["tool-provider/v1"]
+                }))
+                .unwrap(),
+            );
+        }
+        Ok(vec![entry])
     }
     async fn route_open(
         &self,
@@ -86,16 +103,28 @@ impl ToolPlaneConnection for Rig {
         _: &str,
         _: &BindIdentity,
         _: Option<&ScopeSelector>,
-        tool_result_v1: bool,
+        shape: RouteShape,
         installed: bool,
-        call_keepalive: bool,
     ) -> Result<RouteHandle, ConnError> {
+        let RouteShape {
+            tool_result_v1,
+            call_keepalive,
+            tool_provider_v1,
+            session_identity,
+        } = shape;
+        self.opened_session_identity
+            .lock()
+            .unwrap()
+            .push(session_identity);
         self.opened_declaring.lock().unwrap().push(installed);
         self.opened_result.lock().unwrap().push(tool_result_v1);
+        self.opened_role.lock().unwrap().push(tool_provider_v1);
         let mut route = RouteHandle::synthetic(7);
         route.reads_tool_result = (tool_result_v1 || installed) && self.declared_route;
         route.reads_held_reply = installed && self.declared_route;
         route.call_keepalive = call_keepalive;
+        route.tool_provider_v1 = tool_provider_v1;
+        route.session_identity = session_identity;
         Ok(route)
     }
     async fn route_close(&self, _: &RouteHandle) -> Result<(), ConnError> {
@@ -988,4 +1017,157 @@ async fn a_resumed_batch_dispatches_under_the_schema_pin_its_plan_recorded() {
             None
         );
     }
+}
+
+#[tokio::test]
+async fn an_unplanned_dispatch_route_declares_the_manifest_tool_provider_role() {
+    let rig = Rig::new(true, true, false, false);
+    let plane = rig.plane(false);
+    let ctx = ctx();
+    let call = call("unplanned");
+    let manifest = ToolManifest::from_tools(vec![serde_json::from_value(json!({
+        "name":"tool", "description":"", "input_schema":{}, "module":"provider",
+        "execution_mode":"parallel"
+    }))
+    .unwrap()]);
+    plane
+        .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
+        .await
+        .unwrap();
+    completed(plane.dispatch(&ctx, &call).await);
+    assert_eq!(*rig.opened_role.lock().unwrap(), [true]);
+    assert_eq!(*rig.opened_session_identity.lock().unwrap(), [false]);
+}
+
+#[tokio::test]
+async fn dispatch_without_the_manifest_role_stays_roleless_and_reopens_after_role_discovery() {
+    let rig = Rig::new(true, true, false, false);
+    rig.provides_role.store(false, Ordering::SeqCst);
+    let plane = rig.plane(false);
+    let mut ctx = ctx();
+    let manifest = manifest();
+    for role in [false, true] {
+        ctx.batch_id = BatchId(format!("role-{role}"));
+        rig.provides_role.store(role, Ordering::SeqCst);
+        plane.clear_catalog_memo();
+        plane
+            .batch_started(&ctx, &[call("call")], &manifest)
+            .await
+            .unwrap();
+        plane.batch_finished(&ctx).await.unwrap();
+    }
+    assert_eq!(*rig.opened_role.lock().unwrap(), [false, true]);
+}
+
+/// Both planned and unplanned calls declare the role advertised by the daemon manifest.
+/// Result formats remain frozen by the plan, independently of that declaration.
+#[tokio::test]
+async fn the_dispatch_route_declares_tool_provider_v1_with_or_without_a_plan() {
+    let fetched_without_declarations = {
+        let plan = PlanManifest {
+            rich_ui: None,
+            declarations: Vec::new(),
+            plan: OpaqueJson::from_json_text(
+                json!({"tool_items":[{"provider":"provider"}]}).to_string(),
+            )
+            .unwrap(),
+            plan_identity: String::new(),
+            composition_digest: String::new(),
+            fetches: vec![ProviderFetch {
+                provider: "provider".into(),
+                outcome: FetchOutcome::Answered {
+                    catalog_digest: "digest".into(),
+                    tools: Vec::new().into(),
+                    text: None,
+                    result_ops: None,
+                    reply: None,
+                    declarations_frozen: None,
+                    reference_slots: None,
+                },
+            }],
+            tools: Vec::new().into(),
+            system_text: String::new(),
+            system_digest: String::new(),
+            join_version: 1,
+            role_versions: Default::default(),
+        };
+        ToolManifest::from_tools(vec![serde_json::from_value(json!({"name":"tool","description":"","input_schema":{},"module":"provider","execution_mode":"parallel"})).unwrap()])
+            .with_plan_manifest(&plan)
+            .unwrap()
+    };
+    let unplanned = ToolManifest::from_tools(vec![serde_json::from_value(json!({"name":"tool","description":"","input_schema":{},"module":"provider","execution_mode":"parallel"})).unwrap()]);
+
+    let rig = Rig::new(true, true, false, false);
+    let plane = rig.plane(false);
+    let call = call("call");
+    let mut ctx = ctx();
+    for (batch, manifest) in [
+        ("unplanned", &unplanned),
+        ("fetched", &fetched_without_declarations),
+    ] {
+        ctx = BatchCtx {
+            batch_id: BatchId(batch.into()),
+            ..ctx
+        };
+        plane
+            .batch_started(&ctx, std::slice::from_ref(&call), manifest)
+            .await
+            .unwrap();
+        completed(plane.dispatch(&ctx, &call).await);
+        plane.batch_finished(&ctx).await.unwrap();
+    }
+    assert_eq!(*rig.opened_role.lock().unwrap(), [true]);
+    assert_eq!(*rig.opened_session_identity.lock().unwrap(), [false]);
+}
+
+/// A provider that is also the session's compaction provider (the plan's compaction item names
+/// it) gets a tool route bound with the session's own identity, so it sees the session's tool
+/// calls and its compaction as one session. The route still declares the role.
+#[tokio::test]
+async fn the_compaction_providers_tool_route_binds_the_sessions_identity() {
+    let plan = PlanManifest {
+        rich_ui: None,
+        declarations: Vec::new(),
+        plan: OpaqueJson::from_json_text(
+            json!({
+                "tool_items": [{"provider": "provider"}],
+                "compaction_item": {"provider": "provider", "preset": "worker"},
+            })
+            .to_string(),
+        )
+        .unwrap(),
+        plan_identity: String::new(),
+        composition_digest: String::new(),
+        fetches: vec![ProviderFetch {
+            provider: "provider".into(),
+            outcome: FetchOutcome::Answered {
+                catalog_digest: "digest".into(),
+                tools: Vec::new().into(),
+                text: None,
+                result_ops: None,
+                reply: None,
+                declarations_frozen: None,
+                reference_slots: None,
+            },
+        }],
+        tools: Vec::new().into(),
+        system_text: String::new(),
+        system_digest: String::new(),
+        join_version: 1,
+        role_versions: Default::default(),
+    };
+    let manifest = ToolManifest::from_tools(vec![serde_json::from_value(json!({"name":"tool","description":"","input_schema":{},"module":"provider","execution_mode":"parallel"})).unwrap()])
+        .with_plan_manifest(&plan)
+        .unwrap();
+    let rig = Rig::new(true, true, false, false);
+    let plane = rig.plane(false);
+    let ctx = ctx();
+    let call = call("call");
+    plane
+        .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
+        .await
+        .unwrap();
+    completed(plane.dispatch(&ctx, &call).await);
+    assert_eq!(*rig.opened_role.lock().unwrap(), [true]);
+    assert_eq!(*rig.opened_session_identity.lock().unwrap(), [true]);
 }

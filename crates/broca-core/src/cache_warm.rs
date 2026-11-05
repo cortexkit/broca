@@ -226,9 +226,14 @@ fn last_cache_usage(records: &[WalRecord], last_sent_at_ms: u64) -> Option<Usage
 /// Only the new source-maintenance trigger opts into matching the latest request's digest;
 /// unmarked records retain their historical clock inference.
 pub fn last_cache_send_at_ms(records: &[WalRecord]) -> Option<u64> {
-    let mut latest: Option<u64> = None;
+    latest_cache_send(records).map(|(_, sent_at_ms)| sent_at_ms)
+}
+
+/// The index of the record [`last_cache_send_at_ms`] dates the cache from, and that time.
+fn latest_cache_send(records: &[WalRecord]) -> Option<(usize, u64)> {
+    let mut latest: Option<(usize, u64)> = None;
     let mut bound = SendLowerBound::default();
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         let sent_at_ms = match record {
             WalRecord::ModelAttemptFinished {
                 http_status,
@@ -251,10 +256,33 @@ pub fn last_cache_send_at_ms(records: &[WalRecord]) -> Option<u64> {
             }
             _ => None,
         };
-        latest = latest.max(sent_at_ms);
+        if let Some(sent_at_ms) = sent_at_ms {
+            if latest.is_none_or(|(_, latest)| sent_at_ms >= latest) {
+                latest = Some((index, sent_at_ms));
+            }
+        }
         bound.observe(record);
     }
     latest
+}
+
+/// The most recent request that reached the provider's cache, as [`last_cache_send_at_ms`]
+/// finds it, with the run configuration it was sent under: the configuration of the run it
+/// belongs to, with any refreeze written before it. That configuration names the cache lifetime
+/// the request asked the provider for, which may differ from the current run's.
+pub fn last_cache_send(records: &[WalRecord]) -> Option<(u64, RunConfig)> {
+    let (index, sent_at_ms) = latest_cache_send(records)?;
+    let start = records[..=index]
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::RunStarted { .. }))?;
+    let WalRecord::RunStarted { config, .. } = &records[start] else {
+        unreachable!("run_start indexes a RunStarted");
+    };
+    let mut config = (**config).clone();
+    for record in &records[start + 1..=index] {
+        fold_refreeze(&mut config, record);
+    }
+    Some((sent_at_ms, config))
 }
 
 // A standby source warm can finish after a fallback request. Its digest identifies another
@@ -283,14 +311,18 @@ pub(crate) fn warm_reached_the_cache(
 }
 
 /// Whether a model request attempt reached the provider and was accepted for processing, so its
-/// prompt prefix was read into or written to the provider's cache. Only a 2xx status says so:
+/// prompt prefix was read into or written to the provider's cache. A 2xx status says so, and so
+/// does 101 with an answer: a request on a WebSocket connection records 101, the socket's upgrade
+/// status, at the moment it is sent on the open socket, and its outcome says whether the provider
+/// answered it. Before this counted them, every ChatGPT WebSocket request was left out, so the
+/// session's last send looked hours old and its cache looked expired. Not counted:
 /// - no status at all (`connect_failed`, `header_timeout`, `no_status`, or a cancel or shutdown
 ///   before the status line) means the provider may never have seen the request;
 /// - a 4xx or 5xx status is a refusal before any generation, which leaves the cache alone;
 /// - `provider_error` (an error event inside a 2xx body, such as an overload) and an outcome
 ///   this build does not know may also be refusals, so they are not counted either.
 ///
-/// Counted: `complete`, and the 2xx attempts that broke off while the response streamed
+/// Counted: `complete`, and the 2xx or 101 attempts that broke off while the response streamed
 /// (`eof_before_completion`, `chunk_error`, `idle_timeout`, `content_timeout`, `byte_limit`,
 /// `decode_error`, `rate_floor`, `cancelled`, `sealed_in_flight`). Leaving out a doubtful attempt
 /// only falls back to an earlier send, which errs early.
@@ -298,7 +330,7 @@ pub(crate) fn attempt_reached_the_cache(
     http_status: Option<u16>,
     outcome: &AttemptOutcome,
 ) -> bool {
-    http_status.is_some_and(|status| (200..300).contains(&status))
+    http_status.is_some_and(|status| (200..300).contains(&status) || status == 101)
         && !matches!(
             outcome,
             AttemptOutcome::ProviderError | AttemptOutcome::Unknown(_)
@@ -1101,34 +1133,13 @@ pub fn last_recorded_request_with_lineage(
             .expect("run found above");
         let state = crate::compaction_v2::session::load(session, &frames)
             .map_err(RecordedRequestError::Unavailable)?;
-        let transcript = crate::compaction_v2::transcript::project(&frames, lineage)
-            .map_err(RecordedRequestError::Unavailable)?;
-        let manifest = match &records[start] {
-            WalRecord::RunStarted { manifest, .. } => manifest.as_deref(),
-            _ => None,
-        };
-        let edits = state
-            .view_for_step(step_id.0)
-            .map_or(&[][..], |view| view.edits.as_slice());
-        let prompt = if manifest.is_some_and(crate::compaction::has_compaction) {
-            crate::compaction_v2::render::prompt(
-                &opts.prompt,
-                &transcript.entries,
-                edits,
-                crate::compaction_v2::host::image_reference,
-            )
-        } else {
-            crate::compaction_v2::render::deliveries_only(&opts.prompt, &transcript.entries)
-        }
+        opts = crate::compaction_v2::render::request_options(
+            &frames,
+            lineage,
+            opts,
+            state.view_for_step(step_id.0),
+        )
         .map_err(RecordedRequestError::Unavailable)?;
-        opts = crate::compaction_v2::render::options(&opts, prompt);
-        let global = crate::compaction_v2::systems::frozen(true, &config, manifest)
-            .map_err(RecordedRequestError::Unavailable)?;
-        if let Some(view) = crate::compaction_v2::systems::view(&opts, &global)
-            .map_err(RecordedRequestError::Unavailable)?
-        {
-            opts = view;
-        }
     } else {
         let compaction = crate::replay::replay(&records[..attempt_at])
             .map_err(|error| {
@@ -1148,6 +1159,43 @@ pub fn last_recorded_request_with_lineage(
         request_body_sha256: request_body_sha256.clone(),
         route,
     })
+}
+
+#[cfg(test)]
+mod websocket_clock_tests {
+    use broca_wal::WalRecord;
+
+    fn attempt(http_status: Option<u16>, outcome: &str, sent_at_ms: u64) -> WalRecord {
+        let mut record = serde_json::json!({
+            "type":"model_attempt_finished","step_id":1,"attempt":0,
+            "request_body_len":12,"request_body_sha256":"request",
+            "response_body_len":0,"response_body_sha256":"response",
+            "outcome":outcome,"ts_ms":sent_at_ms + 5,"sent_at_ms":sent_at_ms
+        });
+        if let Some(status) = http_status {
+            record["http_status"] = status.into();
+        }
+        serde_json::from_value(record).unwrap()
+    }
+
+    /// A request sent on an open WebSocket and answered reached the cache, so the clock moves to
+    /// it. A WebSocket request that ended without an answer, and one with no status, don't.
+    #[test]
+    fn an_answered_websocket_request_moves_the_cache_clock() {
+        let http = attempt(Some(200), "complete", 1_000);
+        let socket = attempt(Some(101), "complete", 9_000);
+        assert_eq!(
+            super::last_cache_send_at_ms(&[http.clone(), socket]),
+            Some(9_000)
+        );
+        let refused = attempt(Some(101), "provider_error", 9_000);
+        assert_eq!(
+            super::last_cache_send_at_ms(&[http.clone(), refused]),
+            Some(1_000)
+        );
+        let unsent = attempt(None, "connect_failed", 9_000);
+        assert_eq!(super::last_cache_send_at_ms(&[http, unsent]), Some(1_000));
+    }
 }
 
 #[cfg(test)]
@@ -1434,6 +1482,42 @@ mod tests {
             }));
         }
         assert_eq!(last_cache_send_at_ms(&[success]), Some(200));
+    }
+
+    /// The send that dates the cache comes with the configuration it was sent under: its own
+    /// run's, refreeze included, not a later run's, so expiry counts by the lifetime that request
+    /// asked for.
+    #[test]
+    fn the_last_cache_send_names_the_config_it_was_sent_under() {
+        let with_model = |model: &str| {
+            let WalRecord::RunStarted { mut config, .. } = run_started(Some(1_000)) else {
+                unreachable!()
+            };
+            config.model.model_id = model.into();
+            let mut record = run_started(Some(1_000));
+            if let WalRecord::RunStarted { config: slot, .. } = &mut record {
+                *slot = config;
+            }
+            record
+        };
+        let refreeze: WalRecord = serde_json::from_value(serde_json::json!({
+            "type": "run_config_refrozen", "renderer_version": 2,
+            "frozen_render_config": {"refrozen": true}
+        }))
+        .unwrap();
+        // Run one sent at 5 s; run two started but never reached the cache.
+        let records = [
+            with_model("first"),
+            refreeze,
+            attempt(Some(200), "complete", Some(5_000), 6_000),
+            with_model("second"),
+            attempt(Some(500), "provider_error", Some(9_000), 9_500),
+        ];
+        let (sent_at_ms, config) = last_cache_send(&records).unwrap();
+        assert_eq!(sent_at_ms, 5_000);
+        assert_eq!(config.model.model_id, "first");
+        assert_eq!(config.frozen_render_config["refrozen"], true);
+        assert_eq!(last_cache_send(&records[..1]), None);
     }
 
     #[test]

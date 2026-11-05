@@ -38,7 +38,7 @@ fn every_split_of_a_tool_history_folds_to_the_same_state() {
         r#"{"type":"tool_batch_started","batch_id":"b2","step_id":1,"planned_calls":["c2"]}"#,
         r#"{"type":"tool_dispatch_intent","batch_id":"b2","tool_call_id":"c2","args":{"cmd":"rm x"}}"#,
     ]);
-    let converted = convert(&old).unwrap();
+    let converted = convert(&old, None).unwrap();
     let len = converted.records.len();
     let check = check_splits(&converted.records, true, &split_points(len, 64, 0)).unwrap();
     assert_eq!(check.points, len as u64 + 1);

@@ -30,6 +30,9 @@ pub enum FoldError {
     NotFolded(String),
     /// A tool batch started over another batch that still holds evidence of a call.
     OverlappingBatch,
+    /// A record arrived after a change's intent closed the log, other than that change's abort;
+    /// or an abort with no open change.
+    LogClosed(&'static str),
 }
 
 /// The ledger events that change a run's state but aren't folded yet.
@@ -461,6 +464,36 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The change whose intent closed the log, until it aborts. A committed change starts a
+        /// new log whose checkpoint has none.
+        6 opt pub open_change: crate::codec::Id128 => {
+            owner: "writer",
+            reset: "change_aborted",
+            bound: Bound::Fixed,
+        },
+        /// After a revert: the ordinal from which the compaction provider must read the
+        /// transcript again, owed in the next notice as `transcript_changed`. Two reverts before
+        /// a notice owe the lower one.
+        7 opt pub transcript_changed: u64 => {
+            owner: "compaction",
+            reset: "a notice carrying it answered",
+            bound: Bound::Fixed,
+        },
+        /// The session's history version, which every revert moves. The head holds it too; the
+        /// fold carries it so a rebuild from records reproduces it.
+        8 req pub history_version: u64 => {
+            owner: "writer",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// A recovery couldn't rule out that the ledger lost records of actions no surviving
+        /// record identifies, so an action may have run with no record of it. Only an operator
+        /// clears it.
+        9 req pub unattributed_risk: bool => {
+            owner: "recovery",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -501,12 +534,44 @@ impl Operations {
             return Err(FoldError::TranscriptRecord(record.name()));
         }
         self.apply_queue(record);
+        match (record, self.open_change) {
+            (Record::ChangeAborted(aborted), Some(open)) if aborted.change == open => {
+                self.open_change = None;
+                return Ok(());
+            }
+            (_, Some(_)) => return Err(FoldError::LogClosed(record.name())),
+            (Record::ChangeIntent(intent), None) => {
+                self.open_change = Some(intent.change);
+                return Ok(());
+            }
+            (Record::ChangeAborted(_), None) => return Err(FoldError::LogClosed(record.name())),
+            _ => {}
+        }
         match record {
             Record::View(view) => {
                 self.view_accepted = Some(ViewSlot {
                     version: view.version,
                     checksum: view.checksum.clone(),
                 });
+            }
+            Record::RecoveryCut(cut) => {
+                if let Some(ordinal) = cut.ordinal {
+                    self.transcript_changed = Some(
+                        self.transcript_changed
+                            .map_or(ordinal, |owed| owed.min(ordinal)),
+                    );
+                }
+                if let Some(version) = cut.history_version {
+                    self.history_version = version;
+                }
+                self.unattributed_risk |= cut.unattributed_risk;
+            }
+            Record::TranscriptReverted(reverted) => {
+                self.transcript_changed = Some(
+                    self.transcript_changed
+                        .map_or(reverted.ordinal, |owed| owed.min(reverted.ordinal)),
+                );
+                self.history_version = reverted.history_version;
             }
             Record::ViewApplied(applied) => {
                 self.view_applied = Some(AppliedView {

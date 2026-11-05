@@ -273,6 +273,10 @@ async fn main() -> Result<(), String> {
             ProviderReply::WorkersAiError { status, .. } => format!(
                 "{name}: HTTP {status} in {elapsed} ms read as a Workers AI error, which this client never returns"
             ),
+            ProviderReply::ClassifiedError { error, .. } => format!(
+                "{name}: adapter-classified error {} in {elapsed} ms, which this client never returns",
+                error.code
+            ),
             ProviderReply::Credential(message) => {
                 format!("{name}: credential unavailable ({message}); nothing sent")
             }

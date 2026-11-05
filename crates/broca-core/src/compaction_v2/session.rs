@@ -29,6 +29,10 @@ impl Changes for BoundChanges {
             &self.bind,
             self.scope.as_ref(),
             self.plane.as_deref(),
+            // A pushed view arrives outside a run, without the run's cache declaration. When
+            // this notice is the one that sets the provider up, its Setup lists no
+            // `cache_expired`, and rides never claim it until the next Setup.
+            None,
         )
         .await
     }

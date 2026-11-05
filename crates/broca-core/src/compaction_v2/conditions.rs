@@ -21,13 +21,13 @@ pub struct SendContext {
 pub fn ride_causes(
     previous: Option<&SendContext>,
     current: &SendContext,
-    cache_warm: bool,
+    cache_expired: bool,
     chain_reset: bool,
     request_tokens: u64,
     conditions: &Conditions,
 ) -> Vec<RideCause> {
     let mut causes = Vec::new();
-    if !cache_warm {
+    if cache_expired {
         causes.push(RideCause::CacheExpired);
     }
     if chain_reset {
@@ -61,6 +61,22 @@ pub fn ride_causes(
     causes
 }
 
+/// Whether the session's prompt cache has provably expired: the log records the last send that
+/// reached the cache, that send asked the provider for a cache lifetime it honours (`ttl_ms`),
+/// and that lifetime has run out since. A lifetime broca only estimates proves nothing. When broca
+/// can't tell (no requested lifetime, or no send yet), the answer is `false`.
+///
+/// Before a step, broca may *ride*: call the session's compaction provider with the causes that
+/// are about to change the request anyway. The `cache_expired` cause tells the provider that
+/// rewriting history now costs nothing extra, so it publishes any view it has queued. Claiming it when unsure made every step
+/// on routes without a cache clock look like a free rebuild, and each published view then cost a
+/// resend of the whole conversation behind its first edit.
+pub fn cache_proven_expired(ttl_ms: Option<u64>, last_send_ms: Option<u64>, now_ms: u64) -> bool {
+    ttl_ms
+        .zip(last_send_ms)
+        .is_some_and(|(ttl, sent)| now_ms >= sent.saturating_add(ttl))
+}
+
 pub fn usable_window(conditions: &Conditions) -> u64 {
     conditions
         .context_window
@@ -68,14 +84,21 @@ pub fn usable_window(conditions: &Conditions) -> u64 {
 }
 
 /// Setup and notices describe the same frozen model, output reserve and rules.
-pub fn setup_request(preset: &str, conditions: &Conditions, now: u64) -> SetupRequest {
+/// `detects_cache_expired` says whether the session's requests ask for a cache lifetime that can
+/// prove expiry (see `runtime::detects`).
+pub fn setup_request(
+    preset: &str,
+    conditions: &Conditions,
+    now: u64,
+    detects_cache_expired: bool,
+) -> SetupRequest {
     let mut setup = SetupRequest::new(
         preset,
         conditions.model.clone(),
         conditions.context_window,
         conditions.output_reserve,
         conditions.rules.clone(),
-        super::runtime::detects(),
+        super::runtime::detects(detects_cache_expired),
         now,
     );
     setup.accepts_images = conditions.accepts_images;

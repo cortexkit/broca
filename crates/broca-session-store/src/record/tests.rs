@@ -44,6 +44,7 @@ fn one_of_each() -> Vec<Record> {
             }),
             tags_v1: Some(serde_json::json!({"parts": [3]})),
             receipt_seq: Some(4),
+            pruned: Vec::new(),
         }),
         Record::Assistant(Assistant {
             run_id: "run-1".into(),
@@ -58,6 +59,7 @@ fn one_of_each() -> Vec<Record> {
             last_content_at_ms: None,
             budget_finalize: None,
             tags_v1: None,
+            pruned: Vec::new(),
         }),
         Record::ToolReply(ToolReply {
             run_id: "run-1".into(),

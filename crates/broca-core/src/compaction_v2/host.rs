@@ -45,7 +45,19 @@ pub fn conditions(
     let window = config
         .context_limit
         .ok_or("compaction requires a frozen context_limit")?;
-    let reserve = config.generation.max_output_tokens.unwrap_or(0);
+    // What the model may still write. A run that froze no `max_output_tokens` of its own (the
+    // ChatGPT route never sends one, since that backend refuses the field) still writes up to
+    // the model's output cap, which the frozen render config holds.
+    let reserve = config
+        .generation
+        .max_output_tokens
+        .or_else(|| {
+            config
+                .frozen_render_config
+                .pointer("/max_output_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(0);
     if window > 9_007_199_254_740_991 || reserve > 9_007_199_254_740_991 {
         return Err(
             "compaction context_limit or output reserve exceeds the protocol integer range".into(),
@@ -183,6 +195,9 @@ pub async fn notice(
     bind: &broca_protocol::BindIdentity,
     scope: Option<&broca_protocol::SessionScope>,
     plane: Option<&dyn crate::CompactionPlane>,
+    // Reads the cache lifetime the session's requests ask for, which decides whether a Setup
+    // sent here lists `cache_expired`. `None` outside a run.
+    keep_warm: Option<&dyn crate::keep_warm_wait::KeepWarmDriver>,
 ) -> Result<(), String> {
     let frames = records(writer, store, bind).await?;
     let (config, manifest) = frozen(&frames)?;
@@ -205,7 +220,14 @@ pub async fn notice(
     let transcript = super::transcript::project(&frames, &lineage)?;
     let conditions = conditions(&config, &transcript.entries, false)?;
     let applied = session.state.lock().await.applied_identity();
-    let mut setup = conditions::setup_request(&preset, &conditions, crate::compaction::now());
+    let mut setup = conditions::setup_request(
+        &preset,
+        &conditions,
+        crate::compaction::now(),
+        keep_warm
+            .and_then(|driver| driver.requested_ttl_ms(&config))
+            .is_some(),
+    );
     setup.applied_view = applied.clone();
     setup.newest = super::views::newest(&transcript.entries);
     session.runtime.observe(&transcript.entries);

@@ -74,8 +74,18 @@ async fn tool_identity_and_bus_contract_samples() {
     assert_eq!(call["call_key"], expected_key);
     assert_eq!(call["schema_pin"], expected_pin);
     capture("session.history.json", &page.body);
+    // Replay from the start can outlast any fixed quiet window on a loaded runner, so wait for
+    // the replayed `tool_finished`, which follows `tool_started`, before the quiet window starts.
     let frames = rig
-        .subscribe_collect(8, json!({"from":"start"}), Duration::from_millis(30))
+        .subscribe_collect_until(
+            8,
+            json!({"from":"start"}),
+            Duration::from_millis(30),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "tool_finished")
+            },
+        )
         .await;
     for kind in ["tool_started", "tool_finished"] {
         let frame = frames

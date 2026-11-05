@@ -238,24 +238,24 @@ pub fn rows(frames: &[FramedRecord], lineage: Option<&str>) -> Result<Vec<Value>
                         .then(|| step_usage.get(&(run_index, step_id.0)).copied())
                         .flatten()
                 });
-                let rebuilt =
-                    boundary
-                        .zip(config)
-                        .zip(run)
-                        .and_then(|((boundary, config), run)| {
-                            let mut provenance =
-                                broca_protocol::render_provenance::RenderProvenance::default();
-                            crate::wal_render::render_step_with_provenance(
-                                &records[..=boundary],
-                                config,
-                                &run.0,
-                                step_id.0,
-                                cap,
-                                Some(&mut provenance),
-                            )
-                            .ok()
-                            .map(|(frozen, _, body)| (frozen, body, provenance))
-                        });
+                let rebuilt = boundary
+                    .zip(config)
+                    .zip(run)
+                    .and_then(|((_, config), run)| {
+                        let mut provenance =
+                            broca_protocol::render_provenance::RenderProvenance::default();
+                        crate::wal_render::render_step_with_lineage(
+                            lineage,
+                            &records[..index],
+                            config,
+                            &run.0,
+                            step_id.0,
+                            cap,
+                            Some(&mut provenance),
+                        )
+                        .ok()
+                        .map(|(frozen, _, body)| (frozen, body, provenance))
+                    });
                 let reason = match &rebuilt {
                     None => Some("render_unavailable"),
                     Some((_, body, _))

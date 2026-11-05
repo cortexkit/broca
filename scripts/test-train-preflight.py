@@ -61,6 +61,8 @@ class MotorBoundary(unittest.TestCase):
         scripts.mkdir()
         for name in ('train-preflight.sh', 'linux-preflight.sh', 'portable-test-selection.conf', 'preflight-test-report.py'):
             shutil.copy2(ROOT / 'scripts' / name, scripts / name)
+        (scripts / 'lib').mkdir()
+        shutil.copy2(ROOT / 'scripts/lib/exit-guard.sh', scripts / 'lib')
         self.bins = self.root / 'bin'
         self.bins.mkdir()
         self.write_executable('git', GIT)

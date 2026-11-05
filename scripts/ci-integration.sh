@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 source scripts/rust-test-gate.sh
+source scripts/lib/exit-guard.sh
 trap - EXIT
 
 mode="${1:-}"
@@ -35,7 +36,7 @@ case "$mode" in
     # Run the feature-only clock proof on every shard as well as in its normal
     # partition. A listed test is not evidence that the feature actually works.
     clock_output="$(mktemp)"
-    trap 'rm -f "$clock_output"' EXIT
+    trap 'broca_exit_guard rm -f "$clock_output"' EXIT
     sentinel='test_clock::test_clock_feature_is_enabled_for_retention_tests'
     "${base[@]}" -E "kind(test) and package(=broca-module) and test(=$sentinel)" --success-output final 2>&1 | tee "$clock_output"
     "$python_bin" - "$clock_output" "$sentinel" <<'PY'
@@ -52,3 +53,4 @@ PY
     ;;
   *) echo "unknown mode: $mode" >&2; exit 2 ;;
 esac
+BROCA_EXIT_GUARD_FINISHED=1

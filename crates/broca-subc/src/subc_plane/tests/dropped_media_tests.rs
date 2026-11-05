@@ -301,8 +301,10 @@ async fn tool_result_v1_empty_content_is_a_named_terminal_error_once() {
     }
 }
 
+/// An early route already declares the manifest's role, but not result formats. The batch
+/// reopens only if its frozen catalog selects `tool-result/v1`, independently of the role.
 #[tokio::test]
-async fn tool_result_v1_requires_catalog_declaration_and_upgrades_a_warm_legacy_bind() {
+async fn tool_result_v1_requires_catalog_declaration_and_upgrades_only_the_reply_format() {
     for format in [None, Some("tool-result/v1"), Some("content/v1")] {
         let rig = Rig::new(true, true, false, false);
         let plane = rig.plane(false);
@@ -324,9 +326,11 @@ async fn tool_result_v1_requires_catalog_declaration_and_upgrades_a_warm_legacy_
             .unwrap();
         let result = completed(plane.dispatch(&ctx, &call).await);
         let expected = if format == Some("tool-result/v1") {
+            assert_eq!(*rig.opened_role.lock().unwrap(), vec![true, true]);
             assert_eq!(*rig.opened_result.lock().unwrap(), vec![false, true]);
             "errorCode"
         } else {
+            assert_eq!(*rig.opened_role.lock().unwrap(), vec![true]);
             assert_eq!(*rig.opened_result.lock().unwrap(), vec![false]);
             assert_eq!(result.output, ToolOutput::error("boom"));
             "boom"

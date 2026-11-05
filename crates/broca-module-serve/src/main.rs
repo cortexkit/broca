@@ -43,6 +43,12 @@ const EMBEDDED_ENGRAM_CATALOG: &[u8] = include_bytes!("../../../engram-catalog.j
 /// cached, so the caller's next attempt finds it ready rather than binding again.
 const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Whether System One serves OpenAI's Decisions model (`openai/gpt-6-luna-decisions`). Off
+/// until a live request has confirmed OpenAI's answer shapes: the adapter is tested only
+/// against a stand-in server, and while it's off the model is neither advertised nor served,
+/// even though its catalog row exists.
+const OPENAI_DECISIONS_SERVED: bool = false;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module::diagnostics::initialize();
     broca_module_serve::serve::initialize_session_readers();
@@ -160,9 +166,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_overrides =
         broca_module_serve::provider_overrides::ProviderOverrides::load_default_path()
             .map_err(ServeIoError)?;
-    // System One's TypeSafe and Workers AI endpoints honour the same boot override a chat
+    // System One's provider endpoints honour the same boot override a chat
     // provider does.
     let typesafe_base_url = provider_overrides.base_url("typesafe").map(str::to_owned);
+    let openai_decisions_base_url = provider_overrides
+        .base_url(broca_module_serve::system_one::openai_decisions::PROVIDER_ID)
+        .map(str::to_owned);
     let workers_ai_base_url = provider_overrides
         .base_url(broca_module_serve::system_one::workers_ai::PROVIDER_ID)
         .map(str::to_owned);
@@ -568,6 +577,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut workers_ai_credential: Arc<
         dyn broca_module_serve::system_one::credential::CredentialSource,
     > = Arc::new(broca_module_serve::system_one::credential::NoCredential);
+    let mut openai_decisions_credential: Arc<
+        dyn broca_module_serve::system_one::credential::CredentialSource,
+    > = Arc::new(broca_module_serve::system_one::credential::NoCredential);
     // Open the vault only when a real provider call will actually be made. A mock base_url
     // path authenticates with AuthMode::None for every run (see `decide_auth`), so the vault
     // is unused there — skip it. The default is now the vault, but the mock path never needs
@@ -667,7 +679,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         );
         // System One reads its provider keys by grant like a run does, on a vault route of its
-        // own so its credential reads never queue behind a session's. Both providers share it.
+        // own so its credential reads never queue behind a session's. The providers share it.
         let system_one_vault = Arc::new(broca_subc::VaultClient::new(
             Arc::clone(&vault_conn),
             &vault_module,
@@ -692,6 +704,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             system_one_vault_credential(broca_module_serve::system_one::typesafe::CREDENTIAL_ID);
         workers_ai_credential =
             system_one_vault_credential(broca_module_serve::system_one::workers_ai::CREDENTIAL_ID);
+        openai_decisions_credential = system_one_vault_credential(
+            broca_module_serve::system_one::openai_decisions::CREDENTIAL_ID,
+        );
         let client = broca_subc::VaultClient::new(
             vault_conn,
             &vault_module,
@@ -835,6 +850,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| ServeIoError(format!("open System One batch store: {e}")))?,
         );
         let config = broca_module_serve::system_one::Config::default();
+        let openai_decisions =
+            broca_module_serve::system_one::openai_decisions::OpenAiDecisions::new(
+                openai_decisions_base_url.as_deref(),
+                openai_decisions_credential,
+                config.attempt_timeout,
+            )
+            .map_err(ServeIoError)?;
         let typesafe = broca_module_serve::system_one::typesafe::TypeSafe::new(
             typesafe_base_url.as_deref(),
             Arc::clone(&system_one_credential),
@@ -858,11 +880,19 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             store,
             broca_module_serve::serve::process_launch_id(),
             Arc::new(broca_module_serve::system_one::LiveCatalog),
-            vec![
-                broca_module_serve::system_one::ModelPin::jev(Arc::new(typesafe)),
-                broca_module_serve::system_one::ModelPin::clef(clef),
-                broca_module_serve::system_one::ModelPin::clef_flash(clef_flash),
-            ],
+            {
+                let mut pins = vec![
+                    broca_module_serve::system_one::ModelPin::jev(Arc::new(typesafe)),
+                    broca_module_serve::system_one::ModelPin::clef(clef),
+                    broca_module_serve::system_one::ModelPin::clef_flash(clef_flash),
+                ];
+                if OPENAI_DECISIONS_SERVED {
+                    pins.push(broca_module_serve::system_one::ModelPin::openai_decisions(
+                        Arc::new(openai_decisions),
+                    ));
+                }
+                pins
+            },
             config,
             registry.batches_in_flight_gauge(),
         );

@@ -9,12 +9,18 @@
 //!
 //! Compaction and setup records don't change the conversation. A compaction view is applied when
 //! a request is rendered, never to the conversation itself.
+//!
+//! Beside each window message the fold keeps what `session.entries` serves about it: its
+//! `EntryFacts` record, and the text delivered with its tool calls (from `ResultAppend`, in
+//! sessions that keep delivered text apart from results). An assistant message still waiting for
+//! its tool results already has an ordinal reserved, one past the last placed message, and its
+//! facts are kept with it until it is placed.
 
 use broca_protocol::content::{ContentBlock, Message, Role, ToolResult};
 use broca_protocol::ids::ToolCallId;
 
 use crate::fold::Bound;
-use crate::record::{Marker, Placement, Record, Stream};
+use crate::record::{EntryFacts, Marker, Notice, Placement, Record, Stream};
 
 /// Why a record can't be folded into the conversation. Each one means the records don't
 /// describe a conversation a provider would accept, so the fold refuses rather than guess.
@@ -31,6 +37,30 @@ pub enum FoldError {
     InputInsideToolTurn,
     /// An assistant message arrived while another was still waiting for replies.
     AssistantInsideToolTurn,
+    /// Entry facts for an ordinal the conversation hasn't placed or reserved.
+    FactsWithoutEntry(u64),
+}
+
+crate::message! {
+    /// Text delivered with one of a message's tool calls.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Delivered {
+        /// The tool call's position among the message's content blocks.
+        1 req part: u32,
+        2 opt notice: Notice,
+        /// As delivered, before any rendering.
+        3 req text: String,
+    }
+}
+
+crate::message! {
+    /// What `session.entries` serves about one window message besides the message itself.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct EntryState {
+        /// Absent for sessions written before entry facts were recorded.
+        1 opt facts: EntryFacts,
+        2 rep delivered: Delivered,
+    }
 }
 
 crate::message! {
@@ -67,7 +97,7 @@ state! {
         /// conversation. Sessions on the first compaction protocol stored it that way; sessions
         /// on the current contract keep the result as returned and add the text when a request
         /// renders.
-        3 req appends_in_conversation: bool => {
+        3 req pub appends_in_conversation: bool => {
             owner: "admission",
             reset: "never",
             bound: Bound::Fixed,
@@ -77,6 +107,36 @@ state! {
         4 opt pub marker: Marker => {
             owner: "compaction",
             reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// How many messages the conversation has ever placed, the window's included. A message's
+        /// ordinal is its place in the whole conversation, counting from 1, so the window's first
+        /// message has ordinal `placed - messages.len() + 1`, and older ones are in sealed
+        /// segments.
+        5 req pub placed: u64 => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// One per window message, in the same order.
+        6 rep pub entries: EntryState => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Window,
+        },
+        /// The held assistant message's entry, at its reserved ordinal.
+        7 opt pub open_entry: EntryState => {
+            owner: "run loop",
+            reset: "tool replies",
+            bound: Bound::OpenWork("one assistant message's tool calls"),
+        },
+        /// A revert into sealed history left no window: the messages before the new run are in
+        /// sealed segments only. Reads serve them from there, and nothing may render until a
+        /// window is copied back in, after the compaction provider answers an `over_limit`
+        /// notice (not built yet).
+        8 req pub window_pending: bool => {
+            owner: "revert",
+            reset: "a window copied back in",
             bound: Bound::Fixed,
         },
     }
@@ -89,7 +149,54 @@ impl Conversation {
             open: None,
             appends_in_conversation,
             marker: None,
+            placed: 0,
+            entries: Vec::new(),
+            open_entry: None,
+            window_pending: false,
         }
+    }
+
+    /// Empties the window, keeping the count of placed messages and any held tool turn. A
+    /// checkpoint carries no window: it's rebuilt from the log's own records.
+    pub fn clear_window(&mut self) {
+        self.messages.clear();
+        self.entries.clear();
+    }
+
+    /// The window message with `ordinal` and its entry state.
+    pub fn window_entry(&self, ordinal: u64) -> Option<(&Message, &EntryState)> {
+        let start = self.window_start();
+        if ordinal < start {
+            return None;
+        }
+        let at = (ordinal - start) as usize;
+        self.messages.get(at).zip(self.entries.get(at))
+    }
+
+    /// The held assistant message, its reserved ordinal and its entry state.
+    pub fn open_entry(&self) -> Option<(u64, &Message, &EntryState)> {
+        let turn = self.open.as_ref()?;
+        let entry = self.open_entry.as_ref()?;
+        Some((self.placed + 1, &turn.assistant, entry))
+    }
+
+    /// The ordinal of the window's first message, or the next ordinal when the window is empty.
+    pub fn window_start(&self) -> u64 {
+        self.placed - self.messages.len() as u64 + 1
+    }
+
+    /// The window message with `ordinal`, if it's in the window.
+    pub fn window_message(&self, ordinal: u64) -> Option<&Message> {
+        let start = self.window_start();
+        (ordinal >= start)
+            .then(|| self.messages.get((ordinal - start) as usize))
+            .flatten()
+    }
+
+    fn place(&mut self, message: Message, entry: EntryState) {
+        self.messages.push(message);
+        self.entries.push(entry);
+        self.placed += 1;
     }
 
     /// The assistant message still waiting for replies, if any.
@@ -111,8 +218,9 @@ impl Conversation {
                         return Err(FoldError::InputInsideToolTurn);
                     }
                     self.open = None;
+                    self.open_entry = None;
                 }
-                self.messages.push(input.message.clone());
+                self.place(input.message.clone(), EntryState::default());
             }
             Record::Assistant(assistant) => {
                 if self.open.is_some() {
@@ -135,15 +243,16 @@ impl Conversation {
                     message
                         .content
                         .retain(|block| !matches!(block, ContentBlock::ToolCall(_)));
-                    self.messages.push(message);
+                    self.place(message, EntryState::default());
                 } else if calls.is_empty() {
-                    self.messages.push(assistant.message.clone());
+                    self.place(assistant.message.clone(), EntryState::default());
                 } else {
                     self.open = Some(ToolTurn {
                         assistant: assistant.message.clone(),
                         calls,
                         replies: Vec::new(),
                     });
+                    self.open_entry = Some(EntryState::default());
                 }
             }
             Record::ToolReply(reply) => {
@@ -169,20 +278,58 @@ impl Conversation {
                             ContentBlock::ToolResult(turn.replies.swap_remove(at))
                         })
                         .collect();
-                    self.messages.push(turn.assistant);
-                    self.messages.push(Message::new(Role::Tool, results));
+                    let entry = self.open_entry.take().unwrap_or_default();
+                    self.place(turn.assistant, entry);
+                    self.place(Message::new(Role::Tool, results), EntryState::default());
                 }
             }
             Record::ResultAppend(append) => {
                 if self.appends_in_conversation {
                     append_to_newest_result(&mut self.messages, &append.tool_call_id, &append.text);
+                } else {
+                    self.attach_delivery(append);
                 }
+            }
+            Record::EntryFacts(facts) => {
+                let start = self.window_start();
+                if self.open.is_some() && facts.ordinal == self.placed + 1 {
+                    self.open_entry
+                        .get_or_insert_with(EntryState::default)
+                        .facts = Some(facts.clone());
+                } else if facts.ordinal >= start && facts.ordinal <= self.placed {
+                    self.entries[(facts.ordinal - start) as usize].facts = Some(facts.clone());
+                } else if facts.ordinal > self.placed {
+                    return Err(FoldError::FactsWithoutEntry(facts.ordinal));
+                }
+                // Facts for a message below the window have nothing to attach to here, as the
+                // message itself isn't held: a fold that keeps only counts drops both.
             }
             Record::Marker(marker) => self.marker = Some(marker.clone()),
             Record::SetupStub(_) | Record::Compaction(_) => {}
             _ => unreachable!("every transcript kind is matched above"),
         }
         Ok(())
+    }
+}
+
+impl Conversation {
+    /// Attaches delivered text to the newest window message that made the call. Delivered text is
+    /// only ever attached to a result of a batch that already finished, so an unknown call is
+    /// one whose message left the window, and the text goes with it.
+    fn attach_delivery(&mut self, append: &crate::record::ResultAppend) {
+        for (message, entry) in self.messages.iter().zip(&mut self.entries).rev() {
+            let part = message.content.iter().position(|block| {
+                matches!(block, ContentBlock::ToolCall(call) if call.tool_call_id == append.tool_call_id)
+            });
+            if let Some(part) = part {
+                entry.delivered.push(Delivered {
+                    part: part as u32,
+                    notice: append.notice.clone(),
+                    text: append.text.clone(),
+                });
+                return;
+            }
+        }
     }
 }
 

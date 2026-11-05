@@ -96,6 +96,9 @@ values! {
         5 Imported,
         /// A queued send delivered as a turn-scoped system entry (delivery mode `turn_system`).
         6 DeliveredTurnSystem,
+        /// Written by a recovery that may have lost records (see `session::recover`): storage
+        /// damage removed records, and actions near the end may have run unrecorded.
+        7 DamageNotice,
     }
 }
 
@@ -127,6 +130,8 @@ message! {
         /// into a running run): the seq of the ledger record that accepted it. It arrives
         /// while a step runs and is placed at the next step boundary, so the two are apart.
         8 opt receipt_seq: u64,
+        /// Opaque payloads removed when the record left the open log (see `prune`).
+        9 rep [must] pruned: crate::prune::PrunedOpaque,
     }
 }
 
@@ -150,6 +155,9 @@ message! {
         /// calls in it are never run, so the message enters the conversation without them; the
         /// record keeps them as the model wrote them.
         9 opt budget_finalize: bool,
+        /// Opaque payloads removed when the record left the open log (see `prune`). A record
+        /// carrying any must be rendered without its opaque parts.
+        10 rep [must] pruned: crate::prune::PrunedOpaque,
     }
 }
 
@@ -178,6 +186,62 @@ message! {
         3 req text: String,
         4 opt notice: Notice,
         5 opt written_at_ms: u64,
+    }
+}
+
+message! {
+    /// Token counts the provider reported for the request that produced an assistant entry, as
+    /// `session.entries` serves them. Absent means not reported, never zero.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+    pub struct StepUsage {
+        1 opt prompt_tokens: u64,
+        2 opt cache_read_tokens: u64,
+        3 opt cache_write_tokens: u64,
+        4 opt output_tokens: u64,
+        5 opt reasoning_tokens: u64,
+    }
+}
+
+message! {
+    /// A compaction view, named by its version and checksum.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ViewRef {
+        1 req version: u64,
+        2 req checksum: String,
+    }
+}
+
+message! {
+    /// What `session.entries` serves about one conversation message besides the message itself,
+    /// decided when the message was placed and never derived again. Written right after the
+    /// record that places the message (or, for an assistant message still waiting for its tool
+    /// results, the record that reserves its ordinal), in the same batch. A later `EntryFacts`
+    /// for the same ordinal replaces it. Content-free: delivered text stays in its
+    /// `ResultAppend`.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct EntryFacts {
+        /// The message's place in the whole conversation, counting from 1.
+        1 req ordinal: u64,
+        /// When the message was written. Never moves later than an earlier entry's.
+        2 req written_at_ms: u64,
+        /// The part number before this message's first numbered part: its parts take the
+        /// numbers after it, in order.
+        3 req tag_base: u64,
+        4 opt notice: Notice,
+        5 opt usage: StepUsage,
+        /// The compaction view in force when the model wrote this message.
+        6 opt generated_under: ViewRef,
+        /// A model step wrote it, so its completion time is `written_at_ms` once every tool call
+        /// it made has a result. False for an assistant message that came in as caller input.
+        7 req native: bool,
+        /// Whether the run's requests render part numbers, and clean them out of the model's
+        /// replies. Frozen per run; kept here so a message renders without its run's start.
+        8 req render_tags: bool,
+        9 req clean_reply: bool,
+        /// The message's id, which never repeats in the session, across reverts. A message
+        /// converted from today's storage keeps today's id. A new message's id is minted from
+        /// the writer generation and the seq this record takes (`Session::message_id`).
+        10 req mid: String,
     }
 }
 
@@ -802,6 +866,132 @@ macro_rules! records {
     };
 }
 
+message! {
+    /// A writer opened the log: it committed a new generation in the head and may now mint
+    /// identities from (generation, seq). Written as a barrier before the writer's first other
+    /// record, so the head and the log can't name different generations.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct WriterOpened {
+        1 req generation: crate::codec::Id128,
+    }
+}
+
+crate::values! {
+    /// What a change does.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum ChangeKind {
+        /// Seals the transcript before a compaction cut, and every ledger record.
+        1 Cut,
+        /// Seals every ledger record and keeps the transcript open.
+        2 LedgerSeal,
+        /// Ends the transcript branch before an earlier user input and starts a new run there
+        /// with an edited input (see `session::revert`). Seals every ledger record.
+        3 Revert,
+        /// Seals every ledger record of a session idle for days, and, if no run is unfinished,
+        /// prunes finished runs' opaque reasoning from the transcript it keeps open (see
+        /// `session::cold`).
+        4 Cold,
+        /// Repairs a damaged open log (see `session::recover`). Its intent lives in the head, not
+        /// in the damaged log, which nothing writes to again.
+        5 Recover,
+    }
+}
+
+message! {
+    /// A change began: it may now create objects under its id and a new open log. Written as a
+    /// barrier before anything is created, it closes the log: the only record the log accepts
+    /// after it is the change's `ChangeAborted`. A committed change settles it by making its new
+    /// log the session's open log.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ChangeIntent {
+        1 req change: crate::codec::Id128,
+        2 req kind: ChangeKind,
+        /// For a cut, the seq of the first record kept above the cut. For a revert, the seq of
+        /// the first transcript record the branch drops.
+        3 opt cut: u64,
+    }
+}
+
+message! {
+    /// A revert ended the transcript branch before message `ordinal` and started a new run
+    /// there. Its records stay in the ledger: spend, tool side effects and accepted sends aren't
+    /// undone. Only a revert's own ledger segment holds this record, never the log the revert
+    /// replaced, so a revert that never committed leaves no trace of it.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct TranscriptReverted {
+        1 req change: crate::codec::Id128,
+        /// The seq of the first transcript record dropped, and of the last one the branch held.
+        2 req from_seq: u64,
+        3 req through_seq: u64,
+        4 req ordinal: u64,
+        /// The session's history version after the revert.
+        5 req history_version: u64,
+    }
+}
+
+message! {
+    /// A recovery replaced a damaged open log (see `session::recover`). Only the recovery's own
+    /// ledger segment holds this record.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct RecoveryCut {
+        1 req change: crate::codec::Id128,
+        /// The first damaged byte of the replaced log, and its durable bound.
+        2 req at: u64,
+        3 req durable_bound: u64,
+        /// Seqs from `removed_from` through `removed_through` that the new log doesn't hold are
+        /// removed: they were in the damaged bytes, or were never issued. Records written after
+        /// the recovery take seqs above `removed_through`.
+        4 req removed_from: u64,
+        5 req removed_through: u64,
+        /// Some record may have been lost, so open work was closed and a damage notice written.
+        6 req loss_aware: bool,
+        /// When transcript records may have been lost: the first transcript seq dropped, the
+        /// ordinal from which the compaction provider must read again, and the new history
+        /// version.
+        7 opt transcript_from: u64,
+        8 opt ordinal: u64,
+        9 opt history_version: u64,
+        /// The ledger may have lost records of actions no surviving record identifies: an action
+        /// may have run without any record of it.
+        10 req unattributed_risk: bool,
+        /// The object holding the replaced log's bytes from `at` on, kept for an operator.
+        11 req saved: String,
+    }
+}
+
+message! {
+    /// A change that never committed was undone: its objects and new log are deleted, and the log
+    /// accepts records again.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ChangeAborted {
+        1 req change: crate::codec::Id128,
+    }
+}
+
+impl Record {
+    /// The time this record says something happened in the session, from whichever time field
+    /// its kind carries. `None` for kinds that carry none, which includes `WriterOpened`: opening
+    /// a writer isn't activity.
+    pub fn activity_ms(&self) -> Option<u64> {
+        match self {
+            Record::Input(r) => r.written_at_ms,
+            Record::Assistant(r) => r.last_content_at_ms.or(r.written_at_ms),
+            Record::ToolReply(r) => r.finished_at_ms,
+            Record::ResultAppend(r) => r.written_at_ms,
+            Record::EntryFacts(r) => Some(r.written_at_ms),
+            Record::RunStart(r) => r.written_at_ms.or(r.ts_ms),
+            Record::RunEnd(r) => r.ts_ms,
+            Record::Attempt(r) => r.last_content_at_ms.or(Some(r.ts_ms)),
+            Record::ToolOutcome(r) => r.finished_at_ms,
+            Record::QueuedSend(r) => r.written_at_ms.or(r.ts_ms),
+            Record::Pause(r) => r.ts_ms,
+            Record::Steer(r) => r.written_at_ms,
+            Record::Delivery(r) => r.written_at_ms,
+            _ => None,
+        }
+    }
+}
+
 records! {
     transcript {
         1 Input,
@@ -811,6 +1001,7 @@ records! {
         5 SetupStub,
         6 Compaction,
         7 Marker,
+        8 EntryFacts,
     }
     ledger {
         // One per run, and much larger than the rest.
@@ -838,6 +1029,11 @@ records! {
         85 DeliveryOrdered,
         86 View,
         87 ViewApplied,
+        88 WriterOpened,
+        89 ChangeIntent,
+        90 ChangeAborted,
+        91 TranscriptReverted,
+        92 RecoveryCut,
     }
 }
 

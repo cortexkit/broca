@@ -39,7 +39,7 @@ fn a_tool_step_splits_into_transcript_and_ledger_records() {
         r#"{"type":"run_finished","reason":"completed","usage":{},"retries_used":0}"#,
         &run2,
     ]);
-    let converted = convert(&old).unwrap();
+    let converted = convert(&old, None).unwrap();
     assert_eq!(
         names(&converted.records),
         [
@@ -140,7 +140,7 @@ fn changed_dispatch_arguments_are_kept() {
         r#"{"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m1","content":[{"type":"tool_call","tool_call_id":"c1","tool_name":"bash","input":{"cmd":"ls"}}]},"usage":{},"retries_used":0}"#,
         r#"{"type":"tool_dispatch_intent","batch_id":"b1","tool_call_id":"c1","args":{"cmd":"ls -la"}}"#,
     ]);
-    let converted = convert(&old).unwrap();
+    let converted = convert(&old, None).unwrap();
     let Some(Record::ToolIntent(intent)) = converted.records.last() else {
         panic!("last record is the intent");
     };
@@ -174,7 +174,7 @@ fn a_run_start_records_the_refusal_schedule_admission_carried() {
         end,
         &other_model,
     ]);
-    let records = convert(&old).unwrap().records;
+    let records = convert(&old, None).unwrap().records;
     let schedules: Vec<Option<serde_json::Value>> = records
         .iter()
         .filter_map(|record| match record {

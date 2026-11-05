@@ -269,7 +269,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "broca-bench"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "broca-core",
  "broca-protocol",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "broca-catalog"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "base64",
  "broca-catalog",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "broca-ck"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "broca-protocol",
  "serde",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "broca-core"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "async-trait",
  "base64",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "broca-crash-harness"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "async-trait",
  "broca-core",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "broca-diagnostics"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "serde",
  "tokio",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "broca-fetch-plan"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "async-trait",
  "broca-protocol",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "broca-heap-profile"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "serde",
  "serde_json",
@@ -403,11 +403,11 @@ dependencies = [
 
 [[package]]
 name = "broca-memory-relief"
-version = "0.3.310"
+version = "0.3.315"
 
 [[package]]
 name = "broca-module"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "async-trait",
  "base64",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "broca-module-serve"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -508,14 +508,14 @@ dependencies = [
 
 [[package]]
 name = "broca-owner-only"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "broca-protocol"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "cortexkit-anthropic-policy",
  "cortexkit-bus-naming",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "broca-provider"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "async-trait",
  "base64",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "broca-replay"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "broca-protocol",
  "rustix",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "broca-run"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "base64",
  "broca-catalog",
@@ -605,35 +605,41 @@ dependencies = [
 
 [[package]]
 name = "broca-session-convert"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "broca-core",
  "broca-protocol",
  "broca-session-store",
  "broca-wal",
+ "cortexkit-role-compaction",
+ "futures",
  "serde",
  "serde_jcs",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "zstd",
+]
+
+[[package]]
+name = "broca-session-store"
+version = "0.3.315"
+dependencies = [
+ "broca-protocol",
+ "chacha20poly1305",
+ "crc32c",
+ "futures",
+ "getrandom 0.2.17",
+ "proptest",
+ "serde",
  "serde_json",
  "sha2",
  "zstd",
 ]
 
 [[package]]
-name = "broca-session-store"
-version = "0.3.310"
-dependencies = [
- "broca-protocol",
- "chacha20poly1305",
- "crc32c",
- "getrandom 0.2.17",
- "proptest",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "broca-store"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "async-trait",
  "broca-core",
@@ -656,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "broca-store-contention-tests"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "broca-core",
  "broca-protocol",
@@ -667,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "broca-subc"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "async-trait",
  "base64",
@@ -700,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "broca-test-support"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "broca-core",
  "broca-owner-only",
@@ -717,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "broca-wal"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "broca-owner-only",
  "broca-protocol",
@@ -743,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "broca-wire"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "broca-core",
  "broca-protocol",
@@ -889,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "ck-import"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "broca-core",
  "broca-module",
@@ -906,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "ck-session-import"
-version = "0.3.310"
+version = "0.3.315"
 dependencies = [
  "broca-module-serve",
  "broca-protocol",
@@ -1322,9 +1328,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a4f8d0c4c27735951c321f21de4bf95eb172df1910af8043255c0eb5a0f4ceb"
+checksum = "22c630ffa713db6976722d86c1509cd463ece23e964a98581c1ac18baea440d8"
 dependencies = [
  "cortexkit-role-tool-display",
  "serde",
@@ -1336,9 +1342,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider-conformance"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31deee3db8ee631ee61b949d3be7366b00cf61342a6618ba576f7c959442a8f"
+checksum = "1dae9135d30b4c3f0952a47e351fe4d75000ff5d8190b6e94d198e35aded0da6"
 dependencies = [
  "async-trait",
  "cortexkit-role-harness",
@@ -1669,6 +1675,7 @@ checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -1690,6 +1697,17 @@ name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+
+[[package]]
+name = "futures-executor"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf29c38818342a3b26b5b923639e7b1f4a61fc5e76102d4b1981c6dc7a7579d"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
 
 [[package]]
 name = "futures-io"

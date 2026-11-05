@@ -310,7 +310,7 @@ fn setup() -> cortexkit_role_compaction::setup::SetupRequest {
         1000,
         100,
         rules::defaults("gpt-5"),
-        runtime::detects(),
+        runtime::detects(true),
         1,
     )
 }
@@ -618,7 +618,7 @@ fn compaction_v2_rides_include_every_simultaneous_cause() {
     };
     let conditions = session_conditions::conditions(current.model.clone(), 1000, 100, true);
     assert_eq!(
-        session_conditions::ride_causes(Some(&previous), &current, false, true, 901, &conditions),
+        session_conditions::ride_causes(Some(&previous), &current, true, true, 901, &conditions),
         [
             RideCause::CacheExpired,
             RideCause::ChainReset,
@@ -632,13 +632,13 @@ fn compaction_v2_rides_include_every_simultaneous_cause() {
     assert!(session_conditions::ride_causes(
         Some(&current),
         &current,
-        true,
+        false,
         false,
         900,
         &conditions
     )
     .is_empty());
-    let setup = session_conditions::setup_request("unchanged-preset", &conditions, 100);
+    let setup = session_conditions::setup_request("unchanged-preset", &conditions, 100, true);
     assert_eq!(setup.preset, "unchanged-preset");
     assert_eq!(setup.model, current.model);
     assert_eq!(setup.detects.len(), 7);
@@ -1376,11 +1376,75 @@ fn request_at<'a>(
         conditions,
         previous: Some(current),
         current,
-        cache_warm: true,
+        cache_expired: false,
+        detects_cache_expired: false,
         chain_reset: false,
         now: 1,
         next_mid: "m12345678.1",
     }
+}
+
+/// A proven expiry rides as `cache_expired` only when Setup told the provider broca detects it.
+/// Where the session's requests ask for no cache lifetime (ChatGPT's backend), Setup leaves the
+/// cause out, and the ride never claims it, even when broca's own estimate says the cache aged
+/// out.
+#[tokio::test]
+async fn compaction_v2_cache_expired_rides_only_where_setup_listed_it() {
+    for detects in [false, true] {
+        let messages = vec![text(Role::User, "question")];
+        let entries = project(&messages, &facts(1), &Deliveries::new(), true);
+        let plane = RecordingPlane::default();
+        plane.answers.lock().unwrap().extend([
+            json!({"answer":"ready"}),
+            json!({"answer":"received"}),
+            json!({"answer":"nothing"}),
+            json!({"answer":"received"}),
+        ]);
+        let state = tokio::sync::Mutex::new(state::State::default());
+        let conditions = conditions();
+        let current = send_context();
+        let mut at = request_at(&messages, &entries, &conditions, &current);
+        at.cache_expired = true;
+        at.detects_cache_expired = detects;
+        super::request::prepare(
+            &state,
+            &runtime::Runtime::default(),
+            &MemoryJournal::default(),
+            &plane,
+            at,
+            |_| panic!("no image"),
+            text_estimate,
+        )
+        .await
+        .unwrap();
+        let calls = plane.calls.lock().unwrap();
+        let (_, setup) = calls
+            .iter()
+            .find(|(method, _)| method == "compaction.setup")
+            .expect("Setup was sent");
+        let listed = setup["detects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cause| cause == "cache_expired");
+        assert_eq!(listed, detects);
+        let ride = calls.iter().find(|(method, _)| method == "compaction.ride");
+        if detects {
+            let (_, ride) = ride.expect("a proven expiry rides");
+            assert_eq!(ride["causes"], json!(["cache_expired"]), "{ride}");
+        } else {
+            assert!(ride.is_none(), "rode with {:?}", ride);
+        }
+    }
+}
+
+#[test]
+fn compaction_v2_detects_lists_cache_expired_only_when_asked() {
+    use cortexkit_role_compaction::ride::RideCause;
+    assert!(runtime::detects(true).contains(&RideCause::CacheExpired));
+    let without = runtime::detects(false);
+    assert!(!without.contains(&RideCause::CacheExpired));
+    assert_eq!(without.len() + 1, runtime::detects(true).len());
 }
 
 fn send_context() -> session_conditions::SendContext {
@@ -1549,4 +1613,72 @@ async fn compaction_v2_request_ride_view_applies_to_that_request_before_sending(
         ["accepted:1", "applied:1:1"]
     );
     assert!(matches!(&messages[0].content[0], ContentBlock::Text { text } if text.len() == 1000));
+}
+
+/// The ride (broca's call to the compaction provider before a step, naming why the request is
+/// about to change) claims `cache_expired` only when the cache clock proves it. A route with no cache clock,
+/// or a session with no send yet, claims nothing: the provider treats `cache_expired` as a free
+/// rebuild, so a guess there turns every step into a full resend.
+#[test]
+fn cache_expired_is_claimed_only_when_proven() {
+    use session_conditions::cache_proven_expired;
+    assert!(!cache_proven_expired(None, Some(1_000), 10_000_000));
+    assert!(!cache_proven_expired(Some(300_000), None, 10_000_000));
+    assert!(!cache_proven_expired(Some(300_000), Some(1_000), 300_999));
+    assert!(cache_proven_expired(Some(300_000), Some(1_000), 301_000));
+    let causes = session_conditions::ride_causes(
+        Some(&send_context()),
+        &send_context(),
+        false,
+        false,
+        10,
+        &conditions(),
+    );
+    assert!(causes.is_empty(), "{causes:?}");
+}
+
+/// The output reserve is the run's own `max_output_tokens` when it froze one, else the model's
+/// output cap from the frozen render config. The ChatGPT route never sends the field, and its
+/// sessions told the provider a reserve of 0.
+#[test]
+fn the_output_reserve_falls_back_to_the_models_output_cap() {
+    use broca_protocol::request::ModelHandle;
+    use broca_wal::RunConfig;
+    let config = |max_output_tokens: Option<u64>| RunConfig {
+        global_system: None,
+        route_decision_id: None,
+        account_limit_pause: false,
+        turn_directives_v1: None,
+        render_tags: false,
+        computed_tags: None,
+        model: ModelHandle::new("openai", "gpt-6.1-sol"),
+        tools: Vec::new().into(),
+        tool_choice: Default::default(),
+        generation: broca_protocol::request::GenerationConfig {
+            max_output_tokens,
+            ..Default::default()
+        },
+        response_format: Default::default(),
+        provider_options: serde_json::Value::Null,
+        cache_tiers: serde_json::Value::Null,
+        context_epoch: 0,
+        renderer_version: 1,
+        frozen_render_config: serde_json::json!({"max_output_tokens": 128000}),
+        auth_selection: None,
+        tools_were_omitted: false,
+        budget: None,
+        context_limit: Some(1_050_000),
+        work_class: None,
+        variant: None,
+        service_tier: None,
+        stop_when: Vec::new(),
+        context_management: None,
+    };
+    let reserve = |config: RunConfig| {
+        super::host::conditions(&config, &[], false)
+            .unwrap()
+            .output_reserve
+    };
+    assert_eq!(reserve(config(None)), 128_000);
+    assert_eq!(reserve(config(Some(4_096))), 4_096);
 }

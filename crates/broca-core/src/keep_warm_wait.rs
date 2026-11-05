@@ -41,6 +41,12 @@ pub enum WarmTick {
 #[async_trait::async_trait]
 pub trait KeepWarmDriver: Send + Sync {
     fn timing(&self, config: &RunConfig) -> Result<WarmTiming, String>;
+    /// The cache lifetime requests under `config` ask the provider for, when they ask for one
+    /// it honours. Unlike `timing`'s lifetime, which may be broca's own estimate for scheduling
+    /// warms, this one can prove the cache expired. `None` when the request names none.
+    fn requested_ttl_ms(&self, _config: &RunConfig) -> Option<u64> {
+        None
+    }
     fn last_sent_at_ms(&self) -> Option<u64>;
     fn note_attempt(&self, _attempt: &broca_protocol::ModelAttempt) {}
     fn costs(&self, config: &RunConfig) -> Result<crate::keep_warm::WarmCosts, String>;
