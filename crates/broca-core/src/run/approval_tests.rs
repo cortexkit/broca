@@ -1015,7 +1015,6 @@ impl Rig {
             plan: &self.plan,
             plane: self.control.hook_plane.as_ref().unwrap(),
             bind: &self.bind,
-            writer: &self.writer,
             cancel: self.control.cancel.as_ref(),
             stop: self.control.stop_requested.as_ref(),
             seal: None,

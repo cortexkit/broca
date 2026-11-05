@@ -47,11 +47,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let plane = self.executor.hook_plane().ok_or_else(|| {
             SendOutcome::Error("plan.step_transform_items requires an installed hook plane".into())
         })?;
-        let writer = Arc::clone(
-            self.writer
-                .as_ref()
-                .expect("writer live while preparing input"),
-        );
         let bind = self.key.clone();
         // A first send has not recorded its scope yet; its admission supplies that scope.
         // Steering messages and queued inputs use the scope the session already froze.
@@ -69,7 +64,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
             plan: &plan,
             plane: &plane,
             bind: &bind,
-            writer: &writer,
             // A stop or interrupt aimed at the active run cannot cancel a different send.
             cancel: None,
             stop: None,

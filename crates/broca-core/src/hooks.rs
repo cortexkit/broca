@@ -292,7 +292,6 @@ pub struct HookRuntime<'a> {
     pub plane: &'a Arc<dyn HookPlane>,
     pub bind: &'a BindIdentity,
     pub scope: Option<&'a broca_protocol::SessionScope>,
-    pub writer: &'a crate::WalHandle,
     pub cancel: Option<&'a CancellationToken>,
     pub stop: Option<&'a CancellationToken>,
     pub seal: Option<&'a crate::ShutdownSeal>,

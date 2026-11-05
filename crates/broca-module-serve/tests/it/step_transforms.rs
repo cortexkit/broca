@@ -119,7 +119,6 @@ async fn controlled_hook_deadlines() {
             plan: &plan,
             plane: &plane,
             bind: &bind,
-            writer: &writer,
             cancel: None,
             stop: None,
             seal: None,
