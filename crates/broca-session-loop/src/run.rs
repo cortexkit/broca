@@ -33,7 +33,7 @@ use broca_protocol::request::{
     CallOptions, ExecutionMode, ModelHandle, OnRestart, ResponseFormat, StepContext, StopCondition,
     Tool, ToolChoice,
 };
-use broca_protocol::tags::{clean_computed_into, ComputedRules};
+use broca_protocol::tags::{clean_computed_into, render_tags_into, ComputedRules, TagRendering};
 use broca_protocol::{
     BatchId, BindIdentity, FinishReason, GenerationConfig, RunId, StepId, ToolCallId, Usage,
 };
@@ -105,6 +105,9 @@ pub struct Admission {
     /// layout. Today's actor asks for it when the plan names a compaction provider. A later run
     /// keeps its session's layout whatever this says.
     pub compaction_plan_version: Option<u32>,
+    /// Whether the run froze part numbers into the model's view. A caller leaves it false: a new
+    /// run takes it from its plan. A run read back from its start carries what the start froze.
+    pub render_tags: bool,
 }
 
 /// The seams a run calls. None of them is owned by the run.
@@ -183,6 +186,7 @@ where
     P: Provider,
     T: ToolPlane,
 {
+    refuse_first_protocol_compaction(writer)?;
     // A session keeps the layout its first run started under; a new run on it freezes the view
     // library's current plan version, as today's loop does.
     let mut admission = admission;
@@ -260,6 +264,7 @@ where
     P: Provider,
     T: ToolPlane,
 {
+    refuse_first_protocol_compaction(writer)?;
     let run = writer
         .operations()
         .run
@@ -665,7 +670,116 @@ pub(crate) fn admission_of_start(
         compaction_plan_version: start.compaction_plan_version,
         context_limit: start.context_limit,
         manifest: frozen_manifest(start, parts)?,
+        render_tags: member("render_tags")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
     })
+}
+
+/// A session compacted under the first compaction protocol keeps rendering under that protocol's
+/// last view, which only today's run loop applies, so the new loop refuses it rather than send
+/// different bytes.
+fn refuse_first_protocol_compaction<W: Writer>(writer: &W) -> Result<(), LoopError> {
+    if writer.conversation().first_protocol_compaction
+        || writer.operations().first_protocol_compaction
+    {
+        return Err(LoopError::Unsupported(
+            "a session compacted under the first compaction protocol",
+        ));
+    }
+    Ok(())
+}
+
+/// The part-number rules a window run froze, and where its messages start in the window.
+pub(crate) struct RunTagRules {
+    start: usize,
+    rules: Option<ComputedRules>,
+    computed: Option<ComputedTagRules>,
+}
+
+/// Each window run's frozen part-number rules, read from its start record: whether it renders
+/// numbers, the number it continues after, and its render config, combined by today's
+/// `rules_for`, the same function today's loop numbers a run's messages with.
+async fn run_tag_rules<W: Writer>(
+    writer: &W,
+    episodes: &[EpisodeRenderInput],
+) -> Result<Vec<RunTagRules>, LoopError> {
+    let conversation = writer.conversation();
+    let window = &episodes[conversation.sealed_episodes.len()..];
+    let first = (conversation.window_start() - 1) as usize;
+    let mut out = Vec::with_capacity(window.len());
+    for (episode, render) in conversation.episodes.iter().zip(window) {
+        let start = writer.run_start(&episode.run_id).await?.ok_or_else(|| {
+            LoopError::Parts(format!(
+                "the window names run {} but the session holds no start for it",
+                episode.run_id
+            ))
+        })?;
+        let config = start
+            .run_choices
+            .as_ref()
+            .and_then(|choices| choices.get("config"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let render_tags = config["render_tags"].as_bool().unwrap_or(false);
+        let computed: Option<ComputedTagRules> = decode(config.get("computed_tags").cloned())?;
+        out.push(RunTagRules {
+            start: render.prompt_start.saturating_sub(first),
+            rules: broca_core::tags::rules_for(computed, render_tags, &render.frozen_config),
+            computed,
+        });
+    }
+    Ok(out)
+}
+
+/// Whether the run froze part numbers into the model's view: a run read back from its start
+/// carries the frozen choice, and a new run takes it from its plan, as its start record freezes
+/// it.
+fn frozen_render_tags(admission: &Admission) -> bool {
+    admission.render_tags
+        || admission
+            .manifest
+            .as_deref()
+            .is_some_and(broca_core::tags::plan_renders_tags)
+}
+
+/// The request the latest run's step `step_id` sends, built from the session's state exactly as
+/// the run loop builds it before sending, without any provider or tool plane: for checking
+/// requests rebuilt from stored sessions against the bytes that were sent. A run whose plan names
+/// a compaction provider renders from that provider's view, which this doesn't apply yet, so it
+/// refuses.
+pub async fn offline_request<W: Writer>(
+    writer: &W,
+    parts: &dyn Parts,
+    step_id: u64,
+) -> Result<CallOptions, LoopError> {
+    refuse_first_protocol_compaction(writer)?;
+    let run = writer
+        .operations()
+        .run
+        .as_ref()
+        .ok_or(LoopError::Unsupported("a session with no run"))?;
+    let admission = frozen_admission(run, parts)?;
+    let compacted = match (
+        admission.compaction_plan_version,
+        admission.manifest.as_deref(),
+    ) {
+        (Some(_), Some(manifest)) => broca_core::compaction::item(manifest)
+            .map_err(LoopError::Parts)?
+            .is_some(),
+        _ => false,
+    };
+    if compacted {
+        return Err(LoopError::Unsupported(
+            "an offline request for a run with a compaction provider",
+        ));
+    }
+    let episodes = render_episodes(writer, parts)?;
+    let run_rules = run_tag_rules(writer, &episodes).await?;
+    let tools = Arc::new(admission.tools.clone());
+    call_options(
+        writer, &admission, &tools, &episodes, &run_rules, None, step_id, false,
+    )
 }
 
 /// Model steps and tool batches from the run's current state until a decision ends the run.
@@ -892,12 +1006,14 @@ where
             }
             _ => {}
         }
+        let run_rules = run_tag_rules(writer, &episodes).await?;
         let mut opts = call_options(
             writer,
             admission,
             &tools,
             &episodes,
-            seams,
+            &run_rules,
+            seams.session_address.clone(),
             step_id,
             compaction.is_some(),
         )?;
@@ -1149,11 +1265,7 @@ async fn admit<W: Writer>(
         );
     }
     // A plan that asks for part numbers in the model's view freezes that on the run, as today.
-    if admission
-        .manifest
-        .as_deref()
-        .is_some_and(broca_core::tags::plan_renders_tags)
-    {
+    if frozen_render_tags(admission) {
         config.insert("render_tags".into(), json!(true));
     }
     // Today's computed tag rules, starting after the highest number the session has shown.
@@ -1325,12 +1437,13 @@ fn render_episodes<W: Writer>(
 /// The request for step `step_id`: the conversation as the folds hold it, under the run's
 /// frozen settings, with the render inputs today's loop gives a request: each message's
 /// position, its part numbers under the run's tag rules, and the run's place in the prompt.
-fn call_options<W: Writer, P, T>(
+fn call_options<W: Writer>(
     writer: &W,
     admission: &Admission,
     tools: &Arc<Vec<Tool>>,
     episodes: &[EpisodeRenderInput],
-    seams: &Seams<'_, P, T>,
+    run_rules: &[RunTagRules],
+    session_address: Option<String>,
     step_id: u64,
     compacted: bool,
 ) -> Result<CallOptions, LoopError> {
@@ -1347,20 +1460,42 @@ fn call_options<W: Writer, P, T>(
     for (index, message) in prompt.iter_mut().enumerate() {
         message.ordinal = Some(first + index as u64);
     }
-    TagNumbering::for_run(
-        &[],
-        Some(ComputedRules {
-            render: false,
-            clean: false,
-        }),
-        Some(ComputedTagRules { checkpoint: 0 }),
-    )
-    .number_new(&mut prompt)
-    .map_err(|_| LoopError::Unsupported("part numbers past the numbering limit"))?;
     // A session on the current compaction contract renders its numbers from the entries below;
-    // one on the established layout renders them in place.
+    // one on the established layout numbers each run's messages by that run's frozen rules, in
+    // the order they were placed, as today's loop numbers them, and renders them in place.
     let contract = admission.compaction_plan_version.is_some();
-    if !contract {
+    let overflow = |_| LoopError::Unsupported("part numbers past the numbering limit");
+    if contract {
+        TagNumbering::for_run(
+            &[],
+            Some(ComputedRules {
+                render: false,
+                clean: false,
+            }),
+            Some(ComputedTagRules { checkpoint: 0 }),
+        )
+        .number_new(&mut prompt)
+        .map_err(overflow)?;
+    } else {
+        for (at, run) in run_rules.iter().enumerate() {
+            let end = run_rules
+                .get(at + 1)
+                .map_or(prompt.len(), |next| next.start)
+                .min(prompt.len());
+            let start = run.start.min(end);
+            TagNumbering::for_run(&prompt[..start], run.rules, run.computed)
+                .number_new(&mut prompt[..end])
+                .map_err(overflow)?;
+        }
+    }
+    if !contract && frozen_render_tags(admission) {
+        // A run frozen with part numbers in the model's view sends user and tool-result text with
+        // its numbers in front, as today's loop renders it.
+        render_tags_into(
+            &mut prompt,
+            TagRendering::for_render_config(&admission.render_config),
+        );
+    } else if !contract {
         clean_computed_into(&mut prompt);
     }
     let mut opts = CallOptions::new(prompt);
@@ -1375,7 +1510,7 @@ fn call_options<W: Writer, P, T>(
     opts.step_context = Some(StepContext {
         run_id: admission.run_id.clone(),
         step_index: step_id,
-        session_address: seams.session_address.clone(),
+        session_address,
         credential_id: None,
         account_ref: None,
         max_output_tokens: None,

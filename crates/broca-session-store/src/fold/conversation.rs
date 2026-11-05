@@ -198,6 +198,13 @@ state! {
             reset: "a cut",
             bound: Bound::PerRun("one count per distinct failing call"),
         },
+        /// The transcript holds a message of the first compaction protocol, which only today's
+        /// run loop renders, so the new run loop refuses the session.
+        14 req pub first_protocol_compaction: bool => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -220,6 +227,7 @@ impl Conversation {
             render_key: None,
             sealed_episodes: Vec::new(),
             window_repetition: None,
+            first_protocol_compaction: false,
         }
     }
 
@@ -241,6 +249,7 @@ impl Conversation {
             render_key: self.render_key,
             sealed_episodes: self.sealed_episodes.clone(),
             window_repetition: self.window_repetition.clone(),
+            first_protocol_compaction: self.first_protocol_compaction,
         }
     }
 
@@ -483,7 +492,9 @@ impl Conversation {
                     .cloned();
                 self.render_key = stub.render_key;
             }
-            Record::Compaction(_) => {}
+            Record::Compaction(compaction) => {
+                self.first_protocol_compaction |= compaction.version == 1;
+            }
             _ => unreachable!("every transcript kind is matched above"),
         }
         Ok(())

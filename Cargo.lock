@@ -607,7 +607,9 @@ name = "broca-session-convert"
 version = "0.3.315"
 dependencies = [
  "broca-core",
+ "broca-module-serve",
  "broca-protocol",
+ "broca-provider",
  "broca-session-loop",
  "broca-session-store",
  "broca-wal",

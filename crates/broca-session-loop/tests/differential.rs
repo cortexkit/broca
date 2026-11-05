@@ -844,6 +844,7 @@ impl Scenario {
             manifest: self.manifest.clone(),
             global_system: Vec::new(),
             compaction_plan_version: layout(),
+            render_tags: false,
             context_limit: compaction().map(|script| script.context_limit),
         }
     }

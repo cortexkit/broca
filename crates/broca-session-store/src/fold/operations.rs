@@ -622,6 +622,14 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The ledger holds a record of the first compaction protocol (its notices, waits and
+        /// applied views stay generic events under their old names; the current contract's are
+        /// typed). Only today's run loop renders such a session, so the new run loop refuses it.
+        15 req pub first_protocol_compaction: bool => {
+            owner: "compaction",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -853,6 +861,7 @@ impl Operations {
             if NOT_FOLDED.contains(&event.name.as_str()) {
                 return Err(FoldError::NotFolded(event.name.clone()));
             }
+            self.first_protocol_compaction |= event.name.starts_with("compaction_");
         }
         let Some(run) = self.run.as_mut() else {
             return Ok(());

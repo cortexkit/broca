@@ -14,7 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 broca-core = { path = "../broca-core" }
+# Today's offline request renderer (`wal_render`), which the `render` check compares the new run
+# loop's rebuilt requests with.
+broca-module-serve = { path = "../broca-module-serve" }
 broca-protocol = { path = "../broca-protocol" }
+broca-provider = { path = "../broca-provider" }
 broca-session-loop = { path = "../broca-session-loop" }
 broca-session-store = { path = "../broca-session-store" }
 broca-wal = { path = "../broca-wal" }

@@ -248,8 +248,289 @@ fn main() {
         "seal" => run_seal(&args),
         "entries" => run_entries(&args),
         "episodes" => run_episodes(&args),
+        "render" => run_render(&args),
         _ => usage(),
     }
+}
+
+/// Requests rebuilt from stored sessions against the bytes broca sent. For each sampled model step
+/// of a log, today's offline renderer (`wal_render`) rebuilds the step's request from today's
+/// records, and the new run loop rebuilds it from the converted records written into a session.
+/// Each is rendered by the run's own wire family and hashed, then compared with the request
+/// digest the step's first attempt recorded when it was sent. Where today's rebuild matches and
+/// the new loop's doesn't, the report names the first request member that differs.
+#[derive(Default, Serialize)]
+struct RenderReport {
+    logs: u64,
+    /// Logs not checked, by reason.
+    skipped: BTreeMap<String, u64>,
+    steps: u64,
+    /// Steps whose rebuilt request from today's records equals the bytes sent.
+    today_matches: u64,
+    /// Steps whose rebuilt request from the new loop equals the bytes sent.
+    new_matches: u64,
+    /// Today's rebuild matches the bytes sent and the new loop's doesn't: by the first request
+    /// member that differs between the two rebuilds.
+    new_differs: BTreeMap<String, u64>,
+    /// The new loop's rebuild matches and today's doesn't.
+    today_only_differs: u64,
+    /// Neither rebuild matches the bytes sent (today's offline renderer can't rebuild these, so
+    /// they say nothing about the new loop).
+    neither: u64,
+    /// Steps where the new loop couldn't build a request, by its error.
+    new_errors: BTreeMap<String, u64>,
+    /// Steps where today's offline renderer couldn't, by its error.
+    today_errors: BTreeMap<String, u64>,
+    /// Steps sent with a lowered output cap. The new loop doesn't lower caps yet, so both
+    /// rebuilds take the recorded cap.
+    output_capped: u64,
+    /// One log per difference class, to look at.
+    examples: BTreeMap<String, String>,
+}
+
+fn run_render(args: &Args) {
+    use broca_wal::WalRecord;
+    let mut report = RenderReport::default();
+    let deployment = DeploymentKey::new(1, &[0x5a; 32]);
+    let sha = |bytes: &[u8]| {
+        use sha2::Digest as _;
+        broca_session_store::codec::hex(&sha2::Sha256::digest(bytes))
+    };
+    each_log(args, |item| {
+        let Item::Log {
+            name, old: Ok(old), ..
+        } = item
+        else {
+            return;
+        };
+        report.logs += 1;
+        let records: Vec<WalRecord> = old.records.iter().map(|f| f.record.clone()).collect();
+        if broca_core::is_mode3_log(&records) {
+            *report
+                .skipped
+                .entry("compaction contract layout".into())
+                .or_default() += 1;
+            return;
+        }
+        // Every step with a recorded request: where its start is, its run and config, and the
+        // digest of its first attempt.
+        let mut steps = Vec::new();
+        let mut active: Option<(String, broca_wal::RunConfig)> = None;
+        for (index, record) in records.iter().enumerate() {
+            match record {
+                WalRecord::RunStarted { run_id, config, .. } => {
+                    active = Some((run_id.0.clone(), (**config).clone()))
+                }
+                WalRecord::StepStarted { step_id } => {
+                    let Some((run, config)) = &active else {
+                        continue;
+                    };
+                    let digest = records[index + 1..]
+                        .iter()
+                        .take_while(|record| {
+                            !matches!(
+                                record,
+                                WalRecord::StepStarted { .. } | WalRecord::RunStarted { .. }
+                            )
+                        })
+                        .find_map(|record| match record {
+                            WalRecord::ModelAttemptFinished {
+                                step_id: attempted,
+                                request_body_sha256,
+                                ..
+                            } if attempted == step_id => Some(request_body_sha256.clone()),
+                            _ => None,
+                        });
+                    if let Some(digest) = digest {
+                        steps.push((index, run.clone(), step_id.0, config.clone(), digest));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if steps.is_empty() {
+            *report
+                .skipped
+                .entry("no recorded request".into())
+                .or_default() += 1;
+            return;
+        }
+        // At most `--sample` steps, spread over the log, always the first and the last.
+        let take = args.sample.max(2).min(steps.len());
+        let picked: Vec<usize> = (0..take)
+            .map(|k| k * (steps.len() - 1) / (take - 1).max(1))
+            .collect();
+        for &at in &picked {
+            let (index, run, step, config, digest) = &steps[at];
+            // The step's own lowered output cap, if it recorded one, follows its start.
+            let end = match records.get(index + 1) {
+                Some(WalRecord::OutputReservationClamped { .. }) => index + 1,
+                _ => *index,
+            };
+            let prefix = &records[..=end];
+            report.steps += 1;
+            let cap =
+                broca_core::output_reservation::recorded_cap(prefix, broca_protocol::StepId(*step));
+            report.output_capped += u64::from(cap.is_some());
+            let today = broca_module_serve::wal_render::render_step(prefix, config, run, *step);
+            let (frozen, today_opts, today_body) = match today {
+                Ok(today) => today,
+                Err(e) => {
+                    *report
+                        .today_errors
+                        .entry(e.chars().take(100).collect())
+                        .or_default() += 1;
+                    continue;
+                }
+            };
+            let new = (|| -> Result<(broca_protocol::CallOptions, Vec<u8>), String> {
+                let converted = convert(&old.records[..=end], old.lineage.as_deref())
+                    .map_err(|e| format!("convert: {}", e.0))?;
+                let parts = broca_session_loop::parts::MemoryParts {
+                    parts: converted.parts.clone(),
+                };
+                let mut opts = block_on(async {
+                    let backend = MemoryBackend::default();
+                    let mut session = Session::create(
+                        &backend,
+                        SessionAddr(name.clone()),
+                        triple(&name),
+                        &deployment,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| format!("create: {e:?}"))?;
+                    for record in &converted.records {
+                        session
+                            .append(std::slice::from_ref(record), false)
+                            .await
+                            .map_err(|e| format!("append {}: {e:?}", record.name()))?;
+                    }
+                    broca_session_loop::run::offline_request(&session, &parts, *step)
+                        .await
+                        .map_err(|e| format!("{e:?}"))
+                })?;
+                if let Some(context) = opts.step_context.as_mut() {
+                    context.max_output_tokens = cap;
+                }
+                let family = broca_provider::registry::wire_family(frozen.family_id)
+                    .ok_or("no wire family for the frozen family id")?;
+                let body = family.render_with_provenance(&frozen.for_step(&opts), &opts, None);
+                Ok((opts, body))
+            })();
+            let (new_opts, new_body) = match new {
+                Ok(new) => new,
+                Err(e) => {
+                    let key: String = e.chars().take(100).collect();
+                    report
+                        .examples
+                        .entry(format!("error: {key}"))
+                        .or_insert_with(|| name.clone());
+                    *report.new_errors.entry(key).or_default() += 1;
+                    continue;
+                }
+            };
+            let today_ok = sha(&today_body) == *digest;
+            let new_ok = sha(&new_body) == *digest;
+            report.today_matches += u64::from(today_ok);
+            report.new_matches += u64::from(new_ok);
+            match (today_ok, new_ok) {
+                (true, false) => {
+                    let key = options_difference(&today_opts, &new_opts);
+                    // With RENDER_DIFF set, print the first differing prompt message of each
+                    // mismatch, both ways, to see what the new loop builds differently.
+                    if std::env::var_os("RENDER_DIFF").is_some() {
+                        if let Some((at, (a, b))) = today_opts
+                            .prompt
+                            .iter()
+                            .zip(&new_opts.prompt)
+                            .enumerate()
+                            .find(|(_, (a, b))| a != b)
+                        {
+                            // Each part's type and size, then the start of the message.
+                            let show = |m: &broca_protocol::content::Message| {
+                                let value = serde_json::to_value(m).unwrap_or_default();
+                                let parts: Vec<String> = value["content"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|part| {
+                                        format!(
+                                            "{}:{}",
+                                            part["type"].as_str().unwrap_or("?"),
+                                            part.to_string().len()
+                                        )
+                                    })
+                                    .collect();
+                                format!(
+                                    "{parts:?} {}",
+                                    value.to_string().chars().take(300).collect::<String>()
+                                )
+                            };
+                            eprintln!(
+                                "{name} step {step} message {at}\n  today {}\n  new   {}",
+                                show(a),
+                                show(b)
+                            );
+                            if let Ok(replayed) = broca_core::replay::replay(prefix) {
+                                if let Some(m) = replayed.prompt.get(at) {
+                                    eprintln!("  replay {}", show(m));
+                                }
+                                let mut cleaned = replayed.prompt.clone();
+                                broca_protocol::tags::clean_computed_into(&mut cleaned);
+                                eprintln!(
+                                    "  render_tags {} compaction {} cleaned {}",
+                                    config.render_tags,
+                                    replayed.compaction.state().is_some(),
+                                    cleaned.get(at).map(show).unwrap_or_default()
+                                );
+                            }
+                        }
+                    }
+                    report
+                        .examples
+                        .entry(key.clone())
+                        .or_insert_with(|| name.clone());
+                    *report.new_differs.entry(key).or_default() += 1;
+                }
+                (false, true) => report.today_only_differs += 1,
+                (false, false) => report.neither += 1,
+                (true, true) => {}
+            }
+        }
+    });
+    write_report(&report, args.out_file.as_deref());
+}
+
+/// The first member that differs between two rebuilt requests, with array indexes left out so
+/// differences group by member: the serialized request first, then the render-only members the
+/// serialization skips.
+fn options_difference(
+    today: &broca_protocol::CallOptions,
+    new: &broca_protocol::CallOptions,
+) -> String {
+    let a = serde_json::to_value(today).expect("call options serialize");
+    let b = serde_json::to_value(new).expect("call options serialize");
+    if let Some(path) = broca_session_convert::inverse::first_difference(&b, &a, "") {
+        return path
+            .split('/')
+            .filter(|segment| segment.parse::<usize>().is_err())
+            .collect::<Vec<_>>()
+            .join("/");
+    }
+    if today.marker_order_version != new.marker_order_version {
+        return format!(
+            "marker_order_version (today {:?}, new {:?})",
+            today.marker_order_version, new.marker_order_version
+        );
+    }
+    if today.render_episodes != new.render_episodes {
+        return "render_episodes".into();
+    }
+    if today.declared_markers != new.declared_markers {
+        return "declared_markers".into();
+    }
+    "no member differs (the render differs)".into()
 }
 
 /// How many times sessions change their runs' render settings: a run whose render config differs
