@@ -2886,8 +2886,32 @@ async fn authorize_route_request<H: ServeHandler>(
 
 /// Handle an authorized request on an already bound route channel by checking the request method and
 /// calling the matching handler for that method.
+///
+/// The reader constructs request tasks on the main thread, whose Windows stack is only 1 MiB.
+/// Heap-own the method dispatch state before the cancellation, logging and panic wrappers
+/// embed it in the spawned task; copying those nested futures inline overflowed that stack.
 #[allow(clippy::too_many_arguments)]
-async fn execute_route_request<H>(
+fn execute_route_request<'a, H>(
+    req: RouteRequest,
+    writer: &'a EgressSender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    session: &'a BrocaBindIdentity,
+    bind: &'a BindObservation,
+    handler: &'a Arc<H>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), ServeIoError>> + Send + 'a>>
+where
+    H: ServeHandler + 'static,
+{
+    Box::pin(execute_route_request_inner(
+        req, writer, ver, channel, epoch, corr, session, bind, handler,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_route_request_inner<H>(
     req: RouteRequest,
     writer: &EgressSender<Frame>,
     ver: u8,
@@ -7522,6 +7546,35 @@ mod tests {
     struct MockSubscribeHandler {
         sink_tx: mpsc::Sender<mpsc::Sender<Delivery>>,
         refuse_session: std::sync::atomic::AtomicBool,
+    }
+
+    #[test]
+    fn route_request_future_stays_small() {
+        let (sink_tx, _) = mpsc::channel(1);
+        let handler = Arc::new(MockSubscribeHandler {
+            sink_tx,
+            refuse_session: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (writer, _) = broca_diagnostics::channel(4, Default::default());
+        let session = BrocaBindIdentity::new("/project", "runner", "session");
+        let bind = BindObservation::default();
+        let request = execute_route_request(
+            RouteRequest {
+                method: OP_SEND.into(),
+                params: serde_json::json!({}),
+            },
+            &writer,
+            1,
+            1,
+            1,
+            1,
+            &session,
+            &bind,
+            &handler,
+        );
+        let bytes = std::mem::size_of_val(&request);
+        eprintln!("execute_route_request future: {bytes} bytes");
+        assert!(bytes <= 4096, "route request future is {bytes} bytes");
     }
 
     #[async_trait::async_trait]
