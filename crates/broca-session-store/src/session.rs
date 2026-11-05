@@ -104,6 +104,7 @@ fn log_bind(session: &Id128, log: &Id128) -> Vec<u8> {
 fn apply(
     conversation: &mut Conversation,
     operations: &mut Operations,
+    seq: u64,
     record: &Record,
 ) -> Result<(), String> {
     match record.stream() {
@@ -111,7 +112,7 @@ fn apply(
             .apply(record)
             .map_err(|e| format!("conversation: {e:?}")),
         Stream::Ledger => operations
-            .apply(record)
+            .apply_at(Some(seq), record)
             .map_err(|e| format!("operations: {e:?}")),
     }
 }
@@ -324,7 +325,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 }
                 open_ids.add(*seq, record);
             }
-            apply(&mut conversation, &mut operations, record).map_err(SessionError::Fold)?;
+            apply(&mut conversation, &mut operations, *seq, record).map_err(SessionError::Fold)?;
         }
         let mut session = Self {
             backend,
@@ -428,10 +429,16 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             return Err(SessionError::ChangeOpen);
         }
         let encoded = self.encoder.batch(records)?;
+        let first = encoded.first_seq.expect("a batch holds records");
         self.poisoned = true;
-        for record in records {
-            apply(&mut self.conversation, &mut self.operations, record)
-                .map_err(SessionError::Fold)?;
+        for (position, record) in records.iter().enumerate() {
+            apply(
+                &mut self.conversation,
+                &mut self.operations,
+                first + position as u64,
+                record,
+            )
+            .map_err(SessionError::Fold)?;
         }
         self.backend
             .append_log(
@@ -447,7 +454,6 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         if barrier {
             self.encoder.synced();
         }
-        let first = encoded.first_seq.expect("a batch holds records");
         for (position, record) in records.iter().enumerate() {
             if record.stream() == Stream::Ledger {
                 self.open_ids.add(first + position as u64, record);

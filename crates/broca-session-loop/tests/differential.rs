@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use broca_core::{
-    provider::Provider, run_loop, AllowAll, FileLeaseStore, FileWalStore, RunRequest, StubReply,
-    StubToolPlane,
+    provider::Provider, run_loop, run_loop_on_writer, AllowAll, FileLeaseStore, FileWalStore,
+    RunControl, RunRequest, StartMode, SteerInbox, StubReply, StubToolPlane, WalHandle, WalStore,
 };
 use broca_crash_harness::wal::LogImage;
 use broca_protocol::content::{AssistantMessage, ContentBlock, Message, Role, ToolCall};
@@ -33,6 +33,7 @@ use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
 use broca_session_store::record::Record;
 use broca_session_store::session::{Session, SessionError};
+use broca_wal::WalRecord;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -293,11 +294,26 @@ async fn today_from(
 struct Recording<'s, 'b> {
     session: &'s mut Session<'b, MemoryBackend>,
     records: Vec<Record>,
+    /// Records another appender (the session actor, in production) added while the loop was
+    /// waiting on a seam. They're appended, durably, before the loop's next batch.
+    injected: Arc<Mutex<Vec<Record>>>,
+}
+
+impl Recording<'_, '_> {
+    async fn flush(&mut self) -> Result<(), SessionError> {
+        let pending: Vec<Record> = std::mem::take(&mut *self.injected.lock().unwrap());
+        if !pending.is_empty() {
+            self.records.extend(pending.iter().cloned());
+            self.session.append(&pending, true).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait(?Send)]
 impl Writer for Recording<'_, '_> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
+        self.flush().await?;
         self.records.extend_from_slice(records);
         self.session.append(records, barrier).await
     }
@@ -309,6 +325,18 @@ impl Writer for Recording<'_, '_> {
     }
     fn session_id(&self) -> String {
         Writer::session_id(&*self.session)
+    }
+    async fn append_with(
+        &mut self,
+        build: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations) -> Vec<Record> + Send),
+        barrier: bool,
+    ) -> Result<Vec<Record>, SessionError> {
+        self.flush().await?;
+        let records = build(&self.session.conversation, &self.session.operations);
+        if !records.is_empty() {
+            self.append(&records, barrier).await?;
+        }
+        Ok(records)
     }
     fn next_seq(&self) -> u64 {
         self.session.next_seq()
@@ -368,6 +396,7 @@ async fn new_from(
     let mut writer = Recording {
         session: &mut session,
         records: Vec::new(),
+        injected: Default::default(),
     };
     let now = || 0u64;
     let seams = Seams {
@@ -419,6 +448,8 @@ const NORMALIZED: &[&str] = &[
     "call_key",
     // A log position: each format numbers its own records.
     "resumed_from_seq",
+    // The seq of the record that accepted a steered message, in each format's own numbering.
+    "receipt_seq",
 ];
 
 fn normalized(records: &[Record]) -> Vec<Value> {
@@ -908,6 +939,7 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
     let mut writer = Recording {
         session: &mut session,
         records: Vec::new(),
+        injected: Default::default(),
     };
     let mut parts = MemoryParts::default();
     let now = || 0u64;
@@ -986,6 +1018,329 @@ async fn a_second_run_on_the_same_session() {
             ("r1", vec![system("You are careful."), user("first task")]),
             ("r2", vec![user("second task")]),
         ],
+    )
+    .await;
+}
+
+/// Where a scripted provider sends the messages it steers in while answering a step: a
+/// `steered` record as the session actor would write it.
+#[async_trait]
+trait SteerSink: Send + Sync {
+    async fn steer(&self, record: WalRecord);
+}
+
+/// Today's actor: the record is written under the run's steer inbox lock and synced.
+struct TodaySink {
+    inbox: Arc<SteerInbox>,
+    writer: Arc<WalHandle>,
+}
+
+#[async_trait]
+impl SteerSink for TodaySink {
+    async fn steer(&self, record: WalRecord) {
+        let WalRecord::Steered { input, .. } = &record else {
+            panic!("a steer");
+        };
+        let messages = input.as_ref().clone();
+        let writer = Arc::clone(&self.writer);
+        assert!(self.inbox.deliver(messages, move || {
+            writer.record(record);
+            None
+        }));
+        self.writer.sync().await.expect("the steer is durable");
+    }
+}
+
+/// The new store's actor: the same steer as the converter writes it, appended before the
+/// loop's next batch.
+struct NewSink {
+    injected: Arc<Mutex<Vec<Record>>>,
+}
+
+#[async_trait]
+impl SteerSink for NewSink {
+    async fn steer(&self, record: WalRecord) {
+        let mut value = serde_json::to_value(&record).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("type");
+        let input = serde_json::from_value(object.remove("input").unwrap()).unwrap();
+        let written_at_ms = object.remove("written_at_ms").and_then(|v| v.as_u64());
+        let tags_v1 = object.remove("tags");
+        let receipt = (!object.is_empty()).then(|| value.clone());
+        self.injected
+            .lock()
+            .unwrap()
+            .push(Record::Steer(broca_session_store::record::Steer {
+                input,
+                written_at_ms,
+                tags_v1,
+                receipt,
+            }));
+    }
+}
+
+/// A scripted provider that steers messages in while answering given calls.
+struct SteeringProvider {
+    inner: ScriptedProvider,
+    calls: std::sync::atomic::AtomicUsize,
+    /// `(call, messages)`: during the provider's `call`th request (from 1), these are steered in.
+    steers: Mutex<Vec<(usize, Vec<Message>)>>,
+    sink: Arc<dyn SteerSink>,
+}
+
+#[async_trait]
+impl Provider for SteeringProvider {
+    async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let due: Vec<Vec<Message>> = {
+            let mut steers = self.steers.lock().unwrap();
+            let (due, rest) = steers.drain(..).partition(|(at, _)| *at == call);
+            *steers = rest;
+            due.into_iter().map(|(_, messages)| messages).collect()
+        };
+        for (index, messages) in due.into_iter().enumerate() {
+            self.sink.steer(steered(call, index, messages)).await;
+        }
+        self.inner.step(step_id, opts).await
+    }
+}
+
+fn steered(call: usize, index: usize, messages: Vec<Message>) -> WalRecord {
+    WalRecord::Steered {
+        sent_by: None,
+        written_at_ms: Some(0),
+        retention: None,
+        ts_ms: Some(0),
+        send_id: Some(format!("steer-{call}-{index}")),
+        request_identity_digest: None,
+        delivery: Some(broca_protocol::Delivery::Steer),
+        title: None,
+        input: Arc::new(messages),
+        hooks: None,
+        tags: None,
+    }
+}
+
+/// Runs `scenario` once through each loop, steering `steers` in while the provider answers,
+/// and compares everything both did.
+async fn compare_steered(scenario: Scenario, steers: Vec<(usize, Vec<Message>)>) {
+    // Today's loop, on a writer this test owns so its actor side can write steers.
+    let dir = broca_test_support::scratch_root().join(format!(
+        "session-loop-differential-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let wal = FileWalStore::new(dir.join("wal"));
+    let request = scenario.request();
+    let writer = Arc::new(WalHandle::spawn(wal.open(&request.session).unwrap(), 1).unwrap());
+    let inbox = SteerInbox::new();
+    let provider = SteeringProvider {
+        inner: ScriptedProvider::new(scenario.steps.clone()),
+        calls: Default::default(),
+        steers: Mutex::new(steers.clone()),
+        sink: Arc::new(TodaySink {
+            inbox: Arc::clone(&inbox),
+            writer: Arc::clone(&writer),
+        }),
+    };
+    let plane = scenario.plane();
+    let (tx, mut rx) = mpsc::channel(512);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let control = RunControl {
+        steer: Some(Arc::clone(&inbox)),
+        ..Default::default()
+    };
+    run_loop_on_writer(
+        request,
+        &writer,
+        StartMode::FreshOrResume,
+        &provider,
+        &plane,
+        &AllowAll,
+        &wal,
+        None,
+        control,
+        &tx,
+    )
+    .await
+    .expect("today's loop runs");
+    drop(tx);
+    drain.await.unwrap();
+    // The provider's sink holds the writer too; keep only what the comparison reads.
+    let sent = Arc::clone(&provider.inner.sent);
+    drop(provider);
+    Arc::try_unwrap(writer)
+        .ok()
+        .expect("the run released the writer")
+        .shutdown()
+        .await
+        .unwrap();
+    let file = std::fs::read_dir(dir.join("wal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
+        .expect("today's loop wrote a log");
+    let converted = broca_session_convert::convert(&LogImage::read(&file).framed(), None)
+        .expect("the log converts");
+    let _ = std::fs::remove_dir_all(&dir);
+    let today = Outcome {
+        records: normalized(&converted.records),
+        requests: sent.lock().unwrap().clone(),
+        calls: plane
+            .log()
+            .iter()
+            .map(|event| format!("{event:?}"))
+            .collect(),
+    };
+
+    // The new loop.
+    let backend = MemoryBackend::default();
+    let triple = SessionTriple {
+        project_root: "/project".into(),
+        harness: "differential".into(),
+        session: "s1".into(),
+    };
+    let mut session = Session::create(
+        &backend,
+        SessionAddr("0123456789abcdef".into()),
+        triple,
+        &DeploymentKey::new(1, &[7; 32]),
+        false,
+    )
+    .await
+    .unwrap();
+    let injected: Arc<Mutex<Vec<Record>>> = Default::default();
+    let provider = SteeringProvider {
+        inner: ScriptedProvider::new(scenario.steps.clone()),
+        calls: Default::default(),
+        steers: Mutex::new(steers),
+        sink: Arc::new(NewSink {
+            injected: Arc::clone(&injected),
+        }),
+    };
+    let plane = scenario.plane();
+    let mut writer = Recording {
+        session: &mut session,
+        records: Vec::new(),
+        injected,
+    };
+    let mut parts = MemoryParts::default();
+    let now = || 0u64;
+    let bind = bind();
+    let seams = Seams {
+        provider: &provider,
+        tools: &plane,
+        bind: bind.clone(),
+        out: None,
+        cancel: Default::default(),
+        now_ms: &now,
+        session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+    };
+    run(
+        &mut writer,
+        &mut parts,
+        scenario.admission(&provider.inner),
+        &seams,
+    )
+    .await
+    .expect("the new loop runs");
+    let new = Outcome {
+        records: normalized(&writer.records),
+        requests: sent_requests(&provider.inner),
+        calls: plane
+            .log()
+            .iter()
+            .map(|event| format!("{event:?}"))
+            .collect(),
+    };
+    assert_same(&today, &new);
+}
+
+fn assert_same(today: &Outcome, new: &Outcome) {
+    if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
+        for (index, record) in today.records.iter().enumerate() {
+            eprintln!("today {index}: {record}");
+        }
+        for (index, record) in new.records.iter().enumerate() {
+            eprintln!("new   {index}: {record}");
+        }
+    }
+    assert_eq!(new.requests.len(), today.requests.len(), "request count");
+    for (index, (new, today)) in new.requests.iter().zip(&today.requests).enumerate() {
+        assert_eq!(new, today, "request {index}");
+    }
+    for (index, (new, today)) in new.records.iter().zip(&today.records).enumerate() {
+        assert_eq!(new, today, "record {index}");
+    }
+    assert_eq!(new.records.len(), today.records.len(), "record count");
+    assert_eq!(new.calls, today.calls, "tool calls");
+}
+
+#[tokio::test]
+async fn a_steer_during_a_tool_step_enters_at_the_next_boundary() {
+    compare_steered(
+        Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Sequential)],
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        },
+        vec![(1, vec![user("also read b")])],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_steer_during_the_last_answer_takes_one_more_step() {
+    compare_steered(
+        Scenario {
+            input: vec![user("hello")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: Vec::new(),
+            steps: vec![text_step("a1", "hi"), text_step("a2", "and again")],
+        },
+        vec![(1, vec![user("one more thing")])],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_steer_after_a_limiting_stop_ends_with_the_run() {
+    compare_steered(
+        Scenario {
+            input: vec![user("hello")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: vec![StopCondition::StepCount { n: 1 }],
+            steps: vec![text_step("a1", "hi")],
+        },
+        vec![(1, vec![user("too late"), user("and this")])],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_steer_during_a_step_that_hits_the_step_limit_ends_with_the_run() {
+    compare_steered(
+        Scenario {
+            input: vec![user("read a")],
+            tools: vec![tool("read", ExecutionMode::Parallel)],
+            stop_when: vec![StopCondition::StepCount { n: 1 }],
+            steps: vec![answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            )],
+        },
+        vec![(1, vec![user("never mind")])],
     )
     .await;
 }

@@ -456,7 +456,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let mut open_ids = OpenIds::default();
         for (offset, record) in resend.iter().enumerate() {
             let seq = first + offset as u64;
-            apply(&mut conversation, &mut operations, record).map_err(SessionError::Fold)?;
+            apply(&mut conversation, &mut operations, seq, record).map_err(SessionError::Fold)?;
             if record.stream() == Stream::Ledger {
                 open_ids.add(seq, record);
             }

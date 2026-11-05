@@ -32,7 +32,7 @@ use broca_protocol::request::{
 use broca_protocol::tags::{clean_computed_into, ComputedRules};
 use broca_protocol::{BatchId, BindIdentity, FinishReason, GenerationConfig, RunId, StepId, Usage};
 use broca_session_store::codec::{Digest, Message as _};
-use broca_session_store::fold::operations::{CallState, Resolution};
+use broca_session_store::fold::operations::{CallState, Operations, Resolution};
 use broca_session_store::record::{
     Assistant, BatchEnd, BatchStart, CallOutcome, Input, PartKind, Placement, Record, Redo,
     Resumed, RunEnd, RunStart, SetupStub, StepEnd, StepStart, ToolIntent, ToolOutcome, ToolReply,
@@ -211,7 +211,7 @@ async fn close_interrupted<W: Writer, P, T>(
         }));
     }
     records.push(run_end(writer, run_id, RunFinishReason::Interrupted, now));
-    writer.append(&records, true).await?;
+    append_end(writer, run_id, records).await?;
     Ok(finished(writer, RunFinishReason::Interrupted))
 }
 
@@ -402,12 +402,19 @@ where
         let completed_steps = run_state(writer).completed_steps;
         // Step ids count from 1 within a run, as today's loop numbers them.
         let step_id = completed_steps + 1;
+        // The boundary: messages steered or delivered since the last one enter the conversation
+        // here, in the same batch as the step's start.
+        let run_id = admission.run_id.clone();
         writer
-            .append(
-                &[Record::StepStart(StepStart {
-                    run_id: admission.run_id.clone(),
-                    step_id,
-                })],
+            .append_with(
+                &mut |_, operations| {
+                    let mut batch = placed_copies(operations, &run_id);
+                    batch.push(Record::StepStart(StepStart {
+                        run_id: run_id.clone(),
+                        step_id,
+                    }));
+                    batch
+                },
                 false,
             )
             .await?;
@@ -430,7 +437,7 @@ where
                             .map_err(|e| LoopError::Parts(e.to_string()))?,
                     );
                 }
-                writer.append(&[record], true).await?;
+                append_end(writer, &admission.run_id, vec![record]).await?;
                 return Ok(finished(writer, RunFinishReason::Error));
             }
         };
@@ -476,7 +483,36 @@ where
             )
             .await?;
         if calls.is_empty() {
-            return finish(writer, seams, &admission.run_id, RunFinishReason::Completed).await;
+            // A message steered in during the step makes the run take one more step, unless a
+            // stop condition that limits the run was met. Otherwise the run ends here.
+            let end = run_end(
+                writer,
+                &admission.run_id,
+                RunFinishReason::Completed,
+                (seams.now_ms)(),
+            );
+            let run_id = admission.run_id.clone();
+            let mut end = Some(end);
+            let appended = writer
+                .append_with(
+                    &mut |_, operations| {
+                        let run = operations.run.as_ref().expect("a run is active");
+                        let extends = run.natural_end.is_some_and(|end| end.extendable)
+                            && run.pending_messages() > 0;
+                        if extends {
+                            return Vec::new();
+                        }
+                        let mut batch = placed_copies(operations, &run_id);
+                        batch.extend(end.take());
+                        batch
+                    },
+                    true,
+                )
+                .await?;
+            if appended.is_empty() {
+                continue;
+            }
+            return Ok(finished(writer, RunFinishReason::Completed));
         }
         if let Some(stop) = stop {
             return hard_stop(writer, seams, &admission.run_id, step_id, &calls, &stop).await;
@@ -918,7 +954,7 @@ async fn hard_stop<W: Writer, P, T>(
         batch_id,
     }));
     records.push(run_end(writer, run_id, reason, now));
-    writer.append(&records, true).await?;
+    append_end(writer, run_id, records).await?;
     Ok(finished(writer, reason))
 }
 
@@ -1024,6 +1060,61 @@ async fn finish<W: Writer, P, T>(
     reason: RunFinishReason,
 ) -> Result<Finished, LoopError> {
     let record = run_end(writer, run_id, reason, (seams.now_ms)());
-    writer.append(&[record], true).await?;
+    append_end(writer, run_id, vec![record]).await?;
     Ok(finished(writer, reason))
+}
+
+/// Appends `records`, which end with the run's end, as one durable batch. Messages steered or
+/// delivered since the last boundary enter the conversation just before the end: the run ends
+/// with them in its conversation, as today's loop leaves them.
+async fn append_end<W: Writer>(
+    writer: &mut W,
+    run_id: &str,
+    records: Vec<Record>,
+) -> Result<(), LoopError> {
+    let run_id = run_id.to_string();
+    let mut records = Some(records);
+    writer
+        .append_with(
+            &mut |_, operations| {
+                let mut batch = records.take().expect("one batch");
+                let end = batch.pop().expect("the batch ends with the run's end");
+                batch.extend(placed_copies(operations, &run_id));
+                batch.push(end);
+                batch
+            },
+            true,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Copies of the messages steered or delivered since the last boundary, as transcript
+/// entries. Each names the seq of the record that accepted it.
+fn placed_copies(operations: &Operations, run_id: &str) -> Vec<Record> {
+    let Some(run) = operations.run.as_ref() else {
+        return Vec::new();
+    };
+    run.pending_steers
+        .iter()
+        .flat_map(|pending| {
+            pending
+                .messages
+                .iter()
+                .enumerate()
+                .map(move |(index, message)| {
+                    Record::Input(Input {
+                        run_id: run_id.to_string(),
+                        placement: pending.placement,
+                        message: message.clone(),
+                        written_at_ms: pending.written_at_ms,
+                        submission_id: pending.submission_id.clone(),
+                        notice: None,
+                        tags_v1: pending.tags_at(index),
+                        receipt_seq: pending.seq,
+                        pruned: Vec::new(),
+                    })
+                })
+        })
+        .collect()
 }

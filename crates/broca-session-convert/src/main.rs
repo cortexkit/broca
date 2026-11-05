@@ -825,7 +825,7 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
     );
     check(
         "pending_steers",
-        today.pending_steers.len() == run.pending_steers,
+        today.pending_steers.len() == run.pending_messages(),
     );
     let mut nudges: Vec<u64> = today
         .budget_nudges_fired
@@ -922,7 +922,7 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
             "run.budget.nudges_fired",
             run.budget.nudges_fired.len() as u64,
         ),
-        ("run.pending_steers", run.pending_steers as u64),
+        ("run.pending_steers", run.pending_messages() as u64),
     ];
     OpsOutcome::Compared(differs, sizes, set)
 }

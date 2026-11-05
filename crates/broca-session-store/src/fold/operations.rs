@@ -167,6 +167,37 @@ impl OpenBatch {
 }
 
 crate::message! {
+    /// Messages accepted into the running run that wait for its next step boundary: a steer's,
+    /// or a queued send's delivered as user or turn-scoped system messages. The record that
+    /// accepted them keeps them; the boundary places copies in the transcript.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct PendingInput {
+        /// The seq of the record that accepted the messages; absent when folded without seqs.
+        1 opt seq: u64,
+        2 req placement: crate::record::Placement,
+        3 rep messages: broca_protocol::content::Message,
+        4 opt written_at_ms: u64,
+        /// The v1 part numbers, one entry per message.
+        5 opt tags_v1: serde_json::Value,
+        /// The queued send a delivery came from.
+        6 opt submission_id: String,
+    }
+}
+
+impl PendingInput {
+    /// The v1 part numbers of the `index`th message, when the record lists one entry per
+    /// message.
+    pub fn tags_at(&self, index: usize) -> Option<serde_json::Value> {
+        match &self.tags_v1 {
+            Some(serde_json::Value::Array(list)) if list.len() == self.messages.len() => {
+                list.get(index).cloned()
+            }
+            _ => None,
+        }
+    }
+}
+
+crate::message! {
     /// A step that made no tool call, which ends the run unless a steer extends it. A steer is a
     /// message a caller sent into the running run; it reaches the conversation at the next step
     /// boundary.
@@ -244,11 +275,11 @@ state! {
             reset: "run_start",
             bound: Bound::Fixed,
         },
-        /// Steered or delivered messages waiting for a step boundary.
-        14 req pub pending_steers: usize => {
+        /// Steered or delivered messages waiting for a step boundary, in the order accepted.
+        14 rep pub pending_steers: PendingInput => {
             owner: "queue",
             reset: "step_start",
-            bound: Bound::Fixed,
+            bound: Bound::OpenWork("messages accepted since the last step boundary"),
         },
         15 opt pub cancel: CancelPoint => {
             owner: "admission",
@@ -328,7 +359,7 @@ impl Run {
             open_batch: None,
             unknown: Vec::new(),
             hard_stopped: None,
-            pending_steers: 0,
+            pending_steers: Vec::new(),
             cancel: None,
             budget: Budget::default(),
             last_step_usage: None,
@@ -354,6 +385,14 @@ impl Run {
     }
 
     /// What a resume must do. The order matters: the first rule that applies decides.
+    /// How many steered or delivered messages wait for the next step boundary.
+    pub fn pending_messages(&self) -> usize {
+        self.pending_steers
+            .iter()
+            .map(|input| input.messages.len())
+            .sum()
+    }
+
     pub fn resolution(&self) -> Resolution {
         let indeterminate = self.indeterminate();
         let open = self.finished.is_none();
@@ -402,7 +441,7 @@ impl Run {
             return Resolution::Idle(reason);
         }
         if let Some(end) = self.natural_end {
-            if !(end.extendable && self.pending_steers > 0) {
+            if !(end.extendable && self.pending_messages() > 0) {
                 return Resolution::Idle(end.stop.unwrap_or(RunFinishReason::Completed));
             }
         }
@@ -583,6 +622,12 @@ impl Operations {
     }
 
     pub fn apply(&mut self, record: &Record) -> Result<(), FoldError> {
+        self.apply_at(None, record)
+    }
+
+    /// Folds `record`, which has `seq` in its log. A pending input remembers the seq of the
+    /// record that accepted it, so the copy a boundary places can name it.
+    pub fn apply_at(&mut self, seq: Option<u64>, record: &Record) -> Result<(), FoldError> {
         if record.stream() != Stream::Ledger {
             return Err(FoldError::TranscriptRecord(record.name()));
         }
@@ -672,7 +717,7 @@ impl Operations {
                 run.account_limit_pause = None;
                 run.paused = None;
                 run.natural_end = None;
-                run.pending_steers = 0;
+                run.pending_steers.clear();
             }
             Record::StepEnd(step) => {
                 let usage = step.total_usage.or(step.usage).unwrap_or_default();
@@ -779,8 +824,28 @@ impl Operations {
                     run.cancel = Some(cancel.at);
                 }
             }
-            Record::Steer(steer) => run.pending_steers += steer.input.len(),
-            Record::Delivery(delivery) => run.pending_steers += delivery.input.len(),
+            Record::Steer(steer) => run.pending_steers.push(PendingInput {
+                seq,
+                placement: crate::record::Placement::Steer,
+                messages: steer.input.clone(),
+                written_at_ms: steer.written_at_ms,
+                tags_v1: steer.tags_v1.clone(),
+                submission_id: None,
+            }),
+            Record::Delivery(delivery) if !delivery.input.is_empty() => {
+                run.pending_steers.push(PendingInput {
+                    seq,
+                    placement: if delivery.mode == "turn_system" {
+                        crate::record::Placement::DeliveredTurnSystem
+                    } else {
+                        crate::record::Placement::Delivered
+                    },
+                    messages: delivery.input.clone(),
+                    written_at_ms: delivery.written_at_ms,
+                    tags_v1: delivery.tags_v1.clone(),
+                    submission_id: Some(delivery.submission_id.clone()),
+                })
+            }
             Record::BudgetFire(fire) => match fire.firing {
                 BudgetFiring::Nudge => {
                     if let Some(index) = fire.nudge_index {
@@ -796,7 +861,7 @@ impl Operations {
                 run.account_limit_pause = None;
                 run.finished = Some(end.reason);
                 run.retries_used = end.retries_used;
-                run.pending_steers = 0;
+                run.pending_steers.clear();
                 run.paused = None;
             }
             Record::Pause(pause) => {

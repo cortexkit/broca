@@ -19,6 +19,16 @@ pub trait Writer {
     /// `barrier`, it returns only once the batch is durable.
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError>;
 
+    /// Appends the batch `build` makes from the folds as they stand at that moment, and returns
+    /// it. A writer shared with other appenders (the session actor appends steers and queued
+    /// sends during a run) calls `build` and appends its batch with nothing in between, so the
+    /// batch can't miss a record another appender added. An empty batch appends nothing.
+    async fn append_with(
+        &mut self,
+        build: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations) -> Vec<Record> + Send),
+        barrier: bool,
+    ) -> Result<Vec<Record>, SessionError>;
+
     /// The conversation as the folds hold it after every appended record.
     fn conversation(&self) -> &Conversation;
 
@@ -36,6 +46,18 @@ pub trait Writer {
 impl<B: SessionBackend> Writer for Session<'_, B> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         Session::append(self, records, barrier).await
+    }
+
+    async fn append_with(
+        &mut self,
+        build: &mut (dyn for<'s> FnMut(&'s Conversation, &'s Operations) -> Vec<Record> + Send),
+        barrier: bool,
+    ) -> Result<Vec<Record>, SessionError> {
+        let records = build(&self.conversation, &self.operations);
+        if !records.is_empty() {
+            Session::append(self, &records, barrier).await?;
+        }
+        Ok(records)
     }
 
     fn conversation(&self) -> &Conversation {
