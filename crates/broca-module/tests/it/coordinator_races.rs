@@ -3136,6 +3136,10 @@ async fn paused_run_indexes_paused_and_reconciles_after_close() {
     wait_for_resolved_state(&rig, &key, &run_id.0, RunIndexState::Paused).await;
 }
 
+/// A send queued behind a run that pauses is tried when the pause settles. Its admission is
+/// refused for a transient reason, so it ends failed with that refusal rather than waiting at the
+/// head of the queue. Cancelling the paused run then ends it as cancelled, and the session admits
+/// new work.
 #[tokio::test]
 async fn settled_paused_cancel_seals_and_unblocks_queued_work() {
     let (exec, gate) = FakeExecutor::scripted_gated(vec![
@@ -3162,6 +3166,7 @@ async fn settled_paused_cancel_seals_and_unblocks_queued_work() {
 
     gate.release().await;
     wait_for_resolved_state(&rig, &key, "r1", RunIndexState::Paused).await;
+    wait_for_resolved_state(&rig, &key, "r2", RunIndexState::Error).await;
     assert_eq!(
         rig.registry
             .route_cancel(&key, broca_protocol::RunId("r1".into()))
@@ -3171,7 +3176,13 @@ async fn settled_paused_cancel_seals_and_unblocks_queued_work() {
     );
 
     wait_for_resolved_state(&rig, &key, "r1", RunIndexState::Cancelled).await;
-    wait_for_resolved_state(&rig, &key, "r2", RunIndexState::Completed).await;
+    let next = rig
+        .registry
+        .route_send(&key, req(&key, "r3"), RunKind::AppendEpisode)
+        .await
+        .unwrap();
+    assert!(matches!(next, SendOutcome::Active { .. }), "{next:?}");
+    wait_for_resolved_state(&rig, &key, "r3", RunIndexState::Completed).await;
 }
 
 #[tokio::test]
