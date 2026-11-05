@@ -180,9 +180,19 @@ impl subc_client_rs::ModuleHandler for StandIn {
     }
 }
 
+/// A stand-in declares the tool-provider role and also advertises `tool-provider/v1` in its
+/// capabilities, as every live provider does: broca declares the role on its routes only to a
+/// module that advertises it.
 fn stand_in_manifest(id: &str) -> subc_protocol::manifest::ModuleManifest {
-    use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, ProviderRole, Tool};
+    use subc_protocol::manifest::{
+        CapabilityDeclarations, Concurrency, ExecutionMode, IdentityScope, ProviderRole, Tool,
+    };
     subc_protocol::manifest::ModuleManifest::builder(id, env!("CARGO_PKG_VERSION"))
+        .capabilities(Some(CapabilityDeclarations {
+            provides: vec!["tool-provider/v1".to_string()],
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        }))
         .provides(vec![ProviderRole::ToolProvider {
             tools: vec![Tool {
                 name: "noop".to_string(),

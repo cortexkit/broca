@@ -154,6 +154,8 @@ async fn followup_stale_refusal_does_not_orphan_a_sibling_replacement() {
         vec![
             vec![catalog_entry("aft", &["echo"])],
             vec![catalog_entry("aft", &["echo"])],
+            vec![catalog_entry("aft", &["echo"])],
+            vec![catalog_entry("aft", &["echo"])],
         ],
         vec![
             Err(ConnError::Rejected(crate::connection::decode_error_body(

@@ -57,6 +57,8 @@ pub struct ToolManifest {
     /// The session's compaction provider, from the plan's compaction item. Its tool route binds
     /// the session's own identity, so it sees the calls and the compaction as one session.
     compaction_provider: Option<String>,
+    /// Hook routes bind the session's own identity; tools at those same modules must agree.
+    hook_providers: HashSet<String>,
 }
 
 impl ToolManifest {
@@ -93,6 +95,7 @@ impl ToolManifest {
             provider_declarations: HashMap::new(),
             fetched_providers: HashSet::new(),
             compaction_provider: None,
+            hook_providers: HashSet::new(),
         }
     }
 
@@ -105,6 +108,12 @@ impl ToolManifest {
         self.compaction_provider = plan["compaction_item"]["provider"]
             .as_str()
             .map(str::to_owned);
+        self.hook_providers = plan["step_transform_items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["provider"].as_str().map(str::to_owned))
+            .collect();
         if let Some(items) = plan["tool_items"].as_array() {
             for item in items {
                 if let (Some(provider), Some(preset)) =
@@ -164,6 +173,11 @@ impl ToolManifest {
     /// item.
     pub fn is_compaction_provider(&self, provider: &str) -> bool {
         self.compaction_provider.as_deref() == Some(provider)
+    }
+
+    /// Whether another role at this provider already binds the session's own identity.
+    pub fn uses_session_identity(&self, provider: &str) -> bool {
+        self.is_compaction_provider(provider) || self.hook_providers.contains(provider)
     }
 
     /// Whether the session's plan fetch answered `provider`'s catalog at admission. False for a

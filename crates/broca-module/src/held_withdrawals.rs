@@ -28,7 +28,11 @@ const RECOVERY_BATCH_INTERVAL: Duration = Duration::from_secs(3);
 pub trait WithdrawTransport: Send + Sync {
     /// The verdict follows tool-provider caller policy; the raw answer is retained for
     /// unclassified replies and diagnostics rather than guessed into a successful result.
-    async fn withdraw(&self, call: &LateResultRegistration) -> (WithdrawVerdict, Value);
+    async fn withdraw(
+        &self,
+        call: &LateResultRegistration,
+        session_identity: bool,
+    ) -> (WithdrawVerdict, Value);
 }
 
 pub struct HeldWithdrawals {
@@ -252,6 +256,7 @@ impl HeldWithdrawals {
         if !cancelled_hold(records, &call.call_key) {
             return Ok(0);
         }
+        let session_identity = withdrawal_uses_session_identity(records, &call)?;
         let mut sent = 0;
         while attempts < MAX_ATTEMPTS {
             if stopping.is_cancelled() {
@@ -270,7 +275,7 @@ impl HeldWithdrawals {
             let reply = tokio::select! {
                 biased;
                 _ = stopping.cancelled() => return Ok(sent),
-                reply = tokio::time::timeout(ATTEMPT_TIMEOUT, self.transport.withdraw(&call)) => reply,
+                reply = tokio::time::timeout(ATTEMPT_TIMEOUT, self.transport.withdraw(&call, session_identity)) => reply,
             };
             sent += 1;
             let (verdict, raw) = match reply {
@@ -354,6 +359,40 @@ impl HeldWithdrawal for HeldWithdrawals {
         }
         Ok(())
     }
+}
+
+/// Read the plan active when the original call was dispatched, not a later session refresh.
+pub(crate) fn withdrawal_uses_session_identity(
+    records: &[FramedRecord],
+    call: &LateResultRegistration,
+) -> Result<bool, String> {
+    let mut manifest = None;
+    for record in records {
+        match &record.record {
+            WalRecord::RunStarted {
+                manifest: frozen, ..
+            } => manifest = frozen.as_deref(),
+            WalRecord::ToolDispatchIntent { call_key, .. }
+                if broca_core::tool_call_key(
+                    Some(&call.lineage),
+                    record.seq,
+                    call_key.as_deref(),
+                )
+                .as_deref()
+                    == Some(call.call_key.as_str()) =>
+            {
+                return match manifest {
+                    Some(manifest) => broca_core::ToolManifest::from_tools(Vec::new())
+                        .with_plan_manifest(manifest)
+                        .map(|manifest| manifest.uses_session_identity(&call.module))
+                        .map_err(|error| format!("withdrawal plan is unreadable: {error}")),
+                    None => Ok(false),
+                };
+            }
+            _ => {}
+        }
+    }
+    Err("withdrawal dispatch intent is missing".into())
 }
 
 fn cancelled_hold(records: &[FramedRecord], key: &str) -> bool {

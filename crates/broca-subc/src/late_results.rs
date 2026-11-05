@@ -24,6 +24,7 @@ use crate::connection::{ConnError, RouteHandle, SubcConnection};
 pub async fn withdraw_held_call(
     conn: &SubcConnection,
     call: &broca_core::tool_plane::LateResultRegistration,
+    session_identity: bool,
 ) -> (
     cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
     serde_json::Value,
@@ -42,8 +43,17 @@ pub async fn withdraw_held_call(
         Ok(selector) => selector,
         Err(message) => return withdraw_error(ConnError::Protocol(message)),
     };
+    let catalog = match conn.catalog_list().await {
+        Ok(catalog) => catalog,
+        Err(error) => return withdraw_error(error),
+    };
+    let policy = crate::connection::ToolProviderRoutePolicy::for_provider(
+        &catalog,
+        &call.module,
+        session_identity,
+    );
     let route = match conn
-        .route_open_tool_provider_v1(&call.module, &call.bind, selector)
+        .route_open_tool_provider_with_policy(&call.module, &call.bind, selector, policy)
         .await
     {
         Ok(route) => route,
@@ -95,7 +105,9 @@ fn withdraw_error(
     use cortexkit_role_tool_provider::withdraw::caller_verdict;
     let body = match error {
         ConnError::Rejected(refusal) => {
-            subc_protocol::ErrorBody::new(refusal.code(), refusal.to_string())
+            let mut body = subc_protocol::ErrorBody::new(refusal.code(), refusal.to_string());
+            body.detail = refusal.provider_detail().cloned();
+            body
         }
         ConnError::Protocol(message) => {
             subc_protocol::ErrorBody::new("invalid_withdraw_reply", message)
@@ -123,7 +135,11 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Debug)]
 pub enum LateResultsError {
     /// The provider or the daemon answered with a typed refusal carrying `code`.
-    Refused { code: String, message: String },
+    Refused {
+        code: String,
+        message: String,
+        detail: Option<serde_json::Value>,
+    },
     /// The request may have reached the provider; nothing can be concluded from the failure.
     Transport(String),
     /// The provider or daemon answered something this build cannot read.
@@ -135,17 +151,28 @@ impl LateResultsError {
         matches!(self, LateResultsError::Refused { code, .. } if code == CURSOR_INCARNATION_CHANGED)
     }
 
-    /// Only a `Protocol` answer is permanent: a refusal may lift, and a transport failure says
-    /// nothing about the feed.
+    /// A role-declaration refusal needs a corrected route, not another pull on the same one.
+    /// Other refusals may lift; a transport failure says nothing about the feed.
     pub fn is_permanent(&self) -> bool {
         matches!(self, LateResultsError::Protocol(_))
+            || matches!(self, Self::Refused { code, .. } if code == cortexkit_role_tool_provider::errors::TOOL_ROLE_NOT_DECLARED)
     }
 }
 
 impl std::fmt::Display for LateResultsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LateResultsError::Refused { code, message } => write!(f, "{code} — {message}"),
+            LateResultsError::Refused {
+                code,
+                message,
+                detail,
+            } => {
+                write!(f, "{code} — {message}")?;
+                if let Some(detail) = detail {
+                    write!(f, " — {detail}")?;
+                }
+                Ok(())
+            }
             LateResultsError::Transport(message) => write!(f, "late_results transport: {message}"),
             LateResultsError::Protocol(message) => write!(f, "late_results protocol: {message}"),
         }
@@ -160,6 +187,7 @@ impl From<ConnError> for LateResultsError {
             ConnError::Rejected(refusal) => LateResultsError::Refused {
                 code: refusal.code().to_owned(),
                 message: refusal.to_string(),
+                detail: refusal.provider_detail().cloned(),
             },
             ConnError::Protocol(message) => LateResultsError::Protocol(message),
             other => LateResultsError::Transport(other.to_string()),
@@ -197,10 +225,16 @@ impl LateResultsFeed {
                 message:
                     "a late-results feed is served only to a connection with a consumer identity"
                         .into(),
+                detail: None,
             });
         }
+        let catalog = conn.catalog_list().await?;
+        // The feed aggregates the custodian's calls across conversations; its dedicated
+        // maintenance identity must never become a conversation's compaction identity.
+        let policy =
+            crate::connection::ToolProviderRoutePolicy::for_provider(&catalog, module, false);
         let route = conn
-            .route_open_tool_provider_v1(module, identity, None)
+            .route_open_tool_provider_with_policy(module, identity, None, policy)
             .await?;
         Ok(Self {
             conn,
@@ -355,6 +389,29 @@ mod tests {
     use crate::connection::InProcessModuleEnd;
     use cortexkit_role_tool_provider::late_results::{kinds, LateEntry};
     use serde_json::json;
+
+    #[test]
+    fn role_refusal_is_permanent_for_feeds_and_withdrawals_and_keeps_detail() {
+        let refusal = cortexkit_role_tool_provider::errors::tool_role_not_declared(Some("v2"));
+        let error = || {
+            ConnError::Rejected(crate::connection::decode_error_body(
+                &serde_json::to_vec(&refusal).unwrap(),
+            ))
+        };
+        let feed = LateResultsError::from(error());
+        assert!(feed.is_permanent());
+        assert!(
+            matches!(feed, LateResultsError::Refused { code, detail, .. }
+            if code == "tool_role_not_declared" && detail == refusal.detail)
+        );
+        let (verdict, raw) = withdraw_error(error());
+        assert!(!verdict.retries());
+        assert_eq!(raw["code"], "tool_role_not_declared");
+        assert_eq!(
+            raw["detail"],
+            json!({"role":"tool-provider", "declared":"v2"})
+        );
+    }
 
     fn entry(key: &str, event: &str) -> LateEntry {
         LateEntry::new(

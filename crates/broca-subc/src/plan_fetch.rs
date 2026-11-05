@@ -44,6 +44,8 @@ pub struct SubcPlanFetcher {
     compaction: crate::SubcCompactionPlane,
     deadline: tokio::time::Instant,
     catalog_snapshot: Mutex<Option<CatalogSnapshot>>,
+    compaction_provider: Option<String>,
+    hook_providers: std::collections::HashSet<String>,
 }
 
 impl SubcPlanFetcher {
@@ -63,7 +65,21 @@ impl SubcPlanFetcher {
             direct_carrier_scope: None,
             opened: Mutex::new(Vec::new()),
             catalog_snapshot: Mutex::new(None),
+            compaction_provider: None,
+            hook_providers: Default::default(),
         }
+    }
+
+    /// Use the same bind as compaction even while fetching catalogs before admission.
+    pub fn with_compaction_provider(mut self, provider: Option<String>) -> Self {
+        self.compaction_provider = provider;
+        self
+    }
+
+    /// Hook and tool routes at the same module must bind the same session identity.
+    pub fn with_hook_providers(mut self, providers: impl IntoIterator<Item = String>) -> Self {
+        self.hook_providers = providers.into_iter().collect();
+        self
     }
 
     /// Fetch tool catalogs under a caller-supplied scope as a Direct carrier, without
@@ -156,9 +172,16 @@ impl SubcPlanFetcher {
 
     async fn call(&self, provider: &str, op: &str, arguments: Value) -> Result<Value, FetchError> {
         let selector = self.selector().await?;
+        let catalog = self.catalog_snapshot().await?;
+        let policy = crate::connection::ToolProviderRoutePolicy::for_provider(
+            &catalog,
+            provider,
+            self.compaction_provider.as_deref() == Some(provider)
+                || self.hook_providers.contains(provider),
+        );
         let route = self
             .conn
-            .route_open_tool_provider_v1(provider, &self.identity, selector)
+            .route_open_tool_provider_with_policy(provider, &self.identity, selector, policy)
             .await
             .map_err(|error| {
                 open_error(if self.direct_carrier_scope.is_some() {
@@ -285,7 +308,17 @@ impl broca_fetch_plan::PlanAdmitter for SubcPlanAdmitter {
         session: &BindIdentity,
         scope: Option<&SessionScope>,
     ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
-        let fetcher = SubcPlanFetcher::new(self.conn.clone(), session.clone(), scope.cloned());
+        let fetcher = SubcPlanFetcher::new(self.conn.clone(), session.clone(), scope.cloned())
+            .with_compaction_provider(
+                plan.compaction_item
+                    .as_ref()
+                    .map(|item| item.provider.clone()),
+            )
+            .with_hook_providers(
+                plan.step_items
+                    .iter()
+                    .map(|step| step.item.provider.clone()),
+            );
         let admitted = broca_fetch_plan::admit(
             plan,
             &fetcher,
@@ -365,6 +398,70 @@ mod carrier_catalog_tests {
     use super::*;
     use serde_json::json;
 
+    fn inventory(providers: &[&str]) -> Vec<u8> {
+        let modules: Vec<_> = providers
+            .iter()
+            .map(|provider| {
+                let mut entry = subc_control::CatalogEntry::new(*provider, Vec::new(), Vec::new());
+                entry.capabilities =
+                    Some(serde_json::from_value(json!({"provides":["tool-provider/v1"]})).unwrap());
+                entry
+            })
+            .collect();
+        serde_json::to_vec(&subc_control::ClientControlResponse::CatalogList {
+            generation: 1,
+            modules,
+            subc_ops: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn plan_catalog_routes_share_compaction_and_hook_identities_but_keep_other_tools_runner()
+    {
+        let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+        let fetcher = SubcPlanFetcher::new(
+            Arc::new(conn),
+            BindIdentity::new("/project", "broca", "session"),
+            None,
+        )
+        .with_compaction_provider(Some("compactor".into()))
+        .with_hook_providers(["hook".into()]);
+        let fetch = async {
+            for provider in ["compactor", "hook", "aft"] {
+                fetcher.call(provider, CATALOG_OP, json!({})).await.unwrap();
+            }
+        };
+        let serve = async {
+            let request = daemon.next_request().await;
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body).unwrap()["op"],
+                "catalog.list"
+            );
+            daemon.reply(&request, inventory(&["compactor", "hook", "aft"]));
+            for provider in ["compactor", "hook", "aft"] {
+                let open = daemon.next_request().await;
+                let body: Value = serde_json::from_slice(&open.body).unwrap();
+                assert_eq!(
+                    body["identity"],
+                    json!({
+                        "harness": if provider == "aft" { "runner" } else { "broca" },
+                        "session": "session",
+                    })
+                );
+                assert_eq!(body["role_versions"], json!({"tool-provider":"v1"}));
+                daemon.reply(
+                    &open,
+                    br#"{"op":"route.open","route_channel":1,"route_epoch":1}"#.to_vec(),
+                );
+                let request = daemon.next_request().await;
+                assert_eq!(request.body, br#"{"name":"tool.catalog","arguments":{}}"#);
+                daemon.reply(&request, br#"{"tools":[]}"#.to_vec());
+            }
+        };
+        tokio::join!(fetch, serve);
+    }
+
     fn capabilities(capabilities: &[&str]) -> Vec<u8> {
         serde_json::to_vec(&subc_control::ClientControlResponse::ServerDescribe {
             protocol_ver: 1,
@@ -420,6 +517,12 @@ mod carrier_catalog_tests {
                     subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1,
                 ])
             ));
+            let inventory = daemon.next_request().await;
+            assert_eq!(
+                serde_json::from_slice::<Value>(&inventory.body).unwrap()["op"],
+                "catalog.list"
+            );
+            assert!(daemon.reply(&inventory, self::inventory(&["aft", "other"])));
             for provider in ["aft", "other"] {
                 let open = daemon.next_request().await;
                 let body: Value = serde_json::from_slice(&open.body).unwrap();
@@ -476,6 +579,12 @@ mod carrier_catalog_tests {
         let (plan, ()) = tokio::join!(
             broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE),
             async {
+                let inventory = daemon.next_request().await;
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&inventory.body).unwrap()["op"],
+                    "catalog.list"
+                );
+                assert!(daemon.reply(&inventory, self::inventory(&["aft"])));
                 let open = daemon.next_request().await;
                 assert_eq!(open.body, br#"{"op":"route.open","target":{"kind":"tool_provider","module_id":"aft"},"identity":{"harness":"runner","session":"unscoped-plan"},"role_versions":{"tool-provider":"v1"}}"#);
                 assert!(daemon.reply(
