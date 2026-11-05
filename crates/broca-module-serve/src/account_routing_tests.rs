@@ -51,6 +51,7 @@ struct FakeRouting {
     hang: bool,
     answered: AtomicUsize,
     tiers: bool,
+    tier_probes: AtomicUsize,
 }
 
 impl FakeRouting {
@@ -116,6 +117,7 @@ impl FakeRouting {
 #[async_trait::async_trait]
 impl RoutingTransport for FakeRouting {
     async fn service_tier_supported(&self) -> Result<bool, String> {
+        self.tier_probes.fetch_add(1, Ordering::SeqCst);
         Ok(self.tiers)
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
@@ -140,6 +142,29 @@ fn client(routing: &Arc<FakeRouting>) -> RoutingClient {
         Arc::clone(routing) as Arc<dyn RoutingTransport>,
         AccountSelectionConfig::default(),
     )
+}
+
+#[tokio::test]
+async fn tierless_account_request_does_not_probe_router_discovery() {
+    let routing = FakeRouting::choosing("acct-a", "credential-a");
+    let client = client(&routing);
+    let params = json!({"provider":"anthropic","model":"fixture","admission_id":"run"});
+    let outcome = client
+        .account_for(
+            params.clone(),
+            tokio::time::Instant::now() + ADMISSION_BUDGET,
+        )
+        .await;
+    assert!(matches!(outcome, AccountForOutcome::Chosen { .. }));
+    assert_eq!(
+        routing.tier_probes.load(Ordering::SeqCst),
+        0,
+        "a tierless admission must not issue role.describe"
+    );
+    assert_eq!(
+        *routing.requests.lock().unwrap(),
+        vec![json!({"method":ACCOUNT_FOR_OP,"params":params})]
+    );
 }
 
 #[tokio::test]
@@ -169,6 +194,7 @@ async fn head_selection_account_tier_is_capability_gated_and_chosen() {
                 .and_then(Value::as_str),
             supported.then_some("ultrafast")
         );
+        assert_eq!(routing.tier_probes.load(Ordering::SeqCst), 1);
     }
 }
 

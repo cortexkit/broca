@@ -2642,6 +2642,9 @@ impl LlmRunnerSubject for BrocaSubject {
         if broca_module_serve::RETENTION_WRITER_ENABLED {
             capabilities.extend([Capability::Retention, Capability::RetentionClock]);
         }
+        if self.service_tier_enabled {
+            capabilities.insert(Capability::ServiceTier);
+        }
         capabilities.extend([Capability::Attachments, Capability::MediaOnlySend]);
         capabilities
     }
@@ -5382,8 +5385,9 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
     };
     let describe = response(route.request("role.describe", json!({})).await.unwrap());
     let served = route.describe_golden_bytes().await;
-    let golden =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../broca-wire/tests/golden/role_describe.json");
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../broca-wire/tests/golden")
+        .join(writer_describe_golden_name(subject.service_tier_enabled));
     if std::env::var_os("BROCA_REGENERATE_ROLE_DESCRIBE_GOLDEN").is_some() {
         std::fs::write(&golden, &served).unwrap();
         println!("role_describe.json: {}", String::from_utf8_lossy(&served));
@@ -6908,4 +6912,73 @@ async fn conformance_creation_seed_refuses_to_fabricate_a_host_fact() {
         .seed_host_created_at("synthetic-session", "m0", 600)
         .await
         .unwrap());
+}
+
+#[tokio::test]
+async fn conformance_subject_declares_service_tier_exactly_when_enabled() {
+    let root = broca_test_support::scratch_root().join("subject-service-tier-declaration");
+    let mut subject = BrocaSubject::new(&root).await;
+    for enabled in [false, true] {
+        subject.service_tier_enabled = enabled;
+        assert_eq!(
+            subject.capabilities().contains(&Capability::ServiceTier),
+            enabled
+        );
+    }
+}
+
+fn writer_describe_golden_name(service_tier_enabled: bool) -> &'static str {
+    if service_tier_enabled {
+        "role_describe_service_tier.json"
+    } else {
+        "role_describe.json"
+    }
+}
+
+#[test]
+fn conformance_describe_golden_matches_enabled_boot_switch() {
+    const CHILD: &str = "BROCA_DESCRIBE_GOLDEN_CHILD";
+    if let Ok(state) = std::env::var(CHILD) {
+        let enabled = match state.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => panic!("invalid child switch"),
+        };
+        broca_protocol::configure_service_tier(enabled).unwrap();
+        let actual =
+            broca_wire::broca_role_describe_with_writers("0.0.0-writer-golden", true, true, true);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../broca-wire/tests/golden")
+            .join(writer_describe_golden_name(enabled));
+        let expected = std::fs::read(path).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            expected,
+            "the exact discovery golden must represent the same boot switch as its daemon"
+        );
+        let value: Value = serde_json::from_slice(&expected).unwrap();
+        let describe = cortexkit_role_llm_runner::describe::check_describe(&value).unwrap();
+        assert_eq!(
+            describe.declares(cortexkit_role_llm_runner::capabilities::SERVICE_TIER),
+            enabled
+        );
+        return;
+    }
+    for state in ["off", "on"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conformance_describe_golden_matches_enabled_boot_switch",
+                "--nocapture",
+            ])
+            .env(CHILD, state)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{state}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

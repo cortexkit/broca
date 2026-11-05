@@ -933,15 +933,18 @@ impl RoutingClient {
         mut params: Value,
         deadline: tokio::time::Instant,
     ) -> AccountForOutcome {
-        let tier_aware = match tokio::time::timeout_at(
-            deadline,
-            self.transport.service_tier_supported(),
-        )
-        .await
+        // Legacy tierless admissions must not gain a discovery RPC or its failure modes.
+        let tier_aware = if params
+            .get("service_tier")
+            .is_some_and(|tier| !tier.is_null())
         {
-            Ok(Ok(supported)) => supported,
-            Ok(Err(error)) => return AccountForOutcome::Unreachable(error),
-            Err(_) => return AccountForOutcome::NoDecisionWithinBudget,
+            match tokio::time::timeout_at(deadline, self.transport.service_tier_supported()).await {
+                Ok(Ok(supported)) => supported,
+                Ok(Err(error)) => return AccountForOutcome::Unreachable(error),
+                Err(_) => return AccountForOutcome::NoDecisionWithinBudget,
+            }
+        } else {
+            false
         };
         if !tier_aware {
             params

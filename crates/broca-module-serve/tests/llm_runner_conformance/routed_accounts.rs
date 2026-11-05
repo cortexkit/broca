@@ -85,6 +85,7 @@ pub(super) fn seed_catalog(
     ] {
         value["models"][format!("{provider}/{PLAN_MODEL_PREFIX}{session}")] = json!({
             "existence":"present","limit.context":128000,"capability.tool_call":true,
+            "capability.reasoning":false,"capability.attachment":false,
             "wire.npm":{"value":npm,"from":"fixture"},
             "wire.api":{"value":model_url,"from":"fixture"}
         });
@@ -497,6 +498,47 @@ fn text_bytes(value: &Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_account_catalog_resolves_models_for_actual_native_provider_families() {
+        use broca_provider::families::{renderer_version_for, resolve_frozen};
+        let root = broca_test_support::scratch_root()
+            .join(format!("routed-catalog-admission-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        seed_structured_output_catalog(&root).unwrap();
+        seed_catalog(&root, "http://127.0.0.1:7/v1", "native-admission").unwrap();
+        let response =
+            serde_json::from_slice(&std::fs::read(root.join("catalog/fusiform-lkg.json")).unwrap())
+                .unwrap();
+        let cache = broca_catalog::CatalogCache::empty();
+        cache
+            .install_for_test(response, broca_catalog::CatalogSource::Fusiform)
+            .unwrap();
+        let catalog = cache.snapshot().unwrap();
+        for (provider_id, family) in [
+            (
+                "anthropic",
+                broca_provider::spec::WireFamilyId::AnthropicMessages,
+            ),
+            (
+                "openai",
+                broca_provider::spec::WireFamilyId::OpenAiResponsesChatgpt,
+            ),
+        ] {
+            let (mut provider, model) = catalog
+                .model_for_serving(provider_id, &format!("{PLAN_MODEL_PREFIX}native-admission"))
+                .unwrap();
+            provider.wire_family = family;
+            let frozen = resolve_frozen(&provider, &model, 2048, renderer_version_for(family))
+                .unwrap_or_else(|error| panic!("routed model must admit on {family:?}: {error}"));
+            assert_eq!(frozen.family_id, family);
+            assert_eq!(
+                frozen.reasoning,
+                broca_provider::policy::ReasoningPolicy::None
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn routed_accounts_fixtures_offer_two_real_candidates_for_each_declared_method() {
