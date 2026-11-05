@@ -1262,6 +1262,25 @@ pub(crate) fn steer_delivery(records: &[WalRecord], send_id: &str) -> Option<Del
     None
 }
 
+fn permanent_queued_refusal(message: String, provider_code: &'static str) -> ProviderError {
+    ProviderError {
+        provider_details: None,
+        provider_subcode: None,
+        refusal: None,
+        class: ErrorClass::Permanent,
+        message,
+        status: None,
+        retry_after_secs: None,
+        provider_code: Some(provider_code.into()),
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+    }
+}
+
 /// The run id a queued submission starts under: `queue_submission` names it `sub-<run_id>`.
 fn run_id_of_queued(submission_id: &broca_protocol::SubmissionId) -> RunId {
     RunId(
@@ -4264,7 +4283,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             if !already_pending {
                 match self.submission_was_retracted(&submission_id).await {
-                    Ok(true) => return SendOutcome::Retracted { submission_id },
+                    Ok(true) => {
+                        let records = match self.read_wal_records().await {
+                            Ok(records) => records,
+                            Err(error) => return SendOutcome::Error(error),
+                        };
+                        return crate::send_fate::recorded_send_outcome(
+                            &records,
+                            &run_id,
+                            identity.send_id.as_deref().unwrap_or(""),
+                            false,
+                        )
+                        .unwrap_or(SendOutcome::Retracted { submission_id });
+                    }
                     Ok(false) => {}
                     Err(error) => return SendOutcome::Error(error),
                 }
@@ -8529,20 +8560,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     }
                     return Ok(());
                 }
-                Err(StartRunFailure::Admission(error))
-                    if error.admission_error_class() == ErrorClass::Permanent =>
-                {
-                    // Tombstone only failures intrinsic to the durable request. A transient
-                    // dependency failure leaves the queue head intact for the next drain tick.
+                Err(StartRunFailure::Admission(error)) => {
+                    // End every refused send so the refusal reaches its caller, who may resend
+                    // with a new routing decision. Broca does not retry admission on its own.
                     self.persist_failed_queued_admission(
                         submission_id,
                         run_id,
-                        error.to_string(),
-                        match error {
-                            RunError::MediaUnsupported(_) => "media_unsupported",
-                            RunError::MediaTooLarge(_) => "media_too_large",
-                            _ => "queued_admission_failed",
-                        },
+                        crate::serve::admission_refusal::queued_admission_error(error),
                     )
                     .await?;
                 }
@@ -8554,8 +8578,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     self.persist_failed_queued_admission(
                         submission_id,
                         run_id,
-                        format!("scope refused: {refusal:?}"),
-                        "scope_required",
+                        permanent_queued_refusal(
+                            format!("scope refused: {refusal:?}"),
+                            "scope_required",
+                        ),
                     )
                     .await?;
                 }
@@ -8615,25 +8641,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         &mut self,
         submission_id: broca_protocol::SubmissionId,
         run_id: RunId,
-        message: String,
-        provider_code: &'static str,
+        terminal: ProviderError,
     ) -> Result<(), String> {
-        let terminal = ProviderError {
-            provider_details: None,
-            provider_subcode: None,
-            refusal: None,
-            class: ErrorClass::Permanent,
-            message,
-            status: None,
-            retry_after_secs: None,
-            provider_code: Some(provider_code.into()),
-            resets_at_ms: None,
-            resets_at_source: None,
-            limit_window: None,
-            account_ref: None,
-            credential_id: None,
-            affordable_max_tokens: None,
-        };
         let writer = self.writer.as_ref().expect("writer live while open");
         writer.record(WalRecord::Retracted {
             submission_id: submission_id.clone(),

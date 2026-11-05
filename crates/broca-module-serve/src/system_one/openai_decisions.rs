@@ -336,7 +336,8 @@ fn http_error(status: u16, retry_after_ms: Option<u64>, body: &[u8]) -> Provider
         error,
         provider_code,
         // Only a provider error (a timeout or a server failure) may have reached a billed
-        // model, as the other providers' refusal-spend rule reads it.
+        // model, so only then may the call have cost money; every other refusal came before any
+        // model ran.
         may_have_spent: code == errors::PROVIDER_ERROR,
     }
 }

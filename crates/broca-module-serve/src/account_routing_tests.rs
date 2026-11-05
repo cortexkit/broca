@@ -536,6 +536,20 @@ async fn routing_unreachable_refuses_the_send_routing_unavailable() {
     assert_eq!(client.counters.snapshot()["unreachable"], 1);
 }
 
+pub(crate) async fn unavailable_admission_error() -> broca_core::RunError {
+    let routing = FakeRouting::answering(Err("route.open refused: target_unavailable".into()));
+    let refusal = choose(
+        &client(&routing),
+        "oauth:anthropic",
+        false,
+        Some(two_accounts()),
+    )
+    .await
+    .expect_err("unreachable routing refuses admission");
+    assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP]);
+    refusal.into()
+}
+
 #[tokio::test]
 async fn a_malformed_routing_reply_is_refused_as_unreachable() {
     for reply in [
