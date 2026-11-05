@@ -970,6 +970,16 @@ async fn today_from(
         std::fs::write(dir.join("wal").join(name), bytes).unwrap();
     }
     let provider = ScriptedProvider::new(steps);
+    // A real provider resumed after a downgrade is rebuilt from the downgraded frozen config.
+    if start.is_some_and(|(_, bytes)| {
+        bytes
+            .windows(b"structured_output_downgraded".len())
+            .any(|window| window == b"structured_output_downgraded")
+    }) {
+        provider
+            .downgraded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let plane = scenario.plane();
     let spy = compaction().map(|script| Arc::new(CompactionSpy::new(&script)));
     let lease = FileLeaseStore::new(dir.join("lease"));
@@ -1202,6 +1212,14 @@ async fn new_from(
     };
     let spy = compaction().map(|script| Arc::new(CompactionSpy::new(&script)));
     let provider = ScriptedProvider::new(steps);
+    if held
+        .iter()
+        .any(|record| matches!(record, Record::StructuredDowngraded(_)))
+    {
+        provider
+            .downgraded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let plane = scenario.plane();
     let lifecycle = plane.lifecycle();
     let mut writer = Recording {
@@ -4741,4 +4759,22 @@ async fn a_failed_step_after_retries_counts_them_in_the_run_end() {
         *retries_used = 3;
     }
     compare(single(vec![failure])).await;
+}
+
+#[tokio::test]
+async fn a_downgrade_survives_every_crash_cut() {
+    STRUCTURED
+        .scope(
+            Some(strict("final_text")),
+            compare_every_cut(single(vec![
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                grammar_refused(),
+                text_step("a2", r#"{"answer":7}"#),
+            ])),
+        )
+        .await;
 }

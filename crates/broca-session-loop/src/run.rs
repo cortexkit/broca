@@ -1813,7 +1813,10 @@ async fn model_step<W: Writer, P: Provider, T>(
                 retries_used,
             })) => {
                 let Some(message) = message.take() else {
-                    return Ok(Err(StepFailure::Error(Box::new(incomplete_stream()), retries_used)));
+                    return Ok(Err(StepFailure::Error(
+                        Box::new(incomplete_stream()),
+                        retries_used,
+                    )));
                 };
                 return Ok(Ok(Step {
                     message,
