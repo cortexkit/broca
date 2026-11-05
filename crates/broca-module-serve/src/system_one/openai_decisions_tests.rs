@@ -348,8 +348,11 @@ async fn http_errors_are_classified_at_source_and_keep_codes_and_retry_after() {
         (429, "transient", "rate_limited"),
         (500, "transient", "provider_error"),
         (503, "transient", "provider_error"),
+        (529, "transient", "rate_limited"),
+        (408, "transient", "provider_error"),
         (401, "auth_required", "auth_failed"),
-        (403, "permanent", "invalid_item"),
+        (403, "auth_required", "auth_failed"),
+        (404, "permanent", "model_unavailable"),
         (400, "permanent", "invalid_item"),
     ] {
         let (stub, client) = start(vec![(
