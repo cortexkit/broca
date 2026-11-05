@@ -1062,6 +1062,7 @@ fn call_options<W: Writer, P, T>(
     step_id: u64,
 ) -> Result<CallOptions, LoopError> {
     let mut prompt = writer.conversation().messages.clone();
+    repetition_guidance(&mut prompt, episodes);
     stamp_ordinals_from(&mut prompt, 0);
     TagNumbering::for_run(
         &[],
@@ -1092,6 +1093,23 @@ fn call_options<W: Writer, P, T>(
         max_output_tokens: None,
     });
     Ok(opts)
+}
+
+/// Adds today's repetition guidance to the copies of tool results the request sends, never to
+/// what's stored: each run's model steps (from its first answer up to the next run's input) are
+/// folded with fresh counters, as today's loop counts within one run.
+fn repetition_guidance(prompt: &mut [Message], episodes: &[EpisodeRenderInput]) {
+    for (index, episode) in episodes.iter().enumerate() {
+        let end = episodes
+            .get(index + 1)
+            .map_or(prompt.len(), |next| next.prompt_start)
+            .min(prompt.len());
+        let first_step = (episode.prompt_start..end)
+            .find(|position| prompt[*position].role == broca_protocol::content::Role::Assistant);
+        if let Some(first_step) = first_step {
+            broca_core::run::restore_repetition_guidance(&mut prompt[first_step..end]);
+        }
+    }
 }
 
 struct Step {
@@ -2619,10 +2637,11 @@ fn run_state<W: Writer>(writer: &W) -> &broca_session_store::fold::operations::R
 /// The run's end record. Its usage is the run's total, present once a step completed.
 fn run_end<W: Writer>(writer: &W, run_id: &str, reason: RunFinishReason, now: u64) -> Record {
     let run = run_state(writer);
+    // Today's end record always carries the run's usage, empty when it took no step.
     Record::RunEnd(RunEnd {
         run_id: run_id.into(),
         reason,
-        usage: (run.completed_steps > 0).then_some(run.usage),
+        usage: Some(run.usage),
         ts_ms: Some(now),
         retries_used: run.retries_used,
         interrupt_reason: None,

@@ -3150,3 +3150,83 @@ async fn post_assistant_hooks_edit_the_answer() {
 async fn every_cut_of_a_run_with_post_assistant_hooks_resumes_alike() {
     compare_every_cut(post_assistant_scenario()).await;
 }
+
+fn repeated_failure_scenario() -> Scenario {
+    Scenario {
+        input: vec![user("find x")],
+        manifest: None,
+        tools: vec![tool("grep", ExecutionMode::Parallel)],
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "grep", json!({"pattern": "x"}))],
+                FinishReason::ToolCalls,
+            ),
+            answer(
+                "a2",
+                vec![call("c2", "grep", json!({"pattern": "x"}))],
+                FinishReason::ToolCalls,
+            ),
+            answer(
+                "a3",
+                vec![call("c3", "grep", json!({"pattern": "x"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a4", "giving up"),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn a_call_repeated_with_the_same_failure_gets_guidance() {
+    compare(repeated_failure_scenario()).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_repeated_failure_resumes_alike() {
+    compare_every_cut(repeated_failure_scenario()).await;
+}
+
+#[tokio::test]
+async fn repetition_guidance_counts_within_each_run() {
+    let mut scenario = repeated_failure_scenario();
+    // The second run repeats the first run's failing call once more: counted afresh, it gets no
+    // guidance.
+    scenario.steps.extend([
+        answer(
+            "a5",
+            vec![call("c4", "grep", json!({"pattern": "x"}))],
+            FinishReason::ToolCalls,
+        ),
+        answer(
+            "a6",
+            vec![call("c5", "grep", json!({"pattern": "x"}))],
+            FinishReason::ToolCalls,
+        ),
+        text_step("a7", "still nothing"),
+    ]);
+    compare_runs(
+        scenario,
+        &[
+            ("r1", vec![user("find x")]),
+            ("r2", vec![user("try again")]),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_later_run_that_fails_before_its_first_step() {
+    let mut scenario = repeated_failure_scenario();
+    scenario.steps.truncate(1);
+    scenario.steps.push(text_step("a2", "done"));
+    compare_runs(
+        scenario,
+        &[
+            ("r1", vec![user("find x")]),
+            ("r2", vec![user("try again")]),
+        ],
+    )
+    .await;
+}
