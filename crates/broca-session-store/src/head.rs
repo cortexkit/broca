@@ -121,6 +121,9 @@ crate::message! {
         15 rep pending: PendingDeletion,
         /// The id index's root object (see `idindex`). Absent until the first seal.
         16 opt id_index: String,
+        /// Set by the cold step (see `session::cold`) and cleared when a writer opens the session
+        /// again, so a catalog rebuilt from heads knows which sessions are cold.
+        17 opt cold_since_ms: u64,
     }
 }
 

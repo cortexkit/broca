@@ -502,6 +502,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             replaced,
             history_version: Some(history_version),
             abandoned,
+            cold_since_ms: None,
         })
     }
 }

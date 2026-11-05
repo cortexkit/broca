@@ -34,6 +34,7 @@ fn head(deployment: &DeploymentKey, key: &DataKey) -> Head {
         ledger_dir: None,
         pending: Vec::new(),
         id_index: None,
+        cold_since_ms: None,
     }
 }
 

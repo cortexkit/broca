@@ -90,7 +90,12 @@ pub(super) struct Created {
     /// A revert's new history version, and its list of abandoned objects.
     pub(super) history_version: Option<u64>,
     pub(super) abandoned: Option<String>,
+    /// Set by the cold step: the head records when the session went cold.
+    pub(super) cold_since_ms: Option<u64>,
 }
+
+/// The open log as read back: its records, its batches, and its checkpoint.
+pub(super) type OpenLogRead = (Vec<(u64, Record)>, Vec<std::ops::Range<usize>>, Checkpoint);
 
 /// What sealing a change's ledger records wrote.
 pub(super) struct LedgerSealed {
@@ -115,17 +120,31 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         if self.operations.open_change.is_some() {
             return Err(SessionError::ChangeOpen);
         }
-        let (records, batches, checkpoint) = self.read_open_log().await?;
+        let open = self.read_open_log().await?;
         if let Some(cut) = cut {
-            self.check_cut(&records, &checkpoint, cut)?;
+            self.check_cut(&open.0, &open.2, cut)?;
         }
-
-        let change = random_id();
         let kind = if cut.is_some() {
             ChangeKind::Cut
         } else {
             ChangeKind::LedgerSeal
         };
+        self.seal_read(kind, cut, false, open, now_ms).await
+    }
+
+    /// Runs a seal over an open log already read. `prune_window` also prunes finished runs'
+    /// opaque reasoning from the transcript records it copies into the new log; the caller
+    /// passes it only when no run is unfinished.
+    pub(super) async fn seal_read(
+        &mut self,
+        kind: ChangeKind,
+        cut: Option<u64>,
+        prune_window: bool,
+        open: OpenLogRead,
+        now_ms: u64,
+    ) -> Result<Sealed, SessionError> {
+        let (records, batches, checkpoint) = open;
+        let change = random_id();
         let intent = Record::ChangeIntent(ChangeIntent { change, kind, cut });
         let intent_seq = self.append(std::slice::from_ref(&intent), true).await?;
         let mut records = records;
@@ -135,6 +154,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             .create_objects(
                 change,
                 cut,
+                prune_window,
                 intent_seq,
                 &records,
                 &batches,
@@ -142,20 +162,21 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 now_ms,
             )
             .await;
-        let created = match created {
+        let mut created = match created {
             Ok(created) => created,
             Err(error) => {
                 self.abort(change).await;
                 return Err(error);
             }
         };
+        if kind == ChangeKind::Cold {
+            created.cold_since_ms = Some(now_ms);
+        }
         self.commit(change, intent_seq, created, now_ms).await
     }
 
     /// The open log's records, its batches and its checkpoint, read back from the backend.
-    pub(super) async fn read_open_log(
-        &self,
-    ) -> Result<(Vec<(u64, Record)>, Vec<std::ops::Range<usize>>, Checkpoint), SessionError> {
+    pub(super) async fn read_open_log(&self) -> Result<OpenLogRead, SessionError> {
         let open = self.head.open_log.clone().ok_or(SessionError::Backend(
             crate::backend::BackendError::Corrupt("local head without a log"),
         ))?;
@@ -207,6 +228,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         &mut self,
         change: Id128,
         cut: Option<u64>,
+        prune_window: bool,
         intent_seq: u64,
         records: &[(u64, Record)],
         batches: &[std::ops::Range<usize>],
@@ -358,13 +380,21 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let mut conversation = at_cut;
         let mut window_facts = BTreeMap::new();
         for batch in batches {
-            let kept: Vec<(u64, &Record)> = records[batch.clone()]
+            let kept: Vec<(u64, Record)> = records[batch.clone()]
                 .iter()
                 .filter(|(seq, record)| {
                     record.stream() == Stream::Transcript && !below(*seq, record)
                 })
-                .map(|(seq, record)| (*seq, record))
+                .map(|(seq, record)| {
+                    let mut record = record.clone();
+                    if prune_window && record_run(&record).is_some() {
+                        crate::prune::prune_record(&mut record, &prune_key);
+                    }
+                    (*seq, record)
+                })
                 .collect();
+            let kept: Vec<(u64, &Record)> =
+                kept.iter().map(|(seq, record)| (*seq, record)).collect();
             if kept.is_empty() {
                 continue;
             }
@@ -400,6 +430,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             replaced,
             history_version: None,
             abandoned: None,
+            cold_since_ms: None,
         })
     }
 
@@ -521,6 +552,9 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         head.next_seq = created.encoder.next_seq();
         if let Some(version) = created.history_version {
             head.history_version = version;
+        }
+        if created.cold_since_ms.is_some() {
+            head.cold_since_ms = created.cold_since_ms;
         }
         head.pending.push(PendingDeletion {
             change,

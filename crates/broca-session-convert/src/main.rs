@@ -1338,6 +1338,11 @@ struct AppendReport {
     /// A part an earlier session already stored writes nothing and isn't counted.
     setup_parts_written: u64,
     setup_put_us: Percentiles,
+    /// The cold step after the seals: logs whose kept transcript it pruned (no run unfinished),
+    /// and the open logs' total size before and after it.
+    cold_pruned: u64,
+    open_before_cold: u64,
+    open_after_cold: u64,
     /// Per log: the size of the session's log in today's format, records, barriers, total append time in milliseconds, the
     /// written log's size, and its load time in microseconds.
     per_log: Vec<(u64, u64, u64, f64, u64, u64)>,
@@ -1427,6 +1432,9 @@ fn run_append(args: &Args) {
                 expands.extend(measured.expand_us);
                 report.ids_checked += measured.ids_checked;
                 id_lookups.extend(measured.id_lookup_us);
+                report.cold_pruned += u64::from(measured.cold_pruned);
+                report.open_before_cold += measured.open_before_cold;
+                report.open_after_cold += measured.open_after_cold;
             }
             Err(e) => report.failures.push(format!("{}: {e}", file.display())),
         }

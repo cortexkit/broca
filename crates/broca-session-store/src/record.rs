@@ -884,6 +884,10 @@ crate::values! {
         /// Ends the transcript branch before an earlier user input and starts a new run there
         /// with an edited input (see `session::revert`). Seals every ledger record.
         3 Revert,
+        /// Seals every ledger record of a session idle for days, and, if no run is unfinished,
+        /// prunes finished runs' opaque reasoning from the transcript it keeps open (see
+        /// `session::cold`).
+        4 Cold,
     }
 }
 
@@ -925,6 +929,30 @@ message! {
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct ChangeAborted {
         1 req change: crate::codec::Id128,
+    }
+}
+
+impl Record {
+    /// The time this record says something happened in the session, from whichever time field
+    /// its kind carries. `None` for kinds that carry none, which includes `WriterOpened`: opening
+    /// a writer isn't activity.
+    pub fn activity_ms(&self) -> Option<u64> {
+        match self {
+            Record::Input(r) => r.written_at_ms,
+            Record::Assistant(r) => r.last_content_at_ms.or(r.written_at_ms),
+            Record::ToolReply(r) => r.finished_at_ms,
+            Record::ResultAppend(r) => r.written_at_ms,
+            Record::EntryFacts(r) => Some(r.written_at_ms),
+            Record::RunStart(r) => r.written_at_ms.or(r.ts_ms),
+            Record::RunEnd(r) => r.ts_ms,
+            Record::Attempt(r) => r.last_content_at_ms.or(Some(r.ts_ms)),
+            Record::ToolOutcome(r) => r.finished_at_ms,
+            Record::QueuedSend(r) => r.written_at_ms.or(r.ts_ms),
+            Record::Pause(r) => r.ts_ms,
+            Record::Steer(r) => r.written_at_ms,
+            Record::Delivery(r) => r.written_at_ms,
+            _ => None,
+        }
     }
 }
 

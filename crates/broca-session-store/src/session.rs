@@ -151,6 +151,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             ledger_dir: None,
             pending: Vec::new(),
             id_index: None,
+            cold_since_ms: None,
         };
         let version = backend
             .write_head(&addr, &head::seal(&head, &key), None, 1)
@@ -345,6 +346,8 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     ) -> Result<(), SessionError> {
         self.head.generation = random_id();
         self.head.next_seq = self.encoder.next_seq();
+        // A writer opening the session wakes it, if it was cold.
+        self.head.cold_since_ms = None;
         self.version = self
             .backend
             .write_head(
@@ -480,6 +483,8 @@ impl<'b, B: SessionBackend> Session<'b, B> {
 
 mod read;
 pub use read::StoredEntry;
+mod cold;
+pub use cold::Cold;
 mod revert;
 pub use revert::{RevertRefusal, Reverted};
 mod seal;

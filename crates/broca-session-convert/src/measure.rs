@@ -252,6 +252,12 @@ pub struct AppendMeasure {
     /// already held (from this session or an earlier one) asks the backend nothing and isn't
     /// timed.
     pub setup_put_us: Vec<u64>,
+    /// After the seals, the cold step as if the session had been idle for years: whether it
+    /// pruned the kept transcript (it doesn't when a run is unfinished), and the open log's size
+    /// before and after it.
+    pub cold_pruned: bool,
+    pub open_before_cold: u64,
+    pub open_after_cold: u64,
 }
 
 /// The setup parts `record` names.
@@ -275,10 +281,11 @@ fn named_parts(record: &Record) -> &[PartRef] {
 /// must read back from a store with nothing cached, checked against its digest.
 ///
 /// Then it seals twice: a cut at the newest run input where a cut may fall, which must leave the
-/// window as exactly the messages from there on, and a ledger seal on top. After each, the
-/// session reloads to the state its writer held. After the reload, every message reads back by
-/// its ordinal, and every id the written ledger records name is found, through the id index,
-/// with exactly the seqs of the records that name it.
+/// window as exactly the messages from there on, and a ledger seal on top. Then the cold step
+/// runs as if the session had been idle for years, so it prunes the kept transcript unless a run
+/// is unfinished. After each, the session reloads to the state its writer held. After the
+/// reload, every message reads back by its ordinal, and every id the written ledger records name
+/// is found, through the id index, with exactly the seqs of the records that name it.
 pub fn append_log(
     records: &[Record],
     parts: &std::collections::BTreeMap<Digest, Vec<u8>>,
@@ -406,6 +413,21 @@ pub fn append_log(
             .await
             .map_err(|e| format!("ledger seal: {e:?}"))?;
         measure.seal_us.push(started.elapsed().as_micros() as u64);
+        measure.open_before_cold = session.open_log().1;
+        let far_future = u64::MAX / 2;
+        match session
+            .cold(far_future, 7 * 24 * 60 * 60 * 1000)
+            .await
+            .map_err(|e| format!("cold: {e:?}"))?
+        {
+            broca_session_store::session::Cold::Applied { pruned, .. } => {
+                measure.cold_pruned = pruned
+            }
+            // Nothing in the open log carries a time: the session was left alone.
+            broca_session_store::session::Cold::Unknown => {}
+            other => return Err(format!("cold step: {other:?}")),
+        }
+        measure.open_after_cold = session.open_log().1;
         let state = (session.conversation.encode(), session.operations.encode());
         session.close().await.map_err(|e| format!("close: {e:?}"))?;
         Ok::<_, String>((state, whole))
