@@ -790,6 +790,13 @@ where
                 return Ok(finished(writer, RunFinishReason::Error));
             }
         };
+        // The post-assistant hooks edit the answer's text before anything decides on it, so
+        // the stop conditions, the record and the next request all see the edited answer.
+        let mut step = step;
+        let step_hooks = match hooks.as_ref() {
+            Some(runtime) => post_assistant(runtime, step_id, &mut step.message).await,
+            None => None,
+        };
         let calls: Vec<ToolCall> = step.message.tool_calls().cloned().collect();
         let stop = stop_satisfied(&stop_when, completed_steps + 1, &step.message).cloned();
         let limiting = limiting_stop_satisfied(&stop_when, completed_steps + 1, &step.message);
@@ -821,7 +828,7 @@ where
                         speed_used: None,
                         call_count: calls.len() as u32,
                         fallback: None,
-                        hooks: None,
+                        hooks: step_hooks,
                         budget_finalize: None,
                         total_usage: None,
                         stop_met: stop.is_some().then_some(true),
@@ -2488,6 +2495,44 @@ async fn dispatch_one<T: ToolPlane>(
         }
         other => resolve(call, other).into(),
     }
+}
+
+/// A model answer's text through the post-assistant hooks: each accepted edit is applied to the
+/// answer's text parts in place. Returns what the hooks did, for the step's end record, or
+/// `None` when they did nothing. The trace records the answer as the provider gave it.
+async fn post_assistant(
+    runtime: &broca_core::hooks::HookRuntime<'_>,
+    step_id: u64,
+    message: &mut broca_protocol::content::AssistantMessage,
+) -> Option<Value> {
+    use broca_protocol::content::ContentBlock;
+    let original = serde_json::to_value(&*message).expect("an answer serializes");
+    let subject = broca_core::hooks::Subject::PostAssistant {
+        step_id: step_id.to_string(),
+        blocks: message
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect(),
+    };
+    let output = runtime
+        .chain(subject, broca_core::hooks::Trace::default(), |_| true)
+        .await;
+    broca_core::hooks::apply_message_ops(&mut message.content, &output.operations)
+        .expect("checked ops");
+    output
+        .trace
+        .metadata(
+            original,
+            serde_json::to_value(&*message).expect("an answer serializes"),
+            false,
+        )
+        .map(|hooks| serde_json::to_value(hooks).expect("hook metadata serializes"))
 }
 
 /// A provider's result through the post-tool hooks subscribed for its tool, as today's loop

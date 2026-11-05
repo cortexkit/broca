@@ -2965,6 +2965,20 @@ impl broca_core::hooks::HookPlane for HarnessHooks {
         use cortexkit_role_step_transform_provider::answer::HookAnswer;
         use cortexkit_role_step_transform_provider::hook::Subject;
         use cortexkit_role_step_transform_provider::subscription::Phase;
+        if let Subject::PostAssistant { blocks, .. } = &call.subject {
+            if !blocks
+                .first()
+                .is_some_and(|text| text.contains("review me"))
+            {
+                return Ok(HookAnswer::Pass);
+            }
+            return Ok(HookAnswer::Ops {
+                ops: vec![serde_json::from_value(
+                    json!({"op": "append", "block": 0, "text": " [reviewed by the harness hook]"}),
+                )
+                .unwrap()],
+            });
+        }
         if let Subject::PostTool { tool, .. } = &call.subject {
             return match tool.as_str() {
                 "post_down" => Err(broca_core::hooks::HookUnavailable),
@@ -3006,6 +3020,7 @@ fn hooked_manifest(tools: &[Tool]) -> Arc<broca_wal::PlanManifest> {
         {"hook": "pre_tool", "phase": "validate", "ops": [], "on_unavailable": "refuse", "budget_ms": 500},
         {"hook": "post_tool", "tools": ["read"], "ops": ["append", "prepend", "replace"], "on_unavailable": "pass", "budget_ms": 500},
         {"hook": "post_tool", "tools": ["post_down"], "ops": ["append", "prepend", "replace"], "on_unavailable": "refuse", "budget_ms": 500},
+        {"hook": "post_assistant", "ops": ["append", "prepend"], "on_unavailable": "pass", "budget_ms": 500},
     ]);
     let mut manifest = (*planned_manifest(tools)).clone();
     manifest.plan = broca_wal::OpaqueJson::from_json_text(
@@ -3106,4 +3121,32 @@ async fn every_cut_of_a_run_with_post_tool_hooks_resumes_alike() {
 #[tokio::test]
 async fn every_cut_of_a_sequential_run_with_post_tool_hooks_resumes_alike() {
     compare_every_cut(post_tool_scenario(ExecutionMode::Sequential)).await;
+}
+
+fn post_assistant_scenario() -> Scenario {
+    let tools = vec![tool("read", ExecutionMode::Parallel)];
+    Scenario {
+        input: vec![user("read a")],
+        manifest: Some(hooked_manifest(&tools)),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done, review me"),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn post_assistant_hooks_edit_the_answer() {
+    compare(post_assistant_scenario()).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_run_with_post_assistant_hooks_resumes_alike() {
+    compare_every_cut(post_assistant_scenario()).await;
 }
