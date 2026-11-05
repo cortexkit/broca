@@ -444,12 +444,17 @@ fn seed_vault_credential(
         out.status.success().then_some(out)
     };
     run(&["bootstrap"])?;
+    // `ck auth put` takes the secret from a file, never from argv: claustrum refuses
+    // `--payload`. The file sits beside the vault, in the rig's scratch folder.
+    let payload = vault_dir.with_extension("payload");
+    std::fs::write(&payload, "sk-rig-only").ok()?;
+    let payload = payload.to_str()?;
     run(&[
         "put",
         "--id",
         &seed.credential_id,
-        "--payload",
-        "sk-rig-only",
+        "--payload-file",
+        payload,
     ])?;
     // The broca daemon reads every credential by grant (credential.get_scoped) as its
     // supervised principal, never by handle, so the rig grants that principal a read on the
@@ -1222,16 +1227,13 @@ impl Daemon {
     /// production reaches it. A failed repair is asserted here rather than left to surface
     /// later as a resume that did not happen.
     fn repair_vault_credential(&self, credential_id: &str) {
+        let payload = self.dir.join("repaired.payload");
+        std::fs::write(&payload, "sk-repaired").expect("write the repaired credential's payload");
         let out = broca_test_support::retry_executable_file_busy(|| {
             self.ck_auth_command()
-                .args([
-                    "put",
-                    "--id",
-                    credential_id,
-                    "--payload",
-                    "sk-repaired",
-                    "--replace",
-                ])
+                .args(["put", "--id", credential_id, "--payload-file"])
+                .arg(&payload)
+                .arg("--replace")
                 .output()
         })
         .expect("run ck-auth put --replace");
