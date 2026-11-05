@@ -472,7 +472,6 @@ async fn project_identity_existing_unscoped_and_scoped_resume_on_legacy_addresse
         let Some(rig) = Rig::start().await else {
             return;
         };
-        rig.wait_for_broca_ready().await;
         if scoped {
             rig.sync_scopes(
                 serde_json::json!([{
@@ -919,6 +918,9 @@ impl Rig {
             );
             sleep(Duration::from_millis(25)).await;
         }
+        // A running process can still be warming. Wait until broca answers a bind, so no test
+        // opens a route while the daemon still refuses it with `module_warming`.
+        rig.wait_for_broca_ready().await;
         Some(rig)
     }
 
@@ -1564,7 +1566,6 @@ async fn real_basal_sender_guard_protects_other_runs_and_allows_own_flow() {
     let Some(rig) = Rig::start().await else {
         return;
     };
-    rig.wait_for_broca_ready().await;
     rig.sync_scope_with(Some("flow-a"), 1).await;
     let owner = rig.connect_as(OWNER, &rig.owner_nonce).await;
     let basal = rig.connect_as(CARRIER, &rig.carrier_nonce).await;
