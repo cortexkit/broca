@@ -304,6 +304,8 @@ mod reader_identity;
 #[cfg(feature = "test-clock")]
 #[path = "llm_runner_conformance/retention.rs"]
 mod retention;
+#[path = "llm_runner_conformance/routed_accounts.rs"]
+mod routed_accounts;
 #[path = "llm_runner_conformance/session_class.rs"]
 mod session_class;
 /// The `it` target's real-daemon diagnostics (log tails, watchdog stall files, decoded session
@@ -378,6 +380,8 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    routed_account_peers:
+        Mutex<HashMap<String, cortexkit_role_llm_runner_conformance::RecordingRoutingPeer>>,
     service_tier_sessions: Mutex<BTreeSet<String>>,
     head_selection_sessions: Mutex<BTreeSet<String>>,
     service_tier_keys: Mutex<HashMap<String, String>>,
@@ -507,7 +511,13 @@ async fn start_model(shared: Arc<Shared>) -> String {
             };
             let shared = shared.clone();
             tokio::spawn(async move {
-                let _ = serve_model_request(stream, shared).await;
+                if let Err(error) = serve_model_request(stream, shared.clone()).await {
+                    shared
+                        .evidence
+                        .lock()
+                        .unwrap()
+                        .push(format!("scripted model transport: {error}"));
+                }
             });
         }
     });
@@ -721,6 +731,10 @@ async fn serve_model_request(
     mut stream: tokio::net::TcpStream,
     shared: Arc<Shared>,
 ) -> std::io::Result<()> {
+    let mut first = [0u8; 1];
+    if stream.peek(&mut first).await? == 1 && first[0] == b'G' {
+        return routed_accounts::serve_websocket(stream, shared).await;
+    }
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 8192];
     let body_start = loop {
@@ -1241,6 +1255,7 @@ struct Live {
     #[cfg(feature = "test-clock")]
     bus_credentials: Option<tokio::task::JoinHandle<()>>,
     connections: tokio::sync::Mutex<HashMap<String, Arc<SubcConnection>>>,
+    _routed_services: Option<routed_accounts::Services>,
 }
 
 impl Live {
@@ -1341,6 +1356,7 @@ impl Drop for Live {
 #[derive(Clone)]
 struct BrocaSubject {
     shared: Arc<Shared>,
+    routed_instances: Arc<tokio::sync::Mutex<HashMap<String, std::sync::Weak<Live>>>>,
     model_url: String,
     /// The project root for legacy seeds; routed identities use the session-ref inventory.
     project_root: PathBuf,
@@ -1366,6 +1382,7 @@ impl BrocaSubject {
         std::fs::create_dir_all(&project_root).unwrap();
         Self {
             shared,
+            routed_instances: Default::default(),
             model_url,
             project_root: project_root.canonicalize().unwrap(),
             dump_dir: None,
@@ -1423,6 +1440,15 @@ impl BrocaSubject {
     }
 
     async fn start(&self, root: &Path) -> Result<Live, HarnessError> {
+        self.start_configured(root, None).await
+    }
+
+    async fn start_configured(
+        &self,
+        root: &Path,
+        routed_session: Option<&str>,
+    ) -> Result<Live, HarnessError> {
+        let routed = routed_session.is_some();
         let fail = |what: String| HarnessError::new(what);
         let config_home = root.join("config");
         let runtime_dir = root.join("runtime");
@@ -1431,6 +1457,10 @@ impl BrocaSubject {
         std::fs::create_dir_all(&home).map_err(|e| fail(e.to_string()))?;
         let state_root = root.join("broca-state");
         seed_structured_output_catalog(&state_root).map_err(|e| fail(e.to_string()))?;
+        if let Some(session) = routed_session {
+            routed_accounts::seed_catalog(&state_root, &self.model_url, session)
+                .map_err(|e| fail(e.to_string()))?;
+        }
         let config_path = config_home.join("cortexkit").join("subc.jsonc");
         std::fs::create_dir_all(config_path.parent().unwrap()).map_err(|e| fail(e.to_string()))?;
         std::fs::create_dir_all(&runtime_dir).map_err(|e| fail(e.to_string()))?;
@@ -1524,18 +1554,16 @@ impl BrocaSubject {
             });
         }
         let broca_config = config_home.join("cortexkit/broca.jsonc");
-        std::fs::write(
-            &broca_config,
-            serde_json::to_vec(
-                &self
-                    .backup_classes
-                    .as_ref()
-                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled,"service_tier":{"enabled":self.service_tier_enabled}}))
-                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled,"service_tier":{"enabled":self.service_tier_enabled}})),
-            )
-            .unwrap(),
-        )
-        .map_err(|error| fail(error.to_string()))?;
+        let mut settings = json!({"bus_run_events_enabled":self.bus_events_enabled && !routed,
+            "service_tier":{"enabled":self.service_tier_enabled}});
+        if let Some(classes) = &self.backup_classes {
+            settings["backup_classes"] = json!(classes);
+        }
+        if routed {
+            routed_accounts::configure(root, &self.model_url, &mut config, &mut settings)?;
+        }
+        std::fs::write(&broca_config, serde_json::to_vec(&settings).unwrap())
+            .map_err(|error| fail(error.to_string()))?;
         config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] = json!(broca_config);
         if let Some(dump_dir) = &self.dump_dir {
             config["modules"]["broca"]["env"]["BROCA_DUMP_REQUEST_DIR"] = json!(dump_dir);
@@ -1556,6 +1584,7 @@ impl BrocaSubject {
             .env("XDG_DATA_HOME", &data_home)
             .env("HOME", &home)
             .env_remove("BROCA_STATE_ROOT")
+            .env_remove("BROCA_PROVIDER_BASE_URL")
             .env("SUBC_PORT", "0")
             .env_remove("SUBC_LAUNCH_NONCE")
             .env_remove("SUBC_LAUNCH_NONCE_FD")
@@ -1587,12 +1616,20 @@ impl BrocaSubject {
         let tools = tokio::spawn(async move {
             let _ = serve.await;
         });
+        let routed_services = match routed_session {
+            Some(session) => Some(
+                routed_accounts::register(&connection_file, self.shared.clone(), session).await?,
+            ),
+            None => None,
+        };
         #[cfg(feature = "test-clock")]
-        let bus_credentials = match &self.bus {
+        let bus_credentials = match self.bus.as_ref().filter(|_| !routed) {
             Some(bus) => Some(bus.register(&connection_file).await),
             None => None,
         };
-        *self.shared.fixture_connection.lock().unwrap() = Some(connection_file.clone());
+        if !routed {
+            *self.shared.fixture_connection.lock().unwrap() = Some(connection_file.clone());
+        }
         publish_scope_fixtures(&scope_sync, &scope_events).await?;
         Ok(Live {
             daemon: Some(daemon),
@@ -1604,6 +1641,7 @@ impl BrocaSubject {
             #[cfg(feature = "test-clock")]
             bus_credentials,
             connections: tokio::sync::Mutex::new(HashMap::new()),
+            _routed_services: routed_services,
         })
     }
 
@@ -2033,6 +2071,7 @@ struct BrocaRoute {
     session: broca_protocol::BindIdentity,
     describe_calls: std::sync::atomic::AtomicUsize,
     logs_dir: PathBuf,
+    _routed_live: Option<Arc<Live>>,
 }
 
 fn scripted_usage_chunk(id: &str, usage: &ScriptedUsage, output_cap: u64) -> Value {
@@ -2265,6 +2304,38 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    async fn routing_runner_declaration(&self) -> Result<Value, HarnessError> {
+        Ok(routed_accounts::runner_declaration())
+    }
+
+    async fn routed_account_fixture(&self, method: &str) -> Result<Value, HarnessError> {
+        routed_accounts::fixture(method)
+    }
+
+    async fn install_routing_peer(
+        &self,
+        session: &str,
+        peer: cortexkit_role_llm_runner_conformance::RecordingRoutingPeer,
+    ) -> Result<(), HarnessError> {
+        let live = self
+            .routed_instances
+            .lock()
+            .await
+            .get(session)
+            .and_then(std::sync::Weak::upgrade);
+        if live.is_none() {
+            return Err(HarnessError::new(
+                "routed-account session has no vault-backed runner",
+            ));
+        }
+        self.shared
+            .routed_account_peers
+            .lock()
+            .unwrap()
+            .insert(session.into(), peer);
+        Ok(())
+    }
+
     async fn head_selection_models(
         &self,
         session: &str,
@@ -2536,6 +2607,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::RunUsage,
             Capability::SessionUsage,
             Capability::HeadSelection,
+            Capability::RoutedAccounts,
             Capability::RunCancel,
             Capability::Retract,
             Capability::DispatchAttribution,
@@ -2639,6 +2711,8 @@ impl LlmRunnerSubject for BrocaSubject {
         session: &str,
         stamp: &RouteStamp,
     ) -> Result<BrocaRoute, HarnessError> {
+        let routed_live = routed_accounts::session_live(self, handle, session).await?;
+        let handle = routed_live.as_deref().unwrap_or(handle);
         let connection = self.connection(handle, stamp).await?;
         self.shared
             .session_roots
@@ -2681,10 +2755,20 @@ impl LlmRunnerSubject for BrocaSubject {
             session: identity,
             describe_calls: std::sync::atomic::AtomicUsize::new(0),
             logs_dir: handle.logs_dir.clone(),
+            _routed_live: routed_live,
         })
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if let Some(peer) = self
+            .shared
+            .routed_account_peers
+            .lock()
+            .unwrap()
+            .get(session)
+        {
+            return routed_accounts::send_fields(session, first, peer);
+        }
         if self
             .shared
             .head_selection_sessions
@@ -3911,6 +3995,55 @@ fn disabled_kill_case(
         && matches!(&case.outcome, CaseOutcome::Skipped { missing } if missing == &expected)
 }
 
+fn check_routed_account_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+) -> Result<(), String> {
+    for name in [
+        "routed_accounts_follows_account_choice",
+        "routed_accounts_account_for",
+    ] {
+        let case = cases
+            .iter()
+            .find(|case| case.case == name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        if case.outcome != CaseOutcome::Passed {
+            return Err(format!("{name}: {:?}", case.outcome));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn routed_accounts_cases_cannot_skip_or_claim_inapplicability() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+    let cases: Vec<_> = CASES
+        .iter()
+        .filter(|case| case.name.starts_with("routed_accounts_"))
+        .map(|case| CaseReport {
+            case: case.name,
+            requires: case.requires.to_vec(),
+            outcome: CaseOutcome::Passed,
+        })
+        .collect();
+    assert_eq!(cases.len(), 2);
+    assert!(check_routed_account_cases(&cases).is_ok());
+    for index in 0..cases.len() {
+        for outcome in [
+            CaseOutcome::Skipped { missing: vec![] },
+            CaseOutcome::Inapplicable {
+                reason: "routed_accounts is not declared on the wire".into(),
+            },
+        ] {
+            let mut broken = cases.clone();
+            broken[index].outcome = outcome;
+            assert!(check_routed_account_cases(&broken).is_err());
+        }
+        let mut missing = cases.clone();
+        missing.remove(index);
+        assert!(check_routed_account_cases(&missing).is_err());
+    }
+}
+
 fn check_head_selection_cases(
     cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
     tiers: bool,
@@ -4227,6 +4360,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
+    check_routed_account_cases(&report.cases).unwrap();
     check_head_selection_cases(&report.cases, subject.service_tier_enabled).unwrap();
     // Broca does not promise caller-selected output caps on every provider. Only that
     // prerequisite is skipped; provider-limit finish normalization must still pass below.
@@ -5919,6 +6053,7 @@ mod held_call_tests {
     fn subject(shared: Arc<Shared>) -> BrocaSubject {
         BrocaSubject {
             shared,
+            routed_instances: Default::default(),
             model_url: String::new(),
             project_root: PathBuf::new(),
             dump_dir: None,

@@ -498,6 +498,7 @@ dependencies = [
  "subc-protocol",
  "subc-transport",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "tracing-subscriber",

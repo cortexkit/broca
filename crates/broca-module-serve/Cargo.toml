@@ -138,6 +138,7 @@ cortexkit-role-classifier-conformance = { workspace = true }
 # the Workers AI client's tests.
 cortexkit-role-classifier = { workspace = true, features = ["test-vectors"] }
 subc-client-rs = { workspace = true }
+tokio-tungstenite.workspace = true
 # The native-search-probe example decodes a gzip or deflate response it records raw. Same
 # backend tungstenite already builds, so the lockfile gains no new crate.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
