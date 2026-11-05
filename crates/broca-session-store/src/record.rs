@@ -186,6 +186,58 @@ message! {
     }
 }
 
+message! {
+    /// Token counts the provider reported for the request that produced an assistant entry, as
+    /// `session.entries` serves them. Absent means not reported, never zero.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+    pub struct StepUsage {
+        1 opt prompt_tokens: u64,
+        2 opt cache_read_tokens: u64,
+        3 opt cache_write_tokens: u64,
+        4 opt output_tokens: u64,
+        5 opt reasoning_tokens: u64,
+    }
+}
+
+message! {
+    /// A compaction view, named by its version and checksum.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ViewRef {
+        1 req version: u64,
+        2 req checksum: String,
+    }
+}
+
+message! {
+    /// What `session.entries` serves about one conversation message besides the message itself,
+    /// decided when the message was placed and never derived again. Written right after the
+    /// record that places the message (or, for an assistant message still waiting for its tool
+    /// results, the record that reserves its ordinal), in the same batch. A later `EntryFacts`
+    /// for the same ordinal replaces it. Content-free: delivered text stays in its
+    /// `ResultAppend`.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct EntryFacts {
+        /// The message's place in the whole conversation, counting from 1.
+        1 req ordinal: u64,
+        /// When the message was written. Never moves later than an earlier entry's.
+        2 req written_at_ms: u64,
+        /// The part number before this message's first numbered part: its parts take the
+        /// numbers after it, in order.
+        3 req tag_base: u64,
+        4 opt notice: Notice,
+        5 opt usage: StepUsage,
+        /// The compaction view in force when the model wrote this message.
+        6 opt generated_under: ViewRef,
+        /// A model step wrote it, so its completion time is `written_at_ms` once every tool call
+        /// it made has a result. False for an assistant message that came in as caller input.
+        7 req native: bool,
+        /// Whether the run's requests render part numbers, and clean them out of the model's
+        /// replies. Frozen per run; kept here so a message renders without its run's start.
+        8 req render_tags: bool,
+        9 req clean_reply: bool,
+    }
+}
+
 values! {
     /// What a setup part holds. Setup parts are content-addressed and shared between sessions.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -860,6 +912,7 @@ records! {
         5 SetupStub,
         6 Compaction,
         7 Marker,
+        8 EntryFacts,
     }
     ledger {
         // One per run, and much larger than the rest.

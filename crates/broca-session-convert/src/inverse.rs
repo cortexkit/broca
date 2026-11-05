@@ -569,7 +569,9 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
         // A record's seq is its position in the log, from 1.
         let seq = index as u64;
         match record {
-            Record::SetupStub(_) => {}
+            // Both are derived from today's records, and neither is one of its own: entry facts
+            // are what today's projection computes from the log.
+            Record::SetupStub(_) | Record::EntryFacts(_) => {}
             Record::Input(Input {
                 receipt_seq: Some(_),
                 ..

@@ -5,7 +5,7 @@ use futures::executor::block_on;
 use crate::backend::MemoryBackend;
 use crate::head::SessionTriple;
 use crate::keys::DeploymentKey;
-use crate::record::{Assistant, Input, Placement, Record, ToolReply};
+use crate::record::{Assistant, EntryFacts, Input, Placement, Record, ToolReply};
 use crate::session::Session;
 
 fn triple() -> SessionTriple {
@@ -77,17 +77,38 @@ fn reply(id: &str, text: String) -> Record {
     })
 }
 
+/// The entry facts of the message at `ordinal`. Its tag base is the ordinal, so a read that
+/// returns another message's facts shows it.
+fn facts(ordinal: u64) -> Record {
+    Record::EntryFacts(EntryFacts {
+        ordinal,
+        written_at_ms: ordinal,
+        tag_base: ordinal,
+        notice: None,
+        usage: None,
+        generated_under: None,
+        native: true,
+        render_tags: false,
+        clean_reply: false,
+    })
+}
+
 /// Rounds of a user input, a 2 KiB tool turn, and a text answer. Each round places four
-/// messages and fills about a quarter of a block, so the history spans many blocks.
+/// messages and fills about a quarter of a block, so the history spans many blocks. Each message
+/// gets its entry facts in the batch that places it, or that reserves its ordinal.
 fn round(n: usize) -> Vec<Vec<Record>> {
     let id = format!("c{n}");
+    let first = 4 * n as u64 + 1;
     vec![
-        vec![input(format!("ask {n}"))],
-        vec![assistant(vec![call(&id)])],
+        vec![input(format!("ask {n}")), facts(first)],
+        vec![assistant(vec![call(&id)]), facts(first + 1)],
         vec![reply(&id, format!("{n}:{}", "x".repeat(4096)))],
-        vec![assistant(vec![ContentBlock::Text {
-            text: format!("answer {n}"),
-        }])],
+        vec![
+            assistant(vec![ContentBlock::Text {
+                text: format!("answer {n}"),
+            }]),
+            facts(first + 3),
+        ],
     ]
 }
 
@@ -130,5 +151,59 @@ fn every_message_reads_back_by_ordinal_after_two_cuts() {
         }
         assert_eq!(loaded.message(0).await.unwrap(), None);
         assert_eq!(loaded.message(121).await.unwrap(), None);
+
+        // Entries read the same messages, with each one's own facts, and a tool-calling
+        // assistant message with its results, in pages that cross segment and block boundaries.
+        let mut read = Vec::new();
+        let mut from = 1;
+        loop {
+            let page = loaded.entries(from, 7).await.unwrap();
+            assert!(page.len() <= 7);
+            let Some(last) = page.last() else { break };
+            from = last.ordinal + 1;
+            read.extend(page);
+        }
+        assert_eq!(read.len(), 120);
+        for (index, entry) in read.iter().enumerate() {
+            let ordinal = index as u64 + 1;
+            assert_eq!(entry.ordinal, ordinal);
+            assert_eq!(&entry.message, &expected[index], "ordinal {ordinal}");
+            // The tool-calling assistant message is every fourth, from the second.
+            let results = (ordinal % 4 == 2).then(|| &expected[index + 1]);
+            assert_eq!(entry.next.as_ref(), results, "ordinal {ordinal}");
+            // Tool messages (every fourth, from the third) have no facts of their own.
+            let base = entry.state.facts.as_ref().map(|facts| facts.tag_base);
+            let expected_base = (ordinal % 4 != 3).then_some(ordinal);
+            assert_eq!(base, expected_base, "ordinal {ordinal}");
+            assert!(!entry.open);
+        }
+        assert!(loaded.entries(121, 5).await.unwrap().is_empty());
+    });
+}
+
+/// An assistant message waiting for its tool results is read last, at its reserved ordinal,
+/// with its facts and no next message.
+#[test]
+fn a_held_assistant_message_reads_last_at_its_reserved_ordinal() {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        session
+            .append(&[input("ask".into()), facts(1)], true)
+            .await
+            .unwrap();
+        session
+            .append(&[assistant(vec![call("c")]), facts(2)], true)
+            .await
+            .unwrap();
+        let entries = session.entries(1, 10).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].ordinal, 2);
+        assert!(entries[1].open);
+        assert!(entries[1].next.is_none());
+        assert_eq!(entries[1].state.facts.as_ref().map(|f| f.tag_base), Some(2));
+        assert_eq!(session.entries(2, 10).await.unwrap().len(), 1);
     });
 }

@@ -97,7 +97,8 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
         | Record::ResultAppend(_)
         | Record::SetupStub(_)
         | Record::Compaction(_)
-        | Record::Marker(_) => {}
+        | Record::Marker(_)
+        | Record::EntryFacts(_) => {}
         Record::RunStart(start) => {
             push(IdKind::RunId, Some(&start.run_id));
             push(IdKind::SubmissionId, start.submission_id.as_deref());

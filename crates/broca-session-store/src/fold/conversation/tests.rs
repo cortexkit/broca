@@ -2,8 +2,10 @@ use broca_protocol::content::{ContentBlock, Message, Role, ToolCall, ToolOutput,
 use broca_protocol::ids::{MessageId, ToolCallId};
 use broca_protocol::request::ModelHandle;
 
-use super::{Conversation, FoldError};
-use crate::record::{Assistant, Input, Placement, Record, ResultAppend, StepStart, ToolReply};
+use super::{Conversation, Delivered, FoldError};
+use crate::record::{
+    Assistant, EntryFacts, Input, Notice, Placement, Record, ResultAppend, StepStart, ToolReply,
+};
 
 fn model() -> ModelHandle {
     serde_json::from_value(serde_json::json!({"provider_module_id": "p", "model_id": "m"})).unwrap()
@@ -203,4 +205,129 @@ fn delivered_text_joins_its_result_only_where_the_session_stores_it_there() {
     };
     assert_eq!(text(&fold(&records, true).unwrap()), "out +note");
     assert_eq!(text(&fold(&records, false).unwrap()), "out");
+}
+
+fn facts(ordinal: u64, tag_base: u64) -> Record {
+    Record::EntryFacts(EntryFacts {
+        ordinal,
+        written_at_ms: 1_000 + ordinal,
+        tag_base,
+        notice: None,
+        usage: None,
+        generated_under: None,
+        native: true,
+        render_tags: true,
+        clean_reply: true,
+    })
+}
+
+fn tag_base(conversation: &Conversation, ordinal: u64) -> Option<u64> {
+    let (_, state) = conversation.window_entry(ordinal)?;
+    state.facts.as_ref().map(|facts| facts.tag_base)
+}
+
+/// Entry facts attach to the message at their ordinal. A held assistant message's facts wait at
+/// its reserved ordinal and move with it when its last result places it; its tool message, placed
+/// with it, has none of its own. A later record for the same ordinal replaces the first.
+#[test]
+fn entry_facts_follow_their_message_through_a_tool_turn() {
+    let conversation = fold(
+        &[
+            input("hi", Placement::RunInput),
+            facts(1, 0),
+            assistant(&["a"]),
+            facts(2, 0),
+            reply("a", "out"),
+            assistant(&[]),
+            facts(4, 1),
+            facts(4, 2),
+        ],
+        false,
+    )
+    .unwrap();
+    assert_eq!(conversation.placed, 4);
+    assert_eq!(tag_base(&conversation, 1), Some(0));
+    assert_eq!(tag_base(&conversation, 2), Some(0));
+    assert_eq!(
+        tag_base(&conversation, 3),
+        None,
+        "the tool message has no facts"
+    );
+    assert_eq!(tag_base(&conversation, 4), Some(2), "the later record wins");
+
+    let held = fold(
+        &[
+            input("hi", Placement::RunInput),
+            assistant(&["a"]),
+            facts(2, 5),
+        ],
+        false,
+    )
+    .unwrap();
+    let (ordinal, _, state) = held.open_entry().expect("the turn is held");
+    assert_eq!(ordinal, 2);
+    assert_eq!(state.facts.as_ref().map(|f| f.tag_base), Some(5));
+    assert!(held.window_entry(2).is_none(), "not placed yet");
+}
+
+/// Facts for an ordinal that isn't placed or reserved refuse, and facts for a message that left
+/// the window are dropped with it, since only the count of placed messages is kept.
+#[test]
+fn entry_facts_for_an_unplaced_ordinal_refuse() {
+    assert_eq!(
+        fold(&[input("hi", Placement::RunInput), facts(2, 0)], false).unwrap_err(),
+        FoldError::FactsWithoutEntry(2)
+    );
+    assert_eq!(
+        fold(&[assistant(&["a"]), facts(2, 0)], false).unwrap_err(),
+        FoldError::FactsWithoutEntry(2),
+        "the held message reserved ordinal 1"
+    );
+    let mut conversation = fold(&[input("hi", Placement::RunInput)], false).unwrap();
+    conversation.clear_window();
+    assert!(conversation.entries.is_empty());
+    conversation.apply(&facts(1, 0)).unwrap();
+    assert_eq!(conversation.placed, 1);
+}
+
+/// In a session that keeps delivered text apart from results, the text joins the entry of the
+/// newest message that made the call, at the call's position, with its sender.
+#[test]
+fn delivered_text_attaches_to_the_call_that_made_it() {
+    let notice = Notice {
+        sender: "reminders".into(),
+        template: Some("nudge".into()),
+    };
+    let append = |id: &str| {
+        Record::ResultAppend(ResultAppend {
+            run_id: "r".into(),
+            tool_call_id: ToolCallId(id.into()),
+            text: "\n\nnote".into(),
+            notice: Some(notice.clone()),
+            written_at_ms: None,
+        })
+    };
+    let conversation = fold(
+        &[
+            assistant(&["a", "b"]),
+            reply("a", "1"),
+            reply("b", "2"),
+            append("b"),
+            append("gone"),
+        ],
+        false,
+    )
+    .unwrap();
+    let (_, state) = conversation.window_entry(1).unwrap();
+    assert_eq!(
+        state.delivered,
+        [Delivered {
+            part: 1,
+            notice: Some(notice),
+            text: "\n\nnote".into(),
+        }],
+        "an unknown call's text attaches nowhere"
+    );
+    let (_, results) = conversation.window_entry(2).unwrap();
+    assert!(results.delivered.is_empty());
 }

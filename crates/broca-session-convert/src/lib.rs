@@ -20,18 +20,20 @@ use broca_protocol::ids::{MessageId, ToolCallId};
 use broca_protocol::request::ModelHandle;
 use broca_protocol::usage::Usage;
 use broca_session_store::codec::{Digest, Message as _};
+use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::record::{
     Assistant, Attempt, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome, CancelPoint,
-    CancelRequest, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker, PartKind, PartRef,
-    Pause, Placement, QueuedSend, Record, ResultAppend, Retraction, RunEnd, RunStart, SendEnded,
-    SessionRefresh, SetupStub, Steer, StepEnd, StepStart, StructuredResult, ToolHeld, ToolIntent,
-    ToolOutcome, ToolReply, View, ViewApplied,
+    CancelRequest, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker, Notice, PartKind,
+    PartRef, Pause, Placement, QueuedSend, Record, ResultAppend, Retraction, RunEnd, RunStart,
+    SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepStart, Stream, StructuredResult,
+    ToolHeld, ToolIntent, ToolOutcome, ToolReply, View, ViewApplied,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
+pub mod entry_facts;
 pub mod inverse;
 pub mod measure;
 pub mod split;
@@ -111,6 +113,11 @@ struct State {
     /// The refusal-fallback schedule the run being converted starts with, as today's replay
     /// decides it at admission. The new run start records it.
     admitted_schedule: Option<broca_wal::RefusalFallbackSchedule>,
+    /// The seq of the old record being converted.
+    seq: u64,
+    /// In a mode-3 log: who delivered each tool-result delivery's text, by the delivering
+    /// record's seq (see `entry_facts`).
+    delivery_notices: HashMap<u64, Notice>,
 }
 
 /// Writes the held copies as transcript entries at the boundary that places them.
@@ -134,6 +141,13 @@ fn hold(inputs: Vec<Input>, state: &mut State, out: &Converted) {
 pub fn convert(old: &[FramedRecord]) -> Result<Converted, ConvertError> {
     let mut out = Converted::default();
     let mut state = State::default();
+    // A mode-3 log gets an `EntryFacts` record right after each record that places (or
+    // reserves) a message, with what today's projection serves about it. A fold that keeps only
+    // counts tells which ordinals each converted record placed.
+    let mut facts = entry_facts::legacy(old).map_err(err)?.map(|legacy| {
+        state.delivery_notices = legacy.delivery_notices.clone();
+        (legacy, Conversation::new(false), 0u64)
+    });
     // Today's placement and budget rules decide what older records left implicit: the firing a
     // budget record stands for, and whether a step met a stop condition. They read each record
     // before it is converted, as today's replay does.
@@ -192,7 +206,44 @@ pub fn convert(old: &[FramedRecord]) -> Result<Converted, ConvertError> {
             state.limiting_stop_met =
                 broca_core::run::limiting_stop_satisfied(&stop_when, steps, assistant_message);
         }
+        state.seq = framed.seq;
+        let before = out.records.len();
         convert_one(&framed.record, &mut state, &mut out)?;
+        if let Some((legacy, counts, emitted)) = &mut facts {
+            let mut known = *emitted;
+            for record in &out.records[before..] {
+                if record.stream() != Stream::Transcript {
+                    continue;
+                }
+                counts
+                    .apply(record)
+                    .map_err(|e| err(format!("entry facts: conversation {e:?}")))?;
+                counts.clear_window();
+                let reserved = counts.open_tool_turn().is_some();
+                known = known.max(counts.placed + u64::from(reserved));
+            }
+            for ordinal in *emitted + 1..=known {
+                let (metadata, written_at) = legacy.rows.get(&(ordinal - 1)).ok_or_else(|| {
+                    err(format!(
+                        "entry facts: today's projection has no message {ordinal}"
+                    ))
+                })?;
+                out.records.push(Record::EntryFacts(entry_facts::record(
+                    ordinal,
+                    metadata,
+                    *written_at,
+                )));
+            }
+            *emitted = known;
+        }
+    }
+    if let Some((legacy, _, emitted)) = &facts {
+        if emitted != &(legacy.rows.len() as u64) {
+            return Err(err(format!(
+                "entry facts: today's projection has {} messages, the conversion placed {emitted}",
+                legacy.rows.len()
+            )));
+        }
     }
     Ok(out)
 }
@@ -1158,7 +1209,7 @@ fn send_delivered(
             run_id: state.run_id.clone(),
             tool_call_id: call.clone(),
             text: text.clone(),
-            notice: None,
+            notice: state.delivery_notices.get(&state.seq).cloned(),
             written_at_ms: delivery.written_at_ms,
         }));
     }

@@ -149,6 +149,7 @@ pub fn groups(records: &[(u64, Record)]) -> Vec<Range<usize>> {
             Record::ToolReply(_)
             | Record::ResultAppend(_)
             | Record::Marker(_)
+            | Record::EntryFacts(_)
             | Record::SetupStub(_)
             | Record::Compaction(_) => false,
             _ => true,

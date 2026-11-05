@@ -610,6 +610,7 @@ dependencies = [
  "broca-protocol",
  "broca-session-store",
  "broca-wal",
+ "cortexkit-role-compaction",
  "futures",
  "serde",
  "serde_jcs",

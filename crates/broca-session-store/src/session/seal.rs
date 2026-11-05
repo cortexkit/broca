@@ -230,7 +230,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             Some(cut) => {
                 let mut at =
                     conversation_at(checkpoint, records, cut).map_err(SessionError::Fold)?;
-                at.messages.clear();
+                at.clear_window();
                 at
             }
             None => checkpoint.conversation.clone(),
@@ -592,7 +592,7 @@ fn conversation_at(
     cut: u64,
 ) -> Result<Conversation, String> {
     let mut conversation = checkpoint.conversation.clone();
-    if !conversation.messages.is_empty() {
+    if !conversation.messages.is_empty() || !conversation.entries.is_empty() {
         return Err("a checkpoint carries window messages".into());
     }
     for (seq, record) in records {
@@ -625,14 +625,14 @@ fn placed_counts(
     transcript: &[(u64, Record)],
 ) -> Result<(Vec<u64>, u64), String> {
     let mut conversation = start.clone();
-    conversation.messages.clear();
+    conversation.clear_window();
     let mut counts = Vec::with_capacity(transcript.len());
     for (_, record) in transcript {
         counts.push(conversation.placed);
         conversation
             .apply(record)
             .map_err(|e| format!("conversation: {e:?}"))?;
-        conversation.messages.clear();
+        conversation.clear_window();
     }
     Ok((counts, conversation.placed))
 }

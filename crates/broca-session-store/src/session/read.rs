@@ -10,6 +10,12 @@
 //! A sealed message of a finished run has its opaque reasoning pruned (see `prune`); everything
 //! else is as it was stored.
 //!
+//! Entries (`session.entries`) are read the same way, a block at a time: each message comes with
+//! its entry state (see `fold::conversation`), and an assistant message that called tools comes
+//! with the tool message carrying its results. A sealed block always holds both, since a block
+//! never splits an assistant message from its results. An assistant message still waiting for its tool results is
+//! served last, at its reserved ordinal.
+//!
 //! Also here: finding the ledger records that name an id (see `idindex`).
 
 use std::collections::BTreeMap;
@@ -18,14 +24,124 @@ use broca_protocol::content::Message;
 
 use crate::backend::SessionBackend;
 use crate::directory::Pages;
-use crate::fold::conversation::Conversation;
+use crate::fold::conversation::{Conversation, EntryState};
 use crate::idindex::{self, IdKind, IndexPages, IndexRoot};
 use crate::record::Record;
 use crate::segment::Segment;
 
 use super::{Session, SessionError};
 
+/// One message as `session.entries` reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredEntry {
+    pub ordinal: u64,
+    pub message: Message,
+    /// For an assistant message that called tools: the tool message with their results.
+    pub next: Option<Message>,
+    pub state: EntryState,
+    /// An assistant message still waiting for its tool results, at its reserved ordinal.
+    pub open: bool,
+}
+
+/// The entries of `conversation`'s window from `from` on, at most `limit` of them.
+fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> Vec<StoredEntry> {
+    let start = conversation.window_start().max(from);
+    (start..=conversation.placed)
+        .take(limit)
+        .filter_map(|ordinal| {
+            let (message, state) = conversation.window_entry(ordinal)?;
+            let called = message.role == broca_protocol::content::Role::Assistant
+                && message.content.iter().any(|block| {
+                    matches!(block, broca_protocol::content::ContentBlock::ToolCall(_))
+                });
+            let next = conversation
+                .window_message(ordinal + 1)
+                .filter(|next| called && next.role == broca_protocol::content::Role::Tool);
+            Some(StoredEntry {
+                ordinal,
+                message: message.clone(),
+                next: next.cloned(),
+                state: state.clone(),
+                open: false,
+            })
+        })
+        .collect()
+}
+
 impl<B: SessionBackend> Session<'_, B> {
+    /// Up to `limit` entries from ordinal `from` on (counting from 1), in order, over the whole
+    /// conversation: sealed history a block at a time, then the window, then the held assistant
+    /// message, if any.
+    pub async fn entries(&self, from: u64, limit: usize) -> Result<Vec<StoredEntry>, SessionError> {
+        let mut out = Vec::new();
+        let mut next = from.max(1);
+        let key = self.key.frame_key();
+        let pages = Pages {
+            backend: self.backend,
+            addr: &self.addr,
+            session: self.head.session_id,
+            key: &key,
+            fanout: crate::directory::FANOUT,
+        };
+        let window = self.conversation.window_start();
+        while next < window && out.len() < limit {
+            let damaged = || SessionError::Fold(format!("no sealed segment places message {next}"));
+            let entry = pages
+                .find_ordinal(self.head.transcript_dir.as_ref(), next)
+                .await
+                .map_err(SessionError::Directory)?
+                .ok_or_else(damaged)?;
+            let bytes = self
+                .backend
+                .get_object(&self.addr, &entry.object)
+                .await?
+                .ok_or_else(damaged)?;
+            let segment = Segment::open(&bytes, &key, entry.object.as_bytes())
+                .map_err(SessionError::Segment)?;
+            let mut position = segment.block_for_ordinal(next).ok_or_else(damaged)?;
+            // Read on through the segment's blocks while the page wants more.
+            while position < segment.index.blocks.len() && next < window && out.len() < limit {
+                let first = segment.index.blocks[position]
+                    .first_ordinal
+                    .expect("block_for_ordinal only answers when every block has an ordinal");
+                let mut conversation = Conversation::new(self.conversation.appends_in_conversation);
+                conversation.placed = first - 1;
+                for (_, record) in segment.block(position).map_err(SessionError::Segment)? {
+                    conversation
+                        .apply(&record)
+                        .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
+                }
+                let wanted = limit - out.len();
+                let read = window_entries(&conversation, next, wanted);
+                if let Some(last) = read.last() {
+                    next = last.ordinal + 1;
+                }
+                out.extend(read);
+                position += 1;
+                // A block that places nothing past `next` (its messages are all earlier) moves
+                // on to the next block.
+                next = next.max(conversation.placed + 1);
+            }
+        }
+        if out.len() < limit {
+            out.extend(window_entries(&self.conversation, next, limit - out.len()));
+        }
+        if out.len() < limit {
+            if let Some((ordinal, message, state)) = self.conversation.open_entry() {
+                if ordinal >= next {
+                    out.push(StoredEntry {
+                        ordinal,
+                        message: message.clone(),
+                        next: None,
+                        state: state.clone(),
+                        open: true,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The message with `ordinal` (counting from 1 over the whole conversation), or `None` when
     /// the conversation has placed no such message.
     pub async fn message(&self, ordinal: u64) -> Result<Option<Message>, SessionError> {

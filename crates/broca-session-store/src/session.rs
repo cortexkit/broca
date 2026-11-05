@@ -450,6 +450,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
 }
 
 mod read;
+pub use read::StoredEntry;
 mod seal;
 pub use seal::{Sealed, GRACE_MS};
 
