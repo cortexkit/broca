@@ -93,6 +93,7 @@ fn intent(id: &str) -> Record {
         dispatched_at_ms: None,
         schema_pin: None,
         hooks: None,
+        key_derived: None,
     })
 }
 

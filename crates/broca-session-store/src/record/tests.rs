@@ -184,6 +184,7 @@ fn one_of_each() -> Vec<Record> {
             dispatched_at_ms: Some(6),
             schema_pin: None,
             hooks: None,
+            key_derived: None,
         }),
         Record::ToolOutcome(ToolOutcome {
             run_id: "run-1".into(),

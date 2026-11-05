@@ -14,6 +14,11 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use broca_core::capability::ToolManifest;
+use broca_core::tool_plane::{
+    BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ToolOpenGuard, ToolPlane,
+    ToolPlaneError,
+};
 use broca_core::{
     provider::Provider, run_loop, run_loop_on_writer, AllowAll, FileLeaseStore, FileWalStore,
     RunControl, RunRequest, StartMode, SteerInbox, StubReply, StubToolPlane, WalHandle, WalStore,
@@ -126,6 +131,170 @@ fn tool(name: &str, mode: ExecutionMode) -> Tool {
     }
 }
 
+/// The scripted tool plane, wrapped so every call a loop makes on it is logged in order, with
+/// its arguments. Both loops must make the same calls: this sees what the stub's own log
+/// can't, such as registration, the guarded and keyed entry points, and the call key each
+/// dispatch carried. Keys are logged as `key#n`, numbered by first use, since each format mints
+/// its own; `keys` keeps the real one per call, so a run can check it against the call's intent.
+struct Spy {
+    inner: StubToolPlane,
+    log: Mutex<Vec<String>>,
+    keys: Mutex<Vec<(ToolCallId, String)>>,
+}
+
+impl Spy {
+    fn new(inner: StubToolPlane) -> Self {
+        Self {
+            inner,
+            log: Mutex::new(Vec::new()),
+            keys: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
+    }
+
+    /// The key each dispatched call carried, by call id, in dispatch order.
+    fn keys(&self) -> Vec<(ToolCallId, String)> {
+        self.keys.lock().unwrap().clone()
+    }
+
+    fn note(&self, entry: String) {
+        self.log.lock().unwrap().push(entry);
+    }
+
+    /// `key#n` for `key`, numbered by first use; remembers it for `call`.
+    fn key(&self, call: &ToolCallId, key: &str) -> String {
+        let mut keys = self.keys.lock().unwrap();
+        let known: Vec<&String> = keys.iter().map(|(_, known)| known).collect();
+        let n = match known.iter().position(|known| *known == key) {
+            Some(at) => at + 1,
+            None => known.len() + 1,
+        };
+        keys.push((call.clone(), key.to_owned()));
+        format!("key#{n}")
+    }
+}
+
+fn ids(calls: &[ToolCall]) -> Vec<&str> {
+    calls
+        .iter()
+        .map(|call| call.tool_call_id.0.as_str())
+        .collect()
+}
+
+#[async_trait]
+impl ToolPlane for Spy {
+    async fn batch_started(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
+    ) -> Result<(), ToolPlaneError> {
+        self.note(format!("batch_started {:?}", ids(calls)));
+        self.inner.batch_started(ctx, calls, manifest).await
+    }
+
+    async fn batch_started_guarded(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
+        guard: &ToolOpenGuard,
+    ) -> Result<(), ToolPlaneError> {
+        self.note(format!("batch_started_guarded {:?}", ids(calls)));
+        self.inner
+            .batch_started_guarded(ctx, calls, manifest, guard)
+            .await
+    }
+
+    async fn register_dispatch_group(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[DispatchRegistration],
+    ) -> Result<(), ToolPlaneError> {
+        let entries: Vec<String> = calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "{} {} approved={}",
+                    call.tool_call_id.0,
+                    self.key(&call.tool_call_id, &call.call_key),
+                    call.approved
+                )
+            })
+            .collect();
+        self.note(format!("register {entries:?}"));
+        self.inner.register_dispatch_group(ctx, calls).await
+    }
+
+    async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        self.note(format!("dispatch {}", call.tool_call_id.0));
+        self.inner.dispatch(ctx, call).await
+    }
+
+    async fn dispatch_keyed(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: DispatchKey<'_>,
+    ) -> DispatchResult {
+        let token = self.key(&call.tool_call_id, key.call_key);
+        self.note(format!(
+            "dispatch_keyed {} {token} recorder={}",
+            call.tool_call_id.0,
+            key.held_recorder.is_some()
+        ));
+        self.inner.dispatch_keyed(ctx, call, key).await
+    }
+
+    async fn dispatch_guarded(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: Option<DispatchKey<'_>>,
+        guard: &ToolOpenGuard,
+    ) -> DispatchResult {
+        let keyed = key.map(|key| {
+            format!(
+                "{} recorder={}",
+                self.key(&call.tool_call_id, key.call_key),
+                key.held_recorder.is_some()
+            )
+        });
+        self.note(format!(
+            "dispatch_guarded {} {}",
+            call.tool_call_id.0,
+            keyed.as_deref().unwrap_or("unkeyed")
+        ));
+        self.inner.dispatch_guarded(ctx, call, key, guard).await
+    }
+
+    fn dispatch_target(&self, ctx: &BatchCtx, id: &ToolCallId) -> Option<String> {
+        self.inner.dispatch_target(ctx, id)
+    }
+
+    fn dispatch_schema_pin(
+        &self,
+        ctx: &BatchCtx,
+        id: &ToolCallId,
+        tool: &str,
+    ) -> Option<broca_wal::DispatchSchemaPin> {
+        self.inner.dispatch_schema_pin(ctx, id, tool)
+    }
+
+    async fn batch_finished(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
+        self.note("batch_finished".into());
+        self.inner.batch_finished(ctx).await
+    }
+}
+
+/// A log's lineage id as the converter takes it, which today's call keys are made of.
+fn lineage(image: &LogImage) -> Option<String> {
+    image.lineage_id().map(|lineage| lineage.to_string())
+}
+
 /// One scenario: what the caller sends and what the provider and tools answer.
 struct Scenario {
     input: Vec<Message>,
@@ -135,16 +304,18 @@ struct Scenario {
 }
 
 impl Scenario {
-    fn plane(&self) -> StubToolPlane {
-        StubToolPlane::new()
-            .with_canned_text("read", "file contents")
-            .with_tool("grep", |_| StubReply::ExecError("no match".into()))
-            .with_tool("fetch", |_| {
-                StubReply::PlaneUnavailable("route closed".into())
-            })
-            .with_tool("write", |_| {
-                StubReply::OutcomeUnknown("connection reset".into())
-            })
+    fn plane(&self) -> Spy {
+        Spy::new(
+            StubToolPlane::new()
+                .with_canned_text("read", "file contents")
+                .with_tool("grep", |_| StubReply::ExecError("no match".into()))
+                .with_tool("fetch", |_| {
+                    StubReply::PlaneUnavailable("route closed".into())
+                })
+                .with_tool("write", |_| {
+                    StubReply::OutcomeUnknown("connection reset".into())
+                }),
+        )
     }
 
     fn request(&self) -> RunRequest {
@@ -274,8 +445,8 @@ async fn today_from(
         .expect("today's loop wrote a log");
     let image = LogImage::read(&file);
     let name = file.file_name().unwrap().to_string_lossy().into_owned();
-    let converted =
-        broca_session_convert::convert(&image.framed(), None).expect("the log converts");
+    let converted = broca_session_convert::convert(&image.framed(), lineage(&image).as_deref())
+        .expect("the log converts");
     let _ = std::fs::remove_dir_all(&dir);
     (
         Outcome {
@@ -435,6 +606,7 @@ async fn new_from(
     }
     .expect("the new loop runs");
     let records = writer.records.clone();
+    keys_match(writer.session, &plane).await;
     Outcome {
         records: normalized(&records),
         requests: sent_requests(&provider),
@@ -477,9 +649,32 @@ fn normalized(records: &[Record]) -> Vec<Value> {
         .collect()
 }
 
+/// Every call the new loop sent carried a key that finds, through the session's own id lookup,
+/// exactly that call's intent, and names the intent's position: `<session id>:<seq>`.
+async fn keys_match(session: &Session<'_, MemoryBackend>, plane: &Spy) {
+    let id = broca_session_store::codec::hex(&session.head().session_id.0);
+    for (call, key) in plane.keys() {
+        let found = session
+            .find_id(broca_session_store::idindex::IdKind::CallKey, &key)
+            .await
+            .expect("the id lookup reads");
+        let [(seq, Record::ToolIntent(intent))] = found.as_slice() else {
+            panic!("key {key} of call {} finds {found:?}", call.0);
+        };
+        assert_eq!(intent.tool_call_id, call, "key {key} names another call");
+        assert_eq!(key, format!("{id}:{seq}"), "key of call {}", call.0);
+    }
+}
+
+/// Fields only a conversion writes, which say how a value was found rather than what it is.
+/// Today's records get them from the converter and the new loop's never do, so they're left out
+/// of the comparison.
+const CONVERSION_ONLY: &[&str] = &["key_derived"];
+
 fn scrub(value: &mut Value) {
     match value {
         Value::Object(map) => {
+            map.retain(|key, _| !CONVERSION_ONLY.contains(&key.as_str()));
             for (key, field) in map.iter_mut() {
                 if NORMALIZED.contains(&key.as_str()) && !field.is_null() {
                     *field = json!("<normalized>");
@@ -673,7 +868,8 @@ async fn compare_every_cut(scenario: Scenario) {
     assert!(records > 2, "the scenario wrote a log to cut");
     for cut in 1..records {
         let bytes = broca_crash_harness::cut_log(&full, cut, false);
-        let frames = LogImage::parse(bytes.clone()).framed();
+        let cut_image = LogImage::parse(bytes.clone());
+        let frames = cut_image.framed();
         // The provider serves the steps the cut log has no answer for yet.
         let answered = frames
             .iter()
@@ -682,7 +878,8 @@ async fn compare_every_cut(scenario: Scenario) {
             })
             .count();
         let steps = scenario.steps[answered..].to_vec();
-        let converted = broca_session_convert::convert(&frames, None).expect("the cut converts");
+        let converted = broca_session_convert::convert(&frames, lineage(&cut_image).as_deref())
+            .expect("the cut converts");
         let cut_records = converted.records.clone();
         let before = converted.records.len();
         let (today, _, _) = today_from(&scenario, Some((&name, &bytes)), steps.clone()).await;
@@ -751,7 +948,8 @@ fn resumes_an_answered_batch(records: &[Record]) -> bool {
 fn without_empty_resumed_batch(calls: &[String]) -> Vec<String> {
     match calls {
         [started, finished, rest @ ..]
-            if started.starts_with("BatchStarted") && finished == "BatchFinished" =>
+            if started.starts_with("\"batch_started_guarded ")
+                && finished == "\"batch_finished\"" =>
         {
             rest.to_vec()
         }
@@ -919,8 +1117,11 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
         .expect("today's loop wrote a log");
-    let converted = broca_session_convert::convert(&LogImage::read(&file).framed(), None)
-        .expect("the log converts");
+    let converted = {
+        let image = LogImage::read(&file);
+        broca_session_convert::convert(&image.framed(), lineage(&image).as_deref())
+    }
+    .expect("the log converts");
     let _ = std::fs::remove_dir_all(&dir);
     let today = Outcome {
         records: normalized(&converted.records),
@@ -978,6 +1179,7 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         .await
         .expect("the new loop runs");
     }
+    keys_match(writer.session, &plane).await;
     let new = Outcome {
         records: normalized(&writer.records),
         requests: sent_requests(&provider),
@@ -1366,8 +1568,11 @@ async fn compare_actions(
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
         .expect("today's loop wrote a log");
-    let converted = broca_session_convert::convert(&LogImage::read(&file).framed(), None)
-        .expect("the log converts");
+    let converted = {
+        let image = LogImage::read(&file);
+        broca_session_convert::convert(&image.framed(), lineage(&image).as_deref())
+    }
+    .expect("the log converts");
     let _ = std::fs::remove_dir_all(&dir);
     let today = Outcome {
         records: normalized(&converted.records),
@@ -1442,6 +1647,7 @@ async fn compare_actions(
         reports.push((second.reason, second.paused));
     }
     assert_eq!(reports, summaries, "how each run reported");
+    keys_match(writer.session, &plane).await;
     let new = Outcome {
         records: normalized(&writer.records),
         requests: sent_requests(&provider.inner),
@@ -1651,8 +1857,11 @@ async fn compare_auth_pause(scenario: Scenario) {
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
         .expect("today's loop wrote a log");
-    let converted = broca_session_convert::convert(&LogImage::read(&file).framed(), None)
-        .expect("the log converts");
+    let converted = {
+        let image = LogImage::read(&file);
+        broca_session_convert::convert(&image.framed(), lineage(&image).as_deref())
+    }
+    .expect("the log converts");
     let _ = std::fs::remove_dir_all(&dir);
     let today = Outcome {
         records: normalized(&converted.records),
@@ -1711,6 +1920,7 @@ async fn compare_auth_pause(scenario: Scenario) {
     let second = resume(&mut writer, &parts, &seams)
         .await
         .expect("the new loop resumes");
+    keys_match(writer.session, &plane).await;
     let new = Outcome {
         records: normalized(&writer.records),
         requests: sent_requests(&provider),

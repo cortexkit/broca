@@ -18,7 +18,10 @@ use broca_core::delivery_order::{appended_text, choose_mode, Boundary};
 use broca_core::provider::{Provider, StepRuntime};
 use broca_core::run::{limiting_stop_satisfied, stop_satisfied, OutputEvent};
 use broca_core::tags::TagNumbering;
-use broca_core::tool_plane::{BatchCtx, DispatchResult, ToolPlane};
+use broca_core::tool_plane::{
+    BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ProviderHeldRecorder,
+    ProviderHeldReply, ToolOpenGuard, ToolPlane,
+};
 use broca_protocol::caller::{PauseReason, RunFinishReason};
 use broca_protocol::content::{
     stamp_ordinals_from, AssistantMessage, Message, Role, ToolCall, ToolOutput, ToolResult,
@@ -31,17 +34,21 @@ use broca_protocol::request::{
     Tool, ToolChoice,
 };
 use broca_protocol::tags::{clean_computed_into, ComputedRules};
-use broca_protocol::{BatchId, BindIdentity, FinishReason, GenerationConfig, RunId, StepId, Usage};
+use broca_protocol::{
+    BatchId, BindIdentity, FinishReason, GenerationConfig, RunId, StepId, ToolCallId, Usage,
+};
 use broca_protocol::{DeliveryMode, DeliveryOrder};
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::operations::{CallState, Operations, Resolution};
 use broca_session_store::record::{
     Assistant, Attempt, BatchEnd, BatchStart, CallOutcome, Delivery, Input, PartKind, Pause,
     Placement, Record, Redo, Resumed, RunEnd, RunStart, SendEnded, SetupStub, StepEnd, StepStart,
-    ToolIntent, ToolOutcome, ToolReply,
+    ToolHeld, ToolIntent, ToolOutcome, ToolReply,
 };
 use broca_session_store::session::SessionError;
 use broca_wal::ComputedTagRules;
+use futures::channel::oneshot;
+use futures::StreamExt as _;
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
@@ -119,6 +126,9 @@ pub enum LoopError {
     Parts(String),
     /// A case this build of the loop doesn't handle yet.
     Unsupported(&'static str),
+    /// The tool plane refused something the run can't go on without, such as registering a
+    /// batch's call keys for late results.
+    Tools(String),
 }
 
 impl From<SessionError> for LoopError {
@@ -960,38 +970,104 @@ where
         scope: None,
         media_capture: None,
     };
-    let mut records = Vec::new();
-    if !started {
-        records.push(Record::BatchStart(BatchStart {
-            run_id: run_id.into(),
-            batch_id: batch_id.clone(),
-            step_id,
-            planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
-        }));
+    // The plane learns of the batch first, so it can say where each call goes; the intents then
+    // record that, with each call's key, before anything is sent.
+    let guard = ToolOpenGuard::new(Some(&seams.cancel), Some(&seams.stop));
+    if seams
+        .tools
+        .batch_started_guarded(&ctx, calls, manifest, &guard)
+        .await
+        .is_err()
+    {
+        return Err(LoopError::Unsupported("a tool plane refusing a batch"));
     }
+    let sequential = calls.iter().any(|call| {
+        manifest
+            .get(&call.tool_name)
+            .is_some_and(|tool| tool.execution_mode == ExecutionMode::Sequential)
+    });
+    let session = writer.session_id();
+    let now = (seams.now_ms)();
+    let mut intents = Vec::with_capacity(calls.len() + 1);
     for call in calls {
-        let args = canonical(&call.input).map_err(LoopError::Parts)?.1;
-        records.push(Record::ToolIntent(ToolIntent {
-            run_id: run_id.into(),
-            batch_id: batch_id.clone(),
-            tool_call_id: call.tool_call_id.clone(),
-            tool_name: Some(call.tool_name.clone()),
-            module_id: seams.tools.dispatch_target(&ctx, &call.tool_call_id),
-            args_digest: args,
-            args: None,
-            call_key: None,
-            approval_digest: None,
-            dispatched_at_ms: Some((seams.now_ms)()),
-            schema_pin: None,
-            hooks: None,
-        }));
+        intents.push((
+            call,
+            canonical(&call.input).map_err(LoopError::Parts)?.1,
+            seams.tools.dispatch_target(&ctx, &call.tool_call_id),
+            seams
+                .tools
+                .dispatch_schema_pin(&ctx, &call.tool_call_id, &call.tool_name),
+        ));
     }
-    writer.append(&records, true).await?;
+    let written = writer
+        .append_with(
+            &mut |_, _, first_seq| {
+                let mut records = Vec::with_capacity(intents.len() + 1);
+                if !started {
+                    records.push(Record::BatchStart(BatchStart {
+                        run_id: run_id.into(),
+                        batch_id: batch_id.clone(),
+                        step_id,
+                        planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+                    }));
+                }
+                for (call, args, module_id, schema_pin) in &intents {
+                    // The key names the intent record itself, so it never repeats in this
+                    // session and a late result or withdrawal finds exactly this call.
+                    let seq = first_seq + records.len() as u64;
+                    records.push(Record::ToolIntent(ToolIntent {
+                        run_id: run_id.into(),
+                        batch_id: batch_id.clone(),
+                        tool_call_id: call.tool_call_id.clone(),
+                        tool_name: Some(call.tool_name.clone()),
+                        module_id: module_id.clone(),
+                        args_digest: *args,
+                        args: None,
+                        call_key: Some(format!("{session}:{seq}")),
+                        approval_digest: None,
+                        dispatched_at_ms: Some(now),
+                        schema_pin: schema_pin
+                            .as_ref()
+                            .map(|pin| serde_json::to_value(pin).expect("a pin serializes")),
+                        hooks: None,
+                        key_derived: None,
+                    }));
+                }
+                records
+            },
+            true,
+        )
+        .await?;
+    let keys: Vec<(ToolCallId, String)> = written
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolIntent(intent) => intent
+                .call_key
+                .clone()
+                .map(|key| (intent.tool_call_id.clone(), key)),
+            _ => None,
+        })
+        .collect();
+    let registrations: Vec<DispatchRegistration> = keys
+        .iter()
+        .map(|(tool_call_id, call_key)| DispatchRegistration {
+            tool_call_id: tool_call_id.clone(),
+            call_key: call_key.clone(),
+            approved: false,
+        })
+        .collect();
+    if !registrations.is_empty() {
+        seams
+            .tools
+            .register_dispatch_group(&ctx, &registrations)
+            .await
+            .map_err(|error| LoopError::Tools(format!("late-results registration: {error}")))?;
+    }
 
-    let results = match seams.tools.batch_started(&ctx, calls, manifest).await {
-        Ok(()) => dispatch_all(seams, &ctx, calls, manifest).await,
-        Err(_) => return Err(LoopError::Unsupported("a tool plane refusing a batch")),
-    };
+    let results = dispatch_all(
+        writer, seams, &ctx, calls, &keys, &guard, run_id, &batch_id, sequential,
+    )
+    .await?;
     let _ = seams.tools.batch_finished(&ctx).await;
     let unknown = results
         .iter()
@@ -1220,31 +1296,118 @@ async fn ordered_sends<W: Writer>(
 const NOT_DISPATCHED: &str =
     "tool not run: the run was interrupted before this call was dispatched";
 
+/// A held reply on its way to the batch's writer, with where to say it's durable.
+type HeldRequest = (ProviderHeldReply, oneshot::Sender<Result<(), String>>);
+
+/// The held-reply recorder the loop hands the plane. The plane's dispatch future runs while
+/// the batch driver owns the writer, so the recorder doesn't write: it asks the driver to
+/// append the held record durably and waits for the answer.
+struct HeldChannel {
+    requests: futures::channel::mpsc::UnboundedSender<HeldRequest>,
+}
+
+#[async_trait::async_trait]
+impl ProviderHeldRecorder for HeldChannel {
+    async fn sync_held(&self, reply: &ProviderHeldReply) -> Result<(), String> {
+        let (answer, answered) = oneshot::channel();
+        self.requests
+            .unbounded_send((reply.clone(), answer))
+            .map_err(|_| "the batch no longer takes held replies".to_string())?;
+        answered
+            .await
+            .map_err(|_| "the batch stopped before the held reply was durable".to_string())?
+    }
+}
+
 /// Dispatches every call, in parallel unless one of them must run alone, and returns the
-/// results in the calls' order.
-async fn dispatch_all<P, T: ToolPlane>(
+/// results in the calls' order. Each call carries its key and the batch's held-reply
+/// recorder; a held reply is appended, durably, while the other calls keep running.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_all<W: Writer, P, T: ToolPlane>(
+    writer: &mut W,
     seams: &Seams<'_, P, T>,
     ctx: &BatchCtx,
     calls: &[ToolCall],
-    manifest: &ToolManifest,
-) -> Vec<(ToolResult, CallOutcome)> {
-    let sequential = calls.iter().any(|call| {
-        manifest
-            .get(&call.tool_name)
-            .is_some_and(|tool| tool.execution_mode == ExecutionMode::Sequential)
-    });
-    let mut results = Vec::with_capacity(calls.len());
-    if sequential {
-        for call in calls {
-            results.push(resolve(call, seams.tools.dispatch(ctx, call).await));
+    keys: &[(ToolCallId, String)],
+    guard: &ToolOpenGuard,
+    run_id: &str,
+    batch_id: &str,
+    sequential: bool,
+) -> Result<Vec<(ToolResult, CallOutcome)>, LoopError> {
+    let (requests, mut held) = futures::channel::mpsc::unbounded::<HeldRequest>();
+    let recorder = HeldChannel { requests };
+    let key_of = |call: &ToolCall| {
+        keys.iter()
+            .find(|(id, _)| *id == call.tool_call_id)
+            .map(|(_, key)| key.as_str())
+            .expect("every dispatched call has an intent with a key")
+    };
+    let recorder = &recorder;
+    let work =
+        async {
+            if sequential {
+                let mut results = Vec::with_capacity(calls.len());
+                for call in calls {
+                    results.push(
+                        dispatch_one(seams.tools, ctx, call, key_of(call), recorder, guard).await,
+                    );
+                }
+                results
+            } else {
+                futures::future::join_all(calls.iter().map(|call| {
+                    dispatch_one(seams.tools, ctx, call, key_of(call), recorder, guard)
+                }))
+                .await
+            }
+        };
+    let mut work = std::pin::pin!(work);
+    loop {
+        let next = futures::future::select(work.as_mut(), held.next());
+        match next.await {
+            futures::future::Either::Left((results, _)) => return Ok(results),
+            futures::future::Either::Right((Some((reply, answer)), _)) => {
+                let record = Record::ToolHeld(ToolHeld {
+                    batch_id: batch_id.into(),
+                    tool_call_id: reply.tool_call_id.clone(),
+                    call_key: reply.call_key.clone(),
+                    module: reply.module.clone(),
+                    reason: reply.reason.clone(),
+                    detail_digest: reply.detail_digest.clone(),
+                    held_at_ms: (seams.now_ms)(),
+                    sequential,
+                });
+                let _ = run_id;
+                let durable = writer
+                    .append(&[record], true)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:?}"));
+                let _ = answer.send(durable);
+            }
+            futures::future::Either::Right((None, _)) => {
+                unreachable!("the recorder lives as long as the dispatches")
+            }
         }
-    } else {
-        let all = calls
-            .iter()
-            .map(|call| async move { resolve(call, seams.tools.dispatch(ctx, call).await) });
-        results = futures::future::join_all(all).await;
     }
-    results
+}
+
+/// Sends one call with its key and the batch's held-reply recorder, and resolves the answer.
+async fn dispatch_one<T: ToolPlane>(
+    tools: &T,
+    ctx: &BatchCtx,
+    call: &ToolCall,
+    call_key: &str,
+    recorder: &HeldChannel,
+    guard: &ToolOpenGuard,
+) -> (ToolResult, CallOutcome) {
+    let key = DispatchKey {
+        call_key,
+        held_recorder: Some(recorder),
+    };
+    resolve(
+        call,
+        tools.dispatch_guarded(ctx, call, Some(key), guard).await,
+    )
 }
 
 /// A call's result and outcome from what the tool plane said:

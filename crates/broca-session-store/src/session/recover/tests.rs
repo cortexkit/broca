@@ -148,6 +148,7 @@ fn dispatched(run: &str, id: &str) -> [Record; 2] {
             dispatched_at_ms: None,
             schema_pin: None,
             hooks: None,
+            key_derived: None,
         }),
     ]
 }

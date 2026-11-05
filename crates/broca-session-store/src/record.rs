@@ -458,6 +458,12 @@ message! {
         /// schema pin the call was dispatched under.
         11 opt schema_pin: serde_json::Value,
         12 opt hooks: serde_json::Value,
+        /// The converter derived `call_key` from today's log: today's intent stores no key, and
+        /// the runner sent `<log lineage id>:<intent's position>`, which the provider keys the
+        /// call's late result, approval and withdrawal on. The key is stored so it never has to
+        /// be derived from a position again; this marks it as derived, so the record converts
+        /// back exactly.
+        13 opt key_derived: bool,
     }
 }
 

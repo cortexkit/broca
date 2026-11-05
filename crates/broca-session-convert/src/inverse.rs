@@ -268,7 +268,10 @@ fn tool_intent(intent: &ToolIntent, calls: &HashMap<String, Value>) -> Value {
     object.insert("args".into(), args);
     set(&mut object, "tool_name", intent.tool_name.as_ref());
     set(&mut object, "module_id", intent.module_id.as_ref());
-    set(&mut object, "call_key", intent.call_key.as_ref());
+    // A key the converter derived wasn't in today's record.
+    if intent.key_derived != Some(true) {
+        set(&mut object, "call_key", intent.call_key.as_ref());
+    }
     set(
         &mut object,
         "approval_digest",

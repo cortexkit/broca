@@ -89,6 +89,8 @@ fn err(message: impl Into<String>) -> ConvertError {
 /// only when they differ from the call's.
 #[derive(Default)]
 struct State {
+    /// The log's lineage id, which today's call keys are made of.
+    lineage: Option<String>,
     run_id: String,
     model: Option<ModelHandle>,
     setup: Vec<PartRef>,
@@ -142,7 +144,10 @@ fn hold(inputs: Vec<Input>, state: &mut State, out: &Converted) {
 /// contract needs it, because today's message ids carry it and a converted message keeps its id.
 pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted, ConvertError> {
     let mut out = Converted::default();
-    let mut state = State::default();
+    let mut state = State {
+        lineage: lineage.map(str::to_owned),
+        ..State::default()
+    };
     // A mode-3 log gets an `EntryFacts` record right after each record that places (or
     // reserves) a message, with what today's projection serves about it. A fold that keeps only
     // counts tells which ordinals each converted record placed.
@@ -1074,6 +1079,13 @@ fn tool_intent(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
     let args = f.take("args").unwrap_or(Value::Null);
     let args_digest = sha256(&canonical(&args)?);
     let same_as_call = state.call_inputs.get(&call.0) == Some(&args);
+    // Today's intent stores a key only when one was made before it (an approved call); every
+    // other call was sent with the key derived from the log and the intent's position.
+    let recorded = f.string("call_key");
+    let derived = recorded
+        .is_none()
+        .then(|| broca_core::context::tool_call_key(state.lineage.as_deref(), state.seq, None))
+        .flatten();
     out.records.push(Record::ToolIntent(ToolIntent {
         run_id: state.run_id.clone(),
         batch_id: f.req_string("batch_id"),
@@ -1082,7 +1094,8 @@ fn tool_intent(f: &mut Fields, state: &mut State, out: &mut Converted) -> Result
         module_id: f.string("module_id"),
         args_digest,
         args: (!same_as_call).then_some(args),
-        call_key: f.string("call_key"),
+        key_derived: derived.is_some().then_some(true),
+        call_key: recorded.or(derived),
         approval_digest: f.string("approval_digest"),
         dispatched_at_ms: f.u64("dispatched_at_ms"),
         schema_pin: f.take("schema_pin"),
