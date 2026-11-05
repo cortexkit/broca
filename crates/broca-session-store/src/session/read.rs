@@ -191,7 +191,7 @@ impl<B: SessionBackend> Session<'_, B> {
 
     /// The ordinal an `EntryFacts` record at `seq` names, from the window or a sealed segment.
     async fn facts_ordinal(&self, seq: u64) -> Result<Option<u64>, SessionError> {
-        if let Some(ordinal) = self.window_facts.get(&seq) {
+        if let Some(ordinal) = self.window.facts.get(&seq) {
             return Ok(Some(*ordinal));
         }
         let key = self.key.frame_key();

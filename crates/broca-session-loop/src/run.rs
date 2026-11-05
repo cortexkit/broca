@@ -121,10 +121,6 @@ pub struct Seams<'a, P, T> {
     pub now_ms: &'a (dyn Fn() -> u64 + Sync),
     /// The session's address, given to the provider for its diagnostics only.
     pub session_address: Option<String>,
-    /// Where a tool's media is stored as its result arrives. A result keeps only the media
-    /// captured here for that exact call; any other media part becomes a provenance marker, as in
-    /// today's loop. Without it no media is captured, so every media part becomes a marker.
-    pub media: Option<Arc<dyn broca_core::tool_media::MediaCapture>>,
 }
 
 /// How a run ended.
@@ -1275,7 +1271,8 @@ where
         bind: seams.bind.clone(),
         run_id: RunId(run_id.into()),
         scope: None,
-        media_capture: seams.media.clone(),
+        // A result keeps only media captured here for that exact call (`checked`).
+        media_capture: writer.media(),
     };
     // The plane learns of the batch first, so it can say where each call goes; the intents then
     // record that, with each call's key, before anything is sent. A plane that refuses the batch
@@ -1857,6 +1854,7 @@ fn no_dispatch(
         result,
         finished_at_ms: Some(now),
         tags_v1: None,
+        media: Vec::new(),
     }));
     records.push(Record::ToolOutcome(ToolOutcome {
         run_id: run_id.into(),
@@ -1929,6 +1927,7 @@ fn terminal_with_reason(
         result,
         finished_at_ms: now,
         tags_v1: None,
+        media: Vec::new(),
     }));
     records.push(Record::ToolOutcome(ToolOutcome {
         run_id: run_id.into(),

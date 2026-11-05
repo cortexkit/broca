@@ -40,7 +40,8 @@
 //! owed for provider-held calls, the crash-loop limit, and showing the damage notice at system
 //! authority and keeping it in view until a model step has seen it (the run loop's part).
 
-use std::collections::{BTreeMap, BTreeSet};
+use super::media::OpenLogIndex;
+use std::collections::BTreeSet;
 
 use broca_protocol::caller::RunFinishReason;
 use broca_protocol::content::{ContentBlock, Message, Role, ToolOutput, ToolResult};
@@ -389,6 +390,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                         },
                         finished_at_ms: Some(now_ms),
                         tags_v1: None,
+                        media: Vec::new(),
                     }));
                 } else if call.intent && !in_transcript.contains(&id.0) {
                     lost_parts.push(lost_part_line(id, call));
@@ -498,7 +500,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             conversation: checkpoint.conversation.clone(),
             operations: settled.clone(),
             open_ids: OpenIds::default(),
-            window_facts: BTreeMap::new(),
+            window: OpenLogIndex::default(),
         };
         let checkpoint_body = Checkpoint {
             covers_through: intent_seq,
@@ -533,7 +535,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 .checkpoint(&checkpoint_body)?
                 .into_written(&mut encoder);
             let mut conversation = checkpoint.conversation.clone();
-            let mut window_facts = BTreeMap::new();
+            let mut window = OpenLogIndex::default();
             let mut batch_start = 0;
             while batch_start < transcript.len() {
                 let first = transcript[batch_start].1;
@@ -547,9 +549,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                     .collect();
                 for (seq, record) in &kept {
                     conversation.apply(record).map_err(fold_error)?;
-                    if let Record::EntryFacts(facts) = record {
-                        window_facts.insert(*seq, facts.ordinal);
-                    }
+                    window.note(*seq, record);
                 }
                 out.extend(encoder.copy_batch(&kept)?.into_written(&mut encoder));
                 batch_start = batch_end;
@@ -593,7 +593,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 encoder,
                 conversation,
                 operations,
-                window_facts,
+                window,
                 open_ids,
                 transcript_dir: session.head.transcript_dir.clone(),
                 ledger_dir: ledger_sealed.ledger_dir,

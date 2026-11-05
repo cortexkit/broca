@@ -246,6 +246,16 @@ impl MemoryBackend {
         self.setup.lock().unwrap().keys().cloned().collect()
     }
 
+    /// Replaces an object's bytes, as damage would leave them. Tests only.
+    pub fn set_object(&self, s: &SessionAddr, name: &str, bytes: Vec<u8>) {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions
+            .entry(s.clone())
+            .or_default()
+            .objects
+            .insert(name.to_owned(), bytes);
+    }
+
     /// Replaces a log's bytes, as a crash or damage would leave them. Tests only.
     pub fn set_log(&self, s: &SessionAddr, log: &Id128, bytes: Vec<u8>) {
         let mut sessions = self.sessions.lock().unwrap();

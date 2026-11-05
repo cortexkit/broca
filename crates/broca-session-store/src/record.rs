@@ -174,6 +174,25 @@ message! {
         3 req result: ToolResult,
         4 opt finished_at_ms: u64,
         5 opt tags_v1: serde_json::Value,
+        /// Where the bytes of each media part of `result` are stored. A reader that renders the
+        /// result needs them, so a record carrying any is refused by a reader that doesn't know
+        /// the field.
+        6 rep [must] media: MediaObject,
+    }
+}
+
+message! {
+    /// The stored bytes of one media part: an append object, named by the record that first
+    /// named it (`log`, `generation`, `seq`) and a keyed hash of the bytes' digest. A later record
+    /// naming the same bytes while that object is in the open log points at the same object.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct MediaObject {
+        /// The media part's position in the result's parts.
+        1 req part: u32,
+        /// The open log the object was written under.
+        2 req log: crate::codec::Id128,
+        3 req generation: crate::codec::Id128,
+        4 req seq: u64,
     }
 }
 

@@ -49,6 +49,14 @@ pub trait Writer {
 
     /// The seq the next appended record will take.
     fn next_seq(&self) -> u64;
+
+    /// Where the tool plane captures a result's media. A writer that offers one stores, when it
+    /// appends a call's result, the bytes of every media part captured for that call, durable
+    /// before the record. Without one nothing is captured, so every media part of a result
+    /// becomes a provenance marker and no bytes are lost.
+    fn media(&self) -> Option<std::sync::Arc<dyn broca_core::tool_media::MediaCapture>> {
+        None
+    }
 }
 
 #[async_trait(?Send)]

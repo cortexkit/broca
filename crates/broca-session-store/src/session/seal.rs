@@ -30,7 +30,8 @@
 //! encrypted reasoning) and some require it back on later requests of the same run, so resuming
 //! a run may need its own.
 
-use std::collections::{BTreeMap, BTreeSet};
+use super::media::OpenLogIndex;
+use std::collections::BTreeSet;
 
 use crate::backend::SessionBackend;
 use crate::checkpoint::Checkpoint;
@@ -79,7 +80,7 @@ pub(super) struct Created {
     pub(super) conversation: Conversation,
     pub(super) operations: Operations,
     /// The new log's `EntryFacts` records, by seq, and its ledger records' ids.
-    pub(super) window_facts: BTreeMap<u64, u64>,
+    pub(super) window: OpenLogIndex,
     pub(super) open_ids: OpenIds,
     pub(super) transcript_dir: Option<crate::directory::PageRef>,
     pub(super) ledger_dir: Option<crate::directory::PageRef>,
@@ -382,7 +383,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             .into_written(&mut encoder);
         let settled_after = settled;
         let mut conversation = at_cut;
-        let mut window_facts = BTreeMap::new();
+        let mut window = OpenLogIndex::default();
         for batch in batches {
             let kept: Vec<(u64, Record)> = records[batch.clone()]
                 .iter()
@@ -406,9 +407,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 conversation
                     .apply(record)
                     .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
-                if let Record::EntryFacts(facts) = record {
-                    window_facts.insert(*seq, facts.ordinal);
-                }
+                window.note(*seq, record);
             }
             sealed.kept_records += kept.len();
             bytes.extend(encoder.copy_batch(&kept)?.into_written(&mut encoder));
@@ -425,7 +424,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             encoder,
             conversation,
             operations: settled_after,
-            window_facts,
+            window,
             open_ids: OpenIds::default(),
             transcript_dir,
             ledger_dir: ledger_sealed.ledger_dir,
@@ -589,7 +588,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         // Every ledger record the old log held is sealed, and its ids are in the index now;
         // facts of messages that left the window are found through the directory.
         self.open_ids = created.open_ids;
-        self.window_facts = created.window_facts;
+        self.window = created.window;
         self.poisoned = false;
         Ok(created.sealed)
     }

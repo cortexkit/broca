@@ -67,6 +67,7 @@ fn one_of_each() -> Vec<Record> {
             result: result.clone(),
             finished_at_ms: Some(3),
             tags_v1: None,
+            media: Vec::new(),
         }),
         Record::ResultAppend(ResultAppend {
             run_id: "run-1".into(),

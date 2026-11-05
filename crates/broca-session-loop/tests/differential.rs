@@ -10,12 +10,12 @@
 //!   an id minted per log, which the harness normalizes by name;
 //! - **the tool calls:** what the tool plane was asked to run, in order.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use broca_core::capability::ToolManifest;
-use broca_core::tool_media::{CaptureFailure, MediaCapture};
+use broca_core::tool_media::MediaCapture;
 use broca_core::tool_plane::{
     BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ProviderHeldLifecycle,
     ProviderHeldReply, ToolOpenGuard, ToolPlane, ToolPlaneError,
@@ -34,10 +34,8 @@ use broca_protocol::provider::{NormalizedEvent, ProviderControl};
 use broca_protocol::request::{
     CallOptions, ExecutionMode, ModelHandle, OnRestart, StopCondition, Tool, ToolChoice,
 };
-use broca_protocol::{
-    BatchId, FinishReason, GenerationConfig, MediaRef, MessageId, RunId, StepId, ToolCallId, Usage,
-};
-use broca_session_loop::{resume, run, Admission, MemoryParts, Seams, Writer};
+use broca_protocol::{FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage};
+use broca_session_loop::{resume, run, Admission, MemoryParts, PendingMedia, Seams, Writer};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::fold::operations::Operations;
@@ -450,87 +448,86 @@ impl ToolPlane for Spy {
     }
 }
 
-/// The image the `photo` tool returns.
+/// The images the `photo` tool returns: a fixture photo and a 1×1 PNG.
 const PHOTO: &[u8] = include_bytes!("../../broca-provider/examples/media-live/fixtures/image.png");
+const PIXEL: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+    0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
+    0x00, 0x03, 0x01, 0x01, 0x00, 0xc9, 0xfe, 0x92, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e,
+    0x44, 0xae, 0x42, 0x60, 0x82,
+];
 
-/// The new loop's media capture: validated references kept in memory, by batch and call. Today's
-/// loop captures into its session media store; both produce the same reference for the same
-/// bytes, since a reference is derived from the bytes alone.
-#[derive(Debug, Default)]
-struct MemoryCapture {
-    captured: Mutex<HashMap<(BatchId, ToolCallId), Vec<MediaRef>>>,
-}
-
-#[async_trait]
-impl MediaCapture for MemoryCapture {
-    async fn capture(
-        &self,
-        batch_id: &BatchId,
-        call_id: &ToolCallId,
-        bytes: Vec<u8>,
-        declared_mime: String,
-    ) -> Result<MediaRef, CaptureFailure> {
-        let reference = broca_core::media_validation::validate_media(&bytes, &declared_mime)
-            .map_err(|reason| CaptureFailure {
-                reason,
-                media: None,
-            })?;
-        self.captured
-            .lock()
-            .unwrap()
-            .entry((batch_id.clone(), call_id.clone()))
-            .or_default()
-            .push(reference.clone());
-        Ok(reference)
-    }
-
-    fn captured_for(&self, batch_id: &BatchId, call_id: &ToolCallId) -> Vec<MediaRef> {
-        self.captured
-            .lock()
-            .unwrap()
-            .get(&(batch_id.clone(), call_id.clone()))
-            .cloned()
-            .unwrap_or_default()
-    }
-}
-
-/// The `photo` tool's answer: a text part and three images. Only the first was captured for this
-/// call, through the batch's capture; the second names the same bytes with other metadata, and
-/// the third names bytes nobody captured. So a loop must keep the first and mark the other two.
+/// The `photo` tool's answer: a text part and four images. The first two were captured for this
+/// call, through the batch's capture; the third names the first's bytes with other metadata, and
+/// the fourth names bytes nobody captured. So a loop must keep the first two and mark the others.
 async fn photo(ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
-    let captured = match &ctx.media_capture {
-        Some(capture) => capture
-            .capture(
-                &ctx.batch_id,
-                &call.tool_call_id,
-                PHOTO.to_vec(),
-                "image/png".into(),
-            )
-            .await
-            .ok(),
-        None => None,
-    };
-    let photo = captured.unwrap_or_else(|| {
-        broca_core::media_validation::validate_media(PHOTO, "image/png").expect("a valid PNG")
-    });
-    let mut altered = photo.clone();
+    let mut captured = Vec::new();
+    for bytes in [PHOTO, PIXEL] {
+        let reference = match &ctx.media_capture {
+            Some(capture) => capture
+                .capture(
+                    &ctx.batch_id,
+                    &call.tool_call_id,
+                    bytes.to_vec(),
+                    "image/png".into(),
+                )
+                .await
+                .ok(),
+            None => None,
+        };
+        captured.push(reference.unwrap_or_else(|| {
+            broca_core::media_validation::validate_media(bytes, "image/png").expect("a valid PNG")
+        }));
+    }
+    let mut altered = captured[0].clone();
     altered.byte_size += 1;
-    let mut foreign = photo.clone();
+    let mut foreign = captured[0].clone();
     foreign.sha256 = "0".repeat(64);
+    let mut parts = vec![ToolOutputPart::Text {
+        text: "a photo".into(),
+    }];
+    parts.extend(
+        captured
+            .into_iter()
+            .chain([altered, foreign])
+            .map(|media| ToolOutputPart::Media { media }),
+    );
     DispatchResult::Completed(ToolResult {
         tool_call_id: call.tool_call_id.clone(),
-        output: ToolOutput::Parts {
-            parts: vec![
-                ToolOutputPart::Text {
-                    text: "a photo".into(),
-                },
-                ToolOutputPart::Media { media: photo },
-                ToolOutputPart::Media { media: altered },
-                ToolOutputPart::Media { media: foreign },
-            ],
-        },
+        output: ToolOutput::Parts { parts },
         is_error: false,
     })
+}
+
+/// Every media part in the window reads back from the session as the bytes it names. Only the
+/// `photo` tool returns media. (A resumed run's earlier records come from a converted log, whose
+/// media the converter doesn't copy yet, so this runs on whole runs only.)
+async fn media_reads_back(session: &Session<'_, MemoryBackend>) {
+    for message in &session.conversation.messages {
+        for block in &message.content {
+            let ContentBlock::ToolResult(result) = block else {
+                continue;
+            };
+            let ToolOutput::Parts { parts } = &result.output else {
+                continue;
+            };
+            for part in parts {
+                if let ToolOutputPart::Media { media } = part {
+                    let bytes = session
+                        .window_media(media)
+                        .await
+                        .unwrap_or_else(|error| panic!("{media:?} doesn't read back: {error:?}"));
+                    assert!(bytes == PHOTO || bytes == PIXEL, "{media:?}");
+                    assert_eq!(
+                        broca_core::media_validation::validate_media(&bytes, &media.mime).as_ref(),
+                        Ok(media),
+                        "{media:?}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// A log's lineage id as the converter takes it, which today's call keys are made of.
@@ -728,6 +725,8 @@ struct Recording<'s, 'b> {
     /// Set once a run's end is appended durably, so a provider can tell whether it was asked to
     /// withdraw a call before or after the run's end.
     ended: Arc<std::sync::atomic::AtomicBool>,
+    /// The media the tool plane captured, stored when the result naming it is appended.
+    media: Arc<PendingMedia>,
 }
 
 impl Recording<'_, '_> {
@@ -735,7 +734,7 @@ impl Recording<'_, '_> {
         let pending: Vec<Record> = std::mem::take(&mut *self.injected.lock().unwrap());
         if !pending.is_empty() {
             self.records.extend(pending.iter().cloned());
-            self.session.append(&pending, true).await?;
+            self.media.append(self.session, &pending, true).await?;
         }
         Ok(())
     }
@@ -746,7 +745,7 @@ impl Writer for Recording<'_, '_> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         self.flush().await?;
         self.records.extend_from_slice(records);
-        let seq = self.session.append(records, barrier).await?;
+        let seq = self.media.append(self.session, records, barrier).await?;
         if barrier
             && records
                 .iter()
@@ -790,6 +789,9 @@ impl Writer for Recording<'_, '_> {
     }
     fn next_seq(&self) -> u64 {
         self.session.next_seq()
+    }
+    fn media(&self) -> Option<Arc<dyn MediaCapture>> {
+        Some(Arc::clone(&self.media) as Arc<dyn MediaCapture>)
     }
 }
 
@@ -849,6 +851,7 @@ async fn new_from(
         records: Vec::new(),
         injected: Default::default(),
         ended: Default::default(),
+        media: Default::default(),
     };
     let now = || 0u64;
     let cancel = CancellationToken::new();
@@ -864,7 +867,6 @@ async fn new_from(
         hook_plane: Some(harness_hooks_cancelling(cancel)),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
-        media: Some(Arc::new(MemoryCapture::default())),
     };
     if resuming {
         resume(&mut writer, &parts, &seams).await
@@ -880,6 +882,9 @@ async fn new_from(
     .expect("the new loop runs");
     let records = writer.records.clone();
     keys_match(writer.session, &plane).await;
+    if !resuming {
+        media_reads_back(writer.session).await;
+    }
     Outcome {
         records: normalized(&records),
         requests: sent_requests(&provider),
@@ -1308,8 +1313,8 @@ fn tool_run() -> Scenario {
     }
 }
 
-/// A tool that returns an image it captured, and two it didn't: the captured one reaches the
-/// record and the next request, the other two become provenance markers.
+/// A tool that returns two images it captured, and two it didn't: the captured ones reach the
+/// record, the session's storage and the next request; the other two become provenance markers.
 fn photo_run() -> Scenario {
     Scenario {
         input: vec![user("take a photo")],
@@ -1501,6 +1506,7 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         records: Vec::new(),
         injected: Default::default(),
         ended: Default::default(),
+        media: Default::default(),
     };
     let mut parts = MemoryParts::default();
     let now = || 0u64;
@@ -1517,7 +1523,6 @@ async fn compare_runs(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         hook_plane: Some(harness_hooks()),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
-        media: Some(Arc::new(MemoryCapture::default())),
     };
     for (run_id, input) in runs {
         run(
@@ -1991,6 +1996,7 @@ async fn compare_actions(
         records: Vec::new(),
         injected,
         ended: Default::default(),
+        media: Default::default(),
     };
     let mut parts = MemoryParts::default();
     let now = || 0u64;
@@ -2007,7 +2013,6 @@ async fn compare_actions(
         hook_plane: Some(harness_hooks()),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
-        media: Some(Arc::new(MemoryCapture::default())),
     };
     let mut admission = scenario.admission(&provider.inner);
     admission.on_restart = on_restart;
@@ -2305,6 +2310,7 @@ async fn compare_auth_pause(scenario: Scenario) {
         records: Vec::new(),
         injected: Default::default(),
         ended: Default::default(),
+        media: Default::default(),
     };
     let mut parts = MemoryParts::default();
     let now = || 0u64;
@@ -2321,7 +2327,6 @@ async fn compare_auth_pause(scenario: Scenario) {
         hook_plane: Some(harness_hooks()),
         now_ms: &now,
         session_address: Some(broca_core::wal_writer::session_addr(&bind)),
-        media: Some(Arc::new(MemoryCapture::default())),
     };
     let first = run(
         &mut writer,

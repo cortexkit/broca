@@ -68,6 +68,7 @@ fn reply(id: &str, text: &str) -> Record {
         },
         finished_at_ms: None,
         tags_v1: None,
+        media: Vec::new(),
     })
 }
 

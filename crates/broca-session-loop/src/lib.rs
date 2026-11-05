@@ -22,10 +22,12 @@
 //! rest of today's loop come in later stages, each proven against today's loop by the
 //! differential tests in `tests/`.
 
+pub mod media;
 pub mod parts;
 pub mod run;
 pub mod writer;
 
+pub use media::PendingMedia;
 pub use parts::{MemoryParts, Parts};
 pub use run::{resume, run, Admission, Finished, LoopError, Seams};
 pub use writer::Writer;

@@ -167,6 +167,7 @@ fn answered(run: &str, id: &str) -> [Record; 2] {
             },
             finished_at_ms: None,
             tags_v1: None,
+            media: Vec::new(),
         }),
         Record::ToolOutcome(ToolOutcome {
             run_id: run.into(),

@@ -26,7 +26,7 @@
 //! - **Deletion.** The old log, and the objects the cut branch stopped naming, are deleted after
 //!   the grace period. Ledger-named objects are never among them.
 
-use std::collections::BTreeMap;
+use super::media::OpenLogIndex;
 
 use crate::backend::SessionBackend;
 use crate::checkpoint::Checkpoint;
@@ -417,7 +417,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let mut bytes = encoder
             .checkpoint(&checkpoint_body)?
             .into_written(&mut encoder);
-        let mut window_facts = BTreeMap::new();
+        let mut window = OpenLogIndex::default();
         let mut kept_records = 0;
         if !located.sealed {
             for batch in batches {
@@ -435,9 +435,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                     conversation
                         .apply(record)
                         .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
-                    if let Record::EntryFacts(facts) = record {
-                        window_facts.insert(*seq, facts.ordinal);
-                    }
+                    window.note(*seq, record);
                 }
                 kept_records += kept.len();
                 bytes.extend(encoder.copy_batch(&kept)?.into_written(&mut encoder));
@@ -460,9 +458,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             if record.stream() == Stream::Ledger {
                 open_ids.add(seq, record);
             }
-            if let Record::EntryFacts(facts) = record {
-                window_facts.insert(seq, facts.ordinal);
-            }
+            window.note(seq, record);
         }
         if conversation.placed != ordinal {
             return Err(SessionError::Fold(format!(
@@ -493,7 +489,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             encoder,
             conversation,
             operations,
-            window_facts,
+            window,
             open_ids,
             transcript_dir,
             ledger_dir: ledger_sealed.ledger_dir,

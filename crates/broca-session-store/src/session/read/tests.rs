@@ -74,6 +74,7 @@ fn reply(id: &str, text: String) -> Record {
         .unwrap(),
         finished_at_ms: None,
         tags_v1: None,
+        media: Vec::new(),
     })
 }
 

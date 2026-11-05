@@ -60,6 +60,8 @@ pub enum SessionError {
     Index(crate::idindex::IndexError),
     /// A revert was refused; nothing was written.
     RevertRefused(revert::RevertRefusal),
+    /// A tool result's media couldn't be stored or read back.
+    Media(media::MediaError),
     /// The open log holds debris, or a recovery a crash interrupted: run
     /// [`Session::recover`], then load again.
     NeedsRecovery,
@@ -132,9 +134,9 @@ pub struct Session<'b, B: SessionBackend> {
     pub operations: Operations,
     /// The open log's ledger records that name ids, so `find_id` finds ids not sealed yet.
     open_ids: OpenIds,
-    /// The window's `EntryFacts` records, by seq, with the ordinal each names, so
-    /// `find_message` finds a new message's id before it's sealed.
-    window_facts: std::collections::BTreeMap<u64, u64>,
+    /// What the open log's records name: each new message's ordinal, so `find_message` finds
+    /// its id before it's sealed, and where each media digest's bytes are stored.
+    window: OpenLogIndex,
 }
 
 impl<'b, B: SessionBackend> Session<'b, B> {
@@ -247,7 +249,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             conversation,
             operations,
             open_ids: OpenIds::default(),
-            window_facts: Default::default(),
+            window: OpenLogIndex::default(),
         })
     }
 
@@ -314,11 +316,9 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let mut conversation = checkpoint.conversation;
         let mut operations = checkpoint.operational;
         let mut open_ids = OpenIds::default();
-        let mut window_facts = std::collections::BTreeMap::new();
+        let mut window = OpenLogIndex::default();
         for (seq, record) in &read.records {
-            if let Record::EntryFacts(facts) = record {
-                window_facts.insert(*seq, facts.ordinal);
-            }
+            window.note(*seq, record);
             if record.stream() == Stream::Ledger {
                 if *seq <= checkpoint.covers_through {
                     continue;
@@ -339,7 +339,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             conversation,
             operations,
             open_ids,
-            window_facts,
+            window,
         };
         session.open_writer_over(&key, &read, end).await?;
         Ok(session)
@@ -458,10 +458,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             if record.stream() == Stream::Ledger {
                 self.open_ids.add(first + position as u64, record);
             }
-            if let Record::EntryFacts(facts) = record {
-                self.window_facts
-                    .insert(first + position as u64, facts.ordinal);
-            }
+            self.window.note(first + position as u64, record);
         }
         self.poisoned = false;
         Ok(first)
@@ -516,6 +513,10 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         )
     }
 }
+
+mod media;
+use media::OpenLogIndex;
+pub use media::{MediaError, NewMedia};
 
 mod read;
 pub use read::StoredEntry;

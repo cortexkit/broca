@@ -664,6 +664,7 @@ fn convert_one(
                 result,
                 finished_at_ms: None,
                 tags_v1: None,
+                media: Vec::new(),
             }));
             event(&mut f, kind.clone(), out);
         }
@@ -675,6 +676,7 @@ fn convert_one(
                     result,
                     finished_at_ms: f.u64("closed_at_ms"),
                     tags_v1: f.take("tags"),
+                    media: Vec::new(),
                 }));
             }
             event(&mut f, kind.clone(), out);
@@ -1137,6 +1139,7 @@ fn reply_and_outcome(terminal: Terminal, state: &State, out: &mut Converted) {
         result,
         finished_at_ms,
         tags_v1: tags,
+        media: Vec::new(),
     }));
     out.records.push(Record::ToolOutcome(ToolOutcome {
         run_id: state.run_id.clone(),
