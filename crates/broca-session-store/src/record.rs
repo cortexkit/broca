@@ -235,6 +235,10 @@ message! {
         /// replies. Frozen per run; kept here so a message renders without its run's start.
         8 req render_tags: bool,
         9 req clean_reply: bool,
+        /// The message's id, which never repeats in the session, across reverts. A message
+        /// converted from today's storage keeps today's id. A new message's id is minted from
+        /// the writer generation and the seq this record takes (`Session::message_id`).
+        10 req mid: String,
     }
 }
 

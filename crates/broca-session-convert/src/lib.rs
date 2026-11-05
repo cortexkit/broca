@@ -138,16 +138,20 @@ fn hold(inputs: Vec<Input>, state: &mut State, out: &Converted) {
     }));
 }
 
-pub fn convert(old: &[FramedRecord]) -> Result<Converted, ConvertError> {
+/// Converts one log. `lineage` is the log's lineage id: a log on the current compaction
+/// contract needs it, because today's message ids carry it and a converted message keeps its id.
+pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted, ConvertError> {
     let mut out = Converted::default();
     let mut state = State::default();
     // A mode-3 log gets an `EntryFacts` record right after each record that places (or
     // reserves) a message, with what today's projection serves about it. A fold that keeps only
     // counts tells which ordinals each converted record placed.
-    let mut facts = entry_facts::legacy(old).map_err(err)?.map(|legacy| {
-        state.delivery_notices = legacy.delivery_notices.clone();
-        (legacy, Conversation::new(false), 0u64)
-    });
+    let mut facts = entry_facts::legacy(old, lineage)
+        .map_err(err)?
+        .map(|legacy| {
+            state.delivery_notices = legacy.delivery_notices.clone();
+            (legacy, Conversation::new(false), 0u64)
+        });
     // Today's placement and budget rules decide what older records left implicit: the firing a
     // budget record stands for, and whether a step met a stop condition. They read each record
     // before it is converted, as today's replay does.
@@ -223,15 +227,17 @@ pub fn convert(old: &[FramedRecord]) -> Result<Converted, ConvertError> {
                 known = known.max(counts.placed + u64::from(reserved));
             }
             for ordinal in *emitted + 1..=known {
-                let (metadata, written_at) = legacy.rows.get(&(ordinal - 1)).ok_or_else(|| {
-                    err(format!(
-                        "entry facts: today's projection has no message {ordinal}"
-                    ))
-                })?;
+                let (metadata, written_at, mid) =
+                    legacy.rows.get(&(ordinal - 1)).ok_or_else(|| {
+                        err(format!(
+                            "entry facts: today's projection has no message {ordinal}"
+                        ))
+                    })?;
                 out.records.push(Record::EntryFacts(entry_facts::record(
                     ordinal,
                     metadata,
                     *written_at,
+                    mid.clone(),
                 )));
             }
             *emitted = known;

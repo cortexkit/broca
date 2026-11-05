@@ -109,6 +109,9 @@ pub struct Session<'b, B: SessionBackend> {
     pub operations: Operations,
     /// The open log's ledger records that name ids, so `find_id` finds ids not sealed yet.
     open_ids: OpenIds,
+    /// The window's `EntryFacts` records, by seq, with the ordinal each names, so
+    /// `find_message` finds a new message's id before it's sealed.
+    window_facts: std::collections::BTreeMap<u64, u64>,
 }
 
 impl<'b, B: SessionBackend> Session<'b, B> {
@@ -219,6 +222,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             conversation,
             operations,
             open_ids: OpenIds::default(),
+            window_facts: Default::default(),
         })
     }
 
@@ -281,7 +285,11 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let mut conversation = checkpoint.conversation;
         let mut operations = checkpoint.operational;
         let mut open_ids = OpenIds::default();
+        let mut window_facts = std::collections::BTreeMap::new();
         for (seq, record) in &read.records {
+            if let Record::EntryFacts(facts) = record {
+                window_facts.insert(*seq, facts.ordinal);
+            }
             if record.stream() == Stream::Ledger {
                 if *seq <= checkpoint.covers_through {
                     continue;
@@ -302,6 +310,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             conversation,
             operations,
             open_ids,
+            window_facts,
         };
         session.open_writer_over(&key, &read, end).await?;
         Ok(session)
@@ -413,6 +422,10 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             if record.stream() == Stream::Ledger {
                 self.open_ids.add(first + position as u64, record);
             }
+            if let Record::EntryFacts(facts) = record {
+                self.window_facts
+                    .insert(first + position as u64, facts.ordinal);
+            }
         }
         self.poisoned = false;
         Ok(first)
@@ -446,6 +459,20 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     /// The open log's change id and its current length.
     pub fn open_log(&self) -> (Id128, u64) {
         (self.log, self.encoder.offset())
+    }
+
+    /// The id for a new message whose `EntryFacts` record will be the `offset`th record (from 0)
+    /// of the next batch: `g<generation>.<seq of that record>`. A seq can repeat after a crash,
+    /// since a record that never became durable gives its number back, but never under the same
+    /// writer generation, so the pair never repeats. Converted ids start with `m`, so the two
+    /// forms never meet.
+    pub fn message_id(&self, offset: u64) -> String {
+        let generation = crate::codec::hex(&self.head.generation.0);
+        format!(
+            "g{}.{}",
+            &generation[..16],
+            self.encoder.next_seq() + offset
+        )
     }
 }
 

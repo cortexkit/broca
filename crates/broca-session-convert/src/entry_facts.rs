@@ -20,15 +20,16 @@ use cortexkit_role_compaction::read::Entry;
 /// What today's projection derives for a mode-3 log.
 #[derive(Debug, Default)]
 pub struct Legacy {
-    /// By the message's position in today's conversation, from 0.
-    pub rows: BTreeMap<u64, (Metadata, u64)>,
+    /// By the message's position in today's conversation, from 0: its metadata, time and id.
+    pub rows: BTreeMap<u64, (Metadata, u64, String)>,
     /// Who delivered the text a tool-result delivery carried, by the seq of today's record
     /// that delivered it.
     pub delivery_notices: HashMap<u64, Notice>,
 }
 
-/// Today's facts for `old`, or `None` when it isn't a mode-3 log.
-pub fn legacy(old: &[FramedRecord]) -> Result<Option<Legacy>, String> {
+/// Today's facts for `old`, or `None` when it isn't a mode-3 log. `lineage` is the log's lineage
+/// id, which today's message ids carry; a mode-3 log without one can't keep its ids.
+pub fn legacy(old: &[FramedRecord], lineage: Option<&str>) -> Result<Option<Legacy>, String> {
     let raw: Vec<WalRecord> = old.iter().map(|frame| frame.record.clone()).collect();
     if !broca_core::is_mode3_log(&raw) {
         return Ok(None);
@@ -93,13 +94,14 @@ pub fn legacy(old: &[FramedRecord]) -> Result<Option<Legacy>, String> {
                 },
             );
         }
-        legacy.rows.insert(position, (metadata, prior));
+        let mid = broca_core::message_mid(true, lineage, position)?;
+        legacy.rows.insert(position, (metadata, prior, mid));
     }
     Ok(Some(legacy))
 }
 
 /// The record for the message at `ordinal` (counting from 1).
-pub fn record(ordinal: u64, metadata: &Metadata, written_at_ms: u64) -> EntryFacts {
+pub fn record(ordinal: u64, metadata: &Metadata, written_at_ms: u64, mid: String) -> EntryFacts {
     let usage = metadata.usage.map(|usage| {
         // `StepUsage` can't be built field by field outside its crate; its JSON form is its
         // contract.
@@ -129,20 +131,22 @@ pub fn record(ordinal: u64, metadata: &Metadata, written_at_ms: u64) -> EntryFac
         native: metadata.source_input.is_none(),
         render_tags: metadata.render_tags,
         clean_reply: metadata.clean_reply,
+        mid,
     }
 }
 
 /// The compaction entry for a message the new format stored, built only from what it stored:
 /// the message, the message after it, its entry facts and the text delivered with its calls.
 /// Projected with today's projection function, so the result can be compared with today's
-/// entry. `mid` is the message's id, which the new format doesn't mint yet.
-pub fn project(stored: &StoredEntry, mid: &str) -> Result<Entry, String> {
+/// entry.
+pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
     use broca_core::compaction_v2::entries::{project, Deliveries, EntryFacts as Facts};
     let facts = stored
         .state
         .facts
         .as_ref()
         .ok_or_else(|| format!("message {} has no entry facts", stored.ordinal))?;
+    let mid = facts.mid.as_str();
     let usage = facts.usage.map(|usage| {
         let mut out = cortexkit_role_compaction::read::StepUsage::default();
         out.prompt_tokens = usage.prompt_tokens;

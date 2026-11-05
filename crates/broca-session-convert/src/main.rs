@@ -263,6 +263,8 @@ struct EntriesReport {
     /// most entries are read back from sealed segments.
     equal_sealed: u64,
     sealed_logs: u64,
+    /// Entries whose id resolves back to their ordinal through `find_message` after sealing.
+    ids_resolved: u64,
     /// Of today's entries, how many carry each fact, so an equal count above is known to
     /// cover them.
     with_notice: u64,
@@ -300,8 +302,10 @@ fn run_entries(args: &Args) {
             let key: String = format!("{what}: {e}").chars().take(100).collect();
             *report.failures.entry(key).or_default() += 1;
         };
-        let lineage = "00000000-0000-4000-8000-000000000000";
-        let today = match broca_core::compaction_v2::transcript::project(&old, lineage) {
+        let Some(lineage) = old.lineage.clone() else {
+            return fail("lineage", "a mode-3 log has no lineage frame".into());
+        };
+        let today = match broca_core::compaction_v2::transcript::project(&old, &lineage) {
             Ok(transcript) => transcript.entries,
             Err(e) => return fail("today's projection", e),
         };
@@ -309,7 +313,7 @@ fn run_entries(args: &Args) {
             .iter()
             .map(|entry| serde_json::to_value(entry).expect("entries serialize"))
             .collect();
-        let converted = match convert(&old) {
+        let converted = match convert_log(&old) {
             Ok(converted) => converted,
             Err(e) => return fail("convert", e.0),
         };
@@ -342,8 +346,7 @@ fn run_entries(args: &Args) {
             }
             let mut equal = 0;
             for (stored, expected) in served.iter().zip(&today) {
-                let mid = expected["mid"].as_str().unwrap_or_default();
-                let got = match entry_facts::project(stored, mid) {
+                let got = match entry_facts::project(stored) {
                     Ok(entry) => serde_json::to_value(entry).expect("entries serialize"),
                     Err(e) => {
                         *mismatches.entry(format!("project: {e}")).or_default() += 1;
@@ -404,14 +407,32 @@ fn run_entries(args: &Args) {
                 .entries(1, usize::MAX)
                 .await
                 .map_err(|e| format!("entries after seal: {e:?}"))?;
-            Ok::<_, String>((open, sealed, after))
+            let mut resolved = 0;
+            for entry in &after {
+                let Some(facts) = &entry.state.facts else {
+                    continue;
+                };
+                let found = loaded
+                    .find_message(&facts.mid)
+                    .await
+                    .map_err(|e| format!("find {}: {e:?}", facts.mid))?;
+                if found != Some(entry.ordinal) {
+                    return Err(format!(
+                        "{} resolves to {found:?}, not {}",
+                        facts.mid, entry.ordinal
+                    ));
+                }
+                resolved += 1;
+            }
+            Ok::<_, String>((open, sealed, after, resolved))
         });
-        let (open, sealed, after) = match served {
+        let (open, sealed, after, resolved) = match served {
             Ok(served) => served,
             Err(e) => return fail("session", e),
         };
         report.equal_open += compare(&open, &mut report.mismatches);
         report.sealed_logs += u64::from(sealed);
+        report.ids_resolved += resolved;
         report.equal_sealed += compare(&after, &mut report.mismatches);
     });
     write_report(&report, args.out_file.as_deref());
@@ -454,7 +475,7 @@ fn run_check(args: &Args) {
                 return;
             }
         };
-        let converted = match convert(&old) {
+        let converted = match convert_log(&old) {
             Ok(converted) => converted,
             Err(e) => {
                 *report.failures.entry(format!("convert: {e}")).or_default() += 1;
@@ -570,7 +591,7 @@ fn run_prompt(args: &Args) {
                 return;
             }
         };
-        let Ok(converted) = convert(&old) else {
+        let Ok(converted) = convert_log(&old) else {
             *report.fold_refused.entry("convert".into()).or_default() += 1;
             return;
         };
@@ -618,7 +639,7 @@ fn run_trace(args: &Args) {
             return;
         };
         println!("== {name}");
-        for framed in &old {
+        for framed in old.iter() {
             let kind = serde_json::to_value(&framed.record)
                 .ok()
                 .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
@@ -630,7 +651,7 @@ fn run_trace(args: &Args) {
             .map(|s| s.prompt)
             .unwrap_or_default();
         let mut conversation = Conversation::new(!broca_core::is_mode3_log(&records));
-        if let Ok(converted) = convert(&old) {
+        if let Ok(converted) = convert_log(&old) {
             for record in converted
                 .records
                 .iter()
@@ -718,14 +739,14 @@ enum OpsOutcome {
 
 /// Folds one log's converted ledger with the new operational fold, and compares the latest
 /// run's state with what today's replay derives from the same records.
-fn compare_ops(old: &[FramedRecord]) -> OpsOutcome {
+fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
     use broca_session_store::fold::operations::{CallState, Operations, Resolution};
     let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
     let today = match broca_core::replay::replay(&records) {
         Ok(state) => state,
         Err(e) => return OpsOutcome::ReplayRefused(e.to_string().chars().take(80).collect()),
     };
-    let Ok(converted) = convert(old) else {
+    let Ok(converted) = convert(old, lineage) else {
         return OpsOutcome::FoldRefused("convert".into());
     };
     let mut operations = Operations::default();
@@ -936,7 +957,7 @@ fn run_ops(args: &Args) {
         let mut log_equal = true;
         for end in ends {
             report.compared += 1;
-            match compare_ops(&old[..end]) {
+            match compare_ops(&old[..end], old.lineage.as_deref()) {
                 OpsOutcome::ReplayRefused(reason) => {
                     *report.replay_refused.entry(reason).or_default() += 1;
                 }
@@ -1000,9 +1021,9 @@ impl Measuring {
     /// Converts and measures one old log. `name` identifies it in errors, and its frames are
     /// encrypted with `name` as their authenticated data, the way a real log's frames are bound
     /// to that log. `size` is its size as stored today.
-    fn log(&mut self, name: &str, size: u64, old: &[FramedRecord]) {
+    fn log(&mut self, name: &str, size: u64, old: &OldLog) {
         let report = &mut self.report;
-        for framed in old {
+        for framed in old.iter() {
             let bytes = serde_json::to_vec(&framed.record).map_or(0, |v| v.len());
             let kind = serde_json::to_value(&framed.record)
                 .ok()
@@ -1014,7 +1035,7 @@ impl Measuring {
         }
 
         let started = Instant::now();
-        let converted = match convert(old) {
+        let converted = match convert_log(old) {
             Ok(converted) => converted,
             Err(e) => return self.fail(name, format!("convert: {e}")),
         };
@@ -1117,10 +1138,46 @@ enum Item {
         name: String,
         /// Its size as stored today.
         size: u64,
-        old: Result<Vec<FramedRecord>, String>,
+        old: Result<OldLog, String>,
         read_ms: u128,
     },
     Note(String, String),
+}
+
+/// One of today's logs: its records, and its lineage id, which today's message ids carry.
+struct OldLog {
+    records: Vec<FramedRecord>,
+    lineage: Option<String>,
+}
+
+impl std::ops::Deref for OldLog {
+    type Target = [FramedRecord];
+    fn deref(&self) -> &[FramedRecord] {
+        &self.records
+    }
+}
+
+/// Converts a log with its own lineage, so converted messages keep today's ids.
+fn convert_log(
+    old: &OldLog,
+) -> Result<broca_session_convert::Converted, broca_session_convert::ConvertError> {
+    convert(old, old.lineage.as_deref())
+}
+
+/// The lineage id a log's lineage frames name, or `None` for a log written before they existed.
+fn read_lineage(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut rest = bytes.as_slice();
+    while !rest.is_empty() {
+        rest = match broca_wal::framing::decode_next(rest) {
+            broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => {
+                return Some(lineage_id.to_string())
+            }
+            broca_wal::framing::DecodeStep::Record { consumed, .. } => &rest[consumed..],
+            _ => return None,
+        };
+    }
+    None
 }
 
 /// Visits every session log under the given paths: `.wal` files directly, and the members of
@@ -1135,7 +1192,12 @@ fn each_log(args: &Args, mut visit: impl FnMut(Item)) {
     let mut addresses = std::collections::BTreeSet::new();
     let read = |path: &Path| {
         let started = Instant::now();
-        let old = broca_wal::replay_file(path, u64::MAX).map_err(|e| format!("read: {e}"));
+        let old = broca_wal::replay_file(path, u64::MAX)
+            .map(|records| OldLog {
+                records,
+                lineage: read_lineage(path),
+            })
+            .map_err(|e| format!("read: {e}"));
         (old, started.elapsed().as_millis())
     };
     for (index, file) in args.files.iter().enumerate() {
@@ -1319,13 +1381,16 @@ fn run_append(args: &Args) {
     let mut id_lookups = Vec::new();
     for (index, file) in chosen.iter().enumerate() {
         let old = match broca_wal::replay_file(file, u64::MAX) {
-            Ok(old) => old,
+            Ok(records) => OldLog {
+                records,
+                lineage: read_lineage(file),
+            },
             Err(e) => {
                 eprintln!("{}: {e}", file.display());
                 continue;
             }
         };
-        let Ok(converted) = convert(&old) else {
+        let Ok(converted) = convert_log(&old) else {
             continue;
         };
         let target = dir.join(format!("append-{index}"));
@@ -1408,7 +1473,7 @@ fn run_split(args: &Args) {
         };
         let records: Vec<broca_wal::WalRecord> = old.iter().map(|f| f.record.clone()).collect();
         let appends_in_conversation = !broca_core::is_mode3_log(&records);
-        let Ok(converted) = convert(&old) else {
+        let Ok(converted) = convert_log(&old) else {
             *report.refused.entry("convert".into()).or_default() += 1;
             return;
         };
@@ -1478,7 +1543,7 @@ fn run_seal(args: &Args) {
         else {
             return;
         };
-        let Ok(converted) = convert(&old) else {
+        let Ok(converted) = convert_log(&old) else {
             report.failures.push(format!("{name}: convert"));
             return;
         };

@@ -43,6 +43,14 @@ pub struct StoredEntry {
     pub open: bool,
 }
 
+/// A decimal number as an id writes it: no sign, no leading zero, no overflow.
+fn canonical_u64(digits: &str) -> Option<u64> {
+    let canonical = !digits.is_empty()
+        && (digits.len() == 1 || !digits.starts_with('0'))
+        && digits.bytes().all(|byte| byte.is_ascii_digit());
+    canonical.then(|| digits.parse().ok()).flatten()
+}
+
 /// The entries of `conversation`'s window from `from` on, at most `limit` of them.
 fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> Vec<StoredEntry> {
     let start = conversation.window_start().max(from);
@@ -140,6 +148,74 @@ impl<B: SessionBackend> Session<'_, B> {
             }
         }
         Ok(out)
+    }
+
+    /// The ordinal of the message with id `mid`, if it's on the current branch. The id tells
+    /// where to look: a new id names the seq of its `EntryFacts` record, a converted one its
+    /// position in today's history. Either way, the entry found there must carry exactly that
+    /// id, so an id from an abandoned branch, or from another session, never resolves to the
+    /// message that took its place. Messages converted from a session without entry facts have
+    /// none, and their `m<position>` ids resolve by position alone: no message written since
+    /// lacks facts, so nothing else can sit at a converted message's ordinal.
+    pub async fn find_message(&self, mid: &str) -> Result<Option<u64>, SessionError> {
+        let candidate = if let Some(rest) = mid.strip_prefix('g') {
+            let Some(seq) = rest.split_once('.').and_then(|(_, seq)| canonical_u64(seq)) else {
+                return Ok(None);
+            };
+            self.facts_ordinal(seq).await?
+        } else if let Some(rest) = mid.strip_prefix('m') {
+            let digits = rest.split_once('.').map_or(rest, |(_, digits)| digits);
+            canonical_u64(digits).and_then(|position| position.checked_add(1))
+        } else {
+            None
+        };
+        let Some(ordinal) = candidate else {
+            return Ok(None);
+        };
+        let Some(entry) = self.entries(ordinal, 1).await?.into_iter().next() else {
+            return Ok(None);
+        };
+        let matches = match &entry.state.facts {
+            Some(facts) => facts.mid == mid,
+            None => mid
+                .strip_prefix('m')
+                .is_some_and(|rest| !rest.contains('.')),
+        };
+        Ok((entry.ordinal == ordinal && matches).then_some(ordinal))
+    }
+
+    /// The ordinal an `EntryFacts` record at `seq` names, from the window or a sealed segment.
+    async fn facts_ordinal(&self, seq: u64) -> Result<Option<u64>, SessionError> {
+        if let Some(ordinal) = self.window_facts.get(&seq) {
+            return Ok(Some(*ordinal));
+        }
+        let key = self.key.frame_key();
+        let pages = Pages {
+            backend: self.backend,
+            addr: &self.addr,
+            session: self.head.session_id,
+            key: &key,
+            fanout: crate::directory::FANOUT,
+        };
+        let Some(entry) = pages
+            .find(self.head.transcript_dir.as_ref(), seq)
+            .await
+            .map_err(SessionError::Directory)?
+        else {
+            return Ok(None);
+        };
+        let damaged = || SessionError::Fold(format!("directory names a missing segment for {seq}"));
+        let bytes = self
+            .backend
+            .get_object(&self.addr, &entry.object)
+            .await?
+            .ok_or_else(damaged)?;
+        let segment =
+            Segment::open(&bytes, &key, entry.object.as_bytes()).map_err(SessionError::Segment)?;
+        Ok(match segment.find(seq).map_err(SessionError::Segment)? {
+            Some(Record::EntryFacts(facts)) => Some(facts.ordinal),
+            _ => None,
+        })
     }
 
     /// The message with `ordinal` (counting from 1 over the whole conversation), or `None` when

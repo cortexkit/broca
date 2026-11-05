@@ -482,6 +482,9 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         self.operations.open_change = None;
         // Every ledger record the old log held is sealed, and its ids are in the index now.
         self.open_ids.clear();
+        // Facts of messages that left the window are found through the directory now.
+        let start = self.conversation.window_start();
+        self.window_facts.retain(|_, ordinal| *ordinal >= start);
         self.poisoned = false;
         Ok(created.sealed)
     }

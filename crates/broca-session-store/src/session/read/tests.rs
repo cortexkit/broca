@@ -90,6 +90,7 @@ fn facts(ordinal: u64) -> Record {
         native: true,
         render_tags: false,
         clean_reply: false,
+        mid: format!("mfeedface.{}", ordinal - 1),
     })
 }
 
@@ -178,6 +179,93 @@ fn every_message_reads_back_by_ordinal_after_two_cuts() {
             assert!(!entry.open);
         }
         assert!(loaded.entries(121, 5).await.unwrap().is_empty());
+    });
+}
+
+/// Message ids resolve to their ordinals, in the window and after sealing. Converted ids
+/// (`m<prefix>.<position>`) resolve by position, new ids (`g<generation>.<seq>`) by the seq of
+/// their facts record, and any id whose entry doesn't carry exactly that id resolves to nothing:
+/// another prefix, a seq that isn't a facts record, a non-canonical number, an ordinal past
+/// the end.
+#[test]
+fn message_ids_resolve_in_the_window_and_sealed_history() {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(), false)
+            .await
+            .unwrap();
+        let mut cut = 0;
+        for n in 0..10 {
+            for (part, batch) in round(n).into_iter().enumerate() {
+                let seq = session.append(&batch, true).await.unwrap();
+                if part == 0 && n == 6 {
+                    cut = seq;
+                }
+            }
+        }
+        // Two new messages with minted ids: a user input, then an answer.
+        let mut minted = Vec::new();
+        for message in [
+            input("new".into()),
+            assistant(vec![ContentBlock::Text { text: "a".into() }]),
+        ] {
+            let ordinal = session.conversation.placed + 1;
+            let mid = session.message_id(1);
+            let Record::EntryFacts(mut facts) = facts(ordinal) else {
+                unreachable!()
+            };
+            facts.mid = mid.clone();
+            session
+                .append(&[message, Record::EntryFacts(facts)], true)
+                .await
+                .unwrap();
+            minted.push((mid, ordinal));
+        }
+        assert!(minted[0].0.starts_with('g'));
+
+        async fn check(session: &Session<'_, MemoryBackend>, minted: &[(String, u64)]) {
+            for ordinal in (1..=40).filter(|ordinal| ordinal % 4 != 3) {
+                let mid = format!("mfeedface.{}", ordinal - 1);
+                assert_eq!(
+                    session.find_message(&mid).await.unwrap(),
+                    Some(ordinal),
+                    "{mid}"
+                );
+            }
+            for (mid, ordinal) in minted {
+                assert_eq!(
+                    session.find_message(mid).await.unwrap(),
+                    Some(*ordinal),
+                    "{mid}"
+                );
+            }
+            // A tool message has no facts, so a converted id can't name it.
+            assert_eq!(session.find_message("mfeedface.2").await.unwrap(), None);
+            for wrong in [
+                "mdeadbeef.0",
+                "mfeedface.00",
+                "mfeedface.99",
+                "m0",
+                "g0000000000000000.1",
+                "x1",
+                "",
+            ] {
+                assert_eq!(session.find_message(wrong).await.unwrap(), None, "{wrong}");
+            }
+            // The minted id's seq with another generation names nothing.
+            let (mid, _) = &minted[0];
+            let other = format!("gffffffffffffffff{}", &mid[17..]);
+            assert_eq!(session.find_message(&other).await.unwrap(), None);
+        }
+        check(&session, &minted).await;
+        session.seal(Some(cut), 0).await.unwrap();
+        assert!(session.conversation.window_start() > 20);
+        check(&session, &minted).await;
+        session.close().await.unwrap();
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment())
+            .await
+            .unwrap();
+        check(&loaded, &minted).await;
     });
 }
 

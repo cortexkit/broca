@@ -218,6 +218,7 @@ fn facts(ordinal: u64, tag_base: u64) -> Record {
         native: true,
         render_tags: true,
         clean_reply: true,
+        mid: format!("m{}", ordinal - 1),
     })
 }
 
