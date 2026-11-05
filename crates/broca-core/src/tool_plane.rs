@@ -140,6 +140,11 @@ pub struct DispatchKey<'a> {
 /// model can adapt; it never hangs or crashes the run.
 #[derive(Debug, Clone)]
 pub enum ToolPlaneError {
+    /// A terminal provider refusal that another attempt on the same route cannot repair.
+    Permanent {
+        code: String,
+        detail: Option<serde_json::Value>,
+    },
     /// The plane could not reach the executor after its bounded transport retry
     /// (subc unreachable / route gone / timeout).
     Unavailable(String),
@@ -169,6 +174,11 @@ pub enum ToolPlaneError {
 impl std::fmt::Display for ToolPlaneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Permanent { code, detail } => {
+                write!(f, "permanent tool-provider refusal: {code}")?;
+                if let Some(detail) = detail { write!(f, " — {detail}")?; }
+                Ok(())
+            }
             // This text reaches the MODEL as a synthesized tool result, and it is the only
             // account of the failure a caller gets. "tool plane unavailable" alone cost a
             // peer a two-module trace with error-byte capture to learn that their bind had
@@ -198,6 +208,16 @@ impl std::fmt::Display for ToolPlaneError {
 }
 
 impl std::error::Error for ToolPlaneError {}
+
+/// Keep terminal refusal attribution in conversation data instead of calling it an outage.
+pub fn permanent_refusal_output(
+    code: &str,
+    detail: Option<&serde_json::Value>,
+) -> broca_protocol::ToolOutput {
+    broca_protocol::ToolOutput::Json {
+        value: serde_json::json!({"class":"permanent", "code":code, "detail":detail}),
+    }
+}
 
 /// The outcome of dispatching ONE call. The durability barrier needs to know
 /// whether a side effect could have occurred, so a plane failure is NOT a single

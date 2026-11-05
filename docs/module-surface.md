@@ -190,6 +190,11 @@ A consumer can be both. The surface is **session-centric**: consumers address
   the inbound connection. Scoped outgoing tool/catalog routes select the frozen scope;
   unscoped routes carry no folder. Compaction, hook and vault module-level routes are
   unscoped. Neither storage roots nor the namespace are sent as wire bind projects.
+  Tool routes to the plan's compaction or step-transform providers bind the session's own
+  harness and session; other tool modules bind `runner` with the unchanged session string.
+  Keeping one `(harness, session)` bind pair per session at a provider relies on the session
+  string being unique per consumer and provider, which every caller today satisfies
+  (Core names each session with its own task id).
 - **Run = one turn's loop execution** — a user message in → the agent loops until its
   response → a terminal. Each run begins with a `RunStarted` **episode marker** (input +
   frozen config + `origin` + `submission_id`). Runs **accumulate** in the lineage WAL:
