@@ -746,11 +746,11 @@ fn frozen_render_tags(admission: &Admission) -> bool {
 /// The request the latest run's step `step_id` sends, built from the session's state exactly as
 /// the run loop builds it before sending, without any provider or tool plane: for checking
 /// requests rebuilt from stored sessions against the bytes that were sent. A run whose plan names
-/// a compaction provider renders from that provider's view, which this doesn't apply yet, so it
-/// refuses.
+/// a compaction provider renders from the view the session recorded as applied for that step.
 pub async fn offline_request<W: Writer>(
     writer: &W,
     parts: &dyn Parts,
+    bind: &broca_protocol::BindIdentity,
     step_id: u64,
 ) -> Result<CallOptions, LoopError> {
     refuse_first_protocol_compaction(writer)?;
@@ -769,17 +769,16 @@ pub async fn offline_request<W: Writer>(
             .is_some(),
         _ => false,
     };
-    if compacted {
-        return Err(LoopError::Unsupported(
-            "an offline request for a run with a compaction provider",
-        ));
-    }
     let episodes = render_episodes(writer, parts)?;
     let run_rules = run_tag_rules(writer, &episodes).await?;
     let tools = Arc::new(admission.tools.clone());
-    call_options(
-        writer, &admission, &tools, &episodes, &run_rules, None, step_id, false,
-    )
+    let opts = call_options(
+        writer, &admission, &tools, &episodes, &run_rules, None, step_id, compacted,
+    )?;
+    if !compacted {
+        return Ok(opts);
+    }
+    crate::compaction::offline_prompt(writer, &admission, bind, step_id, opts).await
 }
 
 /// Model steps and tool batches from the run's current state until a decision ends the run.

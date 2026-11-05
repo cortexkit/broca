@@ -370,6 +370,41 @@ pub async fn seal_at_cut<W: Writer, P, T>(
     Ok(())
 }
 
+/// The request step `step` sent, rebuilt from stored state without calling the compaction
+/// provider: the views the session recorded replace its answers. The compaction state is restored
+/// from the open log, and the prompt is rendered from the view the session recorded as applied for
+/// that step, by the same render and finish as a live send's (see `prepare`). For checking requests
+/// rebuilt from stored sessions against the bytes that were sent.
+pub async fn offline_prompt<W: Writer>(
+    writer: &W,
+    admission: &Admission,
+    bind: &BindIdentity,
+    step: u64,
+    opts: broca_protocol::request::CallOptions,
+) -> Result<broca_protocol::request::CallOptions, LoopError> {
+    let records = writer.open_log_records().await?;
+    let state = restore(&records, bind, writer.operations()).map_err(LoopError::Parts)?;
+    let view = state.view_for_step(step).cloned();
+    let session = Arc::new(v2::session::Session::default());
+    *session.state.lock().await = state;
+    let ctx = Ctx {
+        session,
+        provider: String::new(),
+        preset: String::new(),
+        earlier: None,
+    };
+    let transcript = transcript(writer, &ctx).await?;
+    let opts = with_sealed(opts, &transcript);
+    let prompt = v2::render::prompt(
+        &opts.prompt,
+        &transcript.entries,
+        view.as_ref().map_or(&[][..], |view| view.edits.as_slice()),
+        |_| Err("a compaction view's inserted images aren't stored yet".into()),
+    )
+    .map_err(LoopError::Parts)?;
+    finish(&opts, prompt, admission).map_err(LoopError::Parts)
+}
+
 /// Seals the session's ledger with no cut, carrying copies of its compaction views, as a seal
 /// must (see `Carry::records`). `session` is the session's compaction state, as the actor holds
 /// it.

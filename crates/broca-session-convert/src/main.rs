@@ -262,6 +262,12 @@ fn main() {
 #[derive(Default, Serialize)]
 struct RenderReport {
     logs: u64,
+    /// Logs on the current compaction contract layout, whose requests render from the compaction
+    /// view each step recorded as applied.
+    contract_logs: u64,
+    /// Sampled steps of those logs, and how many the new loop rebuilds exactly.
+    contract_steps: u64,
+    contract_new_matches: u64,
     /// Logs not checked, by reason.
     skipped: BTreeMap<String, u64>,
     steps: u64,
@@ -305,13 +311,19 @@ fn run_render(args: &Args) {
         };
         report.logs += 1;
         let records: Vec<WalRecord> = old.records.iter().map(|f| f.record.clone()).collect();
-        if broca_core::is_mode3_log(&records) {
-            *report
-                .skipped
-                .entry("compaction contract layout".into())
-                .or_default() += 1;
-            return;
+        let contract = broca_core::is_mode3_log(&records);
+        if contract {
+            report.contract_logs += 1;
         }
+        // A session on the current compaction contract checks its compaction marker against the
+        // session that wrote it, so the rebuild binds as that session did.
+        let Some(bind) = records.iter().find_map(|record| match record {
+            WalRecord::RunStarted { session, .. } => Some(session.clone()),
+            _ => None,
+        }) else {
+            *report.skipped.entry("no run".into()).or_default() += 1;
+            return;
+        };
         // Every step with a recorded request: where its start is, its run and config, and the
         // digest of its first attempt.
         let mut steps = Vec::new();
@@ -372,7 +384,28 @@ fn run_render(args: &Args) {
             let cap =
                 broca_core::output_reservation::recorded_cap(prefix, broca_protocol::StepId(*step));
             report.output_capped += u64::from(cap.is_some());
-            let today = broca_module_serve::wal_render::render_step(prefix, config, run, *step);
+            report.contract_steps += u64::from(contract);
+            // A step on the current contract renders from the views recorded up to its request.
+            let view_end = records[end + 1..]
+                .iter()
+                .position(|record| matches!(record, WalRecord::ModelAttemptFinished { .. }))
+                .map_or(records.len(), |offset| end + 1 + offset);
+            let prefix = if contract { &records[..view_end] } else { prefix };
+            let end = if contract { view_end - 1 } else { end };
+            let cap = if contract {
+                broca_core::output_reservation::recorded_cap(prefix, broca_protocol::StepId(*step))
+            } else {
+                cap
+            };
+            let today = broca_module_serve::wal_render::render_step_with_lineage(
+                old.lineage.as_deref(),
+                prefix,
+                config,
+                run,
+                *step,
+                cap,
+                None,
+            );
             let (frozen, today_opts, today_body) = match today {
                 Ok(today) => today,
                 Err(e) => {
@@ -406,7 +439,7 @@ fn run_render(args: &Args) {
                             .await
                             .map_err(|e| format!("append {}: {e:?}", record.name()))?;
                     }
-                    broca_session_loop::run::offline_request(&session, &parts, *step)
+                    broca_session_loop::run::offline_request(&session, &parts, &bind, *step)
                         .await
                         .map_err(|e| format!("{e:?}"))
                 })?;
@@ -434,6 +467,7 @@ fn run_render(args: &Args) {
             let new_ok = sha(&new_body) == *digest;
             report.today_matches += u64::from(today_ok);
             report.new_matches += u64::from(new_ok);
+            report.contract_new_matches += u64::from(contract && new_ok);
             match (today_ok, new_ok) {
                 (true, false) => {
                     let key = options_difference(&today_opts, &new_opts);
