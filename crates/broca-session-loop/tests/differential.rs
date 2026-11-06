@@ -6020,3 +6020,97 @@ async fn every_cut_of_a_held_call_on_a_changed_render_config_ends_alike() {
     }))
     .await;
 }
+
+/// `step` with the provider's `StepFinished` before its terminal event, reporting `usage` and
+/// how it served the step: the service tier, speed and raw finish reason, and the model that
+/// answered with each model's usage when the provider handed the request on itself.
+fn served(mut step: Vec<NormalizedEvent>, usage: Usage, facts: Value) -> Vec<NormalizedEvent> {
+    let terminal = step.pop().expect("a step ends with its terminal");
+    let NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) = &terminal
+    else {
+        panic!("a step ends with its Finished");
+    };
+    let text = |key: &str| facts[key].as_str().map(str::to_owned);
+    step.push(NormalizedEvent::Control(ProviderControl::StepFinished {
+        step_id: StepId(0),
+        usage,
+        finish_reason: *finish_reason,
+        raw_finish_reason: text("raw_finish_reason"),
+        service_tier_used: text("service_tier_used"),
+        speed_used: text("speed_used"),
+        served_model: text("served_model"),
+        usage_iterations: (!facts["usage_iterations"].is_null()).then(|| {
+            serde_json::from_value(facts["usage_iterations"].clone())
+                .expect("usage iterations decode")
+        }),
+    }));
+    step.push(terminal);
+    step
+}
+
+fn usage(input: u64, output: u64) -> Usage {
+    serde_json::from_value(json!({"input_tokens": input, "output_tokens": output}))
+        .expect("usage decodes")
+}
+
+/// Both loops record what the provider said about how it served each step: its service tier,
+/// speed and raw finish reason, and its step usage over the final event's.
+#[tokio::test]
+async fn each_step_records_how_the_provider_served_it() {
+    compare(Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            served(
+                answer(
+                    "a1",
+                    vec![call("c1", "read", json!({"path": "a"}))],
+                    FinishReason::ToolCalls,
+                ),
+                usage(1200, 40),
+                json!({
+                    "service_tier_used": "priority",
+                    "raw_finish_reason": "tool_use",
+                }),
+            ),
+            served(
+                text_step("a2", "done"),
+                usage(1300, 20),
+                // A raw reason longer than 64 bytes is left out, not cut.
+                json!({
+                    "service_tier_used": "default",
+                    "speed_used": "fast",
+                    "raw_finish_reason": "x".repeat(65),
+                }),
+            ),
+        ],
+    })
+    .await;
+}
+
+/// A step the provider handed to another model itself records the model that answered and
+/// each model's usage, and counts their sum toward the run.
+#[tokio::test]
+async fn a_step_another_model_served_records_it_and_its_whole_usage() {
+    compare(Scenario {
+        input: vec![user("hello")],
+        tools: Vec::new(),
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![served(
+            text_step("a1", "hi"),
+            usage(900, 30),
+            json!({
+                "served_model": "claude-opus-4-8",
+                "raw_finish_reason": "end_turn",
+                "usage_iterations": [
+                    {"kind": "message", "model": "claude-opus-5-5", "input_tokens": 800, "output_tokens": 0},
+                    {"kind": "message", "model": "claude-opus-4-8", "input_tokens": 900, "output_tokens": 30}
+                ],
+            }),
+        )],
+    })
+    .await;
+}

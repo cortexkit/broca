@@ -1517,6 +1517,9 @@ where
         let now = (seams.now_ms)();
         let assistant =
             Message::assistant_from(step.message.content.clone(), admission.model.clone());
+        // The step's whole usage, over every model that ran when the provider handed the
+        // request on itself, as today's loop records it on both the message and the step.
+        let whole = step.served.total(step.usage);
         writer
             .append(
                 &[
@@ -1525,7 +1528,7 @@ where
                         step_id,
                         provider_message_id: step.message.message_id.clone(),
                         message: assistant,
-                        usage: Some(step.usage),
+                        usage: Some(whole),
                         written_at_ms: Some(now),
                         last_content_at_ms: None,
                         tags_v1: None,
@@ -1535,16 +1538,18 @@ where
                     Record::StepEnd(StepEnd {
                         run_id: admission.run_id.clone(),
                         step_id,
-                        usage: Some(step.usage),
+                        usage: Some(whole),
                         finish_reason: Some(step.finish_reason),
                         retries_used: step.retries_used,
-                        service_tier_used: None,
-                        speed_used: None,
+                        service_tier_used: step.served.service_tier_used.clone(),
+                        speed_used: step.served.speed_used.clone(),
                         call_count: calls.len() as u32,
-                        fallback: None,
+                        fallback: step.served.members()?,
                         hooks: step_hooks,
                         budget_finalize: finalizing.then_some(true),
-                        total_usage: None,
+                        // As the converter fills it from today's record: what the iterations
+                        // add up to, when that differs from the recorded usage.
+                        total_usage: Some(step.served.total(whole)).filter(|total| *total != whole),
                         stop_met: stop.is_some().then_some(true),
                         limiting_stop_met: limiting.then_some(true),
                     }),
@@ -2073,6 +2078,49 @@ struct Step {
     usage: Usage,
     finish_reason: FinishReason,
     retries_used: u32,
+    served: Served,
+}
+
+/// What the provider said about how it served a step, from its `StepFinished`, recorded exactly
+/// as reported: absent stays absent, and nothing is filled from the request.
+#[derive(Default)]
+struct Served {
+    /// The provider's own terminal token. A token longer than 64 bytes is left out rather than
+    /// cut, as today's loop does.
+    raw_finish_reason: Option<String>,
+    service_tier_used: Option<String>,
+    speed_used: Option<String>,
+    /// The model that answered when the provider handed the request to another model itself.
+    served_model: Option<String>,
+    /// One usage entry per model that ran, when the provider reported them.
+    usage_iterations: Option<Vec<broca_protocol::usage::UsageIteration>>,
+}
+
+impl Served {
+    /// The step end's `fallback` members these facts fill, as the converter carries today's
+    /// record's remaining members. `None` when the provider reported none of them.
+    fn members(&self) -> Result<Option<Value>, LoopError> {
+        let mut members = serde_json::Map::new();
+        if let Some(reason) = &self.raw_finish_reason {
+            members.insert("raw_finish_reason".into(), json!(reason));
+        }
+        if let Some(model) = &self.served_model {
+            members.insert("served_model".into(), json!(model));
+        }
+        if let Some(iterations) = &self.usage_iterations {
+            members.insert(
+                "usage_iterations".into(),
+                serde_json::to_value(iterations).map_err(|e| LoopError::Parts(e.to_string()))?,
+            );
+        }
+        Ok((!members.is_empty()).then_some(Value::Object(members)))
+    }
+
+    /// The step's whole usage: the sum over the models that ran when the provider reported
+    /// iterations, else `usage`.
+    fn total(&self, usage: Usage) -> Usage {
+        broca_protocol::usage::step_usage(usage, self.usage_iterations.as_deref())
+    }
 }
 
 /// The error a step fails with when the provider's stream ends without an answer and its final
@@ -2139,6 +2187,10 @@ async fn model_step<W: Writer, P: Provider, T>(
         .step_with_runtime(StepId(step_id), Arc::new(opts), runtime)
         .await;
     let mut message = None;
+    // The provider's `StepFinished` usage wins; its final `Finished` fills it only when the
+    // step reported none, as today's loop takes them.
+    let mut step_usage = Usage::default();
+    let mut served = Served::default();
     loop {
         let event = tokio::select! {
             event = events.recv() => event,
@@ -2153,11 +2205,34 @@ async fn model_step<W: Writer, P: Provider, T>(
             Some(NormalizedEvent::Control(ProviderControl::AssistantMessage { message: m })) => {
                 message = Some(m);
             }
+            Some(NormalizedEvent::Control(ProviderControl::StepFinished {
+                usage,
+                raw_finish_reason,
+                service_tier_used,
+                speed_used,
+                served_model,
+                usage_iterations,
+                ..
+            })) => {
+                step_usage = usage;
+                served = Served {
+                    raw_finish_reason: raw_finish_reason.filter(|reason| reason.len() <= 64),
+                    service_tier_used,
+                    speed_used,
+                    served_model,
+                    usage_iterations,
+                };
+            }
             Some(NormalizedEvent::Control(ProviderControl::Finished {
                 usage,
                 finish_reason,
                 retries_used,
             })) => {
+                let usage = if step_usage == Usage::default() {
+                    usage
+                } else {
+                    step_usage
+                };
                 let Some(message) = message.take() else {
                     return Ok(Err(StepFailure::Error(
                         Box::new(incomplete_stream()),
@@ -2170,6 +2245,7 @@ async fn model_step<W: Writer, P: Provider, T>(
                     usage,
                     finish_reason,
                     retries_used,
+                    served,
                 }));
             }
             Some(NormalizedEvent::Control(ProviderControl::Error {
