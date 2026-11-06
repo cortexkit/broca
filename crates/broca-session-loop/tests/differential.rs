@@ -1619,37 +1619,38 @@ impl Scenario {
         self.admission_for(provider, "r1", &self.input)
     }
 
+    /// The new loop's admission of a run of `input`, derived from the same request and run
+    /// control today's loop is given, by the rules both loops share. `ts_ms` and
+    /// `written_at_ms` are wall-clock times the comparison normalizes.
     fn admission_for(
         &self,
         provider: &ScriptedProvider,
         run_id: &str,
         input: &[Message],
     ) -> Admission {
-        Admission {
-            run_id: run_id.into(),
-            model: ModelHandle::new(provider_id(), run_model(run_id)),
-            input: input.to_vec(),
-            tools: self.tools.clone(),
-            tool_choice: ToolChoice::Auto,
-            generation: GenerationConfig::default(),
-            response_format: Default::default(),
-            provider_options: Value::Null,
-            render_config: provider.render_config_blob(),
-            renderer_version: provider.renderer_version(),
-            stop_when: self.stop_when.clone(),
-            on_restart: None,
-            ts_ms: Some(0),
-            written_at_ms: Some(0),
-            manifest: self.manifest.clone(),
-            global_system: Vec::new(),
-            compaction_plan_version: layout(),
-            render_tags: false,
-            budget: budget(),
-            keep_warm: warm_script().map(|_| broca_protocol::request::KeepWarm::Auto),
-            context_limit: frozen_context_limit(),
-            auth_selection: account_selection(),
-            account_limit_pause: account().is_some(),
-        }
+        let mut request = self.request_for(run_id, input);
+        broca_session_loop::admit::admission(
+            &mut request,
+            &admission_control(self),
+            provider,
+            &Default::default(),
+            Some(1),
+        )
+        .expect("the shared rules admit the run")
+    }
+}
+
+/// The run control fields that decide a new run's admission. Each of today's runs is given them,
+/// and the new loop's admission is derived from the same values.
+fn admission_control(scenario: &Scenario) -> RunControl {
+    RunControl {
+        auth_selection: account_selection(),
+        account_limit_pause: account().is_some(),
+        manifest: scenario.manifest.clone(),
+        new_log_compaction_plan_version: layout(),
+        admitted_context_limit: frozen_context_limit(),
+        hook_plane: Some(harness_hooks()),
+        ..Default::default()
     }
 }
 
@@ -1737,7 +1738,7 @@ async fn today_from(
                     Arc::new(CacheLifetime) as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver>
                 }),
             },
-            ..Default::default()
+            ..admission_control(scenario)
         },
         &tx,
     )
@@ -2757,7 +2758,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
             .clone()
             .map(|spy| spy as Arc<dyn broca_core::CompactionPlane>),
         admitted_context_limit: frozen_context_limit(),
-        ..Default::default()
+        ..admission_control(&scenario)
     };
     let lease = FileLeaseStore::new(dir.join("lease"));
     let wal = FileWalStore::new(dir.join("wal"));
@@ -2971,6 +2972,27 @@ async fn a_second_run_on_the_same_session() {
         &[
             ("r1", vec![system("You are careful."), user("first task")]),
             ("r2", vec![user("second task")]),
+        ],
+    )
+    .await;
+}
+
+/// A later run that sends the session's system prompt again, as a client naturally does on every
+/// turn, renders it once. Outside the compaction contract the repeat is stripped from the run's
+/// input before it is written; on the contract it is the session's system text, accepted again.
+#[tokio::test]
+async fn a_later_run_resending_the_system_prompt_renders_it_once() {
+    compare_runs(
+        Scenario {
+            input: Vec::new(),
+            tools: vec![tool("read", ExecutionMode::Sequential)],
+            manifest: None,
+            stop_when: vec![StopCondition::StepCount { n: 8 }],
+            steps: vec![text_step("a1", "done"), text_step("a2", "done again")],
+        },
+        &[
+            ("r1", vec![system("You are careful."), user("first task")]),
+            ("r2", vec![system("You are careful."), user("second task")]),
         ],
     )
     .await;
@@ -3309,7 +3331,7 @@ async fn compare_actions_in_once(
         provider_held_lifecycle: Some(plane.lifecycle()),
         cancel: Some(cancel),
         new_log_compaction_plan_version: layout(),
-        ..Default::default()
+        ..admission_control(&scenario)
     };
     let first = run_loop_on_writer(
         request.clone(),
@@ -3348,7 +3370,7 @@ async fn compare_actions_in_once(
                     .map_or_else(Default::default, |script| script.wait),
                 provider_held_lifecycle: Some(plane.lifecycle()),
                 new_log_compaction_plan_version: layout(),
-                ..Default::default()
+                ..admission_control(&scenario)
             },
             &tx,
         )
@@ -3745,7 +3767,7 @@ async fn compare_auth_pause_in_once(
                 max_same_account_wait: account()
                     .map_or_else(Default::default, |script| script.wait),
                 new_log_compaction_plan_version: layout(),
-                ..Default::default()
+                ..admission_control(&scenario)
             },
             &tx,
         )

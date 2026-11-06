@@ -207,8 +207,9 @@ pub enum LoopError {
     /// The tool plane refused something the run can't go on without, such as registering a
     /// batch's call keys for late results.
     Tools(String),
-    /// A run sent system text other than the session's; nothing was written.
-    SystemPromptChanged,
+    /// A rule today's loop shares with this one refused the run before anything was written:
+    /// for example system text other than the session's, or a plan whose hooks can't run.
+    Refused(broca_core::RunError),
 }
 
 impl From<SessionError> for LoopError {
@@ -234,21 +235,22 @@ where
     // A session keeps the layout its first run started under; a new run on it freezes the view
     // library's current plan version, as today's loop does.
     let mut admission = admission;
-    let contract = match writer
-        .operations()
-        .run
-        .as_ref()
-        .and_then(|run| run.start.as_ref())
-    {
-        Some(start) => start.compaction_plan_version.is_some(),
-        None => admission.compaction_plan_version.is_some(),
-    };
+    let contract =
+        crate::admit::session_contract(writer.operations(), admission.compaction_plan_version);
     admission.compaction_plan_version = contract.then_some(cortexkit_compaction_view::PLAN_VERSION);
+    let mut input = std::mem::take(&mut admission.input);
     if contract {
-        let mut input = std::mem::take(&mut admission.input);
         admission.global_system = global_system(writer, parts, &mut input, &admission)?;
-        admission.input = input;
+    } else if let Some(previous) = writer.operations().run.as_ref() {
+        // A later run outside the contract: its system messages must repeat the session's.
+        broca_core::fresh_start::append_system_messages(
+            &mut input,
+            &writer.conversation().messages,
+            previous_is_import(previous)?,
+        )
+        .map_err(LoopError::Refused)?;
     }
+    admission.input = input;
     let mut placed = Placed {
         facts: contract
             .then(|| Tags::for_run(admission.manifest.as_deref(), &admission.render_config)),
@@ -263,20 +265,14 @@ where
 }
 
 /// Takes the system messages out of a run's input and decides the system text its requests
-/// render, as today's loop does for a session on the current compaction contract: a planned
-/// run renders its plan's system text and ignores what it was sent; any other run renders what
-/// it was sent, or the previous run's text when it sent none, and is refused when it sent text
-/// that differs from the previous run's.
+/// render, by the rule today's loop calls for a session on the current compaction contract
+/// (`broca_core::fresh_start::new_episode_globals`), given the previous run's text.
 fn global_system<W: Writer>(
     writer: &W,
     parts: &dyn Parts,
     input: &mut Vec<Message>,
     admission: &Admission,
 ) -> Result<Vec<Message>, LoopError> {
-    let supplied = broca_core::compaction_v2::systems::take_globals(input);
-    if let Some(manifest) = &admission.manifest {
-        return Ok(broca_core::compaction_v2::systems::from_manifest(manifest));
-    }
     let previous = match writer
         .operations()
         .run
@@ -291,11 +287,28 @@ fn global_system<W: Writer>(
         Some(part) => decode::<Vec<Message>>(Some(parts.get(part).map_err(LoopError::Parts)?))?,
         None => None,
     };
-    match previous {
-        Some(previous) if supplied.is_empty() => Ok(previous),
-        Some(previous) if previous != supplied => Err(LoopError::SystemPromptChanged),
-        _ => Ok(supplied),
-    }
+    broca_core::fresh_start::new_episode_globals(
+        input,
+        admission.manifest.as_deref(),
+        previous.as_deref(),
+    )
+    .map_err(LoopError::Refused)
+}
+
+/// Whether the run before a new one is the run start an import wrote, rather than a run's.
+fn previous_is_import(run: &broca_session_store::fold::operations::Run) -> Result<bool, LoopError> {
+    let Some(start) = run.start.as_ref() else {
+        return Ok(false);
+    };
+    let provider_options = start
+        .run_choices
+        .as_ref()
+        .and_then(|choices| choices.get("config"))
+        .and_then(|config| config.get("provider_options"));
+    Ok(broca_core::fresh_start::is_import_start(
+        &start.model,
+        provider_options.unwrap_or(&Value::Null),
+    ))
 }
 
 /// Continues the session's latest run from its last durable record, after a crash or a
@@ -2995,19 +3008,14 @@ fn hook_plan<P, T>(
     admission: &Admission,
     seams: &Seams<'_, P, T>,
 ) -> Result<Option<broca_core::hooks::HookPlan>, LoopError> {
-    let Some(manifest) = admission
-        .manifest
-        .as_deref()
-        .filter(|manifest| broca_core::hooks::has_transforms(manifest))
+    let Some(plan) = broca_core::fresh_start::admitted_hook_plan(
+        admission.manifest.as_ref(),
+        seams.hook_plane.is_some(),
+    )
+    .map_err(LoopError::Refused)?
     else {
         return Ok(None);
     };
-    let plan = broca_core::hooks::HookPlan::from_manifest(manifest).map_err(LoopError::Parts)?;
-    if seams.hook_plane.is_none() {
-        return Err(LoopError::Unsupported(
-            "a plan that declares hooks, without a hook plane",
-        ));
-    }
     if plan.approves() {
         return Err(LoopError::Unsupported(
             "hooks that ask a person to approve a call",
