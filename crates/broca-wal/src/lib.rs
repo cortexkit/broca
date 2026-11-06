@@ -28,6 +28,7 @@ pub use file_wal::{
     WalError, WalRangeRead, WalRangeRecords, WalTailRead, DEFAULT_MAX_READ_BYTES,
 };
 pub use floor::{raise_floor, read_floor, FEATURE_FLOOR_FILENAME};
+pub use framing::session_storage_head;
 pub use framing::PreparedV4Frame;
 #[cfg(any(test, feature = "test-known-feature"))]
 pub use framing::{forget_feature_for_test, ForgottenFeature};
@@ -39,8 +40,8 @@ pub use framing::{
     PLAN_MANIFEST_FEATURE, PLAN_REFERENCE_SLOTS_FEATURE, PROVIDER_DECLARATIONS_FEATURE,
     PROVIDER_FALLBACK_BLOCK_FEATURE, PROVIDER_HELD_FEATURE, REFUSAL_FALLBACK_FEATURE,
     RUNNER_TAGS_FEATURE, RUNNER_TAGS_V2_FEATURE, SCOPE_FEATURE, SERVICE_TIER_QUEUE_FEATURE,
-    SESSION_CHANGE_FEATURE, STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE,
-    TOOL_NAME_ALIASES_FEATURE, TOOL_REPLY_FEATURE, TOOL_TIMES_FEATURE,
+    SESSION_CHANGE_FEATURE, SESSION_STORAGE_DIR, SESSION_STORAGE_FEATURE, STEER_QUEUE_FEATURE,
+    STEP_TRANSFORMS_FEATURE, TOOL_NAME_ALIASES_FEATURE, TOOL_REPLY_FEATURE, TOOL_TIMES_FEATURE,
 };
 pub use record::{
     compaction_replacement_sha256, AccountDecision, AccountLimitPause, ApprovalDecision,

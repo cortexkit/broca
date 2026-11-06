@@ -143,6 +143,11 @@ fn event(runner: &str, attempt: &DurableAttempt) -> Option<StepFinished> {
     event.work_class = reservation.run.work_class.clone();
     event.request_body_bytes = Some(reservation.request_body_bytes);
     event.context_limit = reservation.run.context_limit;
+    event
+        .route_decision_id
+        .clone_from(&attempt.route_decision_id);
+    event.sent_to_last_content_ms = attempt.sent_to_last_content_ms;
+    event.first_to_last_content_ms = attempt.first_to_last_content_ms;
     // Interrupted reservations carry no usage measurement, including no estimated zero.
     if attempt.interrupted_at_ms.is_none() {
         let mut usage = envelope.usage.unwrap_or_default();
@@ -231,6 +236,9 @@ mod tests {
             attempt_id: serde_json::from_value(json!("0123456789abcdef0123456789abcdef")).unwrap(),
             reservation: Box::new(reservation),
             envelope: Box::new(serde_json::from_value(envelope).unwrap()),
+            route_decision_id: None,
+            sent_to_last_content_ms: None,
+            first_to_last_content_ms: None,
         }
     }
 
@@ -268,6 +276,28 @@ mod tests {
             .unwrap();
             assert_eq!(decoded, event);
         }
+    }
+
+    #[test]
+    fn recorded_content_intervals_and_decision_are_optional_and_checked() {
+        let mut attempt = fixture(false);
+        attempt.route_decision_id = Some("frozen-caller".into());
+        attempt.sent_to_last_content_ms = Some(80);
+        attempt.first_to_last_content_ms = Some(60);
+        let value = serde_json::to_value(event("runner_a", &attempt).unwrap()).unwrap();
+        assert_eq!(value["route_decision_id"], "frozen-caller");
+        assert_eq!(value["sent_to_last_content_ms"], 80);
+        assert_eq!(value["first_to_last_content_ms"], 60);
+        let absent = serde_json::to_value(event("runner_a", &fixture(false)).unwrap()).unwrap();
+        for key in [
+            "route_decision_id",
+            "sent_to_last_content_ms",
+            "first_to_last_content_ms",
+        ] {
+            assert!(absent.get(key).is_none(), "{key}");
+        }
+        attempt.first_to_last_content_ms = Some(81);
+        assert!(event("runner_a", &attempt).is_none());
     }
 
     #[test]

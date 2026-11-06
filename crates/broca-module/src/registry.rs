@@ -609,6 +609,19 @@ enum Entry {
 /// executor) so the admission concurrency is deterministically testable.
 #[async_trait]
 pub trait LineageOpener: Send + Sync {
+    async fn check_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> Result<
+        Option<cortexkit_role_llm_runner::head_selection::PlanModel>,
+        cortexkit_role_llm_runner::head_selection::PlanModelProblem,
+    > {
+        cortexkit_role_llm_runner::head_selection::check_plan(
+            plan,
+            &broca_wire::broca_role_describe(env!("CARGO_PKG_VERSION")).role,
+            |_| None,
+        )
+    }
     /// Retire routes synchronously when retention deletes a session without an actor.
     fn on_session_deleted(&self, _session: &LineageKey) {}
     fn retire_session_transport(&self, _session: &LineageKey) {}
@@ -1952,6 +1965,16 @@ impl LineageRegistry {
     ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, broca_core::RunError>
     {
         self.inner.opener.media_profile(request).await
+    }
+
+    pub(crate) async fn check_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> Result<
+        Option<cortexkit_role_llm_runner::head_selection::PlanModel>,
+        cortexkit_role_llm_runner::head_selection::PlanModelProblem,
+    > {
+        self.inner.opener.check_plan_selection(plan).await
     }
     pub fn active_event_sessions(&self) -> Vec<LineageKey> {
         self.inner

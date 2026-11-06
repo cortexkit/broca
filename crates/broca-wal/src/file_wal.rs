@@ -430,6 +430,18 @@ impl std::fmt::Display for WalError {
             WalError::Corrupt { offset, source } => {
                 write!(f, "wal corruption at offset {offset}: {source}")
             }
+            WalError::NewerWriter { missing, .. }
+                if missing
+                    .iter()
+                    .any(|name| name == crate::framing::SESSION_STORAGE_FEATURE) =>
+            {
+                write!(
+                    f,
+                    "session is kept in the newer session storage ({}), which this build does not \
+                     serve; run a build that serves it",
+                    missing.join(", ")
+                )
+            }
             WalError::NewerWriter {
                 missing,
                 ..

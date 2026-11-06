@@ -1139,6 +1139,54 @@ async fn a_request_whose_input_and_default_reservation_cross_the_window_is_clamp
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A session on the current compaction contract estimates a step's input from the request it
+/// renders, as any other session does. Nothing on that contract records the request's size in
+/// advance, so an estimate that took the first compaction protocol's size would read 0 tokens and
+/// never lower the cap.
+#[tokio::test]
+async fn a_request_on_the_current_compaction_contract_is_clamped_from_its_rendered_size() {
+    let dir = scratch("clamp-contract");
+    let provider = WindowProvider::new(916_594);
+    let finished = run_with(
+        &dir,
+        &provider,
+        request(&dir),
+        None,
+        RunControl {
+            admitted_context_limit: Some(WINDOW),
+            new_log_compaction_plan_version: Some(cortexkit_compaction_view::PLAN_VERSION),
+            ..Default::default()
+        },
+        false,
+    )
+    .await;
+    assert_eq!(finished, RunFinishReason::Completed);
+
+    let sent = provider.sent();
+    assert_eq!(sent.len(), 2);
+    let estimate = estimate(916_594, &sent[0], &sent[1], &provider);
+    assert!(
+        estimate + u64::from(CAP) > WINDOW,
+        "the frozen cap crosses the window"
+    );
+    let expected = WINDOW - estimate - margin(WINDOW);
+    assert_eq!(
+        sent[1].cap(),
+        Some(expected as u32),
+        "step 2's cap is lowered from its rendered size"
+    );
+    assert!(records(&dir).iter().any(|record| {
+        *record
+            == WalRecord::OutputReservationClamped {
+                step_id: StepId(2),
+                max_output_tokens: expected as u32,
+                estimated_input_tokens: estimate,
+                context_limit: WINDOW,
+            }
+    }));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// When even the floor does not fit, the run ends `context_overflow` and the request is never
 /// sent, so the caller compacts instead of retrying into the provider's refusal.
 #[tokio::test]

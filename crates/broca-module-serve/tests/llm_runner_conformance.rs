@@ -304,6 +304,8 @@ mod reader_identity;
 #[cfg(feature = "test-clock")]
 #[path = "llm_runner_conformance/retention.rs"]
 mod retention;
+#[path = "llm_runner_conformance/routed_accounts.rs"]
+mod routed_accounts;
 #[path = "llm_runner_conformance/session_class.rs"]
 mod session_class;
 /// The `it` target's real-daemon diagnostics (log tails, watchdog stall files, decoded session
@@ -378,7 +380,11 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    routed_account_peers:
+        Mutex<HashMap<String, cortexkit_role_llm_runner_conformance::RecordingRoutingPeer>>,
+    routed_http_requests: Mutex<HashMap<String, Vec<routed_accounts::HttpRequestEvidence>>>,
     service_tier_sessions: Mutex<BTreeSet<String>>,
+    head_selection_sessions: Mutex<BTreeSet<String>>,
     service_tier_keys: Mutex<HashMap<String, String>>,
     service_tier_rides: Mutex<HashMap<String, Vec<Value>>>,
     service_tier_request_rides: Mutex<HashMap<String, Vec<u64>>>,
@@ -506,7 +512,13 @@ async fn start_model(shared: Arc<Shared>) -> String {
             };
             let shared = shared.clone();
             tokio::spawn(async move {
-                let _ = serve_model_request(stream, shared).await;
+                if let Err(error) = serve_model_request(stream, shared.clone()).await {
+                    shared
+                        .evidence
+                        .lock()
+                        .unwrap()
+                        .push(format!("scripted model transport: {error}"));
+                }
             });
         }
     });
@@ -720,6 +732,10 @@ async fn serve_model_request(
     mut stream: tokio::net::TcpStream,
     shared: Arc<Shared>,
 ) -> std::io::Result<()> {
+    let mut first = [0u8; 1];
+    if stream.peek(&mut first).await? == 1 && first[0] == b'G' {
+        return routed_accounts::serve_websocket(stream, shared).await;
+    }
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 8192];
     let body_start = loop {
@@ -818,6 +834,21 @@ async fn serve_model_request(
             .and_then(|script| script.turns.get(turn_index).cloned())
     });
     if let Some(session) = &session {
+        if shared
+            .routed_account_peers
+            .lock()
+            .unwrap()
+            .contains_key(session)
+        {
+            let evidence = routed_accounts::http_request_evidence(&headers);
+            shared
+                .routed_http_requests
+                .lock()
+                .unwrap()
+                .entry(session.clone())
+                .or_default()
+                .push(evidence);
+        }
         shared
             .raw_bodies
             .lock()
@@ -928,8 +959,29 @@ async fn serve_model_request(
 
     *shared.last_session.lock().unwrap() = Some(session.clone());
     let id = format!("chatcmpl-{session}-{turn_index}");
-    if model.ends_with(output_refs::MODEL) {
-        let body = output_refs::stream(&id, &turn);
+    // A local endpoint override does not change the provider's native stream grammar.
+    let messages_endpoint = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .is_some_and(|target| {
+            target
+                .split('?')
+                .next()
+                .is_some_and(|path| path.ends_with("/messages"))
+        });
+    let native_messages = messages_endpoint
+        && shared
+            .routed_account_peers
+            .lock()
+            .unwrap()
+            .contains_key(&session);
+    if model.ends_with(output_refs::MODEL) || native_messages {
+        let body = if native_messages {
+            output_refs::stream_for_model(&id, model, &turn)
+        } else {
+            output_refs::stream(&id, &turn)
+        };
         let headers = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
         stream.write_all(headers.as_bytes()).await?;
         stream.write_all(body.as_bytes()).await?;
@@ -1240,6 +1292,7 @@ struct Live {
     #[cfg(feature = "test-clock")]
     bus_credentials: Option<tokio::task::JoinHandle<()>>,
     connections: tokio::sync::Mutex<HashMap<String, Arc<SubcConnection>>>,
+    _routed_services: Option<routed_accounts::Services>,
 }
 
 impl Live {
@@ -1340,6 +1393,7 @@ impl Drop for Live {
 #[derive(Clone)]
 struct BrocaSubject {
     shared: Arc<Shared>,
+    routed_instances: Arc<tokio::sync::Mutex<HashMap<String, std::sync::Weak<Live>>>>,
     model_url: String,
     /// The project root for legacy seeds; routed identities use the session-ref inventory.
     project_root: PathBuf,
@@ -1365,6 +1419,7 @@ impl BrocaSubject {
         std::fs::create_dir_all(&project_root).unwrap();
         Self {
             shared,
+            routed_instances: Default::default(),
             model_url,
             project_root: project_root.canonicalize().unwrap(),
             dump_dir: None,
@@ -1422,6 +1477,15 @@ impl BrocaSubject {
     }
 
     async fn start(&self, root: &Path) -> Result<Live, HarnessError> {
+        self.start_configured(root, None).await
+    }
+
+    async fn start_configured(
+        &self,
+        root: &Path,
+        routed_session: Option<&str>,
+    ) -> Result<Live, HarnessError> {
+        let routed = routed_session.is_some();
         let fail = |what: String| HarnessError::new(what);
         let config_home = root.join("config");
         let runtime_dir = root.join("runtime");
@@ -1430,6 +1494,10 @@ impl BrocaSubject {
         std::fs::create_dir_all(&home).map_err(|e| fail(e.to_string()))?;
         let state_root = root.join("broca-state");
         seed_structured_output_catalog(&state_root).map_err(|e| fail(e.to_string()))?;
+        if let Some(session) = routed_session {
+            routed_accounts::seed_catalog(&state_root, &self.model_url, session)
+                .map_err(|e| fail(e.to_string()))?;
+        }
         let config_path = config_home.join("cortexkit").join("subc.jsonc");
         std::fs::create_dir_all(config_path.parent().unwrap()).map_err(|e| fail(e.to_string()))?;
         std::fs::create_dir_all(&runtime_dir).map_err(|e| fail(e.to_string()))?;
@@ -1523,18 +1591,16 @@ impl BrocaSubject {
             });
         }
         let broca_config = config_home.join("cortexkit/broca.jsonc");
-        std::fs::write(
-            &broca_config,
-            serde_json::to_vec(
-                &self
-                    .backup_classes
-                    .as_ref()
-                    .map(|classes| json!({"backup_classes": classes,"bus_run_events_enabled":self.bus_events_enabled,"service_tier":{"enabled":self.service_tier_enabled}}))
-                    .unwrap_or_else(|| json!({"bus_run_events_enabled":self.bus_events_enabled,"service_tier":{"enabled":self.service_tier_enabled}})),
-            )
-            .unwrap(),
-        )
-        .map_err(|error| fail(error.to_string()))?;
+        let mut settings = json!({"bus_run_events_enabled":self.bus_events_enabled && !routed,
+            "service_tier":{"enabled":self.service_tier_enabled}});
+        if let Some(classes) = &self.backup_classes {
+            settings["backup_classes"] = json!(classes);
+        }
+        if routed {
+            routed_accounts::configure(root, &self.model_url, &mut config, &mut settings)?;
+        }
+        std::fs::write(&broca_config, serde_json::to_vec(&settings).unwrap())
+            .map_err(|error| fail(error.to_string()))?;
         config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] = json!(broca_config);
         if let Some(dump_dir) = &self.dump_dir {
             config["modules"]["broca"]["env"]["BROCA_DUMP_REQUEST_DIR"] = json!(dump_dir);
@@ -1555,6 +1621,7 @@ impl BrocaSubject {
             .env("XDG_DATA_HOME", &data_home)
             .env("HOME", &home)
             .env_remove("BROCA_STATE_ROOT")
+            .env_remove("BROCA_PROVIDER_BASE_URL")
             .env("SUBC_PORT", "0")
             .env_remove("SUBC_LAUNCH_NONCE")
             .env_remove("SUBC_LAUNCH_NONCE_FD")
@@ -1586,12 +1653,20 @@ impl BrocaSubject {
         let tools = tokio::spawn(async move {
             let _ = serve.await;
         });
+        let routed_services = match routed_session {
+            Some(session) => Some(
+                routed_accounts::register(&connection_file, self.shared.clone(), session).await?,
+            ),
+            None => None,
+        };
         #[cfg(feature = "test-clock")]
-        let bus_credentials = match &self.bus {
+        let bus_credentials = match self.bus.as_ref().filter(|_| !routed) {
             Some(bus) => Some(bus.register(&connection_file).await),
             None => None,
         };
-        *self.shared.fixture_connection.lock().unwrap() = Some(connection_file.clone());
+        if !routed {
+            *self.shared.fixture_connection.lock().unwrap() = Some(connection_file.clone());
+        }
         publish_scope_fixtures(&scope_sync, &scope_events).await?;
         Ok(Live {
             daemon: Some(daemon),
@@ -1603,6 +1678,7 @@ impl BrocaSubject {
             #[cfg(feature = "test-clock")]
             bus_credentials,
             connections: tokio::sync::Mutex::new(HashMap::new()),
+            _routed_services: routed_services,
         })
     }
 
@@ -2032,6 +2108,7 @@ struct BrocaRoute {
     session: broca_protocol::BindIdentity,
     describe_calls: std::sync::atomic::AtomicUsize,
     logs_dir: PathBuf,
+    _routed_live: Option<Arc<Live>>,
 }
 
 fn scripted_usage_chunk(id: &str, usage: &ScriptedUsage, output_cap: u64) -> Value {
@@ -2264,6 +2341,63 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    async fn routing_runner_declaration(&self) -> Result<Value, HarnessError> {
+        Ok(routed_accounts::runner_declaration())
+    }
+
+    async fn routed_account_fixture(&self, method: &str) -> Result<Value, HarnessError> {
+        routed_accounts::fixture(method)
+    }
+
+    async fn install_routing_peer(
+        &self,
+        session: &str,
+        peer: cortexkit_role_llm_runner_conformance::RecordingRoutingPeer,
+    ) -> Result<(), HarnessError> {
+        let live = self
+            .routed_instances
+            .lock()
+            .await
+            .get(session)
+            .and_then(std::sync::Weak::upgrade);
+        if live.is_none() {
+            return Err(HarnessError::new(
+                "routed-account session has no vault-backed runner",
+            ));
+        }
+        self.shared
+            .routed_account_peers
+            .lock()
+            .unwrap()
+            .insert(session.into(), peer);
+        Ok(())
+    }
+
+    async fn head_selection_models(
+        &self,
+        session: &str,
+    ) -> Result<Option<[cortexkit_role_llm_runner::head_selection::PlanModel; 2]>, HarnessError>
+    {
+        use cortexkit_role_llm_runner::{head_selection::PlanModel, service_tier::ServiceTier};
+        self.shared
+            .head_selection_sessions
+            .lock()
+            .unwrap()
+            .insert(session.into());
+        self.shared.service_tier_keys.lock().unwrap().insert(
+            broca_provider::hash::clamp_prompt_cache_key(&format!("tier-fixture-{session}")),
+            session.into(),
+        );
+        let mut selected = PlanModel::new("xai", "conformance-service-tier");
+        if self.service_tier_enabled {
+            selected.service_tier = Some(ServiceTier::Fast);
+        }
+        Ok(Some([
+            selected,
+            PlanModel::new("xai", "head-selection-unavailable"),
+        ]))
+    }
+
     fn model_finish_reason_source(&self) -> Option<&'static str> {
         Some("openai.chat_completions")
     }
@@ -2509,6 +2643,8 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::FinishReason,
             Capability::RunUsage,
             Capability::SessionUsage,
+            Capability::HeadSelection,
+            Capability::RoutedAccounts,
             Capability::RunCancel,
             Capability::Retract,
             Capability::DispatchAttribution,
@@ -2542,6 +2678,9 @@ impl LlmRunnerSubject for BrocaSubject {
         // both admission and the retention group in role.describe.
         if broca_module_serve::RETENTION_WRITER_ENABLED {
             capabilities.extend([Capability::Retention, Capability::RetentionClock]);
+        }
+        if self.service_tier_enabled {
+            capabilities.insert(Capability::ServiceTier);
         }
         capabilities.extend([Capability::Attachments, Capability::MediaOnlySend]);
         capabilities
@@ -2612,6 +2751,8 @@ impl LlmRunnerSubject for BrocaSubject {
         session: &str,
         stamp: &RouteStamp,
     ) -> Result<BrocaRoute, HarnessError> {
+        let routed_live = routed_accounts::session_live(self, handle, session).await?;
+        let handle = routed_live.as_deref().unwrap_or(handle);
         let connection = self.connection(handle, stamp).await?;
         self.shared
             .session_roots
@@ -2654,10 +2795,37 @@ impl LlmRunnerSubject for BrocaSubject {
             session: identity,
             describe_calls: std::sync::atomic::AtomicUsize::new(0),
             logs_dir: handle.logs_dir.clone(),
+            _routed_live: routed_live,
         })
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if let Some(peer) = self
+            .shared
+            .routed_account_peers
+            .lock()
+            .unwrap()
+            .get(session)
+        {
+            return routed_accounts::send_fields(session, first, peer);
+        }
+        if self
+            .shared
+            .head_selection_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+        {
+            let mut fields = json!({"cache":{"key":format!("tier-fixture-{session}")}});
+            if first {
+                fields["model"] =
+                    json!({"provider":"mock","model":format!("{PLAN_MODEL_PREFIX}{session}")});
+                let composition = json!({"providers":[],"step_transform_items":[]});
+                fields["plan"] = json!({"tool_items":[],"system_text_items":[],"step_transform_items":[],
+                    "composition":composition,"composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap()});
+            }
+            return fields.as_object().unwrap().clone();
+        }
         if self
             .shared
             .service_tier_sessions
@@ -3867,6 +4035,128 @@ fn disabled_kill_case(
         && matches!(&case.outcome, CaseOutcome::Skipped { missing } if missing == &expected)
 }
 
+fn check_routed_account_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+) -> Result<(), String> {
+    for name in [
+        "routed_accounts_follows_account_choice",
+        "routed_accounts_account_for",
+    ] {
+        let case = cases
+            .iter()
+            .find(|case| case.case == name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        if case.outcome != CaseOutcome::Passed {
+            return Err(format!("{name}: {:?}", case.outcome));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn routed_accounts_cases_cannot_skip_or_claim_inapplicability() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+    let cases: Vec<_> = CASES
+        .iter()
+        .filter(|case| case.name.starts_with("routed_accounts_"))
+        .map(|case| CaseReport {
+            case: case.name,
+            requires: case.requires.to_vec(),
+            outcome: CaseOutcome::Passed,
+        })
+        .collect();
+    assert_eq!(cases.len(), 2);
+    assert!(check_routed_account_cases(&cases).is_ok());
+    for index in 0..cases.len() {
+        for outcome in [
+            CaseOutcome::Skipped { missing: vec![] },
+            CaseOutcome::Inapplicable {
+                reason: "routed_accounts is not declared on the wire".into(),
+            },
+        ] {
+            let mut broken = cases.clone();
+            broken[index].outcome = outcome;
+            assert!(check_routed_account_cases(&broken).is_err());
+        }
+        let mut missing = cases.clone();
+        missing.remove(index);
+        assert!(check_routed_account_cases(&missing).is_err());
+    }
+}
+
+fn check_head_selection_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+    tiers: bool,
+) -> Result<(), String> {
+    for name in [
+        "head_selection_plan_tier",
+        "head_selection_send_overrides",
+        "head_selection_unsupported_tier",
+        "head_selection_unsupported_model",
+        "head_selection_immediate_head",
+        "head_selection_absent_preserves_choice",
+        "head_selection_unchanged_after_host_switch",
+    ] {
+        let case = cases
+            .iter()
+            .find(|case| case.case == name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        let expected_inapplicable = if name == "head_selection_unchanged_after_host_switch" {
+            Some("adapter cannot record a host-side model switch")
+        } else if !tiers
+            && matches!(
+                name,
+                "head_selection_plan_tier"
+                    | "head_selection_send_overrides"
+                    | "head_selection_unsupported_tier"
+                    | "head_selection_absent_preserves_choice"
+            )
+        {
+            Some("service_tier is not declared")
+        } else {
+            None
+        };
+        let valid = match expected_inapplicable {
+            Some(expected) => {
+                matches!(&case.outcome, CaseOutcome::Inapplicable { reason } if reason == expected)
+            }
+            None => case.outcome == CaseOutcome::Passed,
+        };
+        if !valid {
+            return Err(format!("{name}: {:?}", case.outcome));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn head_selection_cases_require_real_fixtures_and_explicit_inapplicability() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+    let cases: Vec<_> = CASES
+        .iter()
+        .filter(|case| case.name.starts_with("head_selection_"))
+        .map(|case| CaseReport {
+            case: case.name,
+            requires: case.requires.to_vec(),
+            outcome: if case.name == "head_selection_unchanged_after_host_switch" {
+                CaseOutcome::Inapplicable {
+                    reason: "adapter cannot record a host-side model switch".into(),
+                }
+            } else {
+                CaseOutcome::Passed
+            },
+        })
+        .collect();
+    assert!(check_head_selection_cases(&cases, true).is_ok());
+    for index in 0..cases.len() {
+        let mut broken = cases.clone();
+        broken[index].outcome = CaseOutcome::Skipped { missing: vec![] };
+        assert!(check_head_selection_cases(&broken, true).is_err());
+        broken.remove(index);
+        assert!(check_head_selection_cases(&broken, true).is_err());
+    }
+}
+
 /// Additive kit cases must not turn an undeclared capability into a required pass.
 /// Check the contracts this adapter implements by name, not by a shared name prefix's size.
 fn check_named_contract_cases(
@@ -4110,6 +4400,8 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence());
     }
     assert!(failed.is_empty(), "{}", report.render());
+    check_routed_account_cases(&report.cases).unwrap();
+    check_head_selection_cases(&report.cases, subject.service_tier_enabled).unwrap();
     // Broca does not promise caller-selected output caps on every provider. Only that
     // prerequisite is skipped; provider-limit finish normalization must still pass below.
     assert_eq!(
@@ -5130,8 +5422,9 @@ async fn production_executor_installs_hooks_and_describes_ordered_phases() {
     };
     let describe = response(route.request("role.describe", json!({})).await.unwrap());
     let served = route.describe_golden_bytes().await;
-    let golden =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../broca-wire/tests/golden/role_describe.json");
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../broca-wire/tests/golden")
+        .join(writer_describe_golden_name(subject.service_tier_enabled));
     if std::env::var_os("BROCA_REGENERATE_ROLE_DESCRIBE_GOLDEN").is_some() {
         std::fs::write(&golden, &served).unwrap();
         println!("role_describe.json: {}", String::from_utf8_lossy(&served));
@@ -5801,6 +6094,7 @@ mod held_call_tests {
     fn subject(shared: Arc<Shared>) -> BrocaSubject {
         BrocaSubject {
             shared,
+            routed_instances: Default::default(),
             model_url: String::new(),
             project_root: PathBuf::new(),
             dump_dir: None,
@@ -6655,4 +6949,73 @@ async fn conformance_creation_seed_refuses_to_fabricate_a_host_fact() {
         .seed_host_created_at("synthetic-session", "m0", 600)
         .await
         .unwrap());
+}
+
+#[tokio::test]
+async fn conformance_subject_declares_service_tier_exactly_when_enabled() {
+    let root = broca_test_support::scratch_root().join("subject-service-tier-declaration");
+    let mut subject = BrocaSubject::new(&root).await;
+    for enabled in [false, true] {
+        subject.service_tier_enabled = enabled;
+        assert_eq!(
+            subject.capabilities().contains(&Capability::ServiceTier),
+            enabled
+        );
+    }
+}
+
+fn writer_describe_golden_name(service_tier_enabled: bool) -> &'static str {
+    if service_tier_enabled {
+        "role_describe_service_tier.json"
+    } else {
+        "role_describe.json"
+    }
+}
+
+#[test]
+fn conformance_describe_golden_matches_enabled_boot_switch() {
+    const CHILD: &str = "BROCA_DESCRIBE_GOLDEN_CHILD";
+    if let Ok(state) = std::env::var(CHILD) {
+        let enabled = match state.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => panic!("invalid child switch"),
+        };
+        broca_protocol::configure_service_tier(enabled).unwrap();
+        let actual =
+            broca_wire::broca_role_describe_with_writers("0.0.0-writer-golden", true, true, true);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../broca-wire/tests/golden")
+            .join(writer_describe_golden_name(enabled));
+        let expected = std::fs::read(path).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            expected,
+            "the exact discovery golden must represent the same boot switch as its daemon"
+        );
+        let value: Value = serde_json::from_slice(&expected).unwrap();
+        let describe = cortexkit_role_llm_runner::describe::check_describe(&value).unwrap();
+        assert_eq!(
+            describe.declares(cortexkit_role_llm_runner::capabilities::SERVICE_TIER),
+            enabled
+        );
+        return;
+    }
+    for state in ["off", "on"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conformance_describe_golden_matches_enabled_boot_switch",
+                "--nocapture",
+            ])
+            .env(CHILD, state)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{state}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

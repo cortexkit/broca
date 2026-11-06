@@ -222,6 +222,10 @@ pub struct AuthRequest {
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
 }
 
 /// Admission-only prompt-cache preferences supplied by the caller. Renderers never

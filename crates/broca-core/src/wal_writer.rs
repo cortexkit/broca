@@ -753,6 +753,7 @@ impl FileWalStore {
         if let Some(guard) = &self.session_guard {
             guard(session).map_err(|error| WalError::Io(io::Error::other(error)))?;
         }
+        self.check_session_storage(session)?;
         // A cut file may name the session by its folder-based v1 reference (recorded before
         // the v2 switch) or by its v2 reference. Check both in one pass, so a pending release
         // under either reference outranks a moved tombstone for writes.
@@ -778,6 +779,24 @@ impl FileWalStore {
             }
         }
         broca_wal::migration::guard_refs(&wal, &[&legacy, &current], write)
+    }
+
+    /// Refuses a session kept in the new session storage: it has no WAL here, and this build
+    /// doesn't serve it. Every read and write of a session checks this first, so no path
+    /// answers for it from an absent WAL or creates one, which would fork the session in two.
+    /// A head that can't be checked refuses too, rather than reading as absent.
+    fn check_session_storage(&self, session: &BindIdentity) -> Result<(), WalError> {
+        let state_root = self.root.parent().unwrap_or_else(|| Path::new(""));
+        let head = broca_wal::session_storage_head(state_root, &session_addr(session));
+        match std::fs::symlink_metadata(head) {
+            Ok(_) => Err(WalError::NewerWriter {
+                offset: 0,
+                ver: 0,
+                missing: vec![broca_wal::SESSION_STORAGE_FEATURE.to_owned()],
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(WalError::Io(error)),
+        }
     }
 
     fn check_authorization_move(&self, session: &BindIdentity) -> Result<(), WalError> {
@@ -2941,6 +2960,10 @@ enum WalCommand {
         record: Box<WalRecord>,
         prepared: broca_wal::PreparedV4Frame,
     },
+    StepEventRun {
+        run_id: broca_protocol::RunId,
+        route_decision_id: Option<String>,
+    },
     /// fsync everything pending + ack with the last FSYNCED seq (a barrier point).
     Sync(oneshot::Sender<Result<u64, WalWriteError>>),
     /// Final fsync if anything is still dirty, then stop the writer.
@@ -3023,6 +3046,11 @@ pub struct DurableAttempt {
     pub attempt_id: broca_wal::record::AttemptId,
     pub reservation: Box<broca_wal::record::AttemptReservation>,
     pub envelope: Box<broca_wal::record::AttemptEnvelope>,
+    /// The caller's frozen RunConfig decision, never the account allocator's decision id.
+    pub route_decision_id: Option<String>,
+    /// Content intervals derived from recorded attempt stamps, not completion latency.
+    pub sent_to_last_content_ms: Option<u64>,
+    pub first_to_last_content_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -3030,9 +3058,29 @@ struct StepEventObserver {
     tx: tokio::sync::mpsc::Sender<DurableAttempt>,
     dropped: Arc<AtomicU64>,
     open: std::collections::BTreeMap<broca_wal::record::AttemptId, DurableAttempt>,
+    // A cache-maintenance request can finish after the next model run starts; keep decision ids
+    // until this WAL writer closes.
+    runs: std::collections::BTreeMap<String, Option<String>>,
 }
 
 impl StepEventObserver {
+    fn note_run(&mut self, run_id: &broca_protocol::RunId, route_decision_id: Option<String>) {
+        for attempt in self
+            .open
+            .values_mut()
+            .filter(|attempt| attempt.reservation.run_id == *run_id)
+        {
+            attempt.route_decision_id.clone_from(&route_decision_id);
+        }
+        self.runs.insert(run_id.0.clone(), route_decision_id);
+    }
+
+    fn route_decision(&self, run_id: &broca_protocol::RunId) -> Option<String> {
+        self.runs
+            .get(&run_id.0)
+            .and_then(|decision| decision.clone())
+    }
+
     fn observe(
         &mut self,
         seq: u64,
@@ -3041,6 +3089,9 @@ impl StepEventObserver {
         record: &WalRecord,
     ) {
         match record {
+            WalRecord::RunStarted { run_id, config, .. } => {
+                self.note_run(run_id, config.route_decision_id.clone());
+            }
             WalRecord::AttemptReserved {
                 attempt_id,
                 reservation,
@@ -3055,6 +3106,9 @@ impl StepEventObserver {
                         attempt_id: attempt_id.clone(),
                         reservation: reservation.clone(),
                         envelope: Default::default(),
+                        route_decision_id: self.route_decision(&reservation.run_id),
+                        sent_to_last_content_ms: None,
+                        first_to_last_content_ms: None,
                     },
                 );
             }
@@ -3075,18 +3129,37 @@ impl StepEventObserver {
                 reservation,
                 envelope,
             } => {
-                self.open.remove(id);
+                let opened = self.open.remove(id);
                 // Reserve before copying evidence: a full queue costs no record clone.
                 match self.tx.try_reserve() {
-                    Ok(slot) => slot.send(DurableAttempt {
-                        seq,
-                        lineage,
-                        writer_id,
-                        interrupted_at_ms: None,
-                        attempt_id: id.clone(),
-                        reservation: reservation.clone(),
-                        envelope: envelope.clone(),
-                    }),
+                    Ok(slot) => {
+                        let (sent_to_last_content_ms, first_to_last_content_ms) = match record {
+                            WalRecord::ModelAttemptFinished {
+                                sent_at_ms,
+                                content_progress,
+                                ..
+                            } => crate::replay::content_timing_intervals(
+                                *sent_at_ms,
+                                content_progress.first_content_at_ms,
+                                content_progress.last_content_at_ms,
+                            ),
+                            _ => (None, None),
+                        };
+                        slot.send(DurableAttempt {
+                            seq,
+                            lineage,
+                            writer_id,
+                            interrupted_at_ms: None,
+                            attempt_id: id.clone(),
+                            reservation: reservation.clone(),
+                            envelope: envelope.clone(),
+                            route_decision_id: opened
+                                .and_then(|attempt| attempt.route_decision_id)
+                                .or_else(|| self.route_decision(&reservation.run_id)),
+                            sent_to_last_content_ms,
+                            first_to_last_content_ms,
+                        })
+                    }
                     Err(_) => {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                     }
@@ -3107,7 +3180,10 @@ impl StepEventObserver {
             // Opening must not replay the log just for best-effort hints. Retain only
             // this writer's reservations; durable readers classify earlier writers'
             // open reservations as possibly billed.
-            WalRecord::WriterOpened { .. } => self.open.clear(),
+            WalRecord::WriterOpened { .. } => {
+                self.open.clear();
+                self.runs.clear();
+            }
             // Corrections are not another attempt and must not create another hint.
             _ => {}
         }
@@ -3175,6 +3251,7 @@ impl RecordObserver {
             tx,
             dropped,
             open: Default::default(),
+            runs: Default::default(),
         });
         self
     }
@@ -3572,6 +3649,84 @@ mod step_event_tests {
     }
 
     #[tokio::test]
+    async fn step_event_resume_context_uses_frozen_config_and_recorded_content_stamps() {
+        let mut start: WalRecord = serde_json::from_str(
+            include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let config = match &mut start {
+            WalRecord::RunStarted { run_id, config, .. } => {
+                *run_id = broca_protocol::RunId("run".into());
+                config.route_decision_id = Some("frozen-caller".into());
+                config.auth_selection = Some(serde_json::from_value(serde_json::json!({
+                    "credential_id":"fixture", "account_decision":{"path":"routed","decision_id":"allocator-only"}
+                })).unwrap());
+                (**config).clone()
+            }
+            _ => panic!("fixture has no admission"),
+        };
+        let replays = Arc::new(AtomicU64::new(0));
+        let (observer, mut inbox, _) = observer(8);
+        let handle = WalHandle::spawn_observed(
+            Box::new(CountingWal {
+                records: vec![broca_wal::FramedRecord {
+                    seq: 1,
+                    fence: 1,
+                    record: start,
+                }],
+                replays: replays.clone(),
+                fail_sync: Default::default(),
+            }),
+            2,
+            Some(observer),
+        )
+        .unwrap();
+        handle.note_step_event_run_config(&broca_protocol::RunId("run".into()), &config);
+        let mut value = serde_json::to_value(terminal(1, false)).unwrap();
+        value["type"] = serde_json::json!("model_attempt_finished");
+        for (field, data) in [
+            ("step_id", serde_json::json!(1)),
+            ("attempt", serde_json::json!(0)),
+            ("request_body_len", serde_json::json!(10)),
+            ("request_body_sha256", serde_json::json!("a".repeat(64))),
+            ("response_body_len", serde_json::json!(10)),
+            ("response_body_sha256", serde_json::json!("b".repeat(64))),
+            ("outcome", serde_json::json!("complete")),
+            ("ts_ms", serde_json::json!(900)),
+            ("sent_at_ms", serde_json::json!(100)),
+            ("first_content_at_ms", serde_json::json!(120)),
+            ("last_content_at_ms", serde_json::json!(180)),
+        ] {
+            value[field] = data;
+        }
+        value["envelope"]["sent_at_ms"] = serde_json::json!(100);
+        value["envelope"]["finished_at_ms"] = serde_json::json!(900);
+        handle
+            .record(serde_json::from_value(value).unwrap())
+            .into_result()
+            .unwrap();
+        handle.sync().await.unwrap();
+        let event = inbox.recv().await.unwrap();
+        assert_eq!(event.route_decision_id.as_deref(), Some("frozen-caller"));
+        assert_eq!(event.sent_to_last_content_ms, Some(80));
+        assert_eq!(event.first_to_last_content_ms, Some(60));
+        assert_eq!(
+            replays.load(Ordering::Relaxed),
+            0,
+            "live hints replayed the old WAL"
+        );
+        assert_eq!(
+            handle.next_record_seq(),
+            3,
+            "hint context wrote a WAL record"
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn step_event_writer_open_reads_no_log_for_predecessor_hints() {
         let replays = Arc::new(AtomicU64::new(0));
         let (observer, mut inbox, _) = observer(8);
@@ -3708,6 +3863,7 @@ pub struct WalHandle {
     fence: u64,
     append_budget: Option<Mutex<AppendBudget>>,
     tx: std_mpsc::Sender<WalCommand>,
+    step_events_enabled: bool,
     /// Reservation order must equal channel-send order because the writer cross-checks
     /// handle-assigned and WAL-assigned seqs and poisons the handle if they drift.
     /// A panic while it is held leaves the reserved-versus-enqueued state unknown, so
@@ -4436,6 +4592,9 @@ impl WalHandle {
         startup: (StampClock, Option<open_writers::WriterContext>),
     ) -> Result<WalHandle, WalWriteError> {
         let (clock, context) = startup;
+        let step_events_enabled = observer
+            .as_ref()
+            .is_some_and(|observer| observer.step_events.is_some());
         // One owner holds the WAL and its lease from here until the writer thread takes
         // them, so a panic while preparing the handle or a failed thread spawn still
         // closes the WAL before the lease is released.
@@ -4721,6 +4880,7 @@ impl WalHandle {
             append_budget,
             v4,
             tx,
+            step_events_enabled,
             enqueue_lock,
             next_seq,
             publication_bytes,
@@ -4743,6 +4903,21 @@ impl WalHandle {
     /// WAL snapshot still matches the writer head before the loop appends anything.
     pub fn next_record_seq(&self) -> u64 {
         self.next_seq.load(Ordering::SeqCst)
+    }
+
+    /// Supply already-admitted metadata when resuming or warming without a new RunStarted.
+    /// This supplies run metadata to step-event handling; it writes no record and never reads the WAL.
+    pub fn note_step_event_run_config(
+        &self,
+        run_id: &broca_protocol::RunId,
+        config: &broca_wal::RunConfig,
+    ) {
+        if self.step_events_enabled {
+            let _ = self.tx.send(WalCommand::StepEventRun {
+                run_id: run_id.clone(),
+                route_decision_id: config.route_decision_id.clone(),
+            });
+        }
     }
 
     pub fn needs_display_placement_seed(&self) -> bool {
@@ -5986,6 +6161,17 @@ fn writer_loop_with_identity(
             continue;
         };
         match cmd {
+            WalCommand::StepEventRun {
+                run_id,
+                route_decision_id,
+            } => {
+                if let Some(events) = observer
+                    .as_mut()
+                    .and_then(|observer| observer.step_events.as_mut())
+                {
+                    events.note_run(&run_id, route_decision_id);
+                }
+            }
             #[cfg(all(test, feature = "test-clock"))]
             WalCommand::BudgetSnapshot(ack) => {
                 let _ = ack.send(wal.append_budget());
@@ -6305,6 +6491,53 @@ mod tests {
             wal.check_move(&session, true).is_err(),
             "the unreadable-cut control must reject a lookup"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A session with a head in the new session storage is refused by name for reads and
+    /// writes, so no path serves it from an absent WAL or creates one beside it. Other sessions
+    /// at the same state root are untouched. A head path that can't be checked refuses too,
+    /// instead of reading as no head.
+    #[test]
+    fn a_session_on_the_new_storage_is_refused_for_reads_and_writes() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("session-storage-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("wal")).unwrap();
+        let wal = super::FileWalStore::new(root.join("wal"));
+        let session = broca_protocol::BindIdentity::new("/project", "runner", "stored");
+        let other = broca_protocol::BindIdentity::new("/project", "runner", "other");
+        wal.check_move(&session, true).unwrap();
+        let head = broca_wal::session_storage_head(&root, &super::session_addr(&session));
+        std::fs::create_dir_all(head.parent().unwrap()).unwrap();
+        std::fs::write(&head, b"head").unwrap();
+        for write in [false, true] {
+            match wal.check_move(&session, write) {
+                Err(error @ broca_wal::WalError::NewerWriter { .. }) => {
+                    let broca_wal::WalError::NewerWriter { missing, .. } = &error else {
+                        unreachable!()
+                    };
+                    assert_eq!(missing, &[broca_wal::SESSION_STORAGE_FEATURE]);
+                    assert!(
+                        error.to_string().contains("newer session storage"),
+                        "{error}"
+                    );
+                }
+                other => panic!("write={write}: expected the session-storage refusal: {other:?}"),
+            }
+        }
+        wal.check_move(&other, true).unwrap();
+        // A file where the head's folder belongs makes the head uncheckable on unix, which
+        // reports it as `NotADirectory`; Windows reports the same path as not found.
+        #[cfg(unix)]
+        {
+            let blocked = broca_wal::session_storage_head(&root, &super::session_addr(&other));
+            std::fs::write(blocked.parent().unwrap(), b"not a folder").unwrap();
+            match wal.check_move(&other, false) {
+                Err(broca_wal::WalError::Io(_)) => {}
+                other => panic!("an uncheckable head read as no head: {other:?}"),
+            }
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

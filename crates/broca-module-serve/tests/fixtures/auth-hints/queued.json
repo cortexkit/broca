@@ -1,0 +1,1 @@
+{"type":"queued","submission_id":"queued","request":{"model":{"provider_module_id":"anthropic","model_id":"fixture"},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"auth":{"method":"oauth","account":"work"},"stop_when":[]},"send_id":"hintless","delivery":"queue"}

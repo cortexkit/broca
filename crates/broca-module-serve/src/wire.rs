@@ -71,6 +71,20 @@ pub trait SendParamsExt {
     ) -> Result<SendRequest, broca_core::RunError>;
 }
 
+pub(crate) const AUTH_PIN_HINT_CONFLICT: &str =
+    "an auth.account pin cannot be combined with auth.pool or auth.credential_id";
+
+fn self_routed_auth(method: &str) -> bool {
+    broca_catalog::live::AuthMethod::from_token(method)
+        .is_some_and(crate::account_routing::selects_accounts)
+}
+
+pub(crate) fn auth_pin_hint_conflict(auth: &AuthParams) -> bool {
+    self_routed_auth(&auth.method)
+        && auth.account.is_some()
+        && (auth.pool.is_some() || auth.credential_id.is_some())
+}
+
 impl SendParamsExt for SendParams {
     fn into_send_request(
         self,
@@ -182,6 +196,20 @@ impl SendParamsExt for SendParams {
         let mut user_message = Message::new(Role::User, prompt_content);
         user_message.cache_prefix_blocks = cache_prefix_blocks;
         input.push(user_message);
+        let auth = auth
+            .map(|auth| {
+                if auth_pin_hint_conflict(&auth) {
+                    return Err(broca_core::RunError::Config(AUTH_PIN_HINT_CONFLICT.into()));
+                }
+                let routed = self_routed_auth(&auth.method);
+                Ok(AuthRequest {
+                    method: auth.method,
+                    account: auth.account,
+                    pool: if routed { auth.pool } else { None },
+                    credential_id: if routed { auth.credential_id } else { None },
+                })
+            })
+            .transpose()?;
         let submission = SubmissionRequest {
             route_decision_id,
             service_tier_level: None,
@@ -211,10 +239,7 @@ impl SendParamsExt for SendParams {
                 mode: cache.mode,
             }),
             budget,
-            auth: auth.map(|auth| AuthRequest {
-                method: auth.method,
-                account: auth.account,
-            }),
+            auth,
             context_limit,
             work_class,
             stop_when,
@@ -536,6 +561,8 @@ mod tests {
     fn send_params_pass_auth_pin_through_without_parsing_the_method() {
         let mut params = make_send_params(None, "hello");
         params.auth = Some(AuthParams {
+            pool: None,
+            credential_id: None,
             method: "api-key".into(),
             account: Some("astro".into()),
         });
@@ -546,6 +573,8 @@ mod tests {
         assert_eq!(
             request.request.auth,
             Some(AuthRequest {
+                pool: None,
+                credential_id: None,
                 method: "api-key".into(),
                 account: Some("astro".into()),
             })

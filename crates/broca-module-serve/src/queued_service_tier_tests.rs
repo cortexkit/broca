@@ -23,6 +23,7 @@ fn install_queued_ultrafast_catalog() {
     let mut standard = value["models"]["openai/test-ultrafast"].clone();
     standard.as_object_mut().unwrap().retain(|key, _| !key.contains(".mode."));
     value["models"]["openai/test-standard-only"] = standard;
+    value["models"]["openai/test-other-fast"] = value["models"]["openai/test-ultrafast"].clone();
     let response = serde_json::from_value(value).unwrap();
     let cache = Arc::new(broca_catalog::CatalogCache::empty());
     cache

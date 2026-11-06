@@ -1746,6 +1746,8 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
         &client,
         "send-pinned",
         Some(broca_wire::AuthParams {
+            pool: None,
+            credential_id: None,
             method: "oauth".into(),
             account: Some("work".into()),
         }),
@@ -3337,6 +3339,8 @@ async fn pinned_anthropic_apikey_error_status(rig: &Rig, name: &str) -> (Value, 
         &client,
         &format!("send-{name}"),
         Some(broca_wire::AuthParams {
+            pool: None,
+            credential_id: None,
             method: "apikey".into(),
             account: Some("work".into()),
         }),
@@ -3598,6 +3602,8 @@ async fn paused_auth_pinned_status_reports_the_frozen_pin() {
         &client,
         "send-paused-auth-default",
         Some(broca_wire::AuthParams {
+            pool: None,
+            credential_id: None,
             method: "oauth".into(),
             account: Some("spare".into()),
         }),

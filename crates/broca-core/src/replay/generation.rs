@@ -9,6 +9,26 @@ pub(super) struct AttemptTiming {
     pub last: Option<u64>,
 }
 
+/// Derive content intervals only from recorded stamps. Missing stamps hide only the interval
+/// that needs them; contradictory recorded ordering invalidates the timing sample.
+pub fn content_timing_intervals(
+    sent: Option<u64>,
+    first: Option<u64>,
+    last: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    if first.zip(sent).is_some_and(|(first, sent)| first < sent)
+        || last.zip(first).is_some_and(|(last, first)| last < first)
+    {
+        return (None, None);
+    }
+    (
+        last.zip(sent)
+            .and_then(|(last, sent)| last.checked_sub(sent)),
+        last.zip(first)
+            .and_then(|(last, first)| last.checked_sub(first)),
+    )
+}
+
 pub(super) fn record(
     entries: &mut Vec<GenerationUsage>,
     attempt: Option<AttemptTiming>,
@@ -30,11 +50,9 @@ pub(super) fn record(
     let (Some(sent), Some(first), Some(last)) = (attempt.sent, attempt.first, attempt.last) else {
         return;
     };
-    let (Some(_), Some(sent_to_last), Some(first_to_last)) = (
-        first.checked_sub(sent),
-        last.checked_sub(sent),
-        last.checked_sub(first),
-    ) else {
+    let (Some(sent_to_last), Some(first_to_last)) =
+        content_timing_intervals(Some(sent), Some(first), Some(last))
+    else {
         return;
     };
     let Some((_, model, _, _)) = by_model.first() else {
@@ -84,6 +102,23 @@ pub(super) fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_event_content_intervals_preserve_unknowns_and_reject_reversed_stamps() {
+        for (sent, first, last, expected) in [
+            (Some(100), Some(120), Some(180), (Some(80), Some(60))),
+            (Some(100), None, Some(180), (Some(80), None)),
+            (None, Some(120), Some(180), (None, Some(60))),
+            (Some(100), Some(120), None, (None, None)),
+            (None, None, None, (None, None)),
+            (Some(100), Some(90), Some(180), (None, None)),
+            (Some(100), Some(120), Some(110), (None, None)),
+            (Some(100), None, Some(90), (None, None)),
+            (Some(100), Some(100), Some(100), (Some(0), Some(0))),
+        ] {
+            assert_eq!(content_timing_intervals(sent, first, last), expected);
+        }
+    }
     use crate::replay::RunUsageProjection;
     use broca_protocol::RunId;
     use serde_json::{json, Value};

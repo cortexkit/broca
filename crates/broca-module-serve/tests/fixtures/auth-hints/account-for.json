@@ -1,0 +1,1 @@
+{"admission_id":"run","affinity_model":"fixture","caller":{"runner":"broca"},"candidates":{"accounts":[{"account_id":"account","credential_id":"credential"}],"view_digest":"view"},"conversation_key":"conversation","hold_wait_max_s":0,"initial_input_bytes":5,"initial_input_estimated":true,"mode":"admit","model":"fixture","provider":"anthropic"}

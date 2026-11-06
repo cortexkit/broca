@@ -369,6 +369,7 @@ impl KeepWarmDriver for AutomaticWarmer {
             base,
             attempt_hook: None,
         };
+        self.writer.note_step_event_run_config(run_id, config);
         let journal = automatic_warm_hook(&self.writer, &self.seal, &job, run_id, self.trigger);
         job.attempt_hook = journal
             .as_ref()

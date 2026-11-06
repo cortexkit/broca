@@ -642,7 +642,12 @@ fn resolve_system_prompt(
 /// "the following required argument was not provided" beats failing at admission with a credential
 /// id the caller never typed.
 fn auth_params(method: Option<String>, account: Option<String>) -> Option<AuthParams> {
-    method.map(|method| AuthParams { method, account })
+    method.map(|method| AuthParams {
+        pool: None,
+        credential_id: None,
+        method,
+        account,
+    })
 }
 
 /// The admission-time knobs, grouped because they travel together and are all optional.

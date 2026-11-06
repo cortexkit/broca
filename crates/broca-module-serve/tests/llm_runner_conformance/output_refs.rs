@@ -18,6 +18,10 @@ pub(super) fn catalog_row() -> Value {
 }
 
 pub(super) fn stream(id: &str, turn: &ScriptedTurn) -> String {
+    stream_for_model(id, MODEL, turn)
+}
+
+pub(super) fn stream_for_model(id: &str, model: &str, turn: &ScriptedTurn) -> String {
     let mut body = String::new();
     let mut event = |value: Value| {
         body.push_str(&format!(
@@ -26,7 +30,7 @@ pub(super) fn stream(id: &str, turn: &ScriptedTurn) -> String {
         ));
     };
     event(
-        json!({"type":"message_start", "message":{"id":id,"type":"message","role":"assistant","model":MODEL,
+        json!({"type":"message_start", "message":{"id":id,"type":"message","role":"assistant","model":model,
         "content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}),
     );
     let mut calls = false;

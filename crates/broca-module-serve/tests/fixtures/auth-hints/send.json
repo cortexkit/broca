@@ -1,0 +1,1 @@
+{"prompt":"hello","system":null,"send_id":"hintless","model":{"provider":"anthropic","model":"fixture"},"tool_choice":{"type":"auto"},"generation":{},"stop_when":[],"cache":null,"auth":{"method":"oauth","account":"work"},"append_episode":false}

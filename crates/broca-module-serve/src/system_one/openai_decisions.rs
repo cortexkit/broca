@@ -112,9 +112,18 @@ fn request_body(request: &Request) -> Result<Value, String> {
                 question["type"] = json!("choice");
                 let criteria: BTreeMap<String, Value> = serde_json::from_str(required_criteria(q)?)
                     .map_err(|e| format!("question {name} choice criteria: {e}"))?;
-                question["choices"] = criteria.into_iter().map(|(value, description)| {
-                    json!({"value":value, "description":text(&description)})
-                }).collect();
+                // A null description means the option has none, so it's left out rather than
+                // sent as the text "null".
+                question["choices"] = criteria
+                    .into_iter()
+                    .map(|(value, description)| {
+                        if description.is_null() {
+                            json!({"value":value})
+                        } else {
+                            json!({"value":value, "description":text(&description)})
+                        }
+                    })
+                    .collect();
             }
             "score" => {
                 question["type"] = json!("score");
@@ -302,15 +311,16 @@ fn mapping_error(message: String) -> ProviderReply {
     }
 }
 
+/// The error for a non-2xx answer. Its code is the shared OpenAI mapping (`cortexkit-model-batch`
+/// `RULES.md` §15): an account out of credit or over its billing limit is the permanent
+/// `account_not_entitled`, since it ends only when someone pays, and every other status maps as
+/// for any provider. Its class follows the code, except that a sign-in failure asks for
+/// authentication.
 fn http_error(status: u16, retry_after_ms: Option<u64>, body: &[u8]) -> ProviderReply {
     let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let provider_code = value["error"]["code"].as_str().map(str::to_owned);
-    let code = match status {
-        401 => errors::AUTH_FAILED,
-        429 => errors::RATE_LIMITED,
-        400..=499 => errors::INVALID_ITEM,
-        _ => errors::PROVIDER_ERROR,
-    };
+    let code = cortexkit_model_batch::status::openai_item_code(status, provider_code.as_deref())
+        .unwrap_or(errors::PROVIDER_ERROR);
     let mut error = ItemError::for_code(
         code,
         format!(
@@ -318,16 +328,17 @@ fn http_error(status: u16, retry_after_ms: Option<u64>, body: &[u8]) -> Provider
             provider_code.as_deref().unwrap_or("unreported")
         ),
     );
-    error.class = match status {
-        401 => ErrorClass::Other("auth_required".into()),
-        429 | 500..=599 => ErrorClass::Transient,
-        _ => ErrorClass::Permanent,
-    };
+    if code == errors::AUTH_FAILED {
+        error.class = ErrorClass::Other("auth_required".into());
+    }
     error.retry_after_ms = retry_after_ms;
     ProviderReply::ClassifiedError {
         error,
         provider_code,
-        may_have_spent: status >= 500,
+        // Only a provider error (a timeout or a server failure) may have reached a billed
+        // model, so only then may the call have cost money; every other refusal came before any
+        // model ran.
+        may_have_spent: code == errors::PROVIDER_ERROR,
     }
 }
 
