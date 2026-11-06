@@ -12,8 +12,9 @@ use broca_session_store::record::{PartKind, PartRef};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-/// Stores setup parts and reads them back.
-pub trait Parts: Send {
+/// Stores setup parts and reads them back. `Sync` as well as `Send`, because a run borrows its
+/// parts across awaits and a run's future must stay `Send`.
+pub trait Parts: Send + Sync {
     /// Stores `value` as a part of `kind` and names it.
     fn put(&mut self, kind: PartKind, value: &Value) -> Result<PartRef, String>;
 

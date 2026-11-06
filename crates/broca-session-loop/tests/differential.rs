@@ -1798,7 +1798,6 @@ impl Recording<'_, '_> {
     }
 }
 
-#[async_trait(?Send)]
 impl Writer for Recording<'_, '_> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         self.flush().await?;

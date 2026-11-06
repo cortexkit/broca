@@ -22,7 +22,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use broca_core::tool_media::MediaCapture;
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::fold::operations::Operations;
@@ -195,7 +194,6 @@ impl ActorWriter {
     }
 }
 
-#[async_trait(?Send)]
 impl Writer for ActorWriter {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         let (missed, first) = self
@@ -397,6 +395,25 @@ impl RunLink {
             }
         }
     }
+}
+
+/// A run over an [`ActorWriter`] can be spawned on a multi-threaded runtime: its future is
+/// `Send` when the provider and tool plane are. This fails to compile if anything the loop holds
+/// across an await stops being `Send`.
+#[allow(dead_code)]
+fn a_run_through_an_actor_writer_is_send(
+    writer: &'static mut ActorWriter,
+    parts: &'static mut crate::parts::MemoryParts,
+    admission: crate::run::Admission,
+    seams: &'static crate::run::Seams<
+        'static,
+        broca_core::provider::StubProvider,
+        broca_core::stub_plane::StubToolPlane,
+    >,
+) {
+    fn send<T: Send>(_: T) {}
+    send(crate::run::run(writer, parts, admission, seams));
+    send(crate::run::resume(writer, parts, seams));
 }
 
 #[cfg(test)]

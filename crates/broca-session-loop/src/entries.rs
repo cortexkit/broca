@@ -13,7 +13,6 @@
 //!   view the step rendered with.
 //! - **Time:** the message's own time, else the nearest earlier entry's.
 
-use async_trait::async_trait;
 use broca_core::compaction_v2::metadata::{numbered_parts, step_usage};
 use broca_protocol::content::{Message, Role};
 use broca_session_store::fold::conversation::Conversation;
@@ -42,7 +41,6 @@ fn written_under(operations: &Operations) -> Option<ViewRef> {
     })
 }
 
-#[async_trait(?Send)]
 impl<W: Writer> Writer for Placed<'_, W> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         let Some(tags) = self.facts else {
