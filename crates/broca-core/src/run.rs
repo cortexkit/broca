@@ -28,9 +28,8 @@ use broca_protocol::{
         ToolResult,
     },
     request::{
-        BudgetConfig, BudgetKind, CacheRequest, CacheTail, CallOptions, ExecutionMode,
-        GenerationConfig, ModelHandle, ResponseFormat, StopCondition, SubmissionRequest, Tool,
-        ToolChoice,
+        BudgetConfig, BudgetKind, CacheRequest, CallOptions, ExecutionMode, GenerationConfig,
+        ModelHandle, StopCondition, SubmissionRequest, Tool, ToolChoice,
     },
     ApprovalResponse, BatchId, DisplayEvent, ErrorClass, ModelAttempt, NormalizedEvent,
     ProviderControl, ProviderError, RunId, StepId, ToolCallId, Usage,
@@ -3075,19 +3074,7 @@ async fn append_budget_firings(
     }
 }
 
-struct RequestConfig {
-    /// The run's model — authoritative on resume (the frozen `run_config.model`), so the
-    /// per-message cross-model reasoning gate compares against the SAME model identity
-    /// that stamped each assistant turn's origin.
-    model: ModelHandle,
-    budget: Option<BudgetConfig>,
-    stop_when: Vec<StopCondition>,
-    tools: Arc<Vec<Tool>>,
-    tool_choice: ToolChoice,
-    generation: GenerationConfig,
-    response_format: ResponseFormat,
-    provider_options: serde_json::Value,
-}
+use crate::fresh_start::RequestConfig;
 
 /// The workload class this episode is admitted under: the caller's on a fresh run or a new
 /// episode, the FROZEN one on a resume.
@@ -3147,78 +3134,7 @@ fn request_config<P: Provider>(
             provider_options: rc.provider_options.clone(),
         });
     }
-    // Fresh run: req ∩ policy, req ORDER preserved.
-    if req
-        .stop_when
-        .iter()
-        .any(|condition| matches!(condition, StopCondition::StepCount { n: 0 }))
-    {
-        return Err(RunError::Config(
-            "stop_when[].n must be at least 1 for type 'step_count'".into(),
-        ));
-    }
-    if req.context_limit == Some(0) {
-        return Err(RunError::Config(
-            "context_limit=0 is invalid; omit context_limit to use the catalog value, or supply a value of at least 1"
-                .into(),
-        ));
-    }
-    if let Some(message) = provider.fresh_admission_config_error(&req.generation, &req.tool_choice)
-    {
-        return Err(RunError::Config(message));
-    }
-    let mut tools = std::mem::take(&mut req.tools);
-    tools.retain(|tool| req.policy_allowed.contains(&tool.name));
-    if matches!(&req.tool_choice, ToolChoice::Required) && tools.is_empty() {
-        return Err(RunError::Config(
-            "tool_choice 'required' needs at least one policy-allowed tool".into(),
-        ));
-    }
-    if let ToolChoice::Tool { name } = &req.tool_choice {
-        if !tools.iter().any(|t| t.name == *name) {
-            return Err(RunError::Config(format!(
-                "tool_choice names '{name}' which is not among the policy-allowed tools"
-            )));
-        }
-    }
-    // `cache.tail = volatile` tells the renderer to withhold the cache breakpoint on the final
-    // message. On a run that can call tools that breakpoint is not waste, it is the entire
-    // mechanism: each step re-sends the previous step's messages, so the anchor one step plants
-    // on its last message is exactly what the next step reads back. Honouring the declaration
-    // there would quietly make caching WORSE on the one leg where it already pays off, and
-    // quietly is the problem -- so refuse, and name which of the two the caller should drop.
-    //
-    // Judged on the tools actually admitted (after the policy intersection) rather than the
-    // ones requested: a run whose tools were all filtered out makes exactly one provider call,
-    // and the declaration is sound for it.
-    if tail_is_volatile(req.cache.as_ref()) && !tools.is_empty() {
-        return Err(RunError::Config(
-            "cache.tail 'volatile' conflicts with tools: a tool-bearing run re-sends each step's \
-             messages, so the final-message breakpoint it withholds is what the next step reads \
-             back; drop cache.tail or drop tools"
-                .into(),
-        ));
-    }
-    Ok(RequestConfig {
-        model: std::mem::replace(&mut req.model, ModelHandle::new("", "")),
-        budget: std::mem::take(&mut req.budget),
-        stop_when: std::mem::take(&mut req.stop_when),
-        tools: Arc::new(tools),
-        tool_choice: std::mem::take(&mut req.tool_choice),
-        generation: std::mem::take(&mut req.generation),
-        response_format: ResponseFormat::default(),
-        provider_options: serde_json::Value::Null,
-    })
-}
-
-/// Whether the caller declared its final message varies between requests. The refusal above is
-/// the only consumer in the loop; the placement it implies is resolved and frozen by the module
-/// before the run starts, so nothing here reads it again on a resume.
-fn tail_is_volatile(cache: Option<&CacheRequest>) -> bool {
-    matches!(
-        cache.and_then(|cache| cache.tail),
-        Some(CacheTail::Volatile)
-    )
+    crate::fresh_start::request_config(req, provider)
 }
 
 /// Fire the admission-ack exactly once (no-op if already fired). `take()` ensures a second
