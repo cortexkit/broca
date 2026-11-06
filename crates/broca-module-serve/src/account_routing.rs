@@ -511,6 +511,8 @@ pub fn classify_refusal(code: &str) -> ErrorClass {
 struct ErrorBodyView {
     code: String,
     #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
     detail: Option<Value>,
 }
 
@@ -566,6 +568,13 @@ fn classify_account_for_reply_at(
                     ))
                 }
             };
+            // Routing's message names which of its checks refused; broca keeps no other copy.
+            tracing::info!(
+                target: "accounts",
+                code = %error.code,
+                message = error.message.as_deref().unwrap_or("<none>"),
+                "route.account_for refusal"
+            );
             let detail = error.detail.unwrap_or(Value::Null);
             let decision_id = detail["decision_id"].as_str().map(str::to_string);
             match error.code.as_str() {
@@ -1361,6 +1370,10 @@ where
     if inputs.hold_cap.evidence_unknown {
         HOLD_CAP_UNKNOWN.fetch_add(1, Ordering::Relaxed);
     }
+    // Kept for the refusal log: routing writes nothing for an `account_for` it refuses before
+    // admission, so the request broca sent is the only record of what was refused. It carries
+    // routing identifiers and sizes, never a credential.
+    let sent = params.to_string();
     match client.account_for(params, deadline).await {
         AccountForOutcome::Chosen {
             account_id,
@@ -1484,6 +1497,8 @@ where
                 retry_after_s = ?refusal.retry_after_s,
                 resets_at_ms = ?refusal.resets_at_ms,
                 decision_id = refusal.decision_id.as_deref().unwrap_or("<none>"),
+                routing_detail = ?refusal.routing_detail,
+                params = %sent,
                 "routing refused account selection"
             );
             if matches!(
