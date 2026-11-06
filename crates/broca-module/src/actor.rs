@@ -951,18 +951,43 @@ fn inherit_frozen_parameters(request: &mut SubmissionRequest, frozen: &broca_wal
     }
 }
 
+/// The settings a running run froze that a joining steer must agree with. Today's actor reads
+/// them from the episode's `RunConfig`; an actor over another storage builds them from what it
+/// keeps of the run's start, so both refuse the same steers.
+pub(crate) struct SteerFrozen<'a> {
+    pub model: &'a broca_protocol::request::ModelHandle,
+    pub variant: Option<&'a str>,
+    pub generation: &'a broca_protocol::request::GenerationConfig,
+    pub stop_when: &'a [broca_protocol::request::StopCondition],
+    pub directives: Option<&'a [broca_protocol::request::DirectiveName]>,
+    pub auth_selection: Option<&'a broca_wal::AuthSelection>,
+}
+
+impl<'a> From<&'a broca_wal::RunConfig> for SteerFrozen<'a> {
+    fn from(config: &'a broca_wal::RunConfig) -> Self {
+        Self {
+            model: &config.model,
+            variant: config.variant.as_deref(),
+            generation: &config.generation,
+            stop_when: &config.stop_when,
+            directives: config.turn_directives_v1.as_deref(),
+            auth_selection: config.auth_selection.as_ref(),
+        }
+    }
+}
+
 /// Compare only named settings: a joining steer inherits every setting it omits. The order
 /// is stable so a send changing several settings always gets the same first field in its reply.
-fn steer_settings_conflict(
+pub(crate) fn steer_settings_conflict(
     request: &SubmissionRequest,
-    frozen: &broca_wal::RunConfig,
+    frozen: SteerFrozen<'_>,
     stop_sequences_named: bool,
 ) -> Option<&'static str> {
     use broca_protocol::request::InheritedParam;
-    if !request.inherit_frozen.contains(&InheritedParam::Model) && request.model != frozen.model {
+    if !request.inherit_frozen.contains(&InheritedParam::Model) && request.model != *frozen.model {
         return Some("model");
     }
-    if request.variant.is_some() && request.variant != frozen.variant {
+    if request.variant.is_some() && request.variant.as_deref() != frozen.variant {
         return Some("model.variant");
     }
     let generation = &request.generation;
@@ -984,19 +1009,21 @@ fn steer_settings_conflict(
         return Some("generation.stop_sequences");
     }
     if !request.inherit_frozen.contains(&InheritedParam::StopWhen)
-        && request.stop_when != frozen.stop_when
+        && request.stop_when.as_slice() != frozen.stop_when
     {
         return Some("stop_when.max_steps");
     }
-    if request.directives.as_ref().is_some_and(|names| {
-        names.as_slice() != frozen.turn_directives_v1.as_deref().unwrap_or_default()
-    }) {
+    if request
+        .directives
+        .as_ref()
+        .is_some_and(|names| names.as_slice() != frozen.directives.unwrap_or_default())
+    {
         return Some("directives");
     }
     // Checked last, so a send that also conflicts on an earlier setting still reports that
     // setting rather than `auth`.
     if let Some(pin) = &request.auth {
-        if !steer_auth_pin_matches(pin, frozen.auth_selection.as_ref()) {
+        if !steer_auth_pin_matches(pin, frozen.auth_selection) {
             return Some("auth");
         }
     }
@@ -5014,7 +5041,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 episode.config.model.provider_module_id, episode.config.model.model_id
             );
             if let Some(field) =
-                steer_settings_conflict(&request, &episode.config, stop_sequences_named)
+                steer_settings_conflict(&request, (&episode.config).into(), stop_sequences_named)
             {
                 // The inbox lock linearizes this refusal against the run's decision to end.
                 // A closed inbox sends the message to a new turn instead, which can honour it.
@@ -12986,16 +13013,25 @@ mod tests {
         let mut request = text_req(&key, "directives").to_submission();
         request.model = frozen.model.clone();
         request.stop_when = frozen.stop_when.clone();
-        assert_eq!(steer_settings_conflict(&request, &frozen, false), None);
+        assert_eq!(
+            steer_settings_conflict(&request, (&frozen).into(), false),
+            None
+        );
         request.directives = frozen.turn_directives_v1.clone();
-        assert_eq!(steer_settings_conflict(&request, &frozen, false), None);
+        assert_eq!(
+            steer_settings_conflict(&request, (&frozen).into(), false),
+            None
+        );
         request.directives = Some(vec![]);
         assert_eq!(
-            steer_settings_conflict(&request, &frozen, false),
+            steer_settings_conflict(&request, (&frozen).into(), false),
             Some("directives")
         );
         frozen.turn_directives_v1 = None;
-        assert_eq!(steer_settings_conflict(&request, &frozen, false), None);
+        assert_eq!(
+            steer_settings_conflict(&request, (&frozen).into(), false),
+            None
+        );
     }
 
     pub(super) fn min_config() -> broca_wal::RunConfig {
@@ -16445,7 +16481,7 @@ mod steer_auth_conflict_tests {
         pin: Option<serde_json::Value>,
         credential_id: Option<&str>,
     ) -> Option<&'static str> {
-        steer_settings_conflict(&steer(pin), &frozen(credential_id), false)
+        steer_settings_conflict(&steer(pin), (&frozen(credential_id)).into(), false)
     }
 
     #[test]
@@ -16512,7 +16548,11 @@ mod steer_auth_conflict_tests {
         let mut request = steer(Some(serde_json::json!({"method": "apikey"})));
         request.generation.stop_sequences = vec!["other".into()];
         assert_eq!(
-            steer_settings_conflict(&request, &frozen(Some("oauth:anthropic:work")), false),
+            steer_settings_conflict(
+                &request,
+                (&frozen(Some("oauth:anthropic:work"))).into(),
+                false
+            ),
             Some("generation.stop_sequences")
         );
     }
