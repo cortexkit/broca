@@ -864,3 +864,13 @@ fn write_fuzz_seeds() {
         ],
     );
 }
+
+/// The generators cover every record kind the store declares, so a kind added later can't go
+/// untested: each kind number with a stream is in `KINDS`, and `KINDS` holds nothing else.
+#[test]
+fn the_generators_cover_every_record_kind() {
+    let declared: Vec<u32> = (0..=u16::MAX as u32)
+        .filter(|kind| crate::record::kind_stream(*kind).is_some())
+        .collect();
+    assert_eq!(declared, KINDS.to_vec());
+}

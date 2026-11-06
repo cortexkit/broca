@@ -1341,6 +1341,18 @@ fn compare_ops(old: &[FramedRecord], lineage: Option<&str>) -> OpsOutcome {
         "refusal_schedule",
         json_of(&today.refusal_fallback) == refusal_schedule,
     );
+    // Today keeps every refused step of the episode; only the step in progress can still be
+    // re-sent, so that is the one the fold keeps.
+    check(
+        "refused_step",
+        run.refused_step.is_some()
+            == today
+                .refused_steps
+                .contains(&broca_protocol::StepId(run.completed_steps + 1))
+            && run
+                .refused_step
+                .is_none_or(|step| step == run.completed_steps + 1),
+    );
     let today_cancel = today.cancel_at.map(|at| match at {
         broca_wal::record::RunCancelAt::Now => CancelPoint::Now,
         broca_wal::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
