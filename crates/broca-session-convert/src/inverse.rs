@@ -771,6 +771,24 @@ pub fn invert(records: &[Record], parts: &BTreeMap<Digest, Vec<u8>>) -> Result<V
                         set(&mut object, "failure", retraction.failure.as_ref());
                         Value::Object(object)
                     }
+                    Record::ConfigRefrozen(refrozen) => {
+                        let mut object = Map::new();
+                        object.insert("type".into(), json("run_config_refrozen"));
+                        set(&mut object, "ts_ms", refrozen.ts_ms);
+                        object.insert("renderer_version".into(), json(refrozen.renderer_version));
+                        object.insert(
+                            "frozen_render_config".into(),
+                            refrozen.render_config.clone(),
+                        );
+                        Value::Object(object)
+                    }
+                    Record::AuthRefrozen(refrozen) => {
+                        let mut object = Map::new();
+                        object.insert("type".into(), json("run_auth_refrozen"));
+                        set(&mut object, "ts_ms", refrozen.ts_ms);
+                        object.insert("auth_selection".into(), refrozen.auth_selection.clone());
+                        Value::Object(object)
+                    }
                     Record::Warmed(warmed) => {
                         let mut object = members(warmed.billing.as_ref())?;
                         object.insert("type".into(), json("cache_warmed"));

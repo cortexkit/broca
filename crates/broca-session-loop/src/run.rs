@@ -350,6 +350,66 @@ where
             });
         }
     }
+    // A resume that will call the provider again first confirms the provider still renders the
+    // run's requests byte for byte, as today's does: a changed renderer or render config would
+    // bust the prompt cache, or make the conversation invalid for the provider.
+    let drift = match resolution {
+        Resolution::Resume | Resolution::ProviderHeld(_) | Resolution::Paused(_) => {
+            broca_core::run::render_identity_error(
+                seams.provider,
+                admission.renderer_version,
+                &admission.render_config,
+            )
+        }
+        Resolution::Idle(_) | Resolution::Interrupted(_) => None,
+    };
+    let mut refrozen = Vec::new();
+    if let Resolution::Paused(reason) = resolution {
+        if let Some(error) = &drift {
+            // Before any provider call no request depends on the old config, so the run takes
+            // the provider's current one; after a call, or when either config can't be read, the
+            // run can't go on.
+            if run.provider_call_started
+                || error.provider_code.as_deref() == Some("frozen_render_config_unverifiable")
+            {
+                return end_with_error(
+                    writer,
+                    seams,
+                    &admission.run_id,
+                    RunFinishReason::Interrupted,
+                    error,
+                )
+                .await;
+            }
+            refrozen.push(Record::ConfigRefrozen(
+                broca_session_store::record::ConfigRefrozen {
+                    run_id: admission.run_id.clone(),
+                    ts_ms: Some((seams.now_ms)()),
+                    renderer_version: seams.provider.renderer_version(),
+                    render_config: seams.provider.render_config_blob(),
+                },
+            ));
+        }
+        // A run resumed on another account than it froze, as routing gives it now, names that
+        // one from here on; one paused on its account's limit has already ended above if the
+        // account changed.
+        if let Some(selection) = seams
+            .auth_selection
+            .as_ref()
+            .filter(|_| reason != PauseReason::AccountLimit)
+            .filter(|selection| Some(*selection) != admission.auth_selection.as_ref())
+        {
+            refrozen.push(Record::AuthRefrozen(
+                broca_session_store::record::AuthRefrozen {
+                    run_id: admission.run_id.clone(),
+                    ts_ms: Some((seams.now_ms)()),
+                    auth_selection: serde_json::to_value(selection)
+                        .map_err(|e| LoopError::Parts(e.to_string()))?,
+                },
+            ));
+        }
+    }
+    let drift = drift.filter(|_| !matches!(resolution, Resolution::Paused(_)));
     let mut placed = Placed {
         facts: admission
             .compaction_plan_version
@@ -365,10 +425,37 @@ where
         _ => None,
     };
     let mut resumed = resumed_record(writer, &resolution);
-    if submit.is_some() {
+    // A resume that ends the run instead of redoing anything records nothing to redo.
+    if submit.is_some() || drift.is_some() {
         resumed.redone.clear();
     }
-    writer.append(&[Record::Resumed(resumed)], false).await?;
+    // A held call's provider may already have answered: the batch closes with what it holds,
+    // sending nothing, and then the resume and the run's end are written.
+    if let (Some(error), Resolution::ProviderHeld(_)) = (&drift, &resolution) {
+        let mut error = error.clone();
+        error.provider_code = Some("held_resume_refused".into());
+        return close_interrupted(writer, seams, &admission.run_id, Some((&error, resumed))).await;
+    }
+    // The refreezes come first, durable with the resume, so nothing the resume does renders or
+    // bills under the old config or account.
+    let barrier = !refrozen.is_empty();
+    refrozen.push(Record::Resumed(resumed));
+    writer.append(&refrozen, barrier).await?;
+    if let Some(error) = drift {
+        return end_with_error(
+            writer,
+            seams,
+            &admission.run_id,
+            RunFinishReason::Interrupted,
+            &error,
+        )
+        .await;
+    }
+    // The run continues under what this resume refroze.
+    let admission = match writer.operations().run.as_ref() {
+        Some(run) if barrier => frozen_admission(run, parts)?,
+        _ => admission,
+    };
     if let Some((frozen, pending)) = submit {
         return submitted(writer, seams, &admission.run_id, &frozen, &pending).await;
     }
@@ -376,7 +463,9 @@ where
     match resolution {
         Resolution::Resume => drive(writer, parts, &admission, seams, compaction.as_ref()).await,
         Resolution::Idle(reason) => finish(writer, seams, &admission.run_id, reason).await,
-        Resolution::Interrupted(_) => close_interrupted(writer, seams, &admission.run_id).await,
+        Resolution::Interrupted(_) => {
+            close_interrupted(writer, seams, &admission.run_id, None).await
+        }
         // A held call's late result arrived: the run goes on from its open batch, waiting on
         // each held call again rather than sending it.
         Resolution::ProviderHeld(_) => {
@@ -404,10 +493,14 @@ const NOT_RUN_INTERRUPTED: &str =
 /// result (unknown outcome if it was sent, not run if it wasn't, the provider-held close result
 /// if a provider holds it), and the batch and the run's end are durable together. No call is
 /// sent. Each provider still holding a call is asked to withdraw it once the end is durable.
+///
+/// A resume that refuses to go on passes the error the run ends with, and its own record, which
+/// today's writes after the batch closes and before the run's end.
 async fn close_interrupted<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
     run_id: &str,
+    refused: Option<(&ProviderError, Resumed)>,
 ) -> Result<Finished, LoopError> {
     let now = (seams.now_ms)();
     let mut records = Vec::new();
@@ -468,7 +561,15 @@ async fn close_interrupted<W: Writer, P, T>(
             batch_id: batch.batch_id.clone(),
         }));
     }
-    records.push(run_end(writer, run_id, RunFinishReason::Interrupted, now));
+    let mut end = run_end(writer, run_id, RunFinishReason::Interrupted, now);
+    if let Some((error, resumed)) = refused {
+        if let Record::RunEnd(end) = &mut end {
+            end.error =
+                Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
+        }
+        records.push(Record::Resumed(resumed));
+    }
+    records.push(end);
     append_end(writer, run_id, records).await?;
     withdraw(seams, &withdrawn).await;
     Ok(finished(writer, RunFinishReason::Interrupted))
@@ -710,6 +811,16 @@ fn frozen_admission(
             .map_err(LoopError::Parts)?;
     }
     let mut admission = admission_of_start(start, parts)?;
+    // A resume that refroze the run's render config (before any provider call) or its account
+    // (onto the one routing gave it) renders and bills under what it refroze.
+    if let Some(refrozen) = &run.refrozen_render {
+        admission.render_config = refrozen["render_config"].clone();
+        admission.renderer_version = decode::<u32>(Some(refrozen["renderer_version"].clone()))?
+            .unwrap_or(admission.renderer_version);
+    }
+    if let Some(selection) = &run.refrozen_auth {
+        admission.auth_selection = decode(Some(selection.clone()))?;
+    }
     // A run whose strict schema was downgraded renders downgraded from then on, as today's
     // resume rebuilds its provider from the downgraded config.
     if run.structured_downgraded {

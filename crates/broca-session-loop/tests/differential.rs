@@ -59,6 +59,9 @@ struct ScriptedProvider {
     downgraded: Arc<std::sync::atomic::AtomicBool>,
     /// Whether this provider has refused the strict schema's grammar.
     refused: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this provider renders with another config than the run froze, as one rebuilt
+    /// from a changed catalog would.
+    drifted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Whether `script` is the provider refusing the strict schema's grammar.
@@ -79,6 +82,36 @@ impl ScriptedProvider {
             sent: Arc::new(Mutex::new(Vec::new())),
             downgraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drifted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// The render config the run freezes: the stateless default, or a real config for a cache
+    /// comparison, carrying the run's structured output, downgraded once refused.
+    fn frozen_blob(&self) -> Value {
+        // A comparison of cache expiry freezes a real first-party Anthropic config, whose cache
+        // markers ask for a lifetime; this provider still renders requests its own way.
+        if cache() {
+            return serde_json::to_value(cached_config()).expect("a frozen config serializes");
+        }
+        let mut blob = json!({ "render_config": "stateless" });
+        if let Some(structured) = structured() {
+            blob["structured_output"] = structured;
+        }
+        if self.downgraded.load(std::sync::atomic::Ordering::SeqCst) {
+            broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(
+                &mut blob,
+            );
+        }
+        blob
+    }
+
+    /// From now on, renders with another config than the run froze when the comparison asks
+    /// for it: called on the provider a resume uses.
+    fn resuming(&self) {
+        if drift() {
+            self.drifted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -110,19 +143,9 @@ impl Provider for ScriptedProvider {
     /// The default stateless config, carrying the run's structured output when the comparison
     /// freezes one: both loops read it from here.
     fn render_config_blob(&self) -> Value {
-        // A comparison of cache expiry freezes a real first-party Anthropic config, whose cache
-        // markers ask for a lifetime; this provider still renders requests its own way.
-        if cache() {
-            return serde_json::to_value(cached_config()).expect("a frozen config serializes");
-        }
-        let mut blob = json!({ "render_config": "stateless" });
-        if let Some(structured) = structured() {
-            blob["structured_output"] = structured;
-        }
-        if self.downgraded.load(std::sync::atomic::Ordering::SeqCst) {
-            broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(
-                &mut blob,
-            );
+        let mut blob = self.frozen_blob();
+        if self.drifted.load(std::sync::atomic::Ordering::SeqCst) {
+            blob["drifted"] = json!(true);
         }
         blob
     }
@@ -915,6 +938,20 @@ fn new_warmer() -> Option<Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Adm
 }
 
 tokio::task_local! {
+    /// Whether a resume's provider renders with another config than the run froze.
+    static DRIFT: bool;
+}
+
+fn drift() -> bool {
+    DRIFT.try_with(|drift| *drift).unwrap_or(false)
+}
+
+/// Runs `compare` with every resume's provider rendering with a changed config.
+async fn compare_drifted<F: std::future::Future<Output = ()>>(compare: F) {
+    DRIFT.scope(true, compare).await;
+}
+
+tokio::task_local! {
     /// The provider account a comparison routes, with the boot cap on same-account waits.
     /// `None` routes no account, and no run may pause on one.
     static ACCOUNT: Option<AccountScript>;
@@ -1503,6 +1540,9 @@ async fn today_from(
             .downgraded
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    if start.is_some() {
+        provider.resuming();
+    }
     let plane = scenario.plane();
     let spy = compaction().map(|script| Arc::new(CompactionSpy::new(&script)));
     let lease = FileLeaseStore::new(dir.join("lease"));
@@ -1756,6 +1796,9 @@ async fn new_from(
         provider
             .downgraded
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    if !held.is_empty() {
+        provider.resuming();
     }
     let plane = scenario.plane();
     let lifecycle = plane.lifecycle();
@@ -3470,6 +3513,7 @@ async fn compare_auth_pause_in(
     for mode in [StartMode::FreshOrResume, StartMode::ResumeAfterAuth] {
         if mode == StartMode::ResumeAfterAuth {
             reset_passes().await;
+            provider.resuming();
         }
         let summary = run_loop_on_writer(
             request.clone(),
@@ -3579,6 +3623,7 @@ async fn compare_auth_pause_in(
     .await
     .expect("the new loop runs");
     reset_passes().await;
+    provider.resuming();
     let seams = Seams {
         auth_selection: resume_account.or(seams.auth_selection.clone()),
         ..seams
@@ -5874,5 +5919,91 @@ async fn an_account_limit_resume_on_another_account_ends_the_run() {
         first,
         compare_auth_pause_switching(tool_then_limited(account_limited()), routed("acct-2")),
     )
+    .await;
+}
+
+/// A run paused for sign-in resumes on the account routing gives it now: both loops name that
+/// account on the resumed step, not the one the run was admitted to.
+#[tokio::test]
+async fn a_sign_in_resume_names_the_account_routing_gives_now() {
+    compare_routed(
+        AccountScript {
+            selection: routed("acct-1"),
+            wait: broca_core::SameAccountWait::default(),
+            wait_for_reset: false,
+        },
+        compare_auth_pause_switching(
+            Scenario {
+                input: vec![user("hello")],
+                tools: vec![tool("read", ExecutionMode::Parallel)],
+                manifest: None,
+                stop_when: Vec::new(),
+                steps: vec![auth_failure(), text_step("a1", "hi")],
+            },
+            routed("acct-2"),
+        ),
+    )
+    .await;
+}
+
+/// After a crash, a resume whose provider renders with another config than the run froze ends
+/// the run interrupted, naming the drift, in both loops; it sends nothing.
+#[tokio::test]
+async fn a_crash_resume_on_a_changed_render_config_ends_the_run() {
+    compare_drifted(compare_every_cut(Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    }))
+    .await;
+}
+
+/// A run paused for sign-in after a provider call can't take a changed render config: both
+/// loops end it interrupted on resume.
+#[tokio::test]
+async fn a_paused_run_on_a_changed_render_config_ends_on_resume() {
+    compare_drifted(compare_auth_pause(Scenario {
+        input: vec![user("hello")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![auth_failure(), text_step("a1", "hi")],
+    }))
+    .await;
+}
+
+/// At every cut of a held call, a resume on a changed render config ends the run without
+/// sending anything: an open batch closes with what its calls hold, as today's does.
+#[tokio::test]
+async fn every_cut_of_a_held_call_on_a_changed_render_config_ends_alike() {
+    compare_drifted(compare_every_cut(Scenario {
+        input: vec![user("run both")],
+        tools: vec![
+            tool("hold_brief", ExecutionMode::Parallel),
+            tool("read", ExecutionMode::Parallel),
+        ],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "hold_brief", json!({"job": 1})),
+                    call("c2", "read", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    }))
     .await;
 }

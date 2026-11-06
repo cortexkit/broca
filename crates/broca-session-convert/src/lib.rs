@@ -22,12 +22,12 @@ use broca_protocol::usage::Usage;
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::record::{
-    Assistant, Attempt, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome, CancelPoint,
-    CancelRequest, CeilingDecided, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker,
-    Notice, OutputCapLowered, PartKind, PartRef, Pause, Placement, QueuedSend, Record, Redo,
-    ResultAppend, Resumed, Retraction, RunEnd, RunStart, SendEnded, SessionRefresh, SetupStub,
-    Steer, StepEnd, StepStart, Stream, StructuredDowngraded, StructuredResult, ToolHeld,
-    ToolIntent, ToolOutcome, ToolReply, View, ViewApplied, Warmed,
+    Assistant, Attempt, AuthRefrozen, BatchEnd, BatchStart, BudgetFire, BudgetFiring, CallOutcome,
+    CancelPoint, CancelRequest, CeilingDecided, Compaction, ConfigRefrozen, Delivery,
+    DeliveryOrdered, Event, Input, Marker, Notice, OutputCapLowered, PartKind, PartRef, Pause,
+    Placement, QueuedSend, Record, Redo, ResultAppend, Resumed, Retraction, RunEnd, RunStart,
+    SendEnded, SessionRefresh, SetupStub, Steer, StepEnd, StepStart, Stream, StructuredDowngraded,
+    StructuredResult, ToolHeld, ToolIntent, ToolOutcome, ToolReply, View, ViewApplied, Warmed,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -613,6 +613,18 @@ fn convert_one(
         "context_ceiling_decided" => out.records.push(Record::CeilingDecided(CeilingDecided {
             step_id: f.req_u64("step_id"),
             detail: f.take("detail"),
+        })),
+        // Today's refreezes name no run: they belong to the run whose resume wrote them.
+        "run_config_refrozen" => out.records.push(Record::ConfigRefrozen(ConfigRefrozen {
+            run_id: state.run_id.clone(),
+            ts_ms: f.u64("ts_ms"),
+            renderer_version: f.req_u64("renderer_version") as u32,
+            render_config: f.take("frozen_render_config").unwrap_or(Value::Null),
+        })),
+        "run_auth_refrozen" => out.records.push(Record::AuthRefrozen(AuthRefrozen {
+            run_id: state.run_id.clone(),
+            ts_ms: f.u64("ts_ms"),
+            auth_selection: f.take("auth_selection").unwrap_or(Value::Null),
         })),
         "cache_warmed" => {
             let mut billing = Map::new();

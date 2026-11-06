@@ -120,7 +120,9 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
         | Record::CeilingDecided(_)
         | Record::OutputCapLowered(_)
         | Record::StructuredDowngraded(_)
-        | Record::Warmed(_) => {}
+        | Record::Warmed(_)
+        | Record::ConfigRefrozen(_)
+        | Record::AuthRefrozen(_) => {}
         Record::ToolIntent(intent) => push(IdKind::CallKey, intent.call_key.as_deref()),
         Record::ToolHeld(held) => push(IdKind::CallKey, Some(&held.call_key)),
         Record::QueuedSend(send) => {

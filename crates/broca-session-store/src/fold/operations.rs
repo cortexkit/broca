@@ -380,6 +380,20 @@ state! {
             reset: "a step's start",
             bound: Bound::OpenWork("the warms of one tool wait"),
         },
+        /// The render config a paused run's resume refroze before any provider call, which the
+        /// run renders with in place of its start's: `{renderer_version, render_config}`.
+        27 opt pub refrozen_render: serde_json::Value => {
+            owner: "provider layer",
+            reset: "run_start",
+            bound: Bound::Config("one render config"),
+        },
+        /// The provider account a paused run's resume refroze, which the run uses in place of
+        /// its start's.
+        28 opt pub refrozen_auth: serde_json::Value => {
+            owner: "admission",
+            reset: "run_start",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -457,6 +471,8 @@ impl Run {
             context_ceiling: None,
             output_cap: None,
             structured_downgraded: false,
+            refrozen_render: None,
+            refrozen_auth: None,
             warms: Vec::new(),
             keep_warm: start.keep_warm.clone(),
             on_restart: start.on_restart.clone(),
@@ -1144,6 +1160,15 @@ impl Operations {
             }
             Record::StructuredDowngraded(downgraded) if downgraded.run_id == run.run_id => {
                 run.structured_downgraded = true;
+            }
+            Record::ConfigRefrozen(refrozen) if refrozen.run_id == run.run_id => {
+                run.refrozen_render = Some(serde_json::json!({
+                    "renderer_version": refrozen.renderer_version,
+                    "render_config": refrozen.render_config,
+                }));
+            }
+            Record::AuthRefrozen(refrozen) if refrozen.run_id == run.run_id => {
+                run.refrozen_auth = Some(refrozen.auth_selection.clone());
             }
             Record::Warmed(warmed)
                 if warmed.trigger.as_deref() == Some("keep_warm")

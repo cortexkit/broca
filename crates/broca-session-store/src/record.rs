@@ -875,6 +875,34 @@ message! {
 }
 
 message! {
+    /// A paused run resumed before any provider call, and its provider now renders with a
+    /// different config than the run froze: the run renders with this one from here on. Only
+    /// before the first call is that safe, since no request bytes depend on the old config.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct ConfigRefrozen {
+        1 req run_id: String,
+        2 opt ts_ms: u64,
+        3 req renderer_version: u32,
+        /// Owned by the provider layer, as the run start's render config is.
+        4 req render_config: serde_json::Value,
+    }
+}
+
+message! {
+    /// A paused run resumed on another provider account than it froze, which routing gave it:
+    /// its later requests and its spend name this account. Account metadata changes no request
+    /// bytes, so this may follow provider calls. Not written for a run paused on its account's
+    /// limit, which resumes only on that account.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct AuthRefrozen {
+        1 req run_id: String,
+        2 opt ts_ms: u64,
+        /// Owned by admission, as the run start's auth selection is.
+        3 req auth_selection: serde_json::Value,
+    }
+}
+
+message! {
     /// The runner sent a request to keep the session's prompt cache warm: the prefix a step's
     /// request wrote, read again so it outlives the wait. Billed, and counted toward how long
     /// the cache lives.
@@ -1185,6 +1213,8 @@ records! {
         95 OutputCapLowered,
         96 StructuredDowngraded,
         97 Warmed,
+        98 ConfigRefrozen,
+        99 AuthRefrozen,
     }
 }
 

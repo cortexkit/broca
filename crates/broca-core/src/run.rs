@@ -3303,22 +3303,36 @@ fn first_system_message(messages: &[Message]) -> Option<&Message> {
 /// byte-identically (its own version, or an earlier one it has proven), and the recorded frozen
 /// config must then equal the blob the provider would have recorded at that version, exactly.
 fn render_config_error<P: Provider>(provider: &P, recorded: &RunConfig) -> Option<ProviderError> {
+    render_identity_error(
+        provider,
+        recorded.renderer_version,
+        &recorded.frozen_render_config,
+    )
+}
+
+/// Why `provider` can't resume a run frozen with `renderer_version` and `frozen_render_config`
+/// byte for byte, if it can't: either config is null, the provider doesn't reproduce that
+/// renderer version, or it renders that version with another config. `None` when it can.
+pub fn render_identity_error<P: Provider + ?Sized>(
+    provider: &P,
+    renderer_version: u32,
+    frozen_render_config: &serde_json::Value,
+) -> Option<ProviderError> {
     let current = provider.render_config_blob();
-    let (message, provider_code) = if current.is_null() || recorded.frozen_render_config.is_null() {
+    let (message, provider_code) = if current.is_null() || frozen_render_config.is_null() {
         (
             "resume refused: the current provider or the recorded WAL has a null frozen render \
              config, so render identity cannot be verified; old WALs with a null frozen config \
              were never resume-safe and must be discarded",
             "frozen_render_config_unverifiable",
         )
-    } else if !provider.reproduces_renderer_version(recorded.renderer_version) {
+    } else if !provider.reproduces_renderer_version(renderer_version) {
         (
             "resume refused: the provider renderer version differs from the version recorded at \
              run start, and the provider does not reproduce the recorded version's bytes",
             "renderer_version_drift",
         )
-    } else if provider.render_config_blob_for_version(recorded.renderer_version)
-        != recorded.frozen_render_config
+    } else if provider.render_config_blob_for_version(renderer_version) != *frozen_render_config
     {
         (
             "resume refused: the provider frozen render config differs from the config recorded \
