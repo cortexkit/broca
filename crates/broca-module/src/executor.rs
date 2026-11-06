@@ -322,8 +322,9 @@ pub trait RunExecutor: Send + Sync + 'static {
 
 /// One run of a session kept in the new storage, as the store actor hands it to the executor.
 /// Like [`RunJob`], the actor builds the request and the session's part of the run control; the
-/// executor resolves the credential, routing, provider and catalog row, completes the control,
-/// admits the run by `broca_session_loop::admit::admission` and runs it through `writer`.
+/// executor resolves the credential, routing, provider and the model's entry in the model catalog,
+/// completes the control, admits the run by `broca_session_loop::admit::admission` and runs it
+/// through `writer`.
 pub struct StoreRunJob {
     pub req: RunRequest,
     /// Caller-scoped credential selection, resolved at admission as for [`RunJob::auth`].
