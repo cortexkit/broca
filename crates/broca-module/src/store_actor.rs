@@ -9,6 +9,8 @@
 //!
 //! What it serves so far:
 //! - a plain send that starts a run on an idle session;
+//! - a keyed send's retry, answered from the records of the run it started, and a different
+//!   payload under a used key, refused naming what differs;
 //! - the session's status;
 //! - cancelling the active run, now or at its next step boundary;
 //! - going away when idle.
@@ -25,6 +27,7 @@ use broca_session_loop::parts::Parts;
 use broca_session_loop::shared::{ActorWriter, RunLink};
 use broca_session_loop::writer::Writer;
 use broca_session_store::backend::SessionBackend;
+use broca_session_store::idindex::IdKind;
 use broca_session_store::record::{CancelPoint, CancelRequest, Record};
 use broca_session_store::session::Session;
 use tokio::sync::{mpsc, oneshot};
@@ -62,6 +65,14 @@ struct ActiveRun {
     /// the sender hears `active` only for a run that exists.
     admitting: Option<oneshot::Sender<SendOutcome>>,
     done: JoinHandle<StoreRunEnd>,
+}
+
+/// How a keyed send is answered.
+enum Keyed {
+    /// The key names a send the session already took: this is the whole answer.
+    Answered(SendOutcome),
+    /// The key is new: the send starts a run that records it with this identity digest.
+    Fresh(String),
 }
 
 /// What woke the actor.
@@ -141,7 +152,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 session_class,
                 retention,
                 stop_sequences_named: _,
-                conversation_key: _,
+                conversation_key,
                 title,
                 run_id,
                 request,
@@ -153,16 +164,64 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 order,
                 reply,
             } => {
-                let unserved_part = if self.run.is_some() {
-                    Some("a send while a run is active")
-                } else if plan.is_some() {
+                let unserved_part = if plan.is_some() {
                     Some("a send carrying a fetch plan")
                 } else if order.is_some() {
                     Some("an ordered delivery")
                 } else if delivery != broca_protocol::Delivery::Queue {
                     Some("a steer or interrupt")
-                } else if key.is_keyed() {
-                    Some("a send whose retry must be deduplicated")
+                } else if conversation_key.is_some() {
+                    // Routing reads it when it picks the run's account, which a store session's
+                    // runs don't do yet.
+                    Some("a send naming a conversation key")
+                } else {
+                    None
+                };
+                if let Some(what) = unserved_part {
+                    let _ = reply.send(SendOutcome::Error(unserved(what)));
+                    return false;
+                }
+                // As in today's actor, a running run's routing decision is fixed, and a send naming
+                // another is refused before its key is looked at.
+                if let Some(fixed) = self.running().map(|run| {
+                    run.start
+                        .as_ref()
+                        .and_then(|start| start.route_decision_id.as_ref())
+                }) {
+                    if let Some(requested) = &request.route_decision_id {
+                        if Some(requested) != fixed {
+                            let _ = reply.send(SendOutcome::RouteDecisionFixed);
+                            return false;
+                        }
+                    }
+                }
+                let mut identity = None;
+                if key.is_keyed() {
+                    match self
+                        .keyed(
+                            &run_id,
+                            &key,
+                            &request,
+                            delivery,
+                            conversation_key.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(Keyed::Answered(outcome)) => {
+                            let _ = reply.send(outcome);
+                            return false;
+                        }
+                        Ok(Keyed::Fresh(digest)) => identity = Some(digest),
+                        Err(error) => {
+                            let _ = reply.send(SendOutcome::Error(error));
+                            return false;
+                        }
+                    }
+                }
+                let unserved_part = if self.run.is_some() {
+                    Some("a send while a run is active")
+                } else if self.running().is_some() {
+                    Some("a send while a run is paused")
                 } else if retention.is_some() {
                     Some("a send setting retention")
                 } else if session_class.is_some() {
@@ -176,7 +235,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     let _ = reply.send(SendOutcome::Error(unserved(what)));
                     return false;
                 }
-                self.start_run(run_id, *request, title, reply);
+                let send_id = key.send_id().map(str::to_owned);
+                self.start_run(run_id, *request, title, send_id, identity, reply);
                 false
             }
             LineageCmd::Status { reply } => {
@@ -209,11 +269,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Starts a run of `request` on the idle session. The sender's reply waits for the run's
     /// start to be durable, or for its refusal.
+    /// `send_id` and `identity` are a keyed send's key and identity digest, which the run's start
+    /// records so a retry can be answered from it.
     fn start_run(
         &mut self,
         run_id: RunId,
         request: SubmissionRequest,
         title: Option<String>,
+        send_id: Option<String>,
+        identity: Option<String>,
         reply: oneshot::Sender<SendOutcome>,
     ) {
         let mut request = request;
@@ -229,6 +293,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         req.submission_id = None;
         req.input_written_at_ms = broca_core::run::epoch_millis();
         req.title = title;
+        req.send_id = send_id;
+        req.request_identity_digest = identity;
         let cancel = CancellationToken::new();
         let control = RunControl {
             cancel: Some(cancel.clone()),
@@ -264,6 +330,125 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             admitting: Some(reply),
             done,
         });
+    }
+
+    /// The session's latest run while it is unfinished and either running here or paused: the
+    /// run a new send would have to wait behind.
+    fn running(&self) -> Option<&broca_session_store::fold::operations::Run> {
+        let run = self.session.operations().run.as_ref()?;
+        (run.finished.is_none() && (self.run.is_some() || run.paused.is_some())).then_some(run)
+    }
+
+    /// A keyed send, looked up by the run id its key names, as today's actor looks it up: a run
+    /// started under the key answers the retry from that run's records when the payload is the
+    /// same, and is refused naming what differs when it is not. A key no run used starts a run.
+    async fn keyed(
+        &self,
+        run_id: &RunId,
+        key: &crate::actor::SendKey,
+        request: &SubmissionRequest,
+        delivery: broca_protocol::Delivery,
+        conversation_key: Option<&str>,
+    ) -> Result<Keyed, String> {
+        let digest = broca_core::send_identity_digest_with_conversation_key(
+            request,
+            delivery,
+            conversation_key,
+        );
+        let find = |kind, id: String| async move {
+            self.session
+                .find_id(kind, &id)
+                .await
+                .map_err(|error| format!("{error:?}"))
+        };
+        let by_run = find(IdKind::RunId, run_id.0.clone()).await?;
+        let submission = find(IdKind::SubmissionId, format!("sub-{}", run_id.0)).await?;
+        let Some(start) = by_run.iter().find_map(|(_, record)| match record {
+            Record::RunStart(start) => Some(start),
+            _ => None,
+        }) else {
+            // Today's actor answers a key a queued send or a steer holds from that send's own
+            // records, which this actor can't read yet.
+            let mut holders = submission;
+            if let Some(send_id) = key.send_id() {
+                holders.extend(find(IdKind::SendId, send_id.to_owned()).await?);
+            }
+            return Ok(if holders.is_empty() {
+                Keyed::Fresh(digest)
+            } else {
+                Keyed::Answered(SendOutcome::Error(unserved(
+                    "a retry of a queued or steered send",
+                )))
+            });
+        };
+        // A run an ordered delivery started is a different send from this plain one.
+        if submission
+            .iter()
+            .any(|(_, record)| matches!(record, Record::DeliveryOrdered(_)))
+        {
+            return Ok(Keyed::Answered(SendOutcome::SendIdReuse {
+                differing: "delivery",
+            }));
+        }
+        let Some(stored) = start.request_identity_digest.as_deref() else {
+            // Nothing can prove the payload is the same send, so the retry neither runs again nor
+            // passes as the same one.
+            return Ok(Keyed::Answered(SendOutcome::SendIdReuse {
+                differing: "request identity because the run's start recorded no digest",
+            }));
+        };
+        if stored != digest {
+            let differing = broca_core::admission::send_identity_difference_with_conversation_key(
+                stored,
+                request,
+                delivery,
+                conversation_key,
+            )
+            .unwrap_or("request identity");
+            return Ok(Keyed::Answered(SendOutcome::SendIdReuse { differing }));
+        }
+        let outcome = match self
+            .session
+            .operations()
+            .run
+            .as_ref()
+            .filter(|run| run.run_id == run_id.0)
+        {
+            Some(run) => match (run.finished, run.paused) {
+                (Some(reason), _) => finished(run_id, reason),
+                _ if self.run.is_some() => SendOutcome::Active {
+                    run_id: run_id.clone(),
+                    delivered: None,
+                },
+                // Runner-owned pauses are reported; a run paused for sign-in, or unfinished with
+                // nothing running it, is driven again by its retry in today's actor.
+                (
+                    None,
+                    Some(
+                        reason @ (broca_protocol::PauseReason::Restart
+                        | broca_protocol::PauseReason::AccountLimit
+                        | broca_protocol::PauseReason::ToolHeld),
+                    ),
+                ) => SendOutcome::Paused {
+                    run_id: run_id.clone(),
+                    reason,
+                    delivered: None,
+                },
+                _ => SendOutcome::Error(unserved("driving an unfinished run again by its retry")),
+            },
+            // An earlier run: a later run started only after this one ended.
+            None => match by_run.iter().find_map(|(_, record)| match record {
+                Record::RunEnd(end) => Some(end.reason),
+                _ => None,
+            }) {
+                Some(reason) => finished(run_id, reason),
+                None => SendOutcome::Error(format!(
+                    "the run {} that a recorded send started has no end, yet a later run started",
+                    run_id.0
+                )),
+            },
+        };
+        Ok(Keyed::Answered(outcome))
     }
 
     /// Tells the sender its run is active, once the run's start is in the session.
@@ -349,6 +534,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             active.cancel.cancel();
         }
         CancelOutcome::Ack
+    }
+}
+
+fn finished(run_id: &RunId, reason: broca_protocol::RunFinishReason) -> SendOutcome {
+    SendOutcome::Finished {
+        run_id: run_id.clone(),
+        reason,
+        delivered: None,
     }
 }
 
@@ -467,5 +660,7 @@ fn refuse(command: LineageCmd) {
     }
 }
 
+#[cfg(test)]
+mod differential;
 #[cfg(test)]
 mod tests;

@@ -24,7 +24,7 @@ use super::StoreActor;
 use crate::actor::{CancelOutcome, LineageCmd, LineageStatus, SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunError, StoreRunJob};
 
-fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
+pub(super) fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
     vec![
         NormalizedEvent::Control(ProviderControl::AssistantMessage {
             message: AssistantMessage {
@@ -76,9 +76,9 @@ fn bind() -> BindIdentity {
 
 /// A scripted provider whose first step waits for `gate`, so a test can act while a run's start
 /// is durable and its first model call is in flight.
-struct Gated {
-    inner: StubProvider,
-    gate: Option<Arc<Notify>>,
+pub(super) struct Gated {
+    pub(super) inner: StubProvider,
+    pub(super) gate: Option<Arc<Notify>>,
 }
 
 #[async_trait]
@@ -96,11 +96,14 @@ impl broca_core::provider::Provider for Gated {
 }
 
 /// Runs each store job through the new loop's admission and run, over a scripted provider.
-struct LoopExecutor {
+pub(super) struct LoopExecutor {
     provider: Gated,
 }
 
-fn executor(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> LoopExecutor {
+pub(super) fn executor(
+    steps: Vec<Vec<NormalizedEvent>>,
+    gate: Option<Arc<Notify>>,
+) -> LoopExecutor {
     LoopExecutor {
         provider: Gated {
             inner: StubProvider::new(steps),
@@ -172,7 +175,7 @@ impl RunExecutor for LoopExecutor {
 
 /// A store actor over a new session in memory, serving on its own task, and the backend it
 /// writes to.
-async fn actor(
+pub(super) async fn actor(
     executor: LoopExecutor,
 ) -> (
     mpsc::UnboundedSender<LineageCmd>,
@@ -204,7 +207,7 @@ async fn actor(
     (commands, served, backend)
 }
 
-fn request(text: &str) -> SubmissionRequest {
+pub(super) fn request(text: &str) -> SubmissionRequest {
     serde_json::from_value(serde_json::json!({
         "model": {"provider_module_id": "stub", "model_id": "m"},
         "input": [{"role": "user", "content": [{"type": "text", "text": text}]}],
@@ -224,6 +227,15 @@ async fn send(
     run_id: &str,
     text: &str,
 ) -> SendOutcome {
+    send_with(commands, run_id, request(text), SendKey::Minted).await
+}
+
+pub(super) async fn send_with(
+    commands: &mpsc::UnboundedSender<LineageCmd>,
+    run_id: &str,
+    request: SubmissionRequest,
+    key: SendKey,
+) -> SendOutcome {
     let (reply, answer) = oneshot::channel();
     commands
         .send(LineageCmd::Send {
@@ -233,9 +245,9 @@ async fn send(
             conversation_key: None,
             title: None,
             run_id: RunId(run_id.into()),
-            request: Box::new(request(text)),
+            request: Box::new(request),
             kind: RunKind::FreshOrResume,
-            key: SendKey::Minted,
+            key,
             skip_materialization: false,
             delivery: broca_protocol::Delivery::Queue,
             plan: None,
@@ -246,6 +258,49 @@ async fn send(
     answer.await.unwrap()
 }
 
+/// A send keyed by the caller's `send_id` `k`, whose run id is `r-k`.
+async fn keyed(commands: &mpsc::UnboundedSender<LineageCmd>, k: &str, text: &str) -> SendOutcome {
+    send_with(
+        commands,
+        &format!("r-{k}"),
+        request(text),
+        SendKey::SendId(k.into()),
+    )
+    .await
+}
+
+/// How many runs the session's open log started.
+async fn starts(session: &Session<&'static MemoryBackend>) -> usize {
+    session
+        .open_log_records()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|(_, record)| matches!(record, Record::RunStart(_)))
+        .count()
+}
+
+fn finished(run_id: &str) -> SendOutcome {
+    SendOutcome::Finished {
+        run_id: RunId(run_id.into()),
+        reason: broca_protocol::RunFinishReason::Completed,
+        delivered: None,
+    }
+}
+
+/// A provider step that fails because the credential needs signing in again.
+pub(super) fn auth_failure() -> Vec<NormalizedEvent> {
+    vec![NormalizedEvent::Control(ProviderControl::Error {
+        error: serde_json::from_value(serde_json::json!({
+            "class": "auth",
+            "message": "sign in again",
+            "status": 401
+        }))
+        .unwrap(),
+        retries_used: 0,
+    })]
+}
+
 async fn status(commands: &mpsc::UnboundedSender<LineageCmd>) -> LineageStatus {
     let (reply, answer) = oneshot::channel();
     commands.send(LineageCmd::Status { reply }).unwrap();
@@ -253,7 +308,7 @@ async fn status(commands: &mpsc::UnboundedSender<LineageCmd>) -> LineageStatus {
 }
 
 /// Waits until the session is idle again.
-async fn idle(commands: &mpsc::UnboundedSender<LineageCmd>) {
+pub(super) async fn idle(commands: &mpsc::UnboundedSender<LineageCmd>) {
     for _ in 0..500 {
         if status(commands).await == LineageStatus::Idle {
             return;
@@ -263,7 +318,7 @@ async fn idle(commands: &mpsc::UnboundedSender<LineageCmd>) {
     panic!("the session never went idle");
 }
 
-fn texts(session: &Session<&'static MemoryBackend>) -> Vec<String> {
+pub(super) fn texts(session: &Session<&'static MemoryBackend>) -> Vec<String> {
     session
         .conversation()
         .messages
@@ -524,4 +579,178 @@ async fn an_unserved_command_is_refused_by_name() {
             "a retraction is not served yet for a session kept in the new storage".into()
         )
     );
+}
+
+/// A keyed send's run records its key and its payload's identity digest. A retry with the same
+/// payload is answered from that run, here finished, and writes nothing.
+#[tokio::test]
+async fn a_keyed_retry_is_answered_from_the_run_it_started() {
+    let (commands, served, _) = actor(executor(vec![text_step("a1", "hello")], None)).await;
+    assert!(matches!(
+        keyed(&commands, "k1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    assert_eq!(keyed(&commands, "k1", "first").await, finished("r-k1"));
+    drop(commands);
+    let session = served.await.unwrap();
+    let start = session
+        .operations()
+        .run
+        .as_ref()
+        .unwrap()
+        .start
+        .clone()
+        .unwrap();
+    assert_eq!(start.send_id.as_deref(), Some("k1"));
+    assert_eq!(
+        start.request_identity_digest,
+        Some(broca_core::send_identity_digest_with_conversation_key(
+            &request("first"),
+            broca_protocol::Delivery::Queue,
+            None,
+        ))
+    );
+    assert_eq!(texts(&session), ["first", "hello"], "the retry ran nothing");
+    assert_eq!(starts(&session).await, 1);
+}
+
+/// A retry whose payload differs from the send its key started is refused naming the field that
+/// differs, and writes nothing.
+#[tokio::test]
+async fn a_retry_with_another_payload_is_refused_naming_what_differs() {
+    let (commands, served, _) = actor(executor(vec![text_step("a1", "hello")], None)).await;
+    assert!(matches!(
+        keyed(&commands, "k1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    assert_eq!(
+        keyed(&commands, "k1", "changed").await,
+        SendOutcome::SendIdReuse { differing: "input" }
+    );
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(texts(&session), ["first", "hello"]);
+    assert_eq!(
+        starts(&session).await,
+        1,
+        "the refused retry started nothing"
+    );
+}
+
+/// A retry of the run the session is running is answered `active`, and once that run ends, with
+/// how it ended.
+#[tokio::test]
+async fn a_retry_of_the_running_run_is_active_until_it_ends() {
+    let gate = Arc::new(Notify::new());
+    let (commands, served, _) = actor(executor(
+        vec![text_step("a1", "hello")],
+        Some(Arc::clone(&gate)),
+    ))
+    .await;
+    let active = SendOutcome::Active {
+        run_id: RunId("r-k1".into()),
+        delivered: None,
+    };
+    assert_eq!(keyed(&commands, "k1", "first").await, active);
+    assert_eq!(keyed(&commands, "k1", "first").await, active);
+    gate.notify_one();
+    idle(&commands).await;
+    assert_eq!(keyed(&commands, "k1", "first").await, finished("r-k1"));
+    drop(commands);
+    assert_eq!(texts(&served.await.unwrap()), ["first", "hello"]);
+}
+
+/// A retry of a run that is no longer the session's latest is answered from that run's own end,
+/// found by its run id.
+#[tokio::test]
+async fn a_retry_of_an_earlier_run_is_answered_from_its_end() {
+    let (commands, served, _) = actor(executor(
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        None,
+    ))
+    .await;
+    assert!(matches!(
+        keyed(&commands, "k1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    assert!(matches!(
+        send(&commands, "r2", "second").await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    assert_eq!(keyed(&commands, "k1", "first").await, finished("r-k1"));
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
+}
+
+/// While the latest run is paused, a new send would have to wait behind it, which this actor
+/// doesn't serve yet: it is refused by name. The paused run's own retry is refused too, since
+/// today's actor drives a run paused for sign-in again on its retry.
+#[tokio::test]
+async fn sends_on_a_paused_session_are_refused_by_name() {
+    let (commands, served, _) = actor(executor(vec![auth_failure()], None)).await;
+    assert!(matches!(
+        keyed(&commands, "k1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    assert_eq!(
+        send(&commands, "r2", "second").await,
+        SendOutcome::Error(
+            "a send while a run is paused is not served yet for a session kept in the new \
+             storage"
+                .into()
+        )
+    );
+    assert_eq!(
+        keyed(&commands, "k1", "first").await,
+        SendOutcome::Error(
+            "driving an unfinished run again by its retry is not served yet for a session kept \
+             in the new storage"
+                .into()
+        )
+    );
+    drop(commands);
+    let session = served.await.unwrap();
+    let run = session.operations().run.as_ref().unwrap();
+    assert_eq!(run.paused, Some(broca_protocol::PauseReason::AuthRequired));
+    assert_eq!(run.run_id, "r-k1");
+    assert_eq!(
+        starts(&session).await,
+        1,
+        "the refused sends started nothing"
+    );
+    assert_eq!(texts(&session), ["first"]);
+}
+
+/// While a run is running, a send naming another routing decision is refused as today's actor
+/// refuses it, before its key is looked at.
+#[tokio::test]
+async fn a_running_runs_routing_decision_is_fixed() {
+    let gate = Arc::new(Notify::new());
+    let (commands, served, _) = actor(executor(
+        vec![text_step("a1", "hello")],
+        Some(Arc::clone(&gate)),
+    ))
+    .await;
+    let mut first = request("first");
+    first.route_decision_id = Some("decision-1".into());
+    assert!(matches!(
+        send_with(&commands, "r-k1", first, SendKey::SendId("k1".into())).await,
+        SendOutcome::Active { .. }
+    ));
+    let mut other = request("first");
+    other.route_decision_id = Some("decision-2".into());
+    assert_eq!(
+        send_with(&commands, "r-k1", other, SendKey::SendId("k1".into())).await,
+        SendOutcome::RouteDecisionFixed
+    );
+    gate.notify_one();
+    idle(&commands).await;
+    drop(commands);
+    assert_eq!(texts(&served.await.unwrap()), ["first", "hello"]);
 }
