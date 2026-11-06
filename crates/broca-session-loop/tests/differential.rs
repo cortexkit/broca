@@ -4941,3 +4941,26 @@ async fn a_budget_starts_over_with_each_run() {
         )
         .await;
 }
+
+#[tokio::test]
+async fn a_batch_ending_in_an_unknown_outcome_still_writes_its_firings() {
+    BUDGET
+        .scope(
+            Some(budgeted(&[1], None)),
+            compare(Scenario {
+                input: vec![user("write a")],
+                tools: vec![tool("write", ExecutionMode::Parallel)],
+                manifest: None,
+                stop_when: Vec::new(),
+                steps: vec![
+                    answer(
+                        "a1",
+                        vec![call("c1", "write", json!({"path": "a"}))],
+                        FinishReason::ToolCalls,
+                    ),
+                    text_step("a2", "should not be reached"),
+                ],
+            }),
+        )
+        .await;
+}
