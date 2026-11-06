@@ -2568,6 +2568,16 @@ mod executor {
         wal_store: Arc<dyn WalStore>,
         session: BindIdentity,
     ) -> Option<u16> {
+        terminal_provider_error(wal_store, session)
+            .await
+            .as_ref()
+            .and_then(wire_auth_status)
+    }
+
+    async fn terminal_provider_error(
+        wal_store: Arc<dyn WalStore>,
+        session: BindIdentity,
+    ) -> Option<ProviderError> {
         let records =
             broca_diagnostics::spawn_blocking(broca_diagnostics::JobKind::WalRead, move || {
                 wal_store.read_records(&session)
@@ -2575,7 +2585,7 @@ mod executor {
             .await
             .ok()?
             .ok()?;
-        latest_terminal_error(&records).and_then(wire_auth_status)
+        latest_terminal_error(&records).cloned()
     }
 
     /// Return the newest pause/finish record's error without crossing that terminal boundary.
@@ -3985,6 +3995,7 @@ mod executor {
                         let id = vault.addressing.vault_id_for(&key);
                         let listing = listing.as_ref()?;
                         let routed = self.routing.is_some()
+                            && key.method != AuthMethod::ApiKey
                             && broca_module_serve::account_routing::selects_accounts(key.method)
                             && broca_module_serve::account_routing::Candidates::from_listing(
                                 listing,
@@ -5121,6 +5132,13 @@ mod executor {
             // Report this run's account evidence to routing when it has an admission id there:
             // every decision path except the `legacy_static` one older builds wrote (the removed
             // operator switch that bypassed routing), fresh or resumed alike.
+            let report_api_key_backoff = resolution.selection.as_ref().is_some_and(|selection| {
+                selection.auth_method.as_deref() == Some("apikey")
+                    && selection.account_decision.as_ref().is_some_and(|decision| {
+                        decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
+                            && decision.admission_id.is_some()
+                    })
+            });
             let account_reporter = match (
                 self.routing.as_ref(),
                 resolution
@@ -5210,6 +5228,19 @@ mod executor {
             // terminal's own sequence number.
             if let (Some(reporter), Ok(finished)) = (&account_reporter, &summary) {
                 if finished.paused.is_none() {
+                    if report_api_key_backoff
+                        && finished.reason == broca_protocol::RunFinishReason::Error
+                    {
+                        if let Some(error) =
+                            terminal_provider_error(self.wal_store.clone(), session.clone()).await
+                        {
+                            reporter.terminal_rate_limit(
+                                job.writer.lineage_id(),
+                                job.writer.durable_head().load(Ordering::Acquire),
+                                &error,
+                            );
+                        }
+                    }
                     reporter.finish(
                         job.writer.lineage_id(),
                         job.writer.durable_head().load(Ordering::Acquire),

@@ -146,17 +146,15 @@ async fn routed_auth_queued_pool_survives_restart_and_drains_to_account_for() {
 fn auth_routing_hints_do_not_change_unlisted_method_submission_bytes_or_identity() {
     use broca_module_serve::wire::SendParamsExt;
     use broca_protocol::{BindIdentity, RunId};
-    for method in ["apikey", "antigravity"] {
-        let base = serde_json::json!({"prompt":"hello","model":{"provider":"anthropic","model":"fixture"},
-            "auth":{"method":method,"account":"work"}});
-        let mut hinted = base.clone();
-        hinted["auth"]["pool"] = serde_json::json!("ignored-pool");
-        hinted["auth"]["credential_id"] = serde_json::json!("ignored-credential");
-        let convert = |value| serde_json::from_value::<broca_wire::SendParams>(value).unwrap()
-            .into_send_request(BindIdentity::new("/private", "runner", "session"), RunId("run".into())).unwrap().request;
-        let base = convert(base);
-        let hinted = convert(hinted);
-        assert_eq!(serde_json::to_vec(&base).unwrap(), serde_json::to_vec(&hinted).unwrap());
-        assert_eq!(broca_core::submission_identity_digest(&base), broca_core::submission_identity_digest(&hinted));
-    }
+    let base = serde_json::json!({"prompt":"hello","model":{"provider":"anthropic","model":"fixture"},
+        "auth":{"method":"antigravity","account":"work"}});
+    let mut hinted = base.clone();
+    hinted["auth"]["pool"] = serde_json::json!("ignored-pool");
+    hinted["auth"]["credential_id"] = serde_json::json!("ignored-credential");
+    let convert = |value| serde_json::from_value::<broca_wire::SendParams>(value).unwrap()
+        .into_send_request(BindIdentity::new("/private", "runner", "session"), RunId("run".into())).unwrap().request;
+    let base = convert(base);
+    let hinted = convert(hinted);
+    assert_eq!(serde_json::to_vec(&base).unwrap(), serde_json::to_vec(&hinted).unwrap());
+    assert_eq!(broca_core::submission_identity_digest(&base), broca_core::submission_identity_digest(&hinted));
 }

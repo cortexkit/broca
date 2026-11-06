@@ -604,11 +604,11 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   possible. A stored system entry switched to an unsupported route renders as user text
   without changing the stored role, text or delivery mode.
 
-`role.describe` declares `routed_accounts: ["oauth", "chatgpt"]` with the matching
-`routed_accounts` capability. These are the subscription sign-ins for which broca chooses
-an account through `route.account_for` and reports its run through `route.account_observe`.
-`apikey` and `antigravity` are not listed: their existing caller/configured credential
-selection is unchanged. Without new hints, an `auth.account` pin bypasses routing. If broca
+`role.describe` declares `routed_accounts: ["oauth", "chatgpt", "apikey"]` with the matching
+`routed_accounts` capability. Broca chooses subscription accounts and pooled API keys through
+`route.account_for` and reports their runs through `route.account_observe`.
+`antigravity` is not listed: its existing caller/configured credential selection is unchanged.
+Without new hints, an `auth.account` pin bypasses routing. For subscription sign-ins, if broca
 cannot list credentials or finds at most one account, it also uses the configured credential
 without asking routing. Resumed runs retain their frozen choice.
 
@@ -622,6 +622,26 @@ A strict `auth.account` pin cannot be combined with either hint for a listed met
 `invalid_params` names `auth.account` before storage or any routing request. A pin without
 either hint bypasses routing. Queued requests retain their original hints across
 restart; a resumed run keeps its frozen credential/decision and accepts no fresh auth pin.
+
+API-key sends without a pool, credential hint or routing decision keep the configured static
+credential, even when several keys are listed. With any of those selectors, broca asks routing
+with `mode: "admit"` and loads the answered `account.credential_id`, never the credential hint.
+Broca validates that the answer declares method `apikey` and names an active, readable API key
+in its own vault listing. Its `provider_ids` must contain the credential provider, or be empty
+(the legacy provider-unmapped case). Broca offers those keys as candidates and refuses an
+answer outside the offered account/credential pairs. A key's account id is the vault's
+`account_id`, or its credential id when that metadata is absent. Missing listings refuse
+hinted admissions rather than bypassing
+routing. `run_finished` with the admission id releases the routed key, just as for subscriptions.
+
+For an API-key run admitted by routing, a terminal transient rate limit with `retry_after_secs`
+also reports `transient_backoff` before `run_finished`. Its own stable event id is distinct from
+the release, and `retry_at_ms` is the final attempt's receipt time plus the retry delay in Unix
+milliseconds. Broca uses the provider's existing rate-limit classification; a refusal recovered
+by the provider's retries is not reported as backoff. The new observation is sent only when the
+router's `role.describe` declares `observe_backoff`. Discovery uses the management route's
+capability cache, also used for `service_tier`, and refreshes when that route is reopened.
+Renewal (`mode: "renew"` with `expected_pin`) is not currently implemented for any routed method.
 
 Broca sends the effective `service_tier` on `route.account_for` only when the router's
 `role.describe` declares `service_tier`. A tier-aware answer's `service_tier_chosen` must be a
