@@ -344,7 +344,10 @@ where
         let ready = account_limit_of(writer)?
             .is_some_and(|pause| (seams.now_ms)() >= pause.resume_not_before_ms);
         if !ready {
-            return Ok(finished(writer, RunFinishReason::Interrupted));
+            return Ok(Finished {
+                paused: Some(PauseReason::AccountLimit),
+                ..finished(writer, RunFinishReason::Interrupted)
+            });
         }
     }
     let mut placed = Placed {

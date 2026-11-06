@@ -175,10 +175,18 @@ impl Provider for ScriptedProvider {
             if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
                 &mut event
             {
-                if attempt.request_body_sha256 == RENDERED {
+                if attempt.request_body_sha256 == RENDERED
+                    || attempt.request_body_sha256 == RENDERED_OTHER
+                {
                     use sha2::Digest as _;
-                    attempt.request_body_len = rendered.len() as u64;
-                    attempt.request_body_sha256 = format!("{:x}", sha2::Sha256::digest(&rendered));
+                    // `RENDERED_OTHER` reports a request other than the one this call sent, as
+                    // if the step had rendered differently before the refusal.
+                    let mut reported = rendered.clone();
+                    if attempt.request_body_sha256 == RENDERED_OTHER {
+                        reported.extend_from_slice(b" ");
+                    }
+                    attempt.request_body_len = reported.len() as u64;
+                    attempt.request_body_sha256 = format!("{:x}", sha2::Sha256::digest(&reported));
                     // An account limit is observed when it is refused, and resets shortly after.
                     if let Some(limit) = attempt.account_observation.limit.as_mut() {
                         limit.observed_at_ms = harness_now();
@@ -204,6 +212,10 @@ const RESETS_AFTER_MS: u64 = 200;
 
 /// The request digest a scripted attempt carries to report the request it was sent with.
 const RENDERED: &str = "rendered";
+
+/// The request digest a scripted attempt carries to report a request other than the one it was
+/// sent with.
+const RENDERED_OTHER: &str = "rendered-other";
 
 fn sent_requests(provider: &ScriptedProvider) -> Vec<CallOptions> {
     let sent = provider.sent.lock().unwrap();
@@ -912,6 +924,8 @@ tokio::task_local! {
 struct AccountScript {
     selection: broca_wal::AuthSelection,
     wait: broca_core::SameAccountWait,
+    /// Whether a pause comparison waits for the account to reset before resuming.
+    wait_for_reset: bool,
 }
 
 fn account() -> Option<AccountScript> {
@@ -954,8 +968,18 @@ fn limited_attempt(number: u32) -> NormalizedEvent {
 
 /// A step the provider refused for the account's limit.
 fn account_limited() -> Vec<NormalizedEvent> {
+    account_limited_reporting(RENDERED)
+}
+
+/// A step the provider refused for the account's limit, its attempt reporting `request` as
+/// the request it was sent with.
+fn account_limited_reporting(request: &str) -> Vec<NormalizedEvent> {
+    let mut attempt = limited_attempt(1);
+    if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) = &mut attempt {
+        attempt.request_body_sha256 = request.into();
+    }
     vec![
-        limited_attempt(1),
+        attempt,
         NormalizedEvent::Control(ProviderControl::Error {
             error: serde_json::from_value(json!({
                 "class": "transient",
@@ -997,7 +1021,7 @@ fn pause_names_its_attempt(writer: &Recording<'_, '_>) {
 
 /// Waits until a scripted account limit has reset, when the comparison routes an account.
 async fn reset_passes() {
-    if account().is_some() {
+    if account().is_some_and(|script| script.wait_for_reset) {
         tokio::time::sleep(std::time::Duration::from_millis(RESETS_AFTER_MS + 50)).await;
     }
 }
@@ -3397,14 +3421,36 @@ fn auth_failure() -> Vec<NormalizedEvent> {
 /// everything both did.
 /// Runs [`compare_auth_pause_in`] in both layouts.
 async fn compare_auth_pause(scenario: Scenario) {
+    compare_auth_pause_switching_to(scenario, None).await;
+}
+
+/// [`compare_auth_pause`], with routing giving the resumed run `account` instead of the one
+/// the run was admitted to.
+async fn compare_auth_pause_switching(scenario: Scenario, account: broca_wal::AuthSelection) {
+    compare_auth_pause_switching_to(scenario, Some(account)).await;
+}
+
+async fn compare_auth_pause_switching_to(
+    scenario: Scenario,
+    resume_account: Option<broca_wal::AuthSelection>,
+) {
     for layout in LAYOUTS {
         LAYOUT
-            .scope(layout, Box::pin(compare_auth_pause_in(scenario.clone())))
+            .scope(
+                layout,
+                Box::pin(compare_auth_pause_in(
+                    scenario.clone(),
+                    resume_account.clone(),
+                )),
+            )
             .await;
     }
 }
 
-async fn compare_auth_pause_in(scenario: Scenario) {
+async fn compare_auth_pause_in(
+    scenario: Scenario,
+    resume_account: Option<broca_wal::AuthSelection>,
+) {
     // Today's loop, pausing and resuming on one writer.
     let dir = broca_test_support::scratch_root().join(format!(
         "session-loop-differential-{}-{}",
@@ -3435,7 +3481,10 @@ async fn compare_auth_pause_in(scenario: Scenario) {
             &wal,
             None,
             RunControl {
-                auth_selection: account_selection(),
+                auth_selection: match mode {
+                    StartMode::ResumeAfterAuth => resume_account.clone().or_else(account_selection),
+                    _ => account_selection(),
+                },
                 account_limit_pause: account().is_some(),
                 max_same_account_wait: account()
                     .map_or_else(Default::default, |script| script.wait),
@@ -3530,6 +3579,10 @@ async fn compare_auth_pause_in(scenario: Scenario) {
     .await
     .expect("the new loop runs");
     reset_passes().await;
+    let seams = Seams {
+        auth_selection: resume_account.or(seams.auth_selection.clone()),
+        ..seams
+    };
     let second = resume(&mut writer, &parts, &seams)
         .await
         .expect("the new loop resumes");
@@ -5721,6 +5774,7 @@ async fn an_account_limit_pauses_on_the_same_account_and_resumes() {
         AccountScript {
             selection: routed("acct-1"),
             wait: broca_core::SameAccountWait::default(),
+            wait_for_reset: true,
         },
         compare_auth_pause(Scenario {
             input: vec![user("read a")],
@@ -5748,6 +5802,7 @@ async fn an_account_limit_ends_the_run_when_waits_are_off() {
         AccountScript {
             selection: routed("acct-1"),
             wait: broca_core::SameAccountWait::Minutes(0),
+            wait_for_reset: true,
         },
         compare(Scenario {
             input: vec![user("hello")],
@@ -5756,6 +5811,68 @@ async fn an_account_limit_ends_the_run_when_waits_are_off() {
             stop_when: Vec::new(),
             steps: vec![account_limited()],
         }),
+    )
+    .await;
+}
+
+fn tool_then_limited(limited: Vec<NormalizedEvent>) -> Scenario {
+    Scenario {
+        input: vec![user("read a")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            limited,
+            text_step("a2", "done"),
+        ],
+    }
+}
+
+/// Asked to resume before the account resets, both loops leave the run paused and send nothing.
+#[tokio::test]
+async fn an_account_limit_pause_stays_paused_before_the_reset() {
+    compare_routed(
+        AccountScript {
+            selection: routed("acct-1"),
+            wait: broca_core::SameAccountWait::default(),
+            wait_for_reset: false,
+        },
+        compare_auth_pause(tool_then_limited(account_limited())),
+    )
+    .await;
+}
+
+/// The step a pause resumes renders a request other than the one the provider refused: both
+/// loops end the run interrupted rather than send it.
+#[tokio::test]
+async fn an_account_limit_resume_refuses_a_changed_request() {
+    compare_routed(
+        AccountScript {
+            selection: routed("acct-1"),
+            wait: broca_core::SameAccountWait::default(),
+            wait_for_reset: true,
+        },
+        compare_auth_pause(tool_then_limited(account_limited_reporting(RENDERED_OTHER))),
+    )
+    .await;
+}
+
+/// Routing gives the resumed run another account: both loops end it interrupted.
+#[tokio::test]
+async fn an_account_limit_resume_on_another_account_ends_the_run() {
+    let first = AccountScript {
+        selection: routed("acct-1"),
+        wait: broca_core::SameAccountWait::default(),
+        wait_for_reset: true,
+    };
+    compare_routed(
+        first,
+        compare_auth_pause_switching(tool_then_limited(account_limited()), routed("acct-2")),
     )
     .await;
 }
