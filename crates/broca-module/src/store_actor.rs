@@ -90,6 +90,9 @@ struct Start {
     /// Who sent the input, which the run's start records: today's actor names the request's
     /// principal.
     sent_by: Option<broca_protocol::BindPrincipal>,
+    /// The scope the run's start records, decided by today's rule (`broca_core::decide_scope`)
+    /// against the session's owner summary: the scope a send freezes, adopts or repeats.
+    scope: Option<broca_protocol::SessionScope>,
 }
 
 /// What a run drained from the queue starts from.
@@ -212,6 +215,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     let _ = reply.send(SendOutcome::Error(unserved(what)));
                     return false;
                 }
+                // As in today's actor, the owner and scope check comes first: a send the session's
+                // history refuses is refused before any retry is answered.
+                let scope = match self.send_scope(&run_id, &request) {
+                    Ok(scope) => scope,
+                    Err(outcome) => {
+                        let _ = reply.send(outcome);
+                        return false;
+                    }
+                };
                 // As in today's actor, a running run's routing decision is fixed, and a send naming
                 // another is refused before its key is looked at.
                 if let Some(fixed) = self.running().map(|run| {
@@ -263,6 +275,21 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     return false;
                 }
                 let request = *request;
+                // Today's actor refuses a send that declares tools on a scoped session unless a
+                // plan gave the session its tools: tool providers need a per-call preset on scoped
+                // routes, and only a plan carries one. A store session has no plan yet.
+                if request
+                    .tools
+                    .as_ref()
+                    .is_some_and(|tools| !tools.is_empty())
+                    && (scope.is_some()
+                        || matches!(request.scope, broca_protocol::SendScope::Stamped(_)))
+                {
+                    let _ = reply.send(SendOutcome::PlanRefused(
+                        broca_fetch_plan::Refusal::ScopedToolsRequirePlan,
+                    ));
+                    return false;
+                }
                 let steering = delivery == broca_protocol::Delivery::Steer;
                 // Today's actor lets a plain send leave its model to the session only when a
                 // plan selected the session's next-run model, and a store session has no plan.
@@ -319,6 +346,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     title,
                     send_id: key.send_id().map(str::to_owned),
                     identity,
+                    scope,
                 };
                 if steering && self.run.is_some() {
                     let outcome = self.steer(start, stop_sequences_named).await;
@@ -389,6 +417,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             send_id,
             identity,
             sent_by,
+            scope,
         } = start;
         // The executor resolves the send's credential selection; only the result is frozen.
         let auth = request.auth.take();
@@ -413,6 +442,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         req.title = title;
         req.send_id = send_id;
         req.request_identity_digest = identity;
+        req.scope = scope;
         let cancel = CancellationToken::new();
         let control = RunControl {
             cancel: Some(cancel.clone()),
@@ -448,6 +478,60 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             submission: drained.map(|drained| drained.submission),
             done,
         });
+    }
+
+    /// The session's owner summary, from its run starts, as today's admission rules read it.
+    fn ownership(&self) -> Result<broca_core::SessionOwnershipV1, String> {
+        broca_session_loop::owner::ownership(&self.session.operations().owner)
+            .map_err(|error| format!("the session's owner summary: {error}"))
+    }
+
+    /// The scope a send's run would record, decided as today's actor decides it: refused by the
+    /// shared rule when the session's history refuses the send's principal or scope, and refused
+    /// as busy when the send would freeze a scope while a run or the queue holds the session,
+    /// since only a run's start can carry it. A send from broca itself (`SendScope::Internal`)
+    /// carries the scope the session already froze.
+    ///
+    /// Reopening a scope at a later epoch, and agent-run scopes, are refused by name: today's
+    /// actor checks more for each (whether the run can start now, the carrier's tools).
+    fn send_scope(
+        &self,
+        run_id: &RunId,
+        request: &SubmissionRequest,
+    ) -> Result<Option<broca_protocol::SessionScope>, SendOutcome> {
+        let ownership = self.ownership().map_err(SendOutcome::Transient)?;
+        if let broca_protocol::SendScope::Stamped(bind) = &request.scope {
+            if bind.scope.run_id.is_some() {
+                return Err(SendOutcome::Error(unserved(
+                    "a send under an agent-run scope",
+                )));
+            }
+        }
+        match broca_core::decide_scope(&ownership, request.principal.as_ref(), &request.scope) {
+            Err(refusal) => Err(SendOutcome::ScopeRefused(refusal)),
+            Ok(broca_core::ScopeDecision::Reopen(_)) => Err(SendOutcome::Error(unserved(
+                "reopening the session's scope at a later epoch",
+            ))),
+            Ok(decision @ broca_core::ScopeDecision::Freeze(_)) => {
+                if let Some(active) = self.run.as_ref().filter(|active| active.run_id != *run_id) {
+                    return Err(SendOutcome::ScopeFreezeBusy {
+                        reason: crate::actor::ScopeFreezeBusyReason::RunActive,
+                        run_id: Some(active.run_id.clone()),
+                    });
+                }
+                if self.run.is_none()
+                    && self.paused().is_none()
+                    && !self.session.operations().queue.is_empty()
+                {
+                    return Err(SendOutcome::ScopeFreezeBusy {
+                        reason: crate::actor::ScopeFreezeBusyReason::QueueNonempty,
+                        run_id: None,
+                    });
+                }
+                Ok(decision.scope().cloned())
+            }
+            Ok(decision) => Ok(decision.scope().cloned()),
+        }
     }
 
     /// The session's latest run and why it paused, while it is paused.
@@ -762,6 +846,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             identity: Some(identity),
             sent_by: principal("sent_by")?,
             request,
+            // A drained send is broca's own, so it carries the scope the session already froze,
+            // as today's drain (`SendScope::Internal`) carries it.
+            scope: self.ownership()?.scope,
         };
         Ok((
             start,
@@ -926,6 +1013,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             send_id,
             identity,
             sent_by,
+            scope: _,
         } = start;
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         match self.queued(&submission_id.0).await {
@@ -1067,9 +1155,7 @@ fn finished(run_id: &RunId, reason: broca_protocol::RunFinishReason) -> SendOutc
 /// The request fields a store session doesn't take yet, refused by name before anything is
 /// written.
 fn refuse_unbuilt_request(request: &SubmissionRequest) -> Option<&'static str> {
-    if request.scope != broca_protocol::SendScope::Internal {
-        Some("a send whose route names an owner or scope")
-    } else if request.structured_output.is_some() {
+    if request.structured_output.is_some() {
         Some("structured output")
     } else if request.keep_warm.is_some() {
         Some("keep-warm")

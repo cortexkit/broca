@@ -172,6 +172,7 @@ impl Today {
                     title,
                     sent_by,
                     principal,
+                    scope,
                     config,
                     ..
                 } => Some(serde_json::json!({
@@ -182,6 +183,7 @@ impl Today {
                     "title": title,
                     "sent_by": sent_by,
                     "principal": principal,
+                    "scope": scope,
                     "model": config.model,
                 })),
                 _ => None,
@@ -413,6 +415,7 @@ async fn store_starts(session: &Session<&'static MemoryBackend>) -> Vec<serde_js
                     .and_then(|choices| choices.pointer("/record/sent_by"))
                     .cloned(),
                 "principal": start.principal,
+                "scope": start.scope,
                 "model": start.model,
             })),
             _ => None,
@@ -730,6 +733,126 @@ async fn a_queued_send_is_retracted_alike() {
             Step::Idle,
             Step::Retract("sub-r3"),
             Step::Retract("sub-r1"),
+        ],
+    )
+    .await;
+}
+
+fn core() -> broca_protocol::BindPrincipal {
+    broca_protocol::BindPrincipal::Reserved {
+        module_id: "prefrontal-core".into(),
+    }
+}
+
+fn head_scope(owner: broca_protocol::BindPrincipal) -> broca_protocol::SendScope {
+    broca_protocol::SendScope::Stamped(broca_protocol::BindScope {
+        scope: broca_protocol::SessionScope {
+            owner,
+            agent_id_frozen: false,
+            scope_ref: "head-1".into(),
+            scope_epoch: 1,
+            flow_id: None,
+            sender: None,
+            agent_id: None,
+            run_id: None,
+        },
+        owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
+    })
+}
+
+/// Core, sending under its own head scope. The send declares no tools: on a scoped session
+/// tools come only from a plan, which a store session can't have yet.
+fn scoped_by_core(request: &mut SubmissionRequest) {
+    request.principal = Some(core());
+    request.scope = head_scope(core());
+    request.tools = Some(Vec::new());
+}
+
+/// Core under its own head scope, declaring the default request's tools.
+fn scoped_with_tools(request: &mut SubmissionRequest) {
+    request.principal = Some(core());
+    request.scope = head_scope(core());
+}
+
+/// Another module, sending under core's head scope.
+fn scoped_by_another(request: &mut SubmissionRequest) {
+    scoped_by_core(request);
+    request.principal = Some(broca_protocol::BindPrincipal::Reserved {
+        module_id: "magic-context".into(),
+    });
+}
+
+/// Core, sending with no scope stamp on a daemon that stamps scopes.
+fn unstamped_by_core(request: &mut SubmissionRequest) {
+    request.principal = Some(core());
+    request.scope = broca_protocol::SendScope::Unstamped;
+    request.tools = Some(Vec::new());
+}
+
+/// A first scoped send freezes its scope, and later sends under it run with it, alike. A send
+/// from another module under that scope, and an unstamped one, are refused by the session's
+/// history, alike.
+#[tokio::test]
+async fn a_scoped_session_freezes_its_scope_alike() {
+    compare(
+        hello(),
+        false,
+        vec![
+            tweaked(send("r1", "first"), scoped_by_core),
+            Step::Idle,
+            tweaked(send("r2", "second"), scoped_by_core),
+            Step::Idle,
+            tweaked(send("r3", "intruder"), scoped_by_another),
+            tweaked(send("r4", "unstamped"), unstamped_by_core),
+        ],
+    )
+    .await;
+}
+
+/// A scoped send can't freeze a scope while an unscoped run holds the session, and is refused
+/// as busy naming that run, alike.
+#[tokio::test]
+async fn freezing_a_scope_while_a_run_runs_is_busy_alike() {
+    compare(
+        hello(),
+        true,
+        vec![
+            tweaked(send("r1", "first"), from_core),
+            tweaked(send("r2", "scoped"), scoped_by_core),
+            Step::Release,
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+/// A scoped send that declares tools is refused, since tools on a scoped session come only from
+/// a plan, alike.
+#[tokio::test]
+async fn a_scoped_send_declaring_tools_is_refused_alike() {
+    compare(
+        hello(),
+        false,
+        vec![tweaked(send("r1", "first"), scoped_with_tools)],
+    )
+    .await;
+}
+
+/// A send queued behind a scoped run drains into a run that carries the session's scope, alike.
+#[tokio::test]
+async fn a_queued_send_carries_the_frozen_scope_alike() {
+    compare(
+        hello(),
+        true,
+        vec![
+            tweaked(send("r1", "first"), scoped_by_core),
+            tweaked(send("r2", "queued"), scoped_by_core),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
         ],
     )
     .await;
