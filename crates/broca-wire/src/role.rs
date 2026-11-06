@@ -399,6 +399,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::HISTORY_DISPLAY,
         cortexkit_role_llm_runner::capabilities::RICH_UI_STAMP,
         cortexkit_role_llm_runner::capabilities::READ_DISPLAY_FACTS,
+        cortexkit_role_llm_runner::capabilities::NOTICES,
         cortexkit_role_llm_runner::capabilities::CALL_IDENTITY,
         cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
@@ -786,10 +787,7 @@ mod pinned_reply_bytes {
                 last_ordinal: Some(4),
                 first_ordinal: Some(1),
                 history_version: 1,
-                head: Some(CursorWire {
-                    wal_seq: 12,
-                    sub_index: 0,
-                }),
+                head: Some(CursorWire::new(12, 0)),
                 last_run_state: Some(LastRunState {
                     run_id: "run-1".into(),
                     state: "completed".into(),
@@ -823,10 +821,7 @@ mod pinned_reply_bytes {
                 last_ordinal: Some(4),
                 first_ordinal: Some(1),
                 history_version: 1,
-                head: Some(CursorWire {
-                    wal_seq: 12,
-                    sub_index: 0,
-                }),
+                head: Some(CursorWire::new(12, 0)),
                 last_run_state: Some(LastRunState {
                     run_id: "run-1".into(),
                     state: "completed".into(),
@@ -858,10 +853,7 @@ mod pinned_reply_bytes {
             last_ordinal: Some(4),
             first_ordinal: Some(1),
             history_version: 1,
-            head: Some(CursorWire {
-                wal_seq: 12,
-                sub_index: 0,
-            }),
+            head: Some(CursorWire::new(12, 0)),
             last_run_state: Some(LastRunState {
                 run_id: "run-1".into(),
                 state: "completed".into(),
@@ -1265,7 +1257,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "b486cf74a3d49f3800ba840c021a2f8a698f4bcbb3cc3b79823f715693881501",
+            "fcf03ccc0eb053d63247d9592b3c16ce66c989d716a1a305dc6496105e5f52ed",
         );
     }
 
@@ -1390,10 +1382,7 @@ mod pinned_reply_bytes {
                 last_ordinal: Some(4),
                 first_ordinal: Some(1),
                 history_version: 1,
-                head: Some(CursorWire {
-                    wal_seq: 12,
-                    sub_index: 0,
-                }),
+                head: Some(CursorWire::new(12, 0)),
                 last_run_state: Some(LastRunState {
                     run_id: "run-1".into(),
                     state: "completed".into(),
@@ -1447,7 +1436,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "b41ce8b9b81b073e20002b7e0e559234ec42d9b1730de1adb78de8d6a7ea22f2";
+        "741377f7f94cfc14ce2cf2e3a1644d8a048e6967f04a61c1fc455d26d6eb98f5";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

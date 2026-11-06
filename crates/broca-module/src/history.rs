@@ -92,9 +92,9 @@ fn media(media: &MediaRef) -> Reference {
 }
 
 #[derive(Clone, Default)]
-struct RowMetadata {
+pub(crate) struct RowMetadata {
     client_message_id: Option<String>,
-    sender: Option<String>,
+    pub(crate) sender: Option<String>,
     tool_pins: BTreeMap<String, broca_wal::DispatchSchemaPin>,
 }
 
@@ -114,7 +114,9 @@ fn send_metadata(
 
 /// Sender metadata and tool schema pins are durable beside message bodies. Reuse
 /// replay placement so held messages and their dispatch facts keep the same ordinals.
-fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, RowMetadata>, ServeError> {
+pub(crate) fn metadata(
+    records: &[broca_wal::WalRecord],
+) -> Result<BTreeMap<u64, RowMetadata>, ServeError> {
     use broca_core::placement::{AppendKind, Placement, PlacementAction};
     use broca_wal::WalRecord;
     let mut placement = Placement::default();
@@ -381,6 +383,8 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
         Role::Tool => "tool",
     };
     let mut row = DisplayRow::new(role, parts);
+    row.notices.clone_from(&entry.notices);
+    row.sender.clone_from(&entry.sender);
     if let Some(origin) = &entry.message.origin {
         row = row.with_model(format!("{}/{}", origin.provider_module_id, origin.model_id));
     }
@@ -486,7 +490,8 @@ pub async fn read<H: ServeHandler + ?Sized>(
         let mut read = SessionReadRequest::new(session.clone(), Some(from), Some(stop - from));
         read.history_version = Some(head.history_version);
         read.include_rich_ui = request.form() == HistoryForm::Display;
-        read.include_display_facts = request.form() == HistoryForm::Display;
+        // Raw history also reports positive sender evidence, but no other opt-in envelope facts.
+        read.include_display_facts = true;
         read.max_bytes = Some(broca_wire::READ_MAXIMUM_MAX_BYTES);
         // Display needs stored payloads; raw history honors the caller's descriptor choice.
         read.media = if request.form() == HistoryForm::Display {
@@ -590,6 +595,16 @@ pub async fn read<H: ServeHandler + ?Sized>(
             .expect("display entry JSON")
         } else {
             let mut value = serde_json::to_value(entry).expect("history entry JSON");
+            for field in [
+                "client_message_id",
+                "created_at",
+                "completed_at",
+                "reasoning_summaries",
+                "tool_times",
+                "notices",
+            ] {
+                value.as_object_mut().unwrap().remove(field);
+            }
             value["written_at"] = written_at.into();
             value
         };

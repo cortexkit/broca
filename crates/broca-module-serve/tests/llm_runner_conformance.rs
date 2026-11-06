@@ -714,7 +714,9 @@ fn observe_model_request(
     // Every text the model received, in request order, as it received it (a rendered tag
     // prefix included): message content strings and text parts, tool results included.
     let mut rendered = Vec::new();
+    let mut system_text = Vec::new();
     for message in request["messages"].as_array().into_iter().flatten() {
+        let start = rendered.len();
         match &message["content"] {
             Value::String(text) => rendered.push(text.clone()),
             Value::Array(parts) => rendered.extend(
@@ -724,7 +726,11 @@ fn observe_model_request(
             ),
             _ => {}
         }
+        if matches!(message["role"].as_str(), Some("system" | "developer")) {
+            system_text.extend_from_slice(&rendered[start..]);
+        }
     }
+    observation.system_text = Some(system_text);
     observation.with_rendered(rendered)
 }
 
@@ -2207,6 +2213,78 @@ impl BrocaRoute {
 
 #[async_trait]
 impl RunnerRoute for BrocaRoute {
+    async fn observe_message_started(
+        &self,
+        mut operation: std::pin::Pin<
+            &mut (dyn std::future::Future<Output = Result<Reply, RouteFailure>> + Send),
+        >,
+    ) -> Result<Option<(Reply, Vec<(Value, Reply)>)>, RouteFailure> {
+        let route = self
+            .connection
+            .route_open_management("broca", &self.session)
+            .await
+            .map_err(|error| RouteFailure::new(error.to_string()))?;
+        let mut stream = self
+            .connection
+            .subscribe(
+                &route,
+                serde_json::to_vec(&json!({"method":"session.subscribe","params":{"from":"live"}}))
+                    .unwrap(),
+            )
+            .await
+            .map_err(|error| RouteFailure::new(error.to_string()))?;
+        // The initial reset confirms registration of the live receiver. Starting the send
+        // earlier could miss the message_started event whose sender binding is being checked.
+        let first = stream
+            .next()
+            .await
+            .map_err(|error| RouteFailure::new(error.to_string()))?;
+        if first.is_none() {
+            return Err(RouteFailure::new(
+                "live observation ended before attachment",
+            ));
+        }
+        let mut reply = None;
+        let mut rows = Vec::new();
+        loop {
+            let event = if reply.is_none() {
+                tokio::select! {
+                    biased;
+                    event = stream.next() => event,
+                    result = operation.as_mut() => { reply = Some(result?); continue; }
+                }
+            } else {
+                match tokio::time::timeout(Duration::from_millis(750), stream.next()).await {
+                    Ok(event) => event,
+                    Err(_) => break,
+                }
+            }
+            .map_err(|error| RouteFailure::new(error.to_string()))?;
+            let Some(event) = event else { break };
+            let event: Value = serde_json::from_slice(&event)
+                .map_err(|error| RouteFailure::new(error.to_string()))?;
+            if event["event"]["type"] == "message_started" {
+                let mid = event["event"]["mid"]
+                    .as_str()
+                    .ok_or_else(|| RouteFailure::new("message_started has no mid"))?;
+                let row = self
+                    .request(
+                        "session.history",
+                        json!({"from_mid":mid,"limit":1,"form":"display"}),
+                    )
+                    .await?;
+                rows.push((event, row));
+            }
+        }
+        drop(stream);
+        let _ = self.connection.route_close(&route).await;
+        Ok(Some((
+            reply.ok_or_else(|| {
+                RouteFailure::new("observation stream ended before the operation")
+            })?,
+            rows,
+        )))
+    }
     async fn request(&self, method: &str, params: Value) -> Result<Reply, RouteFailure> {
         let polled_run = (method == "run.result")
             .then(|| params["run_id"].as_str().map(str::to_owned))
@@ -2320,12 +2398,8 @@ impl RunnerRoute for BrocaRoute {
                         .map_err(|e| RouteFailure::new(format!("an undecodable event: {e}")))?,
                 ),
                 Ok(Err(broca_subc::ConnError::Rejected(rejection))) => {
-                    // This path keeps only the refusal's code and message.
-                    let (code, message) = rejection
-                        .split_once(" — ")
-                        .unwrap_or((rejection.as_ref(), ""));
                     break SubscribeOutcome::Refused(
-                        serde_json::from_value(json!({"code":code,"message":message})).map_err(
+                        serde_json::from_value(json!({"code":rejection.code(),"message":rejection.message(),"detail":rejection.provider_detail()})).map_err(
                             |error| RouteFailure::new(format!("an undecodable refusal: {error}")),
                         )?,
                     );
@@ -2341,6 +2415,95 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    async fn notices_stored_output(
+        &self,
+        handle: &Self::Handle,
+        session: &str,
+        arguments: &Value,
+    ) -> Result<(String, u32, String, String), HarnessError> {
+        use broca_core::WalStore;
+        use broca_wal::WalRecord;
+        let range = broca_core::FileWalStore::new(handle.state_root.join("wal"))
+            .read_records_range(&self.bind_identity(session), 0, None, None)
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let records = match range.records() {
+            broca_wal::WalRangeRecords::Complete(records) => records,
+            _ => return Err(HarnessError::new("native notice WAL is incomplete")),
+        };
+        let call = records
+            .iter()
+            .find_map(|frame| match &frame.record {
+                WalRecord::ToolDispatchIntent {
+                    tool_call_id, args, ..
+                } if args.as_ref() == arguments => Some(tool_call_id),
+                _ => None,
+            })
+            .ok_or_else(|| HarnessError::new("notice carrying intent missing"))?;
+        let output = records
+            .iter()
+            .find_map(|frame| match &frame.record {
+                WalRecord::ToolResult { result, .. } if &result.tool_call_id == call => {
+                    match &result.output {
+                        broca_protocol::ToolOutput::Text { text } => Some(text.clone()),
+                        broca_protocol::ToolOutput::Json { value } => {
+                            value.as_str().map(str::to_owned)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .ok_or_else(|| HarnessError::new("native notice result text missing"))?;
+        let intent = records.iter().find(|frame| matches!(&frame.record, WalRecord::ToolDispatchIntent { tool_call_id, .. } if tool_call_id == call))
+            .ok_or_else(|| HarnessError::new("native carrying intent missing"))?;
+        let WalRecord::ToolDispatchIntent { call_key, .. } = &intent.record else {
+            unreachable!()
+        };
+        let lineage = range.lineage_id.map(|id| id.to_string());
+        let key = broca_core::tool_call_key(lineage.as_deref(), intent.seq, call_key.as_deref())
+            .ok_or_else(|| HarnessError::new("native carrying key missing"))?;
+        let mut placement = broca_core::placement::Placement::default();
+        let mut ordinal = None;
+        let mut part = None;
+        for frame in records {
+            placement
+                .observe(&frame.record)
+                .map_err(HarnessError::new)?;
+            match &frame.record {
+                WalRecord::ModelStepFinished {
+                    assistant_message, ..
+                } if assistant_message
+                    .tool_calls()
+                    .any(|item| &item.tool_call_id == call) =>
+                {
+                    ordinal = placement.held_tool_result_ordinal()
+                }
+                WalRecord::ToolBatchStarted { planned_calls, .. }
+                    if planned_calls.contains(call) =>
+                {
+                    part = planned_calls
+                        .iter()
+                        .position(|id| id == call)
+                        .and_then(|part| u32::try_from(part).ok())
+                }
+                _ => {}
+            }
+        }
+        let ordinal =
+            ordinal.ok_or_else(|| HarnessError::new("native carrying ordinal missing"))?;
+        let mid = broca_core::message_mid(
+            broca_core::is_mode3_log(records.iter().map(|frame| &frame.record)),
+            lineage.as_deref(),
+            ordinal,
+        )
+        .map_err(HarnessError::new)?;
+        Ok((
+            mid,
+            part.ok_or_else(|| HarnessError::new("native carrying part missing"))?,
+            key,
+            output,
+        ))
+    }
     async fn routing_runner_declaration(&self) -> Result<Value, HarnessError> {
         Ok(routed_accounts::runner_declaration())
     }
@@ -2661,6 +2824,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::DeliveryOrder,
             Capability::SenderSuccession,
             Capability::ReadDisplayFacts,
+            Capability::Notices,
             Capability::ClientMessageId,
             // The adapter implements the three session_change subject hooks (a tool-free
             // refresh plan, model request observations and holdable tool calls), so the kit
@@ -4159,6 +4323,99 @@ fn head_selection_cases_require_real_fixtures_and_explicit_inapplicability() {
 
 /// Additive kit cases must not turn an undeclared capability into a required pass.
 /// Check the contracts this adapter implements by name, not by a shared name prefix's size.
+fn check_0811_cases(
+    cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
+) -> Result<(), String> {
+    for name in [
+        "notices_no_transcript_entry",
+        "notices_stored_output_unchanged",
+        "notices_display_fact",
+        "notices_live_event",
+        "notices_append_bytes",
+        "notices_tool_result_only_never_system",
+        "subscribe_resume_refusals",
+        "message_senders_rows_name_their_sender",
+        "sender_attribution_undeclared_refused",
+    ] {
+        let case = cases
+            .iter()
+            .find(|case| case.case == name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        if case.outcome != CaseOutcome::Passed {
+            return Err(format!("{name}: {:?}", case.outcome));
+        }
+    }
+    for name in [
+        "sender_attribution_stored_header",
+        "sender_attribution_fact",
+        "sender_attribution_photo_only",
+        "sender_attribution_template",
+        "sender_attribution_other_sender",
+        "sender_attribution_tampered_prefix",
+        "sender_attribution_display",
+    ] {
+        let case = cases
+            .iter()
+            .find(|case| case.case == name)
+            .ok_or_else(|| format!("the suite has no case {name}"))?;
+        if case.outcome
+            != (CaseOutcome::Skipped {
+                missing: vec![Capability::SenderAttribution],
+            })
+        {
+            return Err(format!("{}: {:?}", case.case, case.outcome));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn new_contract_cases_cannot_skip_or_claim_inapplicability() {
+    use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
+    let cases: Vec<_> = CASES
+        .iter()
+        .map(|case| CaseReport {
+            case: case.name,
+            requires: case.requires.to_vec(),
+            outcome: if case.requires.contains(&Capability::SenderAttribution) {
+                CaseOutcome::Skipped {
+                    missing: vec![Capability::SenderAttribution],
+                }
+            } else {
+                CaseOutcome::Passed
+            },
+        })
+        .collect();
+    assert_eq!(
+        cases
+            .iter()
+            .filter(|case| case.case.starts_with("notices_"))
+            .count(),
+        6
+    );
+    assert!(check_0811_cases(&cases).is_ok());
+    // This kit has no provider-executed capability or case family; the runner
+    // does not claim provider-run tools merely because it upgraded the contract.
+    assert!(!CASES
+        .iter()
+        .any(|case| case.name.starts_with("provider_executed")));
+    for index in 0..cases.len() {
+        if cases[index].case.starts_with("notices_")
+            || [
+                "subscribe_resume_refusals",
+                "message_senders_rows_name_their_sender",
+            ]
+            .contains(&cases[index].case)
+        {
+            let mut broken = cases.clone();
+            broken[index].outcome = CaseOutcome::Inapplicable {
+                reason: "fixture unavailable".into(),
+            };
+            assert!(check_0811_cases(&broken).is_err());
+        }
+    }
+}
+
 fn check_named_contract_cases(
     cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
     crash_kills_disabled: bool,
@@ -4440,23 +4697,19 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             report.render()
         );
     }
-    // The kit times the sender check against the live `message_started` event, and this
-    // adapter has no live observation hook, so the case passes with exactly that one rule
-    // reported not applicable. Pin that outcome rather than accepting any partial pass.
+    // Sender facts must already be readable when their live message_started event arrives.
     let message_senders = report
         .cases
         .iter()
         .find(|case| case.case == "message_senders_rows_name_their_sender")
         .expect("message_senders_rows_name_their_sender");
-    assert!(
-        matches!(
-            &message_senders.outcome,
-            CaseOutcome::PassedWithInapplicableRule { reason }
-                if reason == "message_senders_timing_at_message_started: adapter has no live observation hook"
-        ),
+    assert_eq!(
+        message_senders.outcome,
+        CaseOutcome::Passed,
         "{}",
         report.render()
     );
+    check_0811_cases(&report.cases).unwrap();
     let attachment_gaps = attachment_contract_gaps(&report);
     assert!(
         attachment_gaps.is_empty(),

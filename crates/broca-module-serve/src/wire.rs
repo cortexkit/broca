@@ -54,10 +54,19 @@ impl FromWireExt for FromWire {
                     "unknown 'from' value '{other}' (want start|live|cursor)"
                 )),
             },
-            FromWire::Cursor { wal_seq, sub_index } => Ok(SubscribeFrom::After {
-                wal_seq: *wal_seq,
-                sub_index: *sub_index,
-            }),
+            FromWire::Cursor(cursor) => {
+                match (&cursor.incarnation, &cursor.digest) {
+                    (None, None) => {} // Legacy positions parse, but cannot prove a log identity.
+                    (Some(incarnation), Some(digest))
+                        if !incarnation.is_empty()
+                            && digest.len() == 16
+                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) => {}
+                    _ => return Err("subscribe cursor has malformed incarnation or digest".into()),
+                }
+                Ok(SubscribeFrom::Resume {
+                    cursor: cursor.clone(),
+                })
+            }
         }
     }
 }

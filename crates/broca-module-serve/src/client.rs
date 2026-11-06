@@ -390,8 +390,9 @@ impl SessionClient {
             from: Some(match from {
                 SubscribeFrom::Start => FromWire::Named("start".into()),
                 SubscribeFrom::Live => FromWire::Named("live".into()),
+                SubscribeFrom::Resume { cursor } => FromWire::Cursor(cursor),
                 SubscribeFrom::After { wal_seq, sub_index } => {
-                    FromWire::Cursor { wal_seq, sub_index }
+                    FromWire::Cursor(broca_wire::CursorWire::new(wal_seq, sub_index))
                 }
             }),
         };
@@ -644,6 +645,8 @@ mod tests {
             // An unframed legacy log has a minted snapshot incarnation, but no lineage frame.
             lineage_id: None,
             messages: vec![broca_wire::SessionReadMessage {
+                sender: None,
+                notices: Vec::new(),
                 created_at: None,
                 completed_at: None,
                 reasoning_summaries: Vec::new(),
@@ -668,10 +671,7 @@ mod tests {
                 part_digests: None,
             }],
             next_from_ordinal: Some(8),
-            head: Some(broca_wire::CursorWire {
-                wal_seq: 11,
-                sub_index: 2,
-            }),
+            head: Some(broca_wire::CursorWire::new(11, 2)),
             lineage_state: broca_wire::SessionReadLineageState {
                 last_run_id: Some("run-1".into()),
                 state: "idle".into(),

@@ -20,6 +20,25 @@ async fn describe_contract_sample() {
         .request(7, json!({"method":"role.describe","params":{}}))
         .await;
     assert_eq!(frame.header.ty, subc_protocol::FrameType::Response);
+    let describe = result(&frame);
+    let groups = describe["capabilities"].as_array().unwrap();
+    for required in [
+        "notices",
+        "message_senders",
+        "read_display_facts",
+        "call_identity",
+    ] {
+        assert!(
+            groups.iter().any(|group| group == required),
+            "missing {required}"
+        );
+    }
+    for undeclared in ["sender_attribution", "provider_executed"] {
+        assert!(
+            !groups.iter().any(|group| group == undeclared),
+            "unexpected {undeclared}"
+        );
+    }
     capture("role.describe.json", &frame.body);
     rig.finish().await;
 }
@@ -297,6 +316,10 @@ async fn paused_and_interrupted_heads_never_carry_last_run_error() {
 }
 
 fn seed_approved_call(rig: &Rig) -> (String, String) {
+    seed_approved_call_with_legacy_notice(rig, false)
+}
+
+fn seed_approved_call_with_legacy_notice(rig: &Rig, notice: bool) -> (String, String) {
     use broca_core::{FileWalStore, WalStore};
     let run_id = "synthetic-approved-run".to_owned();
     let scope = json!({"owner":"reserved:sample-owner","ref":"approval-sample","scope_epoch":1});
@@ -363,7 +386,17 @@ fn seed_approved_call(rig: &Rig) -> (String, String) {
     append(
         json!({"type":"tool_result","finished_at_ms":505,"batch_id":"approved-batch","result":{"tool_call_id":"approved-call","output":{"kind":"text","text":"synthetic result"},"is_error":false},"outcome":"completed"}),
     );
+    if notice {
+        append(
+            json!({"type":"queued","submission_id":"legacy-notice","send_id":"legacy-client-key","sent_by":{"kind":"reserved","module_id":"sender"},"request":{"model":{"provider_module_id":"fake","model_id":"fake"},"input":[]}}),
+        );
+    }
     append(json!({"type":"tool_batch_finished","batch_id":"approved-batch"}));
+    if notice {
+        append(
+            json!({"type":"send_delivered","submission_id":"legacy-notice","run_id":run_id,"mode":"tool_result","tool_call_id":"approved-call","appended_text":"\n\nlegacy note"}),
+        );
+    }
     append(json!({"type":"turn_finished","step_id":1}));
     append(json!({"type":"step_started","step_id":2}));
     append(
@@ -376,6 +409,29 @@ fn seed_approved_call(rig: &Rig) -> (String, String) {
         json!({"type":"run_finished","reason":"completed","ts_ms":507,"usage":{"input_tokens":0,"output_tokens":0},"retries_used":0}),
     );
     (key, run_id)
+}
+
+#[tokio::test]
+async fn legacy_tool_delivery_keeps_delivered_as_on_default_and_opted_in_reads() {
+    let mut rig = Rig::start("legacy-tool-delivery-fact").await;
+    seed_approved_call_with_legacy_notice(&rig, true);
+    for facts in [false, true] {
+        let page = rig.request(7, json!({"method":"session.read","params":{"from_ordinal":0,"limit":50,"include_display_facts":facts}})).await;
+        assert_eq!(
+            page.header.ty,
+            subc_protocol::FrameType::Response,
+            "{page:?}"
+        );
+        let body = result(&page);
+        let tool = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["message"]["role"] == "tool")
+            .unwrap();
+        assert_eq!(tool["delivered_as"]["mode"], "tool_result", "{body}");
+    }
+    rig.finish().await;
 }
 
 fn call_keys<'a>(value: &'a serde_json::Value, keys: &mut Vec<&'a str>) {
@@ -485,6 +541,830 @@ async fn approved_preparation_key_matches_all_four_served_surfaces() {
             &format!("approved.{kind}.json"),
             raw["event"].get().as_bytes(),
         );
+    }
+    rig.finish().await;
+}
+
+async fn subscribe_refusal(rig: &mut Rig, from: serde_json::Value, code: &str) {
+    let frames = rig
+        .subscribe_collect(
+            8,
+            json!({"from":from}),
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+    assert_eq!(
+        frames.len(),
+        1,
+        "refusal must precede every event: {frames:?}"
+    );
+    assert_eq!(
+        frames[0].header.ty,
+        subc_protocol::FrameType::Error,
+        "{frames:?}"
+    );
+    let error: serde_json::Value = serde_json::from_slice(&frames[0].body).unwrap();
+    assert_eq!(error["code"], code, "{error}");
+    if code == "invalid_params" {
+        assert_eq!(error["detail"]["field"], "from");
+    }
+}
+
+#[tokio::test]
+async fn subscribe_resume_refuses_malformed_foreign_future_and_legacy_cursors() {
+    let mut rig = Rig::start("subscribe-refusals-0811").await;
+    rig.script.push(&[Step::Text("first")]);
+    rig.send("first", "hello", None).await;
+    rig.wait_idle().await;
+    let head = rig
+        .request(7, json!({"method":"session.head","params":{}}))
+        .await;
+    let cursor = result(&head)["head"].clone();
+    assert!(cursor["incarnation"].is_string());
+    assert_eq!(cursor["digest"].as_str().unwrap().len(), 16);
+    for malformed in [
+        json!(3),
+        json!([]),
+        json!("unknown"),
+        json!({"wal_seq":1}),
+        json!({"wal_seq":1,"sub_index":0,"digest":"broken"}),
+        json!({"wal_seq":1,"sub_index":0,"incarnation":"known","digest":"0000000000000000","extra":1}),
+    ] {
+        subscribe_refusal(&mut rig, malformed, "invalid_params").await;
+    }
+    subscribe_refusal(
+        &mut rig,
+        json!({"wal_seq":1,"sub_index":0}),
+        "cursor_expired",
+    )
+    .await;
+    let mut future = cursor.clone();
+    future["wal_seq"] = json!(u64::MAX);
+    subscribe_refusal(&mut rig, future, "cursor_expired").await;
+    let mut sub_index = cursor.clone();
+    sub_index["sub_index"] = json!(u32::MAX);
+    subscribe_refusal(&mut rig, sub_index, "cursor_expired").await;
+    let mut other = Rig::start("subscribe-other-0811").await;
+    other.script.push(&[Step::Text("other")]);
+    other.send("other", "hello", None).await;
+    other.wait_idle().await;
+    subscribe_refusal(&mut other, cursor.clone(), "cursor_expired").await;
+    other.finish().await;
+    assert!(rig.registry().stop_and_seal().await);
+    rig = rig.restart().await;
+    rig.script.push(&[Step::Text("next")]);
+    rig.send("next", "next", None).await;
+    rig.wait_idle().await;
+    let frames = rig
+        .subscribe_collect_until(
+            8,
+            json!({"from":cursor}),
+            std::time::Duration::from_millis(20),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "run_finished")
+            },
+        )
+        .await;
+    assert!(frames
+        .iter()
+        .all(|frame| frame.header.ty != subc_protocol::FrameType::Error));
+    for from in [serde_json::Value::Null, json!("live")] {
+        let frames = rig
+            .subscribe_collect_until(
+                8,
+                json!({"from":from}),
+                std::time::Duration::from_millis(20),
+                |_| true,
+            )
+            .await;
+        assert!(frames
+            .iter()
+            .all(|frame| frame.header.ty != subc_protocol::FrameType::Error));
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn subscribe_resume_refuses_reused_position_after_restore() {
+    let mut rig = Rig::start("subscribe-restore-0811").await;
+    rig.script.push(&[Step::Text("backup")]);
+    rig.send("backup", "backup", None).await;
+    rig.wait_idle().await;
+    let backup = rig.wal_bytes();
+    rig.script.push(&[Step::Text("discarded")]);
+    rig.send("discarded", "discarded", None).await;
+    rig.wait_idle().await;
+    let old_head = result(
+        &rig.request(7, json!({"method":"session.head","params":{}}))
+            .await,
+    );
+    let cursor = old_head["head"].clone();
+    rig = rig.restart_restoring_wal(&backup).await;
+    subscribe_refusal(&mut rig, cursor.clone(), "cursor_expired").await;
+    for index in 0..3 {
+        rig.script.push(&[Step::Text("replacement")]);
+        rig.send(&format!("replacement-{index}"), "different history", None)
+            .await;
+        rig.wait_idle().await;
+    }
+    let new_head = result(
+        &rig.request(7, json!({"method":"session.head","params":{}}))
+            .await,
+    );
+    assert_eq!(old_head["incarnation"], new_head["incarnation"]);
+    assert!(new_head["head"]["wal_seq"].as_u64().unwrap() > cursor["wal_seq"].as_u64().unwrap());
+    subscribe_refusal(&mut rig, cursor, "cursor_expired").await;
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn subscribe_resume_refuses_a_restored_legacy_frame_with_only_its_fence_changed() {
+    fn legacy_frames(bytes: &[u8], change_fence_at: Option<u64>) -> Vec<u8> {
+        use broca_wal::framing::{decode_next, encode, DecodeStep};
+        let mut output = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match decode_next(&bytes[offset..]) {
+                DecodeStep::Lineage { consumed, .. } => {
+                    output.extend_from_slice(&bytes[offset..offset + consumed]);
+                    offset += consumed;
+                }
+                DecodeStep::Record { framed, consumed } => {
+                    let fence = framed.fence + u64::from(change_fence_at == Some(framed.seq));
+                    output.extend(encode(framed.seq, fence, &framed.record).unwrap());
+                    offset += consumed;
+                }
+                _ => panic!("invalid synthetic log"),
+            }
+        }
+        output
+    }
+
+    let mut rig = Rig::start("subscribe-restore-legacy-fence-0811").await;
+    rig.script.push(&[Step::Text("synthetic answer")]);
+    rig.send("start", "synthetic prompt", None).await;
+    rig.wait_idle().await;
+    let legacy = legacy_frames(&rig.wal_bytes(), None);
+    rig = rig.restart_restoring_wal(&legacy).await;
+    let head = result(
+        &rig.request(7, json!({"method":"session.head","params":{}}))
+            .await,
+    );
+    let cursor = head["head"].clone();
+    assert!(cursor["digest"].is_string(), "{head}");
+    let seq = cursor["wal_seq"].as_u64().unwrap();
+    let restored = legacy_frames(&legacy, Some(seq));
+    assert_ne!(restored, legacy);
+    // Encoding the same records again is byte-stable; only the named fence and
+    // its covering digest change in the restored log.
+    assert_eq!(legacy_frames(&legacy, None), legacy);
+    rig = rig.restart_restoring_wal(&restored).await;
+    subscribe_refusal(&mut rig, cursor, "cursor_expired").await;
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn notices_and_sender_contract_samples() {
+    use broca_core::{FileWalStore, WalStore};
+    use broca_wal::WalRecord;
+    let mut rig = Rig::start("notices-and-sender-0811").await;
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "sample-sender".into(),
+        }),
+    )
+    .await;
+    rig.script.hold_tool(true);
+    rig.script
+        .push(&[Step::Call("sample-carrying-call"), Step::Text("answer")]);
+    rig.send("start", "synthetic prompt", None).await;
+    rig.wait_entered().await;
+    let before = result(
+        &rig.request(7, json!({"method":"session.head","params":{}}))
+            .await,
+    );
+    let text = "  synthetic notice\n☃\n";
+    rig.send_with(
+        "sample-notice",
+        text,
+        None,
+        json!({"delivery":["tool_result"]}),
+    )
+    .await;
+    rig.send_with(
+        "sample-notice-2",
+        "second notice",
+        None,
+        json!({"delivery":["tool_result"]}),
+    )
+    .await;
+    let unkeyed = result(
+        &rig.send_with(
+            "unused",
+            "unkeyed notice",
+            None,
+            json!({"send_id":null,"delivery":["tool_result"]}),
+        )
+        .await,
+    );
+    let unkeyed_id = unkeyed["submission_id"]
+        .as_str()
+        .expect("riding send admission returns submission_id")
+        .to_owned();
+    rig.script.hold_tool(false);
+    rig.wait_idle().await;
+    let records = FileWalStore::new(rig.dir.join("wal"))
+        .read_records(&rig.session)
+        .unwrap();
+    let envelope = records
+        .iter()
+        .find_map(|frame| match &frame.record {
+            WalRecord::SendDelivered { ride, .. } => Some(ride),
+            _ => None,
+        })
+        .expect("notice delivery record");
+    assert_eq!(
+        envelope.is_some(),
+        broca_core::delivery_order::RIDES_V2_WRITER_ENABLED
+    );
+    if let Some(ride) = envelope {
+        assert_eq!(ride.send_id, "sample-notice");
+        assert_eq!(ride.sender, "sample-sender");
+        assert_eq!(ride.forms, ["tool_result"]);
+        assert_eq!(ride.form, broca_wal::record::RideForm::Append);
+    }
+    let lineage = broca_core::FileWalStore::new(rig.dir.join("wal"))
+        .read_records_range(&rig.session, 0, None, None)
+        .unwrap()
+        .lineage_id
+        .unwrap()
+        .to_string();
+    let key = records
+        .iter()
+        .find_map(|frame| match &frame.record {
+            WalRecord::ToolDispatchIntent {
+                tool_call_id,
+                call_key,
+                ..
+            } if tool_call_id.0 == "sample-carrying-call" => {
+                broca_core::tool_call_key(Some(&lineage), frame.seq, call_key.as_deref())
+            }
+            _ => None,
+        })
+        .unwrap();
+    if let Some(ride) = envelope {
+        assert_eq!(ride.call_key, key);
+    }
+    let default = rig
+        .request(7, json!({"method":"session.read","params":{}}))
+        .await;
+    capture("0811.session.read.default.json", &default.body);
+    assert!(result(&default)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry.get("sender").is_none() && entry.get("notices").is_none()));
+    let facts = rig
+        .request(
+            7,
+            json!({"method":"session.read","params":{"include_display_facts":true}}),
+        )
+        .await;
+    capture("0811.session.read.facts.json", &facts.body);
+    let body = result(&facts);
+    let user = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["message"]["role"] == "user")
+        .unwrap();
+    assert_eq!(user["sender"], "sample-sender");
+    let carrying = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["message"]["role"] == "tool")
+        .unwrap();
+    let expected = json!({"part":0,"call_key":key,"send_id":"sample-notice","sender":"sample-sender","text":text,"delivered_as":"tool_result"});
+    let expected_second = json!({"part":0,"call_key":key,"send_id":"sample-notice-2","sender":"sample-sender","text":"second notice","delivered_as":"tool_result"});
+    let expected_unkeyed = json!({"part":0,"call_key":key,"send_id":unkeyed_id,"sender":"sample-sender","text":"unkeyed notice","delivered_as":"tool_result"});
+    assert_eq!(
+        carrying["notices"],
+        json!([expected, expected_second, expected_unkeyed])
+    );
+    assert_eq!(
+        carrying["delivered_as"],
+        json!({"mode":"tool_result","call_key":key})
+    );
+    assert_eq!(body["history_version"], before["history_version"]);
+    for form in ["raw", "display"] {
+        let page = rig
+            .request(
+                7,
+                json!({"method":"session.history","params":{"form":form,"limit":100}}),
+            )
+            .await;
+        capture(&format!("0811.session.history.{form}.json"), &page.body);
+        let body = result(&page);
+        let first = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["mid"] == user["mid"])
+            .unwrap();
+        if form == "raw" {
+            assert_eq!(first["sender"], "sample-sender");
+        } else {
+            let row = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["mid"] == carrying["mid"])
+                .unwrap();
+            assert_eq!(
+                row["row"]["notices"],
+                json!([expected, expected_second, expected_unkeyed])
+            );
+        }
+    }
+    let frames = rig
+        .subscribe_collect_until(
+            8,
+            json!({"from":"start"}),
+            std::time::Duration::from_millis(20),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "run_finished")
+            },
+        )
+        .await;
+    let notices: Vec<_> = frames
+        .iter()
+        .filter(|frame| {
+            serde_json::from_slice::<serde_json::Value>(&frame.body)
+                .is_ok_and(|value| value["event"]["type"] == "notice_delivered")
+        })
+        .collect();
+    assert_eq!(notices.len(), 3);
+    capture("0811.notice_delivered.frame.json", &notices[0].body);
+    let unkeyed_event: serde_json::Value = serde_json::from_slice(&notices[2].body).unwrap();
+    assert_eq!(unkeyed_event["event"]["send_id"], unkeyed_id);
+    assert_eq!(unkeyed_event["event"]["text"], "unkeyed notice");
+    let event: serde_json::Value = serde_json::from_slice(&notices[0].body).unwrap();
+    assert_eq!(
+        event["event"],
+        json!({"type":"notice_delivered","mid":carrying["mid"],"part":0,"call_key":key,"send_id":"sample-notice","sender":"sample-sender","text":text})
+    );
+    let resumed = rig
+        .subscribe_collect_until(
+            8,
+            json!({"from":event["cursor"]}),
+            std::time::Duration::from_millis(20),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "run_finished")
+            },
+        )
+        .await;
+    assert!(resumed
+        .iter()
+        .all(|frame| frame.header.ty != subc_protocol::FrameType::Error));
+    let native = records
+        .iter()
+        .find_map(|frame| match &frame.record {
+            WalRecord::ToolResult { result, .. }
+                if result.tool_call_id.0 == "sample-carrying-call" =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        native.output,
+        broca_protocol::ToolOutput::Text {
+            text: "worked".into()
+        }
+    );
+    let receipt = result(
+        &rig.send_with(
+            "sample-notice",
+            text,
+            None,
+            json!({"delivery":["tool_result"]}),
+        )
+        .await,
+    );
+    assert_eq!(receipt["delivered"]["call_key"], key);
+    let status = rig
+        .request(
+            7,
+            json!({"method":"send.status","params":{"send_id":unkeyed_id}}),
+        )
+        .await;
+    assert_eq!(status.header.ty, subc_protocol::FrameType::Error);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&status.body).unwrap()["code"],
+        "unknown_send"
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn upgrade_wire_samples() {
+    let mut rig = Rig::start("upgrade-wire-samples").await;
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "sample-sender".into(),
+        }),
+    )
+    .await;
+    rig.script.hold_tool(true);
+    rig.script
+        .push(&[Step::Call("sample-carrying-call"), Step::Text("answer")]);
+    rig.send("start", "synthetic prompt", None).await;
+    rig.wait_entered().await;
+    rig.send_with(
+        "sample-notice",
+        "synthetic notice ☃",
+        None,
+        json!({"delivery":["tool_result"]}),
+    )
+    .await;
+    rig.script.hold_tool(false);
+    rig.wait_idle().await;
+    for (name, method, params) in [
+        ("role.describe.json", "role.describe", json!({})),
+        ("session.head.json", "session.head", json!({})),
+        ("session.read.default.json", "session.read", json!({})),
+        (
+            "session.read.facts.json",
+            "session.read",
+            json!({"include_display_facts":true}),
+        ),
+        (
+            "session.history.raw.json",
+            "session.history",
+            json!({"form":"raw","limit":100}),
+        ),
+        (
+            "session.history.display.json",
+            "session.history",
+            json!({"form":"display","limit":100}),
+        ),
+    ] {
+        let frame = rig
+            .request(7, json!({"method":method,"params":params}))
+            .await;
+        assert_eq!(frame.header.ty, subc_protocol::FrameType::Response);
+        capture(&format!("upgrade.{name}"), &frame.body);
+    }
+    let frames = rig
+        .subscribe_collect_until(
+            8,
+            json!({"from":"start"}),
+            std::time::Duration::from_millis(20),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "run_finished")
+            },
+        )
+        .await;
+    for (index, frame) in frames.iter().enumerate() {
+        capture(&format!("upgrade.subscribe.{index}.json"), &frame.body);
+    }
+    assert!(!frames.is_empty());
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn carrying_tool_message_keeps_legacy_delivered_as_on_default_and_fact_reads() {
+    let mut rig = Rig::start("legacy-delivered-as").await;
+    rig.script.hold_tool(true);
+    rig.script
+        .push(&[Step::Call("carrier"), Step::Text("answer")]);
+    rig.send("start", "prompt", None).await;
+    rig.wait_entered().await;
+    rig.send_with(
+        "notice",
+        "notice",
+        None,
+        json!({"delivery":["tool_result"]}),
+    )
+    .await;
+    rig.script.hold_tool(false);
+    rig.wait_idle().await;
+    for params in [json!({}), json!({"include_display_facts":true})] {
+        let frame = rig
+            .request(7, json!({"method":"session.read","params":params}))
+            .await;
+        let body = result(&frame);
+        let carrying = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["message"]["role"] == "tool")
+            .unwrap();
+        assert_eq!(carrying["delivered_as"]["mode"], "tool_result", "{body}");
+        assert!(carrying["delivered_as"]["call_key"].is_string(), "{body}");
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn denied_call_wire_samples() {
+    let mut rig = Rig::start("denied-call-samples").await;
+    *rig.script.deny_input.lock().unwrap() = Some(json!({}));
+    rig.script.push(&[
+        Step::Calls(&["denied-first", "denied-second"]),
+        Step::Text("after denials"),
+    ]);
+    rig.send("denied-start", "synthetic denied calls", None)
+        .await;
+    rig.wait_idle().await;
+    use broca_core::WalStore;
+    let range = broca_core::FileWalStore::new(rig.dir.join("wal"))
+        .read_records_range(&rig.session, 0, None, None)
+        .unwrap();
+    let lineage = range.lineage_id.unwrap().to_string();
+    let expected: std::collections::BTreeMap<_, _> = match range.records() {
+        broca_wal::WalRangeRecords::Complete(records) => records
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                broca_wal::WalRecord::ToolNoDispatch { tool_call_id, .. } => {
+                    Some((tool_call_id.0.clone(), format!("{lineage}:{}", frame.seq)))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => panic!("complete denied-call WAL"),
+    };
+    assert_eq!(expected.len(), 2);
+    for (name, params) in [
+        ("default", json!({})),
+        ("facts", json!({"include_display_facts":true})),
+    ] {
+        let read = rig
+            .request(7, json!({"method":"session.read","params":params}))
+            .await;
+        assert_eq!(read.header.ty, subc_protocol::FrameType::Response);
+        capture(&format!("denied.session.read.{name}.json"), &read.body);
+        let read = result(&read);
+        let calls: Vec<_> = read["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry["tool_calls"].as_array().into_iter().flatten())
+            .collect();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert_eq!(
+                call["call_key"].as_str(),
+                expected
+                    .get(call["tool_call_id"].as_str().unwrap())
+                    .map(String::as_str)
+            );
+        }
+    }
+    let frames = rig
+        .subscribe_collect_until(
+            8,
+            json!({"from":"start"}),
+            std::time::Duration::from_millis(20),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "run_finished")
+            },
+        )
+        .await;
+    for (index, frame) in frames
+        .iter()
+        .filter(|frame| {
+            serde_json::from_slice::<serde_json::Value>(&frame.body).is_ok_and(|value| {
+                matches!(
+                    value["event"]["type"].as_str(),
+                    Some("tool_started" | "tool_finished")
+                )
+            })
+        })
+        .enumerate()
+    {
+        capture(&format!("denied.live.{index}.json"), &frame.body);
+        let value: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(
+            value["event"]["call_key"].as_str(),
+            expected
+                .get(value["event"]["tool_call_id"].as_str().unwrap())
+                .map(String::as_str)
+        );
+    }
+    assert_eq!(
+        rig.records()
+            .iter()
+            .filter(|record| matches!(record, broca_wal::WalRecord::ToolNoDispatch { .. }))
+            .count(),
+        2
+    );
+    assert!(rig.registry().stop_and_seal().await);
+    rig = rig.restart().await;
+    let read = result(
+        &rig.request(7, json!({"method":"session.read","params":{}}))
+            .await,
+    );
+    for call in read["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|entry| entry["tool_calls"].as_array().into_iter().flatten())
+    {
+        assert_eq!(
+            call["call_key"].as_str(),
+            expected
+                .get(call["tool_call_id"].as_str().unwrap())
+                .map(String::as_str)
+        );
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn imported_duplicate_synthesized_results_have_no_call_key() {
+    use broca_core::WalStore;
+    use broca_protocol::{
+        ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
+    };
+    let mut rig = Rig::start("imported-keyless-duplicates").await;
+    let mut start: broca_wal::WalRecord = serde_json::from_str(
+        include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    if let broca_wal::WalRecord::RunStarted {
+        input,
+        session,
+        origin,
+        ..
+    } = &mut start
+    {
+        *session = rig.session.clone();
+        *origin = serde_json::from_value(
+            json!({"kind":"seeded_from","origin_kind":"import","source_ref":"synthetic import"}),
+        )
+        .unwrap();
+        let call = ContentBlock::ToolCall(ToolCall {
+            thought_signature: None,
+            tool_call_id: ToolCallId("same".into()),
+            tool_name: "work".into(),
+            input: json!({}),
+        });
+        let result = ContentBlock::ToolResult(ToolResult {
+            tool_call_id: ToolCallId("same".into()),
+            output: ToolOutput::error("synthesized missing result"),
+            is_error: true,
+        });
+        *input = std::sync::Arc::new(vec![
+            Message::new(Role::Assistant, vec![call.clone(), call]),
+            Message::new(Role::Tool, vec![result.clone(), result]),
+        ]);
+    }
+    let store = broca_core::FileWalStore::new(rig.dir.join("wal"));
+    let mut wal = store.open(&rig.session).unwrap();
+    wal.append(1, &start, false).unwrap();
+    let end = serde_json::from_value(
+        json!({"type":"run_finished","reason":"completed","usage":{},"retries_used":0}),
+    )
+    .unwrap();
+    wal.append(1, &end, true).unwrap();
+    drop(wal);
+    let read = result(
+        &rig.request(7, json!({"method":"session.read","params":{}}))
+            .await,
+    );
+    let calls: Vec<_> = read["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|entry| entry["tool_calls"].as_array().into_iter().flatten())
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert!(calls
+        .iter()
+        .all(|call| call["tool_call_id"] == "same" && call.get("call_key").is_none()));
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn unkeyed_notice_collision_prefers_the_senders_keyed_send() {
+    let mut rig = Rig::start("unkeyed-notice-collision").await;
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "collision-sender".into(),
+        }),
+    )
+    .await;
+    rig.script.hold_tool(true);
+    rig.script
+        .push(&[Step::Call("collision-call"), Step::Text("answer")]);
+    rig.send("start", "synthetic task", None).await;
+    rig.wait_entered().await;
+    let unkeyed = result(
+        &rig.send_with(
+            "unused",
+            "unkeyed payload",
+            None,
+            json!({"send_id":null,"delivery":["tool_result"]}),
+        )
+        .await,
+    );
+    let minted = unkeyed["submission_id"]
+        .as_str()
+        .expect("original riding send returns a submission id")
+        .to_owned();
+    let keyed = result(
+        &rig.send_with(
+            &minted,
+            "keyed payload",
+            None,
+            json!({"delivery":["tool_result"]}),
+        )
+        .await,
+    );
+    assert_ne!(unkeyed["submission_id"], keyed["submission_id"]);
+    rig.script.hold_tool(false);
+    rig.wait_idle().await;
+    let page = result(
+        &rig.request(
+            7,
+            json!({"method":"session.read","params":{"include_display_facts":true}}),
+        )
+        .await,
+    );
+    let notices: Vec<_> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|entry| entry["notices"].as_array().into_iter().flatten())
+        .collect();
+    assert_eq!(notices.len(), 1, "{page}");
+    assert_eq!(notices[0]["sender"], "collision-sender");
+    assert_eq!(notices[0]["send_id"], minted);
+    assert_eq!(notices[0]["text"], "keyed payload");
+    let frames = rig
+        .subscribe_collect_until(
+            8,
+            json!({"from":"start"}),
+            std::time::Duration::from_millis(20),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "run_finished")
+            },
+        )
+        .await;
+    let notices: Vec<serde_json::Value> = frames
+        .iter()
+        .filter_map(|frame| serde_json::from_slice::<serde_json::Value>(&frame.body).ok())
+        .filter(|value| value["event"]["type"] == "notice_delivered")
+        .collect();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["event"]["send_id"], minted);
+    assert_eq!(notices[0]["event"]["text"], "keyed payload");
+    assert_eq!(
+        rig.records()
+            .iter()
+            .filter(|record| matches!(record, broca_wal::WalRecord::SendDelivered { .. }))
+            .count(),
+        2,
+        "suppression does not discard a delivered send"
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn undeclared_sender_attribution_refuses_send_and_refresh_before_writes() {
+    let mut rig = Rig::start("undeclared-attribution").await;
+    rig.script.push(&[Step::Text("answer")]);
+    rig.send("opening", "synthetic prompt", None).await;
+    rig.wait_idle().await;
+    let before = rig.wal_bytes();
+    for method in ["session.send", "session.refresh"] {
+        let plan = json!({"senders":[{"module":"sample-sender","attribution":"header"}]});
+        let frame = if method == "session.send" {
+            rig.send_with("attributed", "new prompt", None, json!({"plan":plan}))
+                .await
+        } else {
+            rig.request(7, json!({"method":method,"params":{"policy":"immediately","generation":1,"plan":plan}})).await
+        };
+        assert_eq!(frame.header.ty, subc_protocol::FrameType::Error);
+        let error: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(error["code"], "invalid_params", "{error}");
+        assert_eq!(error["detail"]["field"], "plan.senders[0].attribution");
+        assert_eq!(rig.wal_bytes(), before);
     }
     rig.finish().await;
 }

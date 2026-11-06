@@ -42,15 +42,64 @@ use broca_wal::{FramedRecord, WalRecord};
 /// This is NOT the materialization watermark (which is a turn-boundary-anchored seq the
 /// store uses for resume). Distinct type on purpose, so a code path can't pass one where
 /// the other belongs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub struct Cursor {
     pub wal_seq: u64,
     pub sub_index: u32,
+    frame: Option<(
+        broca_wal::WalLineageId,
+        broca_wal::framing::CursorFrameIdentity,
+    )>,
 }
 
 impl Cursor {
     pub fn new(wal_seq: u64, sub_index: u32) -> Self {
-        Self { wal_seq, sub_index }
+        Self {
+            wal_seq,
+            sub_index,
+            frame: None,
+        }
+    }
+
+    pub fn with_frame_identity(
+        mut self,
+        lineage: broca_wal::WalLineageId,
+        identity: broca_wal::framing::CursorFrameIdentity,
+    ) -> Self {
+        self.frame = (identity.seq == self.wal_seq).then_some((lineage, identity));
+        self
+    }
+
+    pub fn frame_identity(
+        self,
+    ) -> Option<(
+        broca_wal::WalLineageId,
+        broca_wal::framing::CursorFrameIdentity,
+    )> {
+        self.frame
+    }
+}
+
+// Position ordering is independent of whether a reader also retained the verified frame header.
+impl PartialEq for Cursor {
+    fn eq(&self, other: &Self) -> bool {
+        (self.wal_seq, self.sub_index) == (other.wal_seq, other.sub_index)
+    }
+}
+impl Eq for Cursor {}
+impl PartialOrd for Cursor {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Cursor {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.wal_seq, self.sub_index).cmp(&(other.wal_seq, other.sub_index))
+    }
+}
+impl std::hash::Hash for Cursor {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&(self.wal_seq, self.sub_index), state);
     }
 }
 
@@ -189,8 +238,13 @@ struct LiveCallIdentity {
 /// an instance so later records retain their run, message and call identities.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ControlProjectionState {
+    call_anchors: crate::call_identity::CallAnchors,
+    current_call: Option<crate::call_identity::CallAnchor>,
     wal_lineage_id: Option<broca_wal::WalLineageId>,
     call_identities: std::collections::HashMap<ToolCallId, LiveCallIdentity>,
+    notice_senders: std::collections::HashMap<String, String>,
+    notice_sends: std::collections::HashMap<String, (String, String)>,
+    notice_carriers: std::collections::HashMap<ToolCallId, (u64, u32, Option<String>)>,
     placement: crate::placement::Placement,
     placement_error: Option<String>,
     assistant_ordinal: Option<u64>,
@@ -223,8 +277,13 @@ impl ControlProjectionState {
         run_id: Option<RunId>,
     ) -> Self {
         Self {
+            call_anchors: Default::default(),
+            current_call: None,
             wal_lineage_id: None,
             call_identities: Default::default(),
+            notice_senders: Default::default(),
+            notice_sends: Default::default(),
+            notice_carriers: Default::default(),
             run_id,
             final_step_finish_reason,
             has_completed_step: completed_steps > 0,
@@ -268,6 +327,36 @@ impl ControlProjectionState {
         );
         state.cancelled = episode.cancel_at.is_some()
             && !matches!(episode.disposition, crate::EpisodeDisposition::Finished);
+        for pending in seed.admission_checkpoint.pending_fifo.iter() {
+            let sender = match pending
+                .display_sent_by
+                .as_ref()
+                .or(pending.sent_by.as_ref())
+                .or(pending.principal.as_ref())
+            {
+                Some(broca_protocol::BindPrincipal::Reserved { module_id }) => module_id.clone(),
+                _ => "broca".into(),
+            };
+            if pending.order.is_some() {
+                if let Some(broca_protocol::BindPrincipal::Reserved { module_id }) =
+                    pending.sent_by.as_ref()
+                {
+                    state
+                        .notice_senders
+                        .insert(pending.submission_id.0.clone(), module_id.clone());
+                }
+            }
+            state.notice_sends.insert(
+                pending.submission_id.0.clone(),
+                (
+                    pending
+                        .send_id
+                        .clone()
+                        .unwrap_or_else(|| pending.submission_id.0.clone()),
+                    sender,
+                ),
+            );
+        }
         Some(state)
     }
 
@@ -299,6 +388,10 @@ impl ControlProjectionState {
         }
     }
 
+    pub fn wal_lineage_id(&self) -> Option<broca_wal::WalLineageId> {
+        self.wal_lineage_id
+    }
+
     pub fn placement_error(&self) -> Option<&str> {
         self.placement_error.as_deref()
     }
@@ -314,6 +407,7 @@ impl ControlProjectionState {
         self.assistant_started = false;
         self.started_tools.clear();
         self.call_identities.clear();
+        self.notice_carriers.clear();
         self.cancelled = false;
         self.pending_inputs.clear();
         self.held_calls = Default::default();
@@ -327,6 +421,7 @@ pub struct PlacedControlUnit {
     pub unit: ControlUnit,
     pub message_ordinal: Option<u64>,
     pub event: cortexkit_role_llm_runner::live::LiveEvent,
+    pub notice_submission_id: Option<String>,
 }
 
 impl PlacedControlUnit {
@@ -344,6 +439,14 @@ pub fn project_control_with_mids(
         let first = sink.units.len();
         project_control_record(framed, state, &mut sink);
         for frame in &mut sink.units[first..] {
+            if matches!(
+                frame.event,
+                cortexkit_role_llm_runner::live::LiveEvent::NoticeDelivered(_)
+            ) {
+                if let WalRecord::SendDelivered { submission_id, .. } = &framed.record {
+                    frame.notice_submission_id = Some(submission_id.0.clone());
+                }
+            }
             let (id, key, pin) = match &mut frame.event {
                 cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(event) => (
                     &event.tool_call_id,
@@ -357,7 +460,15 @@ pub fn project_control_with_mids(
                 ),
                 _ => continue,
             };
-            if let Some(identity) = state.call_identities.get(&ToolCallId(id.clone())) {
+            if let Some(identity) = state
+                .current_call
+                .as_ref()
+                .filter(|identity| identity.id.0 == *id)
+            {
+                let lineage = state.wal_lineage_id.map(|lineage| lineage.to_string());
+                *key = identity.key(lineage.as_deref());
+                pin.clone_from(&identity.schema_pin);
+            } else if let Some(identity) = state.call_identities.get(&ToolCallId(id.clone())) {
                 let lineage = state.wal_lineage_id.map(|lineage| lineage.to_string());
                 *key = crate::context::tool_call_key(
                     lineage.as_deref(),
@@ -372,6 +483,64 @@ pub fn project_control_with_mids(
         }
     }
     Ok(sink.units)
+}
+
+/// A notice fact and its source send identity, kept outside the serialized reader envelope.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProjectedNotice {
+    pub fact: cortexkit_role_llm_runner::read::NoticeFact,
+    pub submission_id: String,
+}
+
+/// Rebuild notice envelopes without modifying the stored carrying result or its digest.
+/// Truncations discard facts with the result they removed, even if later appends reuse its ordinal.
+pub fn reader_notices(
+    records: &[FramedRecord],
+    lineage: Option<broca_wal::WalLineageId>,
+) -> Result<std::collections::BTreeMap<u64, Vec<ProjectedNotice>>, String> {
+    use crate::placement::PlacementAction;
+    use cortexkit_role_llm_runner::{live::LiveEvent, read::NoticeFact};
+    let mut state = ControlProjectionState::default();
+    state.set_wal_lineage_id(lineage);
+    let mut placement = crate::placement::Placement::default();
+    let mut send_keys = crate::notice_keys::NoticeSendKeys::default();
+    let mut rows: std::collections::BTreeMap<u64, Vec<ProjectedNotice>> = Default::default();
+    for record in records {
+        send_keys.observe(std::slice::from_ref(record));
+        for action in placement.observe(&record.record)? {
+            if let PlacementAction::Truncate { to } = action {
+                rows.retain(|ordinal, _| *ordinal < to);
+            }
+        }
+        for frame in project_control_with_mids(std::slice::from_ref(record), &mut state)? {
+            if let (Some(ordinal), LiveEvent::NoticeDelivered(notice)) =
+                (frame.message_ordinal, frame.event)
+            {
+                let WalRecord::SendDelivered { submission_id, .. } = &record.record else {
+                    return Err("notice has no durable delivery source".into());
+                };
+                rows.entry(ordinal).or_default().push(ProjectedNotice {
+                    fact: NoticeFact::new(notice.part, notice.send_id, notice.sender, notice.text)
+                        .with_call_key(notice.call_key),
+                    submission_id: submission_id.0.clone(),
+                });
+            }
+        }
+    }
+    for notices in rows.values_mut() {
+        let mut visible = Vec::new();
+        for notice in std::mem::take(notices) {
+            if send_keys.allows(
+                &notice.submission_id,
+                &notice.fact.sender,
+                &notice.fact.send_id,
+            )? {
+                visible.push(notice);
+            }
+        }
+        *notices = visible;
+    }
+    Ok(rows)
 }
 
 /// Project records while retaining episode context across calls.
@@ -508,6 +677,7 @@ impl ControlProjectionSink for PlacedUnitSink {
             unit: make_unit(),
             message_ordinal: ordinal,
             event: make_event(),
+            notice_submission_id: None,
         });
     }
 }
@@ -537,6 +707,32 @@ fn project_control_record<S: ControlProjectionSink>(
 ) {
     use crate::placement::{AppendKind, PlacementAction};
     use cortexkit_role_llm_runner::live::{self, LiveEvent};
+    if let WalRecord::RunStarted {
+        submission_id: Some(submission_id),
+        ..
+    }
+    | WalRecord::Retracted { submission_id, .. }
+    | WalRecord::SendDelivered {
+        submission_id,
+        input: Some(_),
+        ..
+    } = &framed.record
+    {
+        state.notice_senders.remove(&submission_id.0);
+        state.notice_sends.remove(&submission_id.0);
+    }
+    state.current_call = state
+        .call_anchors
+        .observe(&framed.record, framed.seq)
+        .map(|(_, identity)| identity);
+    if matches!(
+        framed.record,
+        WalRecord::TurnFinished { .. }
+            | WalRecord::RunFinished { .. }
+            | WalRecord::ModelStepFinished { .. }
+    ) {
+        state.notice_carriers.clear();
+    }
     let actions = match state.placement.observe(&framed.record) {
         Ok(actions) => actions,
         Err(error) => {
@@ -585,6 +781,7 @@ fn project_control_record<S: ControlProjectionSink>(
             state.assistant_started = true;
             state.started_tools.clear();
             state.call_identities.clear();
+            state.notice_carriers.clear();
             record_sink.ordinal = state.assistant_ordinal;
             push!(
                 ControlUnit::StepStarted { step_id: *step_id },
@@ -949,11 +1146,22 @@ fn project_control_record<S: ControlProjectionSink>(
                 }
             }
         }
-        WalRecord::ToolBatchFinished { .. } => {}
+        WalRecord::ToolBatchFinished { .. } => {
+            if let Some(ordinal) = state.tool_result_ordinal {
+                let lineage = state.wal_lineage_id.map(|id| id.to_string());
+                for (part, call) in state.call_anchors.slots().iter().enumerate() {
+                    let key = call.key(lineage.as_deref());
+                    if let Ok(part) = u32::try_from(part) {
+                        state
+                            .notice_carriers
+                            .insert(call.id.clone(), (ordinal, part, key));
+                    }
+                }
+            }
+        }
         WalRecord::TurnFinished { .. }
         | WalRecord::RunConfigRefrozen { .. }
         | WalRecord::RunAuthRefrozen { .. }
-        | WalRecord::Queued { .. }
         | WalRecord::Retracted { failure: None, .. }
         | WalRecord::ApprovalRequested { .. }
         | WalRecord::ApprovalResolved { .. } => {}
@@ -962,9 +1170,96 @@ fn project_control_record<S: ControlProjectionSink>(
         WalRecord::SendDelivered {
             input: Some(input), ..
         } => state.pending_inputs.push(Arc::clone(input)),
-        WalRecord::DeliveryOrdered { .. }
-        | WalRecord::SendEnded { .. }
-        | WalRecord::SendDelivered { input: None, .. } => {}
+        WalRecord::DeliveryOrdered {
+            submission_id,
+            sent_by,
+            ..
+        } => {
+            if let Some(broca_protocol::BindPrincipal::Reserved { module_id }) = sent_by {
+                state
+                    .notice_senders
+                    .insert(submission_id.0.clone(), module_id.clone());
+            }
+        }
+        WalRecord::Queued {
+            submission_id,
+            send_id,
+            sent_by,
+            principal,
+            ..
+        } => {
+            let sender =
+                match sent_by.as_ref() {
+                    Some(broca_protocol::BindPrincipal::Reserved { module_id }) => {
+                        Some(module_id.clone())
+                    }
+                    _ => state
+                        .notice_senders
+                        .get(&submission_id.0)
+                        .cloned()
+                        .or_else(|| match principal.as_ref() {
+                            Some(broca_protocol::BindPrincipal::Reserved { module_id }) => {
+                                Some(module_id.clone())
+                            }
+                            _ => Some("broca".into()),
+                        }),
+                };
+            if let Some(sender) = sender {
+                state.notice_sends.insert(
+                    submission_id.0.clone(),
+                    (
+                        send_id.clone().unwrap_or_else(|| submission_id.0.clone()),
+                        sender,
+                    ),
+                );
+            }
+        }
+        WalRecord::SendDelivered {
+            submission_id,
+            mode: broca_protocol::DeliveryMode::ToolResult,
+            tool_call_id: Some(call),
+            appended_text: Some(text),
+            input: None,
+            ride,
+            ..
+        } => {
+            let carrier = state.notice_carriers.get(call);
+            let ordinal = carrier.map(|carrier| carrier.0);
+            let part = carrier.map(|carrier| carrier.1);
+            let key = carrier.and_then(|carrier| carrier.2.clone());
+            let key = ride.as_ref().map(|ride| ride.call_key.clone()).or(key);
+            let queued_origin = state.notice_sends.remove(&submission_id.0);
+            let origin = ride
+                .as_ref()
+                .map(|ride| (ride.send_id.clone(), ride.sender.clone()))
+                .or(queued_origin);
+            if let (Some(ordinal), Some(part), Some((send_id, sender))) = (ordinal, part, origin) {
+                // The separator belongs to rendering, not to the sender's notice text.
+                if let Some(text) = text.strip_prefix("\n\n") {
+                    record_sink.boundary(ordinal, || {
+                        key.map(|key| {
+                            LiveEvent::NoticeDelivered(
+                                live::NoticeDelivered::new(
+                                    format!("m{ordinal}"),
+                                    part,
+                                    key,
+                                    send_id,
+                                    sender,
+                                )
+                                .with_text(text),
+                            )
+                        })
+                        .unwrap_or(LiveEvent::DisplayReset)
+                    });
+                }
+            }
+            state.notice_senders.remove(&submission_id.0);
+        }
+        WalRecord::SendEnded { submission_id, .. } => {
+            state.notice_senders.remove(&submission_id.0);
+            state.notice_sends.remove(&submission_id.0);
+        }
+        WalRecord::SendDelivered { input: None, .. } => {}
         // The request changes recovery, not lifecycle: only RunFinished publishes a terminal.
         WalRecord::RunCancelRequested { run_id, .. } => {
             state.cancelled |= state.run_id.as_ref() == Some(run_id);
@@ -1449,6 +1744,21 @@ pub fn decode_positioned_frames(
     to: u64,
     decode_counter: Option<&std::cell::Cell<u64>>,
 ) -> Result<Vec<crate::replay::PositionedFrame>, String> {
+    Ok(decode_positioned_frames_with_identities(read_at, from, to, decode_counter)?.frames)
+}
+
+pub struct VerifiedPositionedFrames {
+    pub frames: Vec<crate::replay::PositionedFrame>,
+    pub identities: Vec<broca_wal::framing::CursorFrameIdentity>,
+}
+
+/// Keep frame identities from the same verified range read; no payload is reserialized.
+pub fn decode_positioned_frames_with_identities(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    from: u64,
+    to: u64,
+    decode_counter: Option<&std::cell::Cell<u64>>,
+) -> Result<VerifiedPositionedFrames, String> {
     use broca_wal::access_counter::decode_next;
     use broca_wal::framing::DecodeStep;
     let len = to
@@ -1463,11 +1773,16 @@ pub fn decode_positioned_frames(
         ));
     }
     let mut frames = Vec::new();
+    let mut identities = Vec::new();
     let mut off = 0usize;
     while off < bytes.len() {
         let at = from + off as u64;
         match decode_next(&bytes[off..]) {
             DecodeStep::Record { framed, consumed } => {
+                identities.push(
+                    broca_wal::framing::cursor_frame_identity(&bytes[off..off + consumed])
+                        .ok_or_else(|| format!("verified frame at {at} has no cursor identity"))?,
+                );
                 if let Some(counter) = decode_counter {
                     counter.set(counter.get() + 1);
                 }
@@ -1490,7 +1805,7 @@ pub fn decode_positioned_frames(
             }
         }
     }
-    Ok(frames)
+    Ok(VerifiedPositionedFrames { frames, identities })
 }
 
 /// The episode whose records hold WAL sequence `seq`: the last one started at or before it.
@@ -1644,5 +1959,46 @@ mod access_counter_tests {
         assert_eq!(snapshot[0].reads[1].class, ReadClass::Origin);
         assert_eq!(snapshot[0].reads[1].length, bytes.len() as u64);
         assert_eq!(snapshot[0].frames_decoded, 1);
+    }
+}
+
+#[cfg(test)]
+mod notice_origin_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_new_envelope_consumes_its_pending_notice_origin() {
+        let values = [
+            json!({"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m","content":[{"type":"tool_call","tool_call_id":"call","tool_name":"work","input":{}}]},"usage":{}}),
+            json!({"type":"tool_batch_started","batch_id":"b","step_id":1,"planned_calls":["call"]}),
+            json!({"type":"tool_dispatch_intent","batch_id":"b","tool_call_id":"call","args":{}}),
+            json!({"type":"queued","submission_id":"sub","send_id":"send","sent_by":{"kind":"reserved","module_id":"m"},"request":{"model":{"provider_module_id":"fake","model_id":"fake"},"input":[]}}),
+            json!({"type":"tool_result","batch_id":"b","result":{"tool_call_id":"call","output":{"kind":"text","text":"output"},"is_error":false},"outcome":"completed"}),
+            json!({"type":"tool_batch_finished","batch_id":"b"}),
+            json!({"type":"send_delivered","submission_id":"sub","run_id":"run","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nnote","ride":{"call_key":"lineage:3","send_id":"send","sender":"m","forms":["tool_result"],"form":"append"}}),
+        ];
+        let frames: Vec<_> = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| FramedRecord {
+                seq: index as u64 + 1,
+                fence: 1,
+                record: serde_json::from_value(value).unwrap(),
+            })
+            .collect();
+        let mut state = ControlProjectionState::default();
+        let projected = project_control_with_mids(&frames, &mut state).unwrap();
+        assert!(state.notice_sends.is_empty());
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|frame| matches!(
+                    frame.event,
+                    cortexkit_role_llm_runner::live::LiveEvent::NoticeDelivered(_)
+                ))
+                .count(),
+            1
+        );
     }
 }

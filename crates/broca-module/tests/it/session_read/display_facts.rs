@@ -1,6 +1,95 @@
 use super::*;
 
 #[tokio::test]
+async fn old_display_seed_rebuilds_only_on_its_sessions_opt_in_read() {
+    use broca_core::display_facts::{
+        DisplayFactVersion, DisplayFacts, DisplayFactsSeed, DISPLAY_FACTS_VERSION,
+    };
+    let (rig, zero_ranges) = Rig::with_counting_zero_ranges("old-display-fact-seed");
+    let key = rig.key("old-seed");
+    let other = rig.key("untouched");
+    append_seed(
+        &rig.wal_store,
+        &key,
+        &[
+            started(&key, "run", "question"),
+            assistant_text(0, "answer"),
+            finished_ok(),
+        ],
+    );
+    materialize_all(&rig, &key);
+    let plain = rig
+        .registry
+        .read(read_request(&key, None, Some(32)))
+        .await
+        .unwrap();
+    let lineage = plain.lineage_id.as_ref().unwrap();
+    let mut old = DisplayFactsSeed::default();
+    old.version -= 1;
+    old.through_seq = u64::MAX;
+    rig.store
+        .publish_display_facts(
+            &key,
+            lineage,
+            None,
+            None,
+            &old,
+            &[DisplayFactVersion {
+                ordinal: 0,
+                seq: 1,
+                facts: DisplayFacts {
+                    client_message_id: Some("stale".into()),
+                    ..Default::default()
+                },
+            }],
+        )
+        .unwrap();
+    zero_ranges.store(0, Ordering::SeqCst);
+    let default = rig
+        .registry
+        .read(read_request(&key, None, Some(32)))
+        .await
+        .unwrap();
+    assert_eq!(default, plain);
+    assert_eq!(
+        zero_ranges.load(Ordering::SeqCst),
+        0,
+        "default reads do not rebuild display facts"
+    );
+    let mut request = read_request(&key, None, Some(32));
+    request.include_display_facts = true;
+    let rebuilt = rig.registry.read(request.clone()).await.unwrap();
+    assert_eq!(
+        zero_ranges.swap(0, Ordering::SeqCst),
+        1,
+        "the old seed requires one cold rebuild"
+    );
+    assert!(rebuilt
+        .messages
+        .iter()
+        .all(|message| message.client_message_id.as_deref() != Some("stale")));
+    let cache = rig
+        .store
+        .read_display_facts_cache(&key, lineage, u64::MAX, &[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(cache.seed.unwrap().version, DISPLAY_FACTS_VERSION);
+    assert_eq!(rig.registry.read(request).await.unwrap(), rebuilt);
+    assert_eq!(
+        zero_ranges.load(Ordering::SeqCst),
+        0,
+        "the rebuilt seed is reused"
+    );
+    assert!(rig
+        .store
+        .read_display_facts_cache(&other, lineage, u64::MAX, &[])
+        .unwrap()
+        .unwrap()
+        .seed
+        .is_none());
+}
+
+#[tokio::test]
 async fn display_fact_backfill_is_lazy_persistent_and_reads_are_bounded_at_1k_and_150k() {
     for size in [1_000, 150_000] {
         let fixture_started = std::time::Instant::now();

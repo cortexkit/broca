@@ -134,6 +134,9 @@ impl Wal for RefusePhysicalSync {
     fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
         self.0.lineage_id()
     }
+    fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+        self.0.last_cursor_frame_identity()
+    }
 }
 
 impl Wal for NoFsyncWal {
@@ -155,6 +158,9 @@ impl Wal for NoFsyncWal {
     }
     fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
         self.0.lineage_id()
+    }
+    fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+        self.0.last_cursor_frame_identity()
     }
 }
 

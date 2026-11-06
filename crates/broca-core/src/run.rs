@@ -6473,6 +6473,7 @@ where
                     step: step_id.0,
                     preset,
                     entries: &transcript.entries,
+                    rides: &transcript.rides,
                     stored: &opts.prompt,
                     conditions: &conditions,
                     previous: previous.as_ref(),
@@ -6550,9 +6551,12 @@ where
                 .map_err(RunError::Wal)?;
             let (config, manifest) =
                 crate::compaction_v2::host::frozen(&frames).map_err(RunError::Wal)?;
-            let prompt =
-                crate::compaction_v2::render::deliveries_only(&opts.prompt, &transcript.entries)
-                    .map_err(RunError::Wal)?;
+            let prompt = crate::compaction_v2::render::deliveries_only_with_rides(
+                &opts.prompt,
+                &transcript.entries,
+                &transcript.rides,
+            )
+            .map_err(RunError::Wal)?;
             model_opts = Some(Arc::new(
                 crate::compaction_v2::render::finish(&opts, prompt, &config, manifest)
                     .map_err(RunError::Wal)?,
@@ -11685,7 +11689,7 @@ fn deliver_ordered_with_results<'a>(
     run_id: &RunId,
     batch_id: &BatchId,
     results: impl IntoIterator<Item = &'a ToolResult>,
-) -> Vec<(ToolCallId, String)> {
+) -> Vec<WalRecord> {
     let mode3 = control.is_some_and(|control| control.new_log_compaction_plan_version.is_some());
     if !mode3 {
         writer.record(WalRecord::ToolBatchFinished {
@@ -11702,6 +11706,7 @@ fn deliver_ordered_with_results<'a>(
         }
         return Vec::new();
     };
+    let mut deliveries = Vec::new();
     inbox.deliver_with_tool_results_mode(
         mode3,
         run_id,
@@ -11716,21 +11721,46 @@ fn deliver_ordered_with_results<'a>(
                 });
             }
             for record in records {
-                writer.record(record);
+                let record = writer.record_delivery(record);
+                if !mode3 {
+                    deliveries.push(record);
+                }
             }
         },
-    )
+    );
+    deliveries
 }
 
 /// Append each delivered text to the live copy of the result it rides on, as replay renders it
 /// from the `SendDelivered` record. The caller's events carry the tool's own output unchanged.
-fn apply_ordered_appends(results: &mut [ToolResult], appends: &[(ToolCallId, String)]) {
-    for (tool_call_id, text) in appends {
-        if let Some(result) = results
-            .iter_mut()
-            .find(|result| &result.tool_call_id == tool_call_id)
-        {
-            crate::delivery_order::append_to_result(result, text);
+fn apply_ordered_appends(results: &mut [ToolResult], appends: &[WalRecord]) {
+    for record in appends {
+        let WalRecord::SendDelivered {
+            tool_call_id: Some(call),
+            appended_text: Some(text),
+            ride,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        // Legacy records historically selected the first matching result. Frozen rides
+        // select the last matching result, the one identified by their recorded call key.
+        let result = if ride.is_some() {
+            results
+                .iter_mut()
+                .rfind(|result| &result.tool_call_id == call)
+        } else {
+            results
+                .iter_mut()
+                .find(|result| &result.tool_call_id == call)
+        };
+        if let Some(result) = result {
+            if let Some(ride) = ride {
+                crate::delivery_order::append_ride(result, ride, text);
+            } else {
+                crate::delivery_order::append_to_result(result, text);
+            }
         }
     }
 }

@@ -201,6 +201,7 @@ pub(crate) fn recorded_send_outcome(
     own_run: &RunId,
     send_id: &str,
     legacy_steers: bool,
+    lineage: Option<broca_wal::WalLineageId>,
 ) -> Option<SendOutcome> {
     if legacy_steers {
         let steers = recorded_steers(records);
@@ -222,12 +223,25 @@ pub(crate) fn recorded_send_outcome(
             reason,
         }),
         QueuedSendFate::Retracted => Some(SendOutcome::Retracted { submission_id }),
-        QueuedSendFate::Delivered { run_id, .. } => Some(run_outcome(
-            records,
-            &run_id,
-            Some(Delivered::new(delivered_as::STEP).with_ref(run_id.0.clone())),
-            true,
-        )),
+        QueuedSendFate::Delivered { run_id, mode } => {
+            let mut delivered = Delivered::new(delivered_as::STEP).with_ref(run_id.0.clone());
+            if let Some(key) = records.iter().find_map(|record| match record {
+                WalRecord::SendDelivered {
+                    submission_id: id,
+                    ride: Some(ride),
+                    ..
+                } if id == &submission_id => Some(&ride.call_key),
+                _ => None,
+            }) {
+                delivered = delivered.with_call_key(key);
+            }
+            if mode == broca_protocol::DeliveryMode::ToolResult && delivered.call_key.is_none() {
+                if let Some(key) = legacy_carrier_key(records, &submission_id, lineage) {
+                    delivered = delivered.with_call_key(key);
+                }
+            }
+            Some(run_outcome(records, &run_id, Some(delivered), true))
+        }
         QueuedSendFate::Started => {
             let ordered = records.iter().any(|record| {
                 matches!(record,
@@ -269,6 +283,49 @@ fn run_outcome(
             delivered,
         }
     }
+}
+
+/// Older deliveries lack an envelope. Their carrying call still has its own durable anchor
+/// in that tool turn; never join a repeated model call ID across different steps.
+fn legacy_carrier_key(
+    records: &[WalRecord],
+    submission: &SubmissionId,
+    lineage: Option<broca_wal::WalLineageId>,
+) -> Option<String> {
+    let lineage = lineage?.to_string();
+    let (at, call) = records
+        .iter()
+        .enumerate()
+        .find_map(|(at, record)| match record {
+            WalRecord::SendDelivered {
+                submission_id,
+                tool_call_id: Some(call),
+                ..
+            } if submission_id == submission => Some((at, call)),
+            _ => None,
+        })?;
+    let step = records[..at]
+        .iter()
+        .rposition(|record| matches!(record, WalRecord::ModelStepFinished { .. }))?;
+    let frames: Vec<_> = records[step..=at]
+        .iter()
+        .enumerate()
+        .map(|(offset, record)| broca_wal::FramedRecord {
+            seq: (step + offset) as u64 + 1,
+            fence: 0,
+            record: record.clone(),
+        })
+        .collect();
+    let dispatches = broca_core::dispatches_of_turns(&frames, &[(0, 0)], 0);
+    let carrier = dispatches
+        .get(&0)?
+        .iter()
+        .rfind(|entry| entry.tool_call_id == call.0)?;
+    broca_core::tool_call_key(
+        Some(&lineage),
+        carrier.key_seq.or(carrier.intent_seq)?,
+        carrier.recorded_call_key.as_deref(),
+    )
 }
 
 #[cfg(test)]

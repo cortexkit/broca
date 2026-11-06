@@ -1554,3 +1554,282 @@ async fn installed_header_only_publication_roundtrips_before_the_first_run() {
     no_legacy_index(&root);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[derive(Clone, Copy)]
+enum CursorCostKind {
+    Head,
+    Page,
+    Live,
+}
+
+async fn cursor_cost_fixture(
+    prefix_bytes: usize,
+    live: bool,
+) -> (
+    PathBuf,
+    BindIdentity,
+    OverhaulDaemon,
+    Option<broca_core::WalHandle>,
+) {
+    let root = root("cursor-binding-cost");
+    let bind = BindIdentity::new("/installed", "runner", "cursor-binding-cost");
+    let access = WalAccessCounter::default();
+    let daemon = OverhaulDaemon::boot(&root, access.clone()).await;
+    let mut records = partial_turn().await;
+    if let WalRecord::RunStarted {
+        manifest, input, ..
+    } = &mut records[0]
+    {
+        *manifest = Some(compaction_plan());
+        *input = vec![
+            broca_protocol::Message::new(
+                broca_protocol::Role::User,
+                vec![ContentBlock::Text {
+                    text: "prefix".into(),
+                }],
+            ),
+            broca_protocol::Message::new(
+                broca_protocol::Role::User,
+                vec![ContentBlock::Text {
+                    text: "current question".into(),
+                }],
+            ),
+        ]
+        .into();
+    }
+    let replacement = std::sync::Arc::new(vec![broca_protocol::Message::new(
+        broca_protocol::Role::User,
+        vec![ContentBlock::Text {
+            text: "prefix summary".into(),
+        }],
+    )]);
+    records.insert(
+        1,
+        WalRecord::CompactionMessage {
+            provider: "compactor".into(),
+            kind: broca_wal::CompactionMessageKind::Setup,
+            compaction_id: "cursor-cost-window".into(),
+            version: 1,
+            range: broca_wal::CompactionRange { from: 0, to: 0 },
+            sha256: broca_wal::compaction_replacement_sha256(&replacement).unwrap(),
+            replacement,
+            request_id: None,
+            cursor: None,
+            call_when: None,
+            stability: None,
+            ceiling: None,
+            tag_checkpoint: None,
+            ride_wait_ms: None,
+            view_features: None,
+            view_due: None,
+        },
+    );
+    // Grow a queued record that is later retracted; the cursor's indexed tool
+    // turn remains the same size and the queued input never enters the transcript.
+    records.insert(2, serde_json::from_value(json!({
+        "type":"queued", "submission_id":"discarded-prefix",
+        "request":{"model":{"provider_module_id":"stub","model_id":"m"},
+            "input":[{"role":"user","content":[{"type":"text","text":"P".repeat(prefix_bytes)}]}]}
+    })).unwrap());
+    records.insert(
+        3,
+        WalRecord::Retracted {
+            submission_id: broca_protocol::SubmissionId("discarded-prefix".into()),
+            failure: None,
+        },
+    );
+    for record in &mut records {
+        if !live {
+            if let WalRecord::ToolResult { result, .. } = record {
+                std::sync::Arc::make_mut(result).output = broca_protocol::ToolOutput::Text {
+                    text: "R".repeat(32 * 1024),
+                };
+            }
+        }
+    }
+    if live {
+        records.push(
+            serde_json::from_value(
+                json!({"type":"run_finished","reason":"completed","usage":{},"retries_used":0}),
+            )
+            .unwrap(),
+        );
+    }
+    let (seq, writer) =
+        write_turn(&daemon, &access, &bind, "cursor-cost-run", &records, false).await;
+    published(&daemon, &bind, seq).await;
+    let writer = if live {
+        writer.shutdown().await.unwrap();
+        published(&daemon, &bind, seq + 1).await;
+        None
+    } else {
+        Some(writer)
+    };
+    (root, bind, daemon, writer)
+}
+
+fn cursor_digest_oracle(daemon: &OverhaulDaemon, bind: &BindIdentity) -> BTreeMap<u64, String> {
+    let bytes = std::fs::read(daemon.wal.wal_path(bind)).unwrap();
+    let mut at = 0;
+    let mut digests = BTreeMap::new();
+    while at < bytes.len() {
+        match broca_wal::framing::decode_next(&bytes[at..]) {
+            broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                let identity =
+                    broca_wal::framing::cursor_frame_identity(&bytes[at..at + consumed]).unwrap();
+                assert_eq!(identity.seq, framed.seq);
+                digests.insert(framed.seq, identity.digest_hex());
+                at += consumed;
+            }
+            broca_wal::framing::DecodeStep::Lineage { consumed, .. } => at += consumed,
+            _ => panic!("invalid verified cursor fixture frame at {at}"),
+        }
+    }
+    digests
+}
+
+async fn cursor_binding_cost(kind: CursorCostKind) {
+    let mut lengths = Vec::new();
+    let mut costs: Vec<Vec<u64>> = Vec::new();
+    for prefix in [32 * 1024, 1024 * 1024] {
+        let (root, bind, daemon, writer) =
+            cursor_cost_fixture(prefix, matches!(kind, CursorCostKind::Live)).await;
+        lengths.push(std::fs::metadata(daemon.wal.wal_path(&bind)).unwrap().len());
+        let mut measured = Vec::new();
+        if matches!(kind, CursorCostKind::Head) {
+            // Populate the existing media/head cache before measuring the cached-head
+            // branch; its cold discovery pass is unrelated to cursor identity minting.
+            daemon.registry.head(&bind).await.unwrap();
+        }
+        if matches!(kind, CursorCostKind::Live) {
+            let idle = FrozenIdleClock::new();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+            daemon
+                .registry
+                .subscribe(&bind, SubscribeFrom::Live, tx)
+                .await
+                .unwrap();
+            let attached =
+                broca_test_support::event_timeout("cursor cost live attachment", rx.recv(), || {
+                    "waiting for display reset".into()
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(attached, broca_module::Delivery::Display(_)));
+            submit(
+                &daemon,
+                &bind,
+                "cursor-cost-live",
+                json!([{"role":"user","content":[{"type":"text","text":"live question"}]}]),
+                "completed",
+            )
+            .await;
+            let oracle = cursor_digest_oracle(&daemon, &bind);
+            loop {
+                let delivery = broca_test_support::event_timeout(
+                    "cursor cost live control",
+                    rx.recv(),
+                    || "waiting for run_finished".into(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let broca_module::Delivery::Control(event) = &delivery else {
+                    continue;
+                };
+                let counter = WalAccessCounter::default();
+                let cursor = counter
+                    .operation("live control cursor binding")
+                    .run_future(broca_module_serve::serve::control_cursor_for_delivery(
+                        &daemon.registry,
+                        &bind,
+                        &delivery,
+                    ))
+                    .await
+                    .unwrap()
+                    .expect("each control frame carries a resumable cursor");
+                assert_eq!(cursor.digest.as_ref(), oracle.get(&cursor.wal_seq));
+                assert!(cursor.incarnation.is_some());
+                measured.push(
+                    counter
+                        .snapshot()
+                        .remove(0)
+                        .reads
+                        .iter()
+                        .map(|read| read.length)
+                        .sum(),
+                );
+                if matches!(
+                    event.1,
+                    broca_protocol::caller::ControlUnit::RunFinished { .. }
+                ) {
+                    break;
+                }
+            }
+            assert!(measured.len() >= 3);
+            drop(idle);
+        } else {
+            let counter = WalAccessCounter::default();
+            let cursor = counter
+                .operation("cached control-head cursor binding")
+                .run_future(async {
+                    if matches!(kind, CursorCostKind::Head) {
+                        daemon.registry.head(&bind).await.unwrap().head
+                    } else {
+                        daemon
+                            .registry
+                            .read(SessionReadRequest::new(bind.clone(), None, Some(2)))
+                            .await
+                            .unwrap()
+                            .head
+                    }
+                })
+                .await
+                .expect("the populated snapshot has a cursor");
+            let oracle = cursor_digest_oracle(&daemon, &bind);
+            assert_eq!(
+                cursor.digest.as_ref(),
+                oracle.get(&cursor.wal_seq),
+                "the digest must name the cursor's frame, not the later TurnFinished boundary"
+            );
+
+            measured.push(
+                counter
+                    .snapshot()
+                    .remove(0)
+                    .reads
+                    .iter()
+                    .map(|read| read.length)
+                    .sum(),
+            );
+        }
+        costs.push(measured);
+        if let Some(writer) = writer {
+            writer.shutdown().await.unwrap();
+        }
+        daemon.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    assert!(
+        lengths[1] >= lengths[0] * 10,
+        "fixture log lengths: {lengths:?}"
+    );
+    assert_eq!(
+        costs[0], costs[1],
+        "cursor binding reads grew with the log: {costs:?}"
+    );
+}
+
+#[tokio::test]
+async fn cached_head_cursor_binding_reads_are_flat_across_10x_logs() {
+    isolated_idle_clock(|| cursor_binding_cost(CursorCostKind::Head)).await;
+}
+#[tokio::test]
+async fn page_cursor_binding_reads_are_flat_across_10x_logs() {
+    isolated_idle_clock(|| cursor_binding_cost(CursorCostKind::Page)).await;
+}
+#[tokio::test]
+async fn live_control_cursor_binding_reads_are_flat_across_10x_logs() {
+    isolated_idle_clock(|| cursor_binding_cost(CursorCostKind::Live)).await;
+}

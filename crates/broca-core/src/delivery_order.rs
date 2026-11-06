@@ -137,6 +137,74 @@ pub fn append_to_result(result: &mut ToolResult, text: &str) {
     }
 }
 
+/// New ride envelopes preserve the native content list; legacy deliveries keep their
+/// original renderer because a resumed model request must not acquire different bytes.
+pub fn append_ride(result: &mut ToolResult, ride: &broca_wal::record::RideMetadata, text: &str) {
+    let rides = [cortexkit_role_llm_runner::rides::Ride::new(
+        &ride.send_id,
+        &ride.sender,
+        &ride.call_key,
+        text.strip_prefix("\n\n").unwrap_or(text),
+    )];
+    append_ride_output(&mut result.output, &rides);
+}
+
+pub(crate) fn append_ride_output(
+    output: &mut ToolOutput,
+    rides: &[cortexkit_role_llm_runner::rides::Ride],
+) {
+    use cortexkit_role_llm_runner::rides::{self, ContentItem};
+    match output {
+        ToolOutput::Text { text } => *text = rides::append(text, rides),
+        ToolOutput::Error { message, .. } => *message = rides::append(message, rides),
+        ToolOutput::Parts { parts } => {
+            let mut content: Vec<_> = std::mem::take(parts)
+                .into_iter()
+                .map(|part| match part {
+                    broca_protocol::ToolOutputPart::Text { text } => ContentItem::Text(text),
+                    part => ContentItem::Opaque(part),
+                })
+                .collect();
+            rides::append_to_content(&mut content, rides);
+            *parts = content
+                .into_iter()
+                .map(|item| match item {
+                    ContentItem::Text(text) => broca_protocol::ToolOutputPart::Text { text },
+                    ContentItem::Opaque(part) => part,
+                })
+                .collect();
+        }
+        ToolOutput::Json { value } => {
+            *output = ToolOutput::Text {
+                text: rides::append(&value.to_string(), rides),
+            }
+        }
+        ToolOutput::Denied { reason } => *output = ToolOutput::error(rides::append(reason, rides)),
+    }
+}
+
+pub fn apply_ride_to_prompt(
+    prompt: &mut [Message],
+    call: &ToolCallId,
+    ride: &broca_wal::record::RideMetadata,
+    text: &str,
+) -> bool {
+    if let Some(message) = prompt
+        .iter_mut()
+        .rfind(|message| message.role == Role::Tool)
+    {
+        for block in message.content.iter_mut().rev() {
+            if let ContentBlock::ToolResult(result) = block {
+                if &result.tool_call_id == call {
+                    append_ride(result, ride, text);
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Apply a `tool_result` delivery to the newest tool message of `prompt` that holds the named
 /// result. Returns whether a result was found. Replay calls this at the delivery record, which
 /// follows the batch's `ToolBatchFinished`, so the tool message is the prompt's newest one.
@@ -218,6 +286,7 @@ pub fn ended(submission_id: &SubmissionId, reason: SendEndReason) -> WalRecord {
 /// The record of a `steer` delivery of `send` into `run_id`.
 pub fn steered(send: &OrderedSend, run_id: &RunId) -> WalRecord {
     WalRecord::SendDelivered {
+        ride: None,
         written_at_ms: send.admitted_at_ms,
         tags: None,
         submission_id: send.submission_id.clone(),
@@ -238,6 +307,7 @@ pub fn system_delivered(send: &OrderedSend, run_id: &RunId) -> WalRecord {
         message.turn_system = true;
     }
     WalRecord::SendDelivered {
+        ride: None,
         written_at_ms: send.admitted_at_ms,
         tags: None,
         submission_id: send.submission_id.clone(),
@@ -257,6 +327,7 @@ pub fn with_tool_result(
     text: String,
 ) -> WalRecord {
     WalRecord::SendDelivered {
+        ride: None,
         written_at_ms: send.admitted_at_ms,
         tags: None,
         submission_id: send.submission_id.clone(),
@@ -514,5 +585,297 @@ mod tests {
         );
         assert_eq!(appended_text(&[text, assistant]), None);
         assert_eq!(appended_text(&[]), None);
+    }
+}
+
+/// Reader support ships before any writer enables the new resume-sensitive envelope.
+pub const RIDES_V2_WRITER_ENABLED: bool = false;
+
+#[derive(Default)]
+pub(crate) struct RideLedger {
+    anchors: crate::call_identity::CallAnchors,
+    sends: std::collections::HashMap<String, (String, String, Vec<String>)>,
+    orders: std::collections::HashMap<String, (Option<broca_protocol::BindPrincipal>, Vec<String>)>,
+}
+
+impl RideLedger {
+    pub(crate) fn observe(&mut self, record: &WalRecord, seq: u64) {
+        self.anchors.observe(record, seq);
+        match record {
+            WalRecord::DeliveryOrdered {
+                submission_id,
+                order,
+                sent_by,
+            } => {
+                let forms = order
+                    .modes
+                    .iter()
+                    .filter_map(|mode| match mode {
+                        DeliveryMode::ToolResult => Some("tool_result".into()),
+                        DeliveryMode::TurnSystem => Some("turn_system".into()),
+                        _ => None,
+                    })
+                    .collect();
+                self.orders
+                    .insert(submission_id.0.clone(), (sent_by.clone(), forms));
+            }
+            WalRecord::Queued {
+                submission_id,
+                send_id,
+                sent_by,
+                principal,
+                ..
+            } => {
+                let (ordered_sender, forms) = self
+                    .orders
+                    .get(&submission_id.0)
+                    .cloned()
+                    .unwrap_or_default();
+                let principal = sent_by
+                    .as_ref()
+                    .or(ordered_sender.as_ref())
+                    .or(principal.as_ref());
+                let sender = match principal {
+                    Some(broca_protocol::BindPrincipal::Reserved { module_id }) => {
+                        module_id.clone()
+                    }
+                    _ => "broca".into(),
+                };
+                self.sends.insert(
+                    submission_id.0.clone(),
+                    (
+                        send_id.clone().unwrap_or_else(|| submission_id.0.clone()),
+                        sender,
+                        forms,
+                    ),
+                );
+            }
+            WalRecord::SendDelivered { submission_id, .. }
+            | WalRecord::SendEnded { submission_id, .. }
+            | WalRecord::Retracted { submission_id, .. } => {
+                self.sends.remove(&submission_id.0);
+                self.orders.remove(&submission_id.0);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn seed_pending(&mut self, pending: &crate::PendingSubmission) {
+        let Some(order) = pending.order.as_ref() else {
+            return;
+        };
+        let sender = match pending
+            .display_sent_by
+            .as_ref()
+            .or(pending.sent_by.as_ref())
+            .or(pending.principal.as_ref())
+        {
+            Some(BindPrincipal::Reserved { module_id }) => module_id.clone(),
+            _ => "broca".into(),
+        };
+        let forms = order
+            .modes
+            .iter()
+            .filter_map(|mode| match mode {
+                DeliveryMode::ToolResult => Some("tool_result".into()),
+                DeliveryMode::TurnSystem => Some("turn_system".into()),
+                _ => None,
+            })
+            .collect();
+        self.sends.insert(
+            pending.submission_id.0.clone(),
+            (
+                pending
+                    .send_id
+                    .clone()
+                    .unwrap_or_else(|| pending.submission_id.0.clone()),
+                sender,
+                forms,
+            ),
+        );
+    }
+
+    pub(crate) fn envelope(
+        &self,
+        record: &WalRecord,
+        lineage: Option<&str>,
+    ) -> Option<broca_wal::record::RideMetadata> {
+        let WalRecord::SendDelivered {
+            submission_id,
+            mode: DeliveryMode::ToolResult,
+            tool_call_id: Some(call),
+            ..
+        } = record
+        else {
+            return None;
+        };
+        let (send_id, sender, forms) = self.sends.get(&submission_id.0)?;
+        Some(broca_wal::record::RideMetadata {
+            call_key: self
+                .anchors
+                .slots()
+                .iter()
+                .rfind(|slot| &slot.id == call)?
+                .key(lineage)?,
+            send_id: send_id.clone(),
+            sender: sender.clone(),
+            forms: forms.clone(),
+            form: broca_wal::record::RideForm::Append,
+        })
+    }
+}
+
+#[cfg(test)]
+mod ride_v2_tests {
+    use super::*;
+    use broca_protocol::{MediaKind, MediaRef, ToolOutputPart};
+    use cortexkit_role_llm_runner::rides::Ride;
+    use serde_json::Value;
+
+    fn parts(value: &Value) -> Vec<ToolOutputPart> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                if let Some(text) = item["text"].as_str() {
+                    ToolOutputPart::Text { text: text.into() }
+                } else {
+                    ToolOutputPart::Media {
+                        media: MediaRef {
+                            kind: MediaKind::Image,
+                            mime: "image/png".into(),
+                            byte_size: 1,
+                            sha256: item["image"].as_str().unwrap().into(),
+                            width: Some(1),
+                            height: Some(1),
+                        },
+                    }
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rides_v2_contract_helper_vectors_pin_native_rendering() {
+        let vectors: Value = serde_json::from_str(
+            cortexkit_role_llm_runner::vectors::file("result-rides.json").unwrap(),
+        )
+        .unwrap();
+        for case in vectors["strings"].as_array().unwrap() {
+            let rides: Vec<_> = case["rides"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|text| Ride::new("send", "sender", "key", text.as_str().unwrap()))
+                .collect();
+            for mut output in [
+                ToolOutput::Text {
+                    text: case["output"].as_str().unwrap().into(),
+                },
+                ToolOutput::error(case["output"].as_str().unwrap()),
+            ] {
+                append_ride_output(&mut output, &rides);
+                let actual = match output {
+                    ToolOutput::Text { text } => text,
+                    ToolOutput::Error { message, .. } => message,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    actual,
+                    case["expected"].as_str().unwrap(),
+                    "{}",
+                    case["name"]
+                );
+            }
+        }
+        for case in vectors["content"].as_array().unwrap() {
+            let rides: Vec<_> = case["rides"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|text| Ride::new("send", "sender", "key", text.as_str().unwrap()))
+                .collect();
+            let mut output = ToolOutput::Parts {
+                parts: parts(&case["input"]),
+            };
+            append_ride_output(&mut output, &rides);
+            assert_eq!(
+                output,
+                ToolOutput::Parts {
+                    parts: parts(&case["expected"])
+                },
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn rides_v2_framed_resume_preserves_old_and_new_multipart_rules() {
+        let source = serde_json::json!([{"image":"opaque"},{"text":"caption"}]);
+        let mut old = ToolResult {
+            tool_call_id: ToolCallId("call".into()),
+            output: ToolOutput::Parts {
+                parts: parts(&source),
+            },
+            is_error: false,
+        };
+        append_to_result(&mut old, "\n\nnote");
+        assert_eq!(
+            old.output,
+            ToolOutput::Parts {
+                parts: parts(
+                    &serde_json::json!([{"image":"opaque"},{"text":"caption"},{"text":"\n\nnote"}])
+                )
+            }
+        );
+        for (input, expected) in [
+            (
+                source,
+                serde_json::json!([{"image":"opaque"},{"text":"caption\n\nnote"}]),
+            ),
+            (
+                serde_json::json!([{"text":"caption"},{"image":"opaque"}]),
+                serde_json::json!([{"text":"caption"},{"image":"opaque"},{"text":"\n\nnote"}]),
+            ),
+        ] {
+            let record: WalRecord = serde_json::from_value(serde_json::json!({"type":"send_delivered","submission_id":"submission","run_id":"run","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nnote","ride":{"call_key":"log:7","send_id":"send","sender":"sender","forms":["tool_result"],"form":"append"}})).unwrap();
+            let bytes = broca_wal::framing::encode(8, 1, &record).unwrap();
+            let broca_wal::framing::DecodeStep::Record { framed, .. } =
+                broca_wal::framing::decode_next(&bytes)
+            else {
+                panic!("ride frame refused")
+            };
+            let WalRecord::SendDelivered {
+                ride: Some(ride),
+                appended_text: Some(text),
+                tool_call_id: Some(call),
+                ..
+            } = framed.record
+            else {
+                panic!("ride envelope lost")
+            };
+            let mut prompt = vec![Message::new(
+                Role::Tool,
+                vec![ContentBlock::ToolResult(ToolResult {
+                    tool_call_id: call.clone(),
+                    output: ToolOutput::Parts {
+                        parts: parts(&input),
+                    },
+                    is_error: false,
+                })],
+            )];
+            assert!(apply_ride_to_prompt(&mut prompt, &call, &ride, &text));
+            let ContentBlock::ToolResult(result) = &prompt[0].content[0] else {
+                unreachable!()
+            };
+            assert_eq!(
+                result.output,
+                ToolOutput::Parts {
+                    parts: parts(&expected)
+                }
+            );
+        }
     }
 }

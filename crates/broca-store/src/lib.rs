@@ -5866,6 +5866,14 @@ mod tests {
         .unwrap();
         assert_eq!(anchored, scanned);
         assert_eq!(
+            anchored
+                .cursor_frame_identities()
+                .map(|identity| identity.seq)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert!(scanned.frame_digest_at(seed.watermark_seq).is_none());
+        assert_eq!(
             (match anchored.records() {
                 broca_wal::WalRangeRecords::Complete(records)
                 | broca_wal::WalRangeRecords::Partial(records)

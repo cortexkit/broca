@@ -145,6 +145,7 @@ pub enum WalRangeRecords<T> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WalRangeRead {
     records: Vec<FramedRecord>,
+    frame_digests: Vec<(u64, String)>,
     pub next_anchor: Option<WalByteAnchor>,
     pub lineage_id: Option<WalLineageId>,
     /// End of the verified source prefix, including trailing lineage frames, only
@@ -240,6 +241,7 @@ impl WalRangeRead {
     ) -> Self {
         Self {
             records,
+            frame_digests: Vec::new(),
             next_anchor: anchors.last().copied(),
             lineage_id,
             complete_byte_end: None,
@@ -254,6 +256,7 @@ impl WalRangeRead {
     pub fn without_anchors(records: Vec<FramedRecord>) -> Self {
         Self {
             records,
+            frame_digests: Vec::new(),
             next_anchor: None,
             lineage_id: None,
             complete_byte_end: None,
@@ -270,6 +273,36 @@ impl WalRangeRead {
             .binary_search_by_key(&seq, |anchor| anchor.seq)
             .ok()
             .map(|index| self.anchors[index])
+    }
+
+    /// A short verified frame identity, not a reserialization of its record.
+    /// Resume cursors use it to detect a restored log whose sequence numbers have been reused.
+    pub fn frame_digest_at(&self, seq: u64) -> Option<&str> {
+        self.frame_digests
+            .binary_search_by_key(&seq, |(seq, _)| *seq)
+            .ok()
+            .map(|index| self.frame_digests[index].1.as_str())
+    }
+
+    pub fn cursor_frame_identity_at(
+        &self,
+        seq: u64,
+    ) -> Option<crate::framing::CursorFrameIdentity> {
+        Some(crate::framing::CursorFrameIdentity {
+            seq,
+            digest: u64::from_str_radix(self.frame_digest_at(seq)?, 16).ok()?,
+        })
+    }
+
+    pub fn cursor_frame_identities(
+        &self,
+    ) -> impl Iterator<Item = crate::framing::CursorFrameIdentity> + '_ {
+        self.frame_digests.iter().filter_map(|(seq, digest)| {
+            Some(crate::framing::CursorFrameIdentity {
+                seq: *seq,
+                digest: u64::from_str_radix(digest, 16).ok()?,
+            })
+        })
     }
 }
 
@@ -533,6 +566,10 @@ fn closed_error() -> WalError {
 
 /// The append-only WAL log. The loop depends on the trait, not the impl.
 pub trait Wal {
+    /// Identity retained from the last successful append, not reread from the file.
+    fn last_cursor_frame_identity(&self) -> Option<crate::framing::CursorFrameIdentity> {
+        None
+    }
     /// Borrow the last synced prefix without allocating on the writer barrier.
     fn borrowed_publication(&self) -> Option<DurablePublicationRef<'_>> {
         None
@@ -1095,6 +1132,7 @@ pub struct FileWal {
     path: PathBuf,
     file: File,
     next_seq: u64,
+    last_cursor_frame_identity: Option<crate::framing::CursorFrameIdentity>,
     /// The file size this writer last left the file at (the byte offset after its last
     /// append; the file size at open). Before each append, the writer re-checks the
     /// file's actual size against this: if it changed, a FOREIGN writer touched the file
@@ -1658,6 +1696,7 @@ impl FileWal {
             path,
             file,
             next_seq,
+            last_cursor_frame_identity: None,
             last_write_end,
             synced_prefix: Cell::new(None),
             dir_needs_sync: Cell::new(true),
@@ -2031,6 +2070,7 @@ impl FileWal {
             self.fsync()?;
         }
         self.next_seq = seq + 1;
+        self.last_cursor_frame_identity = crate::framing::cursor_frame_identity(&record_bytes);
         self.writer_close_reserve = close_reserve;
         // Advance our high-water mark past the bytes we just wrote. Only OUR appends move
         // this, so "size unchanged since our last append" ⟺ no foreign write.
@@ -2043,6 +2083,9 @@ impl FileWal {
 }
 
 impl Wal for FileWal {
+    fn last_cursor_frame_identity(&self) -> Option<crate::framing::CursorFrameIdentity> {
+        self.last_cursor_frame_identity
+    }
     fn borrowed_publication(&self) -> Option<DurablePublicationRef<'_>> {
         let (seq, end) = self.synced_prefix.get()?;
         Some(DurablePublicationRef {
@@ -2858,6 +2901,7 @@ pub fn read_records_range(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(WalRangeRead {
                 records: Vec::new(),
+                frame_digests: Vec::new(),
                 next_anchor: None,
                 lineage_id: None,
                 file_present: Some(false),
@@ -3441,8 +3485,8 @@ fn decode_bytes_seeded(
 
 fn select_decoded_range(
     decoded: DecodedBytes,
-    _bytes: &[u8],
-    _absolute_start: u64,
+    bytes: &[u8],
+    absolute_start: u64,
     file_id: Option<u64>,
     after_seq: u64,
     through_seq: Option<u64>,
@@ -3457,6 +3501,27 @@ fn select_decoded_range(
         decoded.lineage_id,
     );
     range.run_incompatible = decoded.run_incompatible;
+    // Only visit the prefix the decoder verified. Reading header bytes keeps unknown record
+    // members and historical serializer choices in the identity without decoding them again.
+    let mut offset = 0;
+    let valid_len = (complete_end - absolute_start) as usize;
+    while offset < valid_len {
+        let frame = &bytes[offset..valid_len];
+        let header_len = if frame[4] == crate::framing::V4_FRAMING_VERSION {
+            crate::framing::v4_header_len(frame).expect("verified v4 header")
+        } else {
+            crate::framing::HEADER_LEN
+        };
+        let seq = u64::from_le_bytes(frame[5..13].try_into().unwrap());
+        if seq > after_seq && through_seq.is_none_or(|head| seq <= head) {
+            let digest = crate::framing::cursor_frame_identity(frame)
+                .expect("verified record frame has an identity")
+                .digest_hex();
+            range.frame_digests.push((seq, digest));
+        }
+        let payload_len = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
+        offset += header_len + payload_len;
+    }
     if source_head.is_some() && range.next_anchor.map(|a| a.seq) == source_head {
         range.complete_byte_end = Some(complete_end);
     }
@@ -7025,5 +7090,58 @@ mod legacy_owned_io_tests {
         );
         assert_eq!(std::fs::read(path).unwrap(), before);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cursor_frame_identity_tests {
+    #[test]
+    fn cursor_digest_uses_verified_headers_including_unmodeled_record_members() {
+        let bytes = crate::framing::encode_payload(
+            1,
+            7,
+            br#"{"type":"turn_finished","step_id":1,"future":"unchanged"}"#,
+        )
+        .unwrap();
+        let range = super::read_verified_member_range(&bytes, 1, 0, None).unwrap();
+        assert_eq!(range.frame_digest_at(1), Some("f227e9bfae92038f"));
+        assert_eq!(range.frame_digest_at(2), None);
+        let bytes = crate::framing::encode_v4(
+            broca_wal_reader::frame::Metadata {
+                seq: 1,
+                fence: 7,
+                appended_ms: 9,
+                writer_id: [1; 16],
+            },
+            &[crate::framing::FRAME_STAMPS_FEATURE],
+            &crate::WalRecord::TurnFinished {
+                step_id: broca_protocol::StepId(1),
+            },
+        )
+        .unwrap();
+        let range = super::read_verified_member_range(&bytes, 1, 0, None).unwrap();
+        assert_eq!(range.frame_digest_at(1), Some("fe24d8e27491d1a2"));
+        let replacement = crate::framing::encode_v4(
+            broca_wal_reader::frame::Metadata {
+                seq: 1,
+                fence: 7,
+                appended_ms: 9,
+                writer_id: [2; 16],
+            },
+            &[crate::framing::FRAME_STAMPS_FEATURE],
+            &crate::WalRecord::TurnFinished {
+                step_id: broca_protocol::StepId(1),
+            },
+        )
+        .unwrap();
+        let header_len = crate::framing::v4_header_len(&bytes).unwrap();
+        assert_eq!(
+            &bytes[header_len - 36..header_len - 4],
+            &replacement[header_len - 36..header_len - 4],
+            "equal payloads still have equal payload hashes"
+        );
+        let restored = super::read_verified_member_range(&replacement, 1, 0, None).unwrap();
+        assert_eq!(restored.frame_digest_at(1), Some("71325568f7617e7f"));
+        assert_ne!(range.frame_digest_at(1), restored.frame_digest_at(1));
     }
 }

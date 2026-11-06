@@ -49,16 +49,76 @@ pub type ControlEvent = (
     cortexkit_role_llm_runner::live::LiveEvent,
 );
 
+fn placed_events_with_identities(
+    records: &[broca_wal::FramedRecord],
+    state: &mut ControlProjectionState,
+    send_keys: &mut broca_core::notice_keys::NoticeSendKeys,
+    identities: &[broca_wal::framing::CursorFrameIdentity],
+) -> Result<Vec<broca_core::projection::PlacedControlUnit>, String> {
+    send_keys.observe(records);
+    let mut frames = broca_core::project_control_with_mids(records, state)?;
+    if let Some(lineage) = state.wal_lineage_id() {
+        for frame in &mut frames {
+            if let Ok(at) =
+                identities.binary_search_by_key(&frame.cursor.wal_seq, |identity| identity.seq)
+            {
+                frame.cursor = frame.cursor.with_frame_identity(lineage, identities[at]);
+            }
+        }
+    }
+    Ok(frames)
+}
+
+fn visible_control_events(
+    frames: Vec<broca_core::projection::PlacedControlUnit>,
+    send_keys: &broca_core::notice_keys::NoticeSendKeys,
+) -> Result<Vec<ControlEvent>, String> {
+    let mut events = Vec::new();
+    for frame in frames {
+        let visible = match &frame.event {
+            cortexkit_role_llm_runner::live::LiveEvent::NoticeDelivered(notice) => frame
+                .notice_submission_id
+                .as_deref()
+                .ok_or_else(|| {
+                    "notice_send_keys_unavailable: notice has no submission identity".to_owned()
+                })
+                .and_then(|submission| {
+                    send_keys.allows(submission, &notice.sender, &notice.send_id)
+                })?,
+            _ => true,
+        };
+        if visible {
+            events.push((frame.cursor, frame.unit, frame.event));
+        }
+    }
+    Ok(events)
+}
+
+fn project_events_with_identities(
+    records: &[broca_wal::FramedRecord],
+    state: &mut ControlProjectionState,
+    send_keys: &mut broca_core::notice_keys::NoticeSendKeys,
+    identities: &[broca_wal::framing::CursorFrameIdentity],
+) -> Result<Vec<ControlEvent>, String> {
+    let frames = placed_events_with_identities(records, state, send_keys, identities)?;
+    visible_control_events(frames, send_keys)
+}
+
+#[cfg(test)]
+fn project_events_with_keys(
+    records: &[broca_wal::FramedRecord],
+    state: &mut ControlProjectionState,
+    send_keys: &mut broca_core::notice_keys::NoticeSendKeys,
+) -> Result<Vec<ControlEvent>, String> {
+    project_events_with_identities(records, state, send_keys, &[])
+}
+
+#[cfg(test)]
 fn project_events(
     records: &[broca_wal::FramedRecord],
     state: &mut ControlProjectionState,
 ) -> Result<Vec<ControlEvent>, String> {
-    broca_core::project_control_with_mids(records, state).map(|frames| {
-        frames
-            .into_iter()
-            .map(|frame| (frame.cursor, frame.unit, frame.event))
-            .collect()
-    })
+    project_events_with_keys(records, state, &mut Default::default())
 }
 
 #[cfg(test)]
@@ -86,6 +146,7 @@ fn project_control(records: &[broca_wal::FramedRecord]) -> Vec<ControlEvent> {
 /// Display lag is signalled in-band by a `DisplayGap` event, not a detach.
 #[derive(Debug, Clone)]
 pub enum Delivery {
+    CursorExpired,
     Expired {
         expired_at_ms: u64,
     },
@@ -106,6 +167,43 @@ pub enum FromCursor {
     /// position — at-least-once from here; re-delivery of `<= After` is the client's to
     /// ignore).
     After(Cursor),
+    Resume {
+        cursor: Cursor,
+        proof: ResumeCursorProof,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResumeCursorProof {
+    incarnation: [u8; 32],
+    digest: u64,
+}
+
+impl ResumeCursorProof {
+    pub fn new(incarnation: &str, digest: &str) -> Option<Self> {
+        use sha2::{Digest, Sha256};
+        if incarnation.is_empty()
+            || digest.len() != 16
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(Self {
+            incarnation: Sha256::digest(incarnation.as_bytes()).into(),
+            digest: u64::from_str_radix(digest, 16).ok()?,
+        })
+    }
+
+    fn matches(self, cursor: Cursor) -> bool {
+        use sha2::{Digest, Sha256};
+        let Some((lineage, identity)) = cursor.frame_identity() else {
+            return false;
+        };
+        let incarnation: [u8; 32] = Sha256::digest(lineage.to_string().as_bytes()).into();
+        incarnation == self.incarnation
+            && identity.seq == cursor.wal_seq
+            && identity.digest == self.digest
+    }
 }
 
 impl FromCursor {
@@ -113,7 +211,14 @@ impl FromCursor {
     fn includes(&self, cursor: Cursor) -> bool {
         match self {
             FromCursor::Start => true,
-            FromCursor::After(c) => cursor > *c,
+            FromCursor::After(c) | FromCursor::Resume { cursor: c, .. } => cursor > *c,
+        }
+    }
+
+    fn position(self) -> Option<Cursor> {
+        match self {
+            Self::Start => None,
+            Self::After(cursor) | Self::Resume { cursor, .. } => Some(cursor),
         }
     }
 }
@@ -128,6 +233,9 @@ pub(crate) enum AttachFrom {
 struct AttachReplay {
     /// Projection state after the whole prefix, handed to the live projector.
     state: ControlProjectionState,
+    /// Projection state alone has no old client keys; held replay records provide that evidence.
+    send_keys: broca_core::notice_keys::NoticeSendKeys,
+    cursor_valid: bool,
     /// The last sequence number in the prefix.
     seeded_h: u64,
     /// The resolved attach point; `Live` becomes "after the prefix's last cursor".
@@ -147,6 +255,7 @@ struct AttachReplay {
 /// session does not clone every message and tool payload of its history. A unit's cursor
 /// carries its record's sequence number, so every record before the cursor's record yields
 /// only units at or before the cursor.
+#[cfg(test)]
 fn replay_for_attach(
     records: Vec<broca_wal::FramedRecord>,
     h: u64,
@@ -160,21 +269,61 @@ fn replay_for_attach(
     project_attach(&durable_prefix, state, from)
 }
 
+fn replay_for_attach_range(
+    range: broca_wal::WalRangeRead,
+    h: u64,
+    from: AttachFrom,
+) -> Result<AttachReplay, String> {
+    let lineage = range.lineage_id;
+    let identities: Vec<_> = range.cursor_frame_identities().collect();
+    let records = match range.into_records() {
+        broca_wal::WalRangeRecords::Complete(records)
+        | broca_wal::WalRangeRecords::Unknown(records) => records,
+        broca_wal::WalRangeRecords::Absent => Vec::new(),
+        broca_wal::WalRangeRecords::Partial(_) => {
+            return Err("subscribe catch-up has incomplete WAL coverage".into())
+        }
+    };
+    let records: Vec<_> = records
+        .into_iter()
+        .filter(|record| record.seq <= h)
+        .collect();
+    let mut state = ControlProjectionState::default();
+    state.set_wal_lineage_id(lineage);
+    project_attach_with_identities(&records, state, from, &identities)
+}
+
 /// Project a durable prefix for one attach, starting from `state`.
-///
-/// `durable_prefix` ends at the barrier head. `state` must be the projection state just before
-/// its first record: the default for a prefix starting at the log's first record, or
-/// [`ControlProjectionState::at_episode_start`] for one starting at an episode's `RunStarted`.
+/// `state` describes the prefix immediately before the records supplied here.
+#[cfg(test)]
 fn project_attach(
+    durable_prefix: &[broca_wal::FramedRecord],
+    state: ControlProjectionState,
+    from: AttachFrom,
+) -> Result<AttachReplay, String> {
+    project_attach_with_identities(durable_prefix, state, from, &[])
+}
+
+fn project_attach_with_identities(
+    durable_prefix: &[broca_wal::FramedRecord],
+    state: ControlProjectionState,
+    from: AttachFrom,
+    identities: &[broca_wal::framing::CursorFrameIdentity],
+) -> Result<AttachReplay, String> {
+    project_attach_with_index(durable_prefix, state, from, identities, None)
+}
+
+fn project_attach_with_index(
     durable_prefix: &[broca_wal::FramedRecord],
     mut state: ControlProjectionState,
     from: AttachFrom,
+    identities: &[broca_wal::framing::CursorFrameIdentity],
+    index: Option<&broca_core::notice_keys::NoticeSendKeys>,
 ) -> Result<AttachReplay, String> {
     let seeded_h = durable_prefix.last().map_or(0, |record| record.seq);
+    let mut send_keys = index.cloned().unwrap_or_default();
+    send_keys.observe(durable_prefix);
     Ok(match from {
-        // Live uses the existing strictly-after comparison once the barrier has projected H.
-        // An empty lineage has no cursor to resume after, but Start is equivalent because its
-        // replay is empty.
         AttachFrom::Live => {
             let last = advance_control_projection_state(durable_prefix, &mut state);
             if let Some(error) = state.placement_error() {
@@ -182,6 +331,8 @@ fn project_attach(
             }
             AttachReplay {
                 state,
+                send_keys,
+                cursor_valid: true,
                 seeded_h,
                 from: last.map_or(FromCursor::Start, FromCursor::After),
                 units: Vec::new(),
@@ -189,17 +340,29 @@ fn project_attach(
             }
         }
         AttachFrom::Cursor(from) => {
-            let skipped = match from {
-                FromCursor::Start => 0,
-                FromCursor::After(cursor) => {
-                    durable_prefix.partition_point(|framed| framed.seq < cursor.wal_seq)
-                }
-            };
+            let skipped = from.position().map_or(0, |cursor| {
+                durable_prefix.partition_point(|framed| framed.seq < cursor.wal_seq)
+            });
             advance_control_projection_state(&durable_prefix[..skipped], &mut state);
-            let projected = project_events(&durable_prefix[skipped..], &mut state)?;
+            let placed = placed_events_with_identities(
+                &durable_prefix[skipped..],
+                &mut state,
+                &mut send_keys,
+                identities,
+            )?;
+            // Validate against all units of the cursor's frame before filtering notice visibility.
+            let cursor_valid = match from {
+                FromCursor::Resume { cursor, proof } => placed
+                    .iter()
+                    .any(|frame| frame.cursor == cursor && proof.matches(frame.cursor)),
+                _ => true,
+            };
+            let projected = visible_control_events(placed, &send_keys)?;
             let built = projected.len();
             AttachReplay {
                 state,
+                send_keys,
+                cursor_valid,
                 seeded_h,
                 from,
                 units: projected
@@ -222,21 +385,117 @@ pub(crate) struct AttachEpisodeStart {
     pub seed: Option<broca_core::projection::EpisodeSeed>,
 }
 
-/// Replay an attach from the episode holding its attach point instead of the whole log.
-///
-/// Only the frames from the episode's seed boundary to the barrier head are decoded (through
-/// `read_at`, counting each when `decode_counter` is given), where `durable_end` is the byte
-/// offset just past the barrier head's frame. The fold that rebuilds projection state before
-/// the attach point covers that one episode from its `RunStarted`, which resets every
-/// episode-local field; placement carries only the episode's first ordinal across episodes. The
-/// ordinal and the episode start are validated against the log by
-/// [`broca_core::projection::replay_from_episode_start`] before they are used.
-///
-/// An attach from the lineage start, or without an episode start, decodes from the log's first
-/// record: everything it decodes is delivered. Any failed check, an unreadable range, or a
-/// projection error falls back to `complete_read` and a full replay, so the delivered units and
-/// the state handed to the live projector are the same either way; the second value names the
-/// fallback reason, `None` when the attach was served by episode.
+fn contains_notice(records: &[broca_wal::FramedRecord]) -> bool {
+    records.iter().any(|frame| {
+        matches!(
+            &frame.record,
+            broca_wal::WalRecord::SendDelivered {
+                mode: broca_protocol::DeliveryMode::ToolResult,
+                appended_text: Some(text), ..
+            } if text.starts_with("\n\n")
+        )
+    })
+}
+
+// A decoded full prefix already proves send-key uniqueness. A suffix needs the
+// historical lookup only if it contains a notice. The indexed episode read and
+// its full-WAL fallback share one cached lookup.
+struct ReplayNoticeIndex<'a> {
+    result: Result<Option<broca_core::notice_keys::NoticeSendKeys>, String>,
+    load: Option<&'a mut dyn FnMut() -> Result<broca_core::notice_keys::NoticeSendKeys, String>>,
+}
+
+impl<'a> ReplayNoticeIndex<'a> {
+    #[cfg(test)]
+    fn with_keys(keys: Option<&broca_core::notice_keys::NoticeSendKeys>) -> Self {
+        Self {
+            result: Ok(keys.cloned()),
+            load: None,
+        }
+    }
+
+    fn lazy(
+        load: &'a mut dyn FnMut() -> Result<broca_core::notice_keys::NoticeSendKeys, String>,
+    ) -> Self {
+        Self {
+            result: Ok(None),
+            load: Some(load),
+        }
+    }
+
+    fn for_records(
+        &mut self,
+        records: &[broca_wal::FramedRecord],
+    ) -> Result<Option<&broca_core::notice_keys::NoticeSendKeys>, String> {
+        if self.result.as_ref().is_ok_and(Option::is_none)
+            && records.first().is_some_and(|record| record.seq > 1)
+            && contains_notice(records)
+        {
+            if let Some(load) = self.load.take() {
+                self.result = load().map(Some);
+            }
+        }
+        self.result
+            .as_ref()
+            .map(Option::as_ref)
+            .map_err(Clone::clone)
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The indexed path and fallback share one attach barrier and read accounting."
+)]
+fn replay_for_attach_by_episode_with_identities(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    durable_end: u64,
+    h: u64,
+    from: AttachFrom,
+    start: Option<&AttachEpisodeStart>,
+    decode_counter: Option<&std::cell::Cell<u64>>,
+    index: &mut ReplayNoticeIndex<'_>,
+    complete_read: impl FnOnce() -> Result<
+        (
+            Vec<broca_wal::FramedRecord>,
+            Vec<broca_wal::framing::CursorFrameIdentity>,
+        ),
+        String,
+    >,
+) -> Result<(AttachReplay, Option<&'static str>), String> {
+    match broca_wal::access_counter::fallback_result(
+        || attach_by_episode(read_at, durable_end, h, from, start, decode_counter, index),
+        |reason| *reason,
+    ) {
+        Ok(replay) => Ok((replay, None)),
+        Err(reason) => {
+            if let Err(error) = &index.result {
+                return Err(error.clone());
+            }
+            let lineage = broca_core::projection::log_header_info(read_at)
+                .ok()
+                .and_then(|(_, lineage)| lineage);
+            let (records, identities) = complete_read()?;
+            let records: Vec<_> = records
+                .into_iter()
+                .filter(|record| record.seq <= h)
+                .collect();
+            let mut state = ControlProjectionState::default();
+            state.set_wal_lineage_id(lineage);
+            Ok((
+                project_attach_with_index(
+                    &records,
+                    state,
+                    from,
+                    &identities,
+                    index.for_records(&records)?,
+                )?,
+                Some(reason),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
 fn replay_for_attach_by_episode(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     durable_end: u64,
@@ -246,21 +505,16 @@ fn replay_for_attach_by_episode(
     decode_counter: Option<&std::cell::Cell<u64>>,
     complete_read: impl FnOnce() -> Result<Vec<broca_wal::FramedRecord>, String>,
 ) -> Result<(AttachReplay, Option<&'static str>), String> {
-    match broca_wal::access_counter::fallback_result(
-        || attach_by_episode(read_at, durable_end, h, from, start, decode_counter),
-        |reason| *reason,
-    ) {
-        Ok(replay) => Ok((replay, None)),
-        Err(reason) => {
-            let lineage = broca_core::projection::log_header_info(read_at)
-                .ok()
-                .and_then(|(_, lineage)| lineage);
-            Ok((
-                replay_for_attach(complete_read()?, h, from, lineage)?,
-                Some(reason),
-            ))
-        }
-    }
+    replay_for_attach_by_episode_with_identities(
+        read_at,
+        durable_end,
+        h,
+        from,
+        start,
+        decode_counter,
+        &mut ReplayNoticeIndex::with_keys(None),
+        || complete_read().map(|records| (records, Vec::new())),
+    )
 }
 
 fn attach_by_episode(
@@ -270,6 +524,7 @@ fn attach_by_episode(
     from: AttachFrom,
     start: Option<&AttachEpisodeStart>,
     decode_counter: Option<&std::cell::Cell<u64>>,
+    index: &mut ReplayNoticeIndex<'_>,
 ) -> Result<AttachReplay, &'static str> {
     let (records_start, lineage) =
         broca_core::projection::log_header_info(read_at).map_err(|_| "log unreadable")?;
@@ -280,13 +535,15 @@ fn attach_by_episode(
     let frames_from = start
         .and_then(|start| start.seed.as_ref())
         .map_or(records_start, |seed| seed.boundary.frame_end);
-    let frames = broca_core::projection::decode_positioned_frames(
+    let decoded = broca_core::projection::decode_positioned_frames_with_identities(
         read_at,
         frames_from,
         durable_end,
         decode_counter,
     )
     .map_err(|_| "attach frames unreadable")?;
+    let identities = decoded.identities;
+    let frames = decoded.frames;
     if frames
         .windows(2)
         .any(|pair| pair[0].framed.seq + 1 != pair[1].framed.seq)
@@ -311,7 +568,16 @@ fn attach_by_episode(
             .collect();
         let mut state = ControlProjectionState::default();
         state.set_wal_lineage_id(lineage);
-        return project_attach(&prefix, state, from).map_err(|_| "attach projection refused");
+        return project_attach_with_index(
+            &prefix,
+            state,
+            from,
+            &identities,
+            index
+                .for_records(&prefix)
+                .map_err(|_| "notice send-key lookup refused")?,
+        )
+        .map_err(|_| "attach projection refused");
     };
     let run_started = broca_core::projection::episode_start_index(&start.episode, &frames)
         .ok_or("episode start not in the frames read")?;
@@ -326,7 +592,9 @@ fn attach_by_episode(
     .map_err(|fallback| fallback.reason)?;
     let episode_seq = frames[run_started].framed.seq;
     match from {
-        AttachFrom::Cursor(FromCursor::After(cursor)) if cursor.wal_seq < episode_seq => {
+        AttachFrom::Cursor(FromCursor::After(cursor) | FromCursor::Resume { cursor, .. })
+            if cursor.wal_seq < episode_seq =>
+        {
             return Err("attach point precedes the episode");
         }
         AttachFrom::Live if h < episode_seq => return Err("barrier head precedes the episode"),
@@ -340,16 +608,37 @@ fn attach_by_episode(
         .collect();
     let mut state = ControlProjectionState::at_episode_start(start.episode.first_ord);
     state.set_wal_lineage_id(lineage);
-    project_attach(&prefix, state, from).map_err(|_| "attach projection refused")
+    project_attach_with_index(
+        &prefix,
+        state,
+        from,
+        &identities,
+        index
+            .for_records(&prefix)
+            .map_err(|_| "notice send-key lookup refused")?,
+    )
+    .map_err(|_| "attach projection refused")
 }
 
+#[cfg(test)]
 fn replay_for_database_attach(
     reader: &broca_store::db::DatabaseEpisodeReader,
     from: AttachFrom,
+    index: Option<&broca_core::notice_keys::NoticeSendKeys>,
+) -> Result<AttachReplay, String> {
+    replay_for_database_attach_with_lookup(reader, from, &mut ReplayNoticeIndex::with_keys(index))
+}
+
+fn replay_for_database_attach_with_lookup(
+    reader: &broca_store::db::DatabaseEpisodeReader,
+    from: AttachFrom,
+    index: &mut ReplayNoticeIndex<'_>,
 ) -> Result<AttachReplay, String> {
     let h = reader.sequence();
     let at = match from {
-        AttachFrom::Cursor(FromCursor::After(cursor)) => cursor.wal_seq,
+        AttachFrom::Cursor(FromCursor::After(cursor) | FromCursor::Resume { cursor, .. }) => {
+            cursor.wal_seq
+        }
         _ => h,
     };
     let start = match broca_wal::access_counter::fallback_result(
@@ -361,22 +650,53 @@ fn replay_for_database_attach(
     ) {
         Ok(start) => start.map(|(episode, seed)| AttachEpisodeStart { episode, seed }),
         Err(_) => {
-            let records = reader.complete_read().map_err(|e| e.to_string())?;
+            let decoded = reader
+                .complete_read_with_identities()
+                .map_err(|e| e.to_string())?;
             let lineage =
                 broca_core::projection::log_header_info(&|off, len| reader.read_at(off, len))
                     .map_err(|e| e.to_string())?
                     .1;
-            return replay_for_attach(records, h, from, lineage);
+            let records: Vec<_> = decoded
+                .frames
+                .into_iter()
+                .map(|positioned| positioned.framed)
+                .filter(|record| record.seq <= h)
+                .collect();
+            let mut state = ControlProjectionState::default();
+            state.set_wal_lineage_id(lineage);
+            return project_attach_with_index(
+                &records,
+                state,
+                from,
+                &decoded.identities,
+                index.for_records(&records)?,
+            );
         }
     };
-    let (replay, _) = replay_for_attach_by_episode(
+    let (replay, _) = replay_for_attach_by_episode_with_identities(
         &|off, len| reader.read_at(off, len),
         reader.byte_end(),
         h,
         from,
         start.as_ref(),
         None,
-        || reader.complete_read().map_err(|e| e.to_string()),
+        index,
+        || {
+            reader
+                .complete_read_with_identities()
+                .map(|decoded| {
+                    (
+                        decoded
+                            .frames
+                            .into_iter()
+                            .map(|positioned| positioned.framed)
+                            .collect(),
+                        decoded.identities,
+                    )
+                })
+                .map_err(|e| e.to_string())
+        },
     )?;
     Ok(replay)
 }
@@ -517,8 +837,11 @@ struct SubscriberTask {
 }
 
 struct ProjectionSeed {
+    materialized_store: Option<Arc<dyn SessionStore>>,
     head: u64,
     state: ControlProjectionState,
+    /// Projection state alone has no old client keys; held replay records provide that evidence.
+    send_keys: broca_core::notice_keys::NoticeSendKeys,
     /// True only for the attach that changed the observer gate from empty to live.
     gate_reopen: bool,
     /// Identifies the 0 -> 1 gate transition that produced this seed.
@@ -687,6 +1010,13 @@ impl<W: WalStore + 'static> Fanout<W> {
         let (projection_seed, seed_rx) = mpsc::unbounded_channel();
         let gate = SubscriberGate::new();
         let projector_cancel = CancellationToken::new();
+        let notice_lookup: LiveNoticeIndexLookup = Arc::new({
+            let wal = wal_store.clone();
+            let session = session.clone();
+            move |store, lineage, head| {
+                durable_notice_index(wal.as_ref(), store.as_deref(), &session, lineage, head)
+            }
+        });
         let projector = tokio::spawn(projector_loop(
             obs_rx,
             seed_rx,
@@ -695,6 +1025,7 @@ impl<W: WalStore + 'static> Fanout<W> {
             gate.reseed_pending(),
             gate.tenure(),
             projector_cancel.clone(),
+            Some(notice_lookup),
         ));
         let tapped = approvals.clone();
         let observe = move |seq, fence, lineage, record: &broca_wal::WalRecord| {
@@ -937,12 +1268,49 @@ impl<W: WalStore + 'static> Fanout<W> {
 /// Both bounded observer lag and the zero-subscriber optimization use this single reset path.
 fn reset_projection_handshake(
     projection_state: &mut ControlProjectionState,
+    send_keys: &mut broca_core::notice_keys::NoticeSendKeys,
     seeded: &mut bool,
     buffered: &mut Vec<broca_core::ObservedRecord>,
 ) {
     *projection_state = ControlProjectionState::default();
+    *send_keys = Default::default();
     *seeded = false;
     buffered.clear();
+}
+
+type LiveNoticeIndexLookup = Arc<
+    dyn Fn(
+            Option<Arc<dyn SessionStore>>,
+            broca_wal::WalLineageId,
+            u64,
+        ) -> Result<broca_core::notice_keys::NoticeSendKeys, String>
+        + Send
+        + Sync,
+>;
+
+async fn prepare_live_notice_index(
+    keys: &mut broca_core::notice_keys::NoticeSendKeys,
+    record: &broca_core::ObservedRecord,
+    store: &Option<Arc<dyn SessionStore>>,
+    lookup: &Option<LiveNoticeIndexLookup>,
+) -> Result<(), String> {
+    if !keys.is_complete() && contains_notice(std::slice::from_ref(&**record)) {
+        let lookup = lookup
+            .clone()
+            .ok_or("notice_send_keys_unavailable: live lookup missing")?;
+        let lineage = record
+            .lineage_id()
+            .ok_or("notice_send_keys_unavailable: live lineage missing")?;
+        let head = record.seq;
+        let store = store.clone();
+        *keys = spawn_blocking(
+            JobKind::WalRead,
+            broca_wal::access_counter::inherit(move || lookup(store, lineage, head)),
+        )
+        .await
+        .map_err(|error| format!("notice_send_keys_unavailable: {error}"))??;
+    }
+    Ok(())
 }
 
 /// Drains the writer's record observer, projects each record, and broadcasts the units.
@@ -959,6 +1327,7 @@ fn reset_projection_handshake(
 /// writer-to-projector queue and subscriber ring are bounded broadcast channels whose sends are
 /// synchronous and non-blocking. Lag detaches subscribers, which recover through WAL replay;
 /// backpressure must never reach the fsync writer.
+#[allow(clippy::too_many_arguments)]
 async fn projector_loop(
     mut obs_rx: broadcast::Receiver<broca_core::ObservedRecord>,
     mut seed_rx: mpsc::UnboundedReceiver<ProjectionSeedMessage>,
@@ -967,8 +1336,11 @@ async fn projector_loop(
     reseed_pending: Arc<AtomicBool>,
     gate_tenure: Arc<AtomicU64>,
     cancel: CancellationToken,
+    notice_lookup: Option<LiveNoticeIndexLookup>,
 ) {
     let mut projection_state = broca_core::ControlProjectionState::default();
+    let mut send_keys = broca_core::notice_keys::NoticeSendKeys::default();
+    let mut notice_store = None;
     let mut seeded = false;
     let mut gate_seed_required: Option<u64> = None;
     let mut deferred_gate_seed: Option<ProjectionSeed> = None;
@@ -982,6 +1354,7 @@ async fn projector_loop(
                 if reseed_pending.swap(false, Ordering::AcqRel) {
                     reset_projection_handshake(
                         &mut projection_state,
+                        &mut send_keys,
                         &mut seeded,
                         &mut buffered,
                     );
@@ -1043,21 +1416,25 @@ async fn projector_loop(
                 // WAL prefix, so replacing state at exactly `covered_head` cannot discard a
                 // newer record. Buffered records are strictly newer and drain below.
                 projection_state = seed.state;
+                send_keys = seed.send_keys;
+                notice_store = seed.materialized_store;
                 seeded = true;
                 gate_seed_required = None;
                 deferred_gate_seed = None;
                 covered_head = covered_head.max(seed.head);
                 for framed in std::mem::take(&mut buffered).into_iter().filter(|record| record.seq > seed.head) {
                     projection_state.set_wal_lineage_id(framed.lineage_id());
-                    let events = match project_events(
+                    let events = match prepare_live_notice_index(&mut send_keys, &framed, &notice_store, &notice_lookup).await.and_then(|()| project_events_with_identities(
                         std::slice::from_ref(&*framed),
                         &mut projection_state,
-                    ) {
+                        &mut send_keys,
+                        &framed.frame_identity().into_iter().collect::<Vec<_>>(),
+                    )) {
                         Ok(events) => events,
                         Err(error) => {
                             tracing::error!(target: "fanout", %error, "durable control placement failed");
                             let _ = detach_ring.send(());
-                            reset_projection_handshake(&mut projection_state, &mut seeded, &mut buffered);
+                            reset_projection_handshake(&mut projection_state, &mut send_keys, &mut seeded, &mut buffered);
                             break;
                         }
                     };
@@ -1071,6 +1448,7 @@ async fn projector_loop(
                 if reseed_pending.swap(false, Ordering::AcqRel) {
                     reset_projection_handshake(
                         &mut projection_state,
+                        &mut send_keys,
                         &mut seeded,
                         &mut buffered,
                     );
@@ -1085,15 +1463,17 @@ async fn projector_loop(
                             continue;
                         }
                         projection_state.set_wal_lineage_id(framed.lineage_id());
-                        let events = match project_events(
+                        let events = match prepare_live_notice_index(&mut send_keys, &framed, &notice_store, &notice_lookup).await.and_then(|()| project_events_with_identities(
                             std::slice::from_ref(&*framed),
                             &mut projection_state,
-                        ) {
+                            &mut send_keys,
+                            &framed.frame_identity().into_iter().collect::<Vec<_>>(),
+                        )) {
                             Ok(events) => events,
                             Err(error) => {
                                 tracing::error!(target: "fanout", %error, "durable control placement failed");
                                 let _ = detach_ring.send(());
-                                reset_projection_handshake(&mut projection_state, &mut seeded, &mut buffered);
+                                reset_projection_handshake(&mut projection_state, &mut send_keys, &mut seeded, &mut buffered);
                                 continue;
                             }
                         };
@@ -1112,6 +1492,7 @@ async fn projector_loop(
                         let _ = detach_ring.send(());
                         reset_projection_handshake(
                             &mut projection_state,
+                            &mut send_keys,
                             &mut seeded,
                             &mut buffered,
                         );
@@ -1193,6 +1574,60 @@ async fn try_live_projection_seed<W: WalStore + 'static>(
     .flatten()
 }
 
+fn durable_notice_index<W: WalStore>(
+    wal: &W,
+    store: Option<&dyn SessionStore>,
+    session: &BindIdentity,
+    lineage: broca_wal::WalLineageId,
+    h: u64,
+) -> Result<broca_core::notice_keys::NoticeSendKeys, String> {
+    let lineage = lineage.to_string();
+    let cache = store
+        .map(|store| store.read_display_facts_cache(session, &lineage, h, &[]))
+        .transpose()?
+        .flatten()
+        .unwrap_or_default();
+    let expected = cache.seed.as_ref().map(|seed| seed.through_seq);
+    let mut seed = cache.seed.unwrap_or_default();
+    if seed.through_seq < h {
+        let range = wal
+            .read_records_range(
+                session,
+                seed.through_seq,
+                Some(h),
+                seed.anchor
+                    .map(|(file_id, seq, byte_end)| broca_wal::WalByteAnchor {
+                        file_id,
+                        seq,
+                        byte_end,
+                    })
+                    .as_ref(),
+            )
+            .map_err(|error| format!("notice_send_keys_unavailable: {error}"))?;
+        if range.lineage_id.map(|id| id.to_string()).as_deref() != Some(&lineage) {
+            return Err("notice_send_keys_unavailable: lineage changed".into());
+        }
+        let frames = crate::durable_read::DurableRead::classify(&range, seed.through_seq, Some(h))
+            .records()
+            .map_err(|error| format!("notice_send_keys_unavailable: {error}"))?;
+        let versions = seed.fold(frames, &lineage)?;
+        seed.anchor = range
+            .next_anchor
+            .map(|anchor| (anchor.file_id, anchor.seq, anchor.byte_end));
+        if let Some(store) = store {
+            store.publish_display_facts(
+                session,
+                &lineage,
+                expected,
+                cache.publication_epoch,
+                &seed,
+                &versions,
+            )?;
+        }
+    }
+    Ok(seed.send_keys)
+}
+
 /// One subscriber's task: the SLOW part of the attach barrier (off-actor), then ongoing
 /// live forwarding. Holds only the ring receiver + read-only store handles — NEVER the writer Arc
 /// (the no-writer-clone invariant).
@@ -1217,7 +1652,13 @@ async fn subscriber_task<W: WalStore + 'static>(
     let mut slot = Some(slot);
 
     let fast_live_state = if episode_source.is_none() && matches!(from, AttachFrom::Live) {
-        try_live_projection_seed(wal_store.clone(), session.clone(), materialized_store, h).await
+        try_live_projection_seed(
+            wal_store.clone(),
+            session.clone(),
+            materialized_store.clone(),
+            h,
+        )
+        .await
     } else {
         None
     };
@@ -1226,6 +1667,8 @@ async fn subscriber_task<W: WalStore + 'static>(
         // any sink operation; records appended after H are already buffered in the live receiver.
         if projection_seed
             .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
+                send_keys: Default::default(),
+                materialized_store: materialized_store.clone(),
                 head: h,
                 state,
                 gate_reopen,
@@ -1245,12 +1688,30 @@ async fn subscriber_task<W: WalStore + 'static>(
         // Advisory display replay is snapshotted separately after durable control replay.
         let indexed = if let Some(source) = episode_source {
             let session = session.clone();
+            let wal = wal_store.clone();
+            let store = materialized_store.clone();
             Some(
                 spawn_blocking(
                     JobKind::WalRead,
                     broca_wal::access_counter::inherit(move || {
                         source.with_reader(&session, Some(h), |reader| {
-                            replay_for_database_attach(&reader, from)
+                            // Without a materialized store, each notice-bearing suffix replay reads
+                            // the key prefix once; only the daemon's disabled overhaul state format
+                            // currently has no store.
+                            let mut load = || {
+                                durable_notice_index(
+                                    wal.as_ref(),
+                                    store.as_deref(),
+                                    &session,
+                                    reader.lineage_id(),
+                                    h,
+                                )
+                            };
+                            replay_for_database_attach_with_lookup(
+                                &reader,
+                                from,
+                                &mut ReplayNoticeIndex::lazy(&mut load),
+                            )
                         })
                     }),
                 )
@@ -1262,10 +1723,10 @@ async fn subscriber_task<W: WalStore + 'static>(
         let replay_result = if let Some(indexed) = indexed {
             indexed
         } else {
-            let (records, lineage) = match spawn_blocking(JobKind::WalRead, {
+            let range = match spawn_blocking(JobKind::WalRead, {
                 let wal_store = wal_store.clone();
                 let session = session.clone();
-                move || wal_store.read_records_with_lineage(&session)
+                move || wal_store.read_records_range(&session, 0, Some(h), None)
             })
             .await
             {
@@ -1298,12 +1759,14 @@ async fn subscriber_task<W: WalStore + 'static>(
             // Projection is CPU work proportional to the whole prefix, so it runs on the blocking
             // pool rather than on the runtime worker carrying other sessions' streams.
             spawn_blocking(JobKind::Projection, move || {
-                replay_for_attach(records, h, from, lineage)
+                replay_for_attach_range(range, h, from)
             })
             .await
         };
         let AttachReplay {
             state: replay_state,
+            send_keys,
+            cursor_valid,
             seeded_h,
             from,
             units: replay,
@@ -1335,10 +1798,19 @@ async fn subscriber_task<W: WalStore + 'static>(
                 return;
             }
         };
+        if !cursor_valid {
+            slot.as_mut()
+                .expect("subscriber slot remains owned during replay")
+                .report_gate_owner_failure();
+            let _ = deliver(&sink, &cancel, Delivery::CursorExpired).await;
+            return;
+        }
         // Hand the projector the exact state this replay produced. Send before awaiting the subscriber
         // sink so live projection cannot remain unseeded behind a slow replay consumer.
         if projection_seed
             .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
+                send_keys,
+                materialized_store: materialized_store.clone(),
                 head: seeded_h,
                 state: replay_state,
                 gate_reopen,
@@ -2878,6 +3350,7 @@ mod tests {
                 Delivery::Error(error) => panic!("replay failed: {error}"),
                 Delivery::Expired { .. } => panic!("forever subscriber expired"),
                 Delivery::Detached => panic!("subscriber B detached during replay"),
+                Delivery::CursorExpired => panic!("subscriber B cursor expired during replay"),
             }
         }
 
@@ -2913,6 +3386,7 @@ mod tests {
                 Delivery::Error(error) => panic!("live delivery failed: {error}"),
                 Delivery::Expired { .. } => panic!("forever subscriber expired"),
                 Delivery::Detached => panic!("subscriber B detached before terminal"),
+                Delivery::CursorExpired => panic!("subscriber B cursor expired before terminal"),
             }
         };
         assert_eq!(
@@ -2969,6 +3443,7 @@ mod tests {
             gate.reseed_pending(),
             gate.tenure(),
             cancel.clone(),
+            None,
         ));
 
         // The terminal arrives during the second tenure, before either replay completes. The
@@ -2976,6 +3451,8 @@ mod tests {
         observer_tx.send(framed(3, run_finished()).into()).unwrap();
         seed_tx
             .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
+                send_keys: Default::default(),
+                materialized_store: None,
                 head: 2,
                 state: ControlProjectionState::from_completed_steps_and_final_step_finish_reason(
                     1,
@@ -2989,6 +3466,8 @@ mod tests {
             .unwrap();
         seed_tx
             .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
+                send_keys: Default::default(),
+                materialized_store: None,
                 head: 2,
                 state: ControlProjectionState::from_completed_steps_and_final_step_finish_reason(
                     1,
@@ -3044,6 +3523,7 @@ mod tests {
             reseed_pending,
             Arc::new(AtomicU64::new(1)),
             cancel.clone(),
+            None,
         ));
 
         // RunFinished is newer than the attach barrier but reaches the observer before the
@@ -3056,6 +3536,8 @@ mod tests {
         ));
         seed_tx
             .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
+                send_keys: Default::default(),
+                materialized_store: None,
                 head: 2,
                 state: state_through(&prefix),
                 gate_reopen: true,
@@ -3136,6 +3618,7 @@ mod tests {
             gate.reseed_pending(),
             gate.tenure(),
             cancel.clone(),
+            None,
         ));
 
         // The later attach (H=3) finishes replay before the gate owner (H=2). Its seed must
@@ -3143,6 +3626,8 @@ mod tests {
         observer_tx.send(records[2].clone().into()).unwrap();
         seed_tx
             .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
+                send_keys: Default::default(),
+                materialized_store: None,
                 head: 3,
                 state: state_through(&records[..3]),
                 gate_reopen: later.gate_reopen,
@@ -3151,6 +3636,8 @@ mod tests {
             .unwrap();
         seed_tx
             .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
+                send_keys: Default::default(),
+                materialized_store: None,
                 head: 2,
                 state: state_through(&records[..2]),
                 gate_reopen: owner.gate_reopen,
@@ -3345,6 +3832,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(1)),
             cancel.clone(),
+            None,
         ));
         tokio::time::timeout(std::time::Duration::from_secs(1), detach_rx.recv())
             .await
@@ -3509,11 +3997,14 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(1)),
             cancel.clone(),
+            None,
         ));
 
         observer_tx.send(records[split].clone().into()).unwrap();
         seed_tx
             .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
+                send_keys: Default::default(),
+                materialized_store: None,
                 head: records[split - 1].seq,
                 state: replay_state,
                 gate_reopen: true,
@@ -3694,9 +4185,80 @@ mod episode_attach_tests {
     use sha2::Digest;
 
     use super::{
-        replay_for_attach, replay_for_attach_by_episode, AttachEpisodeStart, AttachFrom,
-        AttachReplay, FromCursor,
+        attach_by_episode, project_attach_with_identities, replay_for_attach,
+        replay_for_attach_by_episode, AttachEpisodeStart, AttachFrom, AttachReplay,
+        ControlProjectionState, FromCursor, ResumeCursorProof,
     };
+
+    #[test]
+    fn episode_seeded_unkeyed_notices_match_read_facts_and_refuse_missing_lookup() {
+        for collision in [false, true] {
+            let queued = |submission: &str, id: Option<&str>| {
+                serde_json::from_value(serde_json::json!({"type":"queued","submission_id":submission,"send_id":id,"sent_by":{"kind":"reserved","module_id":"sender"},"request":{"model":{"provider_module_id":"fake","model_id":"fake"},"input":[]}})).unwrap()
+            };
+            let mut records = vec![
+                queued("keyed", Some(if collision { "unkeyed" } else { "other" })),
+                run_started("old", vec![user("old")]),
+                run_finished(),
+                queued("unkeyed", None),
+            ];
+            let from = records.len();
+            records.push(run_started("current", vec![user("current")]));
+            records.extend(tool_step(1, "batch", &["call"]));
+            records.insert(records.len() - 1, serde_json::from_value(serde_json::json!({"type":"send_delivered","submission_id":"unkeyed","run_id":"current","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nnotice","ride":{"call_key":"frozen-key","send_id":"unkeyed","sender":"sender","forms":["tool_result"],"form":"append"}})).unwrap());
+            let frames: Vec<_> = records
+                .into_iter()
+                .enumerate()
+                .map(|(i, record)| FramedRecord {
+                    seq: i as u64 + 1,
+                    fence: 1,
+                    record,
+                })
+                .collect();
+            let mut keys = broca_core::notice_keys::NoticeSendKeys::default();
+            keys.observe(&frames);
+            let replay = super::project_attach_with_index(
+                &frames[from..],
+                ControlProjectionState::at_episode_start(1),
+                AttachFrom::Cursor(FromCursor::Start),
+                &[],
+                Some(&keys),
+            )
+            .unwrap();
+            let events: Vec<_> = replay
+                .units
+                .iter()
+                .filter_map(|(_, _, event)| match event {
+                    cortexkit_role_llm_runner::live::LiveEvent::NoticeDelivered(notice) => {
+                        Some(notice)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let facts = broca_core::projection::reader_notices(&frames, None).unwrap();
+            let facts: Vec<_> = facts.values().flatten().collect();
+            assert_eq!(events.len(), usize::from(!collision));
+            assert_eq!(facts.len(), events.len());
+            if let Some(event) = events.first() {
+                assert_eq!(event.send_id, facts[0].fact.send_id);
+                assert_eq!(event.text, facts[0].fact.text);
+                assert_eq!(event.call_key, facts[0].fact.call_key);
+            }
+            let error = super::project_attach_with_index(
+                &frames[from..],
+                ControlProjectionState::at_episode_start(1),
+                AttachFrom::Cursor(FromCursor::Start),
+                &[],
+                None,
+            )
+            .err()
+            .expect("a suffix cannot prove absence of a keyed collision");
+            assert!(
+                error.starts_with("notice_send_keys_unavailable:"),
+                "{error}"
+            );
+        }
+    }
 
     fn user(text: &str) -> Message {
         Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
@@ -4100,7 +4662,9 @@ mod episode_attach_tests {
             for from in points {
                 let point_seq = match from {
                     AttachFrom::Live => h,
-                    AttachFrom::Cursor(FromCursor::After(cursor)) => cursor.wal_seq,
+                    AttachFrom::Cursor(
+                        FromCursor::After(cursor) | FromCursor::Resume { cursor, .. },
+                    ) => cursor.wal_seq,
                     AttachFrom::Cursor(FromCursor::Start) => 1,
                 };
                 let start = start_for(log, &episodes, &boundaries, point_seq);
@@ -4190,6 +4754,105 @@ mod episode_attach_tests {
     }
 
     #[test]
+    fn cold_resume_cursor_verification_adds_no_reads_to_episode_catchup() {
+        use broca_wal::{FileWal, Wal};
+        let root = broca_test_support::scratch_root().join(format!(
+            "episode-cursor-cost-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.wal");
+        let records = corpus();
+        let mut wal = FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(root.join("wal-feature-floor.json"));
+        for record in &records {
+            wal.append(1, record, true).unwrap();
+        }
+        let lineage = wal.lineage_id().unwrap();
+        drop(wal);
+        let written = std::fs::read(&path).unwrap();
+        let first = broca_core::projection::first_record_offset(&reader(&written)).unwrap();
+        let (encoded, ranges) = encode(&records);
+        let mut bytes = written[..first as usize].to_vec();
+        bytes.extend(encoded);
+        let ranges: Vec<_> = ranges
+            .into_iter()
+            .map(|(off, end)| (off + first, end + first))
+            .collect();
+        let (episodes, mut boundaries) = index_log(&bytes, &ranges);
+        for boundary in &mut boundaries {
+            boundary.lineage_id = Some(lineage.to_string());
+        }
+        let verified = broca_core::projection::decode_positioned_frames_with_identities(
+            &reader(&bytes),
+            first,
+            bytes.len() as u64,
+            None,
+        )
+        .unwrap();
+        let frames: Vec<_> = verified
+            .frames
+            .into_iter()
+            .map(|frame| frame.framed)
+            .collect();
+        let mut state = ControlProjectionState::default();
+        state.set_wal_lineage_id(Some(lineage));
+        let full = project_attach_with_identities(
+            &frames,
+            state,
+            AttachFrom::Cursor(FromCursor::Start),
+            &verified.identities,
+        )
+        .unwrap();
+        let cursor = full.units[full.units.len() / 2].0;
+        let proof = ResumeCursorProof::new(
+            &lineage.to_string(),
+            &cursor.frame_identity().unwrap().1.digest_hex(),
+        )
+        .unwrap();
+        let start = start_for(&records, &episodes, &boundaries, cursor.wal_seq);
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read_at = |off, len| {
+            reads.borrow_mut().push((off, len));
+            reader(&bytes)(off, len)
+        };
+        let baseline = attach_by_episode(
+            &read_at,
+            bytes.len() as u64,
+            records.len() as u64,
+            AttachFrom::Cursor(FromCursor::After(cursor)),
+            start.as_ref(),
+            None,
+            &mut super::ReplayNoticeIndex::with_keys(None),
+        )
+        .unwrap();
+        let baseline_reads = reads.take();
+        let resumed = attach_by_episode(
+            &read_at,
+            bytes.len() as u64,
+            records.len() as u64,
+            AttachFrom::Cursor(FromCursor::Resume { cursor, proof }),
+            start.as_ref(),
+            None,
+            &mut super::ReplayNoticeIndex::with_keys(None),
+        )
+        .unwrap();
+        assert!(resumed.cursor_valid);
+        assert_eq!(resumed.units, baseline.units);
+        assert_eq!(
+            reads.take(),
+            baseline_reads,
+            "cursor verification must reuse catch-up frame reads"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn episode_attach_preserves_recorded_log_identity_for_call_keys() {
         use broca_wal::{FileWal, Wal};
         let root = broca_test_support::scratch_root().join(format!(
@@ -4234,10 +4897,10 @@ mod episode_attach_tests {
             unreachable!()
         };
         let call_id = tool_call_id.0.clone();
-        let from = AttachFrom::Cursor(FromCursor::After(broca_core::Cursor {
-            wal_seq: intent_seq - 1,
-            sub_index: u32::MAX,
-        }));
+        let from = AttachFrom::Cursor(FromCursor::After(broca_core::Cursor::new(
+            intent_seq - 1,
+            u32::MAX,
+        )));
         let h = frames.last().unwrap().seq;
         let (episodes, mut boundaries) = index_log(&bytes, &ranges);
         for boundary in &mut boundaries {
@@ -4361,7 +5024,8 @@ mod database_attach_tests {
                 .current_compaction_facts(_store.as_ref(), &bind)
                 .unwrap();
             let replay =
-                replay_for_database_attach(&reader, AttachFrom::Cursor(FromCursor::Start)).unwrap();
+                replay_for_database_attach(&reader, AttachFrom::Cursor(FromCursor::Start), None)
+                    .unwrap();
             assert!(replay.units.is_empty());
             assert_eq!(reader.sequence(), 0);
         }
@@ -4584,7 +5248,7 @@ mod database_attach_tests {
                 );
                 for from in froms {
                     let expected = replay_for_attach(frames.clone(), h, from, lineage).unwrap();
-                    let actual = replay_for_database_attach(&reader, from).unwrap();
+                    let actual = replay_for_database_attach(&reader, from, None).unwrap();
                     assert_eq!(actual.units, expected.units, "h={h},from={from:?}");
                     assert_eq!(actual.state, expected.state, "h={h},from={from:?}");
                     assert_eq!(actual.seeded_h, expected.seeded_h);
@@ -4646,7 +5310,7 @@ mod database_attach_tests {
             let counter = broca_wal::access_counter::WalAccessCounter::default();
             let actual = counter
                 .operation(corruption)
-                .run(|| replay_for_database_attach(&reader, from).unwrap());
+                .run(|| replay_for_database_attach(&reader, from, None).unwrap());
             let operation = counter.snapshot().remove(0);
             // An unsupported seed also reports an internal decoder failure. Attach
             // must expose only the database reader's final typed fallback reason.
@@ -4691,7 +5355,7 @@ mod database_attach_tests {
             let counter = broca_wal::access_counter::WalAccessCounter::default();
             counter
                 .operation("database live attach")
-                .run(|| replay_for_database_attach(&reader, AttachFrom::Live).unwrap());
+                .run(|| replay_for_database_attach(&reader, AttachFrom::Live, None).unwrap());
             let op = &counter.snapshot()[0];
             use broca_wal::access_counter::{ReadClass as C, ValidationRead as V};
             let bytes = std::fs::read(wal.durable_publication().unwrap().path()).unwrap();
@@ -4763,6 +5427,211 @@ mod database_attach_tests {
         }
         assert_eq!(measurements[0], measurements[1]);
         eprintln!("bounded attach reads/decodes/bytes: {measurements:?}");
+    }
+
+    fn notice_records() -> (Vec<WalRecord>, u64) {
+        let mut records = records(4);
+        let start = records
+            .iter()
+            .rposition(|record| matches!(record, WalRecord::RunStarted { .. }))
+            .unwrap();
+        let call = records[start..]
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::ToolBatchStarted { planned_calls, .. } => planned_calls.first(),
+                _ => None,
+            })
+            .unwrap()
+            .0
+            .clone();
+        let at = records
+            .iter()
+            .rposition(|record| matches!(record, WalRecord::ToolBatchFinished { .. }))
+            .unwrap()
+            + 1;
+        for index in (1..=2).rev() {
+            let send = format!("notice-{index}");
+            records.insert(at, serde_json::from_value(serde_json::json!({
+                "type": "send_delivered", "submission_id": send, "run_id": "attach-current",
+                "mode": "tool_result", "tool_call_id": call, "appended_text": "\n\nnotice",
+                "ride": {"call_key": "carrying-call", "send_id": send, "sender": "sender", "forms": ["tool_result"], "form": "append"}
+            })).unwrap());
+        }
+        (records, start as u64 + 1)
+    }
+
+    #[test]
+    fn database_notice_replay_with_a_warm_seed_keeps_the_indexed_read_budget() {
+        use broca_core::MaterializedStore;
+        let (records, start) = notice_records();
+        let root = root();
+        let WalRecord::RunStarted { session, .. } = &records[0] else {
+            unreachable!()
+        };
+        let bind = session.clone();
+        let (store, mut wal) = wal(&root, &bind);
+        for record in &records {
+            wal.append(1, record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        let reader = db
+            .episode_reader(bind.clone(), wal.durable_publication().unwrap())
+            .unwrap();
+        let frames = wal.replay().unwrap();
+        let lineage = reader.lineage_id().to_string();
+        let facts_root = root.with_extension("facts");
+        std::fs::create_dir_all(&facts_root).unwrap();
+        let facts = broca_store::SqliteStore::open(facts_root.join("facts.db")).unwrap();
+        let mut seed = broca_core::display_facts::DisplayFactsSeed::default();
+        let versions = seed.fold(&frames, &lineage).unwrap();
+        let cache = facts
+            .read_display_facts_cache(&bind, &lineage, reader.sequence(), &[])
+            .unwrap()
+            .unwrap();
+        facts
+            .publish_display_facts(
+                &bind,
+                &lineage,
+                None,
+                cache.publication_epoch,
+                &seed,
+                &versions,
+            )
+            .unwrap();
+        let from = AttachFrom::Cursor(FromCursor::After(Cursor::new(start, 0)));
+        let counter = broca_wal::access_counter::WalAccessCounter::default();
+        let expected = counter
+            .operation("ready notice keys")
+            .run(|| replay_for_database_attach(&reader, from, Some(&seed.send_keys)))
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let mut load = || {
+            calls.set(calls.get() + 1);
+            durable_notice_index(
+                store.as_ref(),
+                Some(&facts),
+                &bind,
+                reader.lineage_id(),
+                reader.sequence(),
+            )
+        };
+        let actual = counter
+            .operation("warm lazy notice keys")
+            .run(|| {
+                replay_for_database_attach_with_lookup(
+                    &reader,
+                    from,
+                    &mut ReplayNoticeIndex::lazy(&mut load),
+                )
+            })
+            .unwrap();
+        assert_eq!(actual.units, expected.units);
+        assert_eq!(
+            actual
+                .units
+                .iter()
+                .filter(|(_, _, event)| matches!(
+                    event,
+                    cortexkit_role_llm_runner::live::LiveEvent::NoticeDelivered(_)
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(calls.get(), 1);
+        let operations = counter.snapshot();
+        let accesses = |operation: &broca_wal::access_counter::OperationAccess| {
+            operation
+                .reads
+                .iter()
+                .map(|read| (read.offset, read.length, read.class))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(accesses(&operations[1]), accesses(&operations[0]));
+        assert_eq!(operations[1].frames_decoded, operations[0].frames_decoded);
+        assert!(operations[1]
+            .reads
+            .iter()
+            .all(|read| read.class != broca_wal::access_counter::ReadClass::Origin));
+        drop(wal);
+        drop(db);
+        drop(facts);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(facts_root).unwrap();
+    }
+
+    #[test]
+    fn database_notice_replay_without_a_store_reads_keys_once_per_replay() {
+        let (records, start) = notice_records();
+        let root = root();
+        let WalRecord::RunStarted { session, .. } = &records[0] else {
+            unreachable!()
+        };
+        let bind = session.clone();
+        let (store, mut wal) = wal(&root, &bind);
+        for record in &records {
+            wal.append(1, record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        let db = Arc::new(broca_store::db::OverhaulDb::open(&root).unwrap());
+        let reader = db
+            .episode_reader(bind.clone(), wal.durable_publication().unwrap())
+            .unwrap();
+        let from = AttachFrom::Cursor(FromCursor::After(Cursor::new(start, 0)));
+        for _ in 0..2 {
+            let calls = std::cell::Cell::new(0);
+            let mut load = || {
+                calls.set(calls.get() + 1);
+                durable_notice_index(
+                    store.as_ref(),
+                    None,
+                    &bind,
+                    reader.lineage_id(),
+                    reader.sequence(),
+                )
+            };
+            let counter = broca_wal::access_counter::WalAccessCounter::default();
+            let replay = counter
+                .operation("storeless notice keys")
+                .run(|| {
+                    replay_for_database_attach_with_lookup(
+                        &reader,
+                        from,
+                        &mut ReplayNoticeIndex::lazy(&mut load),
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                replay
+                    .units
+                    .iter()
+                    .filter(|(_, _, event)| matches!(
+                        event,
+                        cortexkit_role_llm_runner::live::LiveEvent::NoticeDelivered(_)
+                    ))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                calls.get(),
+                1,
+                "both notices share one lookup, scoped to this replay"
+            );
+            let operation = counter.snapshot().remove(0);
+            assert_eq!(
+                operation
+                    .reads
+                    .iter()
+                    .filter(|read| read.class == broca_wal::access_counter::ReadClass::Origin)
+                    .count(),
+                1,
+                "{operation:?}"
+            );
+            assert!(operation.seed_fallbacks.is_empty(), "{operation:?}");
+        }
+        drop(wal);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

@@ -35,6 +35,8 @@ use sha2::{Digest, Sha256};
 
 use crate::record::WalRecord;
 
+pub use broca_wal_reader::frame::{decode_header as decode_v4_header, Metadata as V4FrameMetadata};
+
 /// Fixed header bytes: len(4) + ver(1) + seq(8) + fence(8) + digest(32).
 pub const HEADER_LEN: usize = 4 + 1 + 8 + 8 + 32;
 const DIGEST_LEN: usize = 32;
@@ -49,6 +51,38 @@ pub struct FramedRecord {
     pub seq: u64,
     pub fence: u64,
     pub record: WalRecord,
+}
+
+/// Identity of one verified or newly encoded frame, without retaining its payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CursorFrameIdentity {
+    pub seq: u64,
+    pub digest: u64,
+}
+
+impl CursorFrameIdentity {
+    pub fn digest_hex(self) -> String {
+        format!("{:016x}", self.digest)
+    }
+}
+
+/// Extract identity only after verification or encoding. This does not verify a frame.
+pub fn cursor_frame_identity(bytes: &[u8]) -> Option<CursorFrameIdentity> {
+    let seq = u64::from_le_bytes(bytes.get(5..13)?.try_into().ok()?);
+    let digest = match *bytes.get(4)? {
+        V4_FRAMING_VERSION => {
+            // The payload hash can repeat after a restore; the header also binds writer tenure.
+            let len = v4_header_len(bytes)?;
+            let hash = Sha256::digest(bytes.get(..len)?);
+            u64::from_be_bytes(hash[..8].try_into().ok()?)
+        }
+        FRAMING_VERSION | GATED_FRAMING_VERSION => {
+            bytes.get(..HEADER_LEN)?;
+            u64::from_be_bytes(bytes.get(21..29)?.try_into().ok()?)
+        }
+        _ => return None,
+    };
+    Some(CursorFrameIdentity { seq, digest })
 }
 
 /// Opaque durable identity stored inside a WAL independently of its record sequence.
@@ -248,6 +282,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     REFUSAL_FALLBACK_FEATURE,
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
+    RIDES_V2_FEATURE,
     RUNNER_TAGS_FEATURE,
     RUNNER_TAGS_V2_FEATURE,
     RUN_CANCEL_AT_FEATURE,
@@ -513,6 +548,10 @@ pub const DEFERRED_CALL_FEATURE: &str = "deferred-call/v1";
 /// would start a run from a queued send that may never start one, deliver a send that was
 /// replaced or expired, or render a prompt without a send that was delivered into it.
 pub const DELIVERY_ORDER_FEATURE: &str = "delivery-order/v1";
+
+/// An individual ride freezes its sender, send identity, allowed forms and chosen renderer.
+/// Older readers must refuse it rather than replaying the historical append algorithm.
+pub const RIDES_V2_FEATURE: &str = "rides-v2/v1";
 
 /// Turn-scoped system entries must not be hoisted into legacy global instructions.
 pub const TURN_SYSTEM_FEATURE: &str = "turn-system/v1";
@@ -1690,6 +1729,7 @@ mod tests {
                 REFUSAL_FALLBACK_FEATURE,
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
+                RIDES_V2_FEATURE,
                 RUNNER_TAGS_FEATURE,
                 RUNNER_TAGS_V2_FEATURE,
                 RUN_CANCEL_AT_FEATURE,
@@ -3352,3 +3392,23 @@ mod vault_facts_tests;
 
 #[cfg(test)]
 mod turn_system_tests;
+
+#[cfg(test)]
+mod ride_reader_release_tests {
+    #[test]
+    fn new_ride_envelope_is_must_understand() {
+        let record: crate::WalRecord = serde_json::from_str(r#"{"type":"send_delivered","submission_id":"s","run_id":"r","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nnote","ride":{"call_key":"log:7","send_id":"send","sender":"sender","forms":["tool_result"],"form":"append"}}"#).unwrap();
+        let bytes = super::encode(8, 1, &record).unwrap();
+        let older: Vec<_> = super::KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != super::RIDES_V2_FEATURE)
+            .collect();
+        assert!(
+            matches!(super::decode_next_with(&bytes, &older), super::DecodeStep::NewerWriter { missing, .. } if missing == ["rides-v2/v1"])
+        );
+        assert!(
+            matches!(super::decode_next(&bytes), super::DecodeStep::Record { framed, .. } if framed.record == record)
+        );
+    }
+}

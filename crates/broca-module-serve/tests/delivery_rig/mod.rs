@@ -1503,6 +1503,16 @@ impl Rig {
 
     /// Recreate the serve connection, registry and store from the same durable session.
     pub async fn restart(self) -> Self {
+        self.restart_with_wal(None).await
+    }
+
+    /// Restore a WAL backup and rebuild its derived index while no writer is running.
+    pub async fn restart_restoring_wal(self, bytes: &[u8]) -> Self {
+        assert!(self.registry.stop_and_seal().await);
+        self.restart_with_wal(Some(bytes)).await
+    }
+
+    async fn restart_with_wal(self, restored: Option<&[u8]>) -> Self {
         let Self {
             dir,
             reader,
@@ -1511,12 +1521,25 @@ impl Rig {
             registry,
             daemon_scopes,
             session,
+            wal_path,
+            store,
             ..
         } = self;
         drop(writer);
         drop(reader);
         let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
         drop(registry);
+        drop(store);
+        if let Some(bytes) = restored {
+            std::fs::write(wal_path, bytes).unwrap();
+            for file in ["store.db", "store.db-wal", "store.db-shm"] {
+                match std::fs::remove_file(dir.join(file)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("removing derived index: {error}"),
+                }
+            }
+        }
         Self::open_existing_as(
             dir,
             Duration::from_millis(100),

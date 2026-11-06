@@ -172,6 +172,9 @@ impl Wal for ParkBeforeResult {
     fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
         self.inner.lineage_id()
     }
+    fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+        self.inner.last_cursor_frame_identity()
+    }
 }
 async fn drive(
     root: &Path,

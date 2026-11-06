@@ -920,10 +920,36 @@ pub struct StatusParams {
 }
 
 /// A durable control-stream position shared by `session.read` and `session.subscribe`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CursorWire {
     pub wal_seq: u64,
     pub sub_index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+impl CursorWire {
+    pub fn new(wal_seq: u64, sub_index: u32) -> Self {
+        Self {
+            wal_seq,
+            sub_index,
+            incarnation: None,
+            digest: None,
+        }
+    }
+}
+
+impl From<broca_core::Cursor> for CursorWire {
+    fn from(cursor: broca_core::Cursor) -> Self {
+        let mut wire = Self::new(cursor.wal_seq, cursor.sub_index);
+        if let Some((lineage, identity)) = cursor.frame_identity() {
+            wire.incarnation = Some(lineage.to_string());
+            wire.digest = Some(identity.digest_hex());
+        }
+        wire
+    }
 }
 
 /// `session.subscribe` params: `from` is `"start"`, `"live"`, or a durable cursor.
@@ -1040,7 +1066,7 @@ pub struct ReadParams {
 #[serde(untagged)]
 pub enum FromWire {
     Named(String),
-    Cursor { wal_seq: u64, sub_index: u32 },
+    Cursor(CursorWire),
 }
 
 /// `session.send` response.
@@ -1155,6 +1181,10 @@ fn serialize_read_message<S: serde::Serializer>(
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<cortexkit_role_llm_runner::read::NoticeFact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<u64>,
@@ -1225,6 +1255,10 @@ impl Serialize for SessionReadMessage {
         #[derive(Serialize)]
         struct Wire<'a> {
             #[serde(skip_serializing_if = "Option::is_none")]
+            sender: &'a Option<String>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            notices: &'a [cortexkit_role_llm_runner::read::NoticeFact],
+            #[serde(skip_serializing_if = "Option::is_none")]
             written_at: Option<u64>,
             ordinal: u64,
             mid: &'a str,
@@ -1258,6 +1292,8 @@ impl Serialize for SessionReadMessage {
             reasoning_summaries: &'a [cortexkit_role_llm_runner::read::ReasoningSummary],
         }
         Wire {
+            sender: &self.sender,
+            notices: &self.notices,
             written_at: self.written_at,
             ordinal: self.ordinal,
             mid: &self.mid,
@@ -2887,7 +2923,7 @@ pub fn encode_live_subscribe_control(
         ));
     }
     serde_json::to_vec(&LiveSubscribeEventRef::Control {
-        cursor: CursorWire { wal_seq, sub_index },
+        cursor: CursorWire::new(wal_seq, sub_index),
         unit,
         seq,
         event,
@@ -2995,7 +3031,7 @@ pub fn encode_subscribe_control(
         ));
     }
     serde_json::to_vec(&SubscribeEventRef::Control {
-        cursor: CursorWire { wal_seq, sub_index },
+        cursor: CursorWire::new(wal_seq, sub_index),
         unit,
     })
 }
@@ -3052,10 +3088,7 @@ impl Serialize for SubscribeEvent {
                 sub_index,
                 unit,
             } => SubscribeEventRef::Control {
-                cursor: CursorWire {
-                    wal_seq: *wal_seq,
-                    sub_index: *sub_index,
-                },
+                cursor: CursorWire::new(*wal_seq, *sub_index),
                 unit,
             }
             .serialize(serializer),
@@ -3065,10 +3098,7 @@ impl Serialize for SubscribeEvent {
                 sub_index,
                 state,
             } => UnrecognizedSubscribeEventRef::Control {
-                cursor: CursorWire {
-                    wal_seq: *wal_seq,
-                    sub_index: *sub_index,
-                },
+                cursor: CursorWire::new(*wal_seq, *sub_index),
                 unit: state.into(),
             }
             .serialize(serializer),
@@ -3078,10 +3108,7 @@ impl Serialize for SubscribeEvent {
                 unit,
                 ..
             } => UnknownControlEventRef::Control {
-                cursor: CursorWire {
-                    wal_seq: *wal_seq,
-                    sub_index: *sub_index,
-                },
+                cursor: CursorWire::new(*wal_seq, *sub_index),
                 unit,
             }
             .serialize(serializer),
@@ -6060,6 +6087,8 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            sender: None,
+            notices: Vec::new(),
             created_at: None,
             completed_at: None,
             reasoning_summaries: Vec::new(),
@@ -6449,6 +6478,8 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            sender: None,
+            notices: Vec::new(),
             created_at: None,
             completed_at: None,
             reasoning_summaries: Vec::new(),
@@ -6684,5 +6715,16 @@ mod envelope_time_tests {
         let entry: SessionReadMessage = serde_json::from_str(pinned).unwrap();
         assert_eq!(entry.written_at, None);
         assert_eq!(serde_json::to_string(&entry).unwrap(), pinned);
+    }
+}
+
+#[cfg(test)]
+mod cursor_compatibility_tests {
+    #[test]
+    fn cursor_reply_readers_remain_lenient_about_future_members() {
+        let cursor: super::CursorWire =
+            serde_json::from_value(serde_json::json!({"wal_seq":3,"sub_index":1,"future":true}))
+                .unwrap();
+        assert_eq!(cursor, super::CursorWire::new(3, 1));
     }
 }

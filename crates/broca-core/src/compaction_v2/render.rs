@@ -29,14 +29,15 @@ pub fn request_options(
     let transcript = super::transcript::project(records, lineage)?;
     let (config, manifest) = super::host::frozen(records)?;
     let prompt = if manifest.is_some_and(crate::compaction::has_compaction) {
-        prompt(
+        prompt_with_rides(
             &boundary.prompt,
             &transcript.entries,
+            &transcript.rides,
             applied.map_or(&[], |view| view.edits.as_slice()),
             super::host::image_reference,
         )?
     } else {
-        deliveries_only(&boundary.prompt, &transcript.entries)?
+        deliveries_only_with_rides(&boundary.prompt, &transcript.entries, &transcript.rides)?
     };
     boundary.ephemeral_session |=
         crate::retention::is_retention_records(records.iter().map(|frame| &frame.record));
@@ -63,6 +64,16 @@ pub fn finish(
 pub fn prompt(
     stored: &[Message],
     entries: &[Entry],
+    edits: &[Edit],
+    image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
+) -> Result<Vec<Message>, String> {
+    prompt_with_rides(stored, entries, &Default::default(), edits, image)
+}
+
+pub fn prompt_with_rides(
+    stored: &[Message],
+    entries: &[Entry],
+    rides: &super::entries::RideEnvelopes,
     edits: &[Edit],
     mut image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
 ) -> Result<Vec<Message>, String> {
@@ -199,7 +210,7 @@ pub fn prompt(
                                 else {
                                     unreachable!()
                                 };
-                                render_result(&mut result.output, tool, &part);
+                                render_result(&mut result.output, tool, &part, &mid, rides);
                                 if matches!(tool.status, ToolStatus::Error | ToolStatus::Denied) {
                                     result.is_error = true;
                                 }
@@ -267,6 +278,14 @@ pub fn prompt(
 /// Unnumbered sessions still render tool-result deliveries separately from the
 /// stored output. Messages without a delivery remain exact native copies.
 pub fn deliveries_only(stored: &[Message], entries: &[Entry]) -> Result<Vec<Message>, String> {
+    deliveries_only_with_rides(stored, entries, &Default::default())
+}
+
+pub fn deliveries_only_with_rides(
+    stored: &[Message],
+    entries: &[Entry],
+    rides: &super::entries::RideEnvelopes,
+) -> Result<Vec<Message>, String> {
     if stored.len() != entries.len() {
         return Err("compaction delivery projection does not match native message count".into());
     }
@@ -307,14 +326,13 @@ pub fn deliveries_only(stored: &[Message], entries: &[Entry]) -> Result<Vec<Mess
             let ContentBlock::ToolResult(result) = &mut prompt[position + 1].content[result] else {
                 unreachable!()
             };
-            let mut text = super::entries::tool_output(&result.output).1;
-            for delivery in &tool.delivered {
-                if let Some(delivery) = &delivery.text {
-                    text.push_str("\n\n");
-                    text.push_str(delivery);
-                }
+            for (index, delivery) in tool.delivered.iter().enumerate() {
+                append_delivery(
+                    &mut result.output,
+                    delivery,
+                    rides.get(&entry.mid, &part.id, index),
+                );
             }
-            set_result_text(&mut result.output, text, None);
             if matches!(tool.status, ToolStatus::Error | ToolStatus::Denied) {
                 result.is_error = true;
             }
@@ -380,7 +398,69 @@ fn numbered_reply(original: &str, neutral: &str, tag: u64, assistant: bool) -> S
     format!("{}{neutral}", tags::tag_prefix(tag))
 }
 
-fn render_result(output: &mut ToolOutput, tool: &ToolPart, plan: &PlanPart) {
+fn render_result(
+    output: &mut ToolOutput,
+    tool: &ToolPart,
+    plan: &PlanPart,
+    mid: &str,
+    rides: &super::entries::RideEnvelopes,
+) {
+    let only_new = !tool.delivered.is_empty()
+        && tool
+            .delivered
+            .iter()
+            .enumerate()
+            .all(|(index, _)| rides.get(mid, &plan.id, index).is_some());
+    if only_new
+        && matches!(output, ToolOutput::Parts { .. })
+        && !plan.replace.iter().any(|field| field.field == "output")
+    {
+        if let Some(field) = plan
+            .replace
+            .iter()
+            .find(|field| field.field == "attachments")
+        {
+            let ids: Vec<String> =
+                serde_json::from_value(field.value.clone()).expect("checked attachments");
+            if let ToolOutput::Parts { parts } = output {
+                *parts = std::mem::take(parts)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, part)| {
+                        (!matches!(part, ToolOutputPart::Media { .. })
+                            || ids.contains(&index.to_string()))
+                        .then_some(part)
+                    })
+                    .collect();
+            }
+        }
+        if plan.prefix {
+            if let ToolOutput::Parts { parts } = output {
+                let prefix = tags::tag_prefix(plan.tag.expect("numbered result has a tag"));
+                if let Some(ToolOutputPart::Text { text }) = parts.first_mut() {
+                    text.insert_str(0, &prefix);
+                } else {
+                    parts.insert(
+                        0,
+                        ToolOutputPart::Text {
+                            text: format!(
+                                "{prefix}{}",
+                                plan.empty_result_label.as_deref().unwrap_or("")
+                            ),
+                        },
+                    );
+                }
+            }
+        }
+        for ride in &plan.rides {
+            append_delivery(
+                output,
+                &ride.delivered,
+                rides.get(mid, &plan.id, ride.index as usize),
+            );
+        }
+        return;
+    }
     // The native request may carry frozen model-only guidance. Keep it unless
     // the view explicitly replaces output; validation still used the stored part.
     let mut text = super::entries::tool_output(output).1;
@@ -411,20 +491,50 @@ fn render_result(output: &mut ToolOutput, tool: &ToolPart, plan: &PlanPart) {
             &tags::tag_prefix(plan.tag.expect("numbered result has a tag")),
         );
     }
-    // Delivered bytes are not output edits: a replace of output must not erase a
-    // reminder, and a delivered edit can remove one without touching the result.
+    set_result_text(output, text, attachment_ids.as_deref());
+    // Legacy deliveries keep their original output-edit rule; frozen rides follow
+    // the recorded plan's selected indices. Iterate once to preserve delivery order.
     for (index, delivered) in tool.delivered.iter().enumerate() {
-        if delivery_indexes
-            .as_ref()
-            .is_none_or(|indexes| indexes.contains(&(index as u64)))
-        {
-            if let Some(delivered) = &delivered.text {
-                text.push_str("\n\n");
-                text.push_str(delivered);
-            }
+        let ride = rides.get(mid, &plan.id, index);
+        let kept = if ride.is_some() {
+            plan.rides.iter().any(|ride| ride.index == index as u64)
+        } else {
+            delivery_indexes
+                .as_ref()
+                .is_none_or(|indexes| indexes.contains(&(index as u64)))
+        };
+        if kept {
+            append_delivery(output, delivered, ride);
         }
     }
-    set_result_text(output, text, attachment_ids.as_deref());
+}
+
+fn append_delivery(
+    output: &mut ToolOutput,
+    delivery: &cortexkit_role_compaction::part::Delivered,
+    envelope: Option<&broca_wal::record::RideMetadata>,
+) {
+    let Some(text) = &delivery.text else {
+        return;
+    };
+    match envelope.map(|envelope| envelope.form) {
+        Some(broca_wal::record::RideForm::Append) => {
+            let envelope = envelope.unwrap();
+            let ride = cortexkit_role_llm_runner::rides::Ride::new(
+                &envelope.send_id,
+                &envelope.sender,
+                &envelope.call_key,
+                text,
+            );
+            crate::delivery_order::append_ride_output(output, &[ride]);
+        }
+        None => {
+            let mut rendered = super::entries::tool_output(output).1;
+            rendered.push_str("\n\n");
+            rendered.push_str(text);
+            set_result_text(output, rendered, None);
+        }
+    }
 }
 
 fn set_result_text(output: &mut ToolOutput, text: String, attachment_ids: Option<&[String]>) {

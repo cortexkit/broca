@@ -2009,6 +2009,7 @@ async fn a_full_dispatch_cache_evicts_one_session_not_all() {
     let facts = vec![broca_core::ToolCallDispatch {
         tool_call_id: "call".into(),
         intent_seq: Some(4),
+        key_seq: None,
         recorded_call_key: None,
         dispatched_to: Some("aft".into()),
         indeterminate: false,

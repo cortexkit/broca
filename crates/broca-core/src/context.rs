@@ -2044,9 +2044,11 @@ fn read_session_page_from_rows(
 pub struct ToolCallDispatch {
     /// The model's id for the call. Display only: a model may reuse one id in several steps.
     pub tool_call_id: String,
-    /// The call's dispatch-intent sequence, used with the log identity only when
-    /// the record carries no prepared key; see [`tool_call_key`].
+    /// The actual dispatch-intent sequence, absent when the call was never dispatched.
     pub intent_seq: Option<u64>,
+    /// A per-call key anchor, which may instead be consent preparation or a singular
+    /// negative terminal. A key anchor alone is never evidence of dispatch.
+    pub key_seq: Option<u64>,
     /// A prepared key preserved by the dispatch intent, when consent preparation
     /// made the call durable before the intent was written.
     pub recorded_call_key: Option<String>,
@@ -2085,72 +2087,49 @@ pub fn tool_call_key(
         .or_else(|| lineage_id.map(|lineage| format!("{lineage}:{intent_seq}")))
 }
 
-/// The dispatch facts of the committed tool turns `turns` of a replay over `framed`, keyed by
-/// the ordinal of each turn's assistant message (`ordinal_base` plus its index in the replayed
-/// prompt), its calls in their order.
-///
-/// Each turn names the record index of the step that produced it, so its calls are tied to
-/// that step's own dispatch records by position: the records after the step up to its batch's
-/// `ToolBatchFinished`. Nothing is matched by content, so an imported message holding the same
-/// calls as a real step never borrows that step's facts. Only each turn's own records are walked,
-/// so the cost follows the turns asked about, not the length of `framed`.
+/// Dispatch and durable negative-call anchors for the requested native tool turns.
+/// Imported input never borrows an anchor from another message with the same content.
 pub fn dispatches_of_turns(
     framed: &[FramedRecord],
     turns: &[(usize, usize)],
     ordinal_base: u64,
 ) -> std::collections::BTreeMap<u64, Vec<ToolCallDispatch>> {
-    use std::collections::{HashMap, HashSet};
     let mut out = std::collections::BTreeMap::new();
     for &(prompt_index, step_index) in turns {
-        let Some(WalRecord::ModelStepFinished {
-            assistant_message, ..
-        }) = framed.get(step_index).map(|frame| &frame.record)
-        else {
+        let Some(frame) = framed.get(step_index) else {
             continue;
         };
-        let mut intents: HashMap<&str, (u64, Option<String>, Option<String>)> = HashMap::new();
-        let mut resolved: HashSet<&str> = HashSet::new();
-        for frame in &framed[step_index + 1..] {
-            match &frame.record {
-                WalRecord::ToolDispatchIntent {
-                    tool_call_id,
-                    module_id,
-                    call_key,
-                    ..
-                } => {
-                    intents.entry(tool_call_id.0.as_str()).or_insert((
-                        frame.seq,
-                        module_id.clone(),
-                        call_key.clone(),
-                    ));
-                }
-                WalRecord::ToolResult { result, .. } => {
-                    resolved.insert(result.tool_call_id.0.as_str());
-                }
-                WalRecord::ToolNoDispatch { tool_call_id, .. } => {
-                    resolved.insert(tool_call_id.0.as_str());
-                }
-                WalRecord::ToolBatchFinished { .. }
-                | WalRecord::ModelStepFinished { .. }
-                | WalRecord::RunStarted { .. } => break,
-                _ => {}
-            }
+        if !matches!(frame.record, WalRecord::ModelStepFinished { .. }) {
+            continue;
         }
-        let entries = assistant_message
-            .tool_calls()
-            .map(|call| {
-                let id = call.tool_call_id.0.as_str();
-                let intent = intents.get(id);
-                ToolCallDispatch {
-                    tool_call_id: id.to_owned(),
-                    intent_seq: intent.map(|(seq, _, _)| *seq),
-                    recorded_call_key: intent.and_then(|(_, _, key)| key.clone()),
-                    dispatched_to: intent.and_then(|(_, module, _)| module.clone()),
-                    indeterminate: intent.is_some() && !resolved.contains(id),
-                }
-            })
-            .collect();
-        out.insert(ordinal_base + prompt_index as u64, entries);
+        let mut anchors = crate::call_identity::CallAnchors::default();
+        anchors.observe(&frame.record, frame.seq);
+        for frame in &framed[step_index + 1..] {
+            if matches!(
+                frame.record,
+                WalRecord::ToolBatchFinished { .. }
+                    | WalRecord::ModelStepFinished { .. }
+                    | WalRecord::RunStarted { .. }
+            ) {
+                break;
+            }
+            anchors.observe(&frame.record, frame.seq);
+        }
+        out.insert(
+            ordinal_base + prompt_index as u64,
+            anchors
+                .slots()
+                .iter()
+                .map(|slot| ToolCallDispatch {
+                    tool_call_id: slot.id.0.clone(),
+                    intent_seq: slot.intent_seq,
+                    key_seq: slot.seq,
+                    recorded_call_key: slot.recorded_key.clone(),
+                    dispatched_to: slot.dispatched_to.clone(),
+                    indeterminate: slot.dispatched && !slot.terminal,
+                })
+                .collect(),
+        );
     }
     out
 }

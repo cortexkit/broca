@@ -58,6 +58,132 @@ fn result(output: ToolOutput) -> Message {
     )
 }
 
+fn frozen_ride(id: &str) -> broca_wal::record::RideMetadata {
+    broca_wal::record::RideMetadata {
+        call_key: "frozen-carrier-key".into(),
+        send_id: id.into(),
+        sender: "ck-mc".into(),
+        forms: vec!["tool_result".into()],
+        form: broca_wal::record::RideForm::Append,
+    }
+}
+
+#[test]
+fn frozen_and_legacy_deliveries_keep_record_order_and_error_status() {
+    let messages = vec![
+        text(Role::User, "question"),
+        call(),
+        result(ToolOutput::error("failed")),
+    ];
+    let deliveries = Deliveries::from([(
+        ("m12345678.1".into(), "1".into()),
+        vec![
+            Delivered::new("ck-mc", "first").with_send_id("first"),
+            Delivered::new("ck-mc", "legacy"),
+            Delivered::new("ck-mc", "last").with_send_id("last"),
+        ],
+    )]);
+    let entries = project(&messages, &facts(3), &deliveries, true);
+    let mut rides = super::entries::RideEnvelopes::default();
+    rides.push(&entries[1].mid, "1", Some(frozen_ride("first")));
+    rides.push(&entries[1].mid, "1", None);
+    rides.push(&entries[1].mid, "1", Some(frozen_ride("last")));
+    let rendered = render::deliveries_only_with_rides(&messages, &entries, &rides).unwrap();
+    let ContentBlock::ToolResult(result) = &rendered[2].content[0] else {
+        panic!("missing result")
+    };
+    assert!(result.is_error);
+    assert_eq!(
+        super::entries::tool_output(&result.output).1,
+        "failed\n\nfirst\n\nlegacy\n\nlast"
+    );
+    let only_new = Deliveries::from([(
+        (entries[1].mid.clone(), "1".into()),
+        vec![Delivered::new("ck-mc", "first").with_send_id("first")],
+    )]);
+    let entries = project(&messages, &facts(3), &only_new, true);
+    let rendered = render::deliveries_only_with_rides(&messages, &entries, &rides).unwrap();
+    assert!(matches!(&rendered[2].content[0], ContentBlock::ToolResult(result) if result.is_error));
+}
+
+#[test]
+fn keyed_legacy_delivery_is_not_a_frozen_ride_and_parts_honor_delivered_edits() {
+    use broca_protocol::ToolOutputPart;
+    let mut assistant = call();
+    let ContentBlock::ToolCall(call) = &mut assistant.content[1] else {
+        panic!("missing call")
+    };
+    // Signed calls may only be removed, not edited. Clear the signature before
+    // replacing the delivered list.
+    call.thought_signature = None;
+    let messages = vec![
+        text(Role::User, "question"),
+        assistant,
+        result(ToolOutput::Parts {
+            parts: vec![
+                ToolOutputPart::Text {
+                    text: "value".into(),
+                },
+                ToolOutputPart::Text {
+                    text: "caption".into(),
+                },
+            ],
+        }),
+    ];
+    let deliveries = Deliveries::from([(
+        ("m12345678.1".into(), "1".into()),
+        vec![
+            Delivered::new("ck-mc", "first").with_send_id("first"),
+            Delivered::new("ck-mc", "second").with_send_id("second"),
+        ],
+    )]);
+    let entries = project(&messages, &facts(3), &deliveries, true);
+    let legacy = render::deliveries_only(&messages, &entries).unwrap();
+    let ContentBlock::ToolResult(result) = &legacy[2].content[0] else {
+        panic!("missing result")
+    };
+    assert_eq!(
+        result.output,
+        ToolOutput::Parts {
+            parts: vec![ToolOutputPart::Text {
+                text: "value\ncaption\n\nfirst\n\nsecond".into()
+            }]
+        }
+    );
+    let mut rides = super::entries::RideEnvelopes::default();
+    rides.push(&entries[1].mid, "1", Some(frozen_ride("first")));
+    rides.push(&entries[1].mid, "1", Some(frozen_ride("second")));
+    let edits = [Edit::new(
+        1,
+        EditOp::Replace {
+            mid: entries[1].mid.clone(),
+            part: "1".into(),
+            field: "delivered".into(),
+            value: json!([1]),
+            expect: entries[1].parts[1].digest.clone(),
+        },
+    )];
+    let rendered =
+        render::prompt_with_rides(&messages, &entries, &rides, &edits, |_| panic!("no image"))
+            .unwrap();
+    let ContentBlock::ToolResult(result) = &rendered[2].content[0] else {
+        panic!("missing result")
+    };
+    assert_eq!(
+        result.output,
+        ToolOutput::Parts {
+            parts: vec![
+                ToolOutputPart::Text {
+                    text: "\u{a7}2\u{a7} value".into()
+                },
+                ToolOutputPart::Text {
+                    text: "caption\n\nsecond".into()
+                }
+            ]
+        }
+    );
+}
+
 #[test]
 fn compaction_v2_entries_merge_results_without_merging_delivered_text() {
     let messages = vec![
@@ -1020,6 +1146,7 @@ fn compaction_v2_delivered_attribution_joins_submission_records_in_delivery_orde
     };
     let queued: WalRecord = serde_json::from_value(json!({"type":"queued","submission_id":"queued","principal":{"kind":"reserved","module_id":"queued-module"},"request":{"model":{"provider_module_id":"fake","model_id":"fake"},"input":[]}})).unwrap();
     let delivered = |submission: &str, text: &str| WalRecord::SendDelivered {
+        ride: None,
         written_at_ms: None,
         submission_id: SubmissionId(submission.into()),
         run_id: RunId("run".into()),
@@ -1368,10 +1495,12 @@ fn request_at<'a>(
     conditions: &'a cortexkit_role_compaction::notice::Conditions,
     current: &'a session_conditions::SendContext,
 ) -> super::request::At<'a> {
+    static RIDES: std::sync::OnceLock<super::entries::RideEnvelopes> = std::sync::OnceLock::new();
     super::request::At {
         step: 1,
         preset: "worker",
         entries,
+        rides: RIDES.get_or_init(Default::default),
         stored: messages,
         conditions,
         previous: Some(current),

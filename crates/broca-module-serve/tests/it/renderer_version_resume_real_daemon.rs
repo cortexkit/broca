@@ -410,6 +410,7 @@ async fn wait_send_finished(rig: &Rig, session: &str, send_id: &str) -> Vec<WalR
                 .map_err(|error| format!("decode session.head: {error}: {response}"))?;
             let cursor = head
                 .head
+                .as_ref()
                 .ok_or_else(|| format!("no durable head: {head:?}"))?;
             let range = store
                 .read_records_range(&identity, 0, Some(cursor.wal_seq), None)

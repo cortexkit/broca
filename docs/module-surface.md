@@ -494,13 +494,16 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   use the same target and keep replacement groups and insertion/anchor groups whole. Source-less
   metadata overflow uses the adapter's generic `response_too_large` refusal because there is no
   message or model entry to name.
-- `tool_calls[].call_key` is `<lineage_id>:<wal_seq>` of the call's own `tool_dispatch_intent`,
-  derived on read and never stored. `dispatched_to` is that intent's `module_id`, absent on an
-  intent written before broca recorded it. Sending `call_key` to providers waits until each
-  provider decodes it. A call is tied to the step record that produced its message, never
-  matched by content, so a message an import brought in has no dispatch facts. Facts of a turn
-  in the read's WAL tail come with the page; an older turn's come from a per-session cache that
-  one pass over the whole WAL fills the first time a read needs them.
+- `tool_calls[].call_key` preserves a recorded consent-preparation or dispatch key. Without
+  such a key, a native call uses `<lineage_id>:<wal_seq>` of its own dispatch intent, or of its
+  singular `ToolNoDispatch` / intentless `ToolResult` terminal when it never dispatched.
+  Calls sharing a model ID still have distinct per-occurrence anchors. Imported calls and
+  results synthesized into one run's input remain keyless: their shared input record cannot
+  identify each call uniquely. `dispatched_to` remains the dispatch intent's recorded module,
+  absent for calls never dispatched and for historical intents without that observation.
+  The same durable key is served on call, read, display and live facts before and after restart.
+  Facts of a turn in the read's WAL tail come with the page; an older turn's come from a
+  per-session cache that one pass over the whole WAL fills when a read first needs them.
 - Every known run's `run.status` and `run.result` carry `usage` from completed
   `ModelStepFinished` and billed `ModelStepRefused` WAL records, including while the run is
   active. It always has
@@ -793,10 +796,38 @@ New source-maintenance records use the existing optional `cache_warmed.trigger` 
 `source_keep_warm` to select source-model attribution. Records without that discriminator,
 including historical late manual warms, keep their original attribution and export-fact bytes.
 
-A **cursor** is a durable `(wal_seq, sub_index)` (§7). `subscribe` and `read.head` share
-this one cursor domain. A cursor attach starts strictly after that unit, so
-`read → subscribe(from: head)` is a gapless, duplicate-free handoff. `head` is absent only
-when the lineage has no control unit.
+A **subscribe cursor** is `{wal_seq, sub_index, incarnation, digest}`. The incarnation
+names the WAL, and `digest` is a 16-hex-character verified source-frame identity.
+`subscribe`, `session.head.head` and `session.read.head` share this domain.
+A cursor attach starts strictly after that unit, so `read → subscribe(from: head)` is a
+gapless, duplicate-free handoff. `head` is absent when the log has no resumable control unit.
+Malformed `from` refuses `invalid_params` naming `from`; a parsed cursor with a missing or
+different incarnation, a missing or different frame digest, an absent frame, or a
+sub-index with no corresponding control unit refuses `cursor_expired` before any event. Legacy position-only wire cursors
+also expire. Normal restarts preserve cursors; restoring a shorter WAL and reusing its
+positions cannot revive a cursor whose original frame was replaced.
+Within the same log incarnation, a restored cursor remains valid exactly when its frame
+survives at the same sequence with the same digest, which covers version, sequence,
+the lease fence (the writer's ownership generation) and payload.
+Missing or null `from`
+means live. On either refusal, drop the cursor, reopen live, and read `session.head`.
+
+Broca declares `notices` with `read_display_facts`, `history_display` and `live_events`.
+A send carried by a tool result adds a `notices` list to that entry on opted-in reads and
+to its display row, never a new transcript entry. Each fact names its stored result `part`,
+carrying `call_key`, `send_id`, `sender`, exact `text` and `delivered_as: "tool_result"`.
+The corresponding `notice_delivered` live event names the same result and carrying call.
+An unkeyed send's notices name the submission ID broca's reply gave that send; client-supplied
+send IDs take precedence, and a colliding minted notice ID is not reported.
+A replay that cannot check earlier client-supplied send IDs refuses with
+`notice_send_keys_unavailable`, rather than silently omitting notices or assuming
+that generated submission IDs are unique.
+Neither fact enters a checksum or changes `history_version`. Default reads omit them.
+With `include_display_facts`, `sender` is served beside `mid` when recorded send attribution
+names a module; raw history also serves that field. Absence does not identify a human
+or disprove a sender.
+Broca does not declare `sender_attribution` and serves no `provider_executed` flags:
+it stores no tools that a model provider executed internally.
 
 `session.send.system` is an OPTIONAL leading `Role::System` message for the turn: one
 byte-exact text block, delivered role-scoped before the user prompt; absent, empty, or
@@ -1654,7 +1685,7 @@ Accounting event IDs use `lineage_id:wal_seq`, and timestamps are not join keys.
 ## 15. session.read consistency + pagination
 
 `session.read` cuts each page from one atomic materialized-store snapshot plus its exact
-bounded WAL tail. The response's optional `head: {wal_seq, sub_index}` is the last durable
+bounded WAL tail. The response's optional `head: {wal_seq, sub_index, incarnation, digest}` is the last durable
 control unit covered by that same snapshot. `session.subscribe {from: head}` therefore
 starts strictly after the read snapshot without a race, gap, or duplicate.
 

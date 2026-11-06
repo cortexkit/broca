@@ -266,6 +266,9 @@ impl broca_wal::Wal for HeldWal {
     fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
         self.inner.lineage_id()
     }
+    fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+        self.inner.last_cursor_frame_identity()
+    }
 }
 
 /// A `FileWalStore` whose first opened writer holds its `StepStarted` append (see `HeldAppend`).

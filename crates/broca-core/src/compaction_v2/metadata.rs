@@ -609,6 +609,7 @@ impl Fold {
         }
         if let WalRecord::SendDelivered {
             submission_id,
+            ride,
             mode: DeliveryMode::ToolResult,
             tool_call_id: Some(call),
             appended_text: Some(text),
@@ -639,6 +640,7 @@ impl Fold {
                 template: origin.template.clone(),
             });
             let mut delivered = Delivered::new(sender, text.strip_prefix("\n\n").unwrap_or(text));
+            super::entries::attach_ride_envelope(&mut delivered, ride.as_ref());
             delivered.template = origin.template;
             delta.deliveries.push(DeliveryUpdate {
                 ordinal: assistant.ordinal,
@@ -779,6 +781,7 @@ pub fn project_entry(
             .ok_or_else(|| format!("compaction delivered source {} is missing", origin.seq))?;
         let WalRecord::SendDelivered {
             submission_id,
+            ride,
             appended_text: Some(text),
             ..
         } = &frame.record
@@ -796,6 +799,7 @@ pub fn project_entry(
         }
         let mut delivered =
             Delivered::new(&origin.sender, text.strip_prefix("\n\n").unwrap_or(text));
+        super::entries::attach_ride_envelope(&mut delivered, ride.as_ref());
         delivered.template = origin.template.clone();
         deliveries
             .entry((mid.into(), origin.part.clone()))

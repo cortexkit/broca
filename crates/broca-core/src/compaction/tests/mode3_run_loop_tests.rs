@@ -293,7 +293,8 @@ async fn compaction_v2_unfinished_old_plan_refuses_without_writes_but_completed_
             ..
         } = record
         {
-            *compaction_plan_version = Some(cortexkit_compaction_view::PLAN_VERSION - 1);
+            // Version 2 is still supported; version 1 remains an unsupported renderer.
+            *compaction_plan_version = Some(1);
         }
     }
     let pending = Shared::with_records(
@@ -742,6 +743,16 @@ async fn compaction_v2_every_result_kind_carries_delivery_without_changing_store
                 text: "value".into(),
             }],
         },
+        ToolOutput::Parts {
+            parts: vec![
+                broca_protocol::ToolOutputPart::Text {
+                    text: "value".into(),
+                },
+                broca_protocol::ToolOutputPart::Text {
+                    text: "caption".into(),
+                },
+            ],
+        },
         ToolOutput::Denied {
             reason: "denied".into(),
         },
@@ -845,6 +856,50 @@ async fn compaction_v2_every_result_kind_carries_delivery_without_changing_store
                 .unwrap_or_default()
                 .contains("module note"));
             if !compaction {
+                if matches!(&output, ToolOutput::Parts { parts } if parts.len() == 2) {
+                    let mut resumed = records.clone();
+                    for record in &mut resumed {
+                        if let WalRecord::SendDelivered { ride, .. } = record {
+                            *ride = Some(broca_wal::record::RideMetadata {
+                                call_key: "recorded-carrying-key".into(),
+                                send_id: "reminder".into(),
+                                sender: "broca".into(),
+                                forms: vec!["tool_result".into()],
+                                form: broca_wal::record::RideForm::Append,
+                            });
+                        }
+                    }
+                    let at = resumed.iter().position(|record| matches!(record, WalRecord::ModelStepFinished { step_id, .. } if step_id.0 == 2)).unwrap();
+                    resumed.insert(at, serde_json::from_value(json!({"type":"model_attempt_finished","step_id":2,"attempt":0,"request_body_len":1,"request_body_sha256":"recorded-digest","response_body_len":0,"response_body_sha256":"response","outcome":"complete","http_status":200,"ts_ms":10})).unwrap());
+                    let rebuilt = crate::cache_warm::last_recorded_request_with_lineage(
+                        &resumed,
+                        Some(&fixture_lineage_id().to_string()),
+                    )
+                    .unwrap();
+                    let result = rebuilt
+                        .opts
+                        .prompt
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .find_map(|block| match block {
+                            ContentBlock::ToolResult(result) => Some(result),
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        result.output,
+                        ToolOutput::Parts {
+                            parts: vec![
+                                broca_protocol::ToolOutputPart::Text {
+                                    text: "value".into()
+                                },
+                                broca_protocol::ToolOutputPart::Text {
+                                    text: "caption\n\nmodule note".into()
+                                },
+                            ]
+                        }
+                    );
+                }
                 assert!(
                     !String::from_utf8_lossy(&crate::canonical_request_bytes(&calls[1]))
                         .contains('§')
@@ -1052,4 +1107,130 @@ async fn compaction_v2_context_folds_refreezes_and_tracks_accepted_attempts_befo
     });
     records.push(attempt);
     assert_eq!(v2::host::previous(&frames(&records)).unwrap(), current);
+}
+
+#[tokio::test]
+async fn frozen_rides_live_request_and_restart_are_byte_identical_for_every_carrier() {
+    use broca_protocol::{DeliveryMode, DeliveryOrder, SubmissionId, ToolOutput, ToolOutputPart};
+    let cases = [
+        (
+            false,
+            false,
+            ToolOutput::Text {
+                text: "value\n\n".into(),
+            },
+        ),
+        (false, false, ToolOutput::error("failed")),
+        (
+            false,
+            true,
+            ToolOutput::Text {
+                text: "first duplicate result\n\n".into(),
+            },
+        ),
+        (
+            true,
+            false,
+            ToolOutput::Json {
+                value: json!({"value": 1}),
+            },
+        ),
+        (
+            true,
+            false,
+            ToolOutput::Parts {
+                parts: vec![
+                    ToolOutputPart::Text {
+                        text: "value".into(),
+                    },
+                    ToolOutputPart::Text {
+                        text: "caption\n\n".into(),
+                    },
+                ],
+            },
+        ),
+    ];
+    for (mode3, duplicate, output) in cases {
+        let shared = Shared::default();
+        let writer = Arc::new(shared.writer());
+        writer.enable_ride_writer_for_test();
+        let (mut request, mut control, _) = history_request();
+        request.input = vec![text(Role::User, "question")];
+        request.context_limit = Some(100_000);
+        control.admitted_context_limit = request.context_limit;
+        control.manifest = None;
+        control.new_log_compaction_plan_version =
+            mode3.then_some(cortexkit_compaction_view::PLAN_VERSION);
+        request.tools = vec![serde_json::from_value(
+            json!({"name":"edit","description":"edit","input_schema":{"type":"object"}}),
+        )
+        .unwrap()];
+        request.policy_allowed.insert("edit".into());
+        let inbox = crate::SteerInbox::new();
+        control.steer = Some(inbox.clone());
+        let queued_writer = writer.clone();
+        let original = output.clone();
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let tools = crate::StubToolPlane::new().with_tool("edit", move |_| {
+            if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let order = DeliveryOrder { modes: vec![DeliveryMode::ToolResult], dedupe_key: None, expires_at_ms: None, template: None };
+                queued_writer.record(serde_json::from_value(json!({"type":"delivery_ordered","submission_id":"reminder","order":order,"sent_by":{"kind":"reserved","module_id":"sender"}})).unwrap());
+                queued_writer.record(serde_json::from_value(json!({"type":"queued","submission_id":"reminder","send_id":"client-reminder","sent_by":{"kind":"reserved","module_id":"sender"},"request":{"model":{"provider_module_id":"fake","model_id":"fake"},"input":[{"role":"user","content":[{"type":"text","text":"module note"}]}]}})).unwrap());
+                inbox.seed_ordered(vec![crate::delivery_order::OrderedSend { admitted_at_ms: Some(1), submission_id: SubmissionId("reminder".into()), order, principal: None, input: vec![text(Role::User, "module note")] }]);
+            }
+            crate::StubReply::Output(original.clone())
+        });
+        let mut first = tool_call_events("edit", 1);
+        if duplicate {
+            for event in &mut first {
+                if let broca_protocol::NormalizedEvent::Control(
+                    broca_protocol::ProviderControl::AssistantMessage { message },
+                ) = event
+                {
+                    message.content.push(message.content[0].clone());
+                }
+            }
+        }
+        let model = PrefixBound(crate::StubProvider::new(vec![first, model_events()]));
+        let (out, _events) = tokio::sync::mpsc::channel(256);
+        crate::run_loop_on_writer(
+            request,
+            &writer,
+            crate::StartMode::FreshOrResume,
+            &model,
+            &tools,
+            &crate::AllowAll,
+            &shared,
+            None,
+            control,
+            &out,
+        )
+        .await
+        .unwrap();
+        drop(tools);
+        Arc::try_unwrap(writer)
+            .ok()
+            .expect("tool closure released writer")
+            .shutdown()
+            .await
+            .unwrap();
+        let calls = model.0.calls();
+        assert_eq!(calls.len(), 2);
+        let records = shared.records();
+        assert!(records.iter().any(|record| matches!(record, WalRecord::SendDelivered { ride: Some(ride), .. } if ride.send_id == "client-reminder" && !ride.call_key.is_empty())));
+        assert!(records.iter().any(|record| matches!(record, WalRecord::ToolResult { result, .. } if result.output == output)));
+        let mut resumed = records;
+        let at = resumed.iter().position(|record| matches!(record, WalRecord::ModelStepFinished { step_id, .. } if step_id.0 == 2)).unwrap();
+        resumed.insert(at, serde_json::from_value(json!({"type":"model_attempt_finished","step_id":2,"attempt":0,"request_body_len":1,"request_body_sha256":"recorded-digest","response_body_len":0,"response_body_sha256":"response","outcome":"complete","http_status":200,"ts_ms":10})).unwrap());
+        let rebuilt = crate::cache_warm::last_recorded_request_with_lineage(
+            &resumed,
+            Some(&fixture_lineage_id().to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::canonical_request_bytes(&calls[1]),
+            crate::canonical_request_bytes(&rebuilt.opts),
+            "mode3={mode3} duplicate={duplicate} output={output:?}"
+        );
+    }
 }

@@ -754,6 +754,9 @@ impl WalStore for GatedReadWalStore {
         through: Option<u64>,
         anchor: Option<&broca_wal::WalByteAnchor>,
     ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+        // Hold subscriber replay's first read, not the subsequent state reconstruction
+        // that shutdown needs before writing RunFinished.
+        self.replay_gate.wait_once();
         let mut blocked = self.blocked.lock().unwrap();
         if *blocked {
             self.entered.notify_one();
@@ -779,6 +782,7 @@ impl Drop for ReleaseRead {
 #[derive(Default)]
 struct HoldGate {
     blocked: std::sync::Mutex<bool>,
+    once_claimed: std::sync::atomic::AtomicBool,
     released: std::sync::Condvar,
     entered: tokio::sync::Notify,
     poll_requested: tokio::sync::Notify,
@@ -787,7 +791,18 @@ struct HoldGate {
 impl HoldGate {
     fn arm(self: &Arc<Self>) -> ReleaseGate {
         *self.blocked.lock().unwrap() = true;
+        self.once_claimed
+            .store(false, std::sync::atomic::Ordering::Release);
         ReleaseGate(self.clone())
+    }
+
+    fn wait_once(&self) {
+        if !self
+            .once_claimed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.wait();
+        }
     }
 
     fn wait(&self) {
@@ -859,6 +874,9 @@ impl broca_wal::Wal for GatedSyncWal {
 
     fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
         self.inner.lineage_id()
+    }
+    fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+        self.inner.last_cursor_frame_identity()
     }
 }
 

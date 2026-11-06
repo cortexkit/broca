@@ -60,6 +60,9 @@ impl Wal for AdmissionWal {
     fn lineage_id(&self) -> Option<WalLineageId> {
         self.0.lineage_id()
     }
+    fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+        self.0.last_cursor_frame_identity()
+    }
 }
 
 impl WalStore for AdmissionStore {

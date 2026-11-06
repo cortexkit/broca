@@ -4073,6 +4073,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         &run_id,
                         key.send_id().unwrap_or(""),
                         self.admitting_sent_by.is_none(),
+                        self.writer.as_ref().and_then(|writer| writer.lineage_id()),
                     ) {
                         // An auth-paused re-send is still the explicit re-drive operation;
                         // polling never takes that branch or starts its executor.
@@ -5260,9 +5261,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Ok(records) => records,
             Err(error) => return SendOutcome::Error(error),
         };
-        crate::send_fate::recorded_send_outcome(&records, &target, send_id, true).unwrap_or_else(
-            || SendOutcome::Error("the recorded steer disappeared from the WAL".into()),
+        crate::send_fate::recorded_send_outcome(
+            &records,
+            &target,
+            send_id,
+            true,
+            self.writer.as_ref().and_then(|writer| writer.lineage_id()),
         )
+        .unwrap_or_else(|| SendOutcome::Error("the recorded steer disappeared from the WAL".into()))
     }
 
     /// Resolve admission fields and start a run as a child task; track it Active. The run
@@ -5736,6 +5742,16 @@ impl<W: WalStore + 'static> LineageActor<W> {
             steer.seed_protected(req.input.clone());
         }
         // The run may deliver every ordered send still queued, except the one this run consumes.
+        for pending in self
+            .pending_fifo
+            .iter()
+            .filter(|pending| submission_id.as_ref() != Some(&pending.submission_id))
+        {
+            self.writer
+                .as_ref()
+                .expect("writer live while open")
+                .note_queued_ride(pending);
+        }
         steer.seed_ordered(
             self.pending_fifo
                 .iter()
@@ -6646,6 +6662,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 &run_id,
                 identity.send_id.as_deref().unwrap_or(""),
                 false,
+                self.writer.as_ref().and_then(|writer| writer.lineage_id()),
             ) {
                 return outcome;
             }
@@ -12324,6 +12341,9 @@ mod tests {
         }
         fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
             self.inner.lineage_id()
+        }
+        fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+            self.inner.last_cursor_frame_identity()
         }
     }
 

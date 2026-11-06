@@ -173,7 +173,7 @@ mod read_page_tests;
 /// Where a `session.subscribe` attaches from (the wire spelling: `"start" | "live" |
 /// cursor`). `live` attaches strictly after the durable head captured by the attach barrier,
 /// remaining quiet and open until future units arrive regardless of the current lineage state.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscribeFrom {
     /// From the very start of the lineage (seq 1).
@@ -182,6 +182,8 @@ pub enum SubscribeFrom {
     Live,
     /// Strictly after a durable cursor (a resume from the client's last-processed cursor).
     After { wal_seq: u64, sub_index: u32 },
+    /// A wire cursor bound to a log incarnation and the original frame bytes.
+    Resume { cursor: broca_wire::CursorWire },
 }
 
 /// A `session.import` request carrying canonical history only.
@@ -465,6 +467,8 @@ fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                sender: None,
+                notices: Vec::new(),
                 created_at: None,
                 completed_at: None,
                 reasoning_summaries: Vec::new(),
@@ -491,10 +495,7 @@ fn session_read_response(
             })
             .collect(),
         next_from_ordinal: page.next_from_ordinal.map(|position| position + 1),
-        head: page.head.map(|cursor| CursorWire {
-            wal_seq: cursor.wal_seq,
-            sub_index: cursor.sub_index,
-        }),
+        head: page.head.map(CursorWire::from),
         lineage_id: page.lineage_id.map(|lineage_id| lineage_id.to_string()),
         lineage_state: SessionReadLineageState {
             last_run_id: page.lineage_state.last_run_id.map(|run_id| run_id.0),
@@ -1036,10 +1037,24 @@ fn indexed_run_tool_calls(
                 tool_call_id,
                 ..
             } if active_batch_id.as_deref() == Some(batch_id.0.as_str()) => {
-                if let Some(call) = active_calls
-                    .iter_mut()
-                    .find(|call| call.call.tool_call_id == tool_call_id.0 && !call.terminal)
-                {
+                let at = active_calls
+                    .iter()
+                    .position(|call| {
+                        call.call.tool_call_id == tool_call_id.0
+                            && !call.terminal
+                            && !call.has_intent
+                            && call.call.call_key.is_none()
+                    })
+                    .or_else(|| {
+                        active_calls.iter().position(|call| {
+                            call.call.tool_call_id == tool_call_id.0 && !call.terminal
+                        })
+                    });
+                if let Some(call) = at.and_then(|at| active_calls.get_mut(at)) {
+                    if call.call.call_key.is_none() {
+                        call.call.call_key =
+                            broca_core::tool_call_key(lineage_id, framed.seq, None);
+                    }
                     call.call.outcome = outcomes::REFUSED.into();
                     call.terminal = true;
                 }
@@ -1051,10 +1066,14 @@ fn indexed_run_tool_calls(
                 reason,
                 ..
             } if active_batch_id.as_deref() == Some(batch_id.0.as_str()) => {
-                if let Some(call) = active_calls
-                    .iter_mut()
-                    .find(|call| call.call.tool_call_id == result.tool_call_id.0 && !call.terminal)
-                {
+                let at = active_calls.iter().position(|call| {
+                    call.call.tool_call_id == result.tool_call_id.0 && !call.terminal
+                });
+                if let Some(call) = at.and_then(|at| active_calls.get_mut(at)) {
+                    if call.call.call_key.is_none() {
+                        call.call.call_key =
+                            broca_core::tool_call_key(lineage_id, framed.seq, None);
+                    }
                     call.call.outcome = run_tool_call_outcome(
                         *outcome,
                         call.has_intent,
@@ -1612,6 +1631,7 @@ pub enum ServeError {
     },
     /// A requested version no longer names the session's active history.
     HistoryChanged,
+    CursorExpired,
     HistoryRewriting,
     /// `after_mid` names no message of the lineage.
     UnknownMid(String),
@@ -1752,6 +1772,7 @@ impl std::fmt::Display for ServeError {
             ServeError::InvalidParams { message, .. } => f.write_str(message),
             ServeError::HistoryRewriting => f.write_str("history is being rewritten; retry after its writer finishes recovery"),
             ServeError::HistoryChanged => f.write_str("the session's history changed; read its newest page"),
+            ServeError::CursorExpired => f.write_str("the subscribe cursor is not held in this session log"),
             ServeError::UnknownMid(mid) => write!(f, "the lineage has no message '{mid}'"),
             ServeError::UnknownRun(run_id) => write!(f, "the session has no run '{run_id}'"),
             ServeError::AccountSelectionRefused(refusal) => write!(
@@ -1778,6 +1799,9 @@ impl std::error::Error for ServeError {}
 /// real outcome or a typed `ServeError`.
 #[async_trait]
 pub trait ServeHandler: Send + Sync {
+    fn requires_cursor_frame_identity(&self) -> bool {
+        false
+    }
     async fn check_plan_selection(
         &self,
         plan: &serde_json::Value,
@@ -2363,13 +2387,14 @@ impl crate::LineageRegistry {
                     .and_then(|calls| calls.iter().find(|call| &call.tool_call_id == carrier))
                 {
                     if let Some(receipt) = &mut message.delivered_as {
-                        receipt.call_key = dispatch.intent_seq.and_then(|seq| {
-                            broca_core::tool_call_key(
-                                Some(&lineage_id),
-                                seq,
-                                dispatch.recorded_call_key.as_deref(),
-                            )
-                        });
+                        receipt.call_key =
+                            dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
+                                broca_core::tool_call_key(
+                                    Some(&lineage_id),
+                                    seq,
+                                    dispatch.recorded_call_key.as_deref(),
+                                )
+                            });
                     }
                 }
             }
@@ -2383,7 +2408,7 @@ impl crate::LineageRegistry {
                     .iter()
                     .map(|dispatch| broca_wire::SessionReadToolCall {
                         tool_call_id: dispatch.tool_call_id.clone(),
-                        call_key: dispatch.intent_seq.and_then(|seq| {
+                        call_key: dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
                             broca_core::tool_call_key(
                                 Some(&lineage_id),
                                 seq,
@@ -2413,6 +2438,9 @@ impl crate::LineageRegistry {
 
 #[async_trait]
 impl ServeHandler for crate::LineageRegistry {
+    fn requires_cursor_frame_identity(&self) -> bool {
+        true
+    }
     async fn check_plan_selection(
         &self,
         plan: &serde_json::Value,
@@ -2837,7 +2865,7 @@ impl ServeHandler for crate::LineageRegistry {
         principal: Option<&broca_protocol::BindPrincipal>,
     ) -> Result<broca_wire::SendReplyWire, ServeError> {
         self.check_expired(session, Some(&own_run.0)).await?;
-        let frames = self.read_durable_wal(session).await?.0;
+        let (frames, lineage) = self.read_durable_wal(session).await?;
         let senders = broca_core::AdmissionCheckpointV1::from_frames(&frames)
             .map_err(|error| ServeError::Open(error.to_string(), None))?
             .ownership
@@ -2860,9 +2888,14 @@ impl ServeHandler for crate::LineageRegistry {
             return Err(ServeError::UnknownSend);
         }
         let legacy_steers = crate::send_fate::legacy_steers_allowed(&records, &own_run);
-        let outcome =
-            crate::send_fate::recorded_send_outcome(&records, &own_run, send_id, legacy_steers)
-                .ok_or(ServeError::UnknownSend)?;
+        let outcome = crate::send_fate::recorded_send_outcome(
+            &records,
+            &own_run,
+            send_id,
+            legacy_steers,
+            lineage,
+        )
+        .ok_or(ServeError::UnknownSend)?;
         let (result, delivered) = match outcome {
             crate::actor::SendOutcome::Finished {
                 run_id,
@@ -3116,6 +3149,28 @@ impl ServeHandler for crate::LineageRegistry {
                 )
                 .await?
             }
+            SubscribeFrom::Resume { cursor } => {
+                let (Some(incarnation), Some(digest)) =
+                    (cursor.incarnation.as_deref(), cursor.digest.as_deref())
+                else {
+                    return Err(ServeError::CursorExpired);
+                };
+                let proof = crate::fanout::ResumeCursorProof::new(incarnation, digest).ok_or_else(
+                    || ServeError::InvalidParams {
+                        field: "from".into(),
+                        message: "subscribe cursor has malformed identity".into(),
+                    },
+                )?;
+                self.route_subscribe(
+                    session,
+                    FromCursor::Resume {
+                        cursor: broca_core::Cursor::new(cursor.wal_seq, cursor.sub_index),
+                        proof,
+                    },
+                    sink,
+                )
+                .await?
+            }
         };
         match outcome {
             SubscribeOutcome::Attached => Ok(()),
@@ -3289,6 +3344,12 @@ impl ServeHandler for crate::LineageRegistry {
                             .collect();
                     }
                     if let Some(facts) = facts.get(&(entry.ordinal - 1)) {
+                        entry.sender = facts.sender.clone();
+                        entry.notices = facts
+                            .notices
+                            .iter()
+                            .map(|notice| notice.fact.clone())
+                            .collect();
                         if entry.message.role == broca_protocol::Role::User {
                             entry.client_message_id = facts.client_message_id.clone();
                         }
@@ -3547,6 +3608,7 @@ impl ServeHandler for crate::LineageRegistry {
             )
             .await?;
         let input = media_facts.map_or_else(broca_wire::head_input, |facts| facts.input);
+        let head = page.head.map(CursorWire::from);
         Ok(broca_wire::HeadResponse {
             mode3,
             last_run_rich_ui: head_facts.last_run_rich_ui,
@@ -3560,10 +3622,7 @@ impl ServeHandler for crate::LineageRegistry {
             last_ordinal: (page.prompt_len > 0).then_some(page.prompt_len),
             first_ordinal: (page.prompt_len > 0).then_some(1),
             history_version: snapshot.history_version,
-            head: page.head.map(|cursor| CursorWire {
-                wal_seq: cursor.wal_seq,
-                sub_index: cursor.sub_index,
-            }),
+            head,
             last_run_state: page
                 .lineage_state
                 .last_run_id

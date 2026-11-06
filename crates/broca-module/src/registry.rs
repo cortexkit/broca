@@ -953,6 +953,7 @@ struct Inner {
     change_gates: Mutex<HashMap<LineageKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Migration notices are deduplicated while the session remains in the bounded cache.
     attribution_notices: Mutex<BoundedSessionCache<()>>,
+    unbound_cursor_notices: Mutex<BoundedSessionCache<()>>,
     retention: std::sync::OnceLock<Arc<crate::retention::RetentionService>>,
     #[cfg(test)]
     close_started: tokio::sync::watch::Sender<u64>,
@@ -2276,6 +2277,9 @@ impl LineageRegistry {
                 actor_idle_holds: Mutex::new(HashMap::new()),
                 batches_in_flight: Arc::new(AtomicUsize::new(0)),
                 attribution_notices: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
+                unbound_cursor_notices: Mutex::new(BoundedSessionCache::new(
+                    SESSION_CACHE_SESSIONS,
+                )),
                 retention: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 close_started: tokio::sync::watch::channel(0).0,
@@ -4539,18 +4543,16 @@ impl LineageRegistry {
                 ));
             }
             Ok(Err(error)) => {
-                tracing::warn!(
-                    target: "session",
-                    "session.read durability flush failed; serving only the materialized prefix: {error}"
-                );
-                return Ok(broca_wal::WalRangeRead::without_anchors(Vec::new()));
+                return Err(OpenError::Classified {
+                    reason: format!("durability_flush_failed: {error}"),
+                    class: broca_protocol::ErrorClass::Transient,
+                });
             }
             Err(error) => {
-                tracing::warn!(
-                    target: "session",
-                    "session.read durability flush task failed; serving only the materialized prefix: {error}"
-                );
-                return Ok(broca_wal::WalRangeRead::without_anchors(Vec::new()));
+                return Err(OpenError::Classified {
+                    reason: format!("durability_flush_failed: {error}"),
+                    class: broca_protocol::ErrorClass::Transient,
+                });
             }
         };
 
@@ -5557,6 +5559,25 @@ impl LineageRegistry {
         )
         .map_err(|e| OpenError::Open(format!("replay failed: {e}")))?;
         page.lineage_id = lineage_id;
+        if let (Some(cursor), Some(lineage)) = (page.head, lineage_id) {
+            if let Some(identity) = tail.cursor_frame_identity_at(cursor.wal_seq) {
+                page.head = Some(cursor.with_frame_identity(lineage, identity));
+            } else {
+                // Legacy snapshots have no source-span offsets for an earlier head;
+                // leave it position-only so subscribe expires it rather than scanning the log.
+                page.head = Some(broca_core::Cursor::new(cursor.wal_seq, cursor.sub_index));
+                if self
+                    .inner
+                    .unbound_cursor_notices
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), ())
+                    .is_none()
+                {
+                    tracing::debug!(target: "session", session = ?key, "legacy snapshot minted an unbound control cursor");
+                }
+            }
+        }
 
         let tools = if include_tools {
             let tail_tools = latest_run_started_tools(match tail.records() {
@@ -7438,6 +7459,92 @@ mod tests {
         );
     }
 
+    struct LegacyCursorPages(broca_core::StorePageSnapshot);
+
+    impl broca_core::MaterializedStore for LegacyCursorPages {
+        fn read_prefix_with_watermark(
+            &self,
+            _: &LineageKey,
+        ) -> Result<broca_core::StorePrefix, String> {
+            unreachable!("paged reads only")
+        }
+        fn read_page_with_watermark(
+            &self,
+            _: &LineageKey,
+            _: Option<u64>,
+            _: u64,
+            _: broca_core::ReadView,
+        ) -> Result<broca_core::StorePageSnapshot, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_cursor_without_source_span_stays_unbound_and_expires() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("legacy-cursor-{}", std::process::id()));
+        let session = BindIdentity::new(root.join("project"), "runner", "session");
+        let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
+        let mut wal = wal_store.open(&session).unwrap();
+        wal.append(1, &started_record(&session), true).unwrap();
+        let watermark = wal
+            .append(
+                1,
+                &broca_wal::WalRecord::TurnFinished {
+                    step_id: broca_protocol::StepId(1),
+                },
+                true,
+            )
+            .unwrap();
+        drop(wal);
+        let range = wal_store
+            .read_records_range(&session, 0, None, None)
+            .unwrap();
+        let mut snapshot = broca_core::StorePageSnapshot::empty();
+        snapshot.watermark_seq = watermark;
+        snapshot.lineage_id = range.lineage_id.map(|lineage| lineage.to_string());
+        snapshot.anchor = range.next_anchor;
+        snapshot.control_head = Some(broca_core::Cursor::new(watermark - 1, 0));
+        let registry = LineageRegistry::new_with_reader(
+            Arc::new(NeverOpener),
+            wal_store,
+            Some(Arc::new(LegacyCursorPages(snapshot))),
+        );
+        let capture = broca_test_support::LogCapture::new();
+        capture
+            .scope_future(async {
+                let page = registry.route_read(&session, None, None).await.unwrap();
+                let cursor: broca_wire::CursorWire = page.head.unwrap().into();
+                assert!(cursor.incarnation.is_none() && cursor.digest.is_none());
+                assert_eq!(cursor.wal_seq, watermark - 1);
+                let (sink, _receiver) = tokio::sync::mpsc::channel(1);
+                let result = crate::serve::ServeHandler::subscribe(
+                    &registry,
+                    &session,
+                    crate::serve::SubscribeFrom::Resume { cursor },
+                    sink,
+                )
+                .await;
+                assert!(matches!(
+                    result,
+                    Err(crate::serve::ServeError::CursorExpired)
+                ));
+                registry.route_read(&session, None, None).await.unwrap();
+            })
+            .await;
+        assert_eq!(
+            capture
+                .events()
+                .iter()
+                .filter(
+                    |event| event.message() == "legacy snapshot minted an unbound control cursor"
+                )
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     struct StaleAttributionPages;
 
     impl broca_core::MaterializedStore for StaleAttributionPages {
@@ -7761,7 +7868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn degraded_range_read_does_not_claim_wal_presence() {
+    async fn durability_flush_failure_is_a_named_transient_refusal() {
         let registry = LineageRegistry::new(Arc::new(NeverOpener));
         let session = key();
         let reader = ReadSources {
@@ -7769,25 +7876,13 @@ mod tests {
             store: None,
         };
 
-        let range = registry
+        let error = registry
             .read_durable_range(&reader, &session, 0, None, None)
             .await
-            .expect("degraded read returns the materialized prefix");
-
-        assert_eq!(
-            (match range.records() {
-                broca_wal::WalRangeRecords::Complete(records)
-                | broca_wal::WalRangeRecords::Partial(records)
-                | broca_wal::WalRangeRecords::Unknown(records) => records,
-                broca_wal::WalRangeRecords::Absent => &[],
-            })
-            .len(),
-            0
+            .expect_err("a failed durability flush cannot prove an empty suffix");
+        assert!(
+            matches!(error, OpenError::Classified { class: broca_protocol::ErrorClass::Transient, ref reason } if reason.starts_with("durability_flush_failed:"))
         );
-        assert!(matches!(
-            range.records(),
-            broca_wal::WalRangeRecords::Unknown(_)
-        ));
     }
 
     pub(super) fn started_record(session: &LineageKey) -> WalRecord {
@@ -8415,6 +8510,11 @@ impl LineageRegistry {
         self.inner.frozen_senders.lock().unwrap().remove(key);
         self.inner.mode3_logs.lock().unwrap().remove(key);
         self.inner.attribution_notices.lock().unwrap().remove(key);
+        self.inner
+            .unbound_cursor_notices
+            .lock()
+            .unwrap()
+            .remove(key);
         self.inner.live_ownership.lock().unwrap().remove(key);
         self.inner.owner_snapshots.lock().unwrap().remove(key);
         self.inner.cache.remove(key);
@@ -8429,6 +8529,11 @@ impl RegistryHandle {
         self.inner.frozen_senders.lock().unwrap().remove(key);
         self.inner.mode3_logs.lock().unwrap().remove(key);
         self.inner.attribution_notices.lock().unwrap().remove(key);
+        self.inner
+            .unbound_cursor_notices
+            .lock()
+            .unwrap()
+            .remove(key);
         self.inner.live_ownership.lock().unwrap().remove(key);
         self.inner.owner_snapshots.lock().unwrap().remove(key);
     }

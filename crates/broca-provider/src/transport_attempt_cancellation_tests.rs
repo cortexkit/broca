@@ -61,9 +61,8 @@ impl Wal for ReservationBarrierWal {
     fn append_budget_scope(&self) -> broca_wal::size_limit::SizeScope {
         self.inner.append_budget_scope()
     }
-    fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
-        self.inner.lineage_id()
-    }
+    fn lineage_id(&self) -> Option<broca_wal::WalLineageId> { self.inner.lineage_id() }
+    fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> { self.inner.last_cursor_frame_identity() }
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         self.inner.append(fence, record, sync)
     }

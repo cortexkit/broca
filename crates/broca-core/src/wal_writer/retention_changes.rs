@@ -227,6 +227,9 @@ impl Wal for ObservedWal {
     fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
         self.inner.lineage_id()
     }
+    fn last_cursor_frame_identity(&self) -> Option<broca_wal::framing::CursorFrameIdentity> {
+        self.inner.last_cursor_frame_identity()
+    }
     fn durable_publication(&self) -> Option<broca_wal::file_wal::DurablePublication> {
         if self.inner.wal_config().is_overhaul() {
             self.inner.durable_publication()
