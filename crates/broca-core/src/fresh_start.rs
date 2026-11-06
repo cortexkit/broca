@@ -180,6 +180,14 @@ pub struct EpisodeStart {
     pub input: Arc<Vec<Message>>,
 }
 
+/// When a new episode's input was written: the time the send recorded, else, for a run started
+/// directly rather than from a queued send, `now` (read only then). A zero time is no time.
+pub fn written_at_ms(req: &RunRequest, now: impl FnOnce() -> Option<u64>) -> Option<u64> {
+    req.input_written_at_ms
+        .or_else(|| req.submission_id.is_none().then(now).flatten())
+        .filter(|at| *at != 0)
+}
+
 /// A new episode's `RunStarted`: one record carrying its config and input, so a torn start never
 /// leaves one without the other. A resume treats it as the run's authority.
 pub fn run_started(req: &RunRequest, control: &RunControl, start: EpisodeStart) -> WalRecord {
@@ -188,15 +196,7 @@ pub fn run_started(req: &RunRequest, control: &RunControl, start: EpisodeStart) 
             .mode3
             .then_some(cortexkit_compaction_view::PLAN_VERSION),
         sent_by: control.display_sent_by.clone(),
-        written_at_ms: req
-            .input_written_at_ms
-            .or_else(|| {
-                req.submission_id
-                    .is_none()
-                    .then(|| control.now_ms())
-                    .flatten()
-            })
-            .filter(|at| *at != 0),
+        written_at_ms: written_at_ms(req, || control.now_ms()),
         tags: None,
         session_class: req.session_class.clone(),
         retention: req.retention,
@@ -331,10 +331,15 @@ pub fn append_system_messages(
 
 /// Whether `config` is the run start an import wrote, rather than a run's.
 pub fn is_import(config: &RunConfig) -> bool {
-    config.model.provider_module_id == "import"
-        && config.model.model_id == "import"
-        && config
-            .provider_options
+    is_import_start(&config.model, &config.provider_options)
+}
+
+/// Whether a run start with this model and these provider options is an import's: an import
+/// records the placeholder model `import/import` and the digest of the request it imported.
+pub fn is_import_start(model: &ModelHandle, provider_options: &serde_json::Value) -> bool {
+    model.provider_module_id == "import"
+        && model.model_id == "import"
+        && provider_options
             .get("import_request_digest")
             .is_some_and(serde_json::Value::is_string)
 }
