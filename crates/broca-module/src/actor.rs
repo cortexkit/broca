@@ -3886,11 +3886,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .is_some_and(|first| first.manifest.is_some())
                 || planned
             {
-                return SendOutcome::DeliveryRefused {
-                    code: "invalid_params",
-                    field: "tools",
-                    message: "tools are frozen by the session's fetch plan".into(),
-                };
+                return crate::plan_episode::tools_frozen_refusal();
             }
         }
 
@@ -5541,18 +5537,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // Every path that starts an episode passes here (a direct send, a drained queue, a
         // queue rebuilt after a crash), so an episode whose plan asks a provider to confine its
         // tools never starts without the scope that confinement is keyed on.
-        if episode_scope.is_none()
-            && manifest.as_ref().is_some_and(|manifest| {
-                serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
-                    .is_ok_and(|plan| broca_fetch_plan::names_confined_preset(&plan))
-            })
-        {
-            return Err(StartRunFailure::Scope(
-                broca_core::ScopeRefusal::ScopeRequired {
-                    preset: broca_fetch_plan::CONFINED_TOOL_PRESET,
-                },
-            ));
-        }
+        crate::plan_episode::require_confining_scope(manifest.as_deref(), episode_scope.as_ref())
+            .map_err(StartRunFailure::Scope)?;
         if let Some(manifest) = &manifest {
             // The session's first episode, new or re-driven: only its input holds the system
             // text, exactly as its `RunStarted` recorded it.
@@ -5561,51 +5547,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     .first_episode
                     .as_ref()
                     .is_some_and(|first| first.run_id == run_id);
-            let is_system = |message: &&broca_protocol::content::Message| {
-                message.role == broca_protocol::content::Role::System
-            };
-            let frozen_system = vec![broca_protocol::content::ContentBlock::Text {
-                text: manifest.system_text.clone(),
-            }];
-            let systems: Vec<_> = resolved_request.input.iter().filter(is_system).collect();
-            // A send carries neither tools nor system text: the manifest supplies both. An
-            // episode re-driven from its own `RunStarted` carries the manifest's tools and, in
-            // the first episode, the manifest's system text first; exactly those are accepted.
-            let system_frozen = match systems.as_slice() {
-                [] => true,
-                [only] => {
-                    first_episode_input
-                        && std::ptr::eq(*only, &resolved_request.input[0])
-                        && only.content == frozen_system
-                }
-                _ => false,
-            };
-            let tools_frozen = tools_were_omitted
-                || resolved_request.tools.as_deref() == Some(manifest.tools.as_slice());
-            if !system_frozen || !tools_frozen {
-                return Err(StartRunFailure::Admission(broca_core::RunError::Config(
-                    "this session's tools and system text are frozen from its fetch plan; a \
-                     later send carries neither `tools` nor `system`"
-                        .into(),
-                )));
-            }
-            let needs_system =
-                first_episode_input && systems.is_empty() && !manifest.system_text.is_empty();
-            resolved_request.tools = Some(manifest.tools.as_ref().clone());
-            resolved_request.policy_allowed = manifest
-                .tools
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect();
-            if needs_system {
-                resolved_request.input.insert(
-                    0,
-                    broca_protocol::content::Message::new(
-                        broca_protocol::content::Role::System,
-                        frozen_system,
-                    ),
-                );
-            }
+            crate::plan_episode::freeze_manifest(
+                manifest,
+                &mut resolved_request,
+                first_episode_input,
+                tools_were_omitted,
+            )
+            .map_err(StartRunFailure::Admission)?;
         }
         let first_tool_names: Vec<String> = resolved_request
             .tools

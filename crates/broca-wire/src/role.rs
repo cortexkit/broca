@@ -478,7 +478,7 @@ pub fn broca_role_describe_with_writers(
     // `unknown`.
     .with_steer_receipt(steer_receipt::GUARANTEED)
     .with_run_cancel(vec!["now".into(), "step_boundary".into()])
-    .with_routed_accounts(vec!["oauth".into(), "chatgpt".into()]);
+    .with_routed_accounts(vec!["oauth".into(), "chatgpt".into(), "apikey".into()]);
     if hook_writer {
         // Once a hook plane is installed the run loop calls every hook the role names:
         // `pre_user` on each user message before it is written, `pre_tool` and `post_tool`
@@ -1265,7 +1265,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "b486cf74a3d49f3800ba840c021a2f8a698f4bcbb3cc3b79823f715693881501",
+            "90018d82cc4c8c19f02d6ea59bf4190f58a6a69a50da5968629efc9d746aec7d",
         );
     }
 
@@ -1447,7 +1447,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "b41ce8b9b81b073e20002b7e0e559234ec42d9b1730de1adb78de8d6a7ea22f2";
+        "312c6367b2a189a55b2a6c8d20d1a9aff3671e6e36e9a77ff8304ddefcb1c556";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =
