@@ -643,6 +643,16 @@ router's `role.describe` declares `observe_backoff`. Discovery uses the manageme
 capability cache, also used for `service_tier`, and refreshes when that route is reopened.
 Renewal (`mode: "renew"` with `expected_pin`) is not currently implemented for any routed method.
 
+For a routed admission ending in `billing_exhausted`, `credit_insufficient`,
+`account_not_entitled` or `usage_not_included`, broca sends `credential_refused` before
+`run_finished`, blocking that credential for every runner. API keys also report an unrecovered
+`auth_required` HTTP 401/403, including an `AuthRequired` pause: the pause is preserved and sends
+no `run_finished`. OAuth and ChatGPT auth pauses send no credential refusal. The report
+names `admission_id`, includes `credential_id` when known and `provider_code` verbatim when present,
+and never includes `retry_at_ms`. It is sent only when the router declares
+`observe_credential_refused` and its prerequisite `observe_backoff`; resettable account limits
+and transient rate limits keep their existing reports.
+
 Broca sends the effective `service_tier` on `route.account_for` only when the router's
 `role.describe` declares `service_tier`. A tier-aware answer's `service_tier_chosen` must be a
 known level, must be present for an explicit request, and cannot upgrade it. An unbound

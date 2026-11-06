@@ -300,6 +300,9 @@ pub trait RoutingTransport: Send + Sync {
     async fn observe_backoff_supported(&self) -> Result<bool, String> {
         Ok(false)
     }
+    async fn observe_credential_refused_supported(&self) -> Result<bool, String> {
+        Ok(false)
+    }
     async fn request(&self, body: Vec<u8>) -> RoutingReply;
 }
 
@@ -422,6 +425,9 @@ impl RoutingTransport for SubcRoutingTransport {
     }
     async fn observe_backoff_supported(&self) -> Result<bool, String> {
         self.supports("observe_backoff").await
+    }
+    async fn observe_credential_refused_supported(&self) -> Result<bool, String> {
+        self.supports("observe_credential_refused").await
     }
     async fn request(&self, body: Vec<u8>) -> RoutingReply {
         let route = self.route().await?;
@@ -1068,7 +1074,7 @@ impl RoutingClient {
     /// its own the lease of a run whose `run_finished` never arrived.
     pub async fn observe(&self, params: Value) {
         let deadline = tokio::time::Instant::now() + OBSERVE_BUDGET;
-        if params["kind"] == "transient_backoff" {
+        if params["kind"] == "transient_backoff" || params["kind"] == "credential_refused" {
             match tokio::time::timeout_at(deadline, self.transport.observe_backoff_supported())
                 .await
             {
@@ -1077,6 +1083,22 @@ impl RoutingClient {
                 failed => {
                     self.counters.bump("observe_failed");
                     tracing::warn!(target: "accounts", ?failed, "cannot discover routing's observe_backoff group; backoff report dropped");
+                    return;
+                }
+            }
+        }
+        if params["kind"] == "credential_refused" {
+            match tokio::time::timeout_at(
+                deadline,
+                self.transport.observe_credential_refused_supported(),
+            )
+            .await
+            {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => return,
+                failed => {
+                    self.counters.bump("observe_failed");
+                    tracing::warn!(target: "accounts", ?failed, "cannot discover routing's observe_credential_refused group; credential report dropped");
                     return;
                 }
             }
@@ -1600,6 +1622,23 @@ pub fn run_finished_body(
     Value::Object(body)
 }
 
+/// A provider refusal that makes the admitted credential unusable for every runner.
+pub fn credential_refused_body(
+    event_id: &str,
+    admission_id: &str,
+    credential_id: Option<&str>,
+    provider_code: Option<&str>,
+) -> Value {
+    let mut body = report("credential_refused", event_id, admission_id);
+    if let Some(credential_id) = credential_id {
+        body.insert("credential_id".into(), json!(credential_id));
+    }
+    if let Some(provider_code) = provider_code {
+        body.insert("provider_code".into(), json!(provider_code));
+    }
+    Value::Object(body)
+}
+
 /// `scoped_not_found`: the vault did not serve the credential routing chose. Routing excludes
 /// that account for this admission only.
 pub fn scoped_not_found_body(
@@ -1633,6 +1672,12 @@ enum ReportEvent {
         lineage: Option<WalLineageId>,
         wal_seq: u64,
         retry_after_secs: f64,
+    },
+    CredentialRefused {
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        credential_id: Option<String>,
+        provider_code: Option<String>,
     },
 }
 
@@ -1690,6 +1735,23 @@ impl RunReporter {
                             );
                             body.insert("retry_at_ms".into(), json!(retry_at_ms));
                             client.observe(Value::Object(body)).await;
+                        }
+                    }
+                    ReportEvent::CredentialRefused {
+                        lineage,
+                        wal_seq,
+                        credential_id,
+                        provider_code,
+                    } => {
+                        if let Some(id) = event_id_or_count(&client, lineage, wal_seq) {
+                            client
+                                .observe(credential_refused_body(
+                                    &format!("{id}:credential_refused"),
+                                    &admission_id,
+                                    credential_id.as_deref(),
+                                    provider_code.as_deref(),
+                                ))
+                                .await;
                         }
                     }
                     ReportEvent::Attempt {
@@ -1773,6 +1835,40 @@ impl RunReporter {
                     retry_after_secs,
                 });
             }
+        }
+    }
+
+    /// Report an unrecovered refusal of the admitted credential, not a resettable limit.
+    /// Subscription auth failures need sign-in instead; only API-key auth failures block a key.
+    /// The executor calls this only for a routed admission's error terminal or API-key auth pause.
+    pub fn terminal_credential_refused(
+        &self,
+        lineage: Option<WalLineageId>,
+        wal_seq: u64,
+        error: &broca_protocol::ProviderError,
+        auth_method: Option<&str>,
+        credential_id: Option<&str>,
+    ) {
+        let refused = matches!(
+            error.provider_code.as_deref(),
+            Some(
+                "billing_exhausted"
+                    | "credit_insufficient"
+                    | "account_not_entitled"
+                    | "usage_not_included"
+            )
+        ) || (auth_method == Some("apikey")
+            && error.class == ErrorClass::Auth
+            && matches!(error.status, Some(401 | 403)));
+        if refused {
+            let _ = self.tx.send(ReportEvent::CredentialRefused {
+                lineage,
+                wal_seq,
+                credential_id: credential_id
+                    .or(error.credential_id.as_deref())
+                    .map(str::to_owned),
+                provider_code: error.provider_code.clone(),
+            });
         }
     }
 }
