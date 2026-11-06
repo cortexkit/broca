@@ -2543,10 +2543,12 @@ mod executor {
         )
     }
 
+    /// The terminal auth status to report to the vault. `terminal_status` reads it from the
+    /// session's storage and is awaited only when neither the outcome nor `cached_error`
+    /// settles the answer.
     async fn post_run_wire_auth_status(
         outcome: &Result<RunSummary, RunError>,
-        wal_store: Arc<dyn WalStore>,
-        session: BindIdentity,
+        terminal_status: impl std::future::Future<Output = Option<u16>>,
         cached_error: Option<&Option<ProviderError>>,
     ) -> Option<u16> {
         // A provider 401/403 reaches the loop only as an AuthRequired pause or a wire-error
@@ -2559,24 +2561,20 @@ mod executor {
         if let Some(error) = cached_error {
             return error.as_ref().and_then(wire_auth_status);
         }
-        terminal_wire_auth_status(wal_store, session).await
+        terminal_status.await
     }
 
     /// The HTTP status of a run's terminal AUTH error, but ONLY for an Auth-class 401 or 403 —
     /// the statuses that can mean a credential the provider rejected (so the vault should
-    /// invalidate it). Reads the session's last episode terminal from the durable WAL: an
-    /// Auth-class failure pauses the run, so the status lives on the terminal
-    /// `RunPaused.error.status` (or `RunFinished.error.status` if a future path finalizes instead
-    /// of pausing). Returns `None` for any other terminal, including a Permanent 403, so the
-    /// caller reports ONLY a genuine wire auth rejection, never a forbidden or transient error.
+    /// invalidate it). `terminal_error` reads the error of the session's last terminal from its
+    /// durable storage: an Auth-class failure pauses the run, so the status lives on the
+    /// terminal pause's error (or a finish's, if a future path finalizes instead of pausing).
+    /// Returns `None` for any other terminal, including a Permanent 403, so the caller reports
+    /// ONLY a genuine wire auth rejection, never a forbidden or transient error.
     async fn terminal_wire_auth_status(
-        wal_store: Arc<dyn WalStore>,
-        session: BindIdentity,
+        terminal_error: impl std::future::Future<Output = Option<ProviderError>>,
     ) -> Option<u16> {
-        terminal_provider_error(wal_store, session)
-            .await
-            .as_ref()
-            .and_then(wire_auth_status)
+        terminal_error.await.as_ref().and_then(wire_auth_status)
     }
 
     async fn terminal_provider_error(
@@ -2595,12 +2593,13 @@ mod executor {
 
     /// Share the durable terminal's error between routing and vault reporting. API-key auth
     /// pauses block the rejected key without ending the paused run or releasing its admission.
+    /// `terminal_error` reads the error from the session's storage and is awaited only when the
+    /// outcome can carry a refusal worth reporting.
     async fn report_routed_terminal_error(
         reporter: &broca_module_serve::account_routing::RunReporter,
         selection: Option<&broca_core::AuthSelection>,
         outcome: &Result<RunSummary, RunError>,
-        wal_store: Arc<dyn WalStore>,
-        session: BindIdentity,
+        terminal_error: impl std::future::Future<Output = Option<ProviderError>>,
         terminal: (Option<broca_wal::WalLineageId>, u64),
     ) -> Option<Option<ProviderError>> {
         let selection = selection.filter(|selection| {
@@ -2615,7 +2614,7 @@ mod executor {
         if !(finished_error || (apikey && summary.paused == Some(PauseReason::AuthRequired))) {
             return None;
         }
-        let error = terminal_provider_error(wal_store, session).await;
+        let error = terminal_error.await;
         if let Some(error) = &error {
             reporter.terminal_credential_refused(
                 terminal.0,
@@ -2676,6 +2675,42 @@ mod executor {
                 config: episode.config.clone(),
                 idle: episode.disposition == broca_core::EpisodeDisposition::Finished,
             })
+    }
+
+    /// What a run's admission takes from its job, for a session on today's WAL or in the new
+    /// storage.
+    struct EpisodeJob<'a> {
+        req: &'a broca_core::RunRequest,
+        kind: RunKind,
+        auth: &'a Option<broca_protocol::AuthRequest>,
+        /// A queued send's saved conversation key, which outranks the session's.
+        conversation_key: &'a Option<String>,
+        /// A queued send's service tier level; routing may choose a different one.
+        queued_service_tier: &'a mut Option<String>,
+        media_profile: &'a Option<Box<broca_provider::media_profile::MediaProfile>>,
+        clock: Option<&'a broca_core::Clock>,
+    }
+
+    /// What a run's admission reads from the session's history.
+    struct EpisodeHistory<'a> {
+        /// The session's latest run, unless the job appends a new episode.
+        prior_run: Option<PriorRunView>,
+        /// The latest run's config, for an appended episode too.
+        last_config: Option<&'a broca_wal::RunConfig>,
+        /// The session's durable head: 0 when it holds nothing yet.
+        head_seq: u64,
+    }
+
+    /// What [`LiveLoopExecutor::admit_episode`] decided.
+    struct EpisodeAdmission {
+        fresh_episode: bool,
+        episode_context_management: broca_protocol::request::ContextManagement,
+        resolution: AuthResolution,
+        account_choice: AccountChoice,
+        /// Routing refused the caller's decision; the run pauses on it without a model call.
+        routing_decision_error: Option<ProviderError>,
+        mode: broca_core::StartMode,
+        resolved: broca_catalog::live::ProviderResolution,
     }
 
     fn frozen_render_config(
@@ -3459,6 +3494,697 @@ mod executor {
 
         /// How a fresh run's account is chosen. Only a fresh episode on the vault path with a
         /// routing client asks; a resume reuses its frozen decision and never asks again.
+        /// Decides everything a run's admission freezes before the run's start is written: its
+        /// context management, the credential and account (routing included), the cache policy
+        /// and key, a Claude Code persona and the provider's resolved render config. `history`
+        /// says what the session holds, so the same decision serves a session on today's WAL
+        /// and one in the new storage. An error means nothing was written and no model was
+        /// called; the caller answers the admission with it.
+        async fn admit_episode(
+            &self,
+            job: EpisodeJob<'_>,
+            history: &EpisodeHistory<'_>,
+        ) -> Result<EpisodeAdmission, RunError> {
+            // The run's model id is `<provider>/<model>` from the wire request. A base_url
+            // override for the mock endpoint (`BROCA_PROVIDER_BASE_URL`) sends the model
+            // verbatim as OpenAI-compatible.
+            let model_id = format!(
+                "{}/{}",
+                job.req.model.provider_module_id, job.req.model.model_id
+            );
+            let prior_run = &history.prior_run;
+            let fresh_episode = matches!(job.kind, RunKind::AppendEpisode)
+                || prior_run
+                    .as_ref()
+                    .is_none_or(|prior| prior.idle && prior.run_id != job.req.run_id);
+            // Context management is decided before auth so a refused value costs no credential
+            // read. The last episode's config is read from `history.last_config` because an
+            // appended episode has no `prior_run` view, yet is exactly the case that inherits.
+            let episode_context_management = match self.context_management.for_episode(
+                fresh_episode,
+                job.req.context_management.as_ref(),
+                history.last_config,
+                &job.req.session.project_root.to_string_lossy(),
+            ) {
+                Ok(decided) => decided,
+                Err(error) => {
+                    return Err(error);
+                }
+            };
+            let auth_context = episode_auth_context(fresh_episode, prior_run.is_some());
+            let (pinned_method, pinned_account) =
+                match caller_auth_for_episode(job.auth.as_ref(), auth_context) {
+                    Ok(pin) => pin,
+                    Err(error) => {
+                        return Err(error);
+                    }
+                };
+            // On a RESUME, re-use the credential the prior run FROZE (read from the durable
+            // RunConfig of the last episode) — never re-resolve the method from config/router
+            // (a drift would change the wire family and bust the cache). A NEW episode
+            // (append) resolves fresh — it's a new run with its own method. A fresh run / an
+            // A prior run without a frozen credential id resolves from config.
+            let frozen_credential_id: Option<String> = if fresh_episode {
+                None
+            } else {
+                prior_run
+                    .as_ref()
+                    .and_then(|prior| prior.config.auth_selection.clone())
+                    .map(|s| s.credential_id)
+            };
+            // Present when the frozen credential id is the vault's own id (see
+            // `AuthSelection::auth_method`): the resume then reads it verbatim with this method.
+            let frozen_auth_method: Option<String> = if fresh_episode {
+                None
+            } else {
+                prior_run
+                    .as_ref()
+                    .and_then(|prior| prior.config.auth_selection.as_ref())
+                    .and_then(|selection| selection.auth_method.clone())
+            };
+
+            // Authentication comes from no credential for mock, a fresh vault token, or the
+            // credential source. If the vault says the credential needs re-authentication, we
+            // still resolve the provider without auth to record the correct RunStarted, then
+            // pause before any provider call. Auth attaches after rendering and is excluded
+            // from the config hash, so omitting it does not change the frozen config.
+            // A fresh subscription-account run asks routing to choose an account within the
+            // routing time limit set by ADMISSION_BUDGET; a resume reuses the account decision
+            // saved in that episode's RunConfig. This session's persisted checkpoint contains
+            // its latest episode's conversation key. A new episode inherits that key, or uses
+            // the legacy session-derived fallback if the latest episode predates key recording,
+            // without scanning older WAL history. If this job executes a previously queued
+            // send, its saved key arrives in job.conversation_key and takes precedence.
+            let inherited_key = history
+                .last_config
+                .and_then(|config| config.auth_selection.as_ref())
+                .and_then(|selection| selection.account_decision.as_ref())
+                .and_then(|decision| decision.conversation_key.as_deref());
+            let mut routing_decision_error = None;
+            let account_choice = match self
+                .choose_account_for_episode(
+                    job.req,
+                    fresh_episode,
+                    EpisodeAccountPreference {
+                        pin: (pinned_method, pinned_account),
+                        pool: job.auth.as_ref().and_then(|auth| auth.pool.as_deref()),
+                        credential_id: job
+                            .auth
+                            .as_ref()
+                            .and_then(|auth| auth.credential_id.as_deref()),
+                    },
+                    (job.conversation_key.as_deref(), inherited_key),
+                    broca_module_serve::account_routing::account_hold_cap(
+                        self.max_same_account_wait,
+                        history.last_config,
+                        job.clock
+                            .map_or_else(|| epoch_millis().max(0) as u64, |clock| clock.now_ms()),
+                        |account| {
+                            self.provider_client
+                                .session_last_accepted_at_ms(&job.req.session, account)
+                        },
+                    ),
+                    job.queued_service_tier.as_deref(),
+                )
+                .await
+            {
+                Ok(choice) => choice,
+                Err(broca_module_serve::account_routing::ChoiceRefusal::Refused(refusal))
+                    if job.req.route_decision_id.is_some()
+                        && refusal.routing_code == "unknown_decision" =>
+                {
+                    routing_decision_error = Some(serde_json::from_value::<ProviderError>(serde_json::json!({
+                        "class":"permanent", "provider_code":"routing_decision_refused",
+                        "provider": self.routing.as_ref().map(|routing| routing.config().routing_module.as_str()).unwrap_or("routing"),
+                        "reason":"unknown_decision", "message":"Routing refused the caller's unknown or expired decision; no model request was sent."
+                    })).expect("routing refusal is a provider error"));
+                    AccountChoice::NotApplicable
+                }
+                Err(refusal) => {
+                    let error = RunError::from(refusal);
+                    return Err(error);
+                }
+            };
+            if let (
+                AccountChoice::Routed {
+                    service_tier_chosen: Some(tier),
+                    ..
+                },
+                Some(level),
+            ) = (&account_choice, job.queued_service_tier.as_mut())
+            {
+                level.clone_from(tier);
+            }
+            let frozen_decision = if fresh_episode {
+                None
+            } else {
+                prior_run
+                    .as_ref()
+                    .and_then(|prior| prior.config.auth_selection.as_ref())
+                    .and_then(|selection| selection.account_decision.clone())
+            };
+            let mut resolution = if let Some(error) = &routing_decision_error {
+                AuthResolution {
+                    mode: AuthMode::None,
+                    pause: Some(error.clone()),
+                    selection: None,
+                    method: pinned_method,
+                    project_id: None,
+                    account_id: None,
+                    record_version: None,
+                    in_run_refresh: None,
+                }
+            } else {
+                match self
+                    .decide_auth_with_account(
+                        job.req.model.provider_module_id.as_str(),
+                        frozen_credential_id.as_deref(),
+                        frozen_auth_method.as_deref(),
+                        fresh_episode,
+                        pinned_method,
+                        pinned_account,
+                        &account_choice,
+                        frozen_decision.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.provider_client
+                            .chatgpt_connections()
+                            .retire_session(&job.req.session);
+                        return Err(e);
+                    }
+                }
+            };
+            // A resolve supplies today's token evidence, not a replacement for frozen billing facts.
+            preserve_billing_vault_snapshot(
+                &mut resolution.selection,
+                prior_run
+                    .as_ref()
+                    .and_then(|prior| prior.config.auth_selection.as_ref()),
+            );
+            if resolution.pause.is_some() || resolution.method != Some(AuthMethod::Chatgpt) {
+                self.provider_client
+                    .chatgpt_connections()
+                    .retire_session(&job.req.session);
+            }
+            // Public sends enter as FreshOrResume because the wire cannot know whether the
+            // credential has been repaired. Once auth succeeds, mark the core attempt as
+            // auth-resolved so an AuthRequired replay continues; core ignores that signal for
+            // fresh runs and every other replay resolution.
+            let mode =
+                broca_module_serve::start_mode_after_auth(job.kind, resolution.pause.is_none());
+            // DRIVE the wire family from the resolved auth method: a method that selects a
+            // distinct grammar (Antigravity → google-codeassist, ChatGPT → chatgpt-responses)
+            // overrides the catalog provider's family. `family_for_method` is the single
+            // authority — the same one the consistency guard below consults — so the family
+            // and the credential can't drift to a mismatched pair. The Antigravity project
+            // (a body render input) is frozen here too.
+            let family_override = resolution.method.and_then(family_for_method);
+            // A steer or interrupt that omitted `cache` keeps the session's cache: the policy and
+            // key the latest episode froze, exactly as a resume of that episode would render.
+            let inherited = inherited_cache(job.req, fresh_episode, history.last_config);
+            let cache_policy = match &inherited {
+                Some((policy, _)) => Ok(policy.clone()),
+                None => self.cache_policy_for_episode(
+                    fresh_episode,
+                    family_override,
+                    job.req,
+                    prior_run.as_ref(),
+                ),
+            };
+            let cache_policy = match cache_policy {
+                Ok(policy) => policy,
+                Err(error) => {
+                    return Err(RunError::Config(error));
+                }
+            };
+            let prompt_cache_key = if let Some((_, key)) = inherited {
+                key
+            } else if fresh_episode {
+                self.prompt_cache_key_for_fresh_episode(job.req)
+            } else {
+                prior_run
+                    .as_ref()
+                    .and_then(|prior| frozen_prompt_cache_key(&prior.config))
+            };
+            // The Claude Code persona a fresh episode freezes; the catalog keeps it only when
+            // the episode resolves to the Anthropic OAuth shape. A resume restores the persona
+            // its episode recorded, or its recorded absence, below.
+            let speaks_as_claude_code = job.req.model.provider_module_id.as_str() == "anthropic"
+                && resolution.method != Some(AuthMethod::ApiKey);
+            let fresh_persona = match (&self.claude_code_install_id, fresh_episode) {
+                (Some(install_id), true) if speaks_as_claude_code => {
+                    let cc_version_suffix = self
+                        .session_cc_version_suffix(
+                            job.req,
+                            history
+                                .last_config
+                                .map(|config| &config.frozen_render_config),
+                            history.head_seq,
+                        )
+                        .await;
+                    // Like every other failure before the loop, this one is reported through
+                    // the admission ack. Returning without it would drop the ack unsent, and
+                    // the actor would then see only "run ended before admission" instead of
+                    // this permanent Config cause.
+                    let prompt_ordinal = match self
+                        .session_prompt_ordinal(
+                            job.req,
+                            history
+                                .last_config
+                                .map(|config| &config.frozen_render_config),
+                            history.head_seq,
+                        )
+                        .await
+                    {
+                        Ok(ordinal) => ordinal,
+                        Err(error) => {
+                            return Err(error);
+                        }
+                    };
+                    match broca_module_serve::claude_code_identity::fresh_persona(
+                        install_id,
+                        resolution.account_id.as_deref(),
+                        resolution
+                            .selection
+                            .as_ref()
+                            .map_or(job.req.model.provider_module_id.as_str(), |selection| {
+                                selection.credential_id.as_str()
+                            }),
+                        &job.req.session,
+                        cc_version_suffix,
+                        prompt_ordinal,
+                    ) {
+                        Ok(persona) => Some(persona),
+                        Err(error) => {
+                            tracing::warn!(%error, "Claude Code persona unavailable for this episode");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let opencode_go_session_id =
+                if job.req.model.provider_module_id.as_str() == "opencode-go" {
+                    Some(broca_module_serve::opencode_go_identity::for_session(
+                        &job.req.session,
+                    ))
+                } else {
+                    None
+                };
+            let codeassist_identity = if fresh_episode {
+                match broca_module_serve::codeassist_identity::for_episode(
+                    &job.req.session,
+                    None,
+                    history.head_seq,
+                    epoch_millis().max(0) as u64,
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        let error = format!("Code Assist identity unavailable: {error}");
+                        return Err(RunError::Config(error));
+                    }
+                }
+            } else {
+                None
+            };
+            let alias_route = resolution.method.map(|method| {
+                format!("{}:{}", method.as_token(), job.req.model.provider_module_id)
+            });
+            let mut admitted_tools: Vec<_> = job
+                .req
+                .tools
+                .iter()
+                .filter(|tool| job.req.policy_allowed.contains(&tool.name))
+                .cloned()
+                .collect();
+            // Operator aliases cover every declaration the model sees, including runner-owned
+            // tools. Only fresh episodes freeze this map; resumes keep their recorded names.
+            if let Some(so) = &job.req.structured_output {
+                if so.mode == broca_protocol::structured_output::Mode::SubmitTool {
+                    admitted_tools.push(broca_provider::structured_output::submit_tool(
+                        so.schema.clone(),
+                    ));
+                }
+            }
+            let aliases = alias_route
+                .as_deref()
+                .map(|route| self.tool_name_aliases.for_tools(route, &admitted_tools))
+                .unwrap_or_default();
+            let resolve_options = broca_catalog::live::ResolveOptions {
+                quota_observer: broca_module_serve::usage_observe::observer(
+                    job.req.model.provider_module_id.as_str(),
+                    resolution.method.map(|method| method.as_token()),
+                    if fresh_episode {
+                        resolution.selection.as_ref()
+                    } else {
+                        prior_run
+                            .as_ref()
+                            .and_then(|prior| prior.config.auth_selection.as_ref())
+                    },
+                ),
+                tool_name_aliases: fresh_episode.then_some((&admitted_tools, &aliases)),
+                media: fresh_episode,
+                media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
+                claude_code_persona: fresh_persona.as_ref(),
+                auth_method: resolution.method,
+                family_override,
+                project_id: resolution.project_id.as_deref(),
+                // Use the codex session-id header when no request-level caller scope is fixed for this run.
+                session_id: Some(job.req.session.session.as_str()),
+                account_id: resolution.account_id.as_deref(),
+                cache_policy: cache_policy.clone(),
+                prompt_cache_key: prompt_cache_key.as_deref(),
+                // Only fresh admissions resolve caller render choices; resume uses the bundle.
+                variant: job.req.variant.as_deref().filter(|_| fresh_episode),
+                service_tier: job.req.service_tier.filter(|_| fresh_episode),
+                queued_service_tier: job.queued_service_tier.as_deref().filter(|_| fresh_episode),
+                clock: Some(&self.clock),
+                frozen_account_ref: if fresh_episode {
+                    resolution
+                        .selection
+                        .as_ref()
+                        .and_then(|s| s.account_ref.as_deref())
+                } else {
+                    prior_run
+                        .as_ref()
+                        .and_then(|p| p.config.auth_selection.as_ref())
+                        .and_then(|s| s.account_ref.as_deref())
+                },
+                secret_refresher: resolution
+                    .in_run_refresh
+                    .as_ref()
+                    .map(|refresh| refresh.refresher.clone()),
+                structured_output: job.req.structured_output.as_ref().filter(|_| fresh_episode),
+                // Off unless an operator turned it on; a resume keeps its recorded value.
+                anthropic_server_side_fallback: self.anthropic_fallbacks.server_side,
+                // Offered only to a fresh episode, and only with the operator switch on; the
+                // catalog then decides whether the episode is eligible and freezes it.
+                refusal_fallback_model: self
+                    .anthropic_fallbacks
+                    .refusal_resend
+                    .offer_for(
+                        job.req.model.provider_module_id.as_str(),
+                        job.req.model.model_id.as_str(),
+                    )
+                    .filter(|_| fresh_episode),
+            };
+            let chatgpt_wire = broca_module_serve::chatgpt_identity::for_episode(
+                family_override.filter(|_| fresh_episode),
+                None,
+                || {
+                    let seed = match &self.claude_code_install_id {
+                        Some(seed) => seed.clone(),
+                        None => {
+                            broca_module_serve::claude_code_identity::load_or_create_install_id(
+                                self.wal_store
+                                    .file_store()
+                                    .root()
+                                    .parent()
+                                    .unwrap_or(self.wal_store.file_store().root()),
+                            )
+                            .map_err(|error| {
+                                format!("ChatGPT installation identity unavailable: {error}")
+                            })?
+                        }
+                    };
+                    broca_module_serve::chatgpt_identity::fresh(
+                        &seed,
+                        &job.req.session,
+                        &job.req.run_id.0,
+                        epoch_millis().max(0) as u64,
+                    )
+                },
+            );
+            let chatgpt_wire = match chatgpt_wire {
+                Ok(wire) => wire,
+                Err(error) => {
+                    return Err(RunError::Config(error));
+                }
+            };
+            // Endpoint, renderer and backend ids are admission inputs. Re-reading today's
+            // catalog would move or refuse an already admitted run after an upstream change.
+            let recorded_render_config = prior_run
+                .as_ref()
+                .filter(|_| !fresh_episode)
+                .map(|prior| decode_recorded_render_config(&prior.config));
+            // For a ChatGPT auth-at-start pause, this provider exists solely to satisfy the
+            // core's provider type until resume rebuilds real credentials and runs the pre-call
+            // refreeze check. The core durably writes RunStarted and RunPaused without rendering or
+            // calling the pause-only provider. Verifiable non-pause attempts use strict auth;
+            // an unreadable bundle uses an inert identity solely for core's refusal path.
+            let resolved = match if let Some(Err(error)) = &recorded_render_config {
+                tracing::warn!(%error, "recorded render config is unverifiable");
+                Ok(unverifiable_recorded_resolution(
+                    &model_id,
+                    resolution.method,
+                    family_override,
+                ))
+            } else {
+                resolve_provider_for_episode(
+                    &model_id,
+                    self.provider_base_url.as_deref(),
+                    // Renderers use u32 caps; saturation preserves the caller's u64 in the
+                    // admitted identity while never raising the effective request bound.
+                    job.req
+                        .generation
+                        .max_output_tokens
+                        .map(|limit| limit.min(u64::from(u32::MAX)) as u32),
+                    &resolution,
+                    &resolve_options,
+                    self.provider_client.clone(),
+                    broca_catalog::live::EpisodeRenderConfig {
+                        recorded_config: recorded_render_config
+                            .as_ref()
+                            .and_then(|config| config.as_ref().ok()),
+                        opencode_go_session_id: opencode_go_session_id.as_deref(),
+                        codeassist_identity: codeassist_identity.as_ref(),
+                        chatgpt_wire: chatgpt_wire.as_ref(),
+                        base_url: if fresh_episode {
+                            self.provider_overrides
+                                .base_url(job.req.model.provider_module_id.as_str())
+                        } else {
+                            None
+                        },
+                        ..Default::default()
+                    },
+                )
+            } {
+                Ok(r) => r,
+                Err(e) => {
+                    // Pre-loop resolution failure → fire the admission ack with the error and
+                    // return WITHOUT touching the WAL (no RunStarted, no ghost run).
+                    return Err(e.into());
+                }
+            };
+
+            if let Some(revision) = resolution.record_version {
+                resolved.provider.set_credential_revision(revision);
+            }
+
+            // (provider, auth-method) CONSISTENCY GUARD: a method that IMPLIES a wire family
+            // (the wire-changing methods) must match the family the provider actually
+            // resolved — else a frozen mismatch (e.g. a code-assist token against the plain
+            // Gemini endpoint) would render a token through the wrong wire shape and 400.
+            // `family_for_method` is the single authority both this guard and the future
+            // family driver consult, so the pair can never drift. Same-family method differences
+            // are frozen into the render config by catalog resolution; fail admission (no
+            // RunStarted is written, so no half-started run) if a family-changing method resolves
+            // an inconsistent family.
+            if let Some(method) = resolution.method {
+                if let Some(implied) = family_for_method(method) {
+                    if resolved.family_id != implied {
+                        let msg = format!(
+                            "auth method '{}' implies wire family {:?} but provider resolved \
+                             {:?} — refusing to freeze a mismatched credential/family pair",
+                            method.as_token(),
+                            implied,
+                            resolved.family_id
+                        );
+                        return Err(RunError::Config(msg));
+                    }
+                }
+            }
+
+            Ok(EpisodeAdmission {
+                fresh_episode,
+                episode_context_management,
+                resolution,
+                account_choice,
+                routing_decision_error,
+                mode,
+                resolved,
+            })
+        }
+
+        /// The loop's controls for an admitted run: the routing refusal or sign-in pause it
+        /// starts with, the frozen credential selection, the reporter of its account evidence
+        /// to routing, and its frozen context limit. Returns the reporter too, for the run's
+        /// end. `durable_head` is the session's durable record count, which the reporter's
+        /// event ids are built from.
+        #[allow(clippy::too_many_arguments)]
+        fn episode_control(
+            &self,
+            mut control: broca_core::run::RunControl,
+            run_id: &broca_protocol::RunId,
+            durable_head: Arc<std::sync::atomic::AtomicU64>,
+            routing_decision_error: Option<ProviderError>,
+            resolution: &AuthResolution,
+            account_choice: &AccountChoice,
+            frozen_context_limit: Option<u64>,
+        ) -> (
+            broca_core::run::RunControl,
+            Option<Arc<broca_module_serve::account_routing::RunReporter>>,
+        ) {
+            // Thread the pause-for-reauth instruction + the frozen auth-selection into the
+            // loop's controls. The pause admits the run then writes RunPaused{AuthRequired}
+            // (resumable). The selection is frozen into a fresh RunStarted's RunConfig so a
+            // later resume re-gets the SAME credential (the loop ignores it on a resume —
+            // the value is already durable). Mock stays None; a real run carries the
+            // method-qualified vault credential id.
+            control.compaction_signals = self.compaction_signals;
+            control.max_same_account_wait = self.max_same_account_wait;
+            control.account_limit_pause = self.max_same_account_wait.enabled();
+            control.hook_plane = self.hook_plane();
+            // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
+            // the durable WAL projector. The actor's live-output task discards those same units,
+            // so suppress their payload clones while retaining display, lifecycle, pause, and
+            // error controls needed by the actor and direct loop consumers.
+            control.emit_control_payloads = false;
+            control.pause_for_auth_at_start = if routing_decision_error.is_some() {
+                None
+            } else {
+                resolution.pause.clone()
+            };
+            control.pre_model_error = routing_decision_error.or(control.pre_model_error);
+            control.auth_selection = resolution.selection.clone();
+            // Report this run's account evidence to routing when it has an admission id there:
+            // every decision path except the `legacy_static` one older builds wrote (the removed
+            // operator switch that bypassed routing), fresh or resumed alike.
+            let account_reporter = match (
+                self.routing.as_ref(),
+                resolution
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| selection.account_decision.as_ref())
+                    .and_then(|decision| decision.admission_id.clone()),
+            ) {
+                (Some(routing), Some(admission_id)) => {
+                    let view_digest = match &account_choice {
+                        AccountChoice::Routed { view_digest, .. } => Some(view_digest.clone()),
+                        _ => None,
+                    };
+                    Some(broca_module_serve::account_routing::RunReporter::start(
+                        Arc::clone(routing),
+                        admission_id,
+                        run_id.0.clone(),
+                        view_digest,
+                        durable_head,
+                    ))
+                }
+                _ => None,
+            };
+            control.account_reporter = account_reporter
+                .clone()
+                .map(|reporter| reporter as Arc<dyn broca_core::AccountReporter>);
+            // Freeze the context limit onto a fresh run's RunStarted. A fresh run prefers the
+            // caller override over the catalog; a resume uses only the WAL value.
+            control.admitted_context_limit = frozen_context_limit;
+            (control, account_reporter)
+        }
+
+        /// Reports an admitted run's end: its terminal refusal and finish to routing, and a
+        /// provider's rejection of the vault credential it used to the vault. `terminal_error`
+        /// reads the run's terminal error from the session's storage, only when an outcome
+        /// needs it, and at most once per report. `durable_head` names the run's terminal.
+        #[allow(clippy::too_many_arguments)]
+        async fn report_run_end<F>(
+            &self,
+            summary: &Result<RunSummary, RunError>,
+            account_reporter: Option<&broca_module_serve::account_routing::RunReporter>,
+            report_selection: Option<broca_core::AuthSelection>,
+            used_credential: Option<(broca_core::AuthSelection, u64)>,
+            in_run_refresh: Option<&InRunRefresh>,
+            terminal_error: impl Fn() -> F,
+            lineage: Option<broca_wal::WalLineageId>,
+            durable_head: &std::sync::atomic::AtomicU64,
+            session: &BindIdentity,
+        ) where
+            F: std::future::Future<Output = Option<ProviderError>>,
+        {
+            // The loop made its pause or finish durable and nothing has been appended since:
+            // the durable head names that terminal, including a rejected API key's auth pause.
+            let routed_error = if let Some(reporter) = account_reporter {
+                report_routed_terminal_error(
+                    reporter,
+                    report_selection.as_ref(),
+                    summary,
+                    terminal_error(),
+                    (lineage, durable_head.load(Ordering::Acquire)),
+                )
+                .await
+            } else {
+                None
+            };
+            if let (Some(reporter), Ok(finished)) = (&account_reporter, summary) {
+                if finished.paused.is_none() {
+                    reporter.finish(
+                        lineage,
+                        durable_head.load(Ordering::Acquire),
+                        finished.reason,
+                    );
+                }
+            }
+
+            // Report a WIRE auth rejection to the vault so it invalidates a stale token
+            // (marks it needs_reauth) instead of serving it again next run. This fires only
+            // when the provider REJECTED a token we got from the vault — i.e. the vault
+            // thought the credential was fresh but the provider returned 401 mid-run (the run
+            // then paused AuthRequired, recording the status). Fire-and-forget; a 5xx/429 is a
+            // provider hiccup rather than a dead credential — see `terminal_wire_auth_status`.
+            //
+            // IN PRACTICE ONLY 401 REACHES HERE. This comment used to say 401/403, and
+            // `wire_auth_status` still matches both, but HTTP 403 now classifies Permanent
+            // rather than Auth (transport.rs, "forbidden" is an entitlement refusal, not a stale
+            // token) and the class check rejects it before the status match runs. No shipped
+            // classifier currently pairs Auth with a 403.
+            //
+            // KEEP THE 403 ARM. It is not dead code, it is code waiting on a decision that is
+            // still open: whether a given provider's 403 means "entitlement refused" or "token
+            // is stale" is a judgment, and if one is ever reclassified back to Auth this arm
+            // starts firing correctly with no other change. Deleting it would make that future
+            // flip silently incomplete.
+            //
+            // Worth stating because nothing failed when that reclassification landed: the guard
+            // kept compiling and kept passing its tests while the condition it named moved
+            // elsewhere. An arm whose description outlives its trigger reads as coverage.
+            if let (Some(vault), Some((used_selection, admitted_version))) =
+                (self.vault.as_ref(), used_credential)
+            {
+                if let Some(status) = post_run_wire_auth_status(
+                    summary,
+                    terminal_wire_auth_status(terminal_error()),
+                    routed_error.as_ref(),
+                )
+                .await
+                {
+                    self.provider_client
+                        .chatgpt_connections()
+                        .retire_session(session);
+                    report_rejection_after_run(
+                        vault,
+                        &used_selection,
+                        admitted_version,
+                        in_run_refresh,
+                        status,
+                    )
+                    .await;
+                }
+            }
+        }
+
         async fn choose_account_for_episode(
             &self,
             req: &broca_core::RunRequest,
@@ -3740,7 +4466,8 @@ mod executor {
                             &vault.methods,
                             FALLBACK_METHOD,
                         );
-                        // Every credential is read by grant, by its vault credential id. A
+                        // Every credential is read with a scoped vault read, by its vault
+                        // credential id. A
                         // scoped not_found is final: nothing retries it another way, which
                         // would hide the misconfiguration the operator needs to see.
                         let vault_id = vault.addressing.vault_id_for(&key).into_owned();
@@ -4389,14 +5116,9 @@ mod executor {
         ) -> Result<RunSummary, RunError> {
             // DECIDE auth + RESOLVE the provider BEFORE the loop (so a resolution failure is
             // a typed error via the admission ack, never a ghost run that wrote RunStarted
-            // then died). The run's model id is `<provider>/<model>` from the wire request; a
-            // base_url override (aimock) sends the model verbatim as openai-compatible.
-            let model_id = format!(
-                "{}/{}",
-                job.req.model.provider_module_id, job.req.model.model_id
-            );
-            // Admission, auth/cache selection, and core reconstruction share the same
-            // checkpoint-plus-tail view; a RunStarted may already be behind its watermark.
+            // then died). Admission, auth and cache selection, and the loop's reconstruction
+            // all read one view of the session: its admission checkpoint plus the WAL records
+            // after it. The run's own `RunStarted` may already be inside the checkpoint.
             let prepared = if let Some(readers) = &self.offset_resume {
                 let loaded = async {
                     job.writer
@@ -4432,24 +5154,39 @@ mod executor {
             } else {
                 prior_run_view_from_checkpoint(&prior_snapshot.checkpoint_at_head)
             };
-            let fresh_episode = matches!(job.kind, RunKind::AppendEpisode)
-                || prior_run
-                    .as_ref()
-                    .is_none_or(|prior| prior.idle && prior.run_id != job.req.run_id);
-            // Context management is decided before auth so a refused value costs no credential
-            // read. The last episode's config is read from the snapshot directly because an
-            // appended episode has no `prior_run` view, yet is exactly the case that inherits.
-            let episode_context_management = match self.context_management.for_episode(
-                fresh_episode,
-                job.req.context_management.as_ref(),
-                prior_snapshot
+            let history = EpisodeHistory {
+                prior_run,
+                last_config: prior_snapshot
                     .checkpoint_at_head
                     .last_episode
                     .as_ref()
                     .map(|episode| &episode.config),
-                &job.req.session.project_root.to_string_lossy(),
-            ) {
-                Ok(decided) => decided,
+                head_seq: prior_snapshot.head_seq,
+            };
+            let admitted = self
+                .admit_episode(
+                    EpisodeJob {
+                        req: &job.req,
+                        kind: job.kind,
+                        auth: &job.auth,
+                        conversation_key: &job.conversation_key,
+                        queued_service_tier: &mut job.queued_service_tier,
+                        media_profile: &job.media_profile,
+                        clock: job.control.clock.as_ref(),
+                    },
+                    &history,
+                )
+                .await;
+            let EpisodeAdmission {
+                fresh_episode,
+                episode_context_management,
+                resolution,
+                account_choice,
+                routing_decision_error,
+                mode,
+                resolved,
+            } = match admitted {
+                Ok(admitted) => admitted,
                 Err(error) => {
                     if let Some(ack) = job.on_admitted {
                         let _ = ack.send(Err(error.clone()));
@@ -4457,529 +5194,7 @@ mod executor {
                     return Err(error);
                 }
             };
-            let auth_context = episode_auth_context(fresh_episode, prior_run.is_some());
-            let (pinned_method, pinned_account) =
-                match caller_auth_for_episode(job.auth.as_ref(), auth_context) {
-                    Ok(pin) => pin,
-                    Err(error) => {
-                        if let Some(ack) = job.on_admitted {
-                            let _ = ack.send(Err(error.clone()));
-                        }
-                        return Err(error);
-                    }
-                };
-            // On a RESUME, re-use the credential the prior run FROZE (read from the durable
-            // RunConfig of the last episode) — never re-resolve the method from config/router
-            // (a drift would change the wire family and bust the cache). A NEW episode
-            // (append) resolves fresh — it's a new run with its own method. A fresh run / an
-            // A prior run without a frozen credential id resolves from config.
-            let frozen_credential_id: Option<String> = if fresh_episode {
-                None
-            } else {
-                prior_run
-                    .as_ref()
-                    .and_then(|prior| prior.config.auth_selection.clone())
-                    .map(|s| s.credential_id)
-            };
-            // Present when the frozen credential id is the vault's own id (see
-            // `AuthSelection::auth_method`): the resume then reads it verbatim with this method.
-            let frozen_auth_method: Option<String> = if fresh_episode {
-                None
-            } else {
-                prior_run
-                    .as_ref()
-                    .and_then(|prior| prior.config.auth_selection.as_ref())
-                    .and_then(|selection| selection.auth_method.clone())
-            };
-
-            // Authentication comes from no credential for mock, a fresh vault token, or the
-            // credential source. If the vault says the credential needs re-authentication, we
-            // still resolve the provider without auth to record the correct RunStarted, then
-            // pause before any provider call. Auth attaches after rendering and is excluded
-            // from the config hash, so omitting it does not change the frozen config.
-            // A fresh subscription-account run asks routing to choose an account within the
-            // routing time limit set by ADMISSION_BUDGET; a resume reuses the account decision
-            // saved in that episode's RunConfig. This session's persisted checkpoint contains
-            // its latest episode's conversation key. A new episode inherits that key, or uses
-            // the legacy session-derived fallback if the latest episode predates key recording,
-            // without scanning older WAL history. If this job executes a previously queued
-            // send, its saved key arrives in job.conversation_key and takes precedence.
-            let inherited_key = prior_snapshot
-                .checkpoint_at_head
-                .last_episode
-                .as_ref()
-                .and_then(|episode| episode.config.auth_selection.as_ref())
-                .and_then(|selection| selection.account_decision.as_ref())
-                .and_then(|decision| decision.conversation_key.as_deref());
-            let mut routing_decision_error = None;
-            let account_choice = match self
-                .choose_account_for_episode(
-                    &job.req,
-                    fresh_episode,
-                    EpisodeAccountPreference {
-                        pin: (pinned_method, pinned_account),
-                        pool: job.auth.as_ref().and_then(|auth| auth.pool.as_deref()),
-                        credential_id: job
-                            .auth
-                            .as_ref()
-                            .and_then(|auth| auth.credential_id.as_deref()),
-                    },
-                    (job.conversation_key.as_deref(), inherited_key),
-                    broca_module_serve::account_routing::account_hold_cap(
-                        self.max_same_account_wait,
-                        prior_snapshot
-                            .checkpoint_at_head
-                            .last_episode
-                            .as_ref()
-                            .map(|episode| &episode.config),
-                        job.control
-                            .clock
-                            .as_ref()
-                            .map_or_else(|| epoch_millis().max(0) as u64, |clock| clock.now_ms()),
-                        |account| {
-                            self.provider_client
-                                .session_last_accepted_at_ms(&job.req.session, account)
-                        },
-                    ),
-                    job.queued_service_tier.as_deref(),
-                )
-                .await
-            {
-                Ok(choice) => choice,
-                Err(broca_module_serve::account_routing::ChoiceRefusal::Refused(refusal))
-                    if job.req.route_decision_id.is_some()
-                        && refusal.routing_code == "unknown_decision" =>
-                {
-                    routing_decision_error = Some(serde_json::from_value::<ProviderError>(serde_json::json!({
-                        "class":"permanent", "provider_code":"routing_decision_refused",
-                        "provider": self.routing.as_ref().map(|routing| routing.config().routing_module.as_str()).unwrap_or("routing"),
-                        "reason":"unknown_decision", "message":"Routing refused the caller's unknown or expired decision; no model request was sent."
-                    })).expect("routing refusal is a provider error"));
-                    AccountChoice::NotApplicable
-                }
-                Err(refusal) => {
-                    let error = RunError::from(refusal);
-                    if let Some(ack) = job.on_admitted {
-                        let _ = ack.send(Err(error.clone()));
-                    }
-                    return Err(error);
-                }
-            };
-            if let (
-                AccountChoice::Routed {
-                    service_tier_chosen: Some(tier),
-                    ..
-                },
-                Some(level),
-            ) = (&account_choice, job.queued_service_tier.as_mut())
-            {
-                level.clone_from(tier);
-            }
-            let frozen_decision = if fresh_episode {
-                None
-            } else {
-                prior_run
-                    .as_ref()
-                    .and_then(|prior| prior.config.auth_selection.as_ref())
-                    .and_then(|selection| selection.account_decision.clone())
-            };
-            let mut resolution = if let Some(error) = &routing_decision_error {
-                AuthResolution {
-                    mode: AuthMode::None,
-                    pause: Some(error.clone()),
-                    selection: None,
-                    method: pinned_method,
-                    project_id: None,
-                    account_id: None,
-                    record_version: None,
-                    in_run_refresh: None,
-                }
-            } else {
-                match self
-                    .decide_auth_with_account(
-                        job.req.model.provider_module_id.as_str(),
-                        frozen_credential_id.as_deref(),
-                        frozen_auth_method.as_deref(),
-                        fresh_episode,
-                        pinned_method,
-                        pinned_account,
-                        &account_choice,
-                        frozen_decision.as_ref(),
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.provider_client
-                            .chatgpt_connections()
-                            .retire_session(&job.req.session);
-                        if let Some(ack) = job.on_admitted {
-                            let _ = ack.send(Err(e.clone()));
-                        }
-                        return Err(e);
-                    }
-                }
-            };
-            // A resolve supplies today's token evidence, not a replacement for frozen billing facts.
-            preserve_billing_vault_snapshot(
-                &mut resolution.selection,
-                prior_run
-                    .as_ref()
-                    .and_then(|prior| prior.config.auth_selection.as_ref()),
-            );
-            if resolution.pause.is_some() || resolution.method != Some(AuthMethod::Chatgpt) {
-                self.provider_client
-                    .chatgpt_connections()
-                    .retire_session(&job.req.session);
-            }
-            // Public sends enter as FreshOrResume because the wire cannot know whether the
-            // credential has been repaired. Once auth succeeds, mark the core attempt as
-            // auth-resolved so an AuthRequired replay continues; core ignores that signal for
-            // fresh runs and every other replay resolution.
-            let mode =
-                broca_module_serve::start_mode_after_auth(job.kind, resolution.pause.is_none());
-            // DRIVE the wire family from the resolved auth method: a method that selects a
-            // distinct grammar (Antigravity → google-codeassist, ChatGPT → chatgpt-responses)
-            // overrides the catalog provider's family. `family_for_method` is the single
-            // authority — the same one the consistency guard below consults — so the family
-            // and the credential can't drift to a mismatched pair. The Antigravity project
-            // (a body render input) is frozen here too.
-            let family_override = resolution.method.and_then(family_for_method);
-            // A steer or interrupt that omitted `cache` keeps the session's cache: the policy and
-            // key the latest episode froze, exactly as a resume of that episode would render.
-            let inherited = inherited_cache(
-                &job.req,
-                fresh_episode,
-                prior_snapshot
-                    .checkpoint_at_head
-                    .last_episode
-                    .as_ref()
-                    .map(|episode| &episode.config),
-            );
-            let cache_policy = match &inherited {
-                Some((policy, _)) => Ok(policy.clone()),
-                None => self.cache_policy_for_episode(
-                    fresh_episode,
-                    family_override,
-                    &job.req,
-                    prior_run.as_ref(),
-                ),
-            };
-            let cache_policy = match cache_policy {
-                Ok(policy) => policy,
-                Err(error) => {
-                    if let Some(ack) = job.on_admitted {
-                        let _ = ack.send(Err(RunError::Config(error.clone())));
-                    }
-                    return Err(RunError::Config(error));
-                }
-            };
-            let prompt_cache_key = if let Some((_, key)) = inherited {
-                key
-            } else if fresh_episode {
-                self.prompt_cache_key_for_fresh_episode(&job.req)
-            } else {
-                prior_run
-                    .as_ref()
-                    .and_then(|prior| frozen_prompt_cache_key(&prior.config))
-            };
-            // The Claude Code persona a fresh episode freezes; the catalog keeps it only when
-            // the episode resolves to the Anthropic OAuth shape. A resume restores the persona
-            // its episode recorded, or its recorded absence, below.
-            let speaks_as_claude_code = job.req.model.provider_module_id.as_str() == "anthropic"
-                && resolution.method != Some(AuthMethod::ApiKey);
-            let fresh_persona = match (&self.claude_code_install_id, fresh_episode) {
-                (Some(install_id), true) if speaks_as_claude_code => {
-                    let cc_version_suffix = self
-                        .session_cc_version_suffix(
-                            &job.req,
-                            prior_snapshot
-                                .checkpoint_at_head
-                                .last_episode
-                                .as_ref()
-                                .map(|episode| &episode.config.frozen_render_config),
-                            prior_snapshot.head_seq,
-                        )
-                        .await;
-                    // Like every other failure before the loop, this one is reported through
-                    // the admission ack. Returning without it would drop the ack unsent, and
-                    // the actor would then see only "run ended before admission" instead of
-                    // this permanent Config cause.
-                    let prompt_ordinal = match self
-                        .session_prompt_ordinal(
-                            &job.req,
-                            prior_snapshot
-                                .checkpoint_at_head
-                                .last_episode
-                                .as_ref()
-                                .map(|episode| &episode.config.frozen_render_config),
-                            prior_snapshot.head_seq,
-                        )
-                        .await
-                    {
-                        Ok(ordinal) => ordinal,
-                        Err(error) => {
-                            if let Some(ack) = job.on_admitted {
-                                let _ = ack.send(Err(error.clone()));
-                            }
-                            return Err(error);
-                        }
-                    };
-                    match broca_module_serve::claude_code_identity::fresh_persona(
-                        install_id,
-                        resolution.account_id.as_deref(),
-                        resolution
-                            .selection
-                            .as_ref()
-                            .map_or(job.req.model.provider_module_id.as_str(), |selection| {
-                                selection.credential_id.as_str()
-                            }),
-                        &job.req.session,
-                        cc_version_suffix,
-                        prompt_ordinal,
-                    ) {
-                        Ok(persona) => Some(persona),
-                        Err(error) => {
-                            tracing::warn!(%error, "Claude Code persona unavailable for this episode");
-                            None
-                        }
-                    }
-                }
-                _ => None,
-            };
-            let opencode_go_session_id =
-                if job.req.model.provider_module_id.as_str() == "opencode-go" {
-                    Some(broca_module_serve::opencode_go_identity::for_session(
-                        &job.req.session,
-                    ))
-                } else {
-                    None
-                };
-            let codeassist_identity = if fresh_episode {
-                match broca_module_serve::codeassist_identity::for_episode(
-                    &job.req.session,
-                    None,
-                    prior_snapshot.head_seq,
-                    epoch_millis().max(0) as u64,
-                ) {
-                    Ok(identity) => identity,
-                    Err(error) => {
-                        let error = format!("Code Assist identity unavailable: {error}");
-                        if let Some(ack) = job.on_admitted {
-                            let _ = ack.send(Err(RunError::Config(error.clone())));
-                        }
-                        return Err(RunError::Config(error));
-                    }
-                }
-            } else {
-                None
-            };
-            let alias_route = resolution.method.map(|method| {
-                format!("{}:{}", method.as_token(), job.req.model.provider_module_id)
-            });
-            let mut admitted_tools: Vec<_> = job
-                .req
-                .tools
-                .iter()
-                .filter(|tool| job.req.policy_allowed.contains(&tool.name))
-                .cloned()
-                .collect();
-            // Operator aliases cover every declaration the model sees, including runner-owned
-            // tools. Only fresh episodes freeze this map; resumes keep their recorded names.
-            if let Some(so) = &job.req.structured_output {
-                if so.mode == broca_protocol::structured_output::Mode::SubmitTool {
-                    admitted_tools.push(broca_provider::structured_output::submit_tool(
-                        so.schema.clone(),
-                    ));
-                }
-            }
-            let aliases = alias_route
-                .as_deref()
-                .map(|route| self.tool_name_aliases.for_tools(route, &admitted_tools))
-                .unwrap_or_default();
-            let resolve_options = broca_catalog::live::ResolveOptions {
-                quota_observer: broca_module_serve::usage_observe::observer(
-                    job.req.model.provider_module_id.as_str(),
-                    resolution.method.map(|method| method.as_token()),
-                    if fresh_episode {
-                        resolution.selection.as_ref()
-                    } else {
-                        prior_run
-                            .as_ref()
-                            .and_then(|prior| prior.config.auth_selection.as_ref())
-                    },
-                ),
-                tool_name_aliases: fresh_episode.then_some((&admitted_tools, &aliases)),
-                media: fresh_episode,
-                media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
-                claude_code_persona: fresh_persona.as_ref(),
-                auth_method: resolution.method,
-                family_override,
-                project_id: resolution.project_id.as_deref(),
-                // Use the codex session-id header when no request-level caller scope is fixed for this run.
-                session_id: Some(job.req.session.session.as_str()),
-                account_id: resolution.account_id.as_deref(),
-                cache_policy: cache_policy.clone(),
-                prompt_cache_key: prompt_cache_key.as_deref(),
-                // Only fresh admissions resolve caller render choices; resume uses the bundle.
-                variant: job.req.variant.as_deref().filter(|_| fresh_episode),
-                service_tier: job.req.service_tier.filter(|_| fresh_episode),
-                queued_service_tier: job.queued_service_tier.as_deref().filter(|_| fresh_episode),
-                clock: Some(&self.clock),
-                frozen_account_ref: if fresh_episode {
-                    resolution
-                        .selection
-                        .as_ref()
-                        .and_then(|s| s.account_ref.as_deref())
-                } else {
-                    prior_run
-                        .as_ref()
-                        .and_then(|p| p.config.auth_selection.as_ref())
-                        .and_then(|s| s.account_ref.as_deref())
-                },
-                secret_refresher: resolution
-                    .in_run_refresh
-                    .as_ref()
-                    .map(|refresh| refresh.refresher.clone()),
-                structured_output: job.req.structured_output.as_ref().filter(|_| fresh_episode),
-                // Off unless an operator turned it on; a resume keeps its recorded value.
-                anthropic_server_side_fallback: self.anthropic_fallbacks.server_side,
-                // Offered only to a fresh episode, and only with the operator switch on; the
-                // catalog then decides whether the episode is eligible and freezes it.
-                refusal_fallback_model: self
-                    .anthropic_fallbacks
-                    .refusal_resend
-                    .offer_for(
-                        job.req.model.provider_module_id.as_str(),
-                        job.req.model.model_id.as_str(),
-                    )
-                    .filter(|_| fresh_episode),
-            };
-            let chatgpt_wire = broca_module_serve::chatgpt_identity::for_episode(
-                family_override.filter(|_| fresh_episode),
-                None,
-                || {
-                    let seed = match &self.claude_code_install_id {
-                        Some(seed) => seed.clone(),
-                        None => {
-                            broca_module_serve::claude_code_identity::load_or_create_install_id(
-                                self.wal_store
-                                    .file_store()
-                                    .root()
-                                    .parent()
-                                    .unwrap_or(self.wal_store.file_store().root()),
-                            )
-                            .map_err(|error| {
-                                format!("ChatGPT installation identity unavailable: {error}")
-                            })?
-                        }
-                    };
-                    broca_module_serve::chatgpt_identity::fresh(
-                        &seed,
-                        &job.req.session,
-                        &job.req.run_id.0,
-                        epoch_millis().max(0) as u64,
-                    )
-                },
-            );
-            let chatgpt_wire = match chatgpt_wire {
-                Ok(wire) => wire,
-                Err(error) => {
-                    if let Some(ack) = job.on_admitted {
-                        let _ = ack.send(Err(RunError::Config(error.clone())));
-                    }
-                    return Err(RunError::Config(error));
-                }
-            };
-            // Endpoint, renderer and backend ids are admission inputs. Re-reading today's
-            // catalog would move or refuse an already admitted run after an upstream change.
-            let recorded_render_config = prior_run
-                .as_ref()
-                .filter(|_| !fresh_episode)
-                .map(|prior| decode_recorded_render_config(&prior.config));
-            // For a ChatGPT auth-at-start pause, this provider exists solely to satisfy the
-            // core's provider type until resume rebuilds real credentials and runs the pre-call
-            // refreeze check. The core durably writes RunStarted and RunPaused without rendering or
-            // calling the pause-only provider. Verifiable non-pause attempts use strict auth;
-            // an unreadable bundle uses an inert identity solely for core's refusal path.
-            let resolved = match if let Some(Err(error)) = &recorded_render_config {
-                tracing::warn!(%error, "recorded render config is unverifiable");
-                Ok(unverifiable_recorded_resolution(
-                    &model_id,
-                    resolution.method,
-                    family_override,
-                ))
-            } else {
-                resolve_provider_for_episode(
-                    &model_id,
-                    self.provider_base_url.as_deref(),
-                    // Renderers use u32 caps; saturation preserves the caller's u64 in the
-                    // admitted identity while never raising the effective request bound.
-                    job.req
-                        .generation
-                        .max_output_tokens
-                        .map(|limit| limit.min(u64::from(u32::MAX)) as u32),
-                    &resolution,
-                    &resolve_options,
-                    self.provider_client.clone(),
-                    broca_catalog::live::EpisodeRenderConfig {
-                        recorded_config: recorded_render_config
-                            .as_ref()
-                            .and_then(|config| config.as_ref().ok()),
-                        opencode_go_session_id: opencode_go_session_id.as_deref(),
-                        codeassist_identity: codeassist_identity.as_ref(),
-                        chatgpt_wire: chatgpt_wire.as_ref(),
-                        base_url: if fresh_episode {
-                            self.provider_overrides
-                                .base_url(job.req.model.provider_module_id.as_str())
-                        } else {
-                            None
-                        },
-                        ..Default::default()
-                    },
-                )
-            } {
-                Ok(r) => r,
-                Err(e) => {
-                    // Pre-loop resolution failure → fire the admission ack with the error and
-                    // return WITHOUT touching the WAL (no RunStarted, no ghost run).
-                    if let Some(ack) = job.on_admitted {
-                        let _ = ack.send(Err(e.clone().into()));
-                    }
-                    return Err(e.into());
-                }
-            };
-
-            if let Some(revision) = resolution.record_version {
-                resolved.provider.set_credential_revision(revision);
-            }
-
-            // (provider, auth-method) CONSISTENCY GUARD: a method that IMPLIES a wire family
-            // (the wire-changing methods) must match the family the provider actually
-            // resolved — else a frozen mismatch (e.g. a code-assist token against the plain
-            // Gemini endpoint) would render a token through the wrong wire shape and 400.
-            // `family_for_method` is the single authority both this guard and the future
-            // family driver consult, so the pair can never drift. Same-family method differences
-            // are frozen into the render config by catalog resolution; fail admission (no
-            // RunStarted is written, so no half-started run) if a family-changing method resolves
-            // an inconsistent family.
-            if let Some(method) = resolution.method {
-                if let Some(implied) = family_for_method(method) {
-                    if resolved.family_id != implied {
-                        let msg = format!(
-                            "auth method '{}' implies wire family {:?} but provider resolved \
-                             {:?} — refusing to freeze a mismatched credential/family pair",
-                            method.as_token(),
-                            implied,
-                            resolved.family_id
-                        );
-                        if let Some(ack) = job.on_admitted {
-                            let _ = ack.send(Err(RunError::Config(msg.clone())));
-                        }
-                        return Err(RunError::Config(msg));
-                    }
-                }
-            }
+            let prior_run = history.prior_run;
 
             if job.has_media_input() {
                 let checked = job.admit_media(
@@ -5149,62 +5364,16 @@ mod executor {
                     .and_then(|prior| prior.config.context_limit),
             );
 
-            // Thread the pause-for-reauth instruction + the frozen auth-selection into the
-            // loop's controls. The pause admits the run then writes RunPaused{AuthRequired}
-            // (resumable). The selection is frozen into a fresh RunStarted's RunConfig so a
-            // later resume re-gets the SAME credential (the loop ignores it on a resume —
-            // the value is already durable). Mock stays None; a real run carries the
-            // method-qualified vault credential id.
-            let mut control = job.control;
-            control.compaction_signals = self.compaction_signals;
-            control.max_same_account_wait = self.max_same_account_wait;
-            control.account_limit_pause = self.max_same_account_wait.enabled();
-            control.hook_plane = self.hook_plane();
-            // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
-            // the durable WAL projector. The actor's live-output task discards those same units,
-            // so suppress their payload clones while retaining display, lifecycle, pause, and
-            // error controls needed by the actor and direct loop consumers.
-            control.emit_control_payloads = false;
-            control.pause_for_auth_at_start = if routing_decision_error.is_some() {
-                None
-            } else {
-                resolution.pause.clone()
-            };
-            control.pre_model_error = routing_decision_error.or(control.pre_model_error);
-            control.auth_selection = resolution.selection.clone();
-            // Report this run's account evidence to routing when it has an admission id there:
-            // every decision path except the `legacy_static` one older builds wrote (the removed
-            // operator switch that bypassed routing), fresh or resumed alike.
             let report_selection = resolution.selection.clone();
-            let account_reporter = match (
-                self.routing.as_ref(),
-                resolution
-                    .selection
-                    .as_ref()
-                    .and_then(|selection| selection.account_decision.as_ref())
-                    .and_then(|decision| decision.admission_id.clone()),
-            ) {
-                (Some(routing), Some(admission_id)) => {
-                    let view_digest = match &account_choice {
-                        AccountChoice::Routed { view_digest, .. } => Some(view_digest.clone()),
-                        _ => None,
-                    };
-                    Some(broca_module_serve::account_routing::RunReporter::start(
-                        Arc::clone(routing),
-                        admission_id,
-                        job.req.run_id.0.clone(),
-                        view_digest,
-                        job.writer.durable_head(),
-                    ))
-                }
-                _ => None,
-            };
-            control.account_reporter = account_reporter
-                .clone()
-                .map(|reporter| reporter as Arc<dyn broca_core::AccountReporter>);
-            // Freeze the context limit onto a fresh run's RunStarted. A fresh run prefers the
-            // caller override over the catalog; a resume uses only the WAL value.
-            control.admitted_context_limit = frozen_context_limit;
+            let (control, account_reporter) = self.episode_control(
+                job.control,
+                &job.req.run_id,
+                job.writer.durable_head(),
+                routing_decision_error,
+                &resolution,
+                &account_choice,
+                frozen_context_limit,
+            );
             // What a new episode freezes onto RunStarted; core ignores it on a resume.
             job.req.context_management = Some(episode_context_management);
 
@@ -5260,80 +5429,18 @@ mod executor {
                 .await
             };
 
-            // The loop made its pause or finish durable and nothing has been appended since:
-            // the durable head names that terminal, including a rejected API key's auth pause.
-            let terminal_error = if let Some(reporter) = &account_reporter {
-                report_routed_terminal_error(
-                    reporter,
-                    report_selection.as_ref(),
-                    &summary,
-                    self.wal_store.clone(),
-                    session.clone(),
-                    (
-                        job.writer.lineage_id(),
-                        job.writer.durable_head().load(Ordering::Acquire),
-                    ),
-                )
-                .await
-            } else {
-                None
-            };
-            if let (Some(reporter), Ok(finished)) = (&account_reporter, &summary) {
-                if finished.paused.is_none() {
-                    reporter.finish(
-                        job.writer.lineage_id(),
-                        job.writer.durable_head().load(Ordering::Acquire),
-                        finished.reason,
-                    );
-                }
-            }
-
-            // Report a WIRE auth rejection to the vault so it invalidates a stale token
-            // (marks it needs_reauth) instead of serving it again next run. This fires only
-            // when the provider REJECTED a token we got from the vault — i.e. the vault
-            // thought the credential was fresh but the provider returned 401 mid-run (the run
-            // then paused AuthRequired, recording the status). Fire-and-forget; a 5xx/429 is a
-            // provider hiccup rather than a dead credential — see `terminal_wire_auth_status`.
-            //
-            // IN PRACTICE ONLY 401 REACHES HERE. This comment used to say 401/403, and
-            // `wire_auth_status` still matches both, but HTTP 403 now classifies Permanent
-            // rather than Auth (transport.rs, "forbidden" is an entitlement refusal, not a stale
-            // token) and the class check rejects it before the status match runs. No shipped
-            // classifier currently pairs Auth with a 403.
-            //
-            // KEEP THE 403 ARM. It is not dead code, it is code waiting on a decision that is
-            // still open: whether a given provider's 403 means "entitlement refused" or "token
-            // is stale" is a judgment, and if one is ever reclassified back to Auth this arm
-            // starts firing correctly with no other change. Deleting it would make that future
-            // flip silently incomplete.
-            //
-            // Worth stating because nothing failed when that reclassification landed: the guard
-            // kept compiling and kept passing its tests while the condition it named moved
-            // elsewhere. An arm whose description outlives its trigger reads as coverage.
-            if let (Some(vault), Some((used_selection, admitted_version))) =
-                (self.vault.as_ref(), used_credential)
-            {
-                if let Some(status) = post_run_wire_auth_status(
-                    &summary,
-                    self.wal_store.clone(),
-                    session.clone(),
-                    terminal_error.as_ref(),
-                )
-                .await
-                {
-                    self.provider_client
-                        .chatgpt_connections()
-                        .retire_session(&session);
-                    report_rejection_after_run(
-                        vault,
-                        &used_selection,
-                        admitted_version,
-                        in_run_refresh.as_ref(),
-                        status,
-                    )
-                    .await;
-                }
-            }
+            self.report_run_end(
+                &summary,
+                account_reporter.as_deref(),
+                report_selection,
+                used_credential,
+                in_run_refresh.as_ref(),
+                || terminal_provider_error(self.wal_store.clone(), session.clone()),
+                job.writer.lineage_id(),
+                &job.writer.durable_head(),
+                &session,
+            )
+            .await;
 
             summary
         }
@@ -7083,7 +7190,15 @@ mod executor {
             let outcome = run_outcome(RunFinishReason::Completed, None);
 
             assert_eq!(
-                post_run_wire_auth_status(&outcome, store.clone(), session.clone(), None).await,
+                post_run_wire_auth_status(
+                    &outcome,
+                    terminal_wire_auth_status(terminal_provider_error(
+                        store.clone(),
+                        session.clone()
+                    )),
+                    None,
+                )
+                .await,
                 None
             );
             assert_eq!(store.full_reads(), 0);
@@ -7091,7 +7206,7 @@ mod executor {
             // Control case: bypassing the outcome gate performs the full WAL read even though
             // the newest terminal is a successful finish and therefore yields no auth status.
             assert_eq!(
-                terminal_wire_auth_status(store.clone(), session).await,
+                terminal_wire_auth_status(terminal_provider_error(store.clone(), session)).await,
                 None
             );
             assert_eq!(store.full_reads(), 1);
@@ -7107,7 +7222,12 @@ mod executor {
             );
 
             assert_eq!(
-                post_run_wire_auth_status(&outcome, store.clone(), session, None).await,
+                post_run_wire_auth_status(
+                    &outcome,
+                    terminal_wire_auth_status(terminal_provider_error(store.clone(), session)),
+                    None,
+                )
+                .await,
                 Some(401)
             );
             assert_eq!(store.full_reads(), 1);
@@ -7122,8 +7242,12 @@ mod executor {
                 let cached = terminal_provider_error(store.clone(), session.clone()).await;
                 assert_eq!(store.full_reads(), 1);
                 assert_eq!(
-                    post_run_wire_auth_status(&outcome, store.clone(), session, Some(&cached))
-                        .await,
+                    post_run_wire_auth_status(
+                        &outcome,
+                        terminal_wire_auth_status(terminal_provider_error(store.clone(), session)),
+                        Some(&cached),
+                    )
+                    .await,
                     error.as_ref().and_then(wire_auth_status)
                 );
                 assert_eq!(
@@ -7206,8 +7330,7 @@ mod executor {
                         &reporter,
                         Some(&selection),
                         &outcome,
-                        store.clone(),
-                        session.clone(),
+                        terminal_provider_error(store.clone(), session.clone()),
                         (Some(lineage), seq),
                     )
                     .await;
@@ -7219,8 +7342,10 @@ mod executor {
                         assert_eq!(
                             post_run_wire_auth_status(
                                 &outcome,
-                                store.clone(),
-                                session,
+                                terminal_wire_auth_status(terminal_provider_error(
+                                    store.clone(),
+                                    session
+                                )),
                                 cached.as_ref()
                             )
                             .await,
