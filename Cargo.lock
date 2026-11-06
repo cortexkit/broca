@@ -459,6 +459,8 @@ dependencies = [
  "broca-owner-only",
  "broca-protocol",
  "broca-provider",
+ "broca-session-loop",
+ "broca-session-store",
  "broca-store",
  "broca-subc",
  "broca-test-support",
@@ -629,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "broca-session-loop"
-version = "0.3.318"
+version = "0.3.320"
 dependencies = [
  "async-trait",
  "broca-core",

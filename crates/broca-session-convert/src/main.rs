@@ -971,6 +971,12 @@ struct PromptReport {
     mismatches: BTreeMap<String, u64>,
     /// A few mismatching logs per category, by name, to look at by hand.
     examples: BTreeMap<String, Vec<String>>,
+    /// Logs whose folded human-prompt count equals today's count over the log's run inputs
+    /// (`claude_code_identity::human_prompt_ordinal`), and the logs where it doesn't.
+    prompt_count_equal: u64,
+    prompt_count_mismatches: BTreeMap<String, u64>,
+    /// Logs with at least one human prompt, so a count can tell the two rules apart.
+    prompt_count_nonzero: u64,
 }
 
 /// Where two prompts first differ, named by position, field and role only.
@@ -1059,6 +1065,30 @@ fn run_prompt(args: &Args) {
             return;
         }
         report.messages += today.len() as u64;
+        let counted = broca_module_serve::claude_code_identity::human_prompt_ordinal(&records, &[]);
+        if counted > 0 {
+            report.prompt_count_nonzero += 1;
+        }
+        if conversation.human_prompts == counted {
+            report.prompt_count_equal += 1;
+        } else {
+            let key = if conversation.human_prompts > counted {
+                "folded more"
+            } else {
+                "folded fewer"
+            };
+            *report
+                .prompt_count_mismatches
+                .entry(key.into())
+                .or_default() += 1;
+            let examples = report
+                .examples
+                .entry(format!("prompts: {key}"))
+                .or_default();
+            if examples.len() < 5 {
+                examples.push(name.clone());
+            }
+        }
         match prompt_difference(&today, &conversation.messages) {
             None => report.equal += 1,
             Some(category) => {

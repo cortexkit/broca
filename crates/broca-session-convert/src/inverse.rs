@@ -108,7 +108,6 @@ fn run_started(
 ) -> Result<Value, String> {
     let choices = members(start.run_choices.as_ref())?;
     let mut object = members(choices.get("record"))?;
-    let mut config = members(choices.get("config"))?;
     let mut manifest = choices
         .get("manifest")
         .map(|m| members(Some(m)))
@@ -140,39 +139,15 @@ fn run_started(
     set(&mut object, "keep_warm", start.keep_warm.as_ref());
     set(&mut object, "on_restart", start.on_restart.as_ref());
 
-    config.insert("model".into(), json(&start.model));
-    config.insert("renderer_version".into(), json(start.renderer_version));
-    set(&mut config, "context_limit", start.context_limit);
-    set(&mut config, "service_tier", start.service_tier.as_ref());
-    set(
-        &mut config,
-        "route_decision_id",
-        start.route_decision_id.as_ref(),
-    );
-    set(&mut config, "auth_selection", start.auth_selection.as_ref());
-
-    // The config's parts come first (its tools, then its response format, which every run
-    // config has, then its global system text), then the manifest's. So a tools part before the
-    // response format is the config's, and one after it is the manifest's.
-    let mut past_config = false;
-    for part in &start.setup {
-        let value = part_value(parts, part)?;
-        match part.kind {
-            PartKind::Tools if !past_config => {
-                config.insert("tools".into(), value);
-            }
-            PartKind::ResponseFormat => {
-                config.insert("response_format".into(), value);
-                past_config = true;
-            }
-            PartKind::GlobalSystem => {
-                config.insert("global_system".into(), value);
-            }
-            PartKind::RenderConfig => {
-                config.insert("frozen_render_config".into(), value);
-            }
-            kind => fill_manifest(manifest.get_or_insert_with(Map::new), kind, value),
-        }
+    // The config's members and setup parts are read as the serve executor reads them.
+    let (members_of_config, manifest_parts) = broca_session_loop::run::run_config_members(
+        start,
+        |part| part_value(parts, part),
+        || "a carried payload is not an object".to_string(),
+    )?;
+    let config = members_of_config;
+    for (kind, value) in manifest_parts {
+        fill_manifest(manifest.get_or_insert_with(Map::new), kind, value);
     }
     object.insert("config".into(), Value::Object(config));
     if let Some(manifest) = manifest {

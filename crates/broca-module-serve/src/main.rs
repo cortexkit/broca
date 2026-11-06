@@ -2699,6 +2699,26 @@ mod executor {
         last_config: Option<&'a broca_wal::RunConfig>,
         /// The session's durable head: 0 when it holds nothing yet.
         head_seq: u64,
+        /// Where a fresh Claude Code persona reads the session's earlier prompts from, when the
+        /// latest run recorded neither its `cc_version` suffix nor its prompt ordinal.
+        persona: PersonaHistory,
+    }
+
+    /// The session history a fresh Claude Code persona falls back on.
+    enum PersonaHistory {
+        /// Today's WAL, read through the durable head.
+        Wal,
+        /// What a session in the new storage already holds in its folds.
+        Store {
+            /// The session's first user message, when it is still in the open window.
+            /// `None` with `first_user_sealed` means it's in sealed history, which a run
+            /// can't read; the suffix is then left unpinned, as when a WAL can't be read.
+            first_user: Option<broca_protocol::content::Message>,
+            first_user_sealed: bool,
+            /// The human prompts the session's runs started with (the conversation fold's
+            /// `human_prompts`), counted the way `human_prompt_ordinal` counts a WAL's.
+            human_prompts: u64,
+        },
     }
 
     /// What [`LiveLoopExecutor::admit_episode`] decided.
@@ -2711,6 +2731,202 @@ mod executor {
         routing_decision_error: Option<ProviderError>,
         mode: broca_core::StartMode,
         resolved: broca_catalog::live::ProviderResolution,
+    }
+
+    /// The prompt ordinal a fresh persona freezes: the session's earlier prompt count plus one
+    /// when the new input opens a prompt. A new user send opens one prompt, even if its input
+    /// contains several messages.
+    fn prompt_ordinal_after(req: &broca_core::RunRequest, count: u64) -> Result<u64, RunError> {
+        let admitted = u64::from(
+            broca_module_serve::claude_code_identity::human_prompt_ordinal(
+                std::iter::empty(),
+                &req.input,
+            ) > 0,
+        );
+        count
+            .checked_add(admitted)
+            .ok_or_else(|| RunError::Config("Claude Code prompt ordinal overflow".into()))
+    }
+
+    /// The prompt ordinal the latest run's persona recorded, if it had one.
+    fn recorded_prompt_ordinal(last_frozen: Option<&serde_json::Value>) -> Option<u64> {
+        last_frozen
+            .and_then(|config| config.pointer("/claude_code_persona/prompt_ordinal"))
+            .and_then(serde_json::Value::as_u64)
+    }
+
+    /// [`LiveLoopExecutor::session_prompt_ordinal`] for a session in the new storage, whose
+    /// conversation fold counts its human prompts, so nothing is read.
+    fn prompt_ordinal_from(
+        req: &broca_core::RunRequest,
+        last_frozen: Option<&serde_json::Value>,
+        human_prompts: u64,
+    ) -> Result<u64, RunError> {
+        prompt_ordinal_after(
+            req,
+            recorded_prompt_ordinal(last_frozen).unwrap_or(human_prompts),
+        )
+    }
+
+    /// [`LiveLoopExecutor::session_cc_version_suffix`] for a session in the new storage: the
+    /// latest run's suffix, else one computed from the session's first user message. When that
+    /// message is in sealed history, which a run can't read, the suffix is left unpinned and
+    /// the renderer computes it from each request, as when a WAL can't be read.
+    fn store_cc_version_suffix(
+        req: &broca_core::RunRequest,
+        last_frozen: Option<&serde_json::Value>,
+        first_user: Option<&broca_protocol::content::Message>,
+        first_user_sealed: bool,
+    ) -> Option<String> {
+        use broca_module_serve::claude_code_identity::{
+            first_durable_cc_version_suffix, inherited_cc_version_suffix,
+        };
+        if let Some(inherited) = inherited_cc_version_suffix(last_frozen) {
+            return Some(inherited);
+        }
+        if first_user_sealed {
+            tracing::warn!(
+                session = %req.session.session,
+                "the session's first user message is sealed; its Claude Code cc_version suffix is not pinned"
+            );
+            return None;
+        }
+        first_durable_cc_version_suffix(first_user.cloned().as_slice(), &req.input)
+    }
+
+    /// The loop's seams for a run kept in the new session storage, from the run's controls.
+    #[allow(clippy::too_many_arguments)]
+    fn store_seams<'a, P: broca_core::provider::Provider>(
+        provider: &'a P,
+        tools: &'a SubcToolPlane,
+        req: &broca_core::RunRequest,
+        out: &'a mpsc::Sender<OutputEvent>,
+        control: &broca_core::run::RunControl,
+        held: Option<&'a dyn broca_core::tool_plane::ProviderHeldLifecycle>,
+        compaction_plane: Option<&'a dyn broca_core::CompactionPlane>,
+        now: &'a (dyn Fn() -> u64 + Sync),
+        account_reports: Option<Arc<dyn broca_session_loop::AccountReports>>,
+        auth_selection: Option<broca_core::AuthSelection>,
+        max_same_account_wait: broca_core::SameAccountWait,
+    ) -> broca_session_loop::Seams<'a, P, SubcToolPlane> {
+        broca_session_loop::Seams {
+            provider,
+            tools,
+            bind: req.session.clone(),
+            out: Some(out),
+            cancel: control.cancel.clone().unwrap_or_default(),
+            // A module stop aborts a store run and seals it from the actor.
+            stop: Default::default(),
+            held,
+            approval: &AllowAll,
+            hook_plane: control.hook_plane.clone(),
+            now_ms: now,
+            session_address: Some(broca_core::session_addr(&req.session)),
+            compaction_plane,
+            // The run restores the compaction state from the session's records.
+            compaction_session: None,
+            // No run of a store session warms yet: keep-warm needs its scheduler in the actor.
+            keep_warm: None,
+            account_reports,
+            max_same_account_wait,
+            auth_selection,
+        }
+    }
+
+    /// What a store run's admission reads from the session: its latest run and that run's
+    /// config, rebuilt from the run's start record and setup parts, the persona's history and
+    /// the seq of its last record. The caller builds an [`EpisodeHistory`] from it.
+    struct StoreHistory {
+        prior_run: Option<PriorRunView>,
+        persona: PersonaHistory,
+        head_seq: u64,
+    }
+
+    fn store_history(
+        writer: &broca_session_loop::shared::ActorWriter,
+        parts: &dyn broca_session_loop::parts::Parts,
+    ) -> Result<StoreHistory, broca_session_loop::LoopError> {
+        use broca_session_loop::writer::Writer as _;
+        let prior_run = match writer.operations().run.as_ref() {
+            Some(run) => {
+                let start = run.start.as_ref().ok_or_else(|| {
+                    broca_session_loop::LoopError::Parts(format!(
+                        "the run {} has no start in the session",
+                        run.run_id
+                    ))
+                })?;
+                Some(PriorRunView {
+                    run_id: broca_protocol::RunId(run.run_id.clone()),
+                    config: broca_session_loop::run::run_config_of_start(start, parts)?,
+                    idle: run.finished.is_some(),
+                })
+            }
+            None => None,
+        };
+        let conversation = writer.conversation();
+        // The session's first run is the first of its sealed runs, if any were sealed.
+        let first_run = conversation
+            .sealed_episodes
+            .iter()
+            .chain(conversation.episodes.iter())
+            .find(|episode| episode.first_user.is_some());
+        let (first_user, first_user_sealed) = match first_run.and_then(|episode| episode.first_user)
+        {
+            None => (None, false),
+            Some(ordinal) => match conversation.window_message(ordinal) {
+                Some(message) => (Some(message.clone()), false),
+                None => (None, true),
+            },
+        };
+        Ok(StoreHistory {
+            prior_run,
+            persona: PersonaHistory::Store {
+                first_user,
+                first_user_sealed,
+                human_prompts: conversation.human_prompts,
+            },
+            head_seq: writer.next_seq().saturating_sub(1),
+        })
+    }
+
+    /// The error of a store session's newest run end or pause, read from its open log as
+    /// `terminal_provider_error` reads it from a WAL. A run's end is always in the open log:
+    /// sealing never moves an unfinished run's records, and a run's end is written before any
+    /// later seal.
+    async fn store_terminal_error(
+        writer: &broca_session_loop::shared::ActorWriter,
+    ) -> Option<ProviderError> {
+        use broca_session_loop::writer::Writer as _;
+        use broca_session_store::record::Record;
+        let records = writer.open_log_records().await.ok()?;
+        records
+            .iter()
+            .rev()
+            .find_map(|(_, record)| match record {
+                Record::RunEnd(end) => Some(end.error.clone()),
+                Record::Pause(pause) => Some(pause.error.clone()),
+                _ => None,
+            })?
+            .and_then(|error| serde_json::from_value(error).ok())
+    }
+
+    /// A store run's account reports, handed to today's routing reporter. Its events are named
+    /// as the loop names them, `<session id>:<seq>`, from the session id the reporter holds.
+    struct StoreAccountReports(Arc<broca_module_serve::account_routing::RunReporter>);
+
+    impl broca_session_loop::AccountReports for StoreAccountReports {
+        fn run_started(&self, _event_id: &str, seq: u64) {
+            broca_core::AccountReporter::run_started(&*self.0, None, seq);
+        }
+
+        fn attempt_recorded(
+            &self,
+            _event_id: &str,
+            seq: u64,
+            attempt: &broca_protocol::ModelAttempt,
+        ) {
+            broca_core::AccountReporter::attempt_recorded(&*self.0, None, seq, attempt);
+        }
     }
 
     fn frozen_render_config(
@@ -3351,22 +3567,8 @@ mod executor {
             last_episode_frozen_config: Option<&serde_json::Value>,
             durable_head: u64,
         ) -> Result<u64, RunError> {
-            // A new user send opens one prompt, even if its input contains several messages.
-            let admitted = u64::from(
-                broca_module_serve::claude_code_identity::human_prompt_ordinal(
-                    std::iter::empty(),
-                    &req.input,
-                ) > 0,
-            );
-            let add_input = |count: u64| {
-                count
-                    .checked_add(admitted)
-                    .ok_or_else(|| RunError::Config("Claude Code prompt ordinal overflow".into()))
-            };
-            let recorded = last_episode_frozen_config
-                .and_then(|config| config.pointer("/claude_code_persona/prompt_ordinal"))
-                .and_then(serde_json::Value::as_u64);
-            if let Some(ordinal) = recorded {
+            let add_input = |count: u64| prompt_ordinal_after(req, count);
+            if let Some(ordinal) = recorded_prompt_ordinal(last_episode_frozen_config) {
                 return add_input(ordinal);
             }
             let key = broca_core::session_addr(&req.session);
@@ -3736,29 +3938,38 @@ mod executor {
                 && resolution.method != Some(AuthMethod::ApiKey);
             let fresh_persona = match (&self.claude_code_install_id, fresh_episode) {
                 (Some(install_id), true) if speaks_as_claude_code => {
-                    let cc_version_suffix = self
-                        .session_cc_version_suffix(
+                    let last_frozen = history
+                        .last_config
+                        .map(|config| &config.frozen_render_config);
+                    let cc_version_suffix = match &history.persona {
+                        PersonaHistory::Wal => {
+                            self.session_cc_version_suffix(job.req, last_frozen, history.head_seq)
+                                .await
+                        }
+                        PersonaHistory::Store {
+                            first_user,
+                            first_user_sealed,
+                            ..
+                        } => store_cc_version_suffix(
                             job.req,
-                            history
-                                .last_config
-                                .map(|config| &config.frozen_render_config),
-                            history.head_seq,
-                        )
-                        .await;
+                            last_frozen,
+                            first_user.as_ref(),
+                            *first_user_sealed,
+                        ),
+                    };
                     // Like every other failure before the loop, this one is reported through
                     // the admission ack. Returning without it would drop the ack unsent, and
                     // the actor would then see only "run ended before admission" instead of
                     // this permanent Config cause.
-                    let prompt_ordinal = match self
-                        .session_prompt_ordinal(
-                            job.req,
-                            history
-                                .last_config
-                                .map(|config| &config.frozen_render_config),
-                            history.head_seq,
-                        )
-                        .await
-                    {
+                    let prompt_ordinal = match match &history.persona {
+                        PersonaHistory::Wal => {
+                            self.session_prompt_ordinal(job.req, last_frozen, history.head_seq)
+                                .await
+                        }
+                        PersonaHistory::Store { human_prompts, .. } => {
+                            prompt_ordinal_from(job.req, last_frozen, *human_prompts)
+                        }
+                    } {
                         Ok(ordinal) => ordinal,
                         Err(error) => {
                             return Err(error);
@@ -4022,8 +4233,9 @@ mod executor {
         /// The loop's controls for an admitted run: the routing refusal or sign-in pause it
         /// starts with, the frozen credential selection, the reporter of its account evidence
         /// to routing, and its frozen context limit. Returns the reporter too, for the run's
-        /// end. `durable_head` is the session's durable record count, which the reporter's
-        /// event ids are built from.
+        /// end. `durable_head` is the seq of the session's last durable record: the reporter
+        /// names only records at or below it. `store_session` is a run in the new storage's
+        /// session id, which its event ids are named by in place of a WAL lineage.
         #[allow(clippy::too_many_arguments)]
         fn episode_control(
             &self,
@@ -4034,6 +4246,7 @@ mod executor {
             resolution: &AuthResolution,
             account_choice: &AccountChoice,
             frozen_context_limit: Option<u64>,
+            store_session: Option<String>,
         ) -> (
             broca_core::run::RunControl,
             Option<Arc<broca_module_serve::account_routing::RunReporter>>,
@@ -4076,13 +4289,26 @@ mod executor {
                         AccountChoice::Routed { view_digest, .. } => Some(view_digest.clone()),
                         _ => None,
                     };
-                    Some(broca_module_serve::account_routing::RunReporter::start(
-                        Arc::clone(routing),
-                        admission_id,
-                        run_id.0.clone(),
-                        view_digest,
-                        durable_head,
-                    ))
+                    Some(match store_session {
+                        // A run in the new storage names its records by its session's id.
+                        Some(session) => {
+                            broca_module_serve::account_routing::RunReporter::start_for_store(
+                                Arc::clone(routing),
+                                admission_id,
+                                run_id.0.clone(),
+                                view_digest,
+                                durable_head,
+                                session,
+                            )
+                        }
+                        None => broca_module_serve::account_routing::RunReporter::start(
+                            Arc::clone(routing),
+                            admission_id,
+                            run_id.0.clone(),
+                            view_digest,
+                            durable_head,
+                        ),
+                    })
                 }
                 _ => None,
             };
@@ -4183,6 +4409,198 @@ mod executor {
                     .await;
                 }
             }
+        }
+
+        /// [`RunExecutor::execute_on_store`]'s run. A seal writes what today's seal writes and
+        /// calls no model. A fresh run and a resume make `execute`'s admission decisions, with
+        /// the session's latest run, its config and the persona's history read from the folds.
+        #[allow(clippy::too_many_arguments)]
+        async fn run_on_store(
+            &self,
+            req: &mut broca_core::RunRequest,
+            auth: &Option<broca_protocol::AuthRequest>,
+            control: broca_core::run::RunControl,
+            writer: &mut broca_session_loop::shared::ActorWriter,
+            parts: &mut dyn broca_session_loop::parts::Parts,
+            mode: broca_module::executor::StoreRunMode,
+            out: &mpsc::Sender<OutputEvent>,
+        ) -> Result<broca_session_loop::Finished, broca_module::executor::StoreRunError> {
+            use broca_module::executor::{StoreRunError, StoreRunMode};
+            use broca_session_loop::writer::Writer as _;
+            let now = || epoch_millis().max(0) as u64;
+            let tools = self.plane.as_ref();
+            let held = control.provider_held_lifecycle.clone();
+            let compaction_plane = control.compaction_plane.clone();
+            if let StoreRunMode::Seal(cause) = mode {
+                // A seal writes its records and calls no model, so its provider is one that has
+                // nothing to answer; any model call it made would fail as an empty stream.
+                let provider = broca_core::provider::StubProvider::new(Vec::new());
+                let seams = store_seams(
+                    &provider,
+                    tools,
+                    req,
+                    out,
+                    &control,
+                    held.as_deref(),
+                    compaction_plane.as_deref(),
+                    &now,
+                    None,
+                    None,
+                    self.max_same_account_wait,
+                );
+                return broca_session_loop::seal(writer, parts, &seams, cause)
+                    .await
+                    .map_err(StoreRunError::Loop);
+            }
+            let stored = store_history(writer, parts).map_err(StoreRunError::Loop)?;
+            let last_config = stored.prior_run.as_ref().map(|prior| prior.config.clone());
+            let history = EpisodeHistory {
+                prior_run: stored.prior_run,
+                last_config: last_config.as_ref(),
+                head_seq: stored.head_seq,
+                persona: stored.persona,
+            };
+            let mut queued_service_tier = None;
+            let admitted = self
+                .admit_episode(
+                    EpisodeJob {
+                        req,
+                        kind: RunKind::FreshOrResume,
+                        auth,
+                        conversation_key: &None,
+                        queued_service_tier: &mut queued_service_tier,
+                        media_profile: &None,
+                        clock: control.clock.as_ref(),
+                    },
+                    &history,
+                )
+                .await
+                .map_err(StoreRunError::Admission)?;
+            let EpisodeAdmission {
+                fresh_episode,
+                episode_context_management,
+                resolution,
+                account_choice,
+                routing_decision_error,
+                mode: _,
+                resolved,
+            } = admitted;
+            // The new run loop doesn't yet start a run paused for sign-in or on a routing
+            // refusal; today's loop writes such a run's start and its pause before any model
+            // call. A session in the new storage refuses those runs by name until it does.
+            if fresh_episode != (mode == StoreRunMode::Fresh) {
+                return Err(StoreRunError::Admission(RunError::Config(format!(
+                    "the store actor asked for a {mode:?} run, but the session's latest run says \
+                     otherwise"
+                ))));
+            }
+            if routing_decision_error.is_some() || resolution.pause.is_some() {
+                return Err(StoreRunError::Admission(RunError::Config(
+                    "a run that starts paused (sign-in needed or a routing refusal) isn't \
+                     served on the new session storage yet"
+                        .into(),
+                )));
+            }
+            if resolved.provider.supports_media_renderer() && !req.tools.is_empty() {
+                // Today's media renderer reads captured images from the WAL. Until one reads a
+                // store session's media objects, a run that could carry tool images refuses
+                // rather than send a request without them.
+                return Err(StoreRunError::Admission(RunError::Config(
+                    "a run whose provider renders tool images isn't served on the new session \
+                     storage yet"
+                        .into(),
+                )));
+            }
+            let frozen_context_limit = context_limit_for_episode(
+                fresh_episode,
+                req.context_limit,
+                resolved.context_limit,
+                history
+                    .prior_run
+                    .as_ref()
+                    .and_then(|prior| prior.config.context_limit),
+            );
+            let report_selection = resolution.selection.clone();
+            let durable_head = writer.durable_head();
+            let (control, account_reporter) = self.episode_control(
+                control,
+                &req.run_id,
+                Arc::clone(&durable_head),
+                None,
+                &resolution,
+                &account_choice,
+                frozen_context_limit,
+                Some(writer.session_id()),
+            );
+            req.context_management = Some(episode_context_management);
+            let used_credential = used_credential_for_report(
+                &resolution.pause,
+                resolution.selection.clone(),
+                resolution.record_version,
+            );
+            resolved
+                .provider
+                .set_chatgpt_https_policy(broca_module_serve::transport_config::default_policy());
+            let reports = account_reporter.clone().map(|reporter| {
+                Arc::new(StoreAccountReports(reporter))
+                    as Arc<dyn broca_session_loop::AccountReports>
+            });
+            let seams = store_seams(
+                &resolved.provider,
+                tools,
+                req,
+                out,
+                &control,
+                held.as_deref(),
+                compaction_plane.as_deref(),
+                &now,
+                reports,
+                resolution.selection.clone(),
+                self.max_same_account_wait,
+            );
+            let finished = if fresh_episode {
+                match broca_session_loop::admit::admission(
+                    req,
+                    &control,
+                    &resolved.provider,
+                    writer.operations(),
+                    Some(now()),
+                ) {
+                    Ok(admission) => {
+                        broca_session_loop::run(writer, parts, admission, &seams).await
+                    }
+                    Err(error) => return Err(StoreRunError::Admission(error)),
+                }
+            } else {
+                broca_session_loop::resume(writer, parts, &seams).await
+            };
+            // The run's end, for routing and the vault, as `execute` reports it. The reports
+            // read only how the run ended or paused.
+            let summary = match &finished {
+                Ok(finished) => Ok(broca_core::RunSummary {
+                    reason: finished.reason,
+                    paused: finished.paused,
+                    steps: 0,
+                    usage: finished.usage.unwrap_or_default(),
+                    retries_used: finished.retries_used,
+                    final_step_finish_reason: None,
+                }),
+                Err(error) => Err(RunError::Config(format!("{error:?}"))),
+            };
+            let reader = &*writer;
+            self.report_run_end(
+                &summary,
+                account_reporter.as_deref(),
+                report_selection,
+                used_credential,
+                resolution.in_run_refresh.as_ref(),
+                || store_terminal_error(reader),
+                None,
+                &durable_head,
+                &req.session,
+            )
+            .await;
+            finished.map_err(StoreRunError::Loop)
         }
 
         async fn choose_account_for_episode(
@@ -5162,6 +5580,7 @@ mod executor {
                     .as_ref()
                     .map(|episode| &episode.config),
                 head_seq: prior_snapshot.head_seq,
+                persona: PersonaHistory::Wal,
             };
             let admitted = self
                 .admit_episode(
@@ -5373,6 +5792,7 @@ mod executor {
                 &resolution,
                 &account_choice,
                 frozen_context_limit,
+                None,
             );
             // What a new episode freezes onto RunStarted; core ignores it on a resume.
             job.req.context_management = Some(episode_context_management);
@@ -5445,6 +5865,36 @@ mod executor {
             summary
         }
 
+        /// Runs a session kept in the new session storage: the same admission decisions as
+        /// `execute`, read from the session's folds instead of the WAL, then the new run loop
+        /// (`broca_session_loop`) writing through the store actor.
+        async fn execute_on_store(
+            &self,
+            job: broca_module::executor::StoreRunJob,
+            out: mpsc::Sender<OutputEvent>,
+        ) -> broca_module::executor::StoreRunEnd {
+            let broca_module::executor::StoreRunJob {
+                mut req,
+                auth,
+                control,
+                mut writer,
+                mut parts,
+                mode,
+            } = job;
+            let result = self
+                .run_on_store(
+                    &mut req,
+                    &auth,
+                    control,
+                    &mut writer,
+                    parts.as_mut(),
+                    mode,
+                    &out,
+                )
+                .await;
+            broca_module::executor::StoreRunEnd { parts, result }
+        }
+
         fn on_run_sealed(&self, sealed: broca_module::SealedRun) {
             if let Some(routing) = self.routing.as_ref() {
                 broca_module_serve::account_routing::report_sealed(Arc::clone(routing), &sealed);
@@ -5491,6 +5941,7 @@ mod executor {
         use super::*;
         include!("provider_override_tests.rs");
         include!("recorded_resume_tests.rs");
+        include!("store_run_tests.rs");
         include!("tool_name_alias_tests.rs");
         include!("queued_service_tier_tests.rs");
         include!("service_tier_writer_tests.rs");

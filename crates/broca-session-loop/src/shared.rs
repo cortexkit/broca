@@ -20,6 +20,7 @@
 //! **Seals** run in the actor on the session itself, and replace the copy, since the window
 //! changes at a cut. Reads that go past the folds are requests to the actor.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use broca_core::tool_media::MediaCapture;
@@ -97,6 +98,9 @@ pub struct ActorWriter {
     next_seq: u64,
     message_id_prefix: String,
     media: Option<Arc<dyn MediaCapture>>,
+    /// The seq of the session's last record known durable, as today's WAL writer's durable
+    /// head counts it, for reporters that must name only durable records.
+    durable_head: Arc<AtomicU64>,
 }
 
 /// The actor's end of a run's writer.
@@ -122,6 +126,9 @@ impl ActorWriter {
                 next_seq: session.next_seq(),
                 message_id_prefix: session.message_id_prefix(),
                 media,
+                // A run starts after a barrier: the writer's open, a run's end or the actor's
+                // own append, each synced. So every record the session holds is durable.
+                durable_head: Arc::new(AtomicU64::new(session.next_seq().saturating_sub(1))),
             },
             RunLink {
                 requests: receiver,
@@ -139,10 +146,21 @@ impl ActorWriter {
         answer.await.map_err(|_| SessionError::OwnerGone)?
     }
 
+    /// The seq of the session's last record known durable. It moves on each barrier the run
+    /// appends and each record the actor appends, which it syncs before anyone hears of it.
+    pub fn durable_head(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.durable_head)
+    }
+
+    fn durable_through(&self, seq: u64) {
+        self.durable_head.fetch_max(seq, Ordering::AcqRel);
+    }
+
     /// Folds what the actor appended since the copy last caught up.
     fn catch_up(&mut self, missed: Missed) -> Result<(), SessionError> {
         for (seq, record) in &missed {
             self.fold(*seq, record)?;
+            self.durable_through(*seq);
         }
         Ok(())
     }
@@ -172,6 +190,8 @@ impl ActorWriter {
         self.operations = snapshot.operations;
         self.next_seq = snapshot.next_seq;
         self.message_id_prefix = snapshot.message_id_prefix;
+        // A seal commits the session's new log, synced, before it answers.
+        self.durable_through(self.next_seq.saturating_sub(1));
     }
 
     async fn seal(
@@ -205,6 +225,9 @@ impl Writer for ActorWriter {
             .await?;
         self.catch_up(missed)?;
         self.fold_own(first, records)?;
+        if !records.is_empty() && (barrier || crate::writer::ends_run(records)) {
+            self.durable_through(first + records.len() as u64 - 1);
+        }
         Ok(first)
     }
 
@@ -237,6 +260,9 @@ impl Writer for ActorWriter {
             })
             .await?;
         self.fold_own(first, &records)?;
+        if barrier && !records.is_empty() {
+            self.durable_through(first + records.len() as u64 - 1);
+        }
         Ok(records)
     }
 

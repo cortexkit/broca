@@ -205,6 +205,15 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// How many human prompts the session's runs started with: user messages in a run's
+        /// input with anything besides tool results. Steers and delivered sends join the
+        /// running prompt, so they don't count. A Claude Code persona numbers its prompts by
+        /// this, so it counts the whole history, sealed runs too.
+        15 req pub human_prompts: u64 => {
+            owner: "run loop",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -228,6 +237,7 @@ impl Conversation {
             sealed_episodes: Vec::new(),
             window_repetition: None,
             first_protocol_compaction: false,
+            human_prompts: 0,
         }
     }
 
@@ -250,6 +260,7 @@ impl Conversation {
             sealed_episodes: self.sealed_episodes.clone(),
             window_repetition: self.window_repetition.clone(),
             first_protocol_compaction: self.first_protocol_compaction,
+            human_prompts: self.human_prompts,
         }
     }
 
@@ -364,6 +375,15 @@ impl Conversation {
         let episode = self.episodes.last_mut().expect("pushed above");
         if episode.first_user.is_none() && input.message.role == Role::User {
             episode.first_user = Some(ordinal);
+        }
+        if input.message.role == Role::User
+            && input
+                .message
+                .content
+                .iter()
+                .any(|block| !matches!(block, ContentBlock::ToolResult(_)))
+        {
+            self.human_prompts += 1;
         }
     }
 

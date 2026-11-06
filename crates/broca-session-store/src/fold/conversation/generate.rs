@@ -33,4 +33,5 @@ fields!(Conversation {
     sealed_episodes,
     window_repetition,
     first_protocol_compaction,
+    human_prompts,
 });

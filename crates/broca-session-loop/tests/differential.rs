@@ -1226,9 +1226,9 @@ impl broca_core::AccountReporter for TodayReports {
 struct NewReports(Arc<Mutex<Vec<String>>>);
 
 impl AccountReports for NewReports {
-    fn run_started(&self, event_id: &str) {
+    fn run_started(&self, event_id: &str, seq: u64) {
         assert!(
-            event_id.contains(':'),
+            event_id.ends_with(&format!(":{seq}")),
             "a start's event id names its record"
         );
         self.0.lock().unwrap().push("run started".into());

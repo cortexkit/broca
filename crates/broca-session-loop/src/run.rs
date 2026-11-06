@@ -219,8 +219,9 @@ pub struct Seams<'a, P, T> {
 /// records waits for the session's durable bound to reach `seq`, as today's reporter waits for
 /// the log's durable head.
 pub trait AccountReports: Send + Sync {
-    /// A fresh run's start is durable. Not called on a resume, which writes no start.
-    fn run_started(&self, event_id: &str);
+    /// A fresh run's start, at `seq`, is durable. Not called on a resume, which writes no
+    /// start.
+    fn run_started(&self, event_id: &str, seq: u64);
     /// A provider attempt's record was appended at `seq`.
     fn attempt_recorded(&self, event_id: &str, seq: u64, attempt: &ModelAttempt);
 }
@@ -302,7 +303,7 @@ where
     };
     let start_seq = admit(&mut placed, parts, &admission).await?;
     if let Some(reports) = &seams.account_reports {
-        reports.run_started(&event_id(&placed, start_seq));
+        reports.run_started(&event_id(&placed, start_seq), start_seq);
     }
     let compaction = compaction_ctx(&placed, parts, &admission, seams, true).await?;
     drive(&mut placed, parts, &admission, seams, compaction.as_ref()).await
@@ -1043,6 +1044,94 @@ fn frozen_admission(
         );
     }
     Ok(admission)
+}
+
+/// A run's config members, as `RunStarted.config` spells them, and its plan manifest's setup
+/// parts, in order.
+pub type ConfigMembers = (serde_json::Map<String, Value>, Vec<(PartKind, Value)>);
+
+/// A run start's frozen config as today's `RunStarted` record spells it, the members of its
+/// `config` object, and the setup parts of the run's plan manifest, in order. `part` reads a
+/// setup part's value.
+///
+/// The converter's inverse rebuilds today's record from this, and the serve executor rebuilds
+/// the config a new run's admission reads (`run_config_of_start`), so both read a run's start
+/// the same way. The config's parts come first (its tools, then the response format every run
+/// config has, then its global system text and render config), then the manifest's. So a
+/// tools part before the response format is the config's, and one after it is the manifest's.
+pub fn run_config_members<E>(
+    start: &broca_session_store::record::RunStart,
+    mut part: impl FnMut(&broca_session_store::record::PartRef) -> Result<Value, E>,
+    not_object: impl Fn() -> E,
+) -> Result<ConfigMembers, E> {
+    let choices = match start.run_choices.as_ref() {
+        None => serde_json::Map::new(),
+        Some(Value::Object(choices)) => choices.clone(),
+        Some(_) => return Err(not_object()),
+    };
+    let mut config = match choices.get("config") {
+        None => serde_json::Map::new(),
+        Some(Value::Object(config)) => config.clone(),
+        Some(_) => return Err(not_object()),
+    };
+    fn json(value: impl serde::Serialize) -> Value {
+        serde_json::to_value(value).expect("record values serialize")
+    }
+    fn set(
+        config: &mut serde_json::Map<String, Value>,
+        key: &str,
+        value: Option<impl serde::Serialize>,
+    ) {
+        if let Some(value) = value {
+            config.insert(key.into(), json(value));
+        }
+    }
+    config.insert("model".into(), json(&start.model));
+    config.insert("renderer_version".into(), json(start.renderer_version));
+    set(&mut config, "context_limit", start.context_limit);
+    set(&mut config, "service_tier", start.service_tier.as_ref());
+    set(
+        &mut config,
+        "route_decision_id",
+        start.route_decision_id.as_ref(),
+    );
+    set(&mut config, "auth_selection", start.auth_selection.as_ref());
+    let mut manifest = Vec::new();
+    let mut past_config = false;
+    for setup in &start.setup {
+        let value = part(setup)?;
+        match setup.kind {
+            PartKind::Tools if !past_config => {
+                config.insert("tools".into(), value);
+            }
+            PartKind::ResponseFormat => {
+                config.insert("response_format".into(), value);
+                past_config = true;
+            }
+            PartKind::GlobalSystem => {
+                config.insert("global_system".into(), value);
+            }
+            PartKind::RenderConfig => {
+                config.insert("frozen_render_config".into(), value);
+            }
+            kind => manifest.push((kind, value)),
+        }
+    }
+    Ok((config, manifest))
+}
+
+/// The run's frozen config, rebuilt from its start record and setup parts as
+/// [`run_config_members`] reads them.
+pub fn run_config_of_start(
+    start: &broca_session_store::record::RunStart,
+    parts: &dyn Parts,
+) -> Result<broca_wal::RunConfig, LoopError> {
+    let (config, _) = run_config_members(
+        start,
+        |part| parts.get(part).map_err(LoopError::Parts),
+        || LoopError::Parts("a run start's carried config is not an object".into()),
+    )?;
+    serde_json::from_value(Value::Object(config)).map_err(|e| LoopError::Parts(e.to_string()))
 }
 
 /// The admission a run's start froze: its model, settings, tools and system text, read back from
