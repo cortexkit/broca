@@ -495,6 +495,14 @@ fn ids(calls: &[ToolCall]) -> Vec<&str> {
         .collect()
 }
 
+/// The scope a batch's calls are routed under, as the spy logs it: nothing for an unscoped batch,
+/// so scenarios without a scope log as they always have.
+fn batch_scope(ctx: &BatchCtx) -> String {
+    ctx.scope
+        .as_ref()
+        .map_or_else(String::new, |scope| format!(" scope={}", scope.scope_ref))
+}
+
 #[async_trait]
 impl ToolPlane for Spy {
     async fn batch_started(
@@ -503,7 +511,11 @@ impl ToolPlane for Spy {
         calls: &[ToolCall],
         manifest: &ToolManifest,
     ) -> Result<(), ToolPlaneError> {
-        self.note(format!("batch_started {:?}", ids(calls)));
+        self.note(format!(
+            "batch_started {:?}{}",
+            ids(calls),
+            batch_scope(ctx)
+        ));
         self.inner.batch_started(ctx, calls, manifest).await
     }
 
@@ -514,7 +526,11 @@ impl ToolPlane for Spy {
         manifest: &ToolManifest,
         guard: &ToolOpenGuard,
     ) -> Result<(), ToolPlaneError> {
-        self.note(format!("batch_started_guarded {:?}", ids(calls)));
+        self.note(format!(
+            "batch_started_guarded {:?}{}",
+            ids(calls),
+            batch_scope(ctx)
+        ));
         // A batch with a `down` call meets a tool provider that can't be reached.
         if calls.iter().any(|call| call.tool_name == "down") {
             return Err(ToolPlaneError::Unavailable("route closed".into()));
@@ -780,6 +796,24 @@ tokio::task_local! {
 tokio::task_local! {
     /// The tool-call budget both loops freeze. `None` runs without one.
     static BUDGET: Option<broca_protocol::request::BudgetConfig>;
+}
+
+tokio::task_local! {
+    /// Whether the send sets every field a run's start records about it (its key, labels,
+    /// principal, scope, input hooks, routing decision, tier, variant and the rest), so the
+    /// comparison checks each one reaches the start as today's loop records it.
+    static SEND_FACTS: bool;
+}
+
+fn send_facts() -> bool {
+    SEND_FACTS.try_with(|set| *set).unwrap_or(false)
+}
+
+/// The principal that sends in the send-facts scenario, and owns its scope.
+fn owner() -> broca_protocol::BindPrincipal {
+    broca_protocol::BindPrincipal::Reserved {
+        module_id: "prefrontal-core".into(),
+    }
 }
 
 /// The budget the comparison running in this task freezes.
@@ -1403,14 +1437,19 @@ impl broca_core::CompactionPlane for CompactionSpy {
         &self,
         _: &str,
         _: &broca_protocol::BindIdentity,
-        _: Option<&broca_protocol::SessionScope>,
+        scope: Option<&broca_protocol::SessionScope>,
         method: &str,
         params: Value,
         _: u64,
     ) -> Result<Box<serde_json::value::RawValue>, broca_core::compaction_v2::runtime::CallError>
     {
         entry_mids(&params, &mut self.mids.lock().unwrap());
-        self.calls.lock().unwrap().push((method.into(), params));
+        // The scope the call is routed under is part of what both loops must do alike.
+        let routed = match scope {
+            Some(scope) => format!("{method} scope={}", scope.scope_ref),
+            None => method.into(),
+        };
+        self.calls.lock().unwrap().push((routed, params));
         let answer = match method {
             "compaction.setup" => json!({"answer": "ready"}),
             "compaction.notice" => json!({"answer": "received"}),
@@ -1579,6 +1618,34 @@ impl Scenario {
     }
 
     fn request_for(&self, run_id: &str, input: &[Message]) -> RunRequest {
+        let mut request = self.plain_request_for(run_id, input);
+        if send_facts() {
+            request.send_id = Some(format!("send-{run_id}"));
+            request.request_identity_digest = Some(format!("digest-{run_id}"));
+            request.title = Some("a titled send".into());
+            request.session_class = Some("mason".into());
+            request.principal = Some(owner());
+            request.scope = Some(broca_protocol::SessionScope {
+                owner: owner(),
+                scope_ref: "scope-1".into(),
+                scope_epoch: 3,
+                flow_id: Some("flow-1".into()),
+                sender: None,
+                agent_id: None,
+                run_id: None,
+                agent_id_frozen: false,
+            });
+            request.route_decision_id = Some("decision-1".into());
+            request.directives = Some(vec![broca_protocol::request::DirectiveName::Wake]);
+            request.work_class = Some("coding".into());
+            request.variant = Some("high".into());
+            request.service_tier = Some(broca_protocol::request::ServiceTier::Priority);
+            request.context_management = Some(broca_protocol::request::ContextManagement::None);
+        }
+        request
+    }
+
+    fn plain_request_for(&self, run_id: &str, input: &[Message]) -> RunRequest {
         RunRequest {
             route_decision_id: None,
             input_written_at_ms: None,
@@ -1651,6 +1718,20 @@ fn admission_control(scenario: &Scenario) -> RunControl {
         new_log_compaction_plan_version: layout(),
         admitted_context_limit: frozen_context_limit(),
         hook_plane: Some(harness_hooks()),
+        display_sent_by: send_facts().then(|| broca_protocol::BindPrincipal::Reserved {
+            module_id: "occipital".into(),
+        }),
+        tools_were_omitted: send_facts(),
+        input_hooks: send_facts().then(|| {
+            Box::new(
+                serde_json::from_value(json!({
+                    "original": [{"role": "user", "content": [{"type": "text", "text": "raw"}]}],
+                    "final": scenario.input,
+                    "ops": [{"module": "magic-context", "hook": "pre_user", "phase": null, "op": "replace"}],
+                }))
+                .expect("hooks decode"),
+            )
+        }),
         ..Default::default()
     }
 }
@@ -2975,6 +3056,40 @@ async fn a_second_run_on_the_same_session() {
         ],
     )
     .await;
+}
+
+/// A send that sets every field a run's start records about it: both loops record each one the
+/// same way, across a tool call and a second run.
+#[tokio::test]
+async fn every_send_fact_reaches_the_run_start() {
+    let scenario = Scenario {
+        input: vec![user("go")],
+        tools: vec![tool("read", ExecutionMode::Sequential)],
+        manifest: None,
+        stop_when: vec![StopCondition::StepCount { n: 8 }],
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+            text_step("a3", "done again"),
+        ],
+    };
+    SEND_FACTS
+        .scope(true, async {
+            compare(scenario.clone()).await;
+            compare_runs(
+                scenario,
+                &[
+                    ("r1", vec![user("first task")]),
+                    ("r2", vec![user("second task")]),
+                ],
+            )
+            .await;
+        })
+        .await;
 }
 
 /// A later run that sends the session's system prompt again, as a client naturally does on every
@@ -5106,6 +5221,50 @@ async fn every_cut_of_an_over_limit_ride_resumes_alike() {
         },
     )
     .await;
+}
+
+/// The over-limit ride with every send fact set: the compaction provider's Setup names the run's
+/// variant and its rides compare the run's tier and account, and its routes carry the run's
+/// scope, in both loops alike, over two runs.
+#[tokio::test]
+async fn a_compacted_run_with_every_send_fact_calls_compaction_alike() {
+    SEND_FACTS
+        .scope(true, async {
+            compare_compacted(
+                compacted_scenario(vec![
+                    answer(
+                        "a1",
+                        vec![call("c1", "big", json!({}))],
+                        FinishReason::ToolCalls,
+                    ),
+                    text_step("a2", "done"),
+                ]),
+                CompactionScript {
+                    context_limit: 1_200,
+                    rides: vec![Ride::Drop(2)],
+                },
+            )
+            .await;
+            LAYOUT
+                .scope(
+                    Some(cortexkit_compaction_view::PLAN_VERSION),
+                    COMPACTION.scope(
+                        Some(Arc::new(CompactionScript {
+                            context_limit: 100_000,
+                            rides: Vec::new(),
+                        })),
+                        Box::pin(compare_runs_in(
+                            compacted_scenario(vec![
+                                text_step("a1", "hello"),
+                                text_step("a2", "hello again"),
+                            ]),
+                            &[("r1", vec![user("first")]), ("r2", vec![user("second")])],
+                        )),
+                    ),
+                )
+                .await;
+        })
+        .await;
 }
 
 /// Two runs on one compacted session: the second run's first send compares the first run's

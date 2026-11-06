@@ -121,6 +121,49 @@ pub struct Admission {
     /// is reached and resets soon, rather than end, as today's admission freezes it from the
     /// boot setting.
     pub account_limit_pause: bool,
+    /// The routing decision the run was admitted under.
+    pub route_decision_id: Option<String>,
+    /// The service tier the send asked for. The provider's frozen render config holds the tier
+    /// requests are sent at; this is what the attempt records and compaction conditions name.
+    pub service_tier: Option<broca_protocol::request::ServiceTier>,
+    /// The reasoning variant the send asked for, which the compaction provider is told.
+    pub variant: Option<String>,
+    /// The workload class the send named.
+    pub work_class: Option<String>,
+    /// The session's context management mode, as admission resolved it.
+    pub context_management: Option<broca_protocol::request::ContextManagement>,
+    /// The turn directives the send named.
+    pub directives: Option<Vec<broca_protocol::request::DirectiveName>>,
+    /// Whether the send left its tools out, so the plan's or the session's apply.
+    pub tools_were_omitted: bool,
+    /// What the send said about itself. None of it changes a request; all of it is recorded
+    /// on the run's start, where status, retries and reads find it.
+    pub send: SendFacts,
+}
+
+/// What the send that started a run recorded about itself, as today's run start records it.
+#[derive(Debug, Clone, Default)]
+pub struct SendFacts {
+    /// The queued send the run consumes, when it started from the queue.
+    pub submission_id: Option<String>,
+    /// The caller's idempotency key, and the digest of the request it was sent with: a retry
+    /// under the key is compared with the digest.
+    pub send_id: Option<String>,
+    pub request_identity_digest: Option<String>,
+    /// The caller's label for the send.
+    pub title: Option<String>,
+    pub session_class: Option<String>,
+    /// How long the session is kept after its last activity, in seconds.
+    pub retention_secs: Option<u64>,
+    /// Who sent it, as the daemon attested; and, for a send another module made on the owner's
+    /// behalf, that module.
+    pub principal: Option<broca_protocol::BindPrincipal>,
+    pub sent_by: Option<broca_protocol::BindPrincipal>,
+    /// The scope the session's runs are frozen to.
+    pub scope: Option<broca_protocol::SessionScope>,
+    /// What the input hooks did to the run's input, as evidence: the input itself is already
+    /// the hooks' final value.
+    pub hooks: Option<broca_wal::Hooks>,
 }
 
 /// The seams a run calls. None of them is owned by the run.
@@ -902,6 +945,32 @@ pub(crate) fn admission_of_start(
             .unwrap_or(false),
         budget: decode::<broca_protocol::request::BudgetConfig>(member("budget"))?
             .filter(|budget| *budget != broca_protocol::request::BudgetConfig::default()),
+        route_decision_id: start.route_decision_id.clone(),
+        service_tier: decode(start.service_tier.clone().map(Value::String))?,
+        variant: decode(member("variant"))?,
+        work_class: decode(member("work_class"))?,
+        context_management: decode(member("context_management"))?,
+        directives: decode(member("turn_directives_v1"))?,
+        tools_were_omitted: decode::<bool>(member("tools_were_omitted"))?.unwrap_or(false),
+        send: SendFacts {
+            submission_id: start.submission_id.clone(),
+            send_id: start.send_id.clone(),
+            request_identity_digest: start.request_identity_digest.clone(),
+            title: start.title.clone(),
+            session_class: start.session_class.clone(),
+            retention_secs: start.retention_secs,
+            principal: decode(start.principal.clone())?,
+            sent_by: decode(
+                start
+                    .run_choices
+                    .as_ref()
+                    .and_then(|choices| choices.get("record"))
+                    .and_then(|record| record.get("sent_by"))
+                    .cloned(),
+            )?,
+            scope: decode(start.scope.clone())?,
+            hooks: decode(start.hooks.clone())?,
+        },
     })
 }
 
@@ -1053,7 +1122,7 @@ where
             plan,
             plane: seams.hook_plane.as_ref().expect("checked with the plan"),
             bind: &seams.bind,
-            scope: None,
+            scope: admission.send.scope.as_ref(),
             cancel: Some(&seams.cancel),
             stop: Some(&seams.stop),
             seal: None,
@@ -1109,6 +1178,7 @@ where
             writer,
             seams,
             &admission.run_id,
+            admission.send.scope.as_ref(),
             step_id,
             &planned,
             &unsent,
@@ -1761,6 +1831,7 @@ where
             writer,
             seams,
             &admission.run_id,
+            admission.send.scope.as_ref(),
             step_id,
             &calls,
             &uncut,
@@ -1795,6 +1866,14 @@ where
 
 /// Stores the run's setup parts and appends its start and input as one durable batch.
 /// Writes a fresh run's start; returns the seq of its `RunStart` record.
+/// `value` as JSON, or `None` when there is none.
+fn to_value<T: serde::Serialize>(value: Option<&T>) -> Result<Option<Value>, LoopError> {
+    value
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| LoopError::Parts(e.to_string()))
+}
+
 async fn admit<W: Writer>(
     writer: &mut W,
     parts: &mut dyn Parts,
@@ -1869,15 +1948,38 @@ async fn admit<W: Writer>(
     if admission.account_limit_pause {
         config.insert("account_limit_pause".into(), json!(true));
     }
+    // The members today's run config serializes only when set.
+    for (key, value) in [
+        (
+            "turn_directives_v1",
+            to_value(admission.directives.as_ref())?,
+        ),
+        ("work_class", to_value(admission.work_class.as_ref())?),
+        ("variant", to_value(admission.variant.as_ref())?),
+        (
+            "context_management",
+            to_value(admission.context_management.as_ref())?,
+        ),
+        (
+            "tools_were_omitted",
+            admission.tools_were_omitted.then_some(json!(true)),
+        ),
+    ] {
+        if let Some(value) = value {
+            config.insert(key.into(), value);
+        }
+    }
     let mut choices = serde_json::Map::new();
     choices.insert("config".into(), Value::Object(config));
     if let Some(rest) = manifest_rest {
         choices.insert("manifest".into(), rest);
     }
-    choices.insert(
-        "record".into(),
-        json!({ "marker_order_version": MARKER_ORDER_VERSION }),
-    );
+    let mut record = serde_json::Map::new();
+    record.insert("marker_order_version".into(), json!(MARKER_ORDER_VERSION));
+    if let Some(sent_by) = to_value(admission.send.sent_by.as_ref())? {
+        record.insert("sent_by".into(), sent_by);
+    }
+    choices.insert("record".into(), Value::Object(record));
     let mut records = Vec::new();
     if writer.operations().setup_changed(&setup, &admission.model) {
         records.push(Record::SetupStub(SetupStub {
@@ -1894,17 +1996,17 @@ async fn admit<W: Writer>(
         model: admission.model.clone(),
         setup,
         renderer_version: admission.renderer_version,
-        submission_id: None,
-        send_id: None,
-        request_identity_digest: None,
+        submission_id: admission.send.submission_id.clone(),
+        send_id: admission.send.send_id.clone(),
+        request_identity_digest: admission.send.request_identity_digest.clone(),
         ts_ms: admission.ts_ms,
         written_at_ms: admission.written_at_ms,
-        session_class: None,
-        retention_secs: None,
-        title: None,
+        session_class: admission.send.session_class.clone(),
+        retention_secs: admission.send.retention_secs,
+        title: admission.send.title.clone(),
         context_limit: admission.context_limit,
-        service_tier: None,
-        route_decision_id: None,
+        service_tier: admission.service_tier.map(|tier| tier.as_str().to_owned()),
+        route_decision_id: admission.route_decision_id.clone(),
         compaction_plan_version: admission.compaction_plan_version,
         auth_selection: admission
             .auth_selection
@@ -1914,9 +2016,9 @@ async fn admit<W: Writer>(
             .map_err(|e| LoopError::Parts(e.to_string()))?,
         run_choices: Some(Value::Object(choices)),
         origin: Some(json!({ "kind": "fresh" })),
-        principal: None,
-        scope: None,
-        hooks: None,
+        principal: to_value(admission.send.principal.as_ref())?,
+        scope: to_value(admission.send.scope.as_ref())?,
+        hooks: to_value(admission.send.hooks.as_ref())?,
         keep_warm: admission
             .keep_warm
             .map(serde_json::to_value)
@@ -2492,6 +2594,8 @@ async fn batch<W, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
     run_id: &str,
+    // The scope the run is frozen to: its tool calls are routed under it.
+    scope: Option<&broca_protocol::SessionScope>,
     step_id: u64,
     planned: &[ToolCall],
     calls: &[ToolCall],
@@ -2510,7 +2614,7 @@ where
         batch_id: BatchId(batch_id.clone()),
         bind: seams.bind.clone(),
         run_id: RunId(run_id.into()),
-        scope: None,
+        scope: scope.cloned(),
         // A result keeps only media captured here for that exact call (`checked`).
         media_capture: writer.media(),
     };

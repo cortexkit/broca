@@ -535,15 +535,15 @@ fn spanning_repetition(
 fn frozen(admission: &Admission) -> v2::host::Frozen<'_> {
     v2::host::Frozen {
         model: &admission.model,
-        variant: None,
-        service_tier: None,
+        variant: admission.variant.as_deref(),
+        service_tier: admission.service_tier,
         frozen_render_config: &admission.render_config,
         tools: &admission.tools,
         // A planned run's system text is its plan's, which the send context reads from the
         // manifest; only an unplanned run's own system text counts here, as today's config holds.
         global_system: (admission.manifest.is_none() && !admission.global_system.is_empty())
             .then_some(admission.global_system.as_slice()),
-        auth_selection: None,
+        auth_selection: admission.auth_selection.as_ref(),
         context_limit: admission.context_limit,
         max_output_tokens: admission.generation.max_output_tokens,
     }
@@ -649,7 +649,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         plane: seams.compaction_plane,
         provider: &ctx.provider,
         bind: &seams.bind,
-        scope: None,
+        scope: admission.send.scope.as_ref(),
     };
     let journal = StoreJournal::new(writer, &seams.bind);
     let prepared = v2::request::prepare(
@@ -746,7 +746,7 @@ pub async fn notice<W: Writer, P, T>(
                 plane: seams.compaction_plane,
                 provider: &ctx.provider,
                 bind: &seams.bind,
-                scope: None,
+                scope: admission.send.scope.as_ref(),
             },
             &setup,
             &conditions,

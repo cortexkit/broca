@@ -10,7 +10,7 @@ use broca_core::provider::Provider;
 use broca_core::{RunControl, RunError, RunRequest};
 use broca_session_store::fold::operations::Operations;
 
-use crate::run::Admission;
+use crate::run::{Admission, SendFacts};
 
 /// Whether the session follows the current compaction contract: as its runs started, or, before
 /// its first run, as the first run asks.
@@ -74,5 +74,28 @@ pub fn admission<P: Provider>(
         keep_warm: req.keep_warm,
         auth_selection: control.auth_selection.clone(),
         account_limit_pause: control.account_limit_pause,
+        route_decision_id: req.route_decision_id.clone(),
+        service_tier: req.service_tier,
+        variant: req.variant.clone(),
+        work_class: req.work_class.clone(),
+        context_management: req.context_management.clone(),
+        directives: req.directives.clone(),
+        tools_were_omitted: control.tools_were_omitted,
+        send: SendFacts {
+            submission_id: req.submission_id.as_ref().map(|id| id.0.clone()),
+            send_id: req.send_id.clone(),
+            request_identity_digest: req.request_identity_digest.clone(),
+            title: req.title.clone(),
+            session_class: req.session_class.clone(),
+            retention_secs: req.retention,
+            principal: req.principal.clone(),
+            sent_by: control.display_sent_by.clone(),
+            scope: req.scope.clone(),
+            // The input already holds the hooks' final value; the record keeps the rest.
+            hooks: control.input_hooks.as_deref().cloned().map(|mut hooks| {
+                hooks.final_value = None;
+                hooks
+            }),
+        },
     })
 }

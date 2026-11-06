@@ -220,8 +220,14 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
     let mut time = last_time(at.conversation);
     let mut out = Vec::with_capacity(batch.len() + 2);
     let mut pending: Vec<EntryFacts> = Vec::new();
+    // Who sent the input of a run started in this batch, read from its start as today's entry
+    // metadata reads it from the run's start.
+    let mut run_sender = None;
     let mut records = batch.into_iter().peekable();
     while let Some(record) = records.next() {
+        if let Record::RunStart(start) = &record {
+            run_sender = input_sender(start);
+        }
         if record.stream() == broca_session_store::record::Stream::Transcript {
             counts
                 .apply(&record)
@@ -229,7 +235,7 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
             counts.clear_window();
             let now_known = known_of(&counts);
             for ordinal in known + 1..=now_known {
-                let (message, facts) = describe(&record, at)?;
+                let (message, facts) = describe(&record, at, run_sender.as_ref())?;
                 let own = facts.written_at_ms;
                 let written_at_ms = own.or(time).unwrap_or(0);
                 time = Some(written_at_ms);
@@ -289,6 +295,44 @@ fn flush(out: &mut Vec<Record>, pending: &mut Vec<EntryFacts>, at: &Placing<'_>)
     }
 }
 
+/// The sender of a run's user input, as today's entry metadata names it: for a fresh run, the
+/// module that sent on the owner's behalf, else the run's principal, when that is a module
+/// (`delivery_sender`). A person's input has none. A run that consumes a queued send takes that
+/// send's origin instead, which needs the queued send's records: not built yet, so such a run's
+/// input names no sender.
+fn input_sender(start: &broca_session_store::record::RunStart) -> Option<Notice> {
+    let fresh = start
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("fresh");
+    if !fresh || start.submission_id.is_some() {
+        return None;
+    }
+    let decode = |value: Option<&serde_json::Value>| {
+        value.and_then(|value| {
+            serde_json::from_value::<broca_protocol::BindPrincipal>(value.clone()).ok()
+        })
+    };
+    let sent_by = decode(
+        start
+            .run_choices
+            .as_ref()
+            .and_then(|choices| choices.get("record"))
+            .and_then(|record| record.get("sent_by")),
+    );
+    let principal = sent_by.or_else(|| decode(start.principal.as_ref()));
+    let sender = broca_core::compaction_v2::entries::delivery_sender(
+        principal.as_ref(),
+        broca_protocol::DeliveryMode::Steer,
+    )?;
+    Some(Notice {
+        sender,
+        template: None,
+    })
+}
+
 struct Described {
     written_at_ms: Option<u64>,
     notice: Option<Notice>,
@@ -303,6 +347,7 @@ struct Described {
 fn describe<'r>(
     record: &'r Record,
     at: &Placing<'_>,
+    run_sender: Option<&Notice>,
 ) -> Result<(Option<&'r Message>, Described), String> {
     Ok(match record {
         // A budget reminder is the runner's own message, sent as a notice from broca, as
@@ -325,10 +370,11 @@ fn describe<'r>(
             Some(&input.message),
             Described {
                 written_at_ms: input.written_at_ms,
-                notice: input
-                    .notice
-                    .clone()
-                    .filter(|_| input.message.role == Role::User),
+                notice: match input.placement {
+                    Placement::RunInput => run_sender.cloned(),
+                    _ => input.notice.clone(),
+                }
+                .filter(|_| input.message.role == Role::User),
                 usage: None,
                 generated_under: None,
                 native: false,
