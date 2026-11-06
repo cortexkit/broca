@@ -21,7 +21,10 @@
 //! - on opening the session, its unfinished run: a running one is ended `Interrupted`, since
 //!   only a process that ended without stopping it leaves one, and with no unfinished run the
 //!   queue drains;
-//! - going away when idle.
+//! - going away when idle: in a module, through the registry's close, so a command racing the
+//!   close is answered `Reopen` and re-routed;
+//! - a module stop: the running run is ended `Interrupted` with today's shutdown seal, never
+//!   cancelled, since a cancel records a decision no caller made.
 //!
 //! Every other command, and every send that needs an admission rule not built here yet, is
 //! refused by name with nothing written. Today's actor is the reference for each rule still to
@@ -66,6 +69,67 @@ pub struct StoreActor<B: SessionBackend> {
     /// setup store. `None` keeps them in memory only, as tests do.
     storage: Option<broca_session_loop::durable::SetupParts<B>>,
     run: Option<ActiveRun>,
+    /// Set once the module stops the session: no queued send starts after it.
+    stopping: bool,
+}
+
+/// How an actor lives in the module's registry. Tests serve an actor without one.
+pub struct Lifecycle {
+    pub registry: crate::registry::RegistryHandle,
+    /// The generation of the registry slot this actor serves.
+    pub gen: u64,
+    /// The session lease, held for the actor's whole life and released only after its session
+    /// is closed, so no other process opens a writer beside it.
+    pub lease: Box<dyn std::any::Any + Send>,
+    /// How long the session waits idle before it closes.
+    pub idle_ttl: std::time::Duration,
+    /// The health gauge of whether the session is running a run, shared with its handle.
+    pub run_in_flight: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Where the actor's commands arrive: the registry's bounded channel in a module, an unbounded
+/// one in tests.
+pub enum Commands {
+    Bounded(mpsc::Receiver<LineageCmd>),
+    Unbounded(mpsc::UnboundedReceiver<LineageCmd>),
+}
+
+impl Commands {
+    async fn recv(&mut self) -> Option<LineageCmd> {
+        match self {
+            Self::Bounded(commands) => commands.recv().await,
+            Self::Unbounded(commands) => commands.recv().await,
+        }
+    }
+
+    fn try_recv(&mut self) -> Option<LineageCmd> {
+        match self {
+            Self::Bounded(commands) => commands.try_recv().ok(),
+            Self::Unbounded(commands) => commands.try_recv().ok(),
+        }
+    }
+}
+
+impl From<mpsc::Receiver<LineageCmd>> for Commands {
+    fn from(commands: mpsc::Receiver<LineageCmd>) -> Self {
+        Self::Bounded(commands)
+    }
+}
+
+impl From<mpsc::UnboundedReceiver<LineageCmd>> for Commands {
+    fn from(commands: mpsc::UnboundedReceiver<LineageCmd>) -> Self {
+        Self::Unbounded(commands)
+    }
+}
+
+/// Why the actor stopped serving commands.
+enum Exit {
+    /// Every sender is gone.
+    Closed,
+    /// The session went idle: at its idle deadline, or on an idle tick.
+    Idle,
+    /// The module is stopping.
+    Stop,
 }
 
 /// The run the session is running.
@@ -149,6 +213,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             parts: SharedParts::new(parts),
             storage: None,
             run: None,
+            stopping: false,
         }
     }
 
@@ -174,55 +239,216 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// Serves `commands` until the session goes away: when the channel closes, or when it is
-    /// idle at an idle tick. Returns the session, for whoever closes it.
-    pub async fn serve(mut self, mut commands: mpsc::UnboundedReceiver<LineageCmd>) -> Session<B> {
+    /// idle at an idle tick. Returns the session, for whoever closes it. A run still running
+    /// when the channel closes is ended as a module stop ends it.
+    pub async fn serve(mut self, commands: mpsc::UnboundedReceiver<LineageCmd>) -> Session<B> {
+        let mut commands = Commands::from(commands);
+        self.serve_until_exit(&mut commands, None, None, None).await;
+        self.stop_for_shutdown().await;
+        self.session
+    }
+
+    /// Serves the session as the module's actor for it, until it closes idle or the module
+    /// stops, then gives its registry slot up. The order matches today's actor: the session is
+    /// closed and the executor told before the lease goes, and only then does the slot read
+    /// closed, so a reopen never finds another writer still on the session.
+    pub async fn serve_in_registry(mut self, commands: impl Into<Commands>, life: Lifecycle) {
+        let mut commands = commands.into();
+        let seal = life.registry.seal_signal();
+        let exit = self
+            .serve_until_exit(
+                &mut commands,
+                Some(&seal),
+                Some(life.idle_ttl),
+                Some(&life.run_in_flight),
+            )
+            .await;
+        let close = match exit {
+            Exit::Idle => life.registry.begin_close(&self.key, life.gen),
+            Exit::Closed | Exit::Stop => None,
+        };
+        if close.is_some() {
+            // Commands that raced the close are answered so their callers re-route through the
+            // registry, which reopens the session once this close is done.
+            while let Some(command) = commands.try_recv() {
+                reopen(command);
+            }
+        }
+        self.stop_for_shutdown().await;
+        life.run_in_flight
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let _ = tokio::time::timeout(
+            crate::actor::ON_SESSION_CLOSE_TIMEOUT,
+            self.executor.on_session_close(&self.key),
+        )
+        .await;
+        let key = self.key.clone();
+        drop(self);
+        drop(life.lease);
+        match close {
+            Some(close) => close.commit(),
+            None => life.registry.finalize_exit(&key, life.gen),
+        }
+    }
+
+    /// The command loop. With `seal`, the module's stop ends it; with `idle_ttl`, the session's
+    /// idle deadline does; `gauge` reads whether a run is running.
+    async fn serve_until_exit(
+        &mut self,
+        commands: &mut Commands,
+        seal: Option<&CancellationToken>,
+        idle_ttl: Option<std::time::Duration>,
+        gauge: Option<&Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Exit {
         self.recover().await;
+        let never = CancellationToken::new();
+        let seal = seal.unwrap_or(&never);
+        let idle_after = |now: tokio::time::Instant| idle_ttl.map(|ttl| now + ttl);
+        let mut idle_deadline = idle_after(tokio::time::Instant::now());
         loop {
+            if let Some(gauge) = gauge {
+                gauge.store(
+                    u64::from(self.run.is_some()),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
             let event = match self.run.as_mut() {
                 // Until the run's start is durable, commands wait, as they wait in today's actor
                 // while it awaits a run's admission, a drained run's included: a cancel, a
                 // retraction or a second send can only meet a run that exists.
                 Some(active) => tokio::select! {
+                    biased;
+                    _ = seal.cancelled() => return Exit::Stop,
                     request = active.link.next(), if !active.writer_gone => Event::Request(request),
                     end = &mut active.done => Event::Done(end),
                     command = commands.recv(), if active.started => Event::Command(command),
                 },
-                None => Event::Command(commands.recv().await),
+                None => tokio::select! {
+                    biased;
+                    _ = seal.cancelled() => return Exit::Stop,
+                    command = commands.recv() => Event::Command(command),
+                    _ = async {
+                        match idle_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => return Exit::Idle,
+                },
             };
             match event {
-                Event::Request(Some(request)) => {
-                    let active = self
-                        .run
-                        .as_mut()
-                        .expect("a request comes from the active run");
-                    let mut writer = broca_session_loop::durable::Durable {
-                        writer: &mut self.session,
-                        parts: &mut self.parts,
-                        store: self.storage.as_ref(),
-                    };
-                    active.link.serve(&mut writer, request).await;
-                    self.answer_admission();
-                }
+                Event::Request(Some(request)) => self.serve_request(request).await,
                 Event::Request(None) => {
                     if let Some(active) = self.run.as_mut() {
                         active.writer_gone = true;
                     }
                 }
                 Event::Done(end) => self.finish_run(end).await,
-                Event::Command(None) => break,
+                Event::Command(None) => return Exit::Closed,
                 Event::Command(Some(command)) => {
+                    idle_deadline = idle_after(tokio::time::Instant::now());
                     if self.handle(command).await {
-                        break;
+                        return Exit::Idle;
                     }
                 }
             }
         }
-        if let Some(active) = self.run.take() {
-            // Nobody is left to send commands: the run is cut, as a module stop would cut it.
-            active.cancel.cancel();
-            let _ = active.done.await;
+    }
+
+    /// Serves one write the active run asks for.
+    async fn serve_request(&mut self, request: broca_session_loop::shared::Request) {
+        let active = self
+            .run
+            .as_mut()
+            .expect("a request comes from the active run");
+        let mut writer = broca_session_loop::durable::Durable {
+            writer: &mut self.session,
+            parts: &mut self.parts,
+            store: self.storage.as_ref(),
+        };
+        active.link.serve(&mut writer, request).await;
+        self.answer_admission();
+    }
+
+    /// Serves the active run, and nothing else, until no run is active.
+    async fn run_to_end(&mut self) {
+        loop {
+            let Some(active) = self.run.as_mut() else {
+                return;
+            };
+            let event = tokio::select! {
+                request = active.link.next(), if !active.writer_gone => Event::Request(request),
+                end = &mut active.done => Event::Done(end),
+            };
+            match event {
+                Event::Request(Some(request)) => self.serve_request(request).await,
+                Event::Request(None) => {
+                    if let Some(active) = self.run.as_mut() {
+                        active.writer_gone = true;
+                    }
+                }
+                Event::Done(end) => self.finish_run(end).await,
+                Event::Command(_) => unreachable!("no command is read here"),
+            }
         }
-        self.session
+    }
+
+    /// Stops the session for a module stop, or for a close with nobody left to send commands.
+    /// A running run is stopped where it is and its unfinished run ended `Interrupted` by
+    /// today's shutdown seal (`broca_core::resume::SealCause::Shutdown`): never cancelled, which
+    /// would record a caller's decision nobody made. A run paused or held by a provider is left
+    /// as it is, as today's actor leaves one. Nothing queued starts afterwards.
+    async fn stop_for_shutdown(&mut self) {
+        use broca_session_store::fold::operations::Resolution;
+        self.stopping = true;
+        let Some(active) = self.run.take() else {
+            return;
+        };
+        active.done.abort();
+        let _ = active.done.await;
+        if let Some(reply) = active.admitting {
+            let _ = reply.send(SendOutcome::Transient(
+                "the module stopped before the run's start was written".into(),
+            ));
+        }
+        let operations = self.session.operations();
+        let Some(run) = operations.run.as_ref().filter(|run| run.finished.is_none()) else {
+            return;
+        };
+        if matches!(
+            run.resolution(),
+            Resolution::Paused(_) | Resolution::ProviderHeld(_)
+        ) {
+            return;
+        }
+        let start = match self.recovery_start(run) {
+            Ok(start) => start,
+            Err(error) => {
+                tracing::error!(
+                    target: "broca.store_actor",
+                    session = %self.key.session,
+                    error = %error,
+                    "the stopped run's start could not be read back to seal it; the next open seals it",
+                );
+                return;
+            }
+        };
+        self.start_run(
+            start,
+            None,
+            None,
+            StoreRunMode::Seal(broca_core::resume::SealCause::Shutdown),
+        );
+        if tokio::time::timeout(crate::actor::SHUTDOWN_SEAL_BOUND, self.run_to_end())
+            .await
+            .is_err()
+        {
+            // Left unfinished, the run is sealed as a crash orphan when the session next opens.
+            tracing::warn!(
+                target: "broca.store_actor",
+                session = %self.key.session,
+                "the shutdown seal did not finish in time; the next open seals the run",
+            );
+        }
     }
 
     /// Handles one command. Returns whether the actor should go away.
@@ -244,18 +470,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 order,
                 reply,
             } => {
-                let unserved_part = if order.is_some() {
-                    Some("an ordered delivery")
-                } else if delivery == broca_protocol::Delivery::Interrupt {
-                    Some("an interrupt")
-                } else if conversation_key.is_some() {
-                    // Routing reads it when it picks the run's account, which a store session's
-                    // runs don't do yet.
-                    Some("a send naming a conversation key")
-                } else {
-                    None
-                };
-                if let Some(what) = unserved_part {
+                if let Some(what) =
+                    unserved_delivery(order.is_some(), delivery, conversation_key.is_some())
+                {
                     let _ = reply.send(SendOutcome::Error(unserved(what)));
                     return false;
                 }
@@ -395,14 +612,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         }
                     }
                 }
-                let unserved_part = if retention.is_some() {
-                    Some("a send setting retention")
-                } else if kind == RunKind::ResumeAfterAuth {
-                    Some("resuming after sign-in")
-                } else {
-                    refuse_unbuilt_request(&request)
-                };
-                if let Some(what) = unserved_part {
+                if let Some(what) = unserved_request(&request, kind, retention.is_some()) {
                     let _ = reply.send(SendOutcome::Error(unserved(what)));
                     return false;
                 }
@@ -1165,7 +1375,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// today's actor drains its queue at a run's end. A paused run holds the queue. The run's
     /// end comes back through `finish_run`, which drains again.
     async fn drain(&mut self) {
-        if self.run.is_some()
+        if self.stopping
+            || self.run.is_some()
             || self
                 .session
                 .operations()
@@ -1570,6 +1781,56 @@ fn finished(run_id: &RunId, reason: broca_protocol::RunFinishReason) -> SendOutc
     }
 }
 
+/// Whether a send creating a session asks only for what this actor serves, so the session may
+/// start in the new storage. It makes the same checks the actor makes on a send before writing
+/// anything; a send failing one creates its session on today's storage instead, where it is
+/// served.
+pub fn serves_creating_send(
+    request: &SubmissionRequest,
+    kind: RunKind,
+    delivery: broca_protocol::Delivery,
+    conversation_key: bool,
+    retention: bool,
+    ordered: bool,
+) -> bool {
+    unserved_delivery(ordered, delivery, conversation_key).is_none()
+        && unserved_request(request, kind, retention).is_none()
+}
+
+/// How a send asks to be delivered, where this actor doesn't serve it yet.
+fn unserved_delivery(
+    ordered: bool,
+    delivery: broca_protocol::Delivery,
+    conversation_key: bool,
+) -> Option<&'static str> {
+    if ordered {
+        Some("an ordered delivery")
+    } else if delivery == broca_protocol::Delivery::Interrupt {
+        Some("an interrupt")
+    } else if conversation_key {
+        // Routing reads it when it picks the run's account, which a store session's runs don't
+        // do yet.
+        Some("a send naming a conversation key")
+    } else {
+        None
+    }
+}
+
+/// What a send's request asks for, where this actor doesn't serve it yet.
+fn unserved_request(
+    request: &SubmissionRequest,
+    kind: RunKind,
+    retention: bool,
+) -> Option<&'static str> {
+    if retention {
+        Some("a send setting retention")
+    } else if kind == RunKind::ResumeAfterAuth {
+        Some("resuming after sign-in")
+    } else {
+        refuse_unbuilt_request(request)
+    }
+}
+
 /// The request fields a store session doesn't take yet, refused by name before anything is
 /// written.
 fn refuse_unbuilt_request(request: &SubmissionRequest) -> Option<&'static str> {
@@ -1584,6 +1845,69 @@ fn refuse_unbuilt_request(request: &SubmissionRequest) -> Option<&'static str> {
         Some("a send with media")
     } else {
         None
+    }
+}
+
+/// Answers a command that raced the session's close, as today's actor answers one: the caller
+/// re-routes through the registry and reaches the reopened session.
+fn reopen(command: LineageCmd) {
+    const CLOSING: &str = "session actor is closing";
+    match command {
+        LineageCmd::RepairRetention { reply }
+        | LineageCmd::ResumeRestart { reply }
+        | LineageCmd::ResumeHeld { reply } => {
+            let _ = reply.send(Err(CLOSING.into()));
+        }
+        LineageCmd::Send { reply, .. } => {
+            let _ = reply.send(SendOutcome::Reopen);
+        }
+        LineageCmd::Import { reply, .. } => {
+            let _ = reply.send(crate::actor::ImportOutcome::Reopen);
+        }
+        LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
+            let _ = reply.send(CancelOutcome::Reopen);
+        }
+        LineageCmd::SenderPolicy { reply, .. } => {
+            let _ = reply.send(Ok(None));
+        }
+        LineageCmd::Retract { reply, .. } => {
+            let _ = reply.send(RetractOutcome::Reopen);
+        }
+        LineageCmd::SessionRefresh { reply, .. } => {
+            let _ = reply.send(crate::actor::SessionRefreshOutcome::Reopen);
+        }
+        LineageCmd::SessionRefreshPolicy { reply, .. } => {
+            let _ = reply.send(crate::actor::SessionRefreshPolicyOutcome::Reopen);
+        }
+        LineageCmd::SessionFlushPrefix { reply, .. } => {
+            let _ = reply.send(crate::actor::SessionFlushPrefixOutcome::Reopen);
+        }
+        LineageCmd::Status { reply } => {
+            let _ = reply.send(LineageStatus::Closing);
+        }
+        LineageCmd::RunState { reply, .. } => {
+            let _ = reply.send(Err(CLOSING.into()));
+        }
+        LineageCmd::Subscribe { reply, .. } => {
+            let _ = reply.send(crate::actor::SubscribeOutcome::Reopen);
+        }
+        LineageCmd::Warm { reply, .. } => {
+            let _ = reply.send(crate::actor::WarmOutcome::Reopen);
+        }
+        LineageCmd::CutLock { reply, .. } => drop(reply),
+        // Today's actor sends these two to itself; nothing sends them to this one.
+        LineageCmd::WarmFinished { .. }
+        | LineageCmd::RunFinished { .. }
+        | LineageCmd::IdleTick
+        | LineageCmd::CompactionChanged { .. }
+        | LineageCmd::ApplyCompaction { .. }
+        | LineageCmd::CompactionV2 { .. } => {}
+        #[cfg(test)]
+        LineageCmd::RetainedAdmissionIdentityState { reply } => {
+            let _ = reply.send((usize::MAX, usize::MAX));
+        }
+        #[cfg(test)]
+        LineageCmd::PanicInActor => {}
     }
 }
 

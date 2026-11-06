@@ -642,6 +642,12 @@ pub trait LineageOpener: Send + Sync {
     fn check_move(&self, _key: &LineageKey, _write: bool) -> Result<(), OpenError> {
         Ok(())
     }
+    /// Whether this opener serves `key` from the new storage: the session's head exists and the
+    /// opener has a store runtime. Today's storage refuses such a session by name, so its WAL
+    /// checks are skipped for it. A head that can't be checked is an error, never `false`.
+    fn serves_from_store(&self, _key: &LineageKey) -> Result<bool, OpenError> {
+        Ok(false)
+    }
     /// Best-effort repair through the session's writer fence. The range is already durable;
     /// implementations must not open or modify a WAL while materializing it.
     async fn backfill_attribution(
@@ -966,6 +972,12 @@ struct Inner {
     plan_admitter: std::sync::OnceLock<Arc<dyn broca_fetch_plan::PlanAdmitter>>,
     slots: Mutex<HashMap<LineageKey, Entry>>,
     next_gen: AtomicU64,
+    /// Whether a session that exists in neither storage may start in the new storage, when the
+    /// send creating it asks only for what the store actor serves. Off unless a builder sets it.
+    store_new_sessions: std::sync::atomic::AtomicBool,
+    /// Sessions whose creating send the store actor serves, marked by the send and taken by the
+    /// opener, which starts such a session in the new storage when it exists nowhere yet.
+    store_eligible: Mutex<std::collections::HashSet<LineageKey>>,
     opener: Arc<dyn LineageOpener>,
     reader: Option<ReadSources>,
     run_rows: Option<Arc<OverhaulRunSource>>,
@@ -2215,6 +2227,11 @@ impl LineageRegistry {
         Ok(guard)
     }
     pub fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
+        // A session in the new storage has no WAL, so no WAL move fence applies to it, and
+        // today's store would refuse it by name. Moving such a session isn't built.
+        if self.inner.opener.serves_from_store(key)? {
+            return Ok(());
+        }
         self.inner.opener.check_move(key, write)?;
         if let Some(reader) = &self.inner.reader {
             reader
@@ -2234,6 +2251,15 @@ impl LineageRegistry {
     }
     pub fn backup_classes(&self) -> Vec<String> {
         self.inner.opener.backup_classes()
+    }
+
+    /// Lets a session that exists in neither storage start in the new storage when the send
+    /// creating it asks only for what the store actor serves. The opener must have a store
+    /// runtime (`DefaultOpener::with_store_runtime`); without one every session stays on today's
+    /// storage. Off by default, and in production.
+    pub fn with_store_new_sessions(self) -> Self {
+        self.inner.store_new_sessions.store(true, Ordering::SeqCst);
+        self
     }
 
     pub fn new(opener: Arc<dyn LineageOpener>) -> Self {
@@ -2289,6 +2315,8 @@ impl LineageRegistry {
                 cut_gates: Mutex::new(HashMap::new()),
                 change_gates: Mutex::new(HashMap::new()),
                 next_gen: AtomicU64::new(1),
+                store_new_sessions: std::sync::atomic::AtomicBool::new(false),
+                store_eligible: Mutex::new(std::collections::HashSet::new()),
                 opener,
                 reader: wal_store.map(|wal_store| ReadSources { wal_store, store }),
                 run_rows,
@@ -3865,10 +3893,30 @@ impl LineageRegistry {
         }
         crate::retention::validate_retention(retention, None, false)
             .map_err(OpenError::RetentionInvalid)?;
+        let store_eligible = self.inner.store_new_sessions.load(Ordering::SeqCst)
+            && crate::store_actor::serves_creating_send(
+                &request,
+                kind,
+                delivery,
+                conversation_key.is_some(),
+                retention.is_some(),
+                order.is_some(),
+            );
         loop {
+            if store_eligible {
+                self.inner
+                    .store_eligible
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone());
+            }
             let handle = self
                 .actor_for_mode(key, retention, session_class.clone(), false)
-                .await?;
+                .await;
+            // A mark the open didn't take, because the session was already open, must not
+            // decide a later open.
+            self.inner.store_eligible.lock().unwrap().remove(key);
+            let handle = handle?;
             let (reply, rx) = tokio::sync::oneshot::channel();
             let cmd = LineageCmd::Send {
                 session_class: session_class.clone(),
@@ -6395,6 +6443,11 @@ impl LineageRegistry {
 }
 
 impl RegistryHandle {
+    /// Takes the mark that the send opening `key` is one the store actor serves.
+    pub(crate) fn take_store_eligible(&self, key: &LineageKey) -> bool {
+        self.inner.store_eligible.lock().unwrap().remove(key)
+    }
+
     pub(crate) async fn check_session_log(&self, key: &LineageKey) -> Result<(), OpenError> {
         LineageRegistry {
             inner: self.inner.clone(),

@@ -61,13 +61,13 @@ pub const IDLE_TTL: Duration = Duration::from_secs(30);
 /// How long the close teardown waits for the executor's `on_session_close` hook (a
 /// best-effort wire send to free a tool-route channel) before proceeding with the close
 /// anyway. Bounds external I/O so a stalled send can't hold the registry slot + lease open.
-const ON_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const ON_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Deadline for the Interrupted seal write (WAL barriers, replay and index update), measured
 /// from entry to shutdown sealing. Attempt handover and the aborted run's join spend this
 /// time too, but the join itself is not timed out. Child teardown and the writer join retain
 /// the slot and lease until complete; only the registry's total deadline bounds that wait.
-const SHUTDOWN_SEAL_BOUND: Duration = Duration::from_secs(5);
+pub(crate) const SHUTDOWN_SEAL_BOUND: Duration = Duration::from_secs(5);
 
 /// How long the seal waits for the provider transport to hand over the record of the attempt
 /// it had in flight. The transport does so without any network wait the moment it sees the

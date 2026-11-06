@@ -45,6 +45,9 @@ pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
     /// directory; an opener built from an arbitrary `LeaseStore` cannot prove its root
     /// and therefore accepts none.
     lease_root: Option<PathBuf>,
+    /// Serves sessions kept in the new storage, and starts new ones there when the registry
+    /// marks their creating send. `None` keeps every session on today's storage.
+    store: Option<Arc<crate::store_open::StoreRuntime>>,
     #[cfg(feature = "test-clock")]
     test_fs: Option<Arc<dyn broca_wal::fs_ops::FsOps>>,
 }
@@ -145,9 +148,16 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
             charge_basis_resolver: None,
             lease_domain: None,
             lease_root: None,
+            store: None,
             #[cfg(feature = "test-clock")]
             test_fs: None,
         }
+    }
+
+    /// Serves sessions kept in the new storage through `store`.
+    pub fn with_store_runtime(mut self, store: Arc<crate::store_open::StoreRuntime>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     pub fn with_readers(mut self, readers: Arc<ActorReadSources>) -> Self {
@@ -255,9 +265,18 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
         self.executor.media_profile(request).await
     }
     fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
+        if self.serves_from_store(key)? {
+            return Ok(());
+        }
         self.wal_store
             .check_move(key, write)
             .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))
+    }
+    fn serves_from_store(&self, key: &LineageKey) -> Result<bool, OpenError> {
+        match &self.store {
+            Some(store) => store.holds(key),
+            None => Ok(false),
+        }
     }
     async fn backfill_attribution(
         &self,
@@ -370,9 +389,13 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         session_class: Option<String>,
         status: bool,
     ) -> Result<ActorHandle, OpenError> {
-        self.wal_store
-            .check_move(key, true)
-            .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))?;
+        // A session in the new storage has no WAL: its move fence and today's checks don't
+        // apply, and today's store refuses it by name.
+        if !self.serves_from_store(key)? {
+            self.wal_store
+                .check_move(key, true)
+                .map_err(|e| OpenError::from_wal_read(e.to_string(), &e))?;
+        }
         debug_assert!(
             key.validate_keyable().is_ok(),
             "DefaultOpener identity must be validated before durable key derivation"
@@ -427,6 +450,24 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 drop(authority);
                 return Err(error);
             }
+        }
+        if let Some(store) = &self.store {
+            // Decided under the lease, so no other open of this session decides beside it. A
+            // session in the new storage is served from there; one that exists in neither
+            // storage starts there when the registry marked its creating send. The actor keeps
+            // the lease until its session is closed.
+            let held = store.holds(key)?;
+            let create = !held
+                && !status
+                && registry.take_store_eligible(key)
+                && self.wal_store.wal_present(key) == Some(false);
+            if held || create {
+                return store
+                    .open_actor(key, gen, registry, Box::new(authority), create)
+                    .await;
+            }
+        }
+        if let OpenAuthority::Tenure(_) = &authority {
             // The one move-fence validation of this tenure, before any mutation the open
             // performs: expiry deletion, archive restore, torn-tail recovery or lineage
             // creation. The check before acquisition proves nothing about the tenure, since

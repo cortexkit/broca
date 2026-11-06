@@ -1008,3 +1008,241 @@ async fn a_steer_naming_structured_output_the_run_did_not_freeze_is_refused_alik
     )
     .await;
 }
+
+/// Both loops behind one executor, as the module's executor will be: a session on today's
+/// storage runs through today's loop, a session in the new storage through the new one.
+struct BothLoops {
+    today: TodayLoop,
+    store: super::tests::LoopExecutor,
+}
+
+#[async_trait]
+impl RunExecutor for BothLoops {
+    async fn execute(
+        &self,
+        job: RunJob,
+        out: mpsc::Sender<OutputEvent>,
+    ) -> Result<RunSummary, RunError> {
+        self.today.execute(job, out).await
+    }
+
+    async fn execute_on_store(
+        &self,
+        job: crate::executor::StoreRunJob,
+        out: mpsc::Sender<OutputEvent>,
+    ) -> crate::executor::StoreRunEnd {
+        self.store.execute_on_store(job, out).await
+    }
+}
+
+/// A module over a scratch folder whose opener can serve the new storage, with the registry's
+/// new-session switch `on` or off.
+struct Module {
+    dir: std::path::PathBuf,
+    registry: LineageRegistry,
+    wal: Arc<FileWalStore>,
+    key: BindIdentity,
+}
+
+impl Drop for Module {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+const IDLE: Duration = Duration::from_millis(100);
+
+async fn module(on: bool, steps: Vec<Vec<NormalizedEvent>>) -> Module {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = broca_test_support::scratch_root().join(format!(
+        "store-open-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    // Today's WAL store finds the new storage beside its own folder: its state root is `dir`.
+    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    let executor: Arc<dyn RunExecutor> = Arc::new(BothLoops {
+        today: TodayLoop {
+            provider: Gated {
+                inner: broca_core::provider::StubProvider::new(steps.clone()),
+                gate: None,
+            },
+            wal: Arc::clone(&wal),
+        },
+        store: executor(steps, None),
+    });
+    let runtime = crate::store_open::StoreRuntime::open(
+        &dir,
+        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+        Arc::clone(&executor),
+        IDLE,
+    )
+    .await
+    .unwrap();
+    let registry = LineageRegistry::new_with_reader(
+        Arc::new(
+            crate::opener::DefaultOpener::new(
+                Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                wal.clone(),
+                executor,
+            )
+            .with_idle_ttl(IDLE)
+            .with_store_runtime(Arc::new(runtime)),
+        ),
+        wal.clone(),
+        None,
+    );
+    let registry = if on {
+        registry.with_store_new_sessions()
+    } else {
+        registry
+    };
+    let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
+    Module {
+        dir,
+        registry,
+        wal,
+        key,
+    }
+}
+
+impl Module {
+    async fn send(&self, run_id: &str, text: &str, conversation_key: Option<&str>) -> SendOutcome {
+        self.registry
+            .route_submission_with_order(
+                &self.key,
+                RunId(run_id.into()),
+                request(text),
+                RunKind::FreshOrResume,
+                SendKey::Minted,
+                false,
+                broca_protocol::Delivery::Queue,
+                None,
+                conversation_key.map(str::to_owned),
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("the session opens")
+    }
+
+    /// Waits until the session is idle, then until its actor has closed and left the registry.
+    async fn closed(&self) {
+        for _ in 0..1000 {
+            if self.registry.slot_state(&self.key).is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the session's actor never closed");
+    }
+
+    fn head(&self) -> std::path::PathBuf {
+        broca_wal::session_storage_head(&self.dir, &broca_core::session_addr(&self.key))
+    }
+
+    fn floor(&self) -> String {
+        std::fs::read_to_string(self.dir.join(broca_wal::FEATURE_FLOOR_FILENAME))
+            .unwrap_or_default()
+    }
+
+    /// The text of every message the store session holds, read once its actor is gone.
+    async fn store_texts(&self) -> Vec<String> {
+        let backend = broca_session_store::backend::LocalBackend::new(
+            self.dir.join(broca_wal::SESSION_STORAGE_DIR),
+        );
+        let triple = broca_session_store::head::SessionTriple {
+            project_root: self.key.project_root.display().to_string(),
+            harness: self.key.harness.clone(),
+            session: self.key.session.clone(),
+        };
+        let session = Session::load(
+            backend,
+            broca_session_store::backend::SessionAddr(broca_core::session_addr(&self.key)),
+            &triple,
+            &broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+        )
+        .await
+        .unwrap();
+        session
+            .conversation
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// With the switch on, a session that exists nowhere starts in the new storage: its head is
+/// written, no WAL is, and the feature floor names the new storage before anything else. The
+/// actor closes when idle, and the next send reopens the session from its head and runs after
+/// the first run.
+#[tokio::test]
+async fn the_switch_starts_a_new_session_in_the_new_storage_and_reopens_it() {
+    let module = module(
+        true,
+        vec![
+            super::tests::text_step("a1", "hello"),
+            super::tests::text_step("a2", "again"),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        module.send("r1", "first", None).await,
+        SendOutcome::Active { .. }
+    ));
+    module.closed().await;
+    assert!(
+        module.head().exists(),
+        "the session's head is in the new storage"
+    );
+    assert_eq!(module.wal.wal_present(&module.key), Some(false));
+    assert!(
+        module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE),
+        "{}",
+        module.floor()
+    );
+    assert!(matches!(
+        module.send("r2", "second", None).await,
+        SendOutcome::Active { .. }
+    ));
+    module.closed().await;
+    assert_eq!(module.wal.wal_present(&module.key), Some(false));
+    assert_eq!(
+        module.store_texts().await,
+        ["first", "hello", "second", "again"]
+    );
+}
+
+/// With the switch off, and with it on for a creating send the store actor doesn't serve, the
+/// session starts on today's storage and the new storage holds nothing.
+#[tokio::test]
+async fn sessions_stay_on_todays_storage_unless_the_switch_and_the_send_allow() {
+    for (on, conversation_key) in [(false, None), (true, Some("conversation"))] {
+        let module = module(on, vec![super::tests::text_step("a1", "hello")]).await;
+        assert!(
+            matches!(
+                module.send("r1", "first", conversation_key).await,
+                SendOutcome::Active { .. }
+            ),
+            "switch {on}, conversation key {conversation_key:?}"
+        );
+        module.closed().await;
+        assert!(!module.head().exists(), "switch {on}");
+        assert_eq!(
+            module.wal.wal_present(&module.key),
+            Some(true),
+            "switch {on}"
+        );
+        assert!(!module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
+    }
+}

@@ -1780,3 +1780,53 @@ async fn setup_parts_are_stored_before_the_records_naming_them() {
         .collect();
     assert_eq!(names, ["read", "edit"]);
 }
+
+/// A run still running when the actor stops, as at a module stop, ends `Interrupted` with
+/// today's shutdown seal: no further model call, and never `Cancelled`, which records a
+/// caller's decision nobody made. Nothing queued starts after it.
+#[tokio::test]
+async fn a_run_running_at_a_stop_ends_interrupted_by_the_shutdown_seal() {
+    let gate = Arc::new(Notify::new());
+    let executor = executor(
+        vec![
+            text_step("a1", "never finished"),
+            text_step("a2", "never sent"),
+        ],
+        Some(Arc::clone(&gate)),
+    );
+    let (commands, served, _) = actor(executor).await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    assert!(matches!(
+        send(&commands, "r2", "second").await,
+        SendOutcome::Pending { .. }
+    ));
+    // The run waits on its first model call; the actor stops with it running. A stop that
+    // waits on the run instead of ending it would never return, so it fails here by name.
+    drop(commands);
+    let session = tokio::time::timeout(std::time::Duration::from_secs(10), served)
+        .await
+        .expect("the actor stops without waiting on its running run")
+        .unwrap();
+    let run = session.operations().run.as_ref().unwrap();
+    assert_eq!(run.run_id, "r1", "the queued send never started");
+    assert_eq!(
+        run.finished,
+        Some(broca_protocol::RunFinishReason::Interrupted)
+    );
+    let ends: Vec<_> = session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, record)| match record {
+            Record::RunEnd(end) => Some(end),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), 1, "{ends:?}");
+    assert_eq!(ends[0].interrupt_reason.as_deref(), Some("runner_shutdown"));
+    assert_eq!(session.operations().queue.len(), 1, "r2 stays queued");
+}
