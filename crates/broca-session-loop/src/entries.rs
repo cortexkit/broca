@@ -18,7 +18,7 @@ use broca_core::compaction_v2::metadata::{numbered_parts, step_usage};
 use broca_protocol::content::{Message, Role};
 use broca_session_store::fold::conversation::Conversation;
 use broca_session_store::fold::operations::Operations;
-use broca_session_store::record::{EntryFacts, Notice, Record, StepUsage, ViewRef};
+use broca_session_store::record::{EntryFacts, Notice, Placement, Record, StepUsage, ViewRef};
 use broca_session_store::session::{SessionError, StoredEntry};
 use cortexkit_role_compaction::read::Entry;
 
@@ -254,17 +254,21 @@ pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, S
             }
             known = now_known;
         }
-        let continues = matches!(
-            (&record, records.peek()),
-            (Record::Assistant(_), Some(Record::StepEnd(_)))
-                | (Record::ToolReply(_), Some(Record::ToolOutcome(_)))
-                // Messages placed at a boundary enter with the record that places them: the
-                // step's start, or the run's end.
-                | (
-                    Record::Input(_),
-                    Some(Record::Input(_) | Record::StepStart(_) | Record::RunEnd(_))
-                )
-        );
+        // A budget reminder's firing placed it, just before, so its facts follow it at once.
+        let reminder =
+            matches!(&record, Record::Input(input) if input.placement == Placement::BudgetNudge);
+        let continues = !reminder
+            && matches!(
+                (&record, records.peek()),
+                (Record::Assistant(_), Some(Record::StepEnd(_)))
+                    | (Record::ToolReply(_), Some(Record::ToolOutcome(_)))
+                    // Messages placed at a boundary enter with the record that places them: the
+                    // step's start, or the run's end.
+                    | (
+                        Record::Input(_),
+                        Some(Record::Input(_) | Record::StepStart(_) | Record::RunEnd(_))
+                    )
+            );
         // A builder may name a later record of its own batch by its place in the batch (a call
         // key names its intent's seq), so no record that can be named may follow inserted facts.
         if inserted && matches!(record, Record::ToolIntent(_)) {
@@ -303,6 +307,22 @@ fn describe<'r>(
     at: &Placing<'_>,
 ) -> Result<(Option<&'r Message>, Described), String> {
     Ok(match record {
+        // A budget reminder is the runner's own message, sent as a notice from broca, as
+        // today's entries describe it.
+        Record::Input(input) if input.placement == Placement::BudgetNudge => (
+            Some(&input.message),
+            Described {
+                written_at_ms: input.written_at_ms,
+                notice: Some(Notice {
+                    sender: "broca".into(),
+                    template: None,
+                }),
+                usage: None,
+                generated_under: None,
+                native: true,
+                clean_reply: false,
+            },
+        ),
         Record::Input(input) => (
             Some(&input.message),
             Described {

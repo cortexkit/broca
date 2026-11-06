@@ -656,6 +656,33 @@ tokio::task_local! {
     static STRUCTURED: Option<Value>;
 }
 
+tokio::task_local! {
+    /// The tool-call budget both loops freeze. `None` runs without one.
+    static BUDGET: Option<broca_protocol::request::BudgetConfig>;
+}
+
+/// The budget the comparison running in this task freezes.
+fn budget() -> Option<broca_protocol::request::BudgetConfig> {
+    BUDGET.try_with(Clone::clone).ok().flatten()
+}
+
+/// A budget with these nudges, each at a tool-call count, and a finalize reminder at
+/// `finalize`.
+fn budgeted(nudges: &[u64], finalize: Option<u64>) -> broca_protocol::request::BudgetConfig {
+    broca_protocol::request::BudgetConfig {
+        max_input_tokens: None,
+        nudges: nudges
+            .iter()
+            .map(|at| broca_protocol::request::BudgetNudge {
+                at_tool_calls: *at,
+                text: format!("you have made {at} tool calls"),
+            })
+            .collect(),
+        finalize_at_tool_calls: finalize.unwrap_or(u64::MAX),
+        finalize_text: "finish now".into(),
+    }
+}
+
 /// The structured output the comparison running in this task freezes.
 fn structured() -> Option<Value> {
     STRUCTURED.try_with(Clone::clone).ok().flatten()
@@ -930,7 +957,7 @@ impl Scenario {
             cache: None,
             stop_when: self.stop_when.clone(),
             submission_id: None,
-            budget: None,
+            budget: budget(),
             context_limit: frozen_context_limit(),
             work_class: None,
             context_management: None,
@@ -970,7 +997,7 @@ impl Scenario {
             global_system: Vec::new(),
             compaction_plan_version: layout(),
             render_tags: false,
-            budget: None,
+            budget: budget(),
             context_limit: frozen_context_limit(),
         }
     }
@@ -4813,6 +4840,104 @@ async fn a_downgrade_survives_every_crash_cut() {
                 grammar_refused(),
                 text_step("a2", r#"{"answer":7}"#),
             ])),
+        )
+        .await;
+}
+
+fn reads(steps: usize, last: Vec<NormalizedEvent>) -> Scenario {
+    let mut scripted: Vec<Vec<NormalizedEvent>> = (0..steps)
+        .map(|n| {
+            answer(
+                &format!("a{n}"),
+                vec![call(&format!("c{n}"), "read", json!({"path": n}))],
+                FinishReason::ToolCalls,
+            )
+        })
+        .collect();
+    scripted.push(last);
+    single(scripted)
+}
+
+#[tokio::test]
+async fn a_nudge_is_placed_after_the_batch_that_reaches_it() {
+    BUDGET
+        .scope(
+            Some(budgeted(&[1], None)),
+            compare(reads(2, text_step("z", "done"))),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn nudges_and_finalize_due_together_are_placed_in_order() {
+    BUDGET
+        .scope(
+            Some(budgeted(&[2, 1], Some(2))),
+            compare(reads(
+                2,
+                answer(
+                    "z",
+                    vec![
+                        ContentBlock::Text {
+                            text: "finishing".into(),
+                        },
+                        call("cz", "read", json!({"path": "z"})),
+                    ],
+                    FinishReason::ToolCalls,
+                ),
+            )),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_budget_survives_every_crash_cut() {
+    BUDGET
+        .scope(
+            Some(budgeted(&[1], Some(2))),
+            compare_every_cut(reads(2, text_step("z", "done"))),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_finalize_answer_is_the_structured_result() {
+    STRUCTURED
+        .scope(
+            Some(unconstrained("final_text")),
+            BUDGET.scope(
+                Some(budgeted(&[], Some(1))),
+                compare(reads(1, text_step("z", r#"{"answer":8}"#))),
+            ),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_hard_stop_writes_the_firings_its_calls_made_due() {
+    let mut scenario = reads(1, text_step("z", "done"));
+    scenario.stop_when = vec![StopCondition::StepCount { n: 1 }];
+    BUDGET
+        .scope(Some(budgeted(&[1], None)), compare(scenario))
+        .await;
+}
+
+#[tokio::test]
+async fn a_budget_starts_over_with_each_run() {
+    let mut scenario = reads(1, text_step("z", "done"));
+    scenario.steps.push(answer(
+        "y1",
+        vec![call("cy", "read", json!({"path": "y"}))],
+        FinishReason::ToolCalls,
+    ));
+    scenario.steps.push(text_step("y2", "done again"));
+    BUDGET
+        .scope(
+            Some(budgeted(&[1], None)),
+            compare_runs(
+                scenario,
+                &[("r1", vec![user("read")]), ("r2", vec![user("read again")])],
+            ),
         )
         .await;
 }

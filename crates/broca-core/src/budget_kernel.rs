@@ -74,7 +74,8 @@ pub(crate) struct State<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Due {
+/// A firing the budget has due: its threshold, kind, nudge index and text.
+pub struct Due {
     pub threshold: u64,
     pub kind: BudgetKind,
     pub index: Option<usize>,
@@ -102,7 +103,7 @@ pub fn next_due(state: &BudgetReplayStateV1, config: &BudgetConfig) -> Option<Du
 
 /// Return all outstanding firings in threshold order, with nudges before a tied finalize.
 /// Deciding does not spend an allowance: only applying its durable firing does.
-pub(crate) fn decide(state: &BudgetReplayStateV1, config: &BudgetConfig) -> Vec<Due> {
+pub fn decide(state: &BudgetReplayStateV1, config: &BudgetConfig) -> Vec<Due> {
     let mut due: Vec<_> = config
         .nudges
         .iter()

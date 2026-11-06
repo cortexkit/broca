@@ -29,6 +29,7 @@
 //! views, approval questions, budgets or the rest of today's loop yet. Each part it covers is
 //! proven against today's loop by the differential tests in `tests/`.
 
+pub mod budget;
 pub mod compaction;
 pub mod entries;
 pub mod media;

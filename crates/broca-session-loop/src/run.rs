@@ -108,8 +108,9 @@ pub struct Admission {
     /// Whether the run froze part numbers into the model's view. A caller leaves it false: a new
     /// run takes it from its plan. A run read back from its start carries what the start froze.
     pub render_tags: bool,
-    /// The tool-call and input budget the run froze, which the new loop doesn't apply yet, so a
-    /// run carrying one is refused. A caller leaves it `None`.
+    /// The tool-call budget the run freezes: reminders after so many tool calls, and the
+    /// finalize reminder after which the run's last step has tools disabled. A budget with an
+    /// input-token cap is refused for now.
     pub budget: Option<broca_protocol::request::BudgetConfig>,
 }
 
@@ -719,9 +720,8 @@ fn refuse_first_protocol_compaction<W: Writer>(writer: &W) -> Result<(), LoopErr
 }
 
 /// Refuses, by name, a run that needs a part of today's run loop the new loop hasn't built yet,
-/// rather than running it without that part: a tool-call or input budget, and the client-side
-/// refusal fallback. Each is read from what the run froze. A new run's caller can't ask for a
-/// budget here, so only a run read back from its start can carry one.
+/// rather than running it without that part: an input-token budget (no live session has one),
+/// and the client-side refusal fallback. Each is read from what the run froze.
 fn refuse_unbuilt(admission: &Admission) -> Result<(), LoopError> {
     let frozen = &admission.render_config;
     if frozen
@@ -732,10 +732,12 @@ fn refuse_unbuilt(admission: &Admission) -> Result<(), LoopError> {
             "a run with the client-side refusal fallback",
         ));
     }
-    if admission.budget.is_some() {
-        return Err(LoopError::Unsupported(
-            "a run with a tool-call or input budget",
-        ));
+    if admission
+        .budget
+        .as_ref()
+        .is_some_and(|budget| budget.max_input_tokens.is_some())
+    {
+        return Err(LoopError::Unsupported("a run with an input-token budget"));
     }
     Ok(())
 }
@@ -879,7 +881,27 @@ where
                 run_id: admission.run_id.clone(),
                 batch_id: batch.batch_id.clone(),
             });
-            writer.append(&[record], true).await?;
+            let mut record = Some(record);
+            // The batch's close carries the budget firings its calls made due, as the barrier
+            // the crash cut would have.
+            writer
+                .append_with(
+                    &mut |conversation, operations, first_seq| {
+                        let mut batch: Vec<Record> = record.take().into_iter().collect();
+                        let placing = closing_places(conversation);
+                        let firings = crate::budget::due(
+                            conversation,
+                            operations,
+                            first_seq,
+                            batch.len(),
+                            placing,
+                        );
+                        batch.extend(firings);
+                        batch
+                    },
+                    true,
+                )
+                .await?;
         }
     }
     // A crash after a step asked for tools and before every call was sent: the calls with no
@@ -923,6 +945,18 @@ where
         }
     }
     loop {
+        // A crash can keep a tool turn durable and lose the budget firings its barrier carried,
+        // since today's log writes them record by record. Any firing the durable call count
+        // makes due is written here, before anything else at this boundary, as today's loop
+        // derives it again before its next request.
+        writer
+            .append_with(
+                &mut |conversation, operations, first_seq| {
+                    crate::budget::due(conversation, operations, first_seq, 0, 0)
+                },
+                true,
+            )
+            .await?;
         let completed_steps = run_state(writer).completed_steps;
         // Step ids count from 1 within a run, as today's loop numbers them.
         let step_id = completed_steps + 1;
@@ -1067,6 +1101,13 @@ where
             step_id,
             compaction.is_some(),
         )?;
+        // The budget's finalize step keeps the declared tools byte for byte and disables calls
+        // through the tool choice, as today's loop does: dropping the tools would change the
+        // request's cached prefix on the run's last step.
+        let finalizing = crate::budget::finalizing(writer.operations());
+        if finalizing {
+            opts.tool_choice = Arc::new(ToolChoice::None);
+        }
         if let Some(ctx) = compaction {
             let marked = writer.conversation().marker.clone();
             match crate::compaction::prepare(writer, admission, seams, ctx, step_id, opts).await? {
@@ -1206,6 +1247,16 @@ where
             Some(runtime) => post_assistant(runtime, step_id, &mut step.message).await,
             None => None,
         };
+        // The finalize step's answer is the run's last: calls the model made anyway are dropped
+        // before anything records or decides on the answer, and it ends as a stop.
+        if finalizing {
+            step.message.content.retain(|block| {
+                !matches!(block, broca_protocol::content::ContentBlock::ToolCall(_))
+            });
+            if step.finish_reason == FinishReason::ToolCalls {
+                step.finish_reason = FinishReason::Stop;
+            }
+        }
         let calls: Vec<ToolCall> = step.message.tool_calls().cloned().collect();
         let stop = stop_satisfied(&stop_when, completed_steps + 1, &step.message).cloned();
         let limiting = limiting_stop_satisfied(&stop_when, completed_steps + 1, &step.message);
@@ -1224,7 +1275,7 @@ where
                         written_at_ms: Some(now),
                         last_content_at_ms: None,
                         tags_v1: None,
-                        budget_finalize: None,
+                        budget_finalize: finalizing.then_some(true),
                         pruned: Vec::new(),
                     }),
                     Record::StepEnd(StepEnd {
@@ -1238,7 +1289,7 @@ where
                         call_count: calls.len() as u32,
                         fallback: None,
                         hooks: step_hooks,
-                        budget_finalize: None,
+                        budget_finalize: finalizing.then_some(true),
                         total_usage: None,
                         stop_met: stop.is_some().then_some(true),
                         limiting_stop_met: limiting.then_some(true),
@@ -1282,7 +1333,9 @@ where
                 .append_with(
                     &mut |_, operations, _| {
                         let run = operations.run.as_ref().expect("a run is active");
-                        let extends = run.natural_end.is_some_and(|end| end.extendable)
+                        // The finalize step is the run's last, whatever was steered in.
+                        let extends = !finalizing
+                            && run.natural_end.is_some_and(|end| end.extendable)
                             && run.pending_messages() > 0;
                         if extends {
                             return Vec::new();
@@ -1417,6 +1470,9 @@ async fn admit<W: Writer>(
     config.insert("context_epoch".into(), json!(0));
     if !admission.stop_when.is_empty() {
         config.insert("stop_when".into(), json!(admission.stop_when));
+    }
+    if let Some(budget) = &admission.budget {
+        config.insert("budget".into(), json!(budget));
     }
     let mut choices = serde_json::Map::new();
     choices.insert("config".into(), Value::Object(config));
@@ -1961,7 +2017,7 @@ where
         .any(|plan| matches!(plan, CallPlan::Dispatch(_)));
     let written = writer
         .append_with(
-            &mut |_, _, first_seq| {
+            &mut |conversation, operations, first_seq| {
                 let mut records = Vec::with_capacity(calls.len() + 1);
                 if !started {
                     records.push(Record::BatchStart(BatchStart {
@@ -2050,6 +2106,17 @@ where
                         run_id: run_id.into(),
                         batch_id: batch_id.clone(),
                     }));
+                    // The budget firings the step's calls made due go in the barrier that
+                    // closes its batch, as today's loop writes them.
+                    let placing = closing_places(conversation);
+                    let firings = crate::budget::due(
+                        conversation,
+                        operations,
+                        first_seq,
+                        records.len(),
+                        placing,
+                    );
+                    records.extend(firings);
                 }
                 records
             },
@@ -2176,7 +2243,30 @@ where
         run_id: run_id.into(),
         batch_id,
     }));
-    writer.append(&records, true).await?;
+    // The budget firings the step's calls made due go in the barrier that closes its batch, as
+    // today's loop writes them; a batch that closed held calls on a cancel makes none.
+    let mut records = Some(records);
+    let cancelling = !closed.is_empty();
+    writer
+        .append_with(
+            &mut |conversation, operations, first_seq| {
+                let mut batch = records.take().expect("one batch");
+                if !cancelling {
+                    let placing = closing_places(conversation);
+                    let firings = crate::budget::due(
+                        conversation,
+                        operations,
+                        first_seq,
+                        batch.len(),
+                        placing,
+                    );
+                    batch.extend(firings);
+                }
+                batch
+            },
+            true,
+        )
+        .await?;
     if !closed.is_empty() {
         return Ok(BatchOutcome::Cancelled(closed));
     }
@@ -2577,6 +2667,16 @@ fn structured_of(
     ))
 }
 
+/// How many messages a batch that closes the open tool turn places before anything after it:
+/// the assistant message and its results.
+fn closing_places(conversation: &broca_session_store::fold::conversation::Conversation) -> u64 {
+    if conversation.open_tool_turn().is_some() {
+        2
+    } else {
+        0
+    }
+}
+
 /// What a resume finds of a submit the crash stopped before the run's end: the open turn's
 /// step, its calls, the counted `submit_result` call, and whether the turn's batch already
 /// started with the calls already answered. Today's loop writes a submit's result, batch and
@@ -2752,8 +2852,27 @@ async fn hard_stop<W: Writer, P, T>(
         run_id: run_id.into(),
         batch_id,
     }));
-    records.push(run_end(writer, run_id, reason, now));
-    append_end(writer, run_id, records).await?;
+    // The budget firings the step's calls made due go in the same barrier, after the repaired
+    // batch, as today's hard stop writes them.
+    let end = run_end(writer, run_id, reason, now);
+    let run_id = run_id.to_string();
+    let mut records = Some(records);
+    let mut end = Some(end);
+    writer
+        .append_with(
+            &mut |conversation, operations, first_seq| {
+                let mut batch = records.take().expect("one batch");
+                let placing = closing_places(conversation);
+                let firings =
+                    crate::budget::due(conversation, operations, first_seq, batch.len(), placing);
+                batch.extend(firings);
+                batch.extend(placed_copies(operations, &run_id));
+                batch.extend(end.take());
+                batch
+            },
+            true,
+        )
+        .await?;
     Ok(finished(writer, reason))
 }
 
