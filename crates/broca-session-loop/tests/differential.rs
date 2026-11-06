@@ -3624,6 +3624,7 @@ async fn compare_auth_pause_in(
     .expect("the new loop runs");
     reset_passes().await;
     provider.resuming();
+    let refrozen_to = resume_account.clone();
     let seams = Seams {
         auth_selection: resume_account.or(seams.auth_selection.clone()),
         ..seams
@@ -3633,6 +3634,18 @@ async fn compare_auth_pause_in(
         .expect("the new loop resumes");
     keys_match(writer.session, &plane).await;
     pause_names_its_attempt(&writer);
+    // A run the resume refroze onto another account keeps naming it when nobody routes one,
+    // as a later resume or a rebuild of its requests reads the run back.
+    if let (Some(account), Some(PauseReason::AuthRequired)) = (&refrozen_to, first.paused) {
+        let rebuilt = broca_session_loop::run::offline_request(&writer, &parts, &bind, 1)
+            .await
+            .expect("the run's request rebuilds");
+        assert_eq!(
+            rebuilt.step_context.and_then(|context| context.account_ref),
+            account.account_ref,
+            "the account a rebuilt request names"
+        );
+    }
     let new = Outcome {
         records: normalized(&writer.records),
         requests: sent_requests(&provider),
