@@ -1650,6 +1650,133 @@ pub fn close_out_pending_turn(prior: &ReplayState) -> Vec<WalRecord> {
     records
 }
 
+/// Why a broca process ends a run it didn't finish: it is stopping while the run runs, or it
+/// found, on opening the session, a run that a crashed process left running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealCause {
+    Shutdown,
+    CrashOrphan,
+}
+
+/// The diagnostic a crash-orphan seal records on its `RunFinished`. The run's reason stays
+/// `Interrupted`: recovery knows the old process left the run unsealed, not how it ended.
+pub fn crash_orphan_error() -> broca_protocol::ProviderError {
+    broca_protocol::ProviderError {
+        provider_details: None,
+        provider_subcode: None,
+        class: broca_protocol::ErrorClass::Transient,
+        message: "the previous broca process ended without sealing this run: host crash, kill, \
+                  or power loss"
+            .into(),
+        provider_code: Some("previous_process_ended_unsealed".into()),
+        status: None,
+        retry_after_secs: None,
+        refusal: None,
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+    }
+}
+
+/// What an interrupted seal writes, after any provider attempt a stopping run handed over, in
+/// this order. Built from the replayed log, so every log that ends a run this way ends it the
+/// same: today's actor writes it, and a run loop over other storage writes the same records in
+/// its own format.
+#[derive(Debug, Clone)]
+pub struct InterruptedSeal {
+    /// `ResumeStarted`, for a crash-orphan seal: the seal resumes the crashed process's run to end
+    /// it. Absent when the process sealing the run already recorded `ResumeStarted` since it opened
+    /// the log (see `resume_at`).
+    pub resume_started: Option<WalRecord>,
+    /// The open batch's close-out ([`close_out_open_batch`], or [`close_out_open_batch_for`]
+    /// when held calls close with another reason), or else the close-out of a tool turn whose
+    /// calls were never dispatched ([`close_out_pending_turn`]).
+    pub close_out: Vec<WalRecord>,
+    /// Whether `close_out` is made durable before the terminal: an ordinary batch close-out is,
+    /// so its results are on disk even if the terminal can't be written. A held close-out and a
+    /// never-dispatched turn's close-out share the terminal's barrier instead, since on their
+    /// own they would read as the run ending naturally.
+    pub close_out_syncs_first: bool,
+    /// The run's `RunFinished`, timestamped when it is written.
+    pub terminal: SealTerminal,
+}
+
+/// An interrupted seal's `RunFinished`, all but its timestamp.
+#[derive(Debug, Clone)]
+pub struct SealTerminal {
+    pub cause: SealCause,
+    pub reason: broca_protocol::RunFinishReason,
+    pub usage: broca_protocol::usage::Usage,
+    pub error: Option<broca_protocol::ProviderError>,
+    pub retries_used: u32,
+}
+
+impl SealTerminal {
+    /// The record, stamped `ts_ms` so exported spend belongs to its billing period. A missing
+    /// stamp leaves the spend out of period totals.
+    pub fn record(self, ts_ms: Option<u64>) -> WalRecord {
+        WalRecord::RunFinished {
+            interrupt_reason: Some(
+                match self.cause {
+                    SealCause::CrashOrphan => "runner_crash",
+                    SealCause::Shutdown => "runner_shutdown",
+                }
+                .into(),
+            ),
+            reason: self.reason,
+            ts_ms,
+            usage: self.usage,
+            error: self.error,
+            retries_used: self.retries_used,
+        }
+    }
+}
+
+/// The seal of `prior`'s unfinished run, for `cause`.
+///
+/// `closing` is the reason provider-held calls close with, when they close with one
+/// ([`provider_held_closing_reason`]); the run ends with that reason too, else `Interrupted`.
+/// `holds_replies` says whether held calls have replies to close. `resume_at` is the sequence of
+/// the log's last durable record, which `ResumeStarted` names as where the resume begins; the
+/// caller passes it only when the seal must record one.
+pub fn interrupted_seal(
+    prior: &ReplayState,
+    cause: SealCause,
+    closing: Option<broca_protocol::RunFinishReason>,
+    holds_replies: bool,
+    resume_at: Option<u64>,
+    error: Option<broca_protocol::ProviderError>,
+    deferred_close: impl FnMut(&ToolCallId) -> DeferredCloseKind,
+) -> InterruptedSeal {
+    let reason = closing.unwrap_or(broca_protocol::RunFinishReason::Interrupted);
+    let batch = if closing.is_some() {
+        close_out_open_batch_for(prior, reason, deferred_close)
+    } else {
+        close_out_open_batch(prior, deferred_close)
+    };
+    let close_out_syncs_first = !holds_replies && !batch.is_empty();
+    let close_out = if holds_replies || !batch.is_empty() {
+        batch
+    } else {
+        close_out_pending_turn(prior)
+    };
+    InterruptedSeal {
+        resume_started: resume_at.map(|head| resume_started_record(prior, head, Vec::new())),
+        close_out,
+        close_out_syncs_first,
+        terminal: SealTerminal {
+            cause,
+            reason,
+            usage: prior.usage,
+            error,
+            retries_used: prior.retries_used,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
