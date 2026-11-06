@@ -137,6 +137,7 @@ impl RunExecutor for LoopExecutor {
             control,
             mut writer,
             mut parts,
+            resume,
             ..
         } = job;
         if let (Some((reached, release)), Some(_)) = (&self.drain_gate, &req.submission_id) {
@@ -144,14 +145,20 @@ impl RunExecutor for LoopExecutor {
             release.notified().await;
         }
         let result = async {
-            let admission = broca_session_loop::admit::admission(
-                &mut req,
-                &control,
-                &self.provider,
-                writer.operations(),
-                Some(1),
-            )
-            .map_err(StoreRunError::Admission)?;
+            let admission = if resume {
+                None
+            } else {
+                Some(
+                    broca_session_loop::admit::admission(
+                        &mut req,
+                        &control,
+                        &self.provider,
+                        writer.operations(),
+                        Some(1),
+                    )
+                    .map_err(StoreRunError::Admission)?,
+                )
+            };
             let tools = StubToolPlane::new().with_canned_text("read", "file contents");
             let now = || 1;
             let seams = Seams {
@@ -173,9 +180,12 @@ impl RunExecutor for LoopExecutor {
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
             };
-            run(&mut writer, parts.as_mut(), admission, &seams)
-                .await
-                .map_err(StoreRunError::Loop)
+            // The test's credential is always ready, so a sign-in pause resumes.
+            match admission {
+                Some(admission) => run(&mut writer, parts.as_mut(), admission, &seams).await,
+                None => broca_session_loop::run::resume(&mut writer, parts.as_ref(), &seams).await,
+            }
+            .map_err(StoreRunError::Loop)
         }
         .await;
         StoreRunEnd { parts, result }
@@ -709,12 +719,16 @@ async fn a_retry_of_an_earlier_run_is_answered_from_its_end() {
     assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
 }
 
-/// A run paused for sign-in owns the session: a new send is refused naming it, as today's actor
-/// refuses it. The paused run's own retry is refused by name, since today's actor drives a run
-/// paused for sign-in again on its retry.
+/// A run paused for sign-in owns the session: a new send is refused naming it and starts
+/// nothing. A retry of its own send resumes it as the same run, which then answers, and no
+/// second run starts.
 #[tokio::test]
-async fn a_send_behind_a_sign_in_pause_is_refused_as_paused() {
-    let (commands, served, _) = actor(executor(vec![auth_failure()], None)).await;
+async fn a_sign_in_pause_resumes_on_its_retry() {
+    let (commands, served, _) = actor(executor(
+        vec![auth_failure(), text_step("a1", "hello")],
+        None,
+    ))
+    .await;
     assert!(matches!(
         keyed(&commands, "k1", "first").await,
         SendOutcome::Active { .. }
@@ -729,24 +743,27 @@ async fn a_send_behind_a_sign_in_pause_is_refused_as_paused() {
     );
     assert_eq!(
         keyed(&commands, "k1", "first").await,
-        SendOutcome::Error(
-            "driving an unfinished run again by its retry is not served yet for a session kept \
-             in the new storage"
-                .into()
-        )
+        SendOutcome::Active {
+            run_id: RunId("r-k1".into()),
+            delivered: None
+        }
     );
+    idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
     let run = session.operations().run.as_ref().unwrap();
-    assert_eq!(run.paused, Some(broca_protocol::PauseReason::AuthRequired));
     assert_eq!(run.run_id, "r-k1");
+    assert_eq!(run.paused, None);
+    assert_eq!(
+        run.finished,
+        Some(broca_protocol::RunFinishReason::Completed)
+    );
+    assert_eq!(texts(&session), ["first", "hello"]);
     assert_eq!(
         starts(&session).await,
         1,
-        "the refused sends started nothing"
+        "the resume started no second run"
     );
-    assert_eq!(texts(&session), ["first"]);
-    assert!(session.operations().queue.is_empty(), "nothing was queued");
 }
 
 /// While a run is running, a send naming another routing decision is refused as today's actor

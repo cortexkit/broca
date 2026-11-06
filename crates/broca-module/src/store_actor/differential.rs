@@ -40,10 +40,11 @@ impl RunExecutor for TodayLoop {
         job: RunJob,
         out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
+        // As the serve executor picks it (`start_mode_after_auth`) when the run's credential
+        // resolves, which this harness's always does: a public send resumes a sign-in pause.
         let mode = match job.kind {
-            RunKind::FreshOrResume => StartMode::FreshOrResume,
+            RunKind::FreshOrResume | RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
             RunKind::AppendEpisode => StartMode::AppendEpisode,
-            RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
         };
         let tools = StubToolPlane::new().with_canned_text("read", "file contents");
         Box::pin(run_loop_on_writer_admitted_with_prior_snapshot(
@@ -299,6 +300,13 @@ fn steered(mut step: Step) -> Step {
     step
 }
 
+fn interrupting(mut step: Step) -> Step {
+    if let Step::Send { delivery, .. } = &mut step {
+        *delivery = broca_protocol::Delivery::Interrupt;
+    }
+    step
+}
+
 fn tweaked(mut step: Step, change: fn(&mut SubmissionRequest)) -> Step {
     if let Step::Send { tweak, .. } = &mut step {
         *tweak = Some(change);
@@ -512,21 +520,22 @@ async fn a_running_runs_routing_decision_is_fixed_alike() {
     .await;
 }
 
-/// A run paused for sign-in owns the session: a new send is refused naming it, alike. Today's
-/// actor drives the paused run again on its own retry, which the store actor doesn't serve yet.
+/// A run paused for sign-in owns the session: a new send is refused naming it, and a retry of
+/// its own send resumes it as the same run, which answers on the step it couldn't send, alike.
 #[tokio::test]
-async fn a_send_behind_a_sign_in_pause_is_refused_alike() {
+async fn a_sign_in_pause_resumes_on_its_retry_alike() {
+    let mut steps = vec![auth_failure()];
+    steps.extend(hello());
     compare(
-        vec![auth_failure()],
+        steps,
         false,
         vec![
             keyed("k1", "first"),
             Step::Idle,
             send("r2", "second"),
-            expecting(
-                keyed("k1", "first"),
-                Expect::StoreRefuses("driving an unfinished run again by its retry"),
-            ),
+            keyed("k1", "first"),
+            Step::Idle,
+            keyed("k1", "first"),
         ],
     )
     .await;
@@ -853,6 +862,25 @@ async fn a_queued_send_carries_the_frozen_scope_alike() {
             Step::Release,
             Step::Release,
             Step::Idle,
+        ],
+    )
+    .await;
+}
+
+/// An interrupting send, which today's actor serves (on an idle session it just starts the
+/// message), is refused by name by the store actor, which doesn't serve interrupts yet.
+#[tokio::test]
+async fn an_interrupt_is_refused_by_name() {
+    compare(
+        hello(),
+        false,
+        vec![
+            send("r1", "first"),
+            Step::Idle,
+            expecting(
+                interrupting(send("r2", "interrupting")),
+                Expect::StoreRefuses("an interrupt"),
+            ),
         ],
     )
     .await;

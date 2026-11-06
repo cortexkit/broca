@@ -15,6 +15,7 @@
 //!   ends, and a queued send's retry;
 //! - a steer into the running run, placed at its next step boundary;
 //! - retracting a queued send before it runs;
+//! - a run paused for sign-in, resumed by a retry of its own send;
 //! - the session's status;
 //! - cancelling the active run, now or at its next step boundary;
 //! - going away when idle.
@@ -108,6 +109,9 @@ enum Keyed {
     Answered(SendOutcome),
     /// The key is new: the send starts a run that records it with this identity digest.
     Fresh(String),
+    /// The key names the latest run, paused for sign-in, and the payload is the same: as in
+    /// today's actor, the retry resumes that run.
+    Resume,
 }
 
 /// What woke the actor.
@@ -255,6 +259,19 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                             return false;
                         }
                         Ok(Keyed::Fresh(digest)) => identity = Some(digest),
+                        Ok(Keyed::Resume) => {
+                            let start = Start {
+                                run_id: run_id.clone(),
+                                sent_by: request.principal.clone(),
+                                request: *request,
+                                title,
+                                send_id: key.send_id().map(str::to_owned),
+                                identity: None,
+                                scope,
+                            };
+                            self.start_run(start, None, Some(reply), true);
+                            return false;
+                        }
                         Err(error) => {
                             let _ = reply.send(SendOutcome::Error(error));
                             return false;
@@ -362,7 +379,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         "a send while sends are queued on an idle session",
                     )));
                 } else {
-                    self.start_run(start, None, Some(reply));
+                    self.start_run(start, None, Some(reply), false);
                 }
                 false
             }
@@ -403,12 +420,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Starts a run of `start` on the idle session: a send's own run, whose sender's `reply`
     /// waits for the run's start to be durable or for its refusal, or one `drained` from the
-    /// queue, which no sender waits on.
+    /// queue, which no sender waits on. With `resume`, the session's latest run goes on instead
+    /// of a new one starting: its start is already durable, so the sender hears `active` at
+    /// once, as today's actor answers a resumed run at its admission.
     fn start_run(
         &mut self,
         start: Start,
         drained: Option<Drained>,
-        reply: Option<oneshot::Sender<SendOutcome>>,
+        mut reply: Option<oneshot::Sender<SendOutcome>>,
+        resume: bool,
     ) {
         let Start {
             run_id,
@@ -465,8 +485,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             control,
             writer,
             parts,
-            resume: false,
+            resume,
         };
+        if resume {
+            if let Some(reply) = reply.take() {
+                let _ = reply.send(SendOutcome::Active {
+                    run_id: run_id.clone(),
+                    delivered: None,
+                });
+            }
+        }
         let done = tokio::spawn(async move { executor.execute_on_store(job, out).await });
         self.run = Some(ActiveRun {
             run_id,
@@ -474,7 +502,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             writer_gone: false,
             cancel,
             admitting: reply,
-            started: false,
+            started: resume,
             submission: drained.map(|drained| drained.submission),
             done,
         });
@@ -641,8 +669,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     run_id: run_id.clone(),
                     delivered: None,
                 },
-                // Runner-owned pauses are reported; a run paused for sign-in, or unfinished with
-                // nothing running it, is driven again by its retry in today's actor.
+                // A run paused for sign-in is resumed by its retry, as in today's actor; whether the
+                // credential is ready now is the executor's to decide. Runner-owned pauses are
+                // reported. Today's actor also drives an unfinished run that nothing runs, which
+                // is boot recovery's to do here.
+                (None, Some(broca_protocol::PauseReason::AuthRequired)) => {
+                    return Ok(Keyed::Resume)
+                }
                 (
                     None,
                     Some(
@@ -805,7 +838,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return;
         }
         match self.drained_start(&first.submission_id).await {
-            Ok((start, drained)) => self.start_run(start, Some(drained), None),
+            Ok((start, drained)) => self.start_run(start, Some(drained), None, false),
             Err(error) => tracing::error!(
                 target: "broca.store_actor",
                 session = %self.key.session,
