@@ -69,6 +69,9 @@ pub enum SetupError {
     Missing(PartRef),
     /// The stored part failed to authenticate, or its bytes don't match the record's digest.
     Corrupt(PartRef),
+    /// A stored part, found by listing the store, failed to authenticate or is stored under a
+    /// name its digest doesn't give. It carries the stored name.
+    CorruptStored(String),
 }
 
 impl From<BackendError> for SetupError {
@@ -155,6 +158,30 @@ impl<'a, B: SessionBackend> SetupStore<'a, B> {
         let bytes: Arc<[u8]> = bytes.into();
         self.remember(part.digest, bytes.clone());
         Ok(bytes)
+    }
+
+    /// Every part the deployment's setup store holds, with its digest. Each is read and checked
+    /// as `get` checks it, and its stored name must be the one its digest gives, so a part
+    /// copied under another name is damage, not a part.
+    pub async fn load_all(&self) -> Result<Vec<(Digest, Arc<[u8]>)>, SetupError> {
+        let mut parts = Vec::new();
+        for name in self.backend.list_setup().await? {
+            let corrupt = || SetupError::CorruptStored(name.clone());
+            let sealed = self.backend.get_setup(&name).await?.ok_or_else(corrupt)?;
+            let bytes = self
+                .key
+                .cipher
+                .open_unit(&aad(&name), &sealed)
+                .ok_or_else(corrupt)?;
+            let part_digest = digest(&bytes);
+            if self.key.name(&part_digest) != name {
+                return Err(corrupt());
+            }
+            let bytes: Arc<[u8]> = bytes.into();
+            self.remember(part_digest, bytes.clone());
+            parts.push((part_digest, bytes));
+        }
+        Ok(parts)
     }
 
     fn cached(&self, digest: &Digest) -> Option<Arc<[u8]>> {

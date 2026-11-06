@@ -1038,7 +1038,8 @@ mod operations {
         first_principal,
         any_unrecorded_principal,
         principals,
-        scope
+        scope,
+        first_start
     });
     crate::fuzzing::gen::fields!(Estimate {
         run_model,

@@ -27,6 +27,7 @@ fn the_first_two_principals_answer_scope_adoption_as_all_do() {
         any_unrecorded_principal: false,
         principals: vec![reserved("a"), reserved("b")],
         scope: None,
+        first_start: None,
     };
     let kept = ownership(&owner).unwrap().recorded_principals;
     for asked in all.iter().chain(std::iter::once(&BindPrincipal::Reserved {

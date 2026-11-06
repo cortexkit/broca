@@ -62,6 +62,9 @@ pub struct StoreActor<B: SessionBackend> {
     /// The setup parts store. The actor stores a queued send's tool list in it while the active
     /// run holds its own handle.
     parts: SharedParts,
+    /// Where setup parts are stored durably before any record names them: the deployment's
+    /// setup store. `None` keeps them in memory only, as tests do.
+    storage: Option<broca_session_loop::durable::SetupParts<B>>,
     run: Option<ActiveRun>,
 }
 
@@ -99,6 +102,12 @@ struct Start {
     /// The scope the run's start records, decided by today's rule (`broca_core::decide_scope`)
     /// against the session's owner summary: the scope a send freezes, adopts or repeats.
     scope: Option<broca_protocol::SessionScope>,
+    /// The fetch plan's manifest the run starts under: the one the session's first run froze,
+    /// or, for that first run, the one its send's plan fetched. Its start records it.
+    manifest: Option<Arc<broca_wal::PlanManifest>>,
+    /// The session's label its start records: the one the session's first run froze, or, for
+    /// that first run, the send's.
+    session_class: Option<String>,
 }
 
 /// What a run drained from the queue starts from.
@@ -138,7 +147,29 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             session,
             executor,
             parts: SharedParts::new(parts),
+            storage: None,
             run: None,
+        }
+    }
+
+    /// The actor stores setup parts in `storage` before each append that could name them.
+    pub fn with_storage(mut self, storage: broca_session_loop::durable::SetupParts<B>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// The session's writer, storing setup parts not yet durable before each append.
+    fn durable(
+        &mut self,
+    ) -> broca_session_loop::durable::Durable<
+        '_,
+        Session<B>,
+        broca_session_loop::durable::SetupParts<B>,
+    > {
+        broca_session_loop::durable::Durable {
+            writer: &mut self.session,
+            parts: &mut self.parts,
+            store: self.storage.as_ref(),
         }
     }
 
@@ -164,7 +195,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         .run
                         .as_mut()
                         .expect("a request comes from the active run");
-                    active.link.serve(&mut self.session, request).await;
+                    let mut writer = broca_session_loop::durable::Durable {
+                        writer: &mut self.session,
+                        parts: &mut self.parts,
+                        store: self.storage.as_ref(),
+                    };
+                    active.link.serve(&mut writer, request).await;
                     self.answer_admission();
                 }
                 Event::Request(None) => {
@@ -208,9 +244,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 order,
                 reply,
             } => {
-                let unserved_part = if plan.is_some() {
-                    Some("a send carrying a fetch plan")
-                } else if order.is_some() {
+                let unserved_part = if order.is_some() {
                     Some("an ordered delivery")
                 } else if delivery == broca_protocol::Delivery::Interrupt {
                     Some("an interrupt")
@@ -225,6 +259,39 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     let _ = reply.send(SendOutcome::Error(unserved(what)));
                     return false;
                 }
+                // As in today's actor, a send's label and its structured output are checked against
+                // the session before the owner check, so a retry naming another label is refused
+                // rather than answered.
+                let session_class = match self.session_class(session_class.as_deref()) {
+                    Ok(class) => class,
+                    Err(outcome) => {
+                        let _ = reply.send(outcome);
+                        return false;
+                    }
+                };
+                if let Some(structured_output) = &request.structured_output {
+                    let joins_active_run =
+                        delivery == broca_protocol::Delivery::Steer && self.run.is_some();
+                    let latest = match self.latest_admission() {
+                        Ok(latest) => latest,
+                        Err(error) => {
+                            let _ = reply.send(SendOutcome::Error(error));
+                            return false;
+                        }
+                    };
+                    if let Err(field) = crate::actor::check_structured_output(
+                        structured_output,
+                        &request,
+                        plan.as_deref(),
+                        latest
+                            .as_ref()
+                            .map(|latest| (&latest.render_config, latest.tools.as_slice())),
+                        joins_active_run,
+                    ) {
+                        let _ = reply.send(SendOutcome::StructuredOutputInvalid { field });
+                        return false;
+                    }
+                }
                 // As in today's actor, the owner and scope check comes first: a send the session's
                 // history refuses is refused before any retry is answered.
                 let scope = match self.send_scope(&run_id, &request) {
@@ -234,6 +301,48 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         return false;
                     }
                 };
+                // As in today's actor, the session's fetch plan comes next. It owns the session's
+                // tools for its whole life, so a send naming tools is refused before any retry,
+                // queue or steer path could ignore them; and a send's own plan meets the frozen
+                // one before its key is looked at, so a retry under the same key with another plan
+                // is refused by name. The first send freezes the plan its send fetched.
+                let frozen = match self.frozen_manifest() {
+                    Ok(frozen) => frozen,
+                    Err(error) => {
+                        let _ = reply.send(SendOutcome::Transient(error));
+                        return false;
+                    }
+                };
+                if request.tools.is_some() && frozen.is_some() {
+                    let _ = reply.send(crate::plan_episode::tools_frozen_refusal());
+                    return false;
+                }
+                let mut manifest = frozen.clone();
+                let model_check = plan.as_ref().and_then(|plan| plan.model_check.clone());
+                if let Some(plan) = plan {
+                    if self.session.operations().owner.episodes == 0 {
+                        match plan.manifest {
+                            Some(fetched) => manifest = Some(fetched),
+                            // The serve layer saw a run when it checked the plan, so it fetched
+                            // nothing, yet the session has none: the caller retries the send so
+                            // the plan is checked against one history, as today.
+                            None => {
+                                let _ = reply.send(SendOutcome::Transient(
+                                    "the session's history changed while its plan was checked; \
+                                     retry the send"
+                                        .into(),
+                                ));
+                                return false;
+                            }
+                        }
+                    } else if let Err(refusal) = broca_fetch_plan::check_later_plan(
+                        frozen.as_ref().map(|frozen| frozen.plan_identity.as_str()),
+                        &plan.identity,
+                    ) {
+                        let _ = reply.send(SendOutcome::PlanRefused(refusal));
+                        return false;
+                    }
+                }
                 // As in today's actor, a running run's routing decision is fixed, and a send naming
                 // another is refused before its key is looked at.
                 if let Some(fixed) = self.running().map(|run| {
@@ -274,6 +383,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                                 send_id: key.send_id().map(str::to_owned),
                                 identity: None,
                                 scope,
+                                manifest: None,
+                                session_class: None,
                             };
                             self.start_run(start, None, Some(reply), StoreRunMode::Resume);
                             return false;
@@ -286,8 +397,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 let unserved_part = if retention.is_some() {
                     Some("a send setting retention")
-                } else if session_class.is_some() {
-                    Some("a send setting a session class")
                 } else if kind == RunKind::ResumeAfterAuth {
                     Some("resuming after sign-in")
                 } else {
@@ -297,15 +406,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     let _ = reply.send(SendOutcome::Error(unserved(what)));
                     return false;
                 }
-                let request = *request;
+                let mut request = *request;
                 // Today's actor refuses a send that declares tools on a scoped session unless a
                 // plan gave the session its tools: on a scoped route a tool provider refuses a call
                 // that doesn't name the plan's settings for that tool, and only a plan supplies
-                // them. A store session has no plan yet.
-                if request
-                    .tools
-                    .as_ref()
-                    .is_some_and(|tools| !tools.is_empty())
+                // them.
+                if manifest.is_none()
+                    && request
+                        .tools
+                        .as_ref()
+                        .is_some_and(|tools| !tools.is_empty())
                     && (scope.is_some()
                         || matches!(request.scope, broca_protocol::SendScope::Stamped(_)))
                 {
@@ -316,21 +426,57 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 let steering = delivery == broca_protocol::Delivery::Steer;
                 // Today's actor lets a plain send leave its model to the session only when a
-                // plan selected the session's next-run model, and a store session has no plan.
-                // A steer may leave it: it joins a run whose model is already frozen.
+                // plan selected the session's next-run model (`plan.model`), and then runs it on
+                // that model. A steer may leave it: it joins a run whose model is already frozen.
                 if !steering
                     && request
                         .inherit_frozen
                         .contains(&broca_protocol::request::InheritedParam::Model)
                 {
-                    let _ = reply.send(SendOutcome::DeliveryRefused {
-                        code: "invalid_params",
-                        field: "model",
-                        message: "model is required unless plan.model selected the session's \
-                                  next-run model"
-                            .into(),
-                    });
+                    let Some(selection) = manifest
+                        .as_deref()
+                        .and_then(broca_core::head::manifest_selection)
+                    else {
+                        let _ = reply.send(SendOutcome::DeliveryRefused {
+                            code: "invalid_params",
+                            field: "model",
+                            message: "model is required unless plan.model selected the \
+                                      session's next-run model"
+                                .into(),
+                        });
+                        return false;
+                    };
+                    request
+                        .inherit_frozen
+                        .remove(&broca_protocol::request::InheritedParam::Model);
+                    request.model =
+                        broca_protocol::ModelHandle::new(&selection.provider, &selection.model);
+                    request.variant = selection.variant.clone();
+                }
+                // A send that left its model to the session checks its plan's model-bearing
+                // items against the model it now runs on, as today's actor does once the model
+                // is resolved. A steer that left it would be checked against the joined run's
+                // frozen model and variant, which this actor doesn't read back yet.
+                if model_check.is_some()
+                    && request
+                        .inherit_frozen
+                        .contains(&broca_protocol::request::InheritedParam::Model)
+                {
+                    let _ = reply.send(SendOutcome::Error(unserved(
+                        "a steer leaving its model to the session with a plan to check",
+                    )));
                     return false;
+                }
+                if let Some(plan) = &model_check {
+                    if let Err(refusal) = broca_fetch_plan::admit::check_plan_model(
+                        plan,
+                        request.model.provider_module_id.as_str(),
+                        &request.model.model_id,
+                        request.variant.as_deref(),
+                    ) {
+                        let _ = reply.send(SendOutcome::PlanRefused(refusal));
+                        return false;
+                    }
                 }
                 // A run paused for sign-in or an account limit still owns the session: today's
                 // actor neither queues another send behind it nor drives it again for one. A
@@ -371,6 +517,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     send_id: key.send_id().map(str::to_owned),
                     identity,
                     scope,
+                    manifest,
+                    session_class,
                 };
                 if steering && self.run.is_some() {
                     let outcome = self.steer(start, stop_sequences_named).await;
@@ -386,7 +534,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         "a send while sends are queued on an idle session",
                     )));
                 } else {
-                    self.start_run(start, None, Some(reply), StoreRunMode::Fresh);
+                    let mut start = start;
+                    match self.freeze_plan(&mut start) {
+                        Ok(()) => self.start_run(start, None, Some(reply), StoreRunMode::Fresh),
+                        Err(outcome) => {
+                            let _ = reply.send(outcome);
+                        }
+                    }
                 }
                 false
             }
@@ -445,6 +599,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             identity,
             sent_by,
             scope,
+            manifest,
+            session_class,
         } = start;
         // The executor resolves the send's credential selection; only the result is frozen.
         let auth = request.auth.take();
@@ -470,6 +626,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         req.send_id = send_id;
         req.request_identity_digest = identity;
         req.scope = scope;
+        req.session_class = session_class;
         let cancel = CancellationToken::new();
         let control = RunControl {
             cancel: Some(cancel.clone()),
@@ -477,6 +634,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             provider_held_lifecycle: self.executor.provider_held_lifecycle(),
             compaction_plane: self.executor.compaction_plane(),
             display_sent_by: sent_by,
+            manifest,
             ..Default::default()
         };
         let (writer, link) = ActorWriter::new(&self.session, None);
@@ -601,6 +759,103 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             identity: None,
             sent_by: None,
             scope: self.ownership()?.scope,
+            // The run renders from its own start, which recorded any manifest and label.
+            manifest: None,
+            session_class: None,
+        })
+    }
+
+    /// The label the session's first run froze; `None` for a session created unlabelled.
+    fn frozen_session_class(&self) -> Option<String> {
+        self.session
+            .operations()
+            .owner
+            .first_start
+            .as_ref()
+            .and_then(|start| start.session_class.clone())
+    }
+
+    /// The label a send's run records, by today's rule (`crate::session_class::admit`): the
+    /// session's first run freezes the label its send names, a later send may only repeat it,
+    /// and a session created unlabelled stays unlabelled whatever a later send names.
+    fn session_class(&self, requested: Option<&str>) -> Result<Option<String>, SendOutcome> {
+        let frozen = self
+            .session
+            .operations()
+            .owner
+            .first_start
+            .as_ref()
+            .map(|start| start.session_class.as_deref());
+        let Some(requested) = requested else {
+            return Ok(frozen.flatten().map(str::to_owned));
+        };
+        match crate::session_class::admit(Some(requested), frozen) {
+            Ok(crate::session_class::Admitted::Class(class)) => Ok(class),
+            Ok(crate::session_class::Admitted::IgnoredOnUnlabelled(label)) => {
+                tracing::info!(
+                    target: "broca.session_class",
+                    session = %self.key.session,
+                    label = %label,
+                    "session_class ignored: the session was created unlabelled"
+                );
+                Ok(None)
+            }
+            Err(message) => Err(SendOutcome::SessionClassInvalid(message)),
+        }
+    }
+
+    /// The session's latest run as its start froze it, read back from the setup parts it
+    /// names; `None` before the session's first run.
+    fn latest_admission(&self) -> Result<Option<broca_session_loop::run::Admission>, String> {
+        let Some(start) = self
+            .session
+            .operations()
+            .run
+            .as_ref()
+            .and_then(|run| run.start.as_ref())
+        else {
+            return Ok(None);
+        };
+        broca_session_loop::run::admission_of_start(start, &self.parts)
+            .map(Some)
+            .map_err(|error| format!("the session's latest run start: {error:?}"))
+    }
+
+    /// The fetch plan's manifest the session's first run froze, read back from the setup parts
+    /// its start names; `None` for a session admitted without a plan, or with no run yet.
+    fn frozen_manifest(&self) -> Result<Option<Arc<broca_wal::PlanManifest>>, String> {
+        let Some(first) = self.session.operations().owner.first_start.as_ref() else {
+            return Ok(None);
+        };
+        broca_session_loop::run::admission_of_start(first, &self.parts)
+            .map(|admission| admission.manifest)
+            .map_err(|error| format!("the session's first run start: {error:?}"))
+    }
+
+    /// Freezes the session's fetch plan into a run about to start, by the rules today's actor
+    /// applies on every path that starts an episode (`crate::plan_episode`): a plan that confines
+    /// its tools needs a scope, and the run takes the manifest's tools and, as the session's
+    /// first run, its system text first. Answers the refusal a sender gets otherwise.
+    fn freeze_plan(&self, start: &mut Start) -> Result<(), SendOutcome> {
+        crate::plan_episode::require_confining_scope(
+            start.manifest.as_deref(),
+            start.scope.as_ref(),
+        )
+        .map_err(SendOutcome::ScopeRefused)?;
+        let Some(manifest) = start.manifest.clone() else {
+            return Ok(());
+        };
+        let first_run = self.session.operations().owner.episodes == 0;
+        let tools_were_omitted = start.request.tools.is_none();
+        crate::plan_episode::freeze_manifest(
+            &manifest,
+            &mut start.request,
+            first_run,
+            tools_were_omitted,
+        )
+        .map_err(|error| SendOutcome::ClassifiedError {
+            class: error.admission_error_class(),
+            reason: error.to_string(),
         })
     }
 
@@ -900,7 +1155,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             submission_id: submission.0.clone(),
             failure: Some(serde_json::to_value(failure).map_err(|error| error.to_string())?),
         });
-        Writer::append(&mut self.session, std::slice::from_ref(&record), true)
+        Writer::append(&mut self.durable(), std::slice::from_ref(&record), true)
             .await
             .map(drop)
             .map_err(|error| format!("{error:?}"))
@@ -935,7 +1190,27 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return;
         }
         match self.drained_start(&first.submission_id).await {
-            Ok((start, drained)) => self.start_run(start, Some(drained), None, StoreRunMode::Fresh),
+            Ok((mut start, drained)) => match self.freeze_plan(&mut start) {
+                Ok(()) => self.start_run(start, Some(drained), None, StoreRunMode::Fresh),
+                Err(outcome) => {
+                    // The send can't start under the session's plan: it ends with the refusal,
+                    // as a drained send refused at admission ends, and the next one is tried.
+                    let error = broca_core::RunError::Config(format!("{outcome:?}"));
+                    match self
+                        .end_refused_drain(&drained.submission, &start.run_id, error)
+                        .await
+                    {
+                        Ok(()) => Box::pin(self.drain()).await,
+                        Err(error) => tracing::error!(
+                            target: "broca.store_actor",
+                            session = %self.key.session,
+                            submission_id = %drained.submission.0,
+                            error = %error,
+                            "a queued send refused by the session's plan could not be ended",
+                        ),
+                    }
+                }
+            },
             Err(error) => tracing::error!(
                 target: "broca.store_actor",
                 session = %self.key.session,
@@ -979,6 +1254,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             // A drained send is broca's own, so it carries the scope the session already froze,
             // as today's drain (`SendScope::Internal`) carries it.
             scope: self.ownership()?.scope,
+            manifest: self.frozen_manifest()?,
+            session_class: self.frozen_session_class(),
         };
         Ok((
             start,
@@ -1051,7 +1328,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             submission_id: submission_id.0,
             failure: None,
         });
-        match Writer::append(&mut self.session, std::slice::from_ref(&record), true).await {
+        match Writer::append(&mut self.durable(), std::slice::from_ref(&record), true).await {
             Ok(seq) => {
                 if let Some(active) = self.run.as_mut() {
                     active.link.note_own(seq, &[record]);
@@ -1117,7 +1394,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(steer) => Record::Steer(steer),
             Err(error) => return SendOutcome::Error(error),
         };
-        match Writer::append(&mut self.session, std::slice::from_ref(&record), true).await {
+        match Writer::append(&mut self.durable(), std::slice::from_ref(&record), true).await {
             Ok(seq) => {
                 if let Some(running) = self.run.as_mut() {
                     running.link.note_own(seq, &[record]);
@@ -1144,6 +1421,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             identity,
             sent_by,
             scope: _,
+            // A queued send keeps its request as sent; the plan is frozen into it when it
+            // drains, as today's queue freezes it at the episode's start.
+            manifest: _,
+            session_class: _,
         } = start;
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         match self.queued(&submission_id.0).await {
@@ -1183,7 +1464,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(send) => Record::QueuedSend(send),
             Err(error) => return SendOutcome::Error(error),
         };
-        match Writer::append(&mut self.session, std::slice::from_ref(&record), true).await {
+        match Writer::append(&mut self.durable(), std::slice::from_ref(&record), true).await {
             Ok(seq) => {
                 if let Some(active) = self.run.as_mut() {
                     active.link.note_own(seq, &[record]);
@@ -1212,7 +1493,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             run_id: run_id.0.clone(),
             at: point,
         });
-        match Writer::append(&mut self.session, std::slice::from_ref(&record), true).await {
+        // The writer is built from its fields here, not by `durable`, because `active` still
+        // borrows the run.
+        let mut writer = broca_session_loop::durable::Durable {
+            writer: &mut self.session,
+            parts: &mut self.parts,
+            store: self.storage.as_ref(),
+        };
+        match Writer::append(&mut writer, std::slice::from_ref(&record), true).await {
             Ok(seq) => active.link.note_own(seq, &[record]),
             Err(error) => return CancelOutcome::Error(format!("{error:?}")),
         }
@@ -1285,9 +1573,7 @@ fn finished(run_id: &RunId, reason: broca_protocol::RunFinishReason) -> SendOutc
 /// The request fields a store session doesn't take yet, refused by name before anything is
 /// written.
 fn refuse_unbuilt_request(request: &SubmissionRequest) -> Option<&'static str> {
-    if request.structured_output.is_some() {
-        Some("structured output")
-    } else if request.keep_warm.is_some() {
+    if request.keep_warm.is_some() {
         Some("keep-warm")
     } else if request.service_tier_level.is_some() {
         Some("a service tier level")

@@ -138,3 +138,53 @@ fn local_files_store_each_part_once() {
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// `load_all` returns every stored part with its digest, on memory and on local files, skipping
+/// a temporary file a crashed write left; a part whose bytes or name don't check is damage.
+#[test]
+fn load_all_returns_every_part_and_refuses_a_damaged_one() {
+    const PLAN: &[u8] = br#"{"tool_items":[]}"#;
+    let root = std::env::temp_dir().join(format!(
+        "broca-setup-all-{}",
+        hex(&crate::keys::random_id().0)
+    ));
+    let local = LocalBackend::new(&root);
+    let memory = MemoryBackend::default();
+    let key = DeploymentKey::new(1, &[3; 32]).setup_key();
+    let check = |backend: &dyn Fn() -> Vec<(crate::codec::Digest, std::sync::Arc<[u8]>)>| {
+        let mut loaded = backend();
+        loaded.sort_by_key(|part| part.0 .0);
+        let mut expected = vec![(digest(TOOLS), TOOLS), (digest(PLAN), PLAN)];
+        expected.sort_by_key(|part| part.0 .0);
+        assert_eq!(loaded.len(), 2);
+        for ((digest, bytes), (want_digest, want)) in loaded.iter().zip(expected) {
+            assert_eq!(*digest, want_digest);
+            assert_eq!(&**bytes, want);
+        }
+    };
+    for kind_bytes in [(PartKind::Tools, TOOLS), (PartKind::Plan, PLAN)] {
+        block_on(SetupStore::new(&local, &key).put(kind_bytes.0, kind_bytes.1)).unwrap();
+        block_on(SetupStore::new(&memory, &key).put(kind_bytes.0, kind_bytes.1)).unwrap();
+    }
+    std::fs::write(root.join("setup").join(".half.tmp"), b"partial").unwrap();
+    check(&|| block_on(SetupStore::new(&local, &key).load_all()).unwrap());
+    check(&|| block_on(SetupStore::new(&memory, &key).load_all()).unwrap());
+    // A part copied under another part's name fails authentication, since its seal binds the
+    // name it was stored under.
+    let names = memory.setup_names();
+    let other = block_on(memory.get_setup(&names[1])).unwrap().unwrap();
+    memory.set_setup(&names[0], other);
+    assert!(matches!(
+        block_on(SetupStore::new(&memory, &key).load_all()),
+        Err(SetupError::CorruptStored(_))
+    ));
+    // A part sealed under a name its digest doesn't give authenticates, and fails the name check.
+    let misnamed = MemoryBackend::default();
+    let name = key.name(&digest(PLAN));
+    block_on(misnamed.put_setup(&name, &key.cipher.seal_unit(&aad(&name), TOOLS))).unwrap();
+    assert!(matches!(
+        block_on(SetupStore::new(&misnamed, &key).load_all()),
+        Err(SetupError::CorruptStored(_))
+    ));
+    std::fs::remove_dir_all(root).unwrap();
+}

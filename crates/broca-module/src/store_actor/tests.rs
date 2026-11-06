@@ -315,10 +315,22 @@ pub(super) async fn send_as(
     key: SendKey,
     delivery: broca_protocol::Delivery,
 ) -> SendOutcome {
+    send_labelled(commands, run_id, request, key, delivery, None).await
+}
+
+/// A send with the delivery mode `delivery`, naming the session label `session_class`.
+pub(super) async fn send_labelled(
+    commands: &mpsc::UnboundedSender<LineageCmd>,
+    run_id: &str,
+    request: SubmissionRequest,
+    key: SendKey,
+    delivery: broca_protocol::Delivery,
+    session_class: Option<&str>,
+) -> SendOutcome {
     let (reply, answer) = oneshot::channel();
     commands
         .send(LineageCmd::Send {
-            session_class: None,
+            session_class: session_class.map(str::to_owned),
             retention: None,
             stop_sequences_named: false,
             conversation_key: None,
@@ -1297,4 +1309,474 @@ async fn a_send_left_queued_behind_an_ended_run_drains_on_open() {
     );
     assert!(session.operations().queue.is_empty());
     assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
+}
+
+/// A fetch plan's manifest for these tests, with `plan` as the plan the caller sent: the tools
+/// `read` and `edit`, and a system text.
+fn plan_manifest(identity: &str, plan: serde_json::Value) -> broca_wal::PlanManifest {
+    broca_wal::PlanManifest {
+        rich_ui: None,
+        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan_identity: identity.into(),
+        composition_digest: "composition".into(),
+        tools: Arc::new(
+            ["read", "edit"]
+                .into_iter()
+                .map(|name| {
+                    serde_json::from_value(serde_json::json!({
+                        "name": name,
+                        "description": "a tool",
+                        "input_schema": {"type": "object"},
+                    }))
+                    .unwrap()
+                })
+                .collect(),
+        ),
+        system_text: "you are a worker".into(),
+        system_digest: "system".into(),
+        join_version: 1,
+        role_versions: Default::default(),
+        fetches: vec![],
+        declarations: vec![],
+    }
+}
+
+/// A send carrying a plan, as the serve layer hands it over: its identity, and the manifest it
+/// fetched when the session had no run.
+async fn send_planned(
+    commands: &mpsc::UnboundedSender<LineageCmd>,
+    run_id: &str,
+    request: SubmissionRequest,
+    identity: &str,
+    manifest: Option<broca_wal::PlanManifest>,
+) -> SendOutcome {
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(LineageCmd::Send {
+            session_class: None,
+            retention: None,
+            stop_sequences_named: false,
+            conversation_key: None,
+            title: None,
+            run_id: RunId(run_id.into()),
+            request: Box::new(request),
+            kind: RunKind::FreshOrResume,
+            key: SendKey::Minted,
+            skip_materialization: false,
+            delivery: broca_protocol::Delivery::Queue,
+            plan: Some(Box::new(crate::actor::SendPlan {
+                identity: identity.into(),
+                manifest: manifest.map(Arc::new),
+                model_check: None,
+            })),
+            order: None,
+            reply,
+        })
+        .unwrap();
+    answer.await.unwrap()
+}
+
+/// A send carrying no tools of its own, as a planned session's sends do.
+fn untooled(text: &str) -> SubmissionRequest {
+    let mut request = request(text);
+    request.tools = None;
+    request.policy_allowed = Default::default();
+    request
+}
+
+/// The session's first send freezes the plan its send fetched: the run is sent the manifest's
+/// tools and opens with its system text, its start records the manifest, and a later plain send
+/// runs under the same manifest with no system text of its own.
+#[tokio::test]
+async fn a_planned_session_runs_on_the_manifests_tools_and_system_text() {
+    let executor = Arc::new(executor(
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        None,
+    ));
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let session = Session::create(
+        backend,
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    let actor = StoreActor::new(bind(), session, executor.clone(), Box::new(parts.clone()));
+    let (commands, receiver) = mpsc::unbounded_channel();
+    let served = tokio::spawn(actor.serve(receiver));
+    let manifest = plan_manifest("plan-1", serde_json::json!({}));
+    assert!(matches!(
+        send_planned(
+            &commands,
+            "r1",
+            untooled("first"),
+            "plan-1",
+            Some(manifest.clone())
+        )
+        .await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    assert!(matches!(
+        send(&commands, "r2", "second").await,
+        SendOutcome::DeliveryRefused { field: "tools", .. }
+    ));
+    assert!(matches!(
+        send_with(&commands, "r2", untooled("second"), SendKey::Minted).await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let calls = executor.provider.inner.calls();
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        let names: Vec<_> = call.tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, ["read", "edit"]);
+    }
+    assert_eq!(
+        calls[0].prompt[0].role,
+        broca_protocol::content::Role::System
+    );
+    assert_eq!(
+        calls[0].prompt[0].content,
+        [ContentBlock::Text {
+            text: "you are a worker".into()
+        }]
+    );
+    let systems = |call: &broca_protocol::request::CallOptions| {
+        call.prompt
+            .iter()
+            .filter(|message| message.role == broca_protocol::content::Role::System)
+            .count()
+    };
+    assert_eq!(systems(&calls[1]), 1, "the later run adds no system text");
+    for start in [
+        session.operations().owner.first_start.as_ref().unwrap(),
+        session
+            .operations()
+            .run
+            .as_ref()
+            .unwrap()
+            .start
+            .as_ref()
+            .unwrap(),
+    ] {
+        let admission = broca_session_loop::run::admission_of_start(start, &parts).unwrap();
+        assert_eq!(
+            admission.manifest.as_deref(),
+            Some(&manifest),
+            "{}",
+            start.run_id
+        );
+    }
+}
+
+/// A later send's plan must be the one the session froze: the same plan runs as an ordinary
+/// send, another is refused naming both, and nothing is written for the refusal.
+#[tokio::test]
+async fn a_later_send_with_another_plan_is_refused() {
+    let (commands, served, _) = actor(executor(
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        None,
+    ))
+    .await;
+    let manifest = plan_manifest("plan-1", serde_json::json!({}));
+    assert!(matches!(
+        send_planned(&commands, "r1", untooled("first"), "plan-1", Some(manifest)).await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    assert!(matches!(
+        send_planned(&commands, "r2", untooled("second"), "plan-2", None).await,
+        SendOutcome::PlanRefused(broca_fetch_plan::Refusal::PlanDrift { .. })
+    ));
+    assert!(matches!(
+        send_planned(&commands, "r3", untooled("third"), "plan-1", None).await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(starts(&session).await, 2, "the refused send started no run");
+    // The first run opens with the manifest's system text, as its input recorded it.
+    assert_eq!(
+        texts(&session),
+        ["you are a worker", "first", "hello", "third", "again"]
+    );
+}
+
+/// A plan that confines its tools can't start a session that has no scope: the refusal names
+/// the preset, and nothing is written.
+#[tokio::test]
+async fn a_confining_plan_without_a_scope_is_refused() {
+    let (commands, served, _) = actor(executor(vec![text_step("a1", "hello")], None)).await;
+    let manifest = plan_manifest(
+        "plan-1",
+        serde_json::json!({"tool_items": [{"preset": "worker"}]}),
+    );
+    assert!(matches!(
+        send_planned(&commands, "r1", untooled("first"), "plan-1", Some(manifest)).await,
+        SendOutcome::ScopeRefused(broca_core::ScopeRefusal::ScopeRequired { preset: "worker" })
+    ));
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(starts(&session).await, 0);
+}
+
+/// A send leaving its model to the session runs on the model the session's plan selected.
+#[tokio::test]
+async fn a_send_leaving_its_model_runs_on_the_plans_model() {
+    let (commands, served, _) = actor(executor(
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        None,
+    ))
+    .await;
+    let manifest = plan_manifest(
+        "plan-1",
+        serde_json::json!({"model": {"provider": "stub", "model": "planned"}}),
+    );
+    assert!(matches!(
+        send_planned(&commands, "r1", untooled("first"), "plan-1", Some(manifest)).await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    let mut inheriting = untooled("second");
+    inheriting
+        .inherit_frozen
+        .insert(broca_protocol::request::InheritedParam::Model);
+    assert!(matches!(
+        send_with(&commands, "r2", inheriting, SendKey::Minted).await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let start = session
+        .operations()
+        .run
+        .as_ref()
+        .unwrap()
+        .start
+        .as_ref()
+        .unwrap();
+    assert_eq!(start.run_id, "r2");
+    assert_eq!(start.model.model_id, "planned");
+}
+
+/// A send queued behind a planned session's running run drains under the session's plan: its
+/// run is sent the manifest's tools and records the manifest on its start.
+#[tokio::test]
+async fn a_queued_send_drains_under_the_sessions_plan() {
+    let gate = Arc::new(Notify::new());
+    let executor = Arc::new(executor(
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        Some(Arc::clone(&gate)),
+    ));
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let session = Session::create(
+        backend,
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    let actor = StoreActor::new(bind(), session, executor.clone(), Box::new(parts.clone()));
+    let (commands, receiver) = mpsc::unbounded_channel();
+    let served = tokio::spawn(actor.serve(receiver));
+    let manifest = plan_manifest("plan-1", serde_json::json!({}));
+    assert!(matches!(
+        send_planned(
+            &commands,
+            "r1",
+            untooled("first"),
+            "plan-1",
+            Some(manifest.clone())
+        )
+        .await,
+        SendOutcome::Active { .. }
+    ));
+    assert!(matches!(
+        send_with(&commands, "r2", untooled("second"), SendKey::Minted).await,
+        SendOutcome::Pending { .. }
+    ));
+    gate.notify_one();
+    gate.notify_one();
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let calls = executor.provider.inner.calls();
+    assert_eq!(calls.len(), 2);
+    let names: Vec<_> = calls[1]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(names, ["read", "edit"]);
+    let start = session
+        .operations()
+        .run
+        .as_ref()
+        .unwrap()
+        .start
+        .as_ref()
+        .unwrap();
+    assert_eq!(start.run_id, "r2");
+    let admission = broca_session_loop::run::admission_of_start(start, &parts).unwrap();
+    assert_eq!(admission.manifest.as_deref(), Some(&manifest));
+}
+
+/// The deployment's setup parts store over `backend`, as a store session's actor uses it.
+fn setup_storage(
+    backend: &'static MemoryBackend,
+) -> broca_session_loop::durable::SetupParts<&'static MemoryBackend> {
+    broca_session_loop::durable::SetupParts {
+        backend,
+        key: deployment().setup_key(),
+    }
+}
+
+/// The parts the deployment's setup store holds on `backend`, as a process loads them at start.
+async fn loaded_parts(backend: &'static MemoryBackend) -> SharedParts {
+    let key = deployment().setup_key();
+    let loaded = broca_session_store::setup::SetupStore::new(&backend, &key)
+        .load_all()
+        .await
+        .unwrap();
+    SharedParts::new(Box::new(
+        broca_session_loop::parts::DeploymentParts::loaded(loaded),
+    ))
+}
+
+/// With durable setup storage, every part a run's start names is in the deployment's setup
+/// store by the time the start is, and a process started afresh, holding only what the store
+/// loads, reads the session's runs back: a planned session's next send runs on its frozen
+/// manifest, and a queued send that drained under it too.
+#[tokio::test]
+async fn setup_parts_are_stored_before_the_records_naming_them() {
+    let gate = Arc::new(Notify::new());
+    let executor = Arc::new(executor(
+        vec![
+            text_step("a1", "hello"),
+            text_step("a2", "again"),
+            text_step("a3", "third"),
+        ],
+        Some(Arc::clone(&gate)),
+    ));
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let session = Session::create(
+        backend,
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    let parts = SharedParts::new(Box::new(
+        broca_session_loop::parts::DeploymentParts::default(),
+    ));
+    let actor = StoreActor::new(bind(), session, executor.clone(), Box::new(parts))
+        .with_storage(setup_storage(backend));
+    let (commands, receiver) = mpsc::unbounded_channel();
+    let served = tokio::spawn(actor.serve(receiver));
+    let manifest = plan_manifest("plan-1", serde_json::json!({}));
+    assert!(matches!(
+        send_planned(
+            &commands,
+            "r1",
+            untooled("first"),
+            "plan-1",
+            Some(manifest.clone())
+        )
+        .await,
+        SendOutcome::Active { .. }
+    ));
+    // The run's start is durable now, and nothing else has been appended: every part it names
+    // must already be in the setup store.
+    let stored_with_start: std::collections::BTreeSet<_> =
+        broca_session_store::setup::SetupStore::new(&backend, &deployment().setup_key())
+            .load_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(digest, _)| digest.0)
+            .collect();
+    assert!(matches!(
+        send_with(&commands, "r2", untooled("second"), SendKey::Minted).await,
+        SendOutcome::Pending { .. }
+    ));
+    gate.notify_one();
+    gate.notify_one();
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    drop(session);
+
+    // A fresh process: only what the setup store holds.
+    let parts = loaded_parts(backend).await;
+    let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
+        .await
+        .unwrap();
+    let first = session.operations().owner.first_start.as_ref().unwrap();
+    assert!(!first.setup.is_empty());
+    for part in &first.setup {
+        assert!(
+            stored_with_start.contains(&part.digest.0),
+            "{part:?} was not stored before the run start naming it"
+        );
+    }
+    for start in [
+        first,
+        session
+            .operations()
+            .run
+            .as_ref()
+            .unwrap()
+            .start
+            .as_ref()
+            .unwrap(),
+    ] {
+        let admission = broca_session_loop::run::admission_of_start(start, &parts).unwrap();
+        assert_eq!(
+            admission.manifest.as_deref(),
+            Some(&manifest),
+            "{}",
+            start.run_id
+        );
+    }
+    let actor = StoreActor::new(bind(), session, executor.clone(), Box::new(parts))
+        .with_storage(setup_storage(backend));
+    let (commands, receiver) = mpsc::unbounded_channel();
+    let served = tokio::spawn(actor.serve(receiver));
+    gate.notify_one();
+    assert!(matches!(
+        send_with(&commands, "r3", untooled("third"), SendKey::Minted).await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let start = session
+        .operations()
+        .run
+        .as_ref()
+        .unwrap()
+        .start
+        .as_ref()
+        .unwrap();
+    assert_eq!(start.run_id, "r3");
+    let calls = executor.provider.inner.calls();
+    let names: Vec<_> = calls[2]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(names, ["read", "edit"]);
 }

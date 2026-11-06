@@ -149,6 +149,9 @@ pub trait SessionBackend {
     /// included.
     async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError>;
     async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError>;
+    /// The names of every setup part stored, in no particular order. A part being written is
+    /// not listed until it is complete.
+    async fn list_setup(&self) -> Result<Vec<String>, BackendError>;
 }
 
 /// A borrowed backend is a backend, so a session can borrow one for a short task (a test, a
@@ -261,6 +264,9 @@ impl<T: SessionBackend + ?Sized> SessionBackend for &T {
     }
     async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError> {
         (**self).get_setup(name).await
+    }
+    async fn list_setup(&self) -> Result<Vec<String>, BackendError> {
+        (**self).list_setup().await
     }
 }
 
@@ -575,6 +581,10 @@ impl SessionBackend for MemoryBackend {
 
     async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError> {
         Ok(self.setup.lock().unwrap().get(name).cloned())
+    }
+
+    async fn list_setup(&self) -> Result<Vec<String>, BackendError> {
+        Ok(self.setup_names())
     }
 }
 
@@ -960,5 +970,25 @@ impl SessionBackend for LocalBackend {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    async fn list_setup(&self) -> Result<Vec<String>, BackendError> {
+        let entries = match std::fs::read_dir(self.root.join("setup")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let name = entry?.file_name();
+            let name = name.to_str().ok_or(BackendError::Corrupt(
+                "a setup part's file name is not text",
+            ))?;
+            // A part being written sits in a dot-prefixed temporary file until it is renamed.
+            if !name.starts_with('.') {
+                names.push(name.to_owned());
+            }
+        }
+        Ok(names)
     }
 }

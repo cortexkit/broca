@@ -889,17 +889,19 @@ fn deliver_terminal(
 /// it exactly. Any other send starts a run: its admitted tool set (the plan's frozen tools, the
 /// send's own, or the tools it inherits by omitting them) must not include `submit_result`, and
 /// must be empty for `final_text`.
-fn check_structured_output(
+///
+/// `latest` is the session's latest run as frozen: its provider render config and its tools.
+pub(crate) fn check_structured_output(
     structured_output: &broca_protocol::structured_output::StructuredOutput,
     request: &SubmissionRequest,
     plan: Option<&SendPlan>,
-    latest: Option<&broca_wal::RunConfig>,
+    latest: Option<(&serde_json::Value, &[broca_protocol::request::Tool])>,
     joins_active_run: bool,
 ) -> Result<(), String> {
     use broca_protocol::structured_output::{FrozenStructuredOutput, FIELD};
     if joins_active_run {
-        let frozen = latest.and_then(|config| {
-            FrozenStructuredOutput::from_frozen_render_config(Some(&config.frozen_render_config))
+        let frozen = latest.and_then(|(render, _)| {
+            FrozenStructuredOutput::from_frozen_render_config(Some(render))
         });
         return match frozen {
             Some(frozen) if frozen.matches(structured_output) => Ok(()),
@@ -914,7 +916,7 @@ fn check_structured_output(
             .collect(),
         (None, Some(tools)) => tools.iter().map(|tool| tool.name.clone()).collect(),
         (None, None) => latest
-            .map(|config| config.tools.iter().map(|tool| tool.name.clone()).collect())
+            .map(|(_, tools)| tools.iter().map(|tool| tool.name.clone()).collect())
             .unwrap_or_default(),
     };
     structured_output.check(true, &tools)
@@ -3674,10 +3676,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 structured_output,
                 &request,
                 plan.as_ref(),
-                checkpoint
-                    .last_episode
-                    .as_ref()
-                    .map(|episode| &episode.config),
+                checkpoint.last_episode.as_ref().map(|episode| {
+                    (
+                        &episode.config.frozen_render_config,
+                        episode.config.tools.as_slice(),
+                    )
+                }),
                 joins_active_run,
             ) {
                 return SendOutcome::StructuredOutputInvalid { field };

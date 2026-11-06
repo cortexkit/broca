@@ -21,7 +21,7 @@ use broca_session_store::backend::MemoryBackend;
 use broca_session_store::session::Session;
 use tokio::sync::{mpsc, Notify};
 
-use super::tests::{actor, auth_failure, executor, request, send_as, texts, Gated};
+use super::tests::{actor, auth_failure, executor, request, texts, Gated};
 use crate::actor::{LineageStatus, SendKey, SendOutcome};
 use crate::executor::{RunExecutor, RunJob, RunKind};
 use crate::registry::LineageRegistry;
@@ -126,6 +126,7 @@ impl Today {
         request: SubmissionRequest,
         key: SendKey,
         delivery: broca_protocol::Delivery,
+        session_class: Option<&str>,
     ) -> SendOutcome {
         self.registry
             .route_submission_with_order(
@@ -140,7 +141,7 @@ impl Today {
                 None,
                 None,
                 None,
-                None,
+                session_class.map(str::to_owned),
                 false,
                 None,
             )
@@ -175,6 +176,7 @@ impl Today {
                     sent_by,
                     principal,
                     scope,
+                    session_class,
                     config,
                     ..
                 } => Some(serde_json::json!({
@@ -186,6 +188,7 @@ impl Today {
                     "sent_by": sent_by,
                     "principal": principal,
                     "scope": scope,
+                    "session_class": session_class,
                     "model": config.model,
                 })),
                 _ => None,
@@ -244,6 +247,8 @@ enum Step {
         /// Changes the request before it is sent, the same on both sides.
         tweak: Option<fn(&mut SubmissionRequest)>,
         delivery: broca_protocol::Delivery,
+        /// The session label the send names.
+        class: Option<&'static str>,
         expect: Expect,
     },
     /// Retracts the queued send `submission_id` on both sides; the replies must be equal.
@@ -262,6 +267,7 @@ fn send(run_id: &'static str, text: &'static str) -> Step {
         route_decision: None,
         tweak: None,
         delivery: broca_protocol::Delivery::Queue,
+        class: None,
         expect: Expect::Same,
     }
 }
@@ -276,8 +282,16 @@ fn keyed(key: &'static str, text: &'static str) -> Step {
         route_decision: None,
         tweak: None,
         delivery: broca_protocol::Delivery::Queue,
+        class: None,
         expect: Expect::Same,
     }
+}
+
+fn labelled(mut step: Step, label: &'static str) -> Step {
+    if let Step::Send { class, .. } = &mut step {
+        *class = Some(label);
+    }
+    step
 }
 
 fn expecting(mut step: Step, expected: Expect) -> Step {
@@ -333,6 +347,7 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                 route_decision,
                 tweak,
                 delivery,
+                class,
                 expect,
             } => {
                 let mut sent = request(text);
@@ -344,8 +359,18 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                     Some(key) => SendKey::SendId(key.into()),
                     None => SendKey::Minted,
                 };
-                let old = today.send(run_id, sent.clone(), send_key(), delivery).await;
-                let new = send_as(&commands, run_id, sent, send_key(), delivery).await;
+                let old = today
+                    .send(run_id, sent.clone(), send_key(), delivery, class)
+                    .await;
+                let new = super::tests::send_labelled(
+                    &commands,
+                    run_id,
+                    sent,
+                    send_key(),
+                    delivery,
+                    class,
+                )
+                .await;
                 match expect {
                     Expect::Same => assert_eq!(new, old, "step {index}: replies differ"),
                     Expect::StoreRefuses(what) => {
@@ -425,6 +450,7 @@ async fn store_starts(session: &Session<&'static MemoryBackend>) -> Vec<serde_js
                     .cloned(),
                 "principal": start.principal,
                 "scope": start.scope,
+                "session_class": start.session_class,
                 "model": start.model,
             })),
             _ => None,
@@ -882,6 +908,102 @@ async fn an_interrupt_is_refused_by_name() {
                 interrupting(send("r2", "interrupting")),
                 Expect::StoreRefuses("an interrupt"),
             ),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_sessions_label_freezes_at_its_first_send_alike() {
+    compare(
+        hello(),
+        false,
+        vec![
+            labelled(send("r1", "first"), "sidekick"),
+            Step::Idle,
+            // A later send repeating the label runs; one naming another is refused.
+            labelled(send("r2", "second"), "sidekick"),
+            Step::Idle,
+            labelled(send("r3", "third"), "mason"),
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_later_send_without_its_label_keeps_the_sessions_alike() {
+    compare(
+        hello(),
+        false,
+        vec![
+            labelled(send("r1", "first"), "sidekick"),
+            Step::Idle,
+            send("r2", "second"),
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_label_on_an_unlabelled_session_is_ignored_alike() {
+    compare(
+        hello(),
+        false,
+        vec![
+            send("r1", "first"),
+            Step::Idle,
+            labelled(send("r2", "second"), "sidekick"),
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+/// A `final_text` run must offer no tools, and the test request carries some.
+fn final_text_with_tools(request: &mut SubmissionRequest) {
+    request.structured_output = Some(
+        serde_json::from_value(serde_json::json!({
+            "mode": "final_text",
+            "schema": {"type": "object"},
+        }))
+        .unwrap(),
+    );
+}
+
+/// A `final_text` request offering no tools, which a fresh run would admit: a steer naming it
+/// must still match what the running run froze.
+fn final_text_untooled(request: &mut SubmissionRequest) {
+    final_text_with_tools(request);
+    request.tools = None;
+    request.policy_allowed = Default::default();
+}
+
+#[tokio::test]
+async fn a_final_text_send_offering_tools_is_refused_alike() {
+    compare(
+        hello(),
+        false,
+        vec![
+            tweaked(send("r1", "first"), final_text_with_tools),
+            send("r2", "second"),
+            Step::Idle,
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_steer_naming_structured_output_the_run_did_not_freeze_is_refused_alike() {
+    compare(
+        hello(),
+        true,
+        vec![
+            send("r1", "first"),
+            steered(tweaked(send("r2", "second"), final_text_untooled)),
+            Step::Release,
+            Step::Idle,
         ],
     )
     .await;

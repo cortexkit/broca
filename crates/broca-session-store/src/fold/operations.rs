@@ -782,19 +782,26 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The session's first run start, kept for what it froze for the session's whole life:
+        /// a fetch plan's manifest, among the setup parts it names, which today's rules read as
+        /// the first episode's. The run fold keeps only the latest run's start.
+        6 opt pub first_start: crate::record::RunStart => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
 impl Owner {
     /// Folds one run start's principal and scope, as `SessionOwnershipV1::fold_run_started`
-    /// folds them.
-    fn fold_run_start(
-        &mut self,
-        principal: Option<&serde_json::Value>,
-        scope: Option<&serde_json::Value>,
-    ) {
+    /// folds them, and keeps the session's first run start.
+    fn fold_run_start(&mut self, start: &crate::record::RunStart) {
+        let principal = start.principal.as_ref();
+        let scope = start.scope.as_ref();
         if self.episodes == 0 {
             self.first_principal = principal.cloned();
+            self.first_start = Some(start.clone());
         }
         self.episodes = self.episodes.saturating_add(1);
         match principal {
@@ -926,8 +933,7 @@ impl Operations {
                     .get_or_insert_with(Estimate::default)
                     .run_model = Some(start.model.clone());
                 self.output_attempt_bytes = None;
-                self.owner
-                    .fold_run_start(start.principal.as_ref(), start.scope.as_ref());
+                self.owner.fold_run_start(start);
             }
             Record::Attempt(attempt) => {
                 self.output_attempt_bytes = Some(attempt.request_body_len);

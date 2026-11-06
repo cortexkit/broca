@@ -32,6 +32,7 @@
 pub mod admit;
 pub mod budget;
 pub mod compaction;
+pub mod durable;
 pub mod entries;
 pub mod media;
 pub mod output;

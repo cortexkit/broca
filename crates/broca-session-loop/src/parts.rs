@@ -20,6 +20,16 @@ pub trait Parts: Send + Sync {
 
     /// The value a part holds.
     fn get(&self, part: &PartRef) -> Result<Value, String>;
+
+    /// The parts put here that aren't durable yet, with their bytes. A writer stores each
+    /// before it appends a record, so no record names a part only memory holds. A store that
+    /// keeps nothing durable, such as one for tests, lists none.
+    fn unstored(&self) -> Vec<(PartRef, Vec<u8>)> {
+        Vec::new()
+    }
+
+    /// Notes that `parts` are durable now.
+    fn mark_stored(&mut self, _parts: &[PartRef]) {}
 }
 
 /// Parts held in memory, for tests and for runs whose parts the caller keeps elsewhere.
@@ -87,5 +97,98 @@ impl Parts for SharedParts {
 
     fn get(&self, part: &PartRef) -> Result<Value, String> {
         self.lock()?.get(part)
+    }
+
+    fn unstored(&self) -> Vec<(PartRef, Vec<u8>)> {
+        self.lock()
+            .map(|parts| parts.unstored())
+            .unwrap_or_default()
+    }
+
+    fn mark_stored(&mut self, parts: &[PartRef]) {
+        if let Ok(mut held) = self.lock() {
+            held.mark_stored(parts);
+        }
+    }
+}
+
+/// The deployment's setup parts, shared by every session in the process: what its setup store
+/// held when the process loaded it, and what runs have put since. A part put here is held in
+/// memory and listed by [`Parts::unstored`] until a writer stores it. The list is the
+/// deployment's, not a session's: one session may name a part another session put first, so
+/// whichever writer appends first stores it.
+#[derive(Clone, Default)]
+pub struct DeploymentParts(std::sync::Arc<std::sync::Mutex<DeploymentState>>);
+
+#[derive(Default)]
+struct DeploymentState {
+    parts: BTreeMap<Digest, std::sync::Arc<[u8]>>,
+    unstored: BTreeMap<Digest, PartKind>,
+}
+
+impl DeploymentParts {
+    /// The parts the deployment's setup store holds, as its `load_all` read them.
+    pub fn loaded(parts: impl IntoIterator<Item = (Digest, std::sync::Arc<[u8]>)>) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(
+            DeploymentState {
+                parts: parts.into_iter().collect(),
+                unstored: BTreeMap::new(),
+            },
+        )))
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, DeploymentState>, String> {
+        self.0
+            .lock()
+            .map_err(|_| "a holder of the deployment's parts panicked while using them".to_owned())
+    }
+}
+
+impl Parts for DeploymentParts {
+    fn put(&mut self, kind: PartKind, value: &Value) -> Result<PartRef, String> {
+        let (bytes, digest) = canonical(value)?;
+        let mut state = self.lock()?;
+        if let std::collections::btree_map::Entry::Vacant(entry) = state.parts.entry(digest) {
+            entry.insert(bytes.into());
+            state.unstored.insert(digest, kind);
+        }
+        Ok(PartRef { kind, digest })
+    }
+
+    fn get(&self, part: &PartRef) -> Result<Value, String> {
+        let state = self.lock()?;
+        let bytes = state
+            .parts
+            .get(&part.digest)
+            .ok_or_else(|| "setup part missing".to_string())?;
+        serde_json::from_slice(bytes).map_err(|e| e.to_string())
+    }
+
+    fn unstored(&self) -> Vec<(PartRef, Vec<u8>)> {
+        let Ok(state) = self.lock() else {
+            return Vec::new();
+        };
+        state
+            .unstored
+            .iter()
+            .filter_map(|(digest, kind)| {
+                let bytes = state.parts.get(digest)?;
+                Some((
+                    PartRef {
+                        kind: *kind,
+                        digest: *digest,
+                    },
+                    bytes.to_vec(),
+                ))
+            })
+            .collect()
+    }
+
+    fn mark_stored(&mut self, parts: &[PartRef]) {
+        if let Ok(mut state) = self.lock() {
+            for part in parts {
+                state.unstored.remove(&part.digest);
+            }
+        }
     }
 }
