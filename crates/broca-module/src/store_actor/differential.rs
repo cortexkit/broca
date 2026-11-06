@@ -41,7 +41,8 @@ impl RunExecutor for TodayLoop {
         out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError> {
         // As the serve executor picks it (`start_mode_after_auth`) when the run's credential
-        // resolves, which this harness's always does: a public send resumes a sign-in pause.
+        // resolves, which this harness's always does: an ordinary caller's send, which arrives
+        // as `FreshOrResume`, resumes a sign-in pause.
         let mode = match job.kind {
             RunKind::FreshOrResume | RunKind::ResumeAfterAuth => StartMode::ResumeAfterAuth,
             RunKind::AppendEpisode => StartMode::AppendEpisode,

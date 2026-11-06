@@ -293,8 +293,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 let request = *request;
                 // Today's actor refuses a send that declares tools on a scoped session unless a
-                // plan gave the session its tools: tool providers need a per-call preset on scoped
-                // routes, and only a plan carries one. A store session has no plan yet.
+                // plan gave the session its tools: on a scoped route a tool provider refuses a call
+                // that doesn't name the plan's settings for that tool, and only a plan supplies
+                // them. A store session has no plan yet.
                 if request
                     .tools
                     .as_ref()
@@ -521,7 +522,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// carries the scope the session already froze.
     ///
     /// Reopening a scope at a later epoch, and agent-run scopes, are refused by name: today's
-    /// actor checks more for each (whether the run can start now, the carrier's tools).
+    /// actor checks more for each (whether the run can start now; for an agent run, that the
+    /// send declares no tools of its own).
     fn send_scope(
         &self,
         run_id: &RunId,
