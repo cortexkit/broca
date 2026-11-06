@@ -1172,8 +1172,15 @@ where
         let mut downgraded_now = false;
         let mut prior_retries = 0;
         let outcome = loop {
-            let outcome =
-                model_step(writer, seams, &admission.run_id, step_id, opts.clone()).await?;
+            let outcome = model_step(
+                writer,
+                seams,
+                &admission.run_id,
+                step_id,
+                opts.clone(),
+                requested_cache_ttl(admission),
+            )
+            .await?;
             if let Err(StepFailure::Error(error, retries_used)) = &outcome {
                 // The provider decides: it answers yes only for its own strict schema's refusal.
                 if !downgraded_now && seams.provider.structured_output_grammar_rejection(error) {
@@ -1835,6 +1842,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     run_id: &str,
     step_id: u64,
     opts: CallOptions,
+    requested_ttl_ms: Option<u64>,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
     let runtime = StepRuntime {
         cancel: seams.cancel.clone(),
@@ -1887,7 +1895,10 @@ async fn model_step<W: Writer, P: Provider, T>(
             })) => return Ok(Err(StepFailure::Error(Box::new(error), retries_used))),
             Some(NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt })) => {
                 writer
-                    .append(&[attempt_record(run_id, step_id, attempt)?], false)
+                    .append(
+                        &[attempt_record(run_id, step_id, attempt, requested_ttl_ms)?],
+                        false,
+                    )
                     .await?;
             }
             None => return Ok(Err(StepFailure::Error(Box::new(incomplete_stream()), 0))),
@@ -2665,6 +2676,15 @@ fn structured_of(
     broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(Some(
         &admission.render_config,
     ))
+}
+
+/// The cache lifetime the run's requests ask the provider for, when they ask for one it
+/// honours, as today's cache declaration reads it from the run's frozen render config. Only
+/// this lifetime can prove the cache expired.
+pub(crate) fn requested_cache_ttl(admission: &Admission) -> Option<u64> {
+    let frozen: broca_provider::wire::FrozenRenderConfig =
+        serde_json::from_value(admission.render_config.clone()).ok()?;
+    broca_provider::cache_warm::requested_ttl_ms(&admission.model.provider_module_id, &frozen)
 }
 
 /// How many messages a batch that closes the open tool turn places before anything after it:
@@ -3795,7 +3815,14 @@ fn placed_copies(operations: &Operations, run_id: &str) -> Vec<Record> {
 /// fields; every other field the provider measured is kept as diagnostics telemetry under the
 /// name it has on the provider's evidence. Billing details are absent: no attempt in this loop
 /// is billed through a reservation yet.
-fn attempt_record(run_id: &str, step_id: u64, attempt: ModelAttempt) -> Result<Record, LoopError> {
+/// `requested_ttl_ms` is the cache lifetime the run's requests ask for, recorded on an attempt
+/// that reached the cache.
+fn attempt_record(
+    run_id: &str,
+    step_id: u64,
+    attempt: ModelAttempt,
+    requested_ttl_ms: Option<u64>,
+) -> Result<Record, LoopError> {
     let invalid = |what: &str| LoopError::Parts(format!("attempt evidence: {what}"));
     let mut value = serde_json::to_value(&attempt).map_err(|e| invalid(&e.to_string()))?;
     let fields = value
@@ -3819,6 +3846,8 @@ fn attempt_record(run_id: &str, step_id: u64, attempt: ModelAttempt) -> Result<R
     take("last_content_at_ms");
     take("transport");
     take("served_account_ref");
+    let reached =
+        broca_core::cache_warm::attempt_reached_the_cache(attempt.http_status, &attempt.outcome);
     let request_body_sha256 = digest(take("request_body_sha256"), "request_body_sha256")?;
     let response_body_sha256 = digest(take("response_body_sha256"), "response_body_sha256")?;
     let telemetry = (!fields.is_empty()).then(|| Value::Object(std::mem::take(fields)));
@@ -3841,11 +3870,8 @@ fn attempt_record(run_id: &str, step_id: u64, attempt: ModelAttempt) -> Result<R
         served_account_ref: attempt.served_account_ref.clone(),
         billing: None,
         telemetry,
-        reached_cache: broca_core::cache_warm::attempt_reached_the_cache(
-            attempt.http_status,
-            &attempt.outcome,
-        )
-        .then_some(true),
+        reached_cache: reached.then_some(true),
+        requested_cache_ttl_ms: requested_ttl_ms.filter(|_| reached),
     }))
 }
 

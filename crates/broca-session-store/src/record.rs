@@ -441,6 +441,12 @@ message! {
         /// read into or written to the provider's cache, as the run loop decides it when it
         /// records the attempt. Absent means it didn't, or isn't known to have.
         19 opt reached_cache: bool,
+        /// For a request that reached the cache: the cache lifetime it asked the provider for,
+        /// when it asked for one the provider honours (a first-party Anthropic marker's `ttl`,
+        /// or first-party OpenAI's 24-hour retention), as the run loop decides it from the
+        /// run's frozen render config when it records the attempt. Only this lifetime can prove
+        /// the cache expired. Absent when the request named none.
+        20 opt requested_cache_ttl_ms: u64,
     }
 }
 

@@ -710,6 +710,9 @@ crate::message! {
     pub struct CacheSend {
         1 req sent_at_ms: u64,
         2 req run_id: String,
+        /// The cache lifetime that request asked for, when it asked for one the provider
+        /// honours; only then can the cache be proven expired.
+        3 opt requested_ttl_ms: u64,
     }
 }
 
@@ -814,6 +817,7 @@ impl Operations {
                             self.last_cache_send = Some(CacheSend {
                                 sent_at_ms,
                                 run_id: attempt.run_id.clone(),
+                                requested_ttl_ms: attempt.requested_cache_ttl_ms,
                             });
                         }
                     }

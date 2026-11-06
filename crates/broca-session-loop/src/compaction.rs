@@ -629,6 +629,8 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     let transcript = transcript(writer, ctx).await?;
     let opts = with_sealed(opts, &transcript);
     let entries = transcript.entries;
+    let now = (seams.now_ms)();
+    let last_cache = writer.operations().last_cache_send.clone();
     let chained = seams.provider.history_edit_cost()
         == Some(broca_core::compaction_provider::notice::HistoryEditCost::FullResend);
     let conditions = match v2::host::conditions_of(&frozen(admission), &entries, chained) {
@@ -663,13 +665,17 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             conditions: &conditions,
             previous: previous.as_ref(),
             current: &current,
-            // Cache expiry is proven only from a cache lifetime the run's requests ask for,
-            // which keep-warm reads; the new loop has no keep-warm yet, as a run without one
-            // in today's loop.
-            cache_expired: false,
-            detects_cache_expired: false,
+            // Expiry counts from the last request that reached the cache, by the lifetime that
+            // request asked the provider for; it's claimed only on a run whose own requests ask
+            // for one, as in today's loop.
+            cache_expired: v2::conditions::cache_proven_expired(
+                last_cache.as_ref().and_then(|send| send.requested_ttl_ms),
+                last_cache.as_ref().map(|send| send.sent_at_ms),
+                now,
+            ),
+            detects_cache_expired: crate::run::requested_cache_ttl(admission).is_some(),
             chain_reset: chained && seams.provider.prepare_chain_reset(),
-            now: (seams.now_ms)(),
+            now,
             next_mid: NEXT_MID,
         },
         |_| Err("a compaction view's inserted images aren't stored yet".into()),

@@ -93,6 +93,11 @@ impl Provider for ScriptedProvider {
     /// The default stateless config, carrying the run's structured output when the comparison
     /// freezes one: both loops read it from here.
     fn render_config_blob(&self) -> Value {
+        // A comparison of cache expiry freezes a real first-party Anthropic config, whose cache
+        // markers ask for a lifetime; this provider still renders requests its own way.
+        if cache() {
+            return serde_json::to_value(cached_config()).expect("a frozen config serializes");
+        }
         let mut blob = json!({ "render_config": "stateless" });
         if let Some(structured) = structured() {
             blob["structured_output"] = structured;
@@ -683,6 +688,88 @@ fn budgeted(nudges: &[u64], finalize: Option<u64>) -> broca_protocol::request::B
     }
 }
 
+tokio::task_local! {
+    /// Whether the comparison freezes a provider config whose requests ask for a cache
+    /// lifetime, with both loops reading the wall clock, so a cache can be proven expired.
+    static CACHE: bool;
+}
+
+fn cache() -> bool {
+    CACHE.try_with(|cache| *cache).unwrap_or(false)
+}
+
+/// A first-party Anthropic config whose cache markers ask for five minutes.
+fn cached_config() -> broca_provider::wire::FrozenRenderConfig {
+    let mut frozen = broca_provider::families::anthropic_frozen_config("m");
+    frozen.cache = Some(broca_provider::wire::CachePolicy {
+        version: 1,
+        class: broca_provider::wire::CacheClass::Markers {
+            syntax: broca_provider::wire::MarkerSyntax::AnthropicCacheControl,
+            ttl: broca_provider::wire::CacheTtl::FiveMinutes,
+            max_breakpoints: 4,
+            lookback_blocks: 20,
+            tail: None,
+            omit_ttl: false,
+        },
+    });
+    frozen
+}
+
+/// The provider the runs name: a cache-expiry comparison needs first-party Anthropic, whose
+/// requests ask for a lifetime.
+fn provider_id() -> &'static str {
+    if cache() {
+        "anthropic"
+    } else {
+        "stub"
+    }
+}
+
+/// The time the new loop reads: today's loop reads the wall clock, so a comparison whose result
+/// depends on it does too; every other comparison reads 0 and normalizes the times recorded.
+fn harness_now() -> u64 {
+    if cache() {
+        broca_core::clock::Clock::default().now_ms()
+    } else {
+        0
+    }
+}
+
+/// Today's loop reads the cache lifetime a run's requests ask for from its keep-warm driver,
+/// which production builds from the provider's cache declaration. This one only answers that,
+/// as production's does, and never warms (no run in these comparisons asks to).
+struct CacheLifetime;
+
+#[async_trait::async_trait]
+impl broca_core::keep_warm_wait::KeepWarmDriver for CacheLifetime {
+    fn timing(
+        &self,
+        _: &broca_wal::RunConfig,
+    ) -> Result<broca_core::keep_warm_wait::WarmTiming, String> {
+        Err("not warming in this comparison".into())
+    }
+    fn requested_ttl_ms(&self, config: &broca_wal::RunConfig) -> Option<u64> {
+        let frozen = serde_json::from_value(config.frozen_render_config.clone()).ok()?;
+        broca_provider::cache_warm::requested_ttl_ms(&config.model.provider_module_id, &frozen)
+    }
+    fn last_sent_at_ms(&self) -> Option<u64> {
+        None
+    }
+    fn costs(&self, _: &broca_wal::RunConfig) -> Result<broca_core::keep_warm::WarmCosts, String> {
+        Err("not warming in this comparison".into())
+    }
+    async fn warm(
+        &self,
+        _: &broca_wal::RunConfig,
+        _: &RunId,
+    ) -> broca_core::keep_warm_wait::WarmTick {
+        broca_core::keep_warm_wait::WarmTick::Stop {
+            reason: "unsupported".into(),
+            detail: None,
+        }
+    }
+}
+
 /// The structured output the comparison running in this task freezes.
 fn structured() -> Option<Value> {
     STRUCTURED.try_with(Clone::clone).ok().flatten()
@@ -948,7 +1035,7 @@ impl Scenario {
             principal: None,
             run_id: RunId(run_id.into()),
             session: bind(),
-            model: ModelHandle::new("stub", run_model(run_id)),
+            model: ModelHandle::new(provider_id(), run_model(run_id)),
             input: input.to_vec(),
             tools: self.tools.clone(),
             policy_allowed: self.tools.iter().map(|t| t.name.clone()).collect(),
@@ -980,7 +1067,7 @@ impl Scenario {
     ) -> Admission {
         Admission {
             run_id: run_id.into(),
-            model: ModelHandle::new("stub", run_model(run_id)),
+            model: ModelHandle::new(provider_id(), run_model(run_id)),
             input: input.to_vec(),
             tools: self.tools.clone(),
             tool_choice: ToolChoice::Auto,
@@ -1070,6 +1157,9 @@ async fn today_from(
                 .clone()
                 .map(|spy| spy as Arc<dyn broca_core::CompactionPlane>),
             admitted_context_limit: frozen_context_limit(),
+            keep_warm: cache().then(|| {
+                Arc::new(CacheLifetime) as Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver>
+            }),
             ..Default::default()
         },
         &tx,
@@ -1294,7 +1384,7 @@ async fn new_from(
         ended: Default::default(),
         media: Default::default(),
     };
-    let now = || 0u64;
+    let now = harness_now;
     let cancel = CancellationToken::new();
     let seams = Seams {
         provider: &provider,
@@ -2107,7 +2197,7 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
         media: Default::default(),
     };
     let mut parts = MemoryParts::default();
-    let now = || 0u64;
+    let now = harness_now;
     let bind = bind();
     let seams = Seams {
         provider: &provider,
@@ -2657,7 +2747,7 @@ async fn compare_actions_in(
         media: Default::default(),
     };
     let mut parts = MemoryParts::default();
-    let now = || 0u64;
+    let now = harness_now;
     let bind = bind();
     let seams = Seams {
         provider: &provider,
@@ -2985,7 +3075,7 @@ async fn compare_auth_pause_in(scenario: Scenario) {
         media: Default::default(),
     };
     let mut parts = MemoryParts::default();
-    let now = || 0u64;
+    let now = harness_now;
     let bind = bind();
     let seams = Seams {
         provider: &provider,
@@ -4961,6 +5051,85 @@ async fn a_batch_ending_in_an_unknown_outcome_still_writes_its_firings() {
                     text_step("a2", "should not be reached"),
                 ],
             }),
+        )
+        .await;
+}
+
+/// One cache-reaching attempt sent at `sent_at_ms`.
+fn sent_at(sent_at_ms: u64) -> NormalizedEvent {
+    let mut event = attempt(1, 200, "complete");
+    if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) = &mut event {
+        attempt.sent_at_ms = Some(sent_at_ms);
+    }
+    event
+}
+
+fn cached_scenario(sent_at_ms: u64) -> Scenario {
+    compacted_scenario(vec![
+        attempted(
+            answer(
+                "a1",
+                vec![call("c1", "read", json!({"path": "a"}))],
+                FinishReason::ToolCalls,
+            ),
+            vec![sent_at(sent_at_ms)],
+        ),
+        text_step("a2", "done"),
+    ])
+}
+
+/// The first step's request reached the cache long ago, past the five minutes its markers ask
+/// for, so the next step rides claiming the cache expired, in both loops.
+#[tokio::test]
+async fn a_ride_claims_a_cache_expired_by_the_lifetime_its_requests_asked_for() {
+    assert_eq!(
+        broca_provider::cache_warm::requested_ttl_ms("anthropic", &cached_config()),
+        Some(300_000),
+        "the frozen config asks for a cache lifetime"
+    );
+    CACHE
+        .scope(
+            true,
+            compare_compacted(
+                cached_scenario(10),
+                CompactionScript {
+                    context_limit: 100_000,
+                    rides: Vec::new(),
+                },
+            ),
+        )
+        .await;
+}
+
+/// The same run with its cache written moments ago: nothing is claimed.
+#[tokio::test]
+async fn a_live_cache_is_not_claimed_expired() {
+    CACHE
+        .scope(
+            true,
+            compare_compacted(
+                cached_scenario(broca_core::clock::Clock::default().now_ms()),
+                CompactionScript {
+                    context_limit: 100_000,
+                    rides: Vec::new(),
+                },
+            ),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn every_cut_of_a_cache_expired_ride_resumes_alike() {
+    CACHE
+        .scope(
+            true,
+            compare_compacted_every_cut(
+                cached_scenario(10),
+                CompactionScript {
+                    context_limit: 100_000,
+                    rides: Vec::new(),
+                },
+            ),
         )
         .await;
 }

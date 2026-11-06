@@ -26,8 +26,8 @@ use broca_session_store::record::{
     CancelRequest, CeilingDecided, Compaction, Delivery, DeliveryOrdered, Event, Input, Marker,
     Notice, OutputCapLowered, PartKind, PartRef, Pause, Placement, QueuedSend, Record, Redo,
     ResultAppend, Resumed, Retraction, RunEnd, RunStart, SendEnded, SessionRefresh, SetupStub,
-    Steer, StepEnd, StepStart, Stream, StructuredDowngraded, StructuredResult, ToolHeld, ToolIntent, ToolOutcome,
-    ToolReply, View, ViewApplied,
+    Steer, StepEnd, StepStart, Stream, StructuredDowngraded, StructuredResult, ToolHeld,
+    ToolIntent, ToolOutcome, ToolReply, View, ViewApplied,
 };
 use broca_wal::{FramedRecord, WalRecord};
 use serde::de::DeserializeOwned;
@@ -90,6 +90,9 @@ fn err(message: impl Into<String>) -> ConvertError {
 /// only when they differ from the call's.
 #[derive(Default)]
 struct State {
+    /// The cache lifetime the requests sent now ask the provider for, from the run config in
+    /// force (the run's start, then any refreeze), as today's cache-expiry rule reads it.
+    requested_cache_ttl: Option<u64>,
     /// The log's lineage id, which today's call keys are made of.
     lineage: Option<String>,
     run_id: String,
@@ -166,9 +169,14 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
     let mut stop_when = Vec::new();
     // Session-scoped: the schedule carries from run to run under the same model.
     let mut schedule: Option<broca_wal::RefusalFallbackSchedule> = None;
+    // The provider serving the run in force, which decides what lifetime its requests ask for.
+    let mut provider_id = String::new();
     for framed in old {
         match &framed.record {
             WalRecord::RunStarted { config, ts_ms, .. } => {
+                provider_id = config.model.provider_module_id.clone();
+                state.requested_cache_ttl =
+                    requested_cache_ttl(&provider_id, &config.frozen_render_config);
                 budget = config.budget.clone();
                 stop_when = config.stop_when.clone();
                 state.budget_configured = budget.is_some();
@@ -185,6 +193,12 @@ pub fn convert(old: &[FramedRecord], lineage: Option<&str>) -> Result<Converted,
                 }
             }
             WalRecord::ModelStepRefused { schedule: next, .. } => schedule = Some(next.clone()),
+            WalRecord::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => {
+                state.requested_cache_ttl = requested_cache_ttl(&provider_id, frozen_render_config);
+            }
             WalRecord::BudgetFired { .. } => {
                 state.due_firing = budget
                     .as_ref()
@@ -1117,6 +1131,7 @@ fn model_attempt(f: &mut Fields, state: &mut State, out: &mut Converted) {
         billing: (!billing.is_empty()).then_some(Value::Object(billing)),
         telemetry: f.rest(),
         reached_cache: reached_cache.then_some(true),
+        requested_cache_ttl_ms: state.requested_cache_ttl.filter(|_| reached_cache),
     };
     out.records.push(Record::Attempt(attempt));
 }
@@ -1324,3 +1339,12 @@ fn send_delivered(
 
 #[cfg(test)]
 mod tests;
+
+/// The cache lifetime requests rendered from `frozen` ask `provider_id` for, when they ask for
+/// one it honours, as today's cache declaration reads it. `None` for a config that doesn't
+/// read as a frozen render config, as today's declaration then declares nothing.
+pub fn requested_cache_ttl(provider_id: &str, frozen: &Value) -> Option<u64> {
+    let frozen: broca_provider::wire::FrozenRenderConfig =
+        serde_json::from_value(frozen.clone()).ok()?;
+    broca_provider::cache_warm::requested_ttl_ms(provider_id, &frozen)
+}

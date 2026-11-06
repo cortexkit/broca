@@ -449,7 +449,12 @@ fn reduced_episodes_render_the_same_bytes_as_every_episode() {
                 }
             }
             let admitted = next(10) != 0;
-            rows.push(start("gpt-6.1-sol", effort, admitted, (next(5) != 0).then_some(Role::User)));
+            rows.push(start(
+                "gpt-6.1-sol",
+                effort,
+                admitted,
+                (next(5) != 0).then_some(Role::User),
+            ));
         }
         let prior = broca_core::replay::replay(&rows).unwrap();
         let frozen: FrozenRenderConfig =
@@ -465,8 +470,9 @@ fn reduced_episodes_render_the_same_bytes_as_every_episode() {
         let kept: Vec<Message> = prompt[first_kept..].to_vec();
         let mut whole = CallOptions::new(kept.clone());
         whole.render_episodes = Arc::new(history.clone());
-        let reduced_history =
-            broca_provider::families::openai_responses_chatgpt::reduce_episodes(&history, first_kept);
+        let reduced_history = broca_provider::families::openai_responses_chatgpt::reduce_episodes(
+            &history, first_kept,
+        );
         reduced_any += usize::from(reduced_history.episodes.len() < history.episodes.len());
         let mut reduced = CallOptions::new(kept);
         reduced.render_episodes = Arc::new(reduced_history);
@@ -477,5 +483,8 @@ fn reduced_episodes_render_the_same_bytes_as_every_episode() {
         );
     }
     // The generated sessions do drop runs, so the check isn't passing on unreduced lists alone.
-    assert!(reduced_any > 50, "only {reduced_any} sessions dropped a run");
+    assert!(
+        reduced_any > 50,
+        "only {reduced_any} sessions dropped a run"
+    );
 }
