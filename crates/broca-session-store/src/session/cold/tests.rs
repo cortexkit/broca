@@ -143,7 +143,7 @@ fn texts(messages: &[Message]) -> Vec<String> {
 }
 
 /// Two finished runs, the last record written at `at`.
-async fn finished<B: SessionBackend>(backend: &B, at: u64) -> Session<'_, B> {
+async fn finished<B: SessionBackend>(backend: &B, at: u64) -> Session<&B> {
     let mut session = Session::create(backend, addr(), triple(), &deployment(), false)
         .await
         .unwrap();

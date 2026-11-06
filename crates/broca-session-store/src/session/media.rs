@@ -87,7 +87,7 @@ fn matches(media: &MediaRef, bytes: &[u8]) -> bool {
     media.byte_size == bytes.len() as u64 && media.sha256 == hex(&Sha256::digest(bytes))
 }
 
-impl<'b, B: SessionBackend> Session<'b, B> {
+impl<B: SessionBackend> Session<B> {
     /// The name of the object `object` points at, for bytes whose digest is `sha256`. The digest
     /// is hashed with a key derived from the session key, so a name says nothing about the
     /// content outside the session, and the same bytes always get the same name.

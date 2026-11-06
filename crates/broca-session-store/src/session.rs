@@ -129,8 +129,8 @@ pub fn apply(
 
 /// A session open for writing. It holds the head version it last committed, which fences every
 /// write it makes.
-pub struct Session<'b, B: SessionBackend> {
-    backend: &'b B,
+pub struct Session<B: SessionBackend> {
+    backend: B,
     addr: SessionAddr,
     head: Head,
     version: Version,
@@ -147,12 +147,12 @@ pub struct Session<'b, B: SessionBackend> {
     window: OpenLogIndex,
 }
 
-impl<'b, B: SessionBackend> Session<'b, B> {
+impl<B: SessionBackend> Session<B> {
     /// Creates a session at `addr`. `appends_in_conversation` is the conversation fold's
     /// setting: `false` for sessions on the current compaction contract, which keep text
     /// delivered with a tool result apart from the result.
     pub async fn create(
-        backend: &'b B,
+        backend: B,
         addr: SessionAddr,
         triple: SessionTriple,
         deployment: &DeploymentKey,
@@ -206,7 +206,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     /// names it as the open log. Used by creation and by a load that finishes a crashed
     /// creation.
     async fn create_log(
-        backend: &'b B,
+        backend: B,
         addr: SessionAddr,
         mut head: Head,
         version: Version,
@@ -264,7 +264,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     /// Loads the session at `addr` and opens it for writing. `triple` must be the one it was
     /// created under.
     pub async fn load(
-        backend: &'b B,
+        backend: B,
         addr: SessionAddr,
         triple: &SessionTriple,
         deployment: &DeploymentKey,
@@ -525,8 +525,8 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     }
 
     /// The backend the session reads and writes through.
-    pub fn backend(&self) -> &'b B {
-        self.backend
+    pub fn backend(&self) -> &B {
+        &self.backend
     }
 
     pub fn head(&self) -> &Head {

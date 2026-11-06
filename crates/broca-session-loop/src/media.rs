@@ -105,7 +105,7 @@ impl PendingMedia {
     /// held for that call. Returns the seq of the first record.
     pub async fn append<B: SessionBackend>(
         &self,
-        session: &mut Session<'_, B>,
+        session: &mut Session<B>,
         records: &[Record],
         barrier: bool,
     ) -> Result<u64, SessionError> {

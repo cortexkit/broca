@@ -439,7 +439,7 @@ mod tests {
             .collect()
     }
 
-    async fn session(backend: &MemoryBackend) -> Session<'_, MemoryBackend> {
+    async fn session(backend: &MemoryBackend) -> Session<&MemoryBackend> {
         Session::create(
             backend,
             SessionAddr("0123456789abcdef".into()),
@@ -459,7 +459,7 @@ mod tests {
     /// actor's own records, the way a steer arrives while the run is waiting on its model or
     /// its tools.
     async fn actor(
-        session: &mut Session<'_, MemoryBackend>,
+        session: &mut Session<&MemoryBackend>,
         link: &mut RunLink,
         own: impl Fn(usize) -> Vec<Record>,
     ) {

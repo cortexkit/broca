@@ -354,7 +354,7 @@ async fn session_finds_ids() {
     }
     assert!(merged > 0, "no merge ran");
 
-    async fn check<B: SessionBackend>(session: &Session<'_, B>, runs: usize) {
+    async fn check<B: SessionBackend>(session: &Session<B>, runs: usize) {
         for n in 0..runs {
             let run = format!("run-{n}");
             let found = session.find_id(IdKind::RunId, &run).await.unwrap();

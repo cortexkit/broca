@@ -202,7 +202,7 @@ fn texts(messages: &[Message]) -> Vec<String> {
 /// A finished run, then a run whose call was dispatched (all synced). Then, unsynced: the call's
 /// result and outcome, and the next step's start. Returns the session and the offsets where the
 /// unsynced result batch starts and ends.
-async fn history<B: SessionBackend>(backend: &B) -> (Session<'_, B>, u64, u64) {
+async fn history<B: SessionBackend>(backend: &B) -> (Session<&B>, u64, u64) {
     let mut session = Session::create(backend, addr(), triple(), &deployment(), false)
         .await
         .unwrap();
@@ -260,7 +260,7 @@ fn recover(backend: &MemoryBackend, now: u64) -> Result<Recovery, SessionError> 
     ))
 }
 
-fn load(backend: &MemoryBackend) -> Result<Session<'_, MemoryBackend>, SessionError> {
+fn load(backend: &MemoryBackend) -> Result<Session<&MemoryBackend>, SessionError> {
     block_on(Session::load(backend, addr(), &triple(), &deployment()))
 }
 

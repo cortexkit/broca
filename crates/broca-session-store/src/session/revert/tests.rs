@@ -143,7 +143,7 @@ fn texts(messages: &[Message]) -> Vec<String> {
 /// end. Run `n` places messages `2n + 1` (input) and `2n + 2` (answer). Returns each message's
 /// id, and the seq of each input record, where a cut can fall.
 async fn runs<B: SessionBackend>(
-    session: &mut Session<'_, B>,
+    session: &mut Session<B>,
     from: usize,
     to: usize,
 ) -> (Vec<String>, Vec<u64>) {
@@ -214,7 +214,7 @@ fn a_revert_in_the_open_log_keeps_the_messages_before_it() {
             ["ask 0", "answer 0", "ask 1", "answer 1", "edited"]
         );
 
-        async fn check(session: &Session<'_, MemoryBackend>, mids: &[String], mid: &str) {
+        async fn check(session: &Session<&MemoryBackend>, mids: &[String], mid: &str) {
             assert_eq!(session.conversation.placed, 5);
             assert_eq!(session.head().history_version, 1);
             assert_eq!(session.operations.history_version, 1);
@@ -285,7 +285,7 @@ fn a_revert_into_sealed_history_cuts_the_directory_and_leaves_no_window() {
         assert_eq!(texts(&session.conversation.messages), ["edited"]);
         assert_eq!(session.conversation.window_start(), 3);
 
-        async fn check(session: &Session<'_, MemoryBackend>, mids: &[String], mid: &str) {
+        async fn check(session: &Session<&MemoryBackend>, mids: &[String], mid: &str) {
             let entries = session.entries(1, usize::MAX).await.unwrap();
             let read: Vec<String> = entries
                 .iter()
@@ -337,7 +337,7 @@ fn a_revert_refuses_open_work_and_wrong_targets() {
             Err(SessionError::RevertRefused(refusal)) => refusal,
             other => panic!("{other:?}"),
         };
-        let unchanged = |session: &Session<'_, MemoryBackend>| {
+        let unchanged = |session: &Session<&MemoryBackend>| {
             (session.conversation.encode(), session.operations.encode())
         };
         let before = unchanged(&session);

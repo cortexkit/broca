@@ -47,7 +47,7 @@ fn event(name: &str) -> Record {
 }
 
 /// The state a session holds, as bytes, so two sessions can be compared.
-fn state<B: SessionBackend>(session: &Session<'_, B>) -> (Vec<u8>, Vec<u8>) {
+fn state<B: SessionBackend>(session: &Session<B>) -> (Vec<u8>, Vec<u8>) {
     (session.conversation.encode(), session.operations.encode())
 }
 

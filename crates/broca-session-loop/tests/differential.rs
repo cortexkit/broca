@@ -710,7 +710,7 @@ async fn photo(ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
 /// Every media part in the window reads back from the session as the bytes it names. Only the
 /// `photo` tool returns media. (A resumed run's earlier records come from a converted log, whose
 /// media the converter doesn't copy yet, so this runs on whole runs only.)
-async fn media_reads_back(session: &Session<'_, MemoryBackend>) {
+async fn media_reads_back(session: &Session<&MemoryBackend>) {
     for message in &session.conversation.messages {
         for block in &message.content {
             let ContentBlock::ToolResult(result) = block else {
@@ -1619,9 +1619,10 @@ impl Scenario {
         self.admission_for(provider, "r1", &self.input)
     }
 
-    /// The new loop's admission of a run of `input`, derived from the same request and run
-    /// control today's loop is given, by the rules both loops share. `ts_ms` and
-    /// `written_at_ms` are wall-clock times the comparison normalizes.
+    /// The new loop's admission of a run of `input`, derived by `admit::admission` from the
+    /// same request ([`Scenario::request_for`]) and run control fields ([`admission_control`])
+    /// that `broca_core::run`'s runs in this file are given. `ts_ms` and `written_at_ms` are
+    /// wall-clock times the comparison normalizes.
     fn admission_for(
         &self,
         provider: &ScriptedProvider,
@@ -1640,8 +1641,8 @@ impl Scenario {
     }
 }
 
-/// The run control fields that decide a new run's admission. Each of today's runs is given them,
-/// and the new loop's admission is derived from the same values.
+/// The run control fields that decide a new run's admission. Every run of `broca_core::run` in
+/// this file is given them, and the new loop's admission is derived from the same values.
 fn admission_control(scenario: &Scenario) -> RunControl {
     RunControl {
         auth_selection: account_selection(),
@@ -1774,7 +1775,7 @@ async fn today_from(
 
 /// A session writer that also keeps every record it appended, for comparison.
 struct Recording<'s, 'b> {
-    session: &'s mut Session<'b, MemoryBackend>,
+    session: &'s mut Session<&'b MemoryBackend>,
     records: Vec<Record>,
     /// Records another appender (the session actor, in production) added while the loop was
     /// waiting on a seam. They're appended, durably, before the loop's next batch.
@@ -2099,7 +2100,7 @@ fn rename_ids(value: &mut Value, names: &mut std::collections::HashMap<String, u
 /// no longer starts at the first message, and a fresh load of the session holds exactly the
 /// state the writer holds and rebuilds both compaction view slots from the new open log alone.
 async fn sealed_at_the_cut(
-    session: &Session<'_, MemoryBackend>,
+    session: &Session<&MemoryBackend>,
     triple: &SessionTriple,
     bind: &broca_protocol::BindIdentity,
 ) {
@@ -2113,7 +2114,7 @@ async fn sealed_at_the_cut(
 /// A fresh load of a sealed session holds exactly the state the writer holds, and rebuilds both
 /// compaction view slots from the new open log alone.
 async fn reloads_with_its_views(
-    session: &Session<'_, MemoryBackend>,
+    session: &Session<&MemoryBackend>,
     triple: &SessionTriple,
     bind: &broca_protocol::BindIdentity,
 ) {
@@ -2167,7 +2168,7 @@ fn as_rendered(opts: &CallOptions) -> CallOptions {
 /// Every call the new loop sent carried a key that finds, through the session's own id lookup,
 /// exactly one intent, that call's. A key the new loop minted names the intent's position:
 /// `<session id>:<seq>`.
-async fn keys_match(session: &Session<'_, MemoryBackend>, plane: &Spy) {
+async fn keys_match(session: &Session<&MemoryBackend>, plane: &Spy) {
     let id = broca_session_store::codec::hex(&session.head().session_id.0);
     for (call, key) in plane.keys() {
         let found = session

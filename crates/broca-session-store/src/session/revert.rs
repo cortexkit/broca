@@ -141,7 +141,7 @@ fn check_resend(resend: &[Record]) -> Result<String, SessionError> {
         .ok_or_else(|| bad("the run start has a send id"))
 }
 
-impl<'b, B: SessionBackend> Session<'b, B> {
+impl<B: SessionBackend> Session<B> {
     /// Ends the branch before the message `target` names, and starts the run `resend` describes
     /// there: its run start (with a send id), its input, and the input's entry facts, whose
     /// ordinal and id the revert fills in.
@@ -255,7 +255,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     async fn locate_sealed(&self, ordinal: u64) -> Result<Option<Located>, SessionError> {
         let key = self.key.frame_key();
         let pages = Pages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,
@@ -341,7 +341,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         // The transcript: cut the directory at the message if it's sealed; otherwise keep the
         // open log's records before it.
         let pages = Pages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,
@@ -368,7 +368,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             let mut refs = gone.segments;
             refs.extend(gone.pages);
             IndexPages {
-                backend: self.backend,
+                backend: &self.backend,
                 addr: &self.addr,
                 session: self.head.session_id,
                 key: &key,

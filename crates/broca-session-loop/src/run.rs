@@ -207,8 +207,9 @@ pub enum LoopError {
     /// The tool plane refused something the run can't go on without, such as registering a
     /// batch's call keys for late results.
     Tools(String),
-    /// A rule today's loop shares with this one refused the run before anything was written:
-    /// for example system text other than the session's, or a plan whose hooks can't run.
+    /// A rule in `broca_core::fresh_start`, which the run loop on today's storage calls too,
+    /// refused the run before anything was written: for example system text other than the
+    /// session's, or a plan whose hooks can't run.
     Refused(broca_core::RunError),
 }
 
@@ -265,8 +266,8 @@ where
 }
 
 /// Takes the system messages out of a run's input and decides the system text its requests
-/// render, by the rule today's loop calls for a session on the current compaction contract
-/// (`broca_core::fresh_start::new_episode_globals`), given the previous run's text.
+/// render, for a session on the current compaction contract, by
+/// `broca_core::fresh_start::new_episode_globals`, given the previous run's text.
 fn global_system<W: Writer>(
     writer: &W,
     parts: &dyn Parts,

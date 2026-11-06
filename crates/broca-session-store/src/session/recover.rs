@@ -142,11 +142,11 @@ fn digest(bytes: &[u8]) -> Digest {
     Digest(Sha256::digest(bytes).into())
 }
 
-impl<'b, B: SessionBackend> Session<'b, B> {
+impl<B: SessionBackend> Session<B> {
     /// Repairs the session at `addr` if its open log holds debris, or finishes a recovery a
     /// crash interrupted. Afterwards, load the session as usual.
     pub async fn recover(
-        backend: &'b B,
+        backend: B,
         addr: SessionAddr,
         triple: &SessionTriple,
         deployment: &DeploymentKey,
@@ -198,7 +198,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         let (debris, body) = match debris.checkpoint.clone() {
             Some(body) => (debris, body),
             None => {
-                let body = rebuild_checkpoint(backend, &addr, &head, &key, &open.change).await?;
+                let body = rebuild_checkpoint(&backend, &addr, &head, &key, &open.change).await?;
                 // Analyse again from the rebuilt checkpoint's chain bases, so a damaged
                 // checkpoint alone reads as losing nothing.
                 let base = chain_base(&body).map_err(SessionError::Fold)?;
@@ -515,7 +515,8 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             let ledger_sealed = session
                 .seal_ledger(&name, &ledger, &settled, &checkpoint_body, now_ms)
                 .await?;
-            backend
+            session
+                .backend()
                 .put_object(&addr, &saved, &bytes[first_damage as usize..], version)
                 .await?;
 
@@ -530,7 +531,10 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                     ledger: Some(intent_seq),
                 },
             );
-            backend.create_log(&addr, &change, version).await?;
+            session
+                .backend()
+                .create_log(&addr, &change, version)
+                .await?;
             let mut out = encoder
                 .checkpoint(&checkpoint_body)?
                 .into_written(&mut encoder);
@@ -573,11 +577,15 @@ impl<'b, B: SessionBackend> Session<'b, B> {
                 }
             }
             out.extend(encoder.batch(&batch)?.into_written(&mut encoder));
-            backend
+            session
+                .backend()
                 .append_log(&addr, &change, &out, 0, version, true)
                 .await?;
             encoder.synced();
-            backend.sync_objects(&addr, &change, version).await?;
+            session
+                .backend()
+                .sync_objects(&addr, &change, version)
+                .await?;
             Ok::<_, SessionError>(Created {
                 sealed: Sealed {
                     change,

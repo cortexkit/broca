@@ -93,7 +93,7 @@ pub fn window_entries(conversation: &Conversation, from: u64, limit: usize) -> V
         .collect()
 }
 
-impl<B: SessionBackend> Session<'_, B> {
+impl<B: SessionBackend> Session<B> {
     /// Up to `limit` entries from ordinal `from` on (counting from 1), in order, over the whole
     /// conversation: sealed history a block at a time, then the window, then the held assistant
     /// message, if any.
@@ -102,7 +102,7 @@ impl<B: SessionBackend> Session<'_, B> {
         let mut next = from.max(1);
         let key = self.key.frame_key();
         let pages = Pages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,
@@ -213,7 +213,7 @@ impl<B: SessionBackend> Session<'_, B> {
         }
         let key = self.key.frame_key();
         let pages = Pages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,
@@ -251,7 +251,7 @@ impl<B: SessionBackend> Session<'_, B> {
         }
         let key = self.key.frame_key();
         let pages = Pages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,
@@ -307,7 +307,7 @@ impl<B: SessionBackend> Session<'_, B> {
         if let Some(root_name) = &self.head.id_index {
             let key = self.key.frame_key();
             let index = IndexPages {
-                backend: self.backend,
+                backend: &self.backend,
                 addr: &self.addr,
                 session: self.head.session_id,
                 key: &key,
@@ -335,7 +335,7 @@ impl<B: SessionBackend> Session<'_, B> {
     async fn ledger_records(&self, seqs: &[u64]) -> Result<Vec<(u64, Record)>, SessionError> {
         let key = self.key.frame_key();
         let pages = Pages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,

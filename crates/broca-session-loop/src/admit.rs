@@ -1,6 +1,7 @@
-//! A new run's admission, decided from its send's request and run control by the rules today's
-//! loop calls at the same point (`broca_core::fresh_start`), so a new run starts alike on either
-//! storage. Nothing here is written: a refusal leaves the session as it was.
+//! A new run's admission, decided from its send's request and run control by the rules in
+//! `broca_core::fresh_start`. The run loop on today's storage (`broca_core::run`) calls the same
+//! rules at the same point, so a new run starts alike on either storage. Nothing here is written:
+//! a refusal leaves the session as it was.
 
 use std::sync::Arc;
 
@@ -21,10 +22,11 @@ pub fn session_contract(operations: &Operations, first_run_version: Option<u32>)
 }
 
 /// The admission of a new run of `req` on a session whose operational fold is `operations`.
-/// The request's model, tools and input move out of `req`. Refuses what today's loop refuses
-/// before it writes a new run's start, in the same order: a plan whose hooks can't run, then the
-/// request's own settings, then a run on the current compaction contract whose plan names a
-/// compaction provider but which has no context limit. `now_ms` is when the run is admitted.
+/// The request's model, tools and input move out of `req`. Refuses, before anything is written,
+/// what `broca_core::run` refuses before it writes a new run's start, in the same order: a plan
+/// whose hooks can't run, then the request's own settings, then a run on the current compaction
+/// contract whose plan names a compaction provider but which has no context limit. `now_ms` is
+/// when the run is admitted.
 pub fn admission<P: Provider>(
     req: &mut RunRequest,
     control: &RunControl,

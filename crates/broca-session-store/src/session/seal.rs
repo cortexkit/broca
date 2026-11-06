@@ -124,7 +124,7 @@ pub struct Carry<'a> {
     pub window_repetition: Option<serde_json::Value>,
 }
 
-impl<'b, B: SessionBackend> Session<'b, B> {
+impl<B: SessionBackend> Session<B> {
     /// Seals the open log. With `cut`, the seq of the first record a compaction view keeps,
     /// the transcript records before it are sealed too; it must start an entry (a user input or
     /// an assistant message) with no assistant message waiting for replies before it.
@@ -375,7 +375,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         settled.open_change = None;
 
         let pages = Pages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,
@@ -556,7 +556,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
     ) -> Result<LedgerSealed, SessionError> {
         let key = self.key.frame_key();
         let pages = Pages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,
@@ -594,7 +594,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
             .map_err(SessionError::Directory)?;
         replaced.extend(appended.replaced);
         let index = IndexPages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,
@@ -747,7 +747,7 @@ impl<'b, B: SessionBackend> Session<'b, B> {
         }
         let key = self.key.frame_key();
         let index = IndexPages {
-            backend: self.backend,
+            backend: &self.backend,
             addr: &self.addr,
             session: self.head.session_id,
             key: &key,

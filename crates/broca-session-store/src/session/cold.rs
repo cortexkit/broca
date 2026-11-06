@@ -35,7 +35,7 @@ pub enum Cold {
     Unknown,
 }
 
-impl<'b, B: SessionBackend> Session<'b, B> {
+impl<B: SessionBackend> Session<B> {
     /// Runs the cold step if the session has had no activity for `idle_ms`. It seals the ledger,
     /// so a session with compaction views passes copies of them in `carry` (see
     /// [`Carry::records`]).

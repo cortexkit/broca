@@ -224,7 +224,7 @@ fn message_ids_resolve_in_the_window_and_sealed_history() {
         }
         assert!(minted[0].0.starts_with('g'));
 
-        async fn check(session: &Session<'_, MemoryBackend>, minted: &[(String, u64)]) {
+        async fn check(session: &Session<&MemoryBackend>, minted: &[(String, u64)]) {
             for ordinal in (1..=40).filter(|ordinal| ordinal % 4 != 3) {
                 let mid = format!("mfeedface.{}", ordinal - 1);
                 assert_eq!(

@@ -99,7 +99,7 @@ pub trait Writer {
 }
 
 #[async_trait(?Send)]
-impl<B: SessionBackend> Writer for Session<'_, B> {
+impl<B: SessionBackend> Writer for Session<B> {
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         Session::append(self, records, barrier).await
     }

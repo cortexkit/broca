@@ -126,13 +126,13 @@ fn texts(messages: &[Message]) -> Vec<String> {
         .collect()
 }
 
-fn state<B: SessionBackend>(session: &Session<'_, B>) -> (Vec<u8>, Vec<u8>) {
+fn state<B: SessionBackend>(session: &Session<B>) -> (Vec<u8>, Vec<u8>) {
     (session.conversation.encode(), session.operations.encode())
 }
 
 /// Two finished runs, then a third still running. Returns the session and the seq of the third
 /// run's input, where a cut can fall.
-async fn history<B: SessionBackend>(backend: &B) -> (Session<'_, B>, u64) {
+async fn history<B: SessionBackend>(backend: &B) -> (Session<&B>, u64) {
     let mut session = Session::create(backend, addr(), triple(), &deployment(), false)
         .await
         .unwrap();

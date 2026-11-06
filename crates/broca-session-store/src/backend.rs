@@ -151,6 +151,119 @@ pub trait SessionBackend {
     async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError>;
 }
 
+/// A borrowed backend is a backend, so a session can borrow one for a short task (a test, a
+/// converter pass) or own a handle for its whole life (a session actor).
+impl<T: SessionBackend + ?Sized> SessionBackend for &T {
+    async fn read_head(&self, s: &SessionAddr) -> Result<Option<(Vec<u8>, Version)>, BackendError> {
+        (**self).read_head(s).await
+    }
+    async fn write_head(
+        &self,
+        s: &SessionAddr,
+        head: &[u8],
+        expected: Option<Version>,
+        next: Version,
+    ) -> Result<Version, BackendError> {
+        (**self).write_head(s, head, expected, next).await
+    }
+    async fn create_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).create_log(s, log, at).await
+    }
+    async fn read_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        range: Range<u64>,
+    ) -> Result<Vec<u8>, BackendError> {
+        (**self).read_log(s, log, range).await
+    }
+    async fn log_end(&self, s: &SessionAddr, log: &Id128) -> Result<u64, BackendError> {
+        (**self).log_end(s, log).await
+    }
+    async fn append_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        bytes: &[u8],
+        expected_end: u64,
+        at: Version,
+        barrier: bool,
+    ) -> Result<u64, BackendError> {
+        (**self)
+            .append_log(s, log, bytes, expected_end, at, barrier)
+            .await
+    }
+    async fn truncate_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        to: u64,
+        expected_end: u64,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).truncate_log(s, log, to, expected_end, at).await
+    }
+    async fn delete_log(
+        &self,
+        s: &SessionAddr,
+        log: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).delete_log(s, log, at).await
+    }
+    async fn put_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        bytes: &[u8],
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).put_object(s, name, bytes, at).await
+    }
+    async fn sync_objects(
+        &self,
+        s: &SessionAddr,
+        change: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).sync_objects(s, change, at).await
+    }
+    async fn get_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, BackendError> {
+        (**self).get_object(s, name).await
+    }
+    async fn delete_object(
+        &self,
+        s: &SessionAddr,
+        name: &str,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).delete_object(s, name, at).await
+    }
+    async fn delete_change(
+        &self,
+        s: &SessionAddr,
+        change: &Id128,
+        at: Version,
+    ) -> Result<(), BackendError> {
+        (**self).delete_change(s, change, at).await
+    }
+    async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError> {
+        (**self).put_setup(name, bytes).await
+    }
+    async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        (**self).get_setup(name).await
+    }
+}
+
 /// The change id an object's name starts with.
 pub fn object_change(name: &str) -> &str {
     name.split('/').next().unwrap_or_default()

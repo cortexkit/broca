@@ -183,7 +183,7 @@ fn media_objects(backend: &MemoryBackend) -> Vec<String> {
 /// One run that calls the photo tool once and gets `images`, then answers. Its input is
 /// message `ordinal`. Returns the input's id and the result record as it was appended.
 async fn photo_run<B: SessionBackend>(
-    session: &mut Session<'_, B>,
+    session: &mut Session<B>,
     run: &str,
     ordinal: u64,
     images: &[&[u8]],
