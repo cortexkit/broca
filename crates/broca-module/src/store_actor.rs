@@ -18,8 +18,9 @@
 //! - a run paused for sign-in, resumed by a retry of its own send;
 //! - the session's status;
 //! - cancelling the active run, now or at its next step boundary;
-//! - on opening the session, its unfinished run: one a crashed process left running is ended
-//!   `Interrupted`, any other running run continues, and with no unfinished run the queue drains;
+//! - on opening the session, its unfinished run: a running one is ended `Interrupted`, since
+//!   only a process that ended without stopping it leaves one, and with no unfinished run the
+//!   queue drains;
 //! - going away when idle.
 //!
 //! Every other command, and every send that needs an admission rule not built here yet, is
@@ -62,9 +63,6 @@ pub struct StoreActor<B: SessionBackend> {
     /// run holds its own handle.
     parts: SharedParts,
     run: Option<ActiveRun>,
-    /// Runs the module's startup pass found a crashed process left running, which opening the
-    /// session ends instead of continuing.
-    crash_orphans: std::collections::HashSet<RunId>,
 }
 
 /// The run the session is running.
@@ -141,16 +139,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             executor,
             parts: SharedParts::new(parts),
             run: None,
-            crash_orphans: Default::default(),
         }
-    }
-
-    /// Marks `runs` as runs a crashed process left running: if the session's unfinished run is
-    /// one of them when the actor opens it, it is ended `Interrupted`, as today's actor ends a
-    /// run its registry's startup pass marked.
-    pub fn with_crash_orphans(mut self, runs: std::collections::HashSet<RunId>) -> Self {
-        self.crash_orphans = runs;
-        self
     }
 
     /// Serves `commands` until the session goes away: when the channel closes, or when it is
@@ -529,11 +518,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Recovers the session's unfinished work on opening it, before any command, as today's
     /// actor does on open for the cases this storage serves:
-    /// - a running run that the module's startup pass found a crashed process left behind, or
-    ///   that a queued interrupt asked to stop, is ended `Interrupted` without calling the model,
-    ///   unless a cancel is pending, which its resume carries out instead;
-    /// - any other unfinished run that isn't paused continues, which for a run whose last step
-    ///   ended it naturally writes only its lost end;
+    /// - a running run is ended `Interrupted` without calling the model, as today's startup
+    ///   pass seals a run a crashed process left running (`runner_crash`). The actor owns the
+    ///   session while a run runs, and a graceful stop seals or pauses it, so only a process
+    ///   that ended without doing either leaves one; today needs its run index to tell such a
+    ///   run from one still running elsewhere, and this storage needs nothing;
+    /// - a running run with a cancel pending resumes instead, so the cancel ends it, as today;
+    /// - a run whose last step ended it naturally, with only its end lost, resumes, which
+    ///   writes just that end;
     /// - with no unfinished run, the first queued send drains.
     ///
     /// A paused run stays paused: a sign-in pause waits for its retry. Resuming after a
@@ -546,15 +538,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return self.drain().await;
         };
         let mode = match run.resolution() {
-            Resolution::Resume | Resolution::Interrupted(_) => {
-                let orphaned = self.crash_orphans.contains(&RunId(run.run_id.clone()))
-                    || operations.queue.first().is_some_and(|send| send.interrupt);
-                if orphaned && run.cancel.is_none() {
-                    StoreRunMode::Seal(broca_core::resume::SealCause::CrashOrphan)
-                } else {
-                    StoreRunMode::Resume
-                }
-            }
+            Resolution::Resume | Resolution::Interrupted(_) => match run.cancel {
+                None => StoreRunMode::Seal(broca_core::resume::SealCause::CrashOrphan),
+                Some(_) => StoreRunMode::Resume,
+            },
             Resolution::Idle(_) => StoreRunMode::Resume,
             Resolution::ProviderHeld(_) | Resolution::Paused(_) => {
                 if !matches!(run.paused, Some(broca_protocol::PauseReason::AuthRequired)) {

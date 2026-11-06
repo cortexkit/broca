@@ -251,12 +251,11 @@ fn deployment() -> DeploymentKey {
 }
 
 /// A store actor over the session `backend` already holds, loaded as a module opening it after
-/// a restart loads it, with `crash_orphans` marked by the startup pass.
+/// a restart loads it.
 async fn reopen(
     backend: &'static MemoryBackend,
     executor: Arc<LoopExecutor>,
     parts: &SharedParts,
-    crash_orphans: &[&str],
 ) -> (
     mpsc::UnboundedSender<LineageCmd>,
     tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
@@ -264,13 +263,7 @@ async fn reopen(
     let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
         .await
         .unwrap();
-    let actor = StoreActor::new(bind(), session, executor, Box::new(parts.clone()))
-        .with_crash_orphans(
-            crash_orphans
-                .iter()
-                .map(|run| RunId((*run).into()))
-                .collect(),
-        );
+    let actor = StoreActor::new(bind(), session, executor, Box::new(parts.clone()));
     let (commands, receiver) = mpsc::unbounded_channel();
     (commands, tokio::spawn(actor.serve(receiver)))
 }
@@ -1144,14 +1137,14 @@ async fn appended_after_reopen(session: &Session<&'static MemoryBackend>) -> Vec
         .collect()
 }
 
-/// A run the startup pass marked as left running by a crashed process is ended `Interrupted`
-/// when the session opens, as today's actor seals it: no model call, the crash named on the
-/// run's end. The send queued behind it then runs.
+/// A run a crashed process left running is ended `Interrupted` when the session opens, as
+/// today's startup pass seals it: no model call, the crash named on the run's end. The send
+/// queued behind it then runs.
 #[tokio::test]
 async fn a_crashed_run_ends_interrupted_on_open_and_the_queue_drains() {
     let (backend, parts) = crashed_with_a_queued_send().await;
     let executor = Arc::new(executor(vec![text_step("a2", "again")], None));
-    let (commands, served) = reopen(backend, Arc::clone(&executor), &parts, &["r1"]).await;
+    let (commands, served) = reopen(backend, Arc::clone(&executor), &parts).await;
     idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
@@ -1177,16 +1170,39 @@ async fn a_crashed_run_ends_interrupted_on_open_and_the_queue_drains() {
     assert_eq!(texts(&session), ["first", "second", "again"]);
 }
 
-/// A run left running that the startup pass didn't mark continues when the session opens, and
-/// the send queued behind it runs after it.
+/// A run left running with a boundary cancel pending resumes when the session opens, so the
+/// cancel ends it at its next boundary, as today's recovery carries out a pending cancel. The
+/// send queued behind it then runs.
 #[tokio::test]
-async fn an_unmarked_running_run_continues_on_open() {
-    let (backend, parts) = crashed_with_a_queued_send().await;
+async fn a_running_run_with_a_cancel_pending_resumes_to_its_cancel_on_open() {
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let never = Arc::new(Notify::new());
+    let (commands, served, backend) =
+        actor_with(executor(Vec::new(), Some(never)), parts.clone()).await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(LineageCmd::Cancel {
+            run_id: RunId("r1".into()),
+            at: broca_wal::record::RunCancelAt::StepBoundary,
+            reply,
+        })
+        .unwrap();
+    assert_eq!(answer.await.unwrap(), CancelOutcome::Ack);
+    assert!(matches!(
+        send(&commands, "r2", "second").await,
+        SendOutcome::Pending { .. }
+    ));
+    served.abort();
+    let _ = served.await;
     let executor = Arc::new(executor(
-        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        vec![read_step("a1"), text_step("a2", "again")],
         None,
     ));
-    let (commands, served) = reopen(backend, executor, &parts, &[]).await;
+    let (commands, served) = reopen(backend, executor, &parts).await;
     idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
@@ -1201,11 +1217,10 @@ async fn an_unmarked_running_run_continues_on_open() {
     assert_eq!(
         ends,
         [
-            ("r1".to_owned(), broca_protocol::RunFinishReason::Completed),
+            ("r1".to_owned(), broca_protocol::RunFinishReason::Cancelled),
             ("r2".to_owned(), broca_protocol::RunFinishReason::Completed),
         ]
     );
-    assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
 }
 
 /// A run paused for sign-in stays paused when the session opens: nothing is written for it,
@@ -1223,7 +1238,7 @@ async fn a_sign_in_pause_stays_paused_on_open() {
     drop(commands);
     drop(served.await.unwrap());
     let executor = Arc::new(executor(vec![text_step("a1", "hello")], None));
-    let (commands, served) = reopen(backend, Arc::clone(&executor), &parts, &["r-k1"]).await;
+    let (commands, served) = reopen(backend, Arc::clone(&executor), &parts).await;
     assert_eq!(
         send(&commands, "r2", "second").await,
         SendOutcome::RunPaused {
@@ -1270,7 +1285,7 @@ async fn a_send_left_queued_behind_an_ended_run_drains_on_open() {
     served.abort();
     let _ = served.await;
     let executor = Arc::new(executor(vec![text_step("a2", "again")], None));
-    let (commands, served) = reopen(backend, executor, &parts, &[]).await;
+    let (commands, served) = reopen(backend, executor, &parts).await;
     idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
