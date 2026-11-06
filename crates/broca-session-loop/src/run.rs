@@ -1501,6 +1501,13 @@ where
             Some(runtime) => post_assistant(runtime, step_id, &mut step.message).await,
             None => None,
         };
+        // A cut call on a budget's finalize step or in a structured run takes paths of today's
+        // loop the new one hasn't built; refused by name rather than run without them.
+        if !step.cuts.is_empty() && (finalizing || structured.is_some()) {
+            return Err(LoopError::Unsupported(
+                "a cut tool call on a finalize step or in a structured-output run",
+            ));
+        }
         // The finalize step's answer is the run's last: calls the model made anyway are dropped
         // before anything records or decides on the answer, and it ends as a stop.
         if finalizing {
@@ -1520,6 +1527,44 @@ where
         // The step's whole usage, over every model that ran when the provider handed the
         // request on itself, as today's loop records it on both the message and the step.
         let whole = step.served.total(step.usage);
+        // A call whose arguments the provider cut is answered with today's error in the step's
+        // own batch, before anything is sent; the batch then runs the other calls.
+        let batch_id = format!("{}-b{step_id}", admission.run_id);
+        let mut cut = Vec::new();
+        if !step.cuts.is_empty() {
+            if stop.is_some() || seams.stop.is_cancelled() || seams.cancel.is_cancelled() {
+                return Err(LoopError::Unsupported(
+                    "a cut tool call on a step that meets a stop condition, a stop or a cancel",
+                ));
+            }
+            cut.push(Record::BatchStart(BatchStart {
+                run_id: admission.run_id.clone(),
+                batch_id: batch_id.clone(),
+                step_id,
+                planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+            }));
+            for garbage in &step.cuts {
+                terminal_with_reason(
+                    &mut cut,
+                    &admission.run_id,
+                    &batch_id,
+                    error_result(&garbage.tool_call_id, &garbage.error_text()),
+                    CallOutcome::Completed,
+                    Some("tool_args_trailing_garbage".into()),
+                    Some(now),
+                );
+            }
+        }
+        let uncut: Vec<ToolCall> = calls
+            .iter()
+            .filter(|call| {
+                !step
+                    .cuts
+                    .iter()
+                    .any(|garbage| garbage.tool_call_id == call.tool_call_id)
+            })
+            .cloned()
+            .collect();
         writer
             .append(
                 &[
@@ -1553,7 +1598,10 @@ where
                         stop_met: stop.is_some().then_some(true),
                         limiting_stop_met: limiting.then_some(true),
                     }),
-                ],
+                ]
+                .into_iter()
+                .chain(cut)
+                .collect::<Vec<_>>(),
                 calls.is_empty(),
             )
             .await?;
@@ -1642,11 +1690,11 @@ where
             &admission.run_id,
             step_id,
             &calls,
-            &calls,
+            &uncut,
             &[],
             &manifest,
             hooks.as_ref(),
-            false,
+            !step.cuts.is_empty(),
             warming.as_ref(),
         )
         .await?
@@ -2079,6 +2127,9 @@ struct Step {
     finish_reason: FinishReason,
     retries_used: u32,
     served: Served,
+    /// Calls whose arguments the provider cut: complete JSON followed by runaway whitespace.
+    /// They are answered with an error and never sent.
+    cuts: Vec<broca_protocol::provider::ToolArgsTrailingGarbage>,
 }
 
 /// What the provider said about how it served a step, from its `StepFinished`, recorded exactly
@@ -2191,6 +2242,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     // step reported none, as today's loop takes them.
     let mut step_usage = Usage::default();
     let mut served = Served::default();
+    let mut cuts = Vec::new();
     loop {
         let event = tokio::select! {
             event = events.recv() => event,
@@ -2204,6 +2256,9 @@ async fn model_step<W: Writer, P: Provider, T>(
             }
             Some(NormalizedEvent::Control(ProviderControl::AssistantMessage { message: m })) => {
                 message = Some(m);
+            }
+            Some(NormalizedEvent::Control(ProviderControl::ToolArgsTrailingGarbage { cut })) => {
+                cuts.push(cut);
             }
             Some(NormalizedEvent::Control(ProviderControl::StepFinished {
                 usage,
@@ -2246,6 +2301,7 @@ async fn model_step<W: Writer, P: Provider, T>(
                     finish_reason,
                     retries_used,
                     served,
+                    cuts,
                 }));
             }
             Some(NormalizedEvent::Control(ProviderControl::Error {

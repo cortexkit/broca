@@ -6114,3 +6114,73 @@ async fn a_step_another_model_served_records_it_and_its_whole_usage() {
     })
     .await;
 }
+
+/// `step` with the provider reporting that it cut call `id`'s arguments: complete JSON followed
+/// by runaway whitespace.
+fn cut_call(mut step: Vec<NormalizedEvent>, id: &str, name: &str) -> Vec<NormalizedEvent> {
+    let terminal = step.pop().expect("a step ends with its terminal");
+    step.push(NormalizedEvent::Control(
+        ProviderControl::ToolArgsTrailingGarbage {
+            cut: broca_protocol::provider::ToolArgsTrailingGarbage {
+                tool_call_id: ToolCallId(id.into()),
+                tool_name: name.into(),
+                json_bytes: 18,
+                whitespace_bytes: 4096,
+                omitted_tool_calls: 0,
+            },
+        },
+    ));
+    step.push(terminal);
+    step
+}
+
+fn cut_scenario(calls: Vec<ContentBlock>, cut: &[&str]) -> Scenario {
+    let mut first = answer("a1", calls, FinishReason::ToolCalls);
+    for id in cut {
+        first = cut_call(first, id, "read");
+    }
+    Scenario {
+        input: vec![user("read a and b")],
+        tools: vec![tool("read", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![first, text_step("a2", "done")],
+    }
+}
+
+/// A call whose arguments the provider cut is answered with today's error and never sent; the
+/// step's other calls run, in both loops.
+#[tokio::test]
+async fn a_cut_tool_call_is_answered_and_the_others_run() {
+    compare(cut_scenario(
+        vec![
+            call("c1", "read", json!({"path": "a"})),
+            call("c2", "read", json!({"path": "b"})),
+        ],
+        &["c2"],
+    ))
+    .await;
+}
+
+/// With every call cut, nothing is sent and the run goes on to its next step.
+#[tokio::test]
+async fn a_step_whose_every_call_was_cut_sends_nothing() {
+    compare(cut_scenario(
+        vec![call("c1", "read", json!({"path": "a"}))],
+        &["c1"],
+    ))
+    .await;
+}
+
+/// Resumed at every cut, both loops answer the cut call once and never send it.
+#[tokio::test]
+async fn every_cut_of_a_step_with_a_cut_call_resumes_alike() {
+    compare_every_cut(cut_scenario(
+        vec![
+            call("c1", "read", json!({"path": "a"})),
+            call("c2", "read", json!({"path": "b"})),
+        ],
+        &["c2"],
+    ))
+    .await;
+}
