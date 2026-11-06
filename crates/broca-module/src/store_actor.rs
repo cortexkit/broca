@@ -14,6 +14,7 @@
 //! - a send while the latest run is running or paused, queued durably and started when that run
 //!   ends, and a queued send's retry;
 //! - a steer into the running run, placed at its next step boundary;
+//! - retracting a queued send before it runs;
 //! - the session's status;
 //! - cancelling the active run, now or at its next step boundary;
 //! - going away when idle.
@@ -38,7 +39,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::actor::{CancelOutcome, LineageCmd, LineageStatus, SendOutcome};
+use crate::actor::{CancelOutcome, LineageCmd, LineageStatus, RetractOutcome, SendOutcome};
 use crate::executor::{RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRunJob};
 
 /// The refusal every unserved command and send gets: what it was, and that this storage doesn't
@@ -70,6 +71,8 @@ struct ActiveRun {
     /// the sender hears `active` only for a run that exists. A run drained from the queue has no
     /// sender waiting.
     admitting: Option<oneshot::Sender<SendOutcome>>,
+    /// Whether the run's start is in the session yet. Until it is, commands wait.
+    started: bool,
     /// The queued send the run started from, when it drained from the queue.
     submission: Option<broca_protocol::SubmissionId>,
     done: JoinHandle<StoreRunEnd>,
@@ -133,12 +136,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         loop {
             let event = match self.run.as_mut() {
                 // Until the run's start is durable, commands wait, as they wait in today's actor
-                // while it awaits a run's admission: a cancel or a second send can only meet a
-                // run that exists.
+                // while it awaits a run's admission, a drained run's included: a cancel, a
+                // retraction or a second send can only meet a run that exists.
                 Some(active) => tokio::select! {
                     request = active.link.next(), if !active.writer_gone => Event::Request(request),
                     end = &mut active.done => Event::Done(end),
-                    command = commands.recv(), if active.admitting.is_none() => Event::Command(command),
+                    command = commands.recv(), if active.started => Event::Command(command),
                 },
                 None => Event::Command(commands.recv().await),
             };
@@ -355,6 +358,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 let _ = reply.send(self.cancel(&run_id, at).await);
                 false
             }
+            LineageCmd::Retract {
+                submission_id,
+                reply,
+            } => {
+                let _ = reply.send(self.retract(submission_id).await);
+                false
+            }
             LineageCmd::IdleTick => self.run.is_none(),
             other => {
                 refuse(other);
@@ -434,6 +444,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             writer_gone: false,
             cancel,
             admitting: reply,
+            started: false,
             submission: drained.map(|drained| drained.submission),
             done,
         });
@@ -577,7 +588,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         Ok(Keyed::Answered(outcome))
     }
 
-    /// Tells the sender its run is active, once the run's start is in the session.
+    /// Marks the run started once its start is in the session, and tells a waiting sender it
+    /// is active.
     fn answer_admission(&mut self) {
         let Some(active) = self.run.as_mut() else {
             return;
@@ -590,6 +602,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .and_then(|run| run.start.as_ref())
             .is_some_and(|start| start.run_id == active.run_id.0);
         if started {
+            active.started = true;
             if let Some(reply) = active.admitting.take() {
                 let _ = reply.send(SendOutcome::Active {
                     run_id: active.run_id.clone(),
@@ -782,6 +795,54 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Record::QueuedSend(send) => Some(send),
                 _ => None,
             }))
+    }
+
+    /// Withdraws a queued send before it runs, by today's rule (`broca_core::retract_decision`):
+    /// a send a run's start already names is too late, one still queued gets a `Retraction`,
+    /// durable before the reply, and anything else is not pending.
+    async fn retract(&mut self, submission_id: broca_protocol::SubmissionId) -> RetractOutcome {
+        let records = match self
+            .session
+            .find_id(IdKind::SubmissionId, &submission_id.0)
+            .await
+        {
+            Ok(records) => records,
+            Err(error) => return RetractOutcome::Error(format!("{error:?}")),
+        };
+        if records
+            .iter()
+            .any(|(_, record)| matches!(record, Record::RunStart(_)))
+        {
+            return RetractOutcome::AlreadyStarted;
+        }
+        let Some(pending) = self
+            .session
+            .operations()
+            .queue
+            .iter()
+            .find(|pending| pending.submission_id == submission_id.0)
+        else {
+            return RetractOutcome::NotPending;
+        };
+        // Today's actor withdraws an ordered send through the running run, which may be
+        // delivering it at that moment. This actor never queues one, so only a session written
+        // elsewhere holds one.
+        if pending.ordered {
+            return RetractOutcome::Error(unserved("retracting an ordered send"));
+        }
+        let record = Record::Retraction(Retraction {
+            submission_id: submission_id.0,
+            failure: None,
+        });
+        match Writer::append(&mut self.session, std::slice::from_ref(&record), true).await {
+            Ok(seq) => {
+                if let Some(active) = self.run.as_mut() {
+                    active.link.note_own(seq, &[record]);
+                }
+                RetractOutcome::Retracted
+            }
+            Err(error) => RetractOutcome::Error(format!("{error:?}")),
+        }
     }
 
     /// Joins `start` to the running run as a steer, as today's actor steers it: refused when it
@@ -1059,11 +1120,6 @@ fn refuse(command: LineageCmd) {
                 "a sender check",
             ))));
         }
-        LineageCmd::Retract { reply, .. } => {
-            let _ = reply.send(crate::actor::RetractOutcome::Error(unserved(
-                "a retraction",
-            )));
-        }
         LineageCmd::SessionRefresh { reply, .. } => {
             let _ = reply.send(crate::actor::SessionRefreshOutcome::Error(unserved(
                 "session.refresh",
@@ -1114,6 +1170,7 @@ fn refuse(command: LineageCmd) {
         LineageCmd::Send { .. }
         | LineageCmd::Status { .. }
         | LineageCmd::Cancel { .. }
+        | LineageCmd::Retract { .. }
         | LineageCmd::IdleTick => unreachable!("served by the actor"),
     }
 }

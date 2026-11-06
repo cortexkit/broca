@@ -242,6 +242,8 @@ enum Step {
         delivery: broca_protocol::Delivery,
         expect: Expect,
     },
+    /// Retracts the queued send `submission_id` on both sides; the replies must be equal.
+    Retract(&'static str),
     /// Lets the gated first model step through on both sides.
     Release,
     /// Waits until both sessions are idle.
@@ -348,6 +350,18 @@ async fn compare(script: Vec<Vec<NormalizedEvent>>, gated: bool, steps: Vec<Step
                         );
                     }
                 }
+            }
+            Step::Retract(submission_id) => {
+                let old = today
+                    .registry
+                    .route_retract(
+                        &today.key,
+                        broca_protocol::SubmissionId(submission_id.into()),
+                    )
+                    .await
+                    .expect("today's actor opens");
+                let new = super::tests::retract(&commands, submission_id).await;
+                assert_eq!(new, old, "step {index}: retraction replies differ");
             }
             Step::Release => {
                 for gate in today_gate.iter().chain(store_gate.iter()) {
@@ -693,6 +707,29 @@ async fn a_steer_behind_a_sign_in_pause_is_refused_alike() {
             keyed("k1", "first"),
             Step::Idle,
             steered(send("s1", "steered")),
+        ],
+    )
+    .await;
+}
+
+/// A queued send is retracted before it runs, a second retraction finds nothing pending, and
+/// retracting a send whose run started is too late, alike.
+#[tokio::test]
+async fn a_queued_send_is_retracted_alike() {
+    compare(
+        hello(),
+        true,
+        vec![
+            send("r1", "first"),
+            send("r2", "withdrawn"),
+            send("r3", "third"),
+            Step::Retract("sub-r2"),
+            Step::Retract("sub-r2"),
+            Step::Release,
+            Step::Release,
+            Step::Idle,
+            Step::Retract("sub-r3"),
+            Step::Retract("sub-r1"),
         ],
     )
     .await;

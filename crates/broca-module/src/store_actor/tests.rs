@@ -98,6 +98,10 @@ impl broca_core::provider::Provider for Gated {
 /// Runs each store job through the new loop's admission and run, over a scripted provider.
 pub(super) struct LoopExecutor {
     provider: Gated,
+    /// When set, a run drained from the queue signals the first `Notify` and waits on the second
+    /// before its admission, so a test can act while the drain has started a run whose start
+    /// isn't durable yet.
+    drain_gate: Option<(Arc<Notify>, Arc<Notify>)>,
 }
 
 pub(super) fn executor(
@@ -109,6 +113,7 @@ pub(super) fn executor(
             inner: StubProvider::new(steps),
             gate,
         },
+        drain_gate: None,
     }
 }
 
@@ -134,6 +139,10 @@ impl RunExecutor for LoopExecutor {
             mut parts,
             ..
         } = job;
+        if let (Some((reached, release)), Some(_)) = (&self.drain_gate, &req.submission_id) {
+            reached.notify_one();
+            release.notified().await;
+        }
         let result = async {
             let admission = broca_session_loop::admit::admission(
                 &mut req,
@@ -586,16 +595,11 @@ async fn an_unserved_command_is_refused_by_name() {
     let (commands, _served, _) = actor(executor(vec![], None)).await;
     let (reply, answer) = oneshot::channel();
     commands
-        .send(LineageCmd::Retract {
-            submission_id: broca_protocol::SubmissionId("sub-1".into()),
-            reply,
-        })
+        .send(LineageCmd::RepairRetention { reply })
         .unwrap();
     assert_eq!(
         answer.await.unwrap(),
-        crate::actor::RetractOutcome::Error(
-            "a retraction is not served yet for a session kept in the new storage".into()
-        )
+        Err("retention repair is not served yet for a session kept in the new storage".into())
     );
 }
 
@@ -932,4 +936,110 @@ async fn a_steer_with_another_model_is_refused_naming_it() {
         .unwrap()
         .iter()
         .any(|(_, record)| matches!(record, Record::Steer(_))));
+}
+
+pub(super) async fn retract(
+    commands: &mpsc::UnboundedSender<LineageCmd>,
+    submission_id: &str,
+) -> crate::actor::RetractOutcome {
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(LineageCmd::Retract {
+            submission_id: broca_protocol::SubmissionId(submission_id.into()),
+            reply,
+        })
+        .unwrap();
+    answer.await.unwrap()
+}
+
+/// A queued send can be retracted before it runs: its retraction is durable, a second one finds
+/// nothing pending, and the send never runs. Once a send's run started, retracting it is too
+/// late.
+#[tokio::test]
+async fn a_queued_send_is_retracted_before_it_runs() {
+    use crate::actor::RetractOutcome;
+    let gate = Arc::new(Notify::new());
+    let (commands, served, _) = actor(executor(
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        Some(Arc::clone(&gate)),
+    ))
+    .await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    for (run, text) in [("r2", "withdrawn"), ("r3", "third")] {
+        assert!(matches!(
+            send(&commands, run, text).await,
+            SendOutcome::Pending { .. }
+        ));
+    }
+    assert_eq!(
+        retract(&commands, "sub-r2").await,
+        RetractOutcome::Retracted
+    );
+    assert_eq!(
+        retract(&commands, "sub-r2").await,
+        RetractOutcome::NotPending
+    );
+    gate.notify_one();
+    gate.notify_one();
+    idle(&commands).await;
+    assert_eq!(
+        retract(&commands, "sub-r3").await,
+        RetractOutcome::AlreadyStarted
+    );
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(texts(&session), ["first", "hello", "third", "again"]);
+    let records = session.open_log_records().await.unwrap();
+    assert!(records.iter().any(|(_, record)| matches!(
+        record,
+        Record::Retraction(retraction)
+            if retraction.submission_id == "sub-r2" && retraction.failure.is_none()
+    )));
+}
+
+/// Commands wait until a drained run's start is durable, as they wait for a sender's own run:
+/// a retraction sent while the drain has started the queued send's run, but before that run's
+/// start is written, is answered after the start, as too late. Answered earlier, it would write
+/// a retraction for a send whose run then starts anyway.
+#[tokio::test]
+async fn a_retraction_waits_for_a_drained_runs_start() {
+    use crate::actor::RetractOutcome;
+    let gate = Arc::new(Notify::new());
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut gated = executor(
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        Some(Arc::clone(&gate)),
+    );
+    gated.drain_gate = Some((Arc::clone(&reached), Arc::clone(&release)));
+    let (commands, served, _) = actor(gated).await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    assert!(matches!(
+        send(&commands, "r2", "queued").await,
+        SendOutcome::Pending { .. }
+    ));
+    gate.notify_one();
+    reached.notified().await;
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(LineageCmd::Retract {
+            submission_id: broca_protocol::SubmissionId("sub-r2".into()),
+            reply,
+        })
+        .unwrap();
+    // Time for an actor that took commands now to answer, before the run may write its start.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    release.notify_one();
+    gate.notify_one();
+    assert_eq!(answer.await.unwrap(), RetractOutcome::AlreadyStarted);
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(texts(&session), ["first", "hello", "queued", "again"]);
 }
