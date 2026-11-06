@@ -1378,6 +1378,11 @@ place a broca that knows every missing feature. Branch on `code`, then `detail.k
 message keeps the wording the refusal carried before it had its own code and is never
 parsed. These exact bytes are pinned by `crates/broca-wire/tests/golden/wal_newer_writer.json`.
 
+The same refusal, with `detail.missing` set to `["session-storage/v1"]`, answers every operation
+on a session kept in broca's newer session storage, which has no WAL. This build doesn't serve
+such a session, and it never creates a WAL for one, so a downgrade past the storage release
+leaves those sessions refused until a build that serves them is placed again.
+
 `session.read`'s permanent `history_unreachable` refusal is described in section 15 and
 pinned by `crates/broca-wire/tests/golden/session_read.history_unreachable.json`.
 

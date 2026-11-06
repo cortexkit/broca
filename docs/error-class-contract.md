@@ -253,7 +253,9 @@ broca specifics:
   `wal_newer_writer` means the session's WAL holds a complete frame that requires WAL
   features this build does not know: a newer broca wrote it. The bytes are intact and
   nothing was written, so retrying cannot help; the remedy is to place a build that
-  knows every name in `missing`. It is not in any retryable set. When the materialized
+  knows every name in `missing`. With `missing: ["session-storage/v1"]` it means the session
+  is kept in broca's newer session storage, which this build doesn't serve. It is not in any
+  retryable set. When the materialized
   store proves a session has history but neither live nor archived WAL can cover it,
   `session.read` answers `history_unreachable`, class `permanent`, with `session_ref` and
   no filesystem paths. Every other failure to open a session's WAL, corruption included,

@@ -187,3 +187,46 @@ fn a_run_start_records_the_refusal_schedule_admission_carried() {
         .collect();
     assert_eq!(schedules, [None, Some(schedule), None]);
 }
+
+/// A session the new storage creates is refused by today's WAL store at the same state root, for
+/// reads and writes alike. The head the new storage's local backend writes, rooted at
+/// `SESSION_STORAGE_DIR` and addressed by today's `session_addr`, is exactly where today's guard
+/// looks: without this, a rollback to today's storage would create a second log for the session.
+#[test]
+fn todays_wal_store_refuses_a_session_the_new_storage_created() {
+    use broca_session_store::backend::{LocalBackend, SessionAddr};
+    use broca_session_store::head::SessionTriple;
+    use broca_session_store::keys::DeploymentKey;
+    use broca_session_store::session::Session;
+
+    let state = std::env::temp_dir().join(format!("broca-storage-guard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    let bind = broca_protocol::BindIdentity::new(state.join("proj"), "runner", "guarded");
+    let other = broca_protocol::BindIdentity::new(state.join("proj"), "runner", "other");
+    let wal = broca_core::FileWalStore::new(state.join("wal"));
+    // The control: before the new storage holds it, the session passes.
+    wal.check_move(&bind, true).unwrap();
+    let backend = LocalBackend::new(state.join(broca_wal::SESSION_STORAGE_DIR));
+    futures::executor::block_on(Session::create(
+        &backend,
+        SessionAddr(broca_core::session_addr(&bind)),
+        SessionTriple {
+            project_root: bind.project_root.to_string_lossy().into_owned(),
+            harness: bind.harness.clone(),
+            session: bind.session.clone(),
+        },
+        &DeploymentKey::new(1, &[0x5a; 32]),
+        true,
+    ))
+    .unwrap();
+    for write in [false, true] {
+        match wal.check_move(&bind, write) {
+            Err(broca_wal::WalError::NewerWriter { missing, .. }) => {
+                assert_eq!(missing, [broca_wal::SESSION_STORAGE_FEATURE]);
+            }
+            other => panic!("write={write}: expected the session-storage refusal: {other:?}"),
+        }
+    }
+    wal.check_move(&other, true).unwrap();
+    std::fs::remove_dir_all(&state).unwrap();
+}

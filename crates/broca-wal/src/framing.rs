@@ -217,6 +217,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     TURN_DIRECTIVES_FEATURE,
     AGENT_RUN_SCOPE_FEATURE,
     ARCHIVE_INDEX_V2_FEATURE,
+    SESSION_STORAGE_FEATURE,
     AUTH_SELECTION_METHOD_FEATURE,
     CHATGPT_CODEX_WIRE_FEATURE,
     CLIENT_MESSAGE_ID_FEATURE,
@@ -356,6 +357,30 @@ pub const CONTEXT_CEILING_FEATURE: &str = "context-ceiling/v1";
 /// container by full header scans and without the index's cross-check of member headers
 /// (see `archive.rs`).
 pub const ARCHIVE_INDEX_V2_FEATURE: &str = "archive-index/v2";
+
+/// Not a WAL frame feature either: no frame ever requires it. It names the new session storage
+/// (`broca-session-store`), which keeps each session under [`SESSION_STORAGE_DIR`] instead of in
+/// a WAL. The new storage raises the machine's feature floor with this name before it writes its
+/// first session in a state root, so placement then refuses every build whose table lacks it.
+/// A build that lists it either serves those sessions or refuses them by name, and never creates
+/// a WAL at their address: a second log for the same session would fork it. Today's
+/// `FileWalStore` refuses them (its `check_move`), so this build only refuses.
+pub const SESSION_STORAGE_FEATURE: &str = "session-storage/v1";
+
+/// The folder of a state root that holds the new session storage.
+pub const SESSION_STORAGE_DIR: &str = "session-store";
+
+/// Where the new session storage keeps the head of the session at `address` under
+/// `state_root`. The session exists on the new storage exactly when this file does: creating a
+/// session writes its head before anything else. The layout is the store's local backend's,
+/// `<root>/heads/<address>/head`, rooted at [`SESSION_STORAGE_DIR`].
+pub fn session_storage_head(state_root: &std::path::Path, address: &str) -> std::path::PathBuf {
+    state_root
+        .join(SESSION_STORAGE_DIR)
+        .join("heads")
+        .join(address)
+        .join("head")
+}
 
 /// The feature a `RunStarted` carrying the session's frozen plan manifest requires
 /// (`WalRecord::RunStarted::manifest`). A reader without it must refuse such a WAL: skipping the
@@ -1659,6 +1684,7 @@ mod tests {
                 TURN_DIRECTIVES_FEATURE,
                 AGENT_RUN_SCOPE_FEATURE,
                 ARCHIVE_INDEX_V2_FEATURE,
+                SESSION_STORAGE_FEATURE,
                 AUTH_SELECTION_METHOD_FEATURE,
                 CHATGPT_CODEX_WIRE_FEATURE,
                 CLIENT_MESSAGE_ID_FEATURE,
