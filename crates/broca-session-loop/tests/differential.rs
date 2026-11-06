@@ -36,7 +36,7 @@ use broca_protocol::request::{
 use broca_protocol::{FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage};
 use broca_session_loop::shared::{ActorWriter, Request};
 use broca_session_loop::{
-    resume, run, AccountReports, Admission, MemoryParts, PendingMedia, Seams, Writer,
+    resume, run, seal, AccountReports, Admission, MemoryParts, PendingMedia, Seams, Writer,
 };
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::codec::Message as _;
@@ -767,6 +767,11 @@ fn run_model(run_id: &str) -> &str {
 tokio::task_local! {
     /// Whether the multi-run comparison seals the new loop's ledger after each run but the last.
     static LEDGER_SEAL_BETWEEN_RUNS: bool;
+}
+
+tokio::task_local! {
+    /// When set, the new side ends the cut log's run with this seal instead of resuming it.
+    static SEALING: broca_core::resume::SealCause;
 }
 
 tokio::task_local! {
@@ -2071,11 +2076,17 @@ async fn new_from(
         max_same_account_wait: account().map_or_else(Default::default, |script| script.wait),
         auth_selection: account_selection(),
     };
-    through!(writer, |w| if resuming {
-        resume(w, &parts, &seams).await
-    } else {
-        run(w, &mut parts, scenario.admission(&provider), &seams).await
-    })
+    let sealing = SEALING.try_with(|cause| *cause).ok();
+    through!(
+        writer,
+        |w| if let (true, Some(cause)) = (resuming, sealing) {
+            seal(w, &parts, &seams, cause).await
+        } else if resuming {
+            resume(w, &parts, &seams).await
+        } else {
+            run(w, &mut parts, scenario.admission(&provider), &seams).await
+        }
+    )
     .expect("the new loop runs");
     let records = writer.records.clone();
     keys_match(writer.session, &plane).await;
@@ -2597,6 +2608,153 @@ async fn compare_every_cut_in_once(scenario: Scenario) {
     }
 }
 
+/// At every cut of `scenario` where the run was still running (no pause, no end) and today's
+/// replay would resume it or stop it for review, the new loop's seal writes the same records as
+/// today's seal plan (`broca_core::resume::interrupted_seal`, a crash-orphan seal as today's
+/// actor writes it on open) appended to today's cut log and converted. Asserts some cut seals.
+async fn compare_seal_every_cut(scenario: Scenario) {
+    for layout in LAYOUTS {
+        LAYOUT
+            .scope(
+                layout,
+                Box::pin(compare_seal_every_cut_in(scenario.clone())),
+            )
+            .await;
+    }
+}
+
+async fn compare_seal_every_cut_in(scenario: Scenario) {
+    use broca_core::resume::{crash_orphan_error, interrupted_seal, DeferredCloseKind, SealCause};
+    let (_, full, _) = today_from(&scenario, None, scenario.steps.clone()).await;
+    let records = full.framed().len();
+    let mut sealed = 0;
+    for cut in 1..records {
+        let bytes = broca_crash_harness::cut_log(&full, cut, false);
+        let image = LogImage::parse(bytes);
+        let frames = image.framed();
+        let wal: Vec<WalRecord> = frames.iter().map(|frame| frame.record.clone()).collect();
+        let prior = broca_core::replay(&wal).expect("the cut replays");
+        let running = prior.run_id.is_some()
+            && !prior.run_finished_durable
+            && matches!(
+                prior.resolution,
+                broca_core::ReplayResolution::Resume { .. }
+                    | broca_core::ReplayResolution::Interrupted { .. }
+            );
+        if !running {
+            continue;
+        }
+        sealed += 1;
+        let lineage = lineage(&image);
+        let converted =
+            broca_session_convert::convert(&frames, lineage.as_deref()).expect("the cut converts");
+        let before = converted.records.len();
+        // Today: the seal plan over the cut, appended as today's actor appends it.
+        let head = frames.last().map_or(0, |frame| frame.seq);
+        let plan = interrupted_seal(
+            &prior,
+            SealCause::CrashOrphan,
+            None,
+            false,
+            Some(head),
+            Some(crash_orphan_error()),
+            |_| DeferredCloseKind::NotDispatched,
+        );
+        let today_frames = through_todays_writer(
+            &image.bytes,
+            plan.resume_started
+                .into_iter()
+                .chain(plan.close_out)
+                .chain(std::iter::once(plan.terminal.record(Some(harness_now()))))
+                .collect(),
+            &wal,
+        )
+        .await;
+        let today = broca_session_convert::convert(&today_frames, lineage.as_deref())
+            .expect("today's sealed log converts");
+        let today_sealed = normalized(&today.records)[before..].to_vec();
+        // New: the loop's seal over the converted cut.
+        let new = SEALING
+            .scope(
+                SealCause::CrashOrphan,
+                new_from(&scenario, Some(converted), Vec::new()),
+            )
+            .await;
+        let context = format!("seal after record {cut} of {records}");
+        if std::env::var_os("DIFFERENTIAL_DUMP").is_some() {
+            for (index, record) in today_sealed.iter().enumerate() {
+                eprintln!("{context} today {index}: {record}");
+            }
+            for (index, record) in new.records.iter().enumerate() {
+                eprintln!("{context} new   {index}: {record}");
+            }
+        }
+        for (index, (new, today)) in new.records.iter().zip(&today_sealed).enumerate() {
+            assert_eq!(new, today, "{context}: record {index}");
+        }
+        assert_eq!(
+            new.records.len(),
+            today_sealed.len(),
+            "{context}: record count"
+        );
+        assert!(new.requests.is_empty(), "{context}: a seal sends nothing");
+        assert!(
+            new.calls.iter().all(|call| !call.contains("dispatch")),
+            "{context}: a seal dispatches nothing: {:?}",
+            new.calls
+        );
+    }
+    assert!(sealed > 0, "some cut leaves a running run to seal");
+}
+
+/// The log `bytes` holds with `records` appended through today's real WAL writer, which stamps
+/// what a record leaves for it to stamp (a tool result's finish time), read back as frames.
+async fn through_todays_writer(
+    bytes: &[u8],
+    records: Vec<WalRecord>,
+    held: &[WalRecord],
+) -> Vec<broca_wal::FramedRecord> {
+    use broca_wal::{FileWal, Wal as _};
+    let root = broca_test_support::scratch_root().join(format!(
+        "seal-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("session.wal");
+    std::fs::write(&path, bytes).unwrap();
+    let floor = root.join("wal-feature-floor");
+    let writer = broca_core::WalHandle::spawn(
+        Box::new(FileWal::open(&path).unwrap().with_feature_floor(&floor)),
+        2,
+    )
+    .unwrap();
+    writer.seed_lineage_tags(Some(broca_core::tags::lineage_tags(held)));
+    for record in records {
+        writer.record(record).into_result().unwrap();
+    }
+    writer.sync().await.unwrap();
+    writer.shutdown().await.unwrap();
+    let frames = FileWal::open(&path).unwrap().replay().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    frames
+}
+
+#[tokio::test]
+async fn every_cut_of_a_tool_run_seals_alike() {
+    compare_seal_every_cut(sequential_tool_run()).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_an_unsent_call_seals_alike() {
+    compare_seal_every_cut(unsent_call()).await;
+}
+
+#[tokio::test]
+async fn every_cut_of_parallel_calls_seals_alike() {
+    compare_seal_every_cut(tool_run()).await;
+}
+
 /// Whether a crash left the run's open tool batch with every call answered and the batch not
 /// yet closed, read from the operational fold over the cut's records.
 fn resumes_an_answered_batch(records: &[Record]) -> bool {
@@ -2634,9 +2792,8 @@ fn without_empty_resumed_batch(calls: &[String]) -> Vec<String> {
     }
 }
 
-#[tokio::test]
-async fn every_cut_of_a_tool_run_resumes_alike() {
-    compare_every_cut(Scenario {
+fn sequential_tool_run() -> Scenario {
+    Scenario {
         input: vec![user("read two files")],
         tools: vec![
             tool("read", ExecutionMode::Sequential),
@@ -2660,8 +2817,12 @@ async fn every_cut_of_a_tool_run_resumes_alike() {
             ),
             text_step("a3", "done"),
         ],
-    })
-    .await;
+    }
+}
+
+#[tokio::test]
+async fn every_cut_of_a_tool_run_resumes_alike() {
+    compare_every_cut(sequential_tool_run()).await;
 }
 
 fn tool_run() -> Scenario {
@@ -2771,9 +2932,8 @@ async fn every_cut_of_an_unknown_outcome_resumes_alike() {
     .await;
 }
 
-#[tokio::test]
-async fn every_cut_of_an_unsent_call_resumes_alike() {
-    compare_every_cut(Scenario {
+fn unsent_call() -> Scenario {
+    Scenario {
         input: vec![user("fetch a")],
         tools: vec![tool("fetch", ExecutionMode::Parallel)],
         manifest: None,
@@ -2786,8 +2946,12 @@ async fn every_cut_of_an_unsent_call_resumes_alike() {
             ),
             text_step("a2", "it failed"),
         ],
-    })
-    .await;
+    }
+}
+
+#[tokio::test]
+async fn every_cut_of_an_unsent_call_resumes_alike() {
+    compare_every_cut(unsent_call()).await;
 }
 
 /// Runs `runs` one after another on one session through today's loop (the first with

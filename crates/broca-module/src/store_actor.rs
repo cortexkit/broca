@@ -18,6 +18,8 @@
 //! - a run paused for sign-in, resumed by a retry of its own send;
 //! - the session's status;
 //! - cancelling the active run, now or at its next step boundary;
+//! - on opening the session, its unfinished run: one a crashed process left running is ended
+//!   `Interrupted`, any other running run continues, and with no unfinished run the queue drains;
 //! - going away when idle.
 //!
 //! Every other command, and every send that needs an admission rule not built here yet, is
@@ -41,7 +43,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::{CancelOutcome, LineageCmd, LineageStatus, RetractOutcome, SendOutcome};
-use crate::executor::{RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRunJob};
+use crate::executor::{
+    RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
+};
 
 /// The refusal every unserved command and send gets: what it was, and that this storage doesn't
 /// serve it yet.
@@ -58,6 +62,9 @@ pub struct StoreActor<B: SessionBackend> {
     /// run holds its own handle.
     parts: SharedParts,
     run: Option<ActiveRun>,
+    /// Runs the module's startup pass found a crashed process left running, which opening the
+    /// session ends instead of continuing.
+    crash_orphans: std::collections::HashSet<RunId>,
 }
 
 /// The run the session is running.
@@ -134,12 +141,22 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             executor,
             parts: SharedParts::new(parts),
             run: None,
+            crash_orphans: Default::default(),
         }
+    }
+
+    /// Marks `runs` as runs a crashed process left running: if the session's unfinished run is
+    /// one of them when the actor opens it, it is ended `Interrupted`, as today's actor ends a
+    /// run its registry's startup pass marked.
+    pub fn with_crash_orphans(mut self, runs: std::collections::HashSet<RunId>) -> Self {
+        self.crash_orphans = runs;
+        self
     }
 
     /// Serves `commands` until the session goes away: when the channel closes, or when it is
     /// idle at an idle tick. Returns the session, for whoever closes it.
     pub async fn serve(mut self, mut commands: mpsc::UnboundedReceiver<LineageCmd>) -> Session<B> {
+        self.recover().await;
         loop {
             let event = match self.run.as_mut() {
                 // Until the run's start is durable, commands wait, as they wait in today's actor
@@ -269,7 +286,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                                 identity: None,
                                 scope,
                             };
-                            self.start_run(start, None, Some(reply), true);
+                            self.start_run(start, None, Some(reply), StoreRunMode::Resume);
                             return false;
                         }
                         Err(error) => {
@@ -380,7 +397,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         "a send while sends are queued on an idle session",
                     )));
                 } else {
-                    self.start_run(start, None, Some(reply), false);
+                    self.start_run(start, None, Some(reply), StoreRunMode::Fresh);
                 }
                 false
             }
@@ -421,15 +438,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Starts a run of `start` on the idle session: a send's own run, whose sender's `reply`
     /// waits for the run's start to be durable or for its refusal, or one `drained` from the
-    /// queue, which no sender waits on. With `resume`, the session's latest run goes on instead
-    /// of a new one starting: its start is already durable, so the sender hears `active` at
-    /// once, as today's actor answers a resumed run at its admission.
+    /// queue, which no sender waits on. In any other `mode` the session's latest run goes on or
+    /// ends instead of a new one starting: its start is already durable, so a sender hears
+    /// `active` at once, as today's actor answers a resumed run at its admission.
     fn start_run(
         &mut self,
         start: Start,
         drained: Option<Drained>,
         mut reply: Option<oneshot::Sender<SendOutcome>>,
-        resume: bool,
+        mode: StoreRunMode,
     ) {
         let Start {
             run_id,
@@ -486,8 +503,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             control,
             writer,
             parts,
-            resume,
+            mode,
         };
+        let resume = mode != StoreRunMode::Fresh;
         if resume {
             if let Some(reply) = reply.take() {
                 let _ = reply.send(SendOutcome::Active {
@@ -507,6 +525,96 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             submission: drained.map(|drained| drained.submission),
             done,
         });
+    }
+
+    /// Recovers the session's unfinished work on opening it, before any command, as today's
+    /// actor does on open for the cases this storage serves:
+    /// - a running run that the module's startup pass found a crashed process left behind, or
+    ///   that a queued interrupt asked to stop, is ended `Interrupted` without calling the model,
+    ///   unless a cancel is pending, which its resume carries out instead;
+    /// - any other unfinished run that isn't paused continues, which for a run whose last step
+    ///   ended it naturally writes only its lost end;
+    /// - with no unfinished run, the first queued send drains.
+    ///
+    /// A paused run stays paused: a sign-in pause waits for its retry. Resuming after a
+    /// restart, the account-limit pause's timer, and calls a provider holds aren't recovered on
+    /// this storage yet, so nothing is written for them.
+    async fn recover(&mut self) {
+        use broca_session_store::fold::operations::Resolution;
+        let operations = self.session.operations();
+        let Some(run) = operations.run.as_ref().filter(|run| run.finished.is_none()) else {
+            return self.drain().await;
+        };
+        let mode = match run.resolution() {
+            Resolution::Resume | Resolution::Interrupted(_) => {
+                let orphaned = self.crash_orphans.contains(&RunId(run.run_id.clone()))
+                    || operations.queue.first().is_some_and(|send| send.interrupt);
+                if orphaned && run.cancel.is_none() {
+                    StoreRunMode::Seal(broca_core::resume::SealCause::CrashOrphan)
+                } else {
+                    StoreRunMode::Resume
+                }
+            }
+            Resolution::Idle(_) => StoreRunMode::Resume,
+            Resolution::ProviderHeld(_) | Resolution::Paused(_) => {
+                if !matches!(run.paused, Some(broca_protocol::PauseReason::AuthRequired)) {
+                    tracing::warn!(
+                        target: "broca.store_actor",
+                        session = %self.key.session,
+                        run_id = %run.run_id,
+                        paused = ?run.paused,
+                        "an unfinished run is left as it is: recovering it isn't built for the new storage yet",
+                    );
+                }
+                return;
+            }
+        };
+        match self.recovery_start(run) {
+            Ok(start) => self.start_run(start, None, None, mode),
+            Err(error) => tracing::error!(
+                target: "broca.store_actor",
+                session = %self.key.session,
+                run_id = %run.run_id,
+                error = %error,
+                "the unfinished run's start could not be read back to recover it",
+            ),
+        }
+    }
+
+    /// The run recovery carries on or ends: the session's unfinished `run`, under the request
+    /// its start froze. The resumed run renders from its start record, not from this request;
+    /// the request names what the executor resolves the run's provider by.
+    fn recovery_start(
+        &self,
+        run: &broca_session_store::fold::operations::Run,
+    ) -> Result<Start, String> {
+        let start = run
+            .start
+            .as_ref()
+            .ok_or_else(|| format!("the run {} has no start in the session", run.run_id))?;
+        let admission = broca_session_loop::run::admission_of_start(start, &self.parts)
+            .map_err(|error| format!("{error:?}"))?;
+        let request = serde_json::from_value(serde_json::json!({
+            "model": admission.model,
+            "input": [],
+            "tools": admission.tools,
+            "policy_allowed": admission.tools.iter().map(|tool| &tool.name).collect::<Vec<_>>(),
+            "tool_choice": admission.tool_choice,
+            "generation": admission.generation,
+            "stop_when": admission.stop_when,
+            "context_limit": admission.context_limit,
+            "on_restart": admission.on_restart,
+        }))
+        .map_err(|error| format!("the run's frozen request: {error}"))?;
+        Ok(Start {
+            run_id: RunId(run.run_id.clone()),
+            request,
+            title: None,
+            send_id: None,
+            identity: None,
+            sent_by: None,
+            scope: self.ownership()?.scope,
+        })
     }
 
     /// The session's owner summary, from its run starts, as today's admission rules read it.
@@ -840,7 +948,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return;
         }
         match self.drained_start(&first.submission_id).await {
-            Ok((start, drained)) => self.start_run(start, Some(drained), None, false),
+            Ok((start, drained)) => self.start_run(start, Some(drained), None, StoreRunMode::Fresh),
             Err(error) => tracing::error!(
                 target: "broca.store_actor",
                 session = %self.key.session,

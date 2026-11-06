@@ -10,7 +10,7 @@ use broca_protocol::request::StopCondition;
 use broca_protocol::{
     BindIdentity, MessageId, NormalizedEvent, ProviderControl, RunId, SubmissionRequest, Usage,
 };
-use broca_session_loop::parts::MemoryParts;
+use broca_session_loop::parts::{MemoryParts, SharedParts};
 use broca_session_loop::run::{run, Seams};
 use broca_session_loop::writer::Writer;
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
@@ -22,7 +22,9 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::StoreActor;
 use crate::actor::{CancelOutcome, LineageCmd, LineageStatus, SendKey, SendOutcome};
-use crate::executor::{RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunError, StoreRunJob};
+use crate::executor::{
+    RunExecutor, RunJob, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
+};
 
 pub(super) fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
     vec![
@@ -137,7 +139,7 @@ impl RunExecutor for LoopExecutor {
             control,
             mut writer,
             mut parts,
-            resume,
+            mode,
             ..
         } = job;
         if let (Some((reached, release)), Some(_)) = (&self.drain_gate, &req.submission_id) {
@@ -145,7 +147,7 @@ impl RunExecutor for LoopExecutor {
             release.notified().await;
         }
         let result = async {
-            let admission = if resume {
+            let admission = if mode != StoreRunMode::Fresh {
                 None
             } else {
                 Some(
@@ -181,9 +183,14 @@ impl RunExecutor for LoopExecutor {
                 auth_selection: None,
             };
             // The test's credential is always ready, so a sign-in pause resumes.
-            match admission {
-                Some(admission) => run(&mut writer, parts.as_mut(), admission, &seams).await,
-                None => broca_session_loop::run::resume(&mut writer, parts.as_ref(), &seams).await,
+            match (admission, mode) {
+                (Some(admission), _) => run(&mut writer, parts.as_mut(), admission, &seams).await,
+                (None, StoreRunMode::Seal(cause)) => {
+                    broca_session_loop::seal(&mut writer, parts.as_ref(), &seams, cause).await
+                }
+                (None, _) => {
+                    broca_session_loop::run::resume(&mut writer, parts.as_ref(), &seams).await
+                }
             }
             .map_err(StoreRunError::Loop)
         }
@@ -201,29 +208,71 @@ pub(super) async fn actor(
     tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
     &'static MemoryBackend,
 ) {
+    actor_with(executor, SharedParts::new(Box::new(MemoryParts::default()))).await
+}
+
+/// [`actor`] over the setup parts store `parts`, which a reopened actor can share.
+async fn actor_with(
+    executor: LoopExecutor,
+    parts: SharedParts,
+) -> (
+    mpsc::UnboundedSender<LineageCmd>,
+    tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
+    &'static MemoryBackend,
+) {
     let backend: &'static MemoryBackend = Box::leak(Box::default());
     let session = Session::create(
         backend,
-        SessionAddr("0123456789abcdef".into()),
-        SessionTriple {
-            project_root: "/project".into(),
-            harness: "store-actor".into(),
-            session: "s1".into(),
-        },
-        &DeploymentKey::new(1, &[7; 32]),
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
         false,
     )
     .await
     .unwrap();
-    let actor = StoreActor::new(
-        bind(),
-        session,
-        Arc::new(executor),
-        Box::new(MemoryParts::default()),
-    );
+    let actor = StoreActor::new(bind(), session, Arc::new(executor), Box::new(parts));
     let (commands, receiver) = mpsc::unbounded_channel();
     let served = tokio::spawn(actor.serve(receiver));
     (commands, served, backend)
+}
+
+const ADDR: &str = "0123456789abcdef";
+
+fn triple() -> SessionTriple {
+    SessionTriple {
+        project_root: "/project".into(),
+        harness: "store-actor".into(),
+        session: "s1".into(),
+    }
+}
+
+fn deployment() -> DeploymentKey {
+    DeploymentKey::new(1, &[7; 32])
+}
+
+/// A store actor over the session `backend` already holds, loaded as a module opening it after
+/// a restart loads it, with `crash_orphans` marked by the startup pass.
+async fn reopen(
+    backend: &'static MemoryBackend,
+    executor: Arc<LoopExecutor>,
+    parts: &SharedParts,
+    crash_orphans: &[&str],
+) -> (
+    mpsc::UnboundedSender<LineageCmd>,
+    tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
+) {
+    let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
+        .await
+        .unwrap();
+    let actor = StoreActor::new(bind(), session, executor, Box::new(parts.clone()))
+        .with_crash_orphans(
+            crash_orphans
+                .iter()
+                .map(|run| RunId((*run).into()))
+                .collect(),
+        );
+    let (commands, receiver) = mpsc::unbounded_channel();
+    (commands, tokio::spawn(actor.serve(receiver)))
 }
 
 pub(super) fn request(text: &str) -> SubmissionRequest {
@@ -1059,4 +1108,178 @@ async fn a_retraction_waits_for_a_drained_runs_start() {
     drop(commands);
     let session = served.await.unwrap();
     assert_eq!(texts(&session), ["first", "hello", "queued", "again"]);
+}
+
+/// A process that crashed while `r1` ran (its first model call in flight) and with `r2` queued
+/// behind it: the actor's task is dropped without ending the run, as a killed process leaves
+/// it. Returns the backend holding the session and its setup parts store.
+async fn crashed_with_a_queued_send() -> (&'static MemoryBackend, SharedParts) {
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let never = Arc::new(Notify::new());
+    let (commands, served, backend) =
+        actor_with(executor(Vec::new(), Some(never)), parts.clone()).await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    assert!(matches!(
+        send(&commands, "r2", "second").await,
+        SendOutcome::Pending { .. }
+    ));
+    served.abort();
+    let _ = served.await;
+    (backend, parts)
+}
+
+/// The records a reopened session appended, from the writer's barrier on.
+async fn appended_after_reopen(session: &Session<&'static MemoryBackend>) -> Vec<Record> {
+    let records = session.open_log_records().await.unwrap();
+    let opened = records
+        .iter()
+        .rposition(|(_, record)| matches!(record, Record::WriterOpened(_)))
+        .expect("the reopened writer's barrier");
+    records[opened + 1..]
+        .iter()
+        .map(|(_, record)| record.clone())
+        .collect()
+}
+
+/// A run the startup pass marked as left running by a crashed process is ended `Interrupted`
+/// when the session opens, as today's actor seals it: no model call, the crash named on the
+/// run's end. The send queued behind it then runs.
+#[tokio::test]
+async fn a_crashed_run_ends_interrupted_on_open_and_the_queue_drains() {
+    let (backend, parts) = crashed_with_a_queued_send().await;
+    let executor = Arc::new(executor(vec![text_step("a2", "again")], None));
+    let (commands, served) = reopen(backend, Arc::clone(&executor), &parts, &["r1"]).await;
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let ends: Vec<_> = appended_after_reopen(&session)
+        .await
+        .into_iter()
+        .filter_map(|record| match record {
+            Record::RunEnd(end) => Some(end),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), 2, "{ends:?}");
+    assert_eq!(ends[0].run_id, "r1");
+    assert_eq!(ends[0].reason, broca_protocol::RunFinishReason::Interrupted);
+    assert_eq!(ends[0].interrupt_reason.as_deref(), Some("runner_crash"));
+    assert_eq!(ends[1].run_id, "r2");
+    assert_eq!(ends[1].reason, broca_protocol::RunFinishReason::Completed);
+    assert_eq!(
+        executor.provider.inner.calls().len(),
+        1,
+        "only r2 called the model"
+    );
+    assert_eq!(texts(&session), ["first", "second", "again"]);
+}
+
+/// A run left running that the startup pass didn't mark continues when the session opens, and
+/// the send queued behind it runs after it.
+#[tokio::test]
+async fn an_unmarked_running_run_continues_on_open() {
+    let (backend, parts) = crashed_with_a_queued_send().await;
+    let executor = Arc::new(executor(
+        vec![text_step("a1", "hello"), text_step("a2", "again")],
+        None,
+    ));
+    let (commands, served) = reopen(backend, executor, &parts, &[]).await;
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let ends: Vec<_> = appended_after_reopen(&session)
+        .await
+        .into_iter()
+        .filter_map(|record| match record {
+            Record::RunEnd(end) => Some((end.run_id, end.reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            ("r1".to_owned(), broca_protocol::RunFinishReason::Completed),
+            ("r2".to_owned(), broca_protocol::RunFinishReason::Completed),
+        ]
+    );
+    assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
+}
+
+/// A run paused for sign-in stays paused when the session opens: nothing is written for it,
+/// and its retry still resumes it.
+#[tokio::test]
+async fn a_sign_in_pause_stays_paused_on_open() {
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let (commands, served, backend) =
+        actor_with(executor(vec![auth_failure()], None), parts.clone()).await;
+    assert!(matches!(
+        keyed(&commands, "k1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    drop(commands);
+    drop(served.await.unwrap());
+    let executor = Arc::new(executor(vec![text_step("a1", "hello")], None));
+    let (commands, served) = reopen(backend, Arc::clone(&executor), &parts, &["r-k1"]).await;
+    assert_eq!(
+        send(&commands, "r2", "second").await,
+        SendOutcome::RunPaused {
+            run_id: RunId("r-k1".into()),
+            reason: broca_protocol::PauseReason::AuthRequired,
+        }
+    );
+    assert!(executor.provider.inner.calls().is_empty());
+    assert!(matches!(
+        keyed(&commands, "k1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(
+        session.operations().run.as_ref().unwrap().finished,
+        Some(broca_protocol::RunFinishReason::Completed)
+    );
+    assert_eq!(texts(&session), ["first", "hello"]);
+}
+
+/// A process that crashed after `r1` ended, while the drain was starting the run of `r2`,
+/// which was queued behind it, before that run's start was written. Opening the session drains
+/// `r2`.
+#[tokio::test]
+async fn a_send_left_queued_behind_an_ended_run_drains_on_open() {
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let gate = Arc::new(Notify::new());
+    let (reached, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let mut gated = executor(vec![text_step("a1", "hello")], Some(Arc::clone(&gate)));
+    gated.drain_gate = Some((Arc::clone(&reached), release));
+    let (commands, served, backend) = actor_with(gated, parts.clone()).await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    assert!(matches!(
+        send(&commands, "r2", "second").await,
+        SendOutcome::Pending { .. }
+    ));
+    gate.notify_one();
+    reached.notified().await;
+    served.abort();
+    let _ = served.await;
+    let executor = Arc::new(executor(vec![text_step("a2", "again")], None));
+    let (commands, served) = reopen(backend, executor, &parts, &[]).await;
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let run = session.operations().run.as_ref().unwrap();
+    assert_eq!(run.run_id, "r2");
+    assert_eq!(
+        run.finished,
+        Some(broca_protocol::RunFinishReason::Completed)
+    );
+    assert!(session.operations().queue.is_empty());
+    assert_eq!(texts(&session), ["first", "hello", "second", "again"]);
 }

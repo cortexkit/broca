@@ -560,6 +560,31 @@ async fn close_interrupted<W: Writer, P, T>(
     refused: Option<(&ProviderError, Resumed)>,
 ) -> Result<Finished, LoopError> {
     let now = (seams.now_ms)();
+    let (mut records, withdrawn) = open_batch_close_out(writer, run_id, now);
+    let mut end = run_end(writer, run_id, RunFinishReason::Interrupted, now);
+    if let Some((error, resumed)) = refused {
+        if let Record::RunEnd(end) = &mut end {
+            end.error =
+                Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
+        }
+        records.push(Record::Resumed(resumed));
+    }
+    records.push(end);
+    append_end(writer, run_id, records).await?;
+    withdraw(seams, &withdrawn).await;
+    Ok(finished(writer, RunFinishReason::Interrupted))
+}
+
+/// The records that close the run's open batch after a crash, sending nothing: an
+/// `outcome_unknown` result for each call that was sent with no result recorded, a not-run
+/// result for each planned call that never left, a provider-held call's close result, and the
+/// batch's end. Also the held calls whose providers must be asked to withdraw once the run's end
+/// is durable. Nothing without an open batch.
+fn open_batch_close_out<W: Writer>(
+    writer: &W,
+    run_id: &str,
+    now: u64,
+) -> (Vec<Record>, Vec<ProviderHeldReply>) {
     let mut records = Vec::new();
     let mut withdrawn = Vec::new();
     if let Some(batch) = run_state(writer).open_batch.as_ref() {
@@ -618,18 +643,150 @@ async fn close_interrupted<W: Writer, P, T>(
             batch_id: batch.batch_id.clone(),
         }));
     }
-    let mut end = run_end(writer, run_id, RunFinishReason::Interrupted, now);
-    if let Some((error, resumed)) = refused {
-        if let Record::RunEnd(end) = &mut end {
-            end.error =
-                Some(serde_json::to_value(error).map_err(|e| LoopError::Parts(e.to_string()))?);
-        }
+    (records, withdrawn)
+}
+
+/// Ends the session's unfinished latest run `Interrupted`, sending nothing, with the records
+/// today's seal writes for the same run (`broca_core::resume::interrupted_seal`): on a graceful
+/// stop (`SealCause::Shutdown`), or when a session opens on a run a crashed process left running
+/// (`SealCause::CrashOrphan`), which first records the resume and names the crash on the run's
+/// end.
+///
+/// An open batch closes as a crash resume closes it ([`open_batch_close_out`]), whatever its
+/// calls' state. With no open batch, a tool turn whose calls were never dispatched is kept, each
+/// call answered as never run, so nothing already written is dropped. Then the run ends, all in
+/// one batch.
+///
+/// Only a run that was running is sealed here: a paused run waits for its own resume, and a run
+/// whose last step already ended is finished by [`resume`].
+pub async fn seal<W, P, T>(
+    writer: &mut W,
+    parts: &dyn Parts,
+    seams: &Seams<'_, P, T>,
+    cause: broca_core::resume::SealCause,
+) -> Result<Finished, LoopError>
+where
+    W: Writer,
+    P: Provider,
+    T: ToolPlane,
+{
+    use broca_core::resume::SealCause;
+    let run = writer
+        .operations()
+        .run
+        .as_ref()
+        .ok_or(LoopError::Unsupported("a session with no run to seal"))?;
+    if let Some(reason) = run.finished {
+        return Ok(finished(writer, reason));
+    }
+    let run_id = run.run_id.clone();
+    let resolution = run.resolution();
+    if !matches!(resolution, Resolution::Resume | Resolution::Interrupted(_)) {
+        return Err(LoopError::Unsupported("sealing a run that wasn't running"));
+    }
+    let admission = frozen_admission(run, parts)?;
+    // The closing results message is placed with the facts its run's frozen rules give it, as a
+    // resume places it.
+    let mut placed = Placed {
+        facts: admission
+            .compaction_plan_version
+            .map(|_| Tags::for_run(admission.manifest.as_deref(), &admission.render_config)),
+        inner: writer,
+    };
+    let writer = &mut placed;
+    let now = (seams.now_ms)();
+    let mut records = Vec::new();
+    if cause == SealCause::CrashOrphan {
+        let mut resumed = resumed_record(writer, &resolution);
+        resumed.redone.clear();
         records.push(Record::Resumed(resumed));
     }
+    // As today's seal chooses: an open batch closes, whatever its calls' state; only with no
+    // open batch is a never-dispatched tool turn kept.
+    let (close_out, withdrawn) = open_batch_close_out(writer, &run_id, now);
+    if close_out.is_empty() {
+        records.extend(never_dispatched_close_out(writer, &run_id, now));
+    } else {
+        records.extend(close_out);
+    }
+    let mut end = run_end(writer, &run_id, RunFinishReason::Interrupted, now);
+    if let Record::RunEnd(end) = &mut end {
+        end.interrupt_reason = Some(
+            match cause {
+                SealCause::CrashOrphan => "runner_crash",
+                SealCause::Shutdown => "runner_shutdown",
+            }
+            .into(),
+        );
+        if cause == SealCause::CrashOrphan {
+            end.error = Some(
+                serde_json::to_value(broca_core::resume::crash_orphan_error())
+                    .map_err(|e| LoopError::Parts(e.to_string()))?,
+            );
+        }
+    }
     records.push(end);
-    append_end(writer, run_id, records).await?;
+    append_end(writer, &run_id, records).await?;
     withdraw(seams, &withdrawn).await;
     Ok(finished(writer, RunFinishReason::Interrupted))
+}
+
+/// The records that keep a tool turn whose calls were never dispatched, as today's
+/// `broca_core::close_out_pending_turn` writes them: the step's batch started if it wasn't, a
+/// never-run result for each call without one, and the batch's end. Nothing when the run's last
+/// step asked for no tools.
+fn never_dispatched_close_out<W: Writer>(writer: &W, run_id: &str, now: u64) -> Vec<Record> {
+    let Some(open) = writer.conversation().open_tool_turn() else {
+        return Vec::new();
+    };
+    let planned: Vec<ToolCallId> = open
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            broca_protocol::content::ContentBlock::ToolCall(call) => {
+                Some(call.tool_call_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if planned.is_empty() {
+        return Vec::new();
+    }
+    let run = run_state(writer);
+    let mut records = Vec::new();
+    let batch_id = match run.open_batch.as_ref() {
+        Some(batch) => batch.batch_id.clone(),
+        None => {
+            let batch_id = format!("{run_id}-b{}", run.completed_steps);
+            records.push(Record::BatchStart(BatchStart {
+                run_id: run_id.into(),
+                batch_id: batch_id.clone(),
+                step_id: run.completed_steps,
+                planned: planned.clone(),
+            }));
+            batch_id
+        }
+    };
+    let answered = |id: &ToolCallId| {
+        run.open_batch
+            .as_ref()
+            .is_some_and(|batch| batch.state_of(id) == Some(CallState::Terminated))
+    };
+    for id in planned.iter().filter(|id| !answered(id)) {
+        terminal(
+            &mut records,
+            run_id,
+            &batch_id,
+            broca_core::resume::not_dispatched_result(id),
+            CallOutcome::Interrupted,
+            now,
+        );
+    }
+    records.push(Record::BatchEnd(BatchEnd {
+        run_id: run_id.into(),
+        batch_id,
+    }));
+    records
 }
 
 /// An error result for call `id` saying `message`.

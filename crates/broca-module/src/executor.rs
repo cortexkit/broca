@@ -335,8 +335,19 @@ pub struct StoreRunJob {
     /// Where the run's setup parts are stored and read back, lent by the actor for the run and
     /// handed back in [`StoreRunEnd`].
     pub parts: Box<dyn broca_session_loop::parts::Parts>,
-    /// Continue the session's unfinished run instead of admitting `req` as a new one.
-    pub resume: bool,
+    pub mode: StoreRunMode,
+}
+
+/// What a store run does: admit a new run, or carry on or end the session's unfinished one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreRunMode {
+    /// Admit the job's request as a new run.
+    Fresh,
+    /// Continue the session's unfinished run from its last durable boundary.
+    Resume,
+    /// End the session's unfinished run `Interrupted` without calling the model, writing what
+    /// today's seal writes (`broca_core::resume::interrupted_seal`): `broca_session_loop::seal`.
+    Seal(broca_core::resume::SealCause),
 }
 
 /// How a store run ended, with the parts store its job lent.
