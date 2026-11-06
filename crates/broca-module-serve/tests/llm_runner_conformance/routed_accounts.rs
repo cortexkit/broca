@@ -92,6 +92,12 @@ pub(super) fn seed_catalog(
             "wire.npm":{"value":npm,"from":"fixture"},
             "wire.api":{"value":model_url,"from":"fixture"}
         });
+        if provider == "openai" {
+            // The HTTP stand-in serves Chat Completions SSE, not Responses SSE. ChatGPT
+            // still selects its separate Responses family and WebSocket fixture by method.
+            value["models"][format!("{provider}/{PLAN_MODEL_PREFIX}{session}")]["wire.shape"] =
+                json!({"value":"completions","from":"fixture"});
+        }
     }
     std::fs::write(path, serde_json::to_vec(&value)?)
 }
@@ -676,11 +682,33 @@ mod tests {
 
     #[tokio::test]
     async fn routed_accounts_oauth_fixture_completes_catalog_resolved_messages_request() {
+        routed_accounts_fixture_completes_catalog_resolved_request(
+            "oauth",
+            "routed_accounts::tests::routed_accounts_oauth_fixture_completes_catalog_resolved_messages_request",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn routed_accounts_apikey_fixture_completes_catalog_resolved_chat_request() {
+        routed_accounts_fixture_completes_catalog_resolved_request(
+            "apikey",
+            "routed_accounts::tests::routed_accounts_apikey_fixture_completes_catalog_resolved_chat_request",
+        )
+        .await;
+    }
+
+    async fn routed_accounts_fixture_completes_catalog_resolved_request(
+        auth: &str,
+        test_name: &str,
+    ) {
         const CHILD: &str = "BROCA_ROUTED_MESSAGES_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "routed_accounts::tests::routed_accounts_oauth_fixture_completes_catalog_resolved_messages_request", "--nocapture"])
-                .env(CHILD, "1").output().unwrap();
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
             assert!(
                 output.status.success(),
                 "{}{}",
@@ -694,7 +722,9 @@ mod tests {
             AccountChoice, AccountSelectionConfig, ChoiceInputs, RoutingClient,
         };
         let shared = Arc::new(Shared::default());
-        let session = "cf-routed-account-portable-oauth";
+        let session = format!("cf-routed-account-portable-{auth}");
+        let session = session.as_str();
+        let auth_method = AuthMethod::from_token(auth).unwrap();
         shared.scripts.lock().unwrap().insert(
             session.into(),
             Script {
@@ -703,8 +733,9 @@ mod tests {
                 )],
             },
         );
-        let ids = fixture("oauth").unwrap();
-        let peer = RecordingRoutingPeer::new("oauth", ids.clone()).unwrap();
+        let ids = fixture(auth).unwrap();
+        let provider = ids["provider"].as_str().unwrap();
+        let peer = RecordingRoutingPeer::new(auth, ids.clone()).unwrap();
         shared
             .routed_account_peers
             .lock()
@@ -712,7 +743,7 @@ mod tests {
             .insert(session.into(), peer.clone());
         let model_url = start_model(shared.clone()).await;
         let root = broca_test_support::scratch_root()
-            .join(format!("routed-native-messages-{}", std::process::id()));
+            .join(format!("routed-native-{auth}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         seed_structured_output_catalog(&root).unwrap();
         seed_catalog(&root, &model_url, session).unwrap();
@@ -727,11 +758,8 @@ mod tests {
         let fields = send_fields(session, true, &peer);
         let model = fields["model"]["model"].as_str().unwrap();
         let binding = broca_protocol::BindIdentity::new("/fixture", "broca", session);
-        let static_credential = broca_module_serve::auth_routing::CredentialId::new(
-            AuthMethod::Oauth,
-            "anthropic",
-            None,
-        );
+        let static_credential =
+            broca_module_serve::auth_routing::CredentialId::new(auth_method, provider, None);
         let listing = serde_json::from_value(
             Vault::request(&json!({"method":"credential.list_scoped"})).unwrap()["result"].clone(),
         )
@@ -745,7 +773,7 @@ mod tests {
             ChoiceInputs {
                 decision_id: None,
                 service_tier: None,
-                pool: None,
+                pool: fields["auth"]["pool"].as_str(),
                 credential_id: None,
                 conversation_key: None,
                 inherited_conversation_key: None,
@@ -774,7 +802,7 @@ mod tests {
         };
         assert_eq!(credential_id, ids["credential_id"]);
         assert_eq!(account_id, ids["account_id"]);
-        assert_eq!(method, AuthMethod::Oauth);
+        assert_eq!(method, auth_method);
         let vault = Vault::request(
             &json!({"method":"credential.get_scoped","params":{"credential_id":credential_id}}),
         )
@@ -788,7 +816,7 @@ mod tests {
         let overrides =
             broca_module_serve::provider_overrides::ProviderOverrides::parse(&settings.to_string())
                 .unwrap();
-        let base_url = overrides.base_url("anthropic").unwrap();
+        let base_url = overrides.base_url(provider).unwrap();
         let persona = broca_module_serve::claude_code_identity::fresh_persona(
             "00000000-0000-4000-8000-000000000001",
             Some(&account_id),
@@ -799,7 +827,7 @@ mod tests {
         )
         .unwrap();
         let resolved = broca_catalog::live::resolve_catalog_episode_with_client(
-            &format!("anthropic/{model}"),
+            &format!("{provider}/{model}"),
             Some(2048),
             &AuthMode::Secret(token),
             &ResolveOptions {
@@ -817,15 +845,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(resolved.auth_method, Some(AuthMethod::Oauth));
-        assert_eq!(
-            resolved.family_id,
-            broca_provider::spec::WireFamilyId::AnthropicMessages
-        );
-        assert_eq!(resolved.base_url, model_url.trim_end_matches("/v1"));
+        assert_eq!(resolved.auth_method, Some(auth_method));
+        assert_eq!(resolved.base_url, base_url);
         let frozen = resolved.provider.render_config_blob();
         assert_eq!(frozen["base_url"], resolved.base_url);
-        assert_eq!(frozen["family_id"], "anthropic_messages");
         resolved.provider.bind_run_transport(&binding);
         let options =
             broca_protocol::request::CallOptions::new(vec![broca_protocol::Message::new(
@@ -842,7 +865,7 @@ mod tests {
         let mut attempts = 0;
         let mut answered = false;
         while let Some(event) = broca_test_support::wait_for(
-            "catalog-selected routed Messages event",
+            "catalog-selected routed fixture event",
             events.recv(),
             || format!("completed={completed} attempts={attempts}"),
         )
@@ -874,7 +897,7 @@ mod tests {
                     assert_eq!(
                         attempt.outcome,
                         broca_protocol::AttemptOutcome::Complete,
-                        "native Messages endpoint did not complete: {:?}; received requests={:?}",
+                        "native fixture endpoint did not complete: {:?}; received requests={:?}",
                         attempt.outcome,
                         shared.routed_http_requests.lock().unwrap().get(session)
                     );
@@ -884,6 +907,21 @@ mod tests {
         }
         assert!(completed);
         assert!(answered);
+        let (family, family_token, target) = match auth_method {
+            AuthMethod::Oauth => (
+                broca_provider::spec::WireFamilyId::AnthropicMessages,
+                "anthropic_messages",
+                "/v1/messages?beta=true",
+            ),
+            AuthMethod::ApiKey => (
+                broca_provider::spec::WireFamilyId::OpenAiChat,
+                "openai_chat",
+                "/v1/chat/completions",
+            ),
+            other => panic!("no portable HTTPS fixture for {other:?}"),
+        };
+        assert_eq!(resolved.family_id, family);
+        assert_eq!(frozen["family_id"], family_token);
         assert_eq!(
             attempts, 1,
             "the scripted success must not rely on provider retries"
@@ -896,7 +934,7 @@ mod tests {
                     .unwrap()
                     .trim_end_matches("/v1")
                     .into(),
-                target: "/v1/messages?beta=true".into(),
+                target: target.into(),
                 credential_id: Some(credential_id),
             }]
         );
@@ -911,7 +949,7 @@ mod tests {
         if let Some(path) = std::env::var_os("BROCA_ROUTED_MESSAGES_EVIDENCE") {
             let requests = shared.routed_http_requests.lock().unwrap();
             let request = &requests[session][0];
-            let evidence = json!({"provider":"anthropic","model":model,"auth_method":"oauth",
+            let evidence = json!({"provider":provider,"model":model,"auth_method":auth,
                 "family":frozen["family_id"],"frozen_base_url":frozen["base_url"],
                 "account_id":account_id,"credential_id":ids["credential_id"],
                 "received_authority":request.authority,"received_target":request.target,
