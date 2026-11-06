@@ -1940,7 +1940,15 @@ async fn compare_every_cut(scenario: Scenario) {
 }
 
 async fn compare_every_cut_in(scenario: Scenario) {
-    let (_, full, name) = today_from(&scenario, None, scenario.steps.clone()).await;
+    // The whole log the cuts are taken from. Only the resumes are compared, so its run's warms
+    // go to a driver of their own; the run still freezes the keep-warm its resumes read back.
+    let source_warms = warm_script().map(|_| Arc::new(WarmPair::default()));
+    let (_, full, name) = WARM
+        .scope(
+            source_warms,
+            today_from(&scenario, None, scenario.steps.clone()),
+        )
+        .await;
     let records = full.framed().len();
     assert!(records > 2, "the scenario wrote a log to cut");
     for cut in 1..records {
@@ -5258,13 +5266,16 @@ async fn every_cut_of_a_cache_expired_ride_resumes_alike() {
 }
 
 /// Runs `compare` with keep-warm on in both loops, then checks both sent the same warms, and
-/// that they sent some: `expect` is how many today's loop sent.
-async fn compare_warmed<F: std::future::Future<Output = ()>>(expect: usize, compare: F) {
+/// that they sent some: `expect` is how many today's loop sent, when the comparison knows.
+async fn compare_warmed<F: std::future::Future<Output = ()>>(expect: Option<usize>, compare: F) {
     let pair = Arc::new(WarmPair::default());
     WARM.scope(Some(Arc::clone(&pair)), compare).await;
     let today = pair.today.log.lock().unwrap().clone();
     let new = pair.new.log.lock().unwrap().clone();
-    assert_eq!(today.len(), expect, "today's warms: {today:?}");
+    assert!(!today.is_empty(), "today's loop sent no warm");
+    if let Some(expect) = expect {
+        assert_eq!(today.len(), expect, "today's warms: {today:?}");
+    }
     assert_eq!(new, today, "the new loop's warms");
 }
 
@@ -5285,7 +5296,7 @@ fn slow_scenario(steps: Vec<Vec<NormalizedEvent>>) -> Scenario {
 #[tokio::test]
 async fn a_slow_call_is_waited_on_with_the_cache_kept_warm() {
     compare_warmed(
-        6,
+        Some(6),
         compare(slow_scenario(vec![
             answer(
                 "a1",
@@ -5302,8 +5313,31 @@ async fn a_slow_call_is_waited_on_with_the_cache_kept_warm() {
 #[tokio::test]
 async fn each_tool_wait_has_its_own_spending_cap() {
     compare_warmed(
-        12,
+        Some(12),
         compare(slow_scenario(vec![
+            answer(
+                "a1",
+                vec![call("c1", "slow", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            answer(
+                "a2",
+                vec![call("c2", "slow", json!({}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a3", "done"),
+        ])),
+    )
+    .await;
+}
+
+/// Resumed at every cut, a run still waiting on its slow call warms as it did: its keep-warm is
+/// read back from its start.
+#[tokio::test]
+async fn every_cut_of_a_warmed_wait_resumes_alike() {
+    compare_warmed(
+        None,
+        compare_every_cut(slow_scenario(vec![
             answer(
                 "a1",
                 vec![call("c1", "slow", json!({}))],
