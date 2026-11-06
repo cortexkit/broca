@@ -418,6 +418,8 @@ dependencies = [
  "broca-memory-relief",
  "broca-protocol",
  "broca-provider",
+ "broca-session-loop",
+ "broca-session-store",
  "broca-store",
  "broca-test-support",
  "broca-wal",

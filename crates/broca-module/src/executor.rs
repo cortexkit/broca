@@ -214,6 +214,22 @@ pub trait RunExecutor: Send + Sync + 'static {
         out: mpsc::Sender<OutputEvent>,
     ) -> Result<RunSummary, RunError>;
 
+    /// Runs one run of a session kept in the new storage. An executor that can't refuses with
+    /// nothing written, so a session opts into the new storage only on a build whose executor
+    /// serves it.
+    async fn execute_on_store(
+        &self,
+        job: StoreRunJob,
+        _out: mpsc::Sender<OutputEvent>,
+    ) -> StoreRunEnd {
+        StoreRunEnd {
+            parts: job.parts,
+            result: Err(StoreRunError::Admission(RunError::Config(
+                "this runner cannot run sessions kept in the new storage".into(),
+            ))),
+        }
+    }
+
     /// Called by the actor's CLOSE teardown when a session ends (the lineage idles to
     /// close), so an executor holding per-session resources keyed off a SHARED handle can
     /// release them. The real executor uses it to send a route GOODBYE for the session so a
@@ -302,6 +318,39 @@ pub trait RunExecutor: Send + Sync + 'static {
             "this runner cannot warm a prompt cache".into(),
         ))
     }
+}
+
+/// One run of a session kept in the new storage, as the store actor hands it to the executor.
+/// Like [`RunJob`], the actor builds the request and the session's part of the run control; the
+/// executor resolves the credential, routing, provider and catalog row, completes the control,
+/// admits the run by `broca_session_loop::admit::admission` and runs it through `writer`.
+pub struct StoreRunJob {
+    pub req: RunRequest,
+    /// Caller-scoped credential selection, resolved at admission as for [`RunJob::auth`].
+    pub auth: Option<broca_protocol::AuthRequest>,
+    pub control: RunControl,
+    /// The run's writer: a client of the store actor, which owns the session.
+    pub writer: broca_session_loop::shared::ActorWriter,
+    /// Where the run's setup parts are stored and read back, lent by the actor for the run and
+    /// handed back in [`StoreRunEnd`].
+    pub parts: Box<dyn broca_session_loop::parts::Parts>,
+    /// Continue the session's unfinished run instead of admitting `req` as a new one.
+    pub resume: bool,
+}
+
+/// How a store run ended, with the parts store its job lent.
+pub struct StoreRunEnd {
+    pub parts: Box<dyn broca_session_loop::parts::Parts>,
+    pub result: Result<broca_session_loop::run::Finished, StoreRunError>,
+}
+
+/// Why a store run ended without a finish the loop recorded.
+#[derive(Debug)]
+pub enum StoreRunError {
+    /// Resolving or admitting the run failed before anything was written.
+    Admission(RunError),
+    /// The loop stopped; see [`broca_session_loop::run::LoopError`].
+    Loop(broca_session_loop::run::LoopError),
 }
 
 /// A run the actor sealed `Interrupted`, as [`RunExecutor::on_run_sealed`] receives it.
